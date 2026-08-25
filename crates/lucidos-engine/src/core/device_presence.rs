@@ -97,6 +97,34 @@ impl DevicePresenceStore {
         .await?;
         Ok(rows.into_iter().map(|(d,)| d).collect())
     }
+
+    /// Move a device's presence row to a new id. Called only from
+    /// `DeviceStore::hand_over`.
+    ///
+    /// Takes a connection rather than the pool, because the hand-over is one
+    /// transaction and a pool call would run outside it. Any row already under
+    /// `new_id` belongs to a device that does not exist, so it is cleared
+    /// first: `device_id` is the primary key.
+    ///
+    /// No announcement is owed. This table is a projection of DeviceVisible /
+    /// DeviceHidden, and the move reports neither: the tab's visibility is
+    /// unchanged, only the id naming it.
+    pub async fn move_device(
+        conn: &mut sqlx::PgConnection,
+        old_id: &str,
+        new_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM device_presence WHERE device_id = $1")
+            .bind(new_id)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("UPDATE device_presence SET device_id = $2 WHERE device_id = $1")
+            .bind(old_id)
+            .bind(new_id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

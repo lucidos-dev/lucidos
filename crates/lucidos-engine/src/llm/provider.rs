@@ -19,7 +19,9 @@ impl MessageContent {
             MessageContent::Blocks(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
+                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                        Some(text.as_str())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -59,6 +61,22 @@ pub enum ContentBlock {
         media_type: String,  // "image/png", "image/jpeg", etc.
         data: String,        // base64-encoded image data
     },
+    /// A block the engine appended at the tail of a context-mode round: the
+    /// context panel, or the rendered working understanding.
+    ///
+    /// Every provider renders it as an ordinary text block, so nothing changes
+    /// on the wire. The variant exists so the two passes that treat these
+    /// blocks differently can ask WHO WROTE IT rather than what it starts
+    /// with. Both used to match the displayed prefix, which made a user
+    /// message opening with `[CONTEXT PANEL]` collapse into the
+    /// superseded-panel note and vanish from the request.
+    ///
+    /// One pass is `chat::process::context_panel::collapse_tail_blocks`, which
+    /// rewrites a superseded block. The other is Anthropic's cache marker. It
+    /// anchors in front of the tail, so next round's rewrite does not re-price
+    /// the results the block rides on.
+    #[serde(rename = "engine_tail")]
+    EngineTail { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +137,31 @@ pub struct LlmResponse {
     /// silence. Defaults to 0 for providers that don't track it.
     #[serde(default)]
     pub unknown_sse_dropped: u32,
+    /// Text the model wrote that the USER must not see and the MODEL must.
+    ///
+    /// Gemini narrates its plan in ordinary text parts beside a `functionCall`.
+    /// That is working notes, not an answer, so `content` stays `None` and
+    /// keeps it off the screen. This field carries the same text back into the
+    /// assistant turn, so the model does not re-enter the next round having
+    /// forgotten it. Anthropic and OpenAI keep their text in `content`, so they
+    /// leave this `None`.
+    ///
+    /// Never set alongside `content`: [`LlmResponse::history_text`] reads one
+    /// or the other, so setting both would send the same text twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_only_text: Option<String>,
+}
+
+impl LlmResponse {
+    /// The model's own words for the next request, for the assistant turn the
+    /// agentic loop rebuilds.
+    ///
+    /// `content` is the user-facing half and is not interchangeable. The two
+    /// diverge wherever a provider emits text that is real context but not a
+    /// printable answer.
+    pub fn history_text(&self) -> Option<&str> {
+        self.content.as_deref().or(self.model_only_text.as_deref())
+    }
 }
 
 #[async_trait]

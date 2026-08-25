@@ -662,3 +662,108 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
         cc.content
     );
 }
+
+/// Engine-core audit finding 3: a rebuilt result reaches the model with the
+/// same `[evt-<hex>]` trailer the live turn appends. Without it the context
+/// panel cannot address a resumed result. From the second round on, the model
+/// can then neither keep one open nor see one expire.
+#[test]
+fn every_rebuilt_tool_result_carries_its_event_address() {
+    use crate::core::EventRow;
+    use crate::llm::{ContentBlock, MessageContent};
+    use chrono::Utc;
+    let now = Utc::now();
+    // Three shapes the builder produces: a plain result, an orphan stub, and
+    // a load_knowhow body swapped for the pointer stub. All three are results
+    // the panel has to be able to name.
+    let plain_id = uuid::Uuid::new_v4();
+    let orphan_id = uuid::Uuid::new_v4();
+    let knowhow_id = uuid::Uuid::new_v4();
+    let events = vec![
+        EventRow {
+            id: knowhow_id,
+            event_type: "ToolCalled".into(),
+            payload: json!({"name": "load_knowhow", "args": {"id": "recipe"}}),
+            created: now,
+            thread_id: None,
+            sequence: Some(1),
+        },
+        EventRow {
+            id: uuid::Uuid::new_v4(),
+            event_type: "ToolResult".into(),
+            payload: json!({"name": "load_knowhow", "result": "BODY", "success": true}),
+            created: now + chrono::Duration::seconds(1),
+            thread_id: None,
+            sequence: Some(2),
+        },
+        EventRow {
+            id: plain_id,
+            event_type: "ToolCalled".into(),
+            payload: json!({"name": "read_file", "args": {}}),
+            created: now + chrono::Duration::seconds(2),
+            thread_id: None,
+            sequence: Some(3),
+        },
+        EventRow {
+            id: uuid::Uuid::new_v4(),
+            event_type: "ToolResult".into(),
+            payload: json!({"name": "read_file", "result": "file body", "success": true}),
+            created: now + chrono::Duration::seconds(3),
+            thread_id: None,
+            sequence: Some(4),
+        },
+        EventRow {
+            id: orphan_id,
+            event_type: "ToolCalled".into(),
+            payload: json!({"name": "run_bash", "args": {}}),
+            created: now + chrono::Duration::seconds(4),
+            thread_id: None,
+            sequence: Some(5),
+        },
+    ];
+    let mut loaded = std::collections::HashSet::new();
+    loaded.insert("recipe".to_string());
+    let (blocks, _skip) =
+        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 3, &loaded);
+
+    let results: Vec<(&String, &String)> = blocks
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::Blocks(b) => match b.first() {
+                Some(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                }) => Some((tool_use_id, content)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 3, "one result per call, orphan included");
+
+    for (tool_use_id, content) in results {
+        let trailer = format!("[{tool_use_id}]");
+        assert_eq!(
+            content.lines().next_back().map(str::trim),
+            Some(trailer.as_str()),
+            "last line must be the result's own address; got:\n{content}"
+        );
+    }
+
+    // The stub swap and the orphan stub keep their own body above the trailer.
+    let bodies: Vec<String> = blocks
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::Blocks(b) => match b.first() {
+                Some(ContentBlock::ToolResult { content, .. }) => Some(content.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(bodies.iter().any(|c| c.contains("[LOADED KNOWHOW]")));
+    assert!(bodies
+        .iter()
+        .any(|c| c.contains(crate::llm::validate::ORPHAN_TOOL_RESULT_STUB)));
+    assert!(bodies.iter().any(|c| c.contains("file body")));
+}

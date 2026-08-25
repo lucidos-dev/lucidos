@@ -2,7 +2,8 @@ import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, waitAndClick, waitForVisibleElement,
+  waitForActiveSession, waitAndClick, waitForVisibleElement, pickModelPair,
+  openCurrentModelTiers,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -28,8 +29,10 @@ test.describe('CC reasoning effort pre-session selection', () => {
     await pickComposeDestination(page);
 
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Reasoning');
-    await waitAndClick(page, '.control-option', 'Max');
+    // One entry, not two: the tier is the picker's second step. With no
+    // session and no pick, the model in force is Default.
+    await waitAndClick(page, '.control-item', 'Model');
+    await pickModelPair(page, 'default', 'max');
 
     let sentThreadId: string | null = null;
     page.on('request', (req) => {
@@ -53,14 +56,14 @@ test.describe('CC reasoning effort pre-session selection', () => {
     await waitForActionPanel(page, 'Archive', 120_000);
 
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Reasoning');
+    await waitAndClick(page, '.control-item', 'Model');
     await waitForVisibleElement(page, '.control-option');
 
-    // Max should be marked as current (has control-option-current class)
-    const currentOption = page.locator('.control-option-current:visible').first();
-    await expect(currentOption).toBeVisible({ timeout: 5_000 });
-    const currentLabel = await currentOption.locator('.control-option-label').textContent();
-    expect((currentLabel ?? '').replace(/✓/g, '').trim()).toBe('Max');
+    // The session's own model at Max is now the checked pair, one step in.
+    await openCurrentModelTiers(page);
+    const currentTier = page.locator('.control-option-current:visible').first();
+    await expect(currentTier).toBeVisible({ timeout: 5_000 });
+    expect(await currentTier.getAttribute('data-value')).toMatch(/\|max$/);
 
     // Cleanup
     await page.keyboard.press('Escape');

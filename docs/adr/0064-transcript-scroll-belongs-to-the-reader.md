@@ -89,6 +89,17 @@ keyboard, a PWA resuming onto a restored offset and a restored session all move
 the container with no gesture. Leaving the follow armed there is only half the
 rule: the reader is put back on the live edge they asked for.
 
+> **Sharpened: only a PLACEMENT of ours may suppress that correction.** The
+> correction stands down for the app's own writes, so a chevron or a restore is
+> not undone on its own trailing event. The ride's own writes mark a navigation
+> too, for the mobile header's sake, and a settling transcript re-marks itself
+> every growth round. Read as "any write of ours", the term therefore stood the
+> correction down almost continuously. One unattributed scroll then cleared both
+> readings `keepTheLiveEdge` has, and the reader was stranded off the edge with
+> the toggle lit for good. A held write's own event lands on the stamp, so the
+> moved-off-the-stamp term already excludes it: see `isPlacementScroll`, and
+> `docs/plans/2026-08-21-a-held-write-is-not-a-navigation.md`.
+
 **A submit arms nothing.** It is one ask with one reaction, whichever of the
 five shapes it takes. A reader already riding the live edge is taken there,
 because that is the toggle's standing ask being served. Everyone else gets a

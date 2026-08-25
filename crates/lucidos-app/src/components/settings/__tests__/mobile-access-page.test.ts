@@ -94,7 +94,9 @@ describe('Mobile Access reachability', () => {
     expect(page).toContain('const shell = (body: ComponentChildren) => (');
     // And the shell is what every branch returns, including the two that carry
     // no rows at all.
-    expect(page).toContain('return shell(<LoadableError noun="connect info" error={failure} />);');
+    expect(page).toContain(
+      'return shell(<LoadableError noun="connect info" error={connectReadsError} />);',
+    );
     expect(page).toContain("return shell(showLoading ? <div class=\"empty-state\">Loading…</div> : null);");
   });
 

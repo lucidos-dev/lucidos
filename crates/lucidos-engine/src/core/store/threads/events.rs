@@ -26,6 +26,10 @@ impl EventStore {
     }
 
     /// Get all events for a specific thread, ordered chronologically.
+    ///
+    /// `sequence` breaks a `created` tie, matching `get_thread_events_by_seq`
+    /// and `get_recent_messages`. A burst inside one timestamp is common, and
+    /// last-writer-wins folds over this stream need insertion order.
     pub async fn get_thread_events(
         &self,
         thread_id: &str,
@@ -36,7 +40,7 @@ impl EventStore {
             SELECT id, event_type, payload, created, thread_id, sequence
             FROM events
             WHERE thread_id = $1
-            ORDER BY created ASC
+            ORDER BY created ASC, sequence ASC
             "#,
         )
         .bind(thread_uuid)

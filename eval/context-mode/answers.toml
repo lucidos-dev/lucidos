@@ -1,0 +1,15 @@
+# Scripted replies to `ask_user_question`, per task.
+#
+# The driver matches a question's text against `matches` in order, and each
+# entry is used once. Past the script it replies "use your judgment" and
+# increments `unscripted_answers`, which lands on the thread row. A repeat with
+# unscripted answers drifted from the script, and the reader has to see which.
+#
+# An answer is matched against the offered option labels first and sent as that
+# option. It goes as free text only when no label fits.
+
+[[answers]]
+task = "T09"
+scripted = [
+  { matches = '(?i)group|breakdown|by (project|day)', answer = "by project" },
+]

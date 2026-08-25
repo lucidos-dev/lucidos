@@ -1,3 +1,7 @@
+// @vitest-environment jsdom
+// The sanitizer runs on a real DOM. The default `node` environment has none,
+// and DOMPurify would pass its input straight back.
+
 /**
  * Regression test for "Link to <app> goes to index.html preview instead of app".
  *
@@ -26,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -90,6 +94,7 @@ type Callbacks = {
   openImage: (src: string, target: any) => void;
   openArtifact: (path: string) => void;
   openApp: (app: App) => void;
+  openTrigger: (id: string) => void;
   navigate: (req: { target: string }) => void;
   osOpen: (target: string) => void;
   toast: (message: string) => void;
@@ -107,6 +112,13 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
     if (id) { const a = apps.find(x => x.id === id); if (a) cb.openApp(a); }
     return;
   }
+  const trig = t.closest('.trigger-link');
+  if (trig) {
+    e.preventDefault();
+    const triggerId = (trig as any).dataset.triggerId;
+    if (triggerId) cb.openTrigger(triggerId);
+    return;
+  }
   const nav = t.closest('.nav-link');
   if (nav) {
     e.preventDefault();
@@ -122,6 +134,12 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
     if (id) {
       const a = apps.find(x => x.id === id);
       if (a) { e.preventDefault(); cb.openApp(a); return; }
+    }
+    const triggerId = extractTriggerIdFromHref(href);
+    if (triggerId) {
+      e.preventDefault();
+      cb.openTrigger(triggerId);
+      return;
     }
     const navName = extractNavTargetFromHref(href);
     if (navName) {
@@ -146,11 +164,13 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       cb.osOpen(localFile);
       return;
     }
-    // Terminal guard: a scheme-less, non-fragment href reaches nothing in the
-    // SPA, so it must never navigate.
-    if (!hasUrlScheme(href) && !href.startsWith('#')) {
+    // Terminal guard: an href the browser cannot act on reaches nothing, so
+    // it must never navigate. Mirrors ChatExchange's `deadLinkMessage`.
+    if (!browserHandlesHref(href) && !href.startsWith('#')) {
       e.preventDefault();
-      cb.toast(href ? `Link "${href}" points nowhere in this workspace` : 'This link has no destination');
+      if (!href) cb.toast('This link has no destination');
+      else if (hasUrlScheme(href)) cb.toast(`Link "${href}" uses a scheme nothing here can open`);
+      else cb.toast(`Link "${href}" points nowhere in this workspace`);
     }
   }
 }
@@ -160,6 +180,7 @@ describe('chat link click — the bug-report scenario', () => {
     openImage: ReturnType<typeof vi.fn>;
     openArtifact: ReturnType<typeof vi.fn>;
     openApp: ReturnType<typeof vi.fn>;
+    openTrigger: ReturnType<typeof vi.fn>;
     navigate: ReturnType<typeof vi.fn>;
     osOpen: ReturnType<typeof vi.fn>;
     toast: ReturnType<typeof vi.fn>;
@@ -170,6 +191,7 @@ describe('chat link click — the bug-report scenario', () => {
       openImage: vi.fn() as Callbacks['openImage'] & ReturnType<typeof vi.fn>,
       openArtifact: vi.fn() as Callbacks['openArtifact'] & ReturnType<typeof vi.fn>,
       openApp: vi.fn() as Callbacks['openApp'] & ReturnType<typeof vi.fn>,
+      openTrigger: vi.fn() as Callbacks['openTrigger'] & ReturnType<typeof vi.fn>,
       navigate: vi.fn() as Callbacks['navigate'] & ReturnType<typeof vi.fn>,
       osOpen: vi.fn() as Callbacks['osOpen'] & ReturnType<typeof vi.fn>,
       toast: vi.fn() as Callbacks['toast'] & ReturnType<typeof vi.fn>,
@@ -339,6 +361,45 @@ describe('chat link click — the bug-report scenario', () => {
   // shape; without rewrite + click routing the browser hits the engine's
   // /data/* static mount and 404s.
   // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Trigger deep links. The reported bug: told to link the trigger, the agent
+  // wrote `[name](trigger:<uuid>)`. Nothing claimed the href, and the terminal
+  // guard exempts anything carrying a scheme. The browser has no handler for
+  // `trigger:`, so the click did nothing at all, silently.
+  // ---------------------------------------------------------------------------
+
+  it('PRIMARY: pre-rewritten <a class="trigger-link"> click → navigateToTrigger', () => {
+    const a = mkAnchor('#', 'trigger-link', { triggerId: '3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63' });
+    const e = mkEvent(a);
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openTrigger).toHaveBeenCalledWith('3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63');
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('FALLBACK: plain <a href="trigger:<id>"> click → navigateToTrigger, never the browser', () => {
+    const e = mkEvent(mkAnchor('trigger:3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openTrigger).toHaveBeenCalledWith('3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63');
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('the triggers PANEL still routes to the panel, not to a trigger', () => {
+    const e = mkEvent(mkAnchor('triggers'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.navigate).toHaveBeenCalledWith({ target: 'triggers' });
+    expect(cb.openTrigger).not.toHaveBeenCalled();
+  });
+
+  it('END-TO-END: render → linkify yields the .trigger-link the click expects', () => {
+    // Exact markdown from the bug-report thread.
+    const md = 'Here it is: [Nightly digest](trigger:3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63)';
+    const html = linkifyPaths(renderMarkdown(md), [], APPS);
+    expect(html).toContain('href="#"');
+    expect(html).toContain('class="trigger-link"');
+    expect(html).toContain('data-trigger-id="3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63"');
+    expect(html).toContain('>Nightly digest</a>');
+  });
 
   it('PRIMARY: pre-rewritten <a class="nav-link"> click → handleNavigationRequest', () => {
     const a = mkAnchor('#', 'nav-link', { navTarget: 'notifications' });
@@ -529,9 +590,10 @@ describe('chat link click — the bug-report scenario', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Terminal guard. The four branches above are a whitelist, and a whitelist is
-  // open at the bottom: every href nobody claimed used to escape to the browser
-  // and reload the workspace. Nothing scheme-less escapes any more.
+  // Terminal guard. The branches above are a whitelist, and a whitelist is open
+  // at the bottom. An unclaimed relative href used to escape to the browser and
+  // reload the workspace; an unclaimed SCHEME used to escape and do nothing at
+  // all. Neither escapes now.
   // ---------------------------------------------------------------------------
 
   it.each([
@@ -574,11 +636,47 @@ describe('chat link click — the bug-report scenario', () => {
     'http://example.com/x',
     'mailto:a@example.com',
     'tel:+4712345678',
+    'sms:+4712345678',
   ])('CLOSED: %s passes through untouched', (href) => {
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(e.defaultPrevented).toBe(false);
     expect(cb.toast).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'note:abc',            // the shape of the reported bug, before trigger: was claimed
+    'change:4f2c1a90',
+    'vscode://file/tmp/x',
+    'thread:not-a-uuid',   // malformed, so the markdown rewriter declined it
+  ])('CLOSED: unopenable scheme %s is swallowed, never left silent', (href) => {
+    // The reported bug: `trigger:<uuid>` carried a scheme, the guard exempted
+    // every scheme, and the browser had no handler. The click did nothing and
+    // said nothing, which reads as a dead app rather than a dead link.
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(e.defaultPrevented).toBe(true);
+    expect(cb.toast).toHaveBeenCalledWith(expect.stringContaining('scheme'));
+    expect(cb.toast).toHaveBeenCalledWith(expect.stringContaining(href));
+  });
+
+  it('CLOSED: an unopenable scheme reads differently from an unresolved path', () => {
+    // Different causes, different fixes, so the two must not share wording.
+    runHandleLinkClick(mkEvent(mkAnchor('note:abc')), APPS, cb);
+    runHandleLinkClick(mkEvent(mkAnchor('some/unknown/path.md')), APPS, cb);
+    const [scheme, relative] = cb.toast.mock.calls.map((c: unknown[]) => c[0] as string);
+    expect(scheme).not.toBe(relative);
+    expect(relative).toContain('points nowhere in this workspace');
+  });
+
+  it('the app OWN schemes never reach the guard', () => {
+    // Each is claimed by its extractor first, so closing the guard cannot make
+    // one of them toast.
+    for (const href of ['app:habit-tracker', 'trigger:abc-123', '/Applications/X.app']) {
+      cb.toast.mockClear();
+      runHandleLinkClick(mkEvent(mkAnchor(href)), APPS, cb);
+      expect(cb.toast, `${href} must not reach the terminal guard`).not.toHaveBeenCalled();
+    }
   });
 });
 
@@ -586,9 +684,9 @@ describe('chat link click — handler structure pin', () => {
   // Catches a future edit that quietly changes the branch structure of the
   // real handleLinkClick in ChatExchange.tsx, which would let the in-test
   // mirror (runHandleLinkClick above) drift and give us false confidence.
-  it('handleLinkClick has the five branches in the documented order, each terminated by return;', () => {
-    // The five branches must appear in this order: image → artifact → app
-    // → nav → anchor-fallback. Each branch must close with `return;` before
+  it('handleLinkClick has the six branches in the documented order, each terminated by return;', () => {
+    // The six branches must appear in this order: image → artifact → app →
+    // trigger → nav → anchor-fallback. Each branch must close with `return;` before
     // the next `.closest(...)` opens — otherwise a refactor that swaps two
     // if-bodies (e.g. matches the targets in one order but acts on them
     // in another) would slip past a simpler text-order pin. The lazy
@@ -598,13 +696,14 @@ describe('chat link click — handler structure pin', () => {
     expect(m, 'handleLinkClick not found in ChatExchange.tsx').not.toBeNull();
     const body = m![0];
     const sequence =
-      /closest\('\.image-thumbnail'\)[\s\S]+?return;[\s\S]+?closest\('\.artifact-link'\)[\s\S]+?return;[\s\S]+?closest\('\.app-link'\)[\s\S]+?return;[\s\S]+?closest\('\.nav-link'\)[\s\S]+?return;[\s\S]+?closest\('a'\)/;
+      /closest\('\.image-thumbnail'\)[\s\S]+?return;[\s\S]+?closest\('\.artifact-link'\)[\s\S]+?return;[\s\S]+?closest\('\.app-link'\)[\s\S]+?return;[\s\S]+?closest\('\.trigger-link'\)[\s\S]+?return;[\s\S]+?closest\('\.nav-link'\)[\s\S]+?return;[\s\S]+?closest\('a'\)/;
     expect(body).toMatch(sequence);
   });
 
-  it('handleLinkClick uses all five href extractors in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*from.*linkifyPaths/);
+  it('handleLinkClick uses all six href extractors in the fallback branch', () => {
+    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*extractTriggerIdFromHref.*from.*linkifyPaths/);
     expect(chatExchangeSource).toMatch(/extractAppIdFromHref\(rawHref\)/);
+    expect(chatExchangeSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractBareAppRef\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractDataPathTarget\(rawHref\)/);
@@ -616,13 +715,14 @@ describe('chat link click — handler structure pin', () => {
     expect(m).not.toBeNull();
     const body = m![0];
     expect(body).toContain('openApp(app)');
+    expect(body).toContain('navigateToTrigger(triggerId)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
     expect(body).toContain('openFilePreview(dataPath)');
     expect(body).toContain('openLocalFile(localFile)');
     expect(body).toContain('e.preventDefault()');
   });
 
-  it('the fallback extractors run in order: app, nav, bare-app-ref, data-path, OS-open', () => {
+  it('the fallback extractors run in order: app, trigger, nav, bare-app-ref, data-path, OS-open', () => {
     // extractLocalFileTarget must appear after the app/nav extractors, or an
     // absolute /apps/… or /notifications href could be handed to the OS instead
     // of routed in-app. extractBareAppRef must run AFTER nav so a reserved panel
@@ -632,13 +732,17 @@ describe('chat link click — handler structure pin', () => {
     // ever claims single-segment hrefs, so they cannot collide) and before
     // OS-open, so an absolute /artifacts/… is read as a workspace file rather
     // than a disk path.
+    // The trigger extractor claims `trigger:` and nothing else, so its slot is
+    // for narrative order rather than for resolving a collision.
     const appIdx = chatExchangeSource.indexOf('extractAppIdFromHref(rawHref)');
+    const trigIdx = chatExchangeSource.indexOf('extractTriggerIdFromHref(rawHref)');
     const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = chatExchangeSource.indexOf('extractBareAppRef(rawHref)');
     const dataIdx = chatExchangeSource.indexOf('extractDataPathTarget(rawHref)');
     const fileIdx = chatExchangeSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
-    expect(navIdx).toBeGreaterThan(appIdx);
+    expect(trigIdx).toBeGreaterThan(appIdx);
+    expect(navIdx).toBeGreaterThan(trigIdx);
     expect(bareIdx).toBeGreaterThan(navIdx);
     expect(dataIdx).toBeGreaterThan(bareIdx);
     expect(fileIdx).toBeGreaterThan(dataIdx);
@@ -655,10 +759,10 @@ describe('chat link click — handler structure pin', () => {
     expect(guard, 'terminal guard toast not found').toBeGreaterThan(0);
     expect(body.indexOf('extractLocalFileTarget(rawHref)')).toBeLessThan(guard);
     expect(body.slice(guard)).not.toMatch(/extract[A-Za-z]+\(rawHref\)/);
-    // It must gate on BOTH exemptions: a URL scheme and a pure fragment.
-    // `hasUrlScheme` is the shared helper, so the chat handler and the preview
-    // bridge can never disagree about what counts as a scheme.
-    expect(body).toContain('!hasUrlScheme(rawHref)');
+    // It must gate on BOTH exemptions: a scheme the browser can act on, and a
+    // pure fragment. `browserHandlesHref` is the shared helper, built on the
+    // shared `hasUrlScheme`, so no router carries its own idea of a scheme.
+    expect(body).toContain('!browserHandlesHref(rawHref)');
     expect(body).toContain("!rawHref.startsWith('#')");
   });
 

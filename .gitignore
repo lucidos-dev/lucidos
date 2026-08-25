@@ -65,8 +65,9 @@ dist/
 # renamed onto dist/ in closeBundle — ephemeral build output, never committed)
 dist.staging/
 dist.prev/
-# Checkout-level shared build-watch state (pid + log) for --built dev mode —
-# the singleton `vite build --watch` lives here, see scripts/lib/workspace.sh
+# Checkout-level shared build-watch state for --built dev mode: pid, log, and
+# the per-build status.json the engine reads. See scripts/lib/workspace.sh and
+# crates/lucidos-app/dev-build-watch.mjs
 .build-watch/
 .env
 
@@ -76,6 +77,11 @@ crates/lucidos-app/src/**/*.js
 # Playwright test artifacts
 test-results/
 playwright-report/
+
+# Context-mode eval results (ADR 0087). One JSONL per invocation, written by a
+# run that costs real money. It is local evidence, not source, and an agent
+# worktree that auto-commits its tree would otherwise carry one onto a branch.
+eval/context-mode/results/
 
 # Version files and stamps (build.rs manages these — gitignored so worktrees
 # don't create merge conflicts. Only exist in main working directory.)

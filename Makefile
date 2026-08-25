@@ -1,4 +1,4 @@
-.PHONY: build check lint lint-fmt lint-rust lint-rust-clippy lint-shell fix test clean run start stop restart status logs
+.PHONY: build check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix test test-eval test-full clean run start stop restart status logs
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -42,7 +42,7 @@ check: lint
 # Run every linter. THE clean-build lint gate, ordered cheapest first so a
 # finding surfaces immediately instead of after a full clippy pass: shell takes
 # under a second, the fmt check a few seconds, clippy minutes.
-lint: lint-shell lint-fmt lint-rust
+lint: lint-shell lint-eval lint-fmt lint-rust
 
 # Fail if any tracked Rust file is not rustfmt-clean.
 #
@@ -109,6 +109,12 @@ lint-rust-clippy:
 lint-shell:
 	./scripts/lint-shell.sh
 
+# I4 (ADR 0087 decision 15): the context-mode eval is a binary, never a test.
+# Cheap (a few greps), so it sits beside lint-shell rather than behind clippy.
+# The script's header is the authority on what it checks and why.
+lint-eval:
+	./scripts/check-eval-not-a-test.sh
+
 # Auto-fix linting issues
 fix:
 	cargo fix --allow-dirty --allow-staged
@@ -121,12 +127,24 @@ fmt:
 	cargo fmt --all
 
 # Run tests
-test:
+test: test-eval
 	./scripts/test-engine.sh
 
 # Full test suite
-test-full:
+test-full: test-eval
 	./scripts/test-engine.sh --full
+
+# The context-mode eval crate's own unit tests. Needs no Postgres and runs in
+# well under a second, so it goes first: a broken invariant should surface
+# before the engine suite's two minutes, not after.
+#
+# Running the eval crate under `cargo test` is safe BY CONSTRUCTION, and this
+# is not in tension with I4. `lint-eval` proves nothing a test can reach boots
+# a workspace, drives a thread, drops a database or calls a provider. Without
+# this line the crate's invariant tests would never run in the gate, which is
+# the same as not having written them.
+test-eval:
+	cargo test --locked -p lucidos-eval
 
 # Clean build artifacts (preserves workspace artifacts)
 #

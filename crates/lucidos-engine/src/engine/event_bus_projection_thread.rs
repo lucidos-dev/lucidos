@@ -908,6 +908,15 @@ impl EventBus {
                     // pending-review state is carried by coding_agent_proposed,
                     // not by `status = 'waiting'`.
                     //
+                    // `preserving_verdict` because a proposal is also one of the
+                    // dying turn's trailing events: an interrupted coding-agent
+                    // session commits and proposes on its way out, seconds after
+                    // the teardown abort. Without the wrap this arm walked that
+                    // abort's verdict to 'idle'. That is the same erasure
+                    // `CodingAgentIdled` and `SessionEnded` already guard
+                    // against, and the second half of
+                    // `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
+                    //
                     // `coding_agent_has_diff` is derived from the file list the
                     // event actually carries, not hardcoded TRUE: every ordinary
                     // proposal carries a non-empty list (unchanged), while
@@ -915,12 +924,13 @@ impl EventBus {
                     // one to record that the branch's diff cancelled out — and
                     // that must NOT light the thread's Diff button on a branch
                     // whose live `git diff` is empty.
-                    sqlx::query(
+                    sqlx::query(&format!(
                         "UPDATE thread_summaries SET coding_agent_proposed = TRUE, \
                          coding_agent_requires_restart = $2, coding_agent_has_diff = $3, \
-                         status = CASE WHEN status = 'running' THEN status ELSE 'idle' END \
+                         status = {} \
                          WHERE thread_id = $1",
-                    )
+                        preserving_verdict("CASE WHEN status = 'running' THEN status ELSE 'idle' END")
+                    ))
                     .bind(thread_id)
                     .bind(*requires_restart)
                     .bind(!files.is_empty())
@@ -1173,7 +1183,7 @@ impl EventBus {
             // rather than as finished. That has to hold on a drawer row whose
             // events were never loaded, and across a reload. The count is read
             // as `count > 0` by the frontend's `resolveVisualStatus`; the list
-            // is the whole content of the subscription indicator. No backend
+            // is the waiting indicator's subscriptions section. No backend
             // predicate consumes either, so a subscribed thread stays
             // non-blocking, non-attention-needing and archivable (ADR 0049).
             //
@@ -1445,10 +1455,11 @@ impl EventBus {
             // renderer/agentic loop consult this row without changing the
             // thread summary projection.
             | ThreadEvent::QueuedMessageRemoved { .. }
-            // Agent-driven dismissal of a prior tool result / child completion
-            // from future resume context. Pure resume-helper input; no
-            // projection state change.
+            // Agent-driven curation of a prior tool result / child completion
+            // in future resume context: the retired dismissal, and the record
+            // of a keep. Pure bookkeeping; no projection state change.
             | ThreadEvent::ContextDismissed { .. }
+            | ThreadEvent::ContextKeptOpen { .. }
             // Background bash lifecycle events. The paired ToolCalled /
             // ToolResult for the spawn already bumped last_activity. The
             // completion event fires asynchronously from a tokio watcher,
@@ -1464,10 +1475,18 @@ impl EventBus {
             // trigger a section transition (the MessageReceived already did
             // that one or more iterations earlier).
             | ThreadEvent::ImageDescribed { .. }
+            // The cached older-turn summary. Persisted so the next turn reads
+            // it instead of re-rolling. It says nothing about thread activity.
+            // Some paths write it before the turn's own starter event, so it
+            // must bump nothing.
+            | ThreadEvent::ConversationSummarized { .. }
             // Todo list snapshot from a `todo_write` tool call. The paired
             // `ToolCalled` / `ToolResult` already bumped last_activity; this
             // event exists for the sticky panel projection, not for routing.
             | ThreadEvent::TodoListWritten { .. }
+            // The model's working understanding, written in its own reply.
+            // Read back by the next turn, never routed on.
+            | ThreadEvent::WorkingUnderstandingWritten { .. }
             // Command-guard checkpoint lifecycle (ADR 0002, Phase 4). The
             // checkpoint is taken mid-turn, right before the command runs — the
             // paired ToolCalled already bumped last_activity and the thread is

@@ -670,6 +670,65 @@ describe('tool description from event', () => {
     expect(step.contextCapture?.estimated_total_tokens).toBe(69_000);
   });
 
+  it('an auxiliary capture leaves the turn its context chip', () => {
+    // A memory classification fires during turn setup and a title fires
+    // alongside it, both on this thread. Each is a ContextCaptured, and a
+    // capture binds to the step it follows. Unfiltered, the last one to land
+    // would overwrite the turn's chip with its own few hundred tokens.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'thinking' } as ThreadEvent, '2026-08-12T09:00:01Z');
+    handleEvent(map, 't', 3, {
+      type: 'ContextCaptured',
+      producer: 'main_llm',
+      model: 'claude-opus-5',
+      context_window: 1_000_000,
+      sections: [],
+      tools: [],
+      estimated_total_tokens: 69_000,
+    } as unknown as ThreadEvent, '2026-08-12T09:00:02Z');
+    for (const [seq, purpose] of [[4, 'memory'], [5, 'title']] as const) {
+      handleEvent(map, 't', seq, {
+        type: 'ContextCaptured',
+        producer: 'auxiliary',
+        purpose,
+        model: 'gemini-3-flash-preview',
+        context_window: 0,
+        sections: [],
+        tools: [],
+        estimated_total_tokens: 300,
+      } as unknown as ThreadEvent, '2026-08-12T09:00:03Z');
+    }
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const steps = exchangeSteps(exchanges[0]);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].contextCapture?.estimated_total_tokens).toBe(69_000);
+    expect(steps[0].contextCapture?.model).toBe('claude-opus-5');
+  });
+
+  it('a capture with no purpose is a turn, so legacy rows still bind', () => {
+    // Every row written before `purpose` existed omits it. Treating an absent
+    // value as auxiliary would strip the chip from the whole archive.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-08-12T09:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'thinking' } as ThreadEvent, '2026-08-12T09:00:01Z');
+    handleEvent(map, 't', 3, {
+      type: 'ContextCaptured',
+      producer: 'main_llm',
+      model: 'claude-opus-5',
+      context_window: 1_000_000,
+      sections: [],
+      tools: [],
+      estimated_total_tokens: 42_000,
+    } as unknown as ThreadEvent, '2026-08-12T09:00:02Z');
+
+    const steps = exchangeSteps(groupIntoExchanges(map.get('t')!.events)[0]);
+    expect(steps[0].contextCapture?.estimated_total_tokens).toBe(42_000);
+  });
+
   it('a second narrated pass opens its own row rather than reclaiming the first', () => {
     // The claim is scoped to the pass that opened the marker: once a call has
     // taken the row, it is no longer a `Thinking` row, so the next pass's call

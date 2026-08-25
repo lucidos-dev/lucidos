@@ -119,11 +119,7 @@ async fn ask_gateway(gateway_port: &str, id: &str, our_port: &str) -> Option<Str
     // Every give-up path in here says so. The route answers 200 with a null
     // label whatever happens, and the page only warns when the request itself
     // throws, so a line here is the ONLY place a broken hop is visible at all.
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
+    let client = match crate::gateway_auth::client_builder().build() {
         Ok(client) => client,
         Err(e) => {
             crate::log!(

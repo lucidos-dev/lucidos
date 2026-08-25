@@ -33,16 +33,21 @@ macro_rules! log {
     };
 }
 
+mod auth;
+mod auth_api;
 mod boot_failure;
 mod boot_phase;
 mod build_id;
 mod control;
 mod error;
+mod hook_socket;
 mod net_config;
 mod next_boot;
+mod pairing_qr;
 mod postgres;
 mod proxy;
 mod registry;
+mod release_check;
 mod server;
 mod stack;
 
@@ -66,7 +71,35 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// lazily).
 const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
-fn main() -> Result<(), BoxError> {
+/// The token a fatal boot stamps on stderr, and a contract rather than a log
+/// nicety. Under the packaged `.app` this stderr is
+/// `<app-data>/logs/engine-service.err.log`. The desktop client reads that file
+/// back to tell its startup splash why the background service keeps dying.
+/// `lucidos-app` cannot link this crate (ADR 0014 §1), so its own test greps
+/// this file for the token.
+pub const BOOT_FAILED_MARKER: &str = "[gateway] boot failed:";
+
+/// The stderr line a fatal boot writes. Pure, so the marker and the reason stay
+/// on one line that the client's parser can split.
+fn boot_failure_line(err: impl std::fmt::Display) -> String {
+    format!("{BOOT_FAILED_MARKER} {err}")
+}
+
+/// Report a fatal boot the way the packaged client can read, rather than as
+/// Rust's `Error: "…"` Debug form. That form quotes and escapes the message, so
+/// a path-bearing reason reached the log unreadable and reached the user not at
+/// all.
+fn main() -> std::process::ExitCode {
+    match boot() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", boot_failure_line(e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn boot() -> Result<(), BoxError> {
     // `--version` / `-V` before any heavy startup — machine-readable stdout, so
     // bare `println!` (no timestamp prefix) like the engine's `--version`.
     if std::env::args()
@@ -96,4 +129,25 @@ fn main() -> Result<(), BoxError> {
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()?;
     rt.block_on(server::run())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fatal_boot_is_one_line_the_client_can_split() {
+        let line = boot_failure_line(
+            "LUCIDOS_STATIC_DIR is set to /Resources/frontend but its index.html is missing",
+        );
+        assert_eq!(
+            line,
+            "[gateway] boot failed: LUCIDOS_STATIC_DIR is set to /Resources/frontend but its \
+             index.html is missing"
+        );
+        // No quoting, no escaping: the reason reads as itself. Rust's own
+        // `Error: "…"` form is what this replaced.
+        assert!(!line.contains('"'));
+        assert_eq!(line.lines().count(), 1);
+    }
 }

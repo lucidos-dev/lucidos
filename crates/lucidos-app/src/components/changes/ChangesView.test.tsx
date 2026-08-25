@@ -4,7 +4,7 @@ vi.mock('../../store/actions/threads', () => ({
   focusThreadOrBootstrap: vi.fn(),
 }));
 
-import { openChangeThread, applyBlockedReason, THREAD_ACTIVE_TIP } from './ChangesView';
+import { openChangeThread, applyBlockedReason, THREAD_UNSETTLED_TIP } from './ChangesView';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import type { Change } from '../../api/client';
 
@@ -56,7 +56,7 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
   });
 
   it('blocks Apply while the coding agent is still working', () => {
-    expect(applyBlockedReason(makeChange({ thread_active: true }))).toBe(THREAD_ACTIVE_TIP);
+    expect(applyBlockedReason(makeChange({ thread_unsettled: true }))).toBe(THREAD_UNSETTLED_TIP);
   });
 
   it('blocks Apply on a change reconciled to zero files, steering to Discard', () => {
@@ -70,7 +70,7 @@ describe('applyBlockedReason — the UI mirror of the server-side Apply gates', 
   it('reports the live thread first when a change is both empty and mid-turn', () => {
     // Wait-for-the-agent is the actionable instruction; the file count may
     // still change before it idles.
-    const reason = applyBlockedReason(makeChange({ file_count: 0, thread_active: true }));
-    expect(reason).toBe(THREAD_ACTIVE_TIP);
+    const reason = applyBlockedReason(makeChange({ file_count: 0, thread_unsettled: true }));
+    expect(reason).toBe(THREAD_UNSETTLED_TIP);
   });
 });

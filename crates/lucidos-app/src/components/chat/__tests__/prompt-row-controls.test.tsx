@@ -3,7 +3,7 @@
  *
  *  A coding-agent thread arms *event waits* through `lucidos await-event` just
  *  as the Lucidos Agent arms them through the tool, and the whole
- *  `e2e-lock-wait` skill exists to make it do so. The *subscription indicator*
+ *  `e2e-lock-wait` skill exists to make it do so. The *waiting indicator*
  *  used to be mounted inside the Lucidos arm of this branch, so such a thread
  *  showed the **Waiting** dot with nothing anywhere naming what it watched and
  *  no **Stop waiting** button. These tests pin the mount, from both sides:
@@ -13,7 +13,7 @@ import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
 import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
-import { EventWaitIndicator } from '../EventWaitPanel';
+import { WaitingIndicator } from '../WaitingPanel';
 import { LucidosControlMenu } from '../LucidosControlMenu';
 import { PromptRowControls } from '../PromptRowControls';
 import { TodoListIndicator } from '../TodoListPanel';
@@ -55,12 +55,12 @@ describe('PromptRowControls', () => {
   it.each<['a Claude Code thread' | 'a Codex thread', 'claude-code' | 'codex']>([
     ['a Claude Code thread', 'claude-code'],
     ['a Codex thread', 'codex'],
-  ])('mounts the subscription indicator on %s', (_label, agent) => {
-    expect(cluster(agent)).toContain(EventWaitIndicator);
+  ])('mounts the waiting indicator on %s', (_label, agent) => {
+    expect(cluster(agent)).toContain(WaitingIndicator);
   });
 
-  it('mounts the subscription indicator on a Lucidos Agent thread', () => {
-    expect(cluster(null)).toContain(EventWaitIndicator);
+  it('mounts the waiting indicator on a Lucidos Agent thread', () => {
+    expect(cluster(null)).toContain(WaitingIndicator);
   });
 
   /** The branch exists for the controls that genuinely belong to one backend.
@@ -94,10 +94,10 @@ describe('PromptRowControls', () => {
    *  `<button>` this walk can see. */
   it('pins the menu and the follow toggle, and floats the indicators behind them', () => {
     expect(cluster(null)).toEqual([
-      LucidosControlMenu, FollowLiveEdgeIcon, TodoListIndicator, EventWaitIndicator,
+      LucidosControlMenu, FollowLiveEdgeIcon, TodoListIndicator, WaitingIndicator,
     ]);
     expect(cluster('claude-code')).toEqual([
-      CodingAgentControlMenu, FollowLiveEdgeIcon, EventWaitIndicator,
+      CodingAgentControlMenu, FollowLiveEdgeIcon, WaitingIndicator,
     ]);
   });
 });

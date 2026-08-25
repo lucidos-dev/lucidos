@@ -22,7 +22,7 @@
  * cell with ellipsis so its length can never reshape the row.
  */
 
-import { useSignal } from '@preact/signals';
+import { useSignal, useComputed } from '@preact/signals';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -47,6 +47,7 @@ import {
   rememberLastWorkspaceCount,
   recallLastWorkspaceCount,
 } from '../../utils/lastWorkspace';
+import { isPairingShellDocument } from '../../utils/pairingShell';
 import {
   listWorkspaces,
   createWorkspace,
@@ -63,6 +64,8 @@ import {
   reloadGateway,
   getGatewayNetworkConfig,
   setGatewayNetworkConfig,
+  requestUpdateCheck,
+  setReleaseCheckConfig,
   type WorkspaceStatus,
   type GwRestoreStatus,
   type GatewayStatus,
@@ -306,6 +309,12 @@ export function WorkspacePicker() {
   // available" badge. Null until the first poll lands (legacy non-gateway mode
   // never resolves it, so the control stays hidden).
   const gatewayStatus = useSignal<GatewayStatus | null>(null);
+  // Show the release check's first-run notice while this install could poll and
+  // has not been told yet. An older gateway omits the field, so nothing shows.
+  const updateNotice = useComputed(() => {
+    const check = gatewayStatus.value?.release_check;
+    return !!check?.supported && !check.notice_acknowledged;
+  });
   const reloading = useSignal(false);
   // Confirm step before re-execing the gateway (the reload re-execs the running
   // process). Anchored to the header reload icon.
@@ -344,9 +353,15 @@ export function WorkspacePicker() {
   // stays reachable for switching. Shows a brief "Opening…" splash while we
   // confirm the remembered workspace still exists; if it's gone we forget it and
   // fall through to the picker.
+  // The pairing screen is this same document (utils/pairingShell.ts), so every
+  // workspace it could open answers with the pairing screen again. The inline
+  // fast path stands down there first, and this is the slower route to the same
+  // navigation: `PairingGate` fails OPEN when its session probe fails, which
+  // renders the picker on a document that is still unpaired.
   const autoOpening = useSignal(
     typeof window !== 'undefined' &&
       !new URLSearchParams(window.location.search).has('pick') &&
+      !isPairingShellDocument() &&
       recallLastWorkspace() !== null,
   );
 
@@ -378,6 +393,19 @@ export function WorkspacePicker() {
     // After a reload, the running gateway IS the on-disk binary, so the update
     // clears — that's our signal the new image is up; drop the "Reloading…" state.
     if (reloading.value && !status.update_available) reloading.value = false;
+  }
+
+  /** Answer the release check's first-run notice, and start checking if the
+   *  user said yes. Writing the acknowledgement is what opens the gate: the
+   *  gateway makes no request at all before it. */
+  async function answerUpdateNotice(enabled: boolean): Promise<void> {
+    try {
+      await setReleaseCheckConfig({ enabled, notice_acknowledged: true });
+      await fetchGatewayStatus();
+      if (enabled) await requestUpdateCheck();
+    } catch (e) {
+      error.value = `Couldn't save the update-check setting: ${String(e)}`;
+    }
   }
 
   // Initial load + user-initiated actions: a failure surfaces the error screen.
@@ -503,6 +531,16 @@ export function WorkspacePicker() {
     workspaces.value = { status: 'loading' };
     void (async () => {
       await refresh();
+      // The release check's notice must be answered before anything is sent, so
+      // an install that skips straight past the picker would leave it gated
+      // forever. That is every EXISTING install: it remembers a workspace, so
+      // this is the one screen it never renders. Awaiting the status costs a
+      // warm loopback hop behind the splash, and only on the smart root.
+      await fetchGatewayStatus().catch(() => { /* no notice until the poll lands */ });
+      if (updateNotice.value) {
+        autoOpening.value = false;
+        return;
+      }
       if (!autoOpening.value) return;
       const list = workspaces.value;
       const remembered = recallLastWorkspace();
@@ -884,6 +922,34 @@ export function WorkspacePicker() {
         </header>
 
         {error.value && <div class="ws-picker-error">{error.value}</div>}
+
+        {/* The update check tells the user before it asks anything (ADR 0108).
+            Nothing leaves the machine until one of these two is clicked, so a
+            notice nobody answers means a check that never runs. */}
+        {updateNotice.value && (
+          <div class="ws-picker-notice">
+            <p class="ws-picker-notice-text">
+              Lucidos checks <code>lucidos.dev</code> once an hour for a newer version.
+              It sends your platform, your architecture and the version you run, plus
+              your IP address as any web request does. Nothing else, and nothing
+              installs itself.
+            </p>
+            <div class="ws-picker-notice-actions">
+              <button
+                class="ws-picker-btn ws-picker-btn-confirm"
+                onClick={() => { void answerUpdateNotice(true); }}
+              >
+                Got it
+              </button>
+              <button
+                class="ws-picker-btn"
+                onClick={() => { void answerUpdateNotice(false); }}
+              >
+                Turn it off
+              </button>
+            </div>
+          </div>
+        )}
 
         {v.status === 'failed' && (
           <div class="ws-picker-error">Failed to load workspaces: {v.error}</div>

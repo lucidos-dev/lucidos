@@ -34,7 +34,10 @@ impl OpenAiProvider {
 
                     for block in blocks {
                         match block {
-                            ContentBlock::Text { text } => {
+                            // A tail block is ordinary text here. Only the
+                            // engine and the Anthropic cache anchor care who
+                            // wrote it.
+                            ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
                                 text_parts.push(text.clone());
                             }
                             ContentBlock::Image {
@@ -217,6 +220,8 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        // Bytes of a character the transport split across two chunks.
+        let mut carry: Vec<u8> = Vec::new();
         let mut content = String::new();
         let mut tool_call_map: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
@@ -236,7 +241,7 @@ impl OpenAiProvider {
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            crate::llm::push_utf8_chunk(&mut carry, &chunk, &mut buffer);
 
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -287,11 +292,7 @@ impl OpenAiProvider {
         let data: serde_json::Value = serde_json::from_str(data_str)?;
 
         if let Some(error) = data.get("error") {
-            let error_msg = error["message"]
-                .as_str()
-                .unwrap_or("Unknown streaming error");
-            let error_type = error["type"].as_str().unwrap_or("unknown");
-            return Err(format!("OpenAI streaming error [{}]: {}", error_type, error_msg).into());
+            return Err(format_stream_error(error).into());
         }
 
         // Top-level usage object (final include_usage chunk has choices: []).
@@ -426,6 +427,97 @@ impl OpenAiProvider {
     }
 }
 
+/// Longest provider detail we append. The whole string lands in a
+/// `ResponseFailed` payload the UI renders, so an unbounded provider blob
+/// would be unreadable there.
+const PROVIDER_DETAIL_MAX: usize = 300;
+
+/// Render one Chat Completions SSE error frame as a single readable line.
+///
+/// This builder serves OpenRouter and local servers as well as OpenAI, and
+/// they disagree about which field names the failure. OpenAI sends `type`;
+/// OpenRouter sends `code` plus a `metadata` object and no `type` at all. A
+/// `type`-only reader therefore labelled EVERY OpenRouter failure `unknown`
+/// and dropped the one field saying why. The Responses path already falls
+/// back to `code`, so this is the two paths agreeing rather than a new rule.
+fn format_stream_error(error: &serde_json::Value) -> String {
+    let label = scalar_label(error.get("type"))
+        .or_else(|| scalar_label(error.get("code")))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // A local OpenAI-compatible server often sends `{"error": "..."}` with no
+    // object around it. Reading only `error.message` there discarded the only
+    // text the frame had and reported "Unknown streaming error".
+    let message = error
+        .as_str()
+        .or_else(|| error.get("message").and_then(|m| m.as_str()))
+        .filter(|m| !m.is_empty())
+        .unwrap_or("Unknown streaming error");
+
+    match provider_detail(error.get("metadata")) {
+        Some(detail) => format!("OpenAI streaming error [{label}]: {message} ({detail})"),
+        None => format!("OpenAI streaming error [{label}]: {message}"),
+    }
+}
+
+/// A JSON scalar as a bare label: `429`, never `"429"`. `None` for absent,
+/// null, empty, or a container, so the caller can fall through to the next
+/// candidate field.
+fn scalar_label(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// The upstream cause OpenRouter tucks into `metadata`, as one bounded line.
+/// `raw` holds the provider's own error body, which is what explains a
+/// message as bare as "ERROR"; `provider_name` says who produced it.
+fn provider_detail(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let metadata = metadata?.as_object()?;
+    let provider = metadata
+        .get("provider_name")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty());
+    let raw = metadata.get("raw").and_then(collapse_to_one_line);
+
+    let detail = match (provider, raw) {
+        (Some(p), Some(r)) => format!("{p}: {r}"),
+        (Some(p), None) => p.to_string(),
+        (None, Some(r)) => r,
+        (None, None) => return None,
+    };
+    Some(truncate_detail(detail))
+}
+
+/// Flatten a `raw` value to one whitespace-normalised line. Providers send it
+/// as a string or as a nested object, and either can carry the newlines that
+/// would break the single-line error.
+///
+/// `None` for a null or empty `raw`. A present-but-null one is what a provider
+/// sends when it failed with no body, and rendering it appended a literal
+/// "(null)" to the error.
+fn collapse_to_one_line(value: &serde_json::Value) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let text = match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+fn truncate_detail(mut detail: String) -> String {
+    if detail.len() > PROVIDER_DETAIL_MAX {
+        detail.truncate(detail.floor_char_boundary(PROVIDER_DETAIL_MAX));
+        detail.push('…');
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +563,8 @@ mod tests {
 
         assert_eq!(content, "hi");
         assert_eq!(meta.stop_reason.as_deref(), Some("stop"));
+        // 42 processed, 12 of them a cache read. The two overlap, because a
+        // stored `input_tokens` is the whole prompt the model read.
         assert_eq!(meta.input_tokens, Some(42));
         assert_eq!(meta.output_tokens, Some(7));
         assert_eq!(meta.cache_read_tokens, Some(12));
@@ -483,6 +577,62 @@ mod tests {
         assert_eq!(resp.cache_read_tokens, Some(12));
         // OpenAI doesn't separate cache writes from reads, so this stays None.
         assert_eq!(resp.cache_creation_tokens, None);
+    }
+
+    /// The overlap, on its own, so it is not buried in a stream test. The
+    /// cached subset is recorded beside the prompt total, never out of it. That
+    /// is what makes the stored figure the size of the whole prompt.
+    #[test]
+    fn a_cached_prefix_overlaps_the_prompt_total_rather_than_reducing_it() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":12}}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, Some(12));
+    }
+
+    /// A prompt that read no cache leaves the count unset, so "read nothing"
+    /// stays distinct from "this server reports no cached count at all".
+    #[test]
+    fn a_prompt_with_no_cache_reports_no_cache_read() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":0}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, None);
+    }
+
+    /// More cached than prompt is a corrupt block. The wire records what
+    /// arrived rather than repairing it, and the one consumer that subtracts
+    /// saturates there instead.
+    #[test]
+    fn a_cached_count_over_the_prompt_total_is_recorded_as_reported() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":99}}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(10));
+        assert_eq!(meta.cache_read_tokens, Some(99));
     }
 
     /// Empty content with `finish_reason=length` is the truncation case. We
@@ -515,6 +665,286 @@ mod tests {
         assert_eq!(resp.stop_reason.as_deref(), Some("length"));
         assert_eq!(resp.input_tokens, Some(16000));
         assert_eq!(resp.output_tokens, Some(0));
+    }
+
+    /// The incident this guard exists for: `finish_reason: stop`, no content,
+    /// no tool call, and no usage chunk at all. `include_usage` is
+    /// unconditional, so a compliant server always closes with usage. Its
+    /// absence means the terminal frame never arrived, which is ADR 0089's
+    /// truncation reached by a different signal than Claude's missing
+    /// `message_delta`. Without this the turn reached
+    /// `classify_empty_completion` as a clean stop with `output_tokens`
+    /// defaulted to 0, graded benign, and the thread ended Idle in silence.
+    #[test]
+    fn a_clean_stop_that_reported_no_usage_at_all_is_a_truncation() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+
+        assert_eq!(meta.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(meta.input_tokens, None, "no usage chunk arrived");
+
+        let err = OpenAiProvider::build_llm_response(content, tools, meta)
+            .expect_err("a usage-less empty stream must not build a response")
+            .to_string();
+        // The literal `is_transient_error` matches on, which is what routes
+        // this into the retry loop rather than failing the turn.
+        assert!(err.contains("stream truncated"), "wording: {err}");
+        assert!(crate::llm::is_retryable_error(&err), "wording: {err}");
+    }
+
+    /// A stream that already streamed text stays a success even with no usage
+    /// chunk. The token callback has rendered that text to the frontend, so a
+    /// retry would render the answer twice. That is the alternative ADR 0089
+    /// rejected outright.
+    #[test]
+    fn a_stream_that_rendered_text_is_never_a_truncation() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{"content":"partial answer"},"finish_reason":"stop"}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
+        assert_eq!(resp.content.as_deref(), Some("partial answer"));
+        assert_eq!(resp.input_tokens, None);
+    }
+
+    /// A stream that produced a tool call stays a success even with no usage
+    /// chunk. Retrying would run the tool a second time, and a side-effecting
+    /// tool cannot be replayed for free.
+    #[test]
+    fn a_stream_that_produced_a_tool_call_is_never_a_truncation() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.input_tokens, None);
+    }
+
+    /// A server that reports only one half of the token pair is odd, not
+    /// truncated. Either count proves the terminal frame arrived, so this must
+    /// not retry every silent turn such a server produces.
+    #[test]
+    fn a_partial_usage_block_still_proves_the_stream_completed() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"completion_tokens":0}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+
+        assert_eq!(meta.input_tokens, None, "this server omits prompt_tokens");
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
+        assert_eq!(resp.content, None);
+        assert_eq!(resp.output_tokens, Some(0));
+    }
+
+    /// The case ADR 0009 protects: the model finished cleanly and chose to say
+    /// nothing. The usage chunk arrived, so the stream completed. This stays a
+    /// benign empty completion and must not be dragged into a retry.
+    #[test]
+    fn an_empty_turn_that_reported_usage_stays_a_benign_completion() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+        OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":0,"total_tokens":900}}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .unwrap();
+
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
+        assert_eq!(resp.content, None);
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.input_tokens, Some(900));
+        assert_eq!(resp.output_tokens, Some(0));
+    }
+
+    /// Feed one SSE error frame through the chunk parser and return the
+    /// message it fails with. Every error-frame test goes through the real
+    /// entry point rather than calling the formatter directly.
+    fn stream_error_for(frame: &str) -> String {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_chat_chunk(frame, &mut content, &mut tools, &mut meta)
+            .expect_err("an error frame must fail the chunk")
+            .to_string()
+    }
+
+    /// OpenRouter sends `code` and `metadata` and no `type`, so a
+    /// `type`-only reader called every one of its failures `[unknown]` and
+    /// threw away the upstream text. Label from `code`, and name the
+    /// provider that actually produced the error.
+    #[test]
+    fn an_openrouter_error_frame_labels_the_code_and_names_the_provider() {
+        let msg = stream_error_for(
+            r#"{"error":{"code":429,"message":"Provider returned error",
+                "metadata":{"provider_name":"Chutes","raw":"rate limit exceeded"}}}"#,
+        );
+        assert_eq!(
+            msg,
+            "OpenAI streaming error [429]: Provider returned error \
+             (Chutes: rate limit exceeded)"
+        );
+    }
+
+    /// The frame that ended the diagnosed turn: a bare message, no `type`
+    /// and no `code`. It still reads `[unknown]`, because there is genuinely
+    /// nothing else in the frame to say.
+    #[test]
+    fn an_error_frame_with_no_type_and_no_code_stays_unknown() {
+        assert_eq!(
+            stream_error_for(r#"{"error":{"message":"ERROR"}}"#),
+            "OpenAI streaming error [unknown]: ERROR"
+        );
+    }
+
+    /// Regression: OpenAI's own frames carry `type`, which still wins over
+    /// `code` when both are present.
+    #[test]
+    fn an_openai_error_frame_still_labels_the_type() {
+        assert_eq!(
+            stream_error_for(
+                r#"{"error":{"type":"server_error","code":"internal",
+                    "message":"upstream failed"}}"#
+            ),
+            "OpenAI streaming error [server_error]: upstream failed"
+        );
+    }
+
+    /// A provider can put its whole error body in `raw`, newlines and all.
+    /// The line stays one line and stays bounded, because this string is
+    /// persisted in a `ResponseFailed` payload and rendered in the UI.
+    #[test]
+    fn a_long_multiline_provider_detail_is_flattened_and_bounded() {
+        let raw = format!("upstream said:\n{}", "x".repeat(1000));
+        let frame = serde_json::json!({
+            "error": {
+                "code": 502,
+                "message": "Provider returned error",
+                "metadata": { "provider_name": "Chutes", "raw": raw },
+            }
+        })
+        .to_string();
+
+        let msg = stream_error_for(&frame);
+        assert!(!msg.contains('\n'), "must stay one line: {msg}");
+        assert!(msg.ends_with("…)"), "must be marked as truncated: {msg}");
+        assert!(msg.len() < 400, "must stay bounded, got {}", msg.len());
+        assert!(msg.starts_with("OpenAI streaming error [502]: Provider returned error (Chutes: "));
+    }
+
+    /// An error frame carrying nothing usable must still fail the stream,
+    /// rather than being read as an ordinary empty chunk.
+    #[test]
+    fn an_empty_error_object_still_fails_the_stream() {
+        assert_eq!(
+            stream_error_for(r#"{"error":{}}"#),
+            "OpenAI streaming error [unknown]: Unknown streaming error"
+        );
+    }
+
+    /// A local OpenAI-compatible server often sends the error as a bare
+    /// string. Reading only `error.message` threw away the only text the
+    /// frame carried.
+    #[test]
+    fn a_bare_string_error_keeps_its_text() {
+        assert_eq!(
+            stream_error_for(r#"{"error":"context window exceeded"}"#),
+            "OpenAI streaming error [unknown]: context window exceeded"
+        );
+    }
+
+    /// A provider that failed with no body sends `raw: null`. Rendering that
+    /// appended a literal "(null)" to an otherwise clean error.
+    #[test]
+    fn a_null_provider_body_appends_nothing() {
+        assert_eq!(
+            stream_error_for(
+                r#"{"error":{"code":502,"message":"Provider returned error",
+                    "metadata":{"provider_name":"Chutes","raw":null}}}"#
+            ),
+            "OpenAI streaming error [502]: Provider returned error (Chutes)"
+        );
+    }
+
+    /// Deliberate consequence of carrying `code`: the retry classifier reads
+    /// the formatted string, so a transient upstream status now reaches it.
+    /// Before, every OpenRouter frame read `[unknown]` and no retry fired.
+    /// A genuine client error still must not retry.
+    #[test]
+    fn a_transient_upstream_status_now_reaches_the_retry_classifier() {
+        let transient =
+            stream_error_for(r#"{"error":{"code":502,"message":"Provider returned error"}}"#);
+        assert!(
+            crate::llm::is_retryable_error(&transient),
+            "502 must retry: {transient}"
+        );
+
+        let client_error = stream_error_for(
+            r#"{"error":{"code":400,"message":"invalid request: bad tool schema"}}"#,
+        );
+        assert!(
+            !crate::llm::is_retryable_error(&client_error),
+            "400 must not retry: {client_error}"
+        );
     }
 
     /// Regression: after a tool call the agentic loop packs the ToolResult and

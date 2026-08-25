@@ -29,6 +29,19 @@ pub struct CcMenuOption {
     /// Claude Code and universally supported Codex options leave it absent.
     #[serde(default)]
     pub supported_models: Option<Vec<String>>,
+    /// The window a session on this model actually runs under, in tokens.
+    ///
+    /// Absent on almost every row, because it is an OVERRIDE of what
+    /// `llm::model_registry::context_window_for` infers from the id. Declare it
+    /// only where the backend's window differs, and read it through
+    /// [`crate::runtime::coding_agent_context_window`].
+    ///
+    /// The two answers differ because they describe different requests. The
+    /// registry describes the one LUCIDOS makes, where 1M mode is gated on our
+    /// own `[1m]` suffix. A coding agent makes its own request and picks its
+    /// own context mode, so nothing here bounds a prompt the engine packs.
+    #[serde(default)]
+    pub context_window: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -90,22 +103,66 @@ pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
 mod parse;
 pub use parse::{parse_line, CcStreamState};
 
+/// The reasoning tiers `model` is offered, read out of the effort rows.
+///
+/// An effort with no `supported_models` is universal; one that names models is
+/// offered only to those. The `default` row matches nothing by name, so it
+/// takes the universal set. That is the right answer for a model the backend
+/// has not resolved yet.
+pub(super) fn efforts_for_model(model: &str, efforts: &[CcMenuOption]) -> Vec<String> {
+    efforts
+        .iter()
+        .filter(|e| {
+            e.supported_models
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|m| m == model))
+        })
+        .map(|e| e.value.clone())
+        .collect()
+}
+
+/// Render one backend's `set_model` and `set_reasoning_effort` option lists.
+///
+/// The JSON files keep the hand-maintained effort-to-models shape, because that
+/// is how upstream announces a tier: one line naming the models that accept it.
+/// The wire carries the transpose, `reasoning_efforts` per MODEL row, matching
+/// what `GET /api/v1/models` serves for the Lucidos Agent. One picker rule then
+/// covers both surfaces: ask the model row what it offers.
+pub(super) fn model_and_effort_options(
+    models: &[CcMenuOption],
+    efforts: &[CcMenuOption],
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let model_options = models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "value": m.value,
+                "label": m.label,
+                "description": m.description,
+                "reasoning_efforts": efforts_for_model(&m.value, efforts),
+            })
+        })
+        .collect();
+    // No `supported_models` on the wire: the model rows now carry the same
+    // information in the shape the picker reads.
+    let effort_options = efforts
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "value": e.value,
+                "label": e.label,
+                "description": e.description,
+            })
+        })
+        .collect();
+    (model_options, effort_options)
+}
+
 /// Render the menu of supported control commands for the frontend's `/model`
 /// picker. CC-specific — Codex and other agents have their own menus.
 pub fn cc_command_definitions() -> serde_json::Value {
-    fn options_to_json(opts: &[CcMenuOption]) -> Vec<serde_json::Value> {
-        opts.iter()
-            .map(|m| {
-                serde_json::json!({
-                    "value": m.value,
-                    "label": m.label,
-                    "description": m.description,
-                })
-            })
-            .collect()
-    }
-    let model_options = options_to_json(cc_model_options());
-    let effort_options = options_to_json(cc_reasoning_effort_options());
+    let (model_options, effort_options) =
+        model_and_effort_options(cc_model_options(), cc_reasoning_effort_options());
     serde_json::json!([
         {
             "subtype": "set_model",

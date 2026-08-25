@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use super::PinnedAppStore;
+use super::{DevicePresenceStore, PinnedAppStore};
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
@@ -14,6 +14,22 @@ pub struct Device {
     pub push_enabled: bool,
     pub last_seen_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+/// What a hand-over did, so the caller can answer without guessing.
+///
+/// `AlreadyDone` and `NoSuchDevice` are both ordinary outcomes rather than
+/// errors. A client retries the call on a later load, and by then the first
+/// attempt has usually landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandOver {
+    /// Every row moved from the old id to the new one.
+    Moved,
+    /// The new id already has a row, so there is nothing to move onto it.
+    AlreadyDone,
+    /// The old id has no row. Nothing to hand over.
+    NoSuchDevice,
 }
 
 /// The registry of devices that have connected to this workspace.
@@ -336,6 +352,108 @@ impl DeviceStore {
         Ok(removed)
     }
 
+    /// Move every trace of `old_id` onto `new_id`, and announce the result.
+    ///
+    /// The one migration path off the `localStorage` device id. A browser now
+    /// takes its id from the *workspace gateway*. Without this it arrives as a
+    /// new device and loses its push subscription and its preferences. It knows
+    /// both ids for one page load, which is the window this uses. Rationale in
+    /// `docs/plans/2026-08-22-one-device-identity-minted-at-the-gateway.md`.
+    ///
+    /// Order is load-bearing. `push_subscriptions.device_id` is a foreign key
+    /// onto `devices(id)` with no `ON UPDATE CASCADE`, so the parent key cannot
+    /// be renamed in place. Copy the row forward, repoint the children, drop
+    /// the old row last.
+    ///
+    /// `push_log` is left alone: it records what was sent to which id at the
+    /// time, so it is history, like an event payload.
+    pub async fn hand_over(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        old_id: &str,
+        new_id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<HandOver, Box<dyn std::error::Error + Send + Sync>> {
+        if old_id == new_id {
+            return Ok(HandOver::AlreadyDone);
+        }
+        let mut tx = pool.begin().await?;
+
+        // This check is a fast path, NOT the guarantee. Under READ COMMITTED a
+        // `SELECT EXISTS` takes no lock on a row that is not there. So a
+        // concurrent `register(new_id)` can still commit before the insert
+        // below. What actually holds is the `devices` primary key: the insert
+        // blocks, then fails, and the transaction aborts to a 500 the client
+        // retries on its next load.
+        let new_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM devices WHERE id = $1)")
+                .bind(new_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if new_exists {
+            return Ok(HandOver::AlreadyDone);
+        }
+        let copied = sqlx::query(
+            "INSERT INTO devices (id, name, user_agent, push_enabled, last_seen_at, created_at)
+             SELECT $2, name, user_agent, push_enabled, last_seen_at, created_at
+             FROM devices WHERE id = $1",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
+        if copied.rows_affected() == 0 {
+            return Ok(HandOver::NoSuchDevice);
+        }
+
+        // `preferences` carries no foreign key, so a client that wrote one
+        // before registering can leave rows under an id with no device. They
+        // belong to a device that does not exist, so they are cleared rather
+        // than merged: `(key, COALESCE(device_id, ''))` would collide.
+        sqlx::query("DELETE FROM preferences WHERE device_id = $1")
+            .bind(new_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE preferences SET device_id = $2 WHERE device_id = $1")
+            .bind(old_id)
+            .bind(new_id)
+            .execute(&mut *tx)
+            .await?;
+        // Its foreign key is why the parent row was copied first: there can be
+        // no orphan here to clear.
+        sqlx::query("UPDATE push_subscriptions SET device_id = $2 WHERE device_id = $1")
+            .bind(old_id)
+            .bind(new_id)
+            .execute(&mut *tx)
+            .await?;
+        // Through their owning stores, matching what `delete_row` does with its
+        // own cascade. `core::announced_surfaces` is the reason: this module owns
+        // neither table. A module writing another's table behind its back is
+        // exactly what that registry exists to refuse.
+        PinnedAppStore::move_device(&mut tx, old_id, new_id).await?;
+        DevicePresenceStore::move_device(&mut tx, old_id, new_id).await?;
+
+        sqlx::query("DELETE FROM devices WHERE id = $1")
+            .bind(old_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        // One event for the whole move, matching `delete`'s cascade rule. The
+        // per-row changes describe a device no client tracks any more.
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::DeviceHandedOver {
+                    old_device_id: old_id.to_string(),
+                    device_id: new_id.to_string(),
+                    actor,
+                }),
+                "[Devices] DeviceHandedOver",
+            )
+            .await;
+        Ok(HandOver::Moved)
+    }
+
     /// List IDs of currently push-enabled devices whose `last_seen_at` is
     /// older than `cutoff_days` days. Used by the daily prune to flip them
     /// to `push_enabled = false`, stopping push fan-out to phantom
@@ -572,6 +690,220 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unpinned, 0, "the cascade rides under DeviceDeleted");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Seed one row in every table the hand-over must move. A table added to
+    /// the schema and forgotten here shows up as a surviving old-id row.
+    async fn seed_device_state(pool: &PgPool, bus: &EventBus, id: &str) {
+        DeviceStore::register(pool, bus, id, Some("UA"), None)
+            .await
+            .unwrap();
+        DeviceStore::set_push_enabled(pool, bus, id, true, None)
+            .await
+            .unwrap();
+        DeviceStore::rename(pool, bus, id, Some("My iPhone"), None)
+            .await
+            .unwrap();
+        PinnedAppStore::pin(pool, bus, "habit-tracker", "main", id, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '1.25', $1)",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO push_subscriptions (endpoint, p256dh, auth, device_id)
+             VALUES ('https://push.example/sub', 'k', 'a', $1)",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO device_presence (device_id) VALUES ($1)")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn rows_for(pool: &PgPool, table: &str, id: &str) -> i64 {
+        let column = if table == "devices" {
+            "id"
+        } else {
+            "device_id"
+        };
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE {column} = $1"))
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    const HAND_OVER_TABLES: &[&str] = &[
+        "devices",
+        "preferences",
+        "pinned_apps",
+        "device_presence",
+        "push_subscriptions",
+    ];
+
+    /// The whole point of the migration: a browser that changed id keeps its
+    /// push subscription, its name and its device-scoped preferences.
+    #[tokio::test]
+    async fn hand_over_moves_every_table_and_leaves_nothing_behind() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "old").await;
+
+        let outcome = DeviceStore::hand_over(&pool, &bus, "old", "new", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HandOver::Moved);
+
+        for table in HAND_OVER_TABLES {
+            assert_eq!(
+                rows_for(&pool, table, "new").await,
+                1,
+                "{table} must carry the new id"
+            );
+            assert_eq!(
+                rows_for(&pool, table, "old").await,
+                0,
+                "{table} must keep nothing under the old id"
+            );
+        }
+        let device: Device = sqlx::query_as("SELECT * FROM devices WHERE id = 'new'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(device.name.as_deref(), Some("My iPhone"));
+        assert!(device.push_enabled, "the push flag rides across");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// One event for the whole move, matching the `DeviceDeleted` cascade rule.
+    #[tokio::test]
+    async fn hand_over_announces_once() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "old").await;
+
+        DeviceStore::hand_over(&pool, &bus, "old", "new", None)
+            .await
+            .unwrap();
+
+        let announced: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'DeviceHandedOver'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(announced, 1);
+        let registered: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'DeviceRegistered'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            registered, 1,
+            "the copied row is a move, not a second registration"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Replaying the claim must not move a second device onto the same id. The
+    /// client retries on a later load, so this is an ordinary path.
+    #[tokio::test]
+    async fn hand_over_refuses_once_the_new_id_has_a_row() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "old").await;
+        DeviceStore::register(&pool, &bus, "new", Some("UA"), None)
+            .await
+            .unwrap();
+
+        let outcome = DeviceStore::hand_over(&pool, &bus, "old", "new", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HandOver::AlreadyDone);
+        assert_eq!(
+            rows_for(&pool, "devices", "old").await,
+            1,
+            "a refused hand-over changes nothing"
+        );
+        assert_eq!(rows_for(&pool, "push_subscriptions", "old").await, 1);
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn hand_over_reports_an_unknown_old_id_rather_than_failing() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        let outcome = DeviceStore::hand_over(&pool, &bus, "never-existed", "new", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HandOver::NoSuchDevice);
+        assert_eq!(
+            rows_for(&pool, "devices", "new").await,
+            0,
+            "nothing is conjured for a claim with no source"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// An orphan preference under the target id would collide with the
+    /// `(key, COALESCE(device_id, ''))` unique index, aborting the whole move.
+    /// It belongs to a device that does not exist, so it is cleared.
+    #[tokio::test]
+    async fn hand_over_clears_orphan_rows_sitting_under_the_new_id() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "old").await;
+        sqlx::query(
+            "INSERT INTO preferences (key, value, device_id) VALUES ('ui_scale', '0.75', 'new')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = DeviceStore::hand_over(&pool, &bus, "old", "new", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HandOver::Moved);
+        let value: String = sqlx::query_scalar(
+            "SELECT value FROM preferences WHERE key = 'ui_scale' AND device_id = 'new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            value, "1.25",
+            "the real device's value wins over the orphan"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn hand_over_to_the_same_id_is_a_no_op() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        seed_device_state(&pool, &bus, "same").await;
+
+        let outcome = DeviceStore::hand_over(&pool, &bus, "same", "same", None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, HandOver::AlreadyDone);
+        assert_eq!(rows_for(&pool, "devices", "same").await, 1);
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

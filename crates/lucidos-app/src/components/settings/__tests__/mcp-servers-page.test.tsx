@@ -449,3 +449,33 @@ describe('every figure comes from the API', () => {
     }
   });
 });
+
+describe('an SSE reload never reverts a switch flipped under it', () => {
+  // The page's write races live inside the component, so this is a source
+  // scan rather than a render. What it pins is the pairing: the SSE-driven
+  // reload reads `localWrites` before it starts and drops its reply if the
+  // counter moved, and BOTH local write paths move it. Drop either half and a
+  // reload fired by the user's own flip reverts the next one (`18874e1da`).
+  const here = dirname(fileURLToPath(import.meta.url));
+  const src: string = readFileSync(resolve(here, '../McpServersPage.tsx'), 'utf8');
+
+  it('drops an SSE reload whose reply predates a local write', () => {
+    expect(src).toMatch(/const startedAt = localWrites\.current;/);
+    expect(src).toMatch(/refresh\(\(\) => localWrites\.current === startedAt\)/);
+  });
+
+  it('bumps the counter on the optimistic tool flip', () => {
+    // Before the optimistic paint, so a reload started after it sees the move.
+    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*showData\(patchToolDisabled\(/);
+  });
+
+  it('bumps the counter on a row verb', () => {
+    expect(src).toMatch(/localWrites\.current\+\+;\s*\n\s*setPending\(/);
+  });
+
+  it('keeps the counter a ref, so no render is needed to read it', () => {
+    // A reactive signal would be read at render time, and the reply arrives
+    // between renders. It has to be readable exactly when the data lands.
+    expect(src).toMatch(/const localWrites = useRef\(0\);/);
+  });
+});

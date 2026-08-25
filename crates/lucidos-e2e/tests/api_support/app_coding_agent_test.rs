@@ -311,9 +311,10 @@ async fn app_coding_agent_lifecycle() {
     .await;
 
     let apply_url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
-    // Puts a file into the shared workspace working tree; see
-    // `workspace_tree_lock`.
-    let tree = crate::support::workspace_tree_lock().read().await;
+    // Merges a file into the shared workspace working tree, so the tree has to
+    // be quiet: an unrelated test's uncommitted file makes the engine refuse
+    // the merge outright. See `workspace_tree_lock`.
+    let tree = crate::support::workspace_tree_lock().write().await;
     let resp = client.post(&apply_url).send().await.expect("apply");
     drop(tree);
     let status = resp.status().as_u16();
@@ -427,9 +428,10 @@ async fn app_coding_agent_concurrent_apply() {
 
     // These two merges put files into the shared workspace working tree, which
     // the command-checkpoint test snapshots whole; see `workspace_tree_lock`.
-    // A read guard, so the two applies below still overlap each other, which is
-    // the entire point of this test.
-    let _tree = crate::support::workspace_tree_lock().read().await;
+    // A WRITE guard, because a merge also needs the tree free of anybody
+    // else's uncommitted file. It is one guard held across both applies, so
+    // they still overlap each other, which is the entire point of this test.
+    let _tree = crate::support::workspace_tree_lock().write().await;
 
     // Fire concurrently. MERGE_MUTEX inside change_ops serialises the actual
     // ff-merge, but both requests are alive in the engine at the same time.

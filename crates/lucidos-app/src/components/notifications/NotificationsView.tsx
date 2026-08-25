@@ -12,12 +12,15 @@ import {
   loadMoreNotifications,
   setNotificationsFilter,
 } from '../../store/actions/notifications';
+import { dispatchDeepLink } from '../../store/actions/in-app-notification-toast';
+import { parseDeepLinkFromInboxRow } from '../../store/actions/notification-deeplink';
 import { stripHtml } from '../../utils/escapeHtml';
 import { formatTimeAgo, formatNotificationDate } from '../../utils/formatTime';
 import { loadedOr, type Loadable, type Notification } from '../../store/types';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { ChevronRightIcon } from '../shared/icons';
 import { ListSkeletonOf, useSkeleton, SkText } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
 
@@ -147,18 +150,28 @@ export function NotificationsView() {
  *  passes it. In skeleton mode it renders a non-interactive `<div>` (no click
  *  handler), mirroring the three lines (title, summary, time).
  *
- *  The row carries NO icon. It wore a 📋 clipboard until 2026-08-13, which was
- *  the last colour emoji in this pane and said nothing: every row in the
+ *  The row carries NO icon. It wore a 📋 clipboard until the emoji sweep, which
+ *  was the last colour emoji in this pane and said nothing: every row in the
  *  Notifications list is a notification, so a per-row glyph only restated the
- *  pane it was already inside. Unread state is carried by `.notification-item.unread`.
+ *  pane it was already inside. Unread state is carried by `.notification-row.unread`.
  *  Its `<SkBlock>` stand-in went with it, since a skeleton mirrors the real row
- *  by construction and a shimmer dot standing in for nothing is a hole. */
-function NotificationRow({ n }: { n?: Notification }) {
+ *  by construction and a shimmer dot standing in for nothing is a hole.
+ *
+ *  The row body dispatches the notification's own `tap`, so it lands where the
+ *  toast and the OS push land. A `navigate` tap therefore leaves the message
+ *  itself unseen, and that row grows a trailing chevron for the detail. A
+ *  modal-tap row's body already opens the detail, so it gets no chevron. The
+ *  chevron is a SIBLING of the row button, not a child: a button cannot contain
+ *  a button, and a nested one would fire both handlers on one tap. It wears the
+ *  shared `row-icon` band, whose 2.25rem tap target is what a row icon needs to
+ *  be hittable on a phone. */
+export function NotificationRow({ n }: { n?: Notification }) {
   const sk = useSkeleton();
   const date = n ? new Date(n.created_at) : null;
   const timeAgo = date ? formatTimeAgo(date) : '';
   const dateStr = date ? formatNotificationDate(date) : '';
-  const className = `notification-item ${sk || n?.read ? '' : 'unread'}`;
+  const jumps = !sk && n?.tap?.kind === 'navigate';
+  const rowClass = `notification-row ${sk || n?.read ? '' : 'unread'}`;
   const body = (
     <>
       <div class="title notification-title">
@@ -172,10 +185,31 @@ function NotificationRow({ n }: { n?: Notification }) {
       </SkText>
     </>
   );
-  if (sk) return <div class={className}>{body}</div>;
+  if (sk) {
+    return (
+      <div class={rowClass}>
+        <div class="notification-item">{body}</div>
+      </div>
+    );
+  }
   return (
-    <button class={className} onClick={() => n && void viewNotification(n.id)}>
-      {body}
-    </button>
+    <div class={rowClass}>
+      <button
+        class="notification-item"
+        onClick={() => n && dispatchDeepLink(parseDeepLinkFromInboxRow(n))}
+      >
+        {body}
+      </button>
+      {jumps && n && (
+        <button
+          class="icon-btn row-icon notification-row-detail-btn"
+          onClick={() => void viewNotification(n.id)}
+          aria-label="Open notification"
+          data-tooltip="Open notification"
+        >
+          <ChevronRightIcon />
+        </button>
+      )}
+    </div>
   );
 }

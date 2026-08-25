@@ -206,19 +206,6 @@ pub(crate) fn thread_target_is_addressable(
         || caller_workspace_present
 }
 
-/// Does a `thread_summaries` row exist for `thread_id`?
-///
-/// For the legacy `/chat` route, which reads nothing else. `chat_submit` gets
-/// the same answer from the row it already reads for the continuity lock.
-async fn thread_summary_exists(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
-    )
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await
-}
-
 /// Announce every orphan in `batch` as `UserPromptInjected`, anchored on the
 /// batch's first message (the turn the re-process runs under).
 ///
@@ -398,13 +385,21 @@ fn resolve_file_ctx(
         })
 }
 
-/// Parsed spawn / caller UUIDs returned by `validate_mode_and_spawn`.
+/// What the engine tells a caller that named a thread as its own parent.
+pub(crate) const PARENT_IS_THE_THREAD_ITSELF: &str = "\
+`parent_thread_id` equals `thread_id`, so this request asks a thread to be its \
+own parent. A thread family is a tree, and that row would put a cycle in it. \
+Send the id of the thread that spawned this one, or drop `parent_thread_id` if \
+this is a follow-up on the thread itself.";
+
+/// Parsed target / spawn / caller UUIDs returned by `validate_mode_and_spawn`.
 ///
-/// Carrying parsed `caller_*` UUIDs out of validation lets the handler avoid
+/// Carrying the parsed UUIDs out of validation lets the handler avoid
 /// re-parsing (which would silently drop on regression — see CLAUDE.md
 /// "no silent defaults").
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidatedSpawn {
+    thread_id: Option<Uuid>,
     parent_thread_id: Option<Uuid>,
     spawning_event_id: Option<Uuid>,
     caller_thread_id: Option<Uuid>,
@@ -428,40 +423,57 @@ struct ValidatedSpawn {
 /// relationships (origin without callback, parent with callback). A
 /// `caller_thread_id` or `caller_event_id` without `caller_workspace` is
 /// malformed.
-fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, StatusCode> {
+///
+/// This also refuses a `parent_thread_id` equal to `thread_id`, and it is the
+/// only reachable write path that could produce one. Every other spawn either
+/// mints the child id itself or carries no parent at all. Such a row is a
+/// one-node cycle in `parent_thread_id`, and the projection's ancestor walks
+/// are what pay for it.
+fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, ApiError> {
     let has_caller = request.caller_workspace.is_some()
         || request.caller_thread_id.is_some()
         || request.caller_event_id.is_some();
 
     if has_caller && request.caller_workspace.is_none() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
     let has_parent = request.parent_thread_id.is_some() || request.spawning_event_id.is_some();
 
     if has_caller && has_parent {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
+    let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
     let caller_thread_id = parse_optional_uuid(request.caller_thread_id.as_deref())?;
     let caller_event_id = parse_optional_uuid(request.caller_event_id.as_deref())?;
     let parent_thread_id = parse_optional_uuid(request.parent_thread_id.as_deref())?;
     let spawning_event_id = parse_optional_uuid(request.spawning_event_id.as_deref())?;
 
+    if parent_thread_id.is_some() && parent_thread_id == thread_id {
+        log!(
+            "[Chat] Refusing self-parented thread {:?}: mode={:?}",
+            thread_id,
+            request.mode
+        );
+        return Err(ApiError::bad_request(PARENT_IS_THE_THREAD_ITSELF));
+    }
+
     match request.mode {
         ActorMode::Human => {
             if parent_thread_id.is_some() || spawning_event_id.is_some() {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
         }
         ActorMode::Agent | ActorMode::Engine => {
             if parent_thread_id.is_none() && request.caller_workspace.is_none() {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
         }
     }
 
     Ok(ValidatedSpawn {
+        thread_id,
         parent_thread_id,
         spawning_event_id,
         caller_thread_id,
@@ -542,101 +554,6 @@ pub(super) fn validate_thread_continuity(
         }
     }
     Ok(())
-}
-
-pub(super) async fn chat(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(request): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, ApiError> {
-    if let Some(ref model) = request.model {
-        log!("[Chat] Using model: {}", model);
-    }
-
-    // Same gate as `chat_submit`, first thing, for the same reason: this
-    // handler also persists a `MessageReceived` carrying the body's `mode`. It
-    // is in fact the wider hole of the two, because it never builds a
-    // `MessageOrigin` and never runs the subprocess gate.
-    require_human_mode_is_attributed(&state.pool, &headers, &request).await?;
-
-    let validated = validate_mode_and_spawn(&request)?;
-    let ValidatedSpawn {
-        parent_thread_id,
-        spawning_event_id,
-        ..
-    } = validated;
-    let mode = request.mode;
-
-    let app_ctx = request.app_context;
-    let file_ctx = resolve_file_ctx(
-        request.file_context.as_ref(),
-        request.repo_file_context.as_ref(),
-    );
-    let url_ctx = request.url_context;
-
-    // Reject malformed thread_id with 400 instead of silently starting a new
-    // thread (CLAUDE.md "no silent defaults").
-    let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
-    // And reject a WELL-FORMED id that names nothing, on the same terms as
-    // `chat_submit`. Two entry points disagreeing about which requests are
-    // legitimate is what leaves a hole, so this route pays for its own
-    // existence query.
-    if let Some(tid) = thread_id {
-        let exists = thread_summary_exists(state.engine.pool(), tid)
-            .await
-            .map_err(|e| {
-                log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
-                ApiError::db(e)
-            })?;
-        if !thread_target_is_addressable(
-            exists,
-            request.new_thread,
-            parent_thread_id,
-            request.caller_workspace.is_some(),
-        ) {
-            log!("[Chat] Refusing to address unknown thread {} on /chat", tid);
-            return Err(ApiError::not_found(unknown_thread_message(tid)));
-        }
-    }
-    Ok(
-        match state
-            .engine
-            .process_message_with_steps(
-                &request.message,
-                request.model.as_deref(),
-                app_ctx,
-                file_ctx,
-                request.reasoning_effort.as_deref(),
-                request.images.as_deref(),
-                request.device_id.as_deref(),
-                None,
-                request.event_id.as_deref(),
-                thread_id,
-                None,
-                None,
-                url_ctx,
-                parent_thread_id,
-                spawning_event_id,
-                mode,
-                request.cc_model.as_deref(),
-                None,
-                None,
-                request.title.as_deref(),
-                None,
-                crate::engine::FollowUpUrgency::Normal,
-            )
-            .await
-        {
-            Ok(result) => Json(ChatResponse {
-                response: result.response,
-                steps: result.steps,
-            }),
-            Err(e) => Json(ChatResponse {
-                response: format!("[ERROR] {}", e),
-                steps: vec![],
-            }),
-        },
-    )
 }
 
 #[derive(Serialize)]
@@ -776,16 +693,16 @@ pub(super) async fn chat_submit(
     // front of the (stricter, but opt-in) subprocess gate further down.
     require_human_mode_is_attributed(&state.pool, &headers, &request).await?;
 
+    // The validator parses the target id too, so the subprocess gate below and
+    // the self-parent refusal read the same value.
     let ValidatedSpawn {
+        thread_id: target_thread_id,
         parent_thread_id,
         spawning_event_id,
         caller_thread_id,
         caller_event_id,
     } = validate_mode_and_spawn(&request)?;
     let mode = request.mode;
-
-    // Parse target thread id up front so the subprocess gate can see it.
-    let target_thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
 
     // The target's projection row, read ONCE and used twice: by the subprocess
     // gate, which needs to know whether the target exists, and by the mode/repo
@@ -1474,25 +1391,13 @@ pub(super) async fn chat_submit(
                     });
                 }
             }
-            Err(ref e) => {
-                log!("[Chat] Chat error: {}", e);
-                // Signal frontend to exit "running" state with error
-                if let Some(tid) = thread_id {
-                    if let Err(emit_err) = engine_clone
-                        .event_bus
-                        .emit(crate::engine::event_bus::BusEvent::Thread {
-                            thread_id: tid,
-                            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                error: e.to_string(),
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        })
-                        .await
-                    {
-                        log!("[Chat] Failed to emit ResponseFailed: {}", emit_err);
-                    }
-                }
-            }
+            // No terminator here. `process_message_with_steps` settles the
+            // exchange itself on every error exit, anchored to the turn's
+            // originating event. This branch used to emit its own unanchored
+            // `ResponseFailed`. The idempotency gate could not match that, so
+            // an in-loop failure wrote the event twice and fired every
+            // subscribed trigger twice.
+            Err(ref e) => log!("[Chat] Chat error: {}", e),
         }
     });
 
@@ -1624,9 +1529,12 @@ pub(super) async fn cancel_chat(
 }
 
 /// Routes for the `/chat*` surface.
+///
+/// There is no bare `POST /chat`. It was a strictly weaker duplicate of
+/// `/chat/stream` over the same mutation. Keeping it meant maintaining two
+/// gate lists that had already drifted apart (ADR 0116).
 pub(super) fn router() -> Router<AppState> {
     Router::new()
-        .route("/chat", post(chat))
         .route("/chat/stream", post(chat_submit))
         .route("/chat/cancel", post(cancel_chat))
         .route("/chat/queued-message/remove", post(remove_queued_message))

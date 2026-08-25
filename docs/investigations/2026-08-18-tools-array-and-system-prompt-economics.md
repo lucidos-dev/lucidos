@@ -51,9 +51,9 @@ neither came up." This is that examination.
 existing artifact did not use any of them.
 
 1. `payload.tools`, the **exact tool-name array** sent on that call, in order.
-2. A `Tool Definitions (N)` section whose `char_count` is the engine's own
+2. A `Tool Definitions (N)` section whose declared size is the engine's own
    accounting of the schemas.
-3. A `System Instructions` section whose `char_count` is the assembled system
+3. A `System Instructions` section whose declared size is the assembled system
    block.
 
 The engine's tool accounting is not the wire form.
@@ -553,7 +553,8 @@ with s as (
          (e.payload->'usage'->>'cache_read_tokens')::bigint cr,
          jsonb_array_length(e.payload->'tools') nt,
          max(case when x->>'name' like 'Tool Definitions%'
-                  then (x->>'char_count')::int end) tool_chars
+                  then coalesce(x->>'budget_delta_chars',
+                                x->>'char_count')::int end) tool_chars
   from events e, jsonb_array_elements(e.payload->'sections') x
   where e.event_type='ContextCaptured' and e.payload->>'producer'='main_llm'
     and e.payload->>'model' like 'claude-opus-5%'

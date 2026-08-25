@@ -16,7 +16,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { ResponsePanel, turnControls } from '../chat-exchange-parts';
+import { InitiatorPanel, ResponsePanel, turnControls } from '../chat-exchange-parts';
+import type { InitiatorDescriptor } from '../ChatExchange';
 
 interface AnyVNode extends VNode<{ children?: ComponentChildren; [k: string]: unknown }> {}
 
@@ -91,9 +92,7 @@ describe('turnControls', () => {
   });
 
   it('makes every control a real button', () => {
-    // Keyboard reachability and the right semantics for a toggle, and what
-    // keeps a click off the INITIATOR header's collapse handler, which does
-    // still fold on a row click (`handlePanelHeaderClick` skips `button, a`).
+    // Keyboard reachability, and the right semantics for a toggle.
     for (const role of ROLES) {
       const btn = findByRole(controls(), role)!;
       expect(btn.type, role).toBe('button');
@@ -302,7 +301,7 @@ describe('ResponsePanel', () => {
     const positions = children(header).map((c) => {
       const cls = String((c as AnyVNode)?.props?.class ?? '');
       if (cls.includes('response-executor')) return 'executor';
-      if (cls.includes('response-controls')) return 'controls';
+      if (cls.includes('turn-controls')) return 'controls';
       if (cls.includes('response-meta')) return 'meta';
       return null;
     }).filter(Boolean);
@@ -317,5 +316,88 @@ describe('ResponsePanel', () => {
     const header = findByClass(panel(controls()), 'response-header')!;
     expect(header.props.onClick).toBeUndefined();
     expect(String(header.props.class)).toBe('response-header');
+  });
+});
+
+/** The initiator header carries the SAME collapse control. A turn's two headers
+ *  are read as one widget. A fold announced by an icon on one and by nothing but
+ *  a cursor on the other is two answers to one question. */
+describe('InitiatorPanel collapse control', () => {
+  const initiator: InitiatorDescriptor = {
+    variant: 'system',
+    icon: null,
+    label: 'Lucidos Agent',
+    summary: 'Forwarded message',
+  };
+
+  const panel = (over: Partial<Parameters<typeof InitiatorPanel>[0]> = {}) => InitiatorPanel({
+    initiator,
+    timestamp: '14:32',
+    collapsible: true,
+    collapsed: false,
+    onToggle: noop,
+    ...over,
+  });
+
+  it('renders the response header\'s collapse control, glyph and label included', () => {
+    const here = findByRole(panel(), 'toggle-collapsed')!;
+    const there = findByRole(controls(), 'toggle-collapsed')!;
+    expect(here).not.toBeNull();
+    expect(here.props.class).toBe(there.props.class);
+    expect(here.props['aria-label']).toBe(there.props['aria-label']);
+    expect(here.props['data-tooltip']).toBe(there.props['data-tooltip']);
+    expect((here.props.children as AnyVNode).type).toBe((there.props.children as AnyVNode).type);
+  });
+
+  it('turns its glyph around and reports aria-pressed, exactly as the response one', () => {
+    const folded = findByRole(panel({ collapsed: true }), 'toggle-collapsed')!;
+    expect(folded.props['aria-pressed']).toBe(true);
+    expect((folded.props.children as AnyVNode).props.collapsed).toBe(true);
+    expect(findByRole(panel(), 'toggle-collapsed')!.props['aria-pressed']).toBe(false);
+  });
+
+  it('puts it between the actor chip and the meta cluster, where the response has its run', () => {
+    const header = findByClass(panel(), 'initiator-header')!;
+    const positions = children(header).map((c) => {
+      const cls = String((c as AnyVNode)?.props?.class ?? '');
+      if (cls.includes('initiator-actor')) return 'actor';
+      if (cls.includes('turn-controls')) return 'controls';
+      if (cls.includes('initiator-meta')) return 'meta';
+      return null;
+    }).filter(Boolean);
+    expect(positions).toEqual(['actor', 'controls', 'meta']);
+  });
+
+  it('omits it where the response DISABLES its own, because this panel has no body', () => {
+    // The response's control renders disabled instead. It is one of three, and
+    // a hole in that run is a hole in a column of identical headers. This panel
+    // has no run to keep whole. Its body is a pure function of its event and
+    // never streams in. A control that never lights up would be a dead icon for
+    // the life of the thread.
+    expect(findByRole(panel({ collapsible: false, onToggle: undefined }), 'toggle-collapsed')).toBeNull();
+  });
+
+  it('keeps that one slot whatever the panel wears, since it has only one', () => {
+    // The slot never varied by turn type in the end. The two turns that made
+    // it look as though it should, a user message and a change card, carry no
+    // fold at all now. `ChatExchange` decides that; this panel renders what it
+    // is handed, in the response header's own order.
+    const header = findByClass(panel({ bubble: true, chromeless: true }), 'initiator-header')!;
+    const slots = children(header).map((c) => {
+      const cls = String((c as AnyVNode)?.props?.class ?? '');
+      if (cls.includes('turn-controls')) return 'controls';
+      if (cls.includes('initiator-meta')) return 'meta';
+      return null;
+    }).filter(Boolean);
+    expect(slots).toEqual(['controls', 'meta']);
+  });
+
+  it('leaves the row inert, exactly as the response header does', () => {
+    // Both rows once folded on a click announced by nothing but a cursor. A row
+    // that swallows one fires wherever the pointer misses a chip, and the
+    // control is the affordance now.
+    const header = findByClass(panel(), 'initiator-header')!;
+    expect(header.props.onClick).toBeUndefined();
+    expect(String(header.props.class)).toBe('initiator-header');
   });
 });

@@ -53,8 +53,12 @@ pub fn ensure_git_init(user_dir: &Path) {
 
 /// Stage a file and commit in the user dir. Best-effort — logs errors but does not propagate.
 pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
+    // `--` for the same reason the commit below has one: `relative_path` comes
+    // from a model-supplied file tool path, and a name opening with `-` is read
+    // as an option. `git add -A` would stage the whole tree instead of the one
+    // file the caller asked for.
     let add = Command::new("git")
-        .args(["add", relative_path])
+        .args(["add", "--", relative_path])
         .current_dir(user_dir)
         .output();
     match add {

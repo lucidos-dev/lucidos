@@ -1,9 +1,26 @@
 #!/bin/bash
-# Run the full e2e suite — API tests, browser tests, then heavy integration
-# suites that need external setup (WASM signer artifacts; real fastembed model).
+# Run the full e2e suite: API tests, the heavy integration suites that need
+# external setup (WASM signer artifacts; real fastembed model), then the
+# browser tests.
+#
+# PHASE ORDER IS A MEMORY DECISION. The browser phase used to run second, and
+# inside it mobile-webkit ran first. That one project costs about 15 GB of
+# macOS VM compressor; api, chromium and mobile cost about 0.6 GB between
+# them. `set -e` below means a browser-phase memory stop ends the run, so wasm
+# and embedder sat behind the most expensive thing in the suite and two
+# consecutive nightlies never reached them. Cheapest first, so a stop can only
+# cost the work that caused it.
 #
 # Usage:
-#   ./scripts/e2e.sh [--packaged]
+#   ./scripts/e2e.sh [--packaged] [--no-webkit]
+#
+# --no-webkit skips the mobile-webkit browser project. The compressor does not
+# drain between projects, so mobile-webkit spends the session's whole budget
+# whenever it runs. Splitting it out is what lets the other five finish and
+# lets it start from a cold host:
+#
+#   ./scripts/e2e.sh --no-webkit          # the five cheap projects
+#   ./scripts/e2e-browser.sh --webkit     # then mobile-webkit, on a cold host
 #
 # --packaged (or LUCIDOS_E2E_PACKAGED=1) appends the macOS packaged-build boot
 # smoke test (scripts/e2e-packaged.sh) as a final phase. OFF by default: it does a
@@ -30,9 +47,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Opt-in: append the packaged-build boot smoke test as a final phase (default off).
 RUN_PACKAGED="${LUCIDOS_E2E_PACKAGED:-0}"
+# Passed straight through to the browser phase. Kept as an array so the flagless
+# case adds no argument at all rather than an empty one.
+BROWSER_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --packaged) RUN_PACKAGED=1; shift ;;
+        --no-webkit) BROWSER_ARGS+=(--no-webkit); shift ;;
         *) echo "e2e.sh: unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -75,23 +96,6 @@ echo "════════════════════════�
 
 echo ""
 echo "═══════════════════════════════════════════════════"
-echo "  Running browser e2e tests"
-echo "═══════════════════════════════════════════════════"
-# The API phase populated the workspace DB with throwaway threads. The browser
-# phase's FIRST project (mobile-webkit) deliberately skips its own DB reset on
-# the assumption the workspace was just freshly booted (see e2e-browser.sh —
-# only projects 2+ reset). Under this umbrella that assumption is false: the API
-# phase ran first, so mobile-webkit would inherit hundreds of API-phase threads
-# and fail drawer-order-sensitive specs (e.g. threads.spec.ts "thread loads with
-# correct messages when clicked" picked an API thread as the first drawer row).
-# Reset here so mobile-webkit gets the clean DB it expects. This restarts the
-# engine (the recreated database is only migrated at boot) onto the same binary
-# the API phase ran against — build_e2e_engine_once never recompiles mid-suite.
-reset_e2e_database
-"$SCRIPT_DIR/e2e-browser.sh"
-
-echo ""
-echo "═══════════════════════════════════════════════════"
 echo "  Running wasm signer e2e tests"
 echo "═══════════════════════════════════════════════════"
 "$SCRIPT_DIR/e2e-wasm.sh"
@@ -101,6 +105,25 @@ echo "════════════════════════�
 echo "  Running real-embedder integration tests"
 echo "═══════════════════════════════════════════════════"
 "$SCRIPT_DIR/e2e-embedder.sh"
+
+echo ""
+echo "═══════════════════════════════════════════════════"
+echo "  Running browser e2e tests"
+echo "═══════════════════════════════════════════════════"
+# The API phase populated the workspace DB with throwaway threads. The browser
+# phase's FIRST project deliberately skips its own DB reset on the assumption
+# the workspace was just freshly booted (see e2e-browser.sh: only projects 2+
+# reset). Under this umbrella that assumption is false, so the first project
+# would inherit hundreds of API-phase threads and fail drawer-order-sensitive
+# specs. One did: threads.spec.ts "thread loads with correct messages when
+# clicked" picked an API thread as the first drawer row.
+#
+# Reset here so the first project gets the clean DB it expects. This restarts
+# the engine, since the recreated database is only migrated at boot, onto the
+# same binary the API phase ran against (build_e2e_engine_once never recompiles
+# mid-suite). The wasm and embedder phases above do not touch this database.
+reset_e2e_database
+"$SCRIPT_DIR/e2e-browser.sh" ${BROWSER_ARGS[@]+"${BROWSER_ARGS[@]}"}
 
 # Packaged-build boot smoke test — opt-in (--packaged / LUCIDOS_E2E_PACKAGED=1).
 # Heavy (full release + DMG build); it boots the bundle's own embedded stack on

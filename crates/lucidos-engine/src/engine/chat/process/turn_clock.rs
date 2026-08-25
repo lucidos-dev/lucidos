@@ -273,10 +273,18 @@ mod tests {
 
     // ===== The wire, where the cache actually looks =====
     //
-    // The tests above pin the two halves. These assemble a real Anthropic
-    // request out of them and assert on its serialized bytes, which is what
+    // The tests above pin the clock's two halves. These assemble a real
+    // Anthropic request and assert on its serialized bytes, which is what
     // Anthropic hashes and what `llm::cache_probe` reports.
+    //
+    // Scope is the whole cached-tier contract rather than the clock alone,
+    // because the property is one property: `super::turn_tail`'s two values
+    // split the same way and share this harness.
 
+    use super::super::turn_tail::{
+        client_url_block, engine_build_block, version_status, CLIENT_URL_POINTER,
+        ENGINE_BUILD_POINTER,
+    };
     use crate::llm::anthropic_wire::{build_claude_request, ClaudeRequest, WireTarget};
     use crate::llm::provider::{ContentBlock, Message, MessageContent, ToolDefinition};
 
@@ -284,20 +292,47 @@ mod tests {
     const TZ: &str = "Europe/Oslo";
 
     /// The system block in miniature: the identity framing, the timezone
-    /// section, the language line. The rest of the real prompt is
-    /// workspace-level static text that would only pad the bytes.
+    /// section, the language line, and the two pointers at the values that
+    /// left this tier. The rest of the real prompt is workspace-level static
+    /// text that would only pad the bytes.
     fn system_prompt() -> String {
         format!(
             "You are managing Lucidos, a personal assistant running in the \"myws\" workspace.\
-             \n\n{}\n\nUSER LANGUAGE: English",
+             \n\n{}\n\nUSER LANGUAGE: English{ENGINE_BUILD_POINTER}{CLIENT_URL_POINTER}",
             timezone_section(TZ)
         )
     }
 
+    /// The per-turn readings, in the order `run.rs` appends them.
+    struct Tail {
+        /// `(update_available, source_behind_head, rebuild_wedged)`.
+        build: (bool, bool, bool),
+        origin: &'static str,
+    }
+
+    impl Default for Tail {
+        fn default() -> Self {
+            Self {
+                build: (false, false, false),
+                origin: "https://localhost:5173",
+            }
+        }
+    }
+
     /// One turn's messages, in the order `run.rs` builds them: a resume tool
     /// pair, then the user message whose parts end with the request line and
-    /// then the clock.
+    /// then the three tail blocks.
     fn turn_messages(history: &str, request: &str, anchor: DateTime<Utc>) -> Vec<Message> {
+        turn_messages_with_tail(history, request, anchor, Tail::default())
+    }
+
+    fn turn_messages_with_tail(
+        history: &str,
+        request: &str,
+        anchor: DateTime<Utc>,
+        tail: Tail,
+    ) -> Vec<Message> {
+        let (update, behind, wedged) = tail.build;
         vec![
             Message {
                 role: "assistant".to_string(),
@@ -319,7 +354,9 @@ mod tests {
                 role: "user".to_string(),
                 content: MessageContent::Text(format!(
                     "[CONVERSATION HISTORY (recent)]\n{history}\n[END HISTORY]\
-                     \n\nRequest: {request}\n\n{}",
+                     \n\nRequest: {request}\n\n{}\n\n{}\n\n{}",
+                    engine_build_block(&version_status(update, behind, wedged)),
+                    client_url_block(tail.origin),
                     current_time_block(anchor, TZ)
                 )),
             },
@@ -362,13 +399,12 @@ mod tests {
     /// The message prefix Anthropic looks up, through `last`, canonicalized to
     /// the content it keys on rather than the envelope we happened to send.
     ///
-    /// Two encodings are undone, both introduced by
-    /// `apply_cache_control_to_last_message` and both applying only while a
-    /// message is the last one. It adds `cache_control`, and it rewrites bare
+    /// Two encodings are undone, both from the wire's breakpoint placement on
+    /// the last two messages. It adds `cache_control`, and it rewrites bare
     /// string content into a one-block array (the only shape that accepts the
     /// marker). Neither changes a token, which is what the ~99% mid-turn read
     /// rate in `data/artifacts/prompt-cache-clock-invalidation.md` shows. Left
-    /// in, both would read as prefix churn every time the breakpoint advances.
+    /// in, both would read as prefix churn every time a breakpoint advances.
     fn message_prefix_hash(request: &ClaudeRequest, last: usize) -> String {
         let canonical: Vec<serde_json::Value> = request.messages[..=last]
             .iter()
@@ -439,8 +475,8 @@ mod tests {
             "the reading must actually be present in the message tier"
         );
 
-        // tools[-1], system, messages[-1]. The fourth is reserved.
-        assert_eq!(marker_count(&first), 3);
+        // tools[-1], system, messages[-1] and messages[-2]. All four are spent.
+        assert_eq!(marker_count(&first), 4);
     }
 
     /// Round 2 pushes the breakpoint onto a newer last message, so round 1's
@@ -476,7 +512,7 @@ mod tests {
             "round 2 sees a different round-1 prefix, so the miss only moved tiers"
         );
         assert_eq!(system_hash(&round_one), system_hash(&round_two));
-        assert_eq!(marker_count(&round_two), 3);
+        assert_eq!(marker_count(&round_two), 4);
     }
 
     /// The system block is workspace-level, so two unrelated threads should
@@ -507,5 +543,77 @@ mod tests {
         // Guards against passing on an empty request: the threads really do
         // differ everywhere the system block is not.
         assert_ne!(message_prefix_hash(&one, 2), message_prefix_hash(&two, 2));
+    }
+
+    /// The guard above compares two threads at ONE moment, so a value that is
+    /// per-TURN rather than per-thread reads the same on both and passes. That
+    /// is exactly how the engine build state and the client URL sat in the
+    /// cached tier undetected. This is the missing axis: one thread, two turns,
+    /// with both of those values moved.
+    ///
+    /// A build flip alone was measured costing a full system-tier rewrite, at
+    /// 21,668 tokens times the write-minus-read rate. The origin flip is the
+    /// same shape, for a user reaching one workspace from two clients.
+    #[test]
+    fn one_thread_across_turns_keeps_the_system_block() {
+        let first = request_for(turn_messages_with_tail(
+            "User: hi",
+            "is the change live?",
+            utc(2026, 8, 17, 13, 2),
+            Tail {
+                build: (false, false, false),
+                origin: "https://localhost:5173",
+            },
+        ));
+        // Later: a newer engine is built and unswitched, and they moved to the
+        // desktop app on another origin.
+        let later = request_for(turn_messages_with_tail(
+            "User: hi",
+            "is the change live?",
+            utc(2026, 8, 17, 16, 2),
+            Tail {
+                build: (true, false, false),
+                origin: "http://localhost:3000",
+            },
+        ));
+
+        assert_eq!(
+            system_hash(&first),
+            system_hash(&later),
+            "a per-turn value is back in the cached system tier"
+        );
+        assert_ne!(
+            message_prefix_hash(&first, 2),
+            message_prefix_hash(&later, 2),
+            "the readings must actually be present in the message tier"
+        );
+        assert_eq!(marker_count(&later), 4);
+    }
+
+    /// The same claim from the other side, and the one a hash cannot make
+    /// readable: no build state and no URL appears anywhere in the system
+    /// block's bytes, whichever turn built it.
+    #[test]
+    fn no_build_state_and_no_origin_reaches_the_system_block() {
+        let system = system_prompt();
+        for leaked in [
+            "RUNNING ENGINE IS CURRENT",
+            "HAS NOT SWITCHED ONTO IT YET",
+            "NO BUILD BEHIND IT YET",
+            "NO REBUILD CAN DELIVER",
+            "localhost:5173",
+            "localhost:3000",
+        ] {
+            assert!(
+                !system.contains(leaked),
+                "the cached system block leaks {leaked}:\n{system}"
+            );
+        }
+        // It still POINTS at both, or the agent cannot find them.
+        assert!(
+            system.contains("[ENGINE BUILD] block at the END"),
+            "{system}"
+        );
+        assert!(system.contains("[CLIENT URL] block at the END"), "{system}");
     }
 }

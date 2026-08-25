@@ -202,6 +202,26 @@ impl OpenAiProvider {
         })
     }
 
+    /// Cap every HTTP attempt this provider makes at `timeout`, the SSE body
+    /// included. Builder-style, so the ordinary constructors keep their
+    /// unbounded-stream behaviour and only the caller that wants a bound pays
+    /// for it.
+    ///
+    /// Same single caller and same reason as
+    /// [`crate::llm::VertexProvider::with_request_timeout`]. An *auxiliary
+    /// model call* runs under a deadline that has to contain the provider's own
+    /// retries, and only a bounded attempt lets it.
+    pub fn with_request_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        self.streaming_client = reqwest::Client::builder()
+            .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(self)
+    }
+
     /// Whether this request should take the Responses API path. OpenRouter /
     /// local backends pin Chat Completions via `force_chat_completions`;
     /// direct OpenAI keeps the GPT-5/codex → Responses split.
@@ -244,6 +264,14 @@ impl OpenAiProvider {
     /// requested directory, `query_events({})` returns the unfiltered default,
     /// and the model then reasons over the wrong result. The Anthropic parser
     /// already errors on the same condition.
+    ///
+    /// Also errors when the stream carried no output AND no usage block, which
+    /// is ADR 0089's transport truncation on the OpenAI side. Both paths
+    /// through here are guaranteed a usage block by construction: Chat
+    /// Completions always sends `stream_options.include_usage`, and the
+    /// Responses path reads usage off the `response.completed` terminal event.
+    /// So no usage at all means the terminal frame never arrived, whatever
+    /// `finish_reason` an intermediate chunk claimed.
     fn build_llm_response(
         content: String,
         tool_call_map: Vec<AccumulatedToolCall>,
@@ -254,6 +282,25 @@ impl OpenAiProvider {
         } else {
             Some(content)
         };
+
+        // Output means text or a tool call, matching ADR 0089. Either one has
+        // already reached the frontend or already ran, so retrying duplicates
+        // it; only a turn that produced nothing is safe to re-issue. The
+        // wording carries "stream truncated" because `is_transient_error`
+        // matches on that, which is what routes it to the caller's retry loop.
+        //
+        // EITHER token count proves the terminal frame arrived, so both must be
+        // absent. A server that reports only one of the pair is odd but not
+        // truncated, and retrying its every silent turn would be wrong.
+        let no_usage_at_all = meta.input_tokens.is_none() && meta.output_tokens.is_none();
+        if final_content.is_none() && tool_call_map.is_empty() && no_usage_at_all {
+            return Err(format!(
+                "OpenAI stream truncated: ended with no content, no tool call and no usage \
+                 block (stop_reason: {})",
+                meta.stop_reason.as_deref().unwrap_or("absent"),
+            )
+            .into());
+        }
 
         let tool_calls: Vec<ToolCall> = tool_call_map
             .into_iter()
@@ -294,6 +341,8 @@ impl OpenAiProvider {
             cache_read_tokens: meta.cache_read_tokens,
             thinking_chars: None,
             unknown_sse_dropped: 0,
+            // Like Anthropic: text always rides in `content`, printable.
+            model_only_text: None,
         })
     }
 }

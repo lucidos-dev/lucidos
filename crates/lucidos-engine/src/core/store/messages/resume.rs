@@ -13,17 +13,52 @@ pub(crate) const RESUME_VERBATIM_TOOL_TAIL: usize = 3;
 /// resumes.
 const PINNED_TOOL_NAMES: &[&str] = &[crate::llm::tool_names::LOAD_KNOWHOW];
 
-/// Stable synthetic `tool_use_id` used by
-/// [`build_resume_tool_blocks_with_skip_ids`] to pair the reconstructed
-/// `ToolUse` and `ToolResult` blocks. Same event id → same synthetic id
-/// across resumes (deterministic, idempotent).
+/// Render a `ToolCalled` event id as the `evt-<32 hex>` address the LLM sees.
 ///
-/// Renders the full 32-hex-char simple-form UUID (`evt-<32 hex>`). The
-/// `dismiss_from_context` tool handler accepts this form (and the bare
-/// hyphenated/simple UUID) so the LLM can pass any tool-block id from
-/// history directly back to dismiss without truncation guessing.
-fn synthesize_tool_use_id(tool_called_event_id: &uuid::Uuid) -> String {
+/// One renderer for both places that address reaches the model, so the two
+/// cannot drift: the resumed pair's synthetic `tool_use_id` here, and the
+/// `[evt-…]` marker the live turn appends to every tool result
+/// (`agentic_loop::helpers::build_tool_result_blocks`). Deterministic, so the
+/// same event id always yields the same string.
+///
+/// Renders the full simple-form UUID. Every reader accepts this form and the
+/// bare hyphenated/simple UUID; the `events` tool's `event_id` argument is the
+/// live one, and the retired `dismiss_from_context` (ADR 0109) took the same
+/// shape. So the LLM can pass any address it saw straight back, with no
+/// truncation guessing.
+pub(crate) fn synthesize_tool_use_id(tool_called_event_id: &uuid::Uuid) -> String {
     format!("evt-{}", tool_called_event_id.simple())
+}
+
+/// Append the result's own event address. The model can then note a pointer
+/// to something the turn boundary is about to drop (ADR 0085 Decision 9).
+///
+/// One appender for every path that assembles a tool result, beside the one
+/// renderer, for the same reason. The address only works if it looks the same
+/// everywhere the model meets it.
+///
+/// Appended here rather than stored. The `ToolResult` event payload keeps
+/// exactly what it held before, so nothing is retained by this and the pair
+/// still vanishes at the boundary. The address costs a measured 24 tokens per
+/// call on Claude; see `docs/plans/2026-08-18-adr-0085-pointer-prerequisites.md`.
+pub(crate) fn with_event_address(content: String, event_id: Option<&uuid::Uuid>) -> String {
+    match event_id {
+        Some(id) => format!("{content}\n[{}]", synthesize_tool_use_id(id)),
+        None => content,
+    }
+}
+
+/// Parse an address the LLM passed back, the inverse of
+/// [`synthesize_tool_use_id`]. Kept beside its renderer so what is accepted
+/// cannot drift from what is emitted.
+///
+/// Accepts the `evt-` form and a bare UUID, hyphenated or simple. `None` is a
+/// malformed address; each caller words its own refusal, because the argument
+/// it read differs.
+pub(crate) fn parse_event_address(raw: &str) -> Option<uuid::Uuid> {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix("evt-").unwrap_or(trimmed);
+    uuid::Uuid::parse_str(stripped).ok()
 }
 
 /// One reconstructed `(ToolCalled, ToolResult)` pair, with the originating
@@ -257,7 +292,11 @@ pub(crate) fn build_resume_tool_blocks_with_skip_ids(
             content: crate::llm::MessageContent::Blocks(vec![
                 crate::llm::ContentBlock::ToolResult {
                     tool_use_id: id,
-                    content,
+                    // The trailer the live turn appends, on the rebuilt pair
+                    // too. Without it the panel cannot see a resumed result.
+                    // The model could then neither keep one open nor watch one
+                    // expire, on any round after the first.
+                    content: with_event_address(content, Some(&p.tool_called_event_id)),
                 },
             ]),
         });

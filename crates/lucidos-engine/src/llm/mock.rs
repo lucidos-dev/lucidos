@@ -199,6 +199,7 @@ impl LlmProvider for MockProvider {
                 cache_read_tokens: None,
                 thinking_chars: None,
                 unknown_sse_dropped: 0,
+                model_only_text: None,
             });
         }
 
@@ -218,6 +219,7 @@ impl LlmProvider for MockProvider {
                 cache_read_tokens: None,
                 thinking_chars: None,
                 unknown_sse_dropped: 0,
+                model_only_text: None,
             });
         }
 
@@ -250,6 +252,7 @@ impl LlmProvider for MockProvider {
             cache_read_tokens: None,
             thinking_chars: None,
             unknown_sse_dropped: 0,
+            model_only_text: None,
         })
     }
 

@@ -64,6 +64,84 @@ mod serialize_messages_for_capture_tests {
     }
 }
 
+/// The one section whose two sizes disagree, and the reason both exist.
+mod conversation_section_tests {
+    use super::super::conversation_section;
+    use crate::llm::{Message, MessageContent};
+
+    fn turn() -> Vec<Message> {
+        vec![
+            Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("A".repeat(1_000)),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::Text("B".repeat(500)),
+            },
+        ]
+    }
+
+    /// The bundle is already inside `messages[0]`, so the delta counts only
+    /// what the loop added. Summing the true size instead would bill the
+    /// bundle twice against the headline estimate.
+    #[test]
+    fn the_delta_is_what_the_loop_added_and_never_the_whole_array() {
+        let section = conversation_section(&turn(), 900, 1_500, false);
+        assert_eq!(section.budget_delta_chars, 600);
+        let real = section.content_chars.expect("measured on every round");
+        assert!(
+            real > section.budget_delta_chars,
+            "the array holds {real} chars against a {} delta",
+            section.budget_delta_chars
+        );
+    }
+
+    /// A round that added nothing floors at zero rather than going negative,
+    /// and the region size is unaffected by that floor.
+    #[test]
+    fn a_delta_floors_at_zero_while_the_region_keeps_its_size() {
+        let section = conversation_section(&turn(), 5_000, 1_500, false);
+        assert_eq!(section.budget_delta_chars, 0);
+        assert!(section.content_chars.expect("measured") > 1_000);
+    }
+
+    /// Dropping the body is a persistence decision. It must not move the
+    /// number that says how big the region was.
+    #[test]
+    fn dropping_the_body_leaves_the_region_size_alone() {
+        let with_body = conversation_section(&turn(), 900, 1_500, true);
+        let without = conversation_section(&turn(), 900, 1_500, false);
+        assert!(with_body.content.is_some());
+        assert!(without.content.is_none());
+        assert_eq!(with_body.content_chars, without.content_chars);
+    }
+
+    /// Truncation is the same decision at a different size. A body cut head
+    /// and tail still reports the array it was cut from.
+    ///
+    /// Skipped under the eval's full capture, which is the one configuration
+    /// that lifts the cap this test is about (ADR 0110).
+    #[test]
+    fn a_truncated_body_still_reports_the_size_it_was_cut_from() {
+        if crate::engine::eval_capture::body_cap(8_000).is_none() {
+            return;
+        }
+        let long = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("C".repeat(30_000)),
+        }];
+        let section = conversation_section(&long, 0, 30_000, true);
+        let body = section.content.as_ref().expect("body captured");
+        let real = section.content_chars.expect("measured");
+        assert!(real > 30_000, "the array is bigger than the cap");
+        assert!(
+            body.chars().count() < real,
+            "the persisted body is the cut one"
+        );
+    }
+}
+
 mod relation_tests {
     use super::super::special_tool::{parse_relation, Relation};
     use serde_json::json;

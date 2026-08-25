@@ -5,9 +5,9 @@ use async_trait::async_trait;
 /// as a `ThreadEvent::ResponseFailed` (see `engine/agentic_loop/run.rs`), so the
 /// wording is user-facing. Must never be mistaken for real or mock output.
 ///
-/// No "restart" instruction: adding a provider credential in Settings → Models →
-/// Providers now takes effect at runtime (the credential subscriber hot-swaps the
-/// active provider — see `spawn_provider_credential_subscriber`).
+/// No "restart" instruction: configuring a provider in Settings → Models →
+/// Providers now takes effect at runtime (the config subscriber hot-swaps the
+/// active provider, see `spawn_provider_config_subscriber`).
 pub const NO_PROVIDER_MESSAGE: &str =
     "No LLM provider configured. Add one in Settings → Models → Providers.";
 

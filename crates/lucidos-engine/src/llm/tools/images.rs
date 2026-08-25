@@ -5,6 +5,18 @@ use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
+/// The two that read an image the thread already has. Ungated: neither needs
+/// an image-generation provider.
+pub(super) fn thread_image_tools() -> Vec<ToolDefinition> {
+    vec![get_save_thread_image_tool(), get_view_image_tool()]
+}
+
+/// The one that synthesizes an image, offered only where a provider is
+/// configured to do it (ADR 0088).
+pub(super) fn generation_tools() -> Vec<ToolDefinition> {
+    vec![get_image_generation_tool()]
+}
+
 /// Tool for pulling an image posted earlier in the thread back into vision.
 ///
 /// Recently-posted images are already in the model's vision; older ones age out
@@ -20,7 +32,7 @@ pub fn get_view_image_tool() -> ToolDefinition {
             "properties": {
                 "image": {
                     "type": "string",
-                    "description": "Thread image reference 'thread:N', 1-based as shown in the conversation history."
+                    "description": "Its 'img-<hex>' handle, as shown in the history. 'thread:N' also works."
                 }
             },
             "required": ["image"]
@@ -38,7 +50,7 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
             "properties": {
                 "image": {
                     "type": "string",
-                    "description": "Thread image reference 'thread:N', 1-based across the conversation."
+                    "description": "Its 'img-<hex>' handle, as shown in the history. 'thread:N' also works."
                 },
                 "path": {
                     "type": "string",
@@ -57,7 +69,7 @@ pub fn get_image_generation_tool() -> ToolDefinition {
         description: "SYNTHESIZES a new image, or edits an existing one. Returns image bytes, never text. \
             NOT a vision or analysis tool: never call it to describe, analyze, summarize or transcribe an \
             image. You can see recent conversation images natively, so describe them directly in your reply; \
-            for an older one, call view_image('thread:N') first. \
+            for an older one, call view_image with its 'img-<hex>' handle first. \
             `prompt` describes the output image; add `input_images` to edit an existing one. The current \
             provider may accept only one input image, and passing more then fails with an error asking the \
             user to pick.".to_string(),
@@ -71,7 +83,7 @@ pub fn get_image_generation_tool() -> ToolDefinition {
                 "input_images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Images to edit, each 'thread:N' (1-based) or an artifact path. Omit for text-to-image."
+                    "description": "Images to edit: an 'img-<hex>' handle, a 'thread:N', or an artifact path. Omit for text-to-image."
                 },
                 "size": {
                     "type": "string",

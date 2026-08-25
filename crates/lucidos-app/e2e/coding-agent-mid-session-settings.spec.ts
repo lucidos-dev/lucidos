@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, waitAndClick,
+  waitForActiveSession, waitAndClick, pickModelPair, openCurrentModelTiers,
 } from './helpers';
 
 /**
@@ -55,8 +55,11 @@ test.describe('CC mid-session model/effort persistence', () => {
     // follow-up sendMessage carries it as `reasoning_effort` in the request
     // body, which the next CC spawn picks up.
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Reasoning');
-    await waitAndClick(page, '.control-option', 'Max');
+    await waitAndClick(page, '.control-item', 'Model');
+    // The tier is the second step, so raising it means stepping into the model
+    // the session is already on rather than naming another.
+    const onModel = await openCurrentModelTiers(page);
+    await waitAndClick(page, `.control-option[data-value="${onModel}|max"]`);
 
     // Send follow-up to trigger respawn with pending effort applied
     await sendMessage(page, 'Say exactly: "effort-still-max". Do not create any files.');
@@ -74,12 +77,12 @@ test.describe('CC mid-session model/effort persistence', () => {
 
     // Verify UI also shows 'Max' in the control menu
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
-    await waitAndClick(page, '.control-item', 'Reasoning');
+    await waitAndClick(page, '.control-item', 'Model');
 
+    await openCurrentModelTiers(page);
     const currentEffort = page.locator('.control-option-current:visible').first();
     await expect(currentEffort).toBeVisible({ timeout: 5_000 });
-    const effortLabel = await currentEffort.locator('.control-option-label').textContent();
-    expect((effortLabel ?? '').replace(/✓/g, '').trim()).toBe('Max');
+    expect(await currentEffort.getAttribute('data-value')).toMatch(/\|max$/);
 
     // Cleanup
     await page.keyboard.press('Escape');
@@ -116,7 +119,7 @@ test.describe('CC mid-session model/effort persistence', () => {
     // next CC spawn picks up.
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.control-item', 'Model');
-    await waitAndClick(page, '.control-option', 'Haiku');
+    await pickModelPair(page, 'haiku');
 
     // Send follow-up — triggers respawn with pending model applied
     await sendMessage(page, 'Say exactly: "model-still-haiku". Do not create any files.');
@@ -138,8 +141,7 @@ test.describe('CC mid-session model/effort persistence', () => {
 
     const currentModel = page.locator('.control-option-current:visible').first();
     await expect(currentModel).toBeVisible({ timeout: 5_000 });
-    const modelLabel = await currentModel.locator('.control-option-label').textContent();
-    expect((modelLabel ?? '').replace(/✓/g, '').trim()).toBe('Haiku 4.5');
+    expect(await currentModel.getAttribute('data-value')).toBe('haiku');
 
     // Cleanup
     await page.keyboard.press('Escape');

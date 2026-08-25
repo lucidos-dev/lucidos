@@ -1,8 +1,74 @@
 use super::*;
 use crate::engine::git_ops::{
     auto_commit_safe_files_if_dirty, find_worktree_for_branch, git_answer,
-    is_merge_of_branch_into_main,
+    is_merge_of_branch_into_main, WorktreeLookup,
 };
+
+/// Clear a discarded change's branch state, given what git said about it.
+///
+/// A worktree on disk is reset to main HEAD. The directory and the branch stay,
+/// so the next user message resumes the same Claude Code session. With no
+/// worktree the branch ref is reset directly, so the commits do not linger as a
+/// phantom pending state.
+///
+/// The lookup is a parameter rather than an inner call so a test can drive the
+/// `Unknown` arm against a real repo. Unknown skips: `git branch -f` moves a
+/// ref with no old-value guard, over a branch that may hold the only copy of
+/// the work. The change is still discarded, and the branch is left ahead of
+/// main with nothing pointing at it, which is inert.
+pub(crate) async fn settle_discarded_branch(
+    repo_root: &Path,
+    branch_name: &str,
+    change_id: Uuid,
+    lookup: WorktreeLookup,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match lookup {
+        WorktreeLookup::Found(wt_path) => {
+            reset_worktree_to_main_after_discard(&wt_path).await?;
+            log!(
+                "[Changes] Discarded change {}: reset worktree {} on branch {} to main; branch preserved",
+                change_id,
+                wt_path.display(),
+                branch_name
+            );
+        }
+        WorktreeLookup::Unknown => {
+            log!(
+                "[Changes] Discarded change {}: git worktree list gave no answer for branch {}; \
+                 leaving the branch ref alone rather than moving it on a guess",
+                change_id,
+                branch_name
+            );
+        }
+        WorktreeLookup::NotFound => {
+            let reset = git_cmd(&["branch", "-f", branch_name, "main"], repo_root)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "git branch -f {} main failed in repo {}: {}",
+                        branch_name,
+                        repo_root.display(),
+                        e
+                    )
+                })?;
+            if !reset.status.success() {
+                return Err(format!(
+                    "git branch -f {} main failed in repo {}: {}",
+                    branch_name,
+                    repo_root.display(),
+                    String::from_utf8_lossy(&reset.stderr).trim()
+                )
+                .into());
+            }
+            log!(
+                "[Changes] Discarded change {}: no worktree on branch {}; reset branch ref to main, branch preserved",
+                change_id,
+                branch_name
+            );
+        }
+    }
+    Ok(())
+}
 
 impl LucidosEngine {
     pub async fn is_external_repo_thread(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
@@ -212,47 +278,9 @@ impl LucidosEngine {
             return Ok(());
         }
 
-        // Phase 6.3: reset the worktree to main HEAD; preserve directory +
-        // branch so the next user message resumes the same Claude Code session.
         let repo_root = std::path::PathBuf::from(&change.repo_root);
-        if let Some(wt_path) = find_worktree_for_branch(&repo_root, &change.branch_name).await {
-            reset_worktree_to_main_after_discard(&wt_path).await?;
-            log!(
-                "[Changes] Discarded change {}: reset worktree {} on branch {} to main; branch preserved",
-                change_id,
-                wt_path.display(),
-                change.branch_name
-            );
-        } else {
-            // No worktree on disk for this branch (legacy threads, or already
-            // cleaned up). Reset the branch ref to main directly so the
-            // commits don't linger as a phantom pending state.
-            let reset = git_cmd(&["branch", "-f", &change.branch_name, "main"], &repo_root)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "git branch -f {} main failed in repo {}: {}",
-                        change.branch_name,
-                        repo_root.display(),
-                        e
-                    )
-                })?;
-            if !reset.status.success() {
-                return Err(format!(
-                    "git branch -f {} main failed in repo {}: {}",
-                    change.branch_name,
-                    repo_root.display(),
-                    String::from_utf8_lossy(&reset.stderr).trim()
-                )
-                .into());
-            }
-            log!(
-                "[Changes] Discarded change {}: no worktree on branch {} — reset branch ref to main; branch preserved",
-                change_id,
-                change.branch_name
-            );
-        }
-        Ok(())
+        let lookup = find_worktree_for_branch(&repo_root, &change.branch_name).await;
+        settle_discarded_branch(&repo_root, &change.branch_name, change_id, lookup).await
     }
 
     /// Revert a previously applied change by reverting its commits.

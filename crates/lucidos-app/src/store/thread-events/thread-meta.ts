@@ -277,6 +277,16 @@ export type ThreadMeta = {
    *  per render) so the prompt-bar indicator doesn't walk the events Map on
    *  every threadMap flush — see `TodoListIndicator`. */
   latestTodoList: TodoItem[] | null;
+  /** The *todo notes* written with that list, or `null` when it carried none.
+   *  Replaced with the items on every `TodoListWritten`, so it can never
+   *  outlive the list it was written against. Almost always absent: notes are
+   *  ADR 0085's *context mode*, which is off by default.
+   *
+   *  Optional where `latestTodoList` is required, because absent and `null`
+   *  say the same thing here and every reader takes `?? null`. Requiring it
+   *  would have every hand-built `ThreadMeta` fixture declare "no notes" for
+   *  a field almost none of them will ever have. */
+  latestTodoNotes?: string | null;
   /** Live *event waits* on this thread, oldest first, with each one's reason,
    *  subscription and deadline. This is what the always-visible subscription
    *  indicator renders, and the only surface answering "what is this thread
@@ -386,6 +396,7 @@ export function makeOptimisticThreadState(opts: {
       codingAgent: opts.codingAgent,
       state: opts.state ?? 'active',
       latestTodoList: null,
+      latestTodoNotes: null,
       liveEventWaits: [],
     },
     events: new Map(),

@@ -1,7 +1,7 @@
 /**
  * The turn's collapse control never brightens; the two beside it do.
  *
- * All three response-header controls report `aria-pressed`, and one rule keys
+ * All three turn controls report `aria-pressed`, and one rule keys
  * the brightened "on" look off that attribute. Bright means "on, and you are
  * seeing MORE" for the transcript-wide pair, whose off state looks like nothing
  * at all: a turn drawing no steps is indistinguishable from a turn whose steps
@@ -10,6 +10,10 @@
  * 0.125rem from the two it contradicts, and reporting a state nothing is
  * hiding: the turn underneath has become a `⋯` stub. Reported as "weird that it
  * toggles between gray and white".
+ *
+ * The rule reaches the INITIATOR header's lone collapse control too, since both
+ * headers put their controls in a `.turn-controls` run. It has to keep missing
+ * it there for the same reason.
  *
  * So it carries its state in its GLYPH instead (the arrowheads turn around,
  * pinned in components/chat/__tests__/turn-controls.test.tsx), and the
@@ -32,11 +36,13 @@ import { dirname, resolve } from 'node:path';
 import { rulesTargeting } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const css: string = readFileSync(resolve(here, '../chat/response.css'), 'utf8');
+// The run's rules live with the actor/executor chip they are measured against,
+// which both headers share, rather than with either header.
+const css: string = readFileSync(resolve(here, '../chat/input-messages.css'), 'utf8');
 
-/** Rules that colour a `.response-controls` icon button by its pressed state. */
+/** Rules that colour a `.turn-controls` icon button by its pressed state. */
 const pressedRules = rulesTargeting(css, 'icon-btn').filter(
-  (r) => r.selector.includes('response-controls')
+  (r) => r.selector.includes('turn-controls')
     && r.selector.includes('aria-pressed="true"')
     && r.props.has('color'),
 );
@@ -57,7 +63,7 @@ describe('turn control brightness', () => {
       expect(
         rule.selector,
         `"${rule.selector}" lights the collapse control; it states its state by turning its arrows around`,
-      ).toContain(':not(.response-control-turn)');
+      ).toContain(':not(.turn-control-collapse)');
     }
   });
 
@@ -66,13 +72,13 @@ describe('turn control brightness', () => {
     // control is shared, so it still reads as one of three icons in a row
     // rather than as a disabled or differently-skinned button.
     const shared = rulesTargeting(css, 'icon-btn').filter(
-      (r) => r.selector.includes('response-controls') && !r.selector.includes('aria-pressed'),
+      (r) => r.selector.includes('turn-controls') && !r.selector.includes('aria-pressed'),
     );
     const colours = shared.filter((r) => r.props.has('color'));
     expect(colours.length, 'no base/hover colour rules found').toBeGreaterThan(0);
     for (const rule of colours) {
       expect(rule.selector, `"${rule.selector}" singles the collapse control out`)
-        .not.toContain('response-control-turn');
+        .not.toContain('turn-control-collapse');
     }
   });
 });

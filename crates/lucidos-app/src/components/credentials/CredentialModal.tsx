@@ -21,6 +21,7 @@ import type { AuthType, CredentialInfo, CredentialRequest, EmailAccountInfo, Loa
 import { getCredentialValue, getEmailAccount } from '../../api/client';
 import type { UpdateCredentialBody } from '../../api/client/settings';
 import { Dropdown } from '../shared/Dropdown';
+import { copyToClipboard } from '../../utils/clipboard';
 import { SecretInput } from '../shared/SecretInput';
 import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
@@ -305,13 +306,8 @@ function CredentialFormInner({
     setUserinfoMethod(row.userinfo_method ?? 'GET');
   }
 
-  async function copyRedirectUri() {
-    try {
-      await navigator.clipboard.writeText(redirectUri);
-      showToast('Redirect URI copied to clipboard', 'success');
-    } catch {
-      showToast('Failed to copy the redirect URI to clipboard', 'error');
-    }
+  function copyRedirectUri() {
+    copyToClipboard(redirectUri, 'Redirect URI copied to clipboard');
   }
 
   const serviceRef = useRef<HTMLInputElement>(null);

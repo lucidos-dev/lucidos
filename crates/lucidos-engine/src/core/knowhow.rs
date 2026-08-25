@@ -121,7 +121,48 @@ fn derive_description(name: &str, body: &str) -> String {
     }
 }
 
+/// How deep a listing scan descends under a knowhow root.
+///
+/// Listing is what puts a doc in a thread's Know-how routing list, so every
+/// listed file costs tokens on every turn of every thread. A file below the
+/// cap is a *reference*: it belongs to the doc above it, and that doc names
+/// it. Resolution ignores the cap, so a reference still loads by its full id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnowhowListDepth {
+    /// `<name>.md` only, for `data/apps/<id>/knowhow/` and
+    /// `data/triggers/<slug>/knowhow/`. The app or the trigger is already the
+    /// group, so a folder inside those roots holds references.
+    FilesOnly,
+    /// `<name>.md` and `<group>/<name>.md`, for `data/knowhow/` and the shared
+    /// `~/.lucidos/knowhow/`. One group folder deep is still a doc.
+    FilesAndGroups,
+    /// Every `.md` at any depth. Engine-shipped `system-knowhow/` only, where
+    /// the whole tree is the catalog.
+    Unbounded,
+}
+
+impl KnowhowListDepth {
+    /// Path components a listed file may have below the root, its own name
+    /// included. So 1 is the files sitting directly in the root.
+    fn levels(self) -> usize {
+        match self {
+            Self::FilesOnly => 1,
+            Self::FilesAndGroups => 2,
+            Self::Unbounded => usize::MAX,
+        }
+    }
+}
+
+/// Every `.md` under `dir`, at any depth. A caller building a *listing* takes
+/// [`collect_md_files_within`] instead, so a doc's supporting references never
+/// take a row of their own.
 pub(crate) fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
+    collect_md_files_within(dir, usize::MAX)
+}
+
+/// Every `.md` within `levels` path components of `dir`, its own name
+/// included. `levels` of 1 collects the files sitting directly in `dir`.
+fn collect_md_files_within(dir: &Path, levels: usize) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -145,7 +186,9 @@ pub(crate) fn collect_md_files(dir: &Path) -> Vec<PathBuf> {
     for entry in sorted {
         let path = entry.path();
         if path.is_dir() {
-            files.extend(collect_md_files(&path));
+            if levels > 1 {
+                files.extend(collect_md_files_within(&path, levels - 1));
+            }
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             files.push(path);
         }
@@ -162,15 +205,17 @@ pub(crate) fn id_from_path(root: &Path, path: &Path) -> Option<String> {
 }
 
 impl KnowhowStore {
-    /// Load name + description for all know-how files recursively (cheap, loaded at startup)
-    pub fn load_summaries(knowhow_dir: &Path) -> Vec<KnowhowSummary> {
+    /// Load name + description for the docs a root lists (cheap, loaded at
+    /// startup). `depth` states which files that root counts as docs; see
+    /// [`KnowhowListDepth`].
+    pub fn load_summaries(knowhow_dir: &Path, depth: KnowhowListDepth) -> Vec<KnowhowSummary> {
         let mut summaries = Vec::new();
 
         if !knowhow_dir.exists() {
             return summaries;
         }
 
-        for path in collect_md_files(knowhow_dir) {
+        for path in collect_md_files_within(knowhow_dir, depth.levels()) {
             let id = match id_from_path(knowhow_dir, &path) {
                 Some(id) => id,
                 None => continue,
@@ -206,13 +251,19 @@ impl KnowhowStore {
     /// exists for the slug. IDs are bare filenames (no slug prefix in
     /// the id; the trigger system prompt section labels them by slug
     /// separately, mirroring `load_app_summaries`).
+    ///
+    /// The trigger is already the group, so a folder in its knowhow dir holds
+    /// a doc's references and is not listed.
     pub fn load_trigger_summaries(triggers_dir: &Path, slug: &str) -> Vec<KnowhowSummary> {
         let kh_dir = triggers_dir.join(slug).join("knowhow");
-        Self::load_summaries(&kh_dir)
+        Self::load_summaries(&kh_dir, KnowhowListDepth::FilesOnly)
     }
 
     /// Load know-how summaries from all app knowhow/ subdirectories.
     /// Returns (app_id, summary) pairs for each app that has knowhow files.
+    ///
+    /// The app is already the group, so a folder in its knowhow dir holds a
+    /// doc's references and is not listed.
     pub fn load_app_summaries(apps_dir: &Path) -> Vec<(String, KnowhowSummary)> {
         let mut results = Vec::new();
         if !apps_dir.exists() {
@@ -237,7 +288,7 @@ impl KnowhowStore {
                 None => continue,
             };
             let kh_dir = entry.path().join("knowhow");
-            let summaries = Self::load_summaries(&kh_dir);
+            let summaries = Self::load_summaries(&kh_dir, KnowhowListDepth::FilesOnly);
             for s in summaries {
                 results.push((app_id.clone(), s));
             }
@@ -247,16 +298,22 @@ impl KnowhowStore {
 
     /// Load summaries from shared and local directories, deduplicating by ID.
     /// Priority (highest wins): local > shared.
+    ///
+    /// Both are top-level roots, so a group folder inside them still holds
+    /// docs (`lucidos-ops/release-process`) and anything deeper is a
+    /// reference. This is the one catalog: the Know-how routing list, the
+    /// `/api/v1/knowhow` listing and `lucidos knowhow list` all read it, so
+    /// they cannot disagree about what a doc is.
     pub fn load_merged_summaries(dirs: &KnowhowDirs) -> Vec<KnowhowSummary> {
         let mut by_id: HashMap<String, KnowhowSummary> = HashMap::new();
 
         if let Some(shared) = &dirs.shared {
-            for s in Self::load_summaries(shared) {
+            for s in Self::load_summaries(shared, KnowhowListDepth::FilesAndGroups) {
                 by_id.insert(s.id.clone(), s);
             }
         }
 
-        for s in Self::load_summaries(&dirs.local) {
+        for s in Self::load_summaries(&dirs.local, KnowhowListDepth::FilesAndGroups) {
             by_id.insert(s.id.clone(), s);
         }
 
@@ -475,6 +532,10 @@ pub fn is_not_found_body(body: &str) -> bool {
 
 /// Load all know-how files from an app's knowhow/ subdirectory (recursively).
 /// Returns formatted sections for injection into the system prompt, or empty string if none found.
+///
+/// Recursive on purpose. This injects bodies into an executing app intent
+/// rather than building a routing list, so [`KnowhowListDepth`] does not
+/// apply. A reference folder here reaches that prompt whole.
 pub fn load_app_knowhow(knowhow_dir: &Path) -> String {
     if !knowhow_dir.exists() {
         return String::new();

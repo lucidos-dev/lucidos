@@ -2,11 +2,13 @@ import { signal } from '@preact/signals';
 import type { Loadable } from '../types';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { DeviceInfo } from '../../api/types';
-import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, setPreference } from '../../api/client';
+import { registerDevice as apiRegisterDevice, listDevices as apiListDevices, renameDevice as apiRenameDevice, setDevicePush as apiSetDevicePush, deleteDevice as apiDeleteDevice, handOverDevice, setPreference } from '../../api/client';
+import { pairingSession } from '../../api/client/pairing';
 import { showToast, showConfirm } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
+import { postClientLog } from '../../utils/clientLog';
 import { isTauri, registrationUserAgent } from '../../utils/platform';
-import { getOrCreateDeviceId } from '../../utils/tauri';
+import { getOrCreateDeviceId, previousDeviceId, rememberDeviceId } from '../../utils/tauri';
 import { generateUuid } from '../../utils/uuid';
 // The key is owned by the leaf that also builds the request header, so the id
 // this module mints and the id every API call sends cannot drift apart.
@@ -15,6 +17,32 @@ import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 /** Upper bound on the native-store reconcile so a wedged IPC can't hold the boot
  *  splash — past it, boot proceeds on the existing localStorage value. */
 const NATIVE_DEVICE_ID_TIMEOUT_MS = 1500;
+
+/** Upper bound on the gateway-identity adoption, for the same reason and with a
+ *  wider window: it is a loopback HTTP round trip rather than an IPC call, and
+ *  a migration load spends a second one on the hand-over.
+ *
+ *  Bounded because this is the first await every client pays on boot, browser
+ *  and PWA included. A gateway that accepts the connection and stalls would
+ *  hold the splash forever. Timing out costs only a page load, since nothing
+ *  commits until the row has moved. */
+const GATEWAY_DEVICE_ID_TIMEOUT_MS = 4000;
+
+/** Race `work` against `ms`, resolving to `onTimeout` if it wins.
+ *
+ *  Clears the timer either way, so a resolved boot step does not keep the event
+ *  loop warm for the rest of the window. */
+async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(onTimeout), ms);
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
 
@@ -100,6 +128,104 @@ export async function reconcileDesktopDeviceId(workspace: string): Promise<void>
   });
   await Promise.race([reconcile, timeout]);
   if (timer) clearTimeout(timer);
+}
+
+/**
+ * Take the device id the *workspace gateway* authenticated us as, and move this
+ * workspace's row onto it.
+ *
+ * One identity instead of two. The gateway already minted an id when this
+ * browser paired, and the engine keys push, preferences and attribution on
+ * whatever `x-lucidos-device-id` says. Writing the gateway's id into the same
+ * `localStorage` slot keeps every synchronous `getDeviceId()` caller unchanged.
+ *
+ * Returns whether a gateway answered. `false` means nothing was adopted, and
+ * the `localStorage` id stays authoritative: reaching an engine port directly
+ * there is no paired-devices list either, so nothing can be confused with it.
+ *
+ * Every write happens AFTER `handOver` resolves, so a failure forgets nothing
+ * and the next load retries. `handOver` must REJECT for that to hold, which is
+ * why the engine answers a failed transaction with a 500. Rationale in
+ * `docs/plans/2026-08-22-one-device-identity-minted-at-the-gateway.md`.
+ *
+ * Pure/injectable, so every branch is testable without a DOM or a gateway.
+ */
+export async function adoptGatewayDeviceIdentity(deps: {
+  session: () => Promise<{ device_id?: string }>;
+  storage: Pick<Storage, 'getItem' | 'setItem'>;
+  handOver: (oldId: string, newId: string) => Promise<unknown>;
+  /** Desktop only, and READ-ONLY: the id this window last used. A reinstall
+   *  empties `localStorage`, so this is the only memory left. */
+  previousId?: () => Promise<string | null>;
+  /** Desktop only: commit the new id natively, once the row has moved. */
+  remember?: (id: string) => Promise<unknown>;
+}): Promise<boolean> {
+  const { session, storage, handOver, previousId, remember } = deps;
+  const gatewayId = (await session()).device_id?.trim();
+  if (!gatewayId) return false;
+
+  const stored = storage.getItem(DEVICE_ID_KEY);
+  // The steady state, on every load after the first. Nothing to read, move or
+  // write, so it costs one comparison.
+  if (stored === gatewayId) return true;
+
+  // This webview's own last id is the more direct answer, so it wins. The
+  // native store is consulted only when storage has been emptied under us.
+  const previous = stored ?? (previousId ? await previousId() : null);
+  if (previous && previous !== gatewayId) {
+    await handOver(previous, gatewayId);
+  }
+  storage.setItem(DEVICE_ID_KEY, gatewayId);
+  if (remember) await remember(gatewayId);
+  return true;
+}
+
+/**
+ * Production entry for the adoption above. Returns whether the gateway named
+ * us, so the caller knows whether the desktop native reconcile still applies.
+ *
+ * Best-effort in the telemetry sense (`.claude/rules/frontend.md`): it runs on
+ * every load with no user intent behind it. A failure re-runs on the next one,
+ * because nothing is committed until the hand-over lands. A toast here would
+ * fire on every direct-engine page load, where no gateway is meant to answer.
+ */
+export async function adoptGatewayDeviceId(workspace: string | null): Promise<boolean> {
+  const onDesktop = isTauri() && workspace !== null;
+  const adopt = (async () => {
+    try {
+      return await adoptGatewayDeviceIdentity({
+        session: pairingSession,
+        storage: localStorage,
+        handOver: async (oldId, newId) => {
+          try {
+            await handOverDevice(oldId, newId);
+          } catch (e) {
+            // Telemetry carve-out (`.claude/rules/frontend.md`). Boot runs this
+            // with no user intent and the next load retries it, so a toast
+            // would fire on a hiccup nobody asked about. A toast is also the
+            // wrong surface for the failure that matters: a hand-over refused
+            // on EVERY load strands the migration, and that reached the user as
+            // two rows per device rather than as an error. The breadcrumb puts
+            // it in `engine.log`, where it is greppable without a console.
+            postClientLog('devices', 'hand_over_failed', {
+              old_device_id: oldId,
+              device_id: newId,
+              reason: errorDetail(e),
+            });
+            throw e;
+          }
+        },
+        previousId: onDesktop ? () => previousDeviceId(workspace) : undefined,
+        remember: onDesktop ? (id) => rememberDeviceId(workspace, id) : undefined,
+      });
+    } catch (e) {
+      console.warn('[Devices] could not adopt the gateway device id', e);
+      return false;
+    }
+  })();
+  // `false` on a timeout, which is honest: nothing was adopted, and on desktop
+  // it lets the native reconcile answer instead.
+  return withDeadline(adopt, GATEWAY_DEVICE_ID_TIMEOUT_MS, false);
 }
 
 /** This page load's registration attempt, resolving when it has settled either

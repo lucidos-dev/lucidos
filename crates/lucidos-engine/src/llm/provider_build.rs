@@ -1,6 +1,6 @@
 //! Build the engine's active `Arc<dyn LlmProvider>` from current credentials,
 //! preferences, and env — the single construction path shared by startup
-//! (`main.rs`) and the runtime credential subscriber (`spawn_provider_credential_subscriber`).
+//! (`main.rs`) and the runtime config subscriber (`spawn_provider_config_subscriber`).
 //!
 //! The decision of *which* provider to install lives in
 //! [`crate::llm::select_provider`] (unit-tested matrix); this module resolves
@@ -10,6 +10,7 @@
 
 use crate::core::{
     AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
+    PREF_OPENCODE_FREE_ENABLED,
 };
 use crate::llm::web_search::{
     AnthropicServerToolSearch, OpenAiResponsesSearch, VertexGroundingSearch, WebSearchChain,
@@ -19,8 +20,8 @@ use crate::llm::{
     resolve_anthropic_auth, resolve_bearer_key, resolve_openai_api_key, select_provider,
     AnthropicAuth, AnthropicAuthSource, AnthropicProvider, LlmProvider, OpenAiKeySource,
     OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingProvider,
-    UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL,
-    XAI_BASE_URL,
+    UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL, OPENCODE_FREE_BASE_URL,
+    OPENROUTER_BASE_URL, XAI_BASE_URL,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -32,19 +33,30 @@ use std::sync::Arc;
 pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 5] =
     ["openai", "anthropic", "openrouter", "xai", "local"];
 
+/// Preference keys that, when changed, change which LLM provider is installed.
+/// The same subscriber that watches [`PROVIDER_CREDENTIAL_SERVICES`] filters on
+/// this set, so a provider configured by a preference hot-swaps exactly like one
+/// configured by a credential. `opencode-free` has no credential at all, and the
+/// local base URL used to need a restart.
+pub const PROVIDER_PREFERENCE_KEYS: [&str; 2] = [PREF_OPENCODE_FREE_ENABLED, PREF_LOCAL_BASE_URL];
+
 /// Whether `LUCIDOS_BOOT_WITHOUT_PROVIDER` is truthy — a packaged build lets the
 /// engine boot (into `UnconfiguredProvider`) before any provider is configured,
 /// instead of the dev/docker fail-fast panic. Read in both `main.rs` (boot) and
 /// the subscriber (so a runtime swap-back to unconfigured mirrors boot).
 pub fn boot_without_provider_enabled() -> bool {
     std::env::var("LUCIDOS_BOOT_WITHOUT_PROVIDER")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| reads_as_true(&v))
         .unwrap_or(false)
+}
+
+/// Whether a preference or env string reads as on. One spelling of truth for
+/// every boolean switch this module resolves.
+fn reads_as_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Inputs the active-provider build needs beyond the DB pool. Fixed at boot
@@ -98,6 +110,7 @@ struct DirectProviders {
     anthropic: Option<AnthropicProvider>,
     openrouter: Option<OpenAiProvider>,
     xai: Option<OpenAiProvider>,
+    opencode_free: Option<OpenAiProvider>,
     local: Option<OpenAiProvider>,
     /// Search backends in chain order — Anthropic before OpenAI. Vertex is
     /// prepended by the caller, which owns the Vertex config.
@@ -135,6 +148,7 @@ async fn resolve_direct_providers(
             std::env::var("LUCIDOS_XAI_API_KEY").ok(),
             default_model,
         );
+        let opencode_free = build_opencode_free_provider(None, default_model);
         let local = build_local_provider(None, None, default_model);
         // Same chain order as the DB-up path below: Anthropic, then OpenAI.
         let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
@@ -147,6 +161,7 @@ async fn resolve_direct_providers(
             anthropic,
             openrouter,
             xai,
+            opencode_free,
             local,
             search_backends,
         };
@@ -212,6 +227,20 @@ async fn resolve_direct_providers(
         default_model,
     );
 
+    // OpenCode Free: a preference, not a credential. Nothing is read from the
+    // credential store here, and nothing is sent as a bearer.
+    let opencode_free_pref = match PreferenceStore::get(pool, PREF_OPENCODE_FREE_ENABLED).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to read opencode_free_enabled preference: {}",
+                e
+            );
+            None
+        }
+    };
+    let opencode_free = build_opencode_free_provider(opencode_free_pref, default_model);
+
     // Local OpenAI-compatible: base URL from the `local_base_url` pref (env /
     // default applied inside the builder) and an optional `local` credential.
     let local_base_pref = match PreferenceStore::get(pool, PREF_LOCAL_BASE_URL).await {
@@ -245,6 +274,7 @@ async fn resolve_direct_providers(
         anthropic,
         openrouter,
         xai,
+        opencode_free,
         local,
         search_backends,
     }
@@ -402,6 +432,7 @@ pub async fn build_active_provider(
         anthropic,
         openrouter,
         xai,
+        opencode_free,
         local,
         search_backends,
     } = resolve_direct_providers(
@@ -421,6 +452,7 @@ pub async fn build_active_provider(
         has_anthropic: anthropic.is_some(),
         has_openrouter: openrouter.is_some(),
         has_xai: xai.is_some(),
+        has_opencode_free: opencode_free.is_some(),
         has_local: local.is_some(),
         boot_without_provider: ctx.boot_without_provider,
     });
@@ -486,6 +518,7 @@ pub async fn build_active_provider(
             anthropic,
             openrouter,
             xai,
+            opencode_free,
             local,
             ctx.model_registry.clone(),
             ctx.default_model.clone(),
@@ -642,6 +675,70 @@ fn build_bearer_openai_compatible(
     }
 }
 
+/// The headers the keyless provider sends on every request.
+///
+/// Attribution follows OpenRouter's convention, which the relay honours. The
+/// User-Agent names Lucidos: some free models are gated to another client's
+/// User-Agent, and impersonating it is not an option we take. Split out from
+/// the builder so the list itself is unit-testable.
+fn opencode_free_headers() -> Vec<(String, String)> {
+    vec![
+        (
+            "HTTP-Referer".to_string(),
+            "https://lucidos.dev".to_string(),
+        ),
+        ("X-Title".to_string(), "Lucidos".to_string()),
+        (
+            "User-Agent".to_string(),
+            format!("Lucidos/{}", env!("CARGO_PKG_VERSION")),
+        ),
+    ]
+}
+
+/// Build the keyless OpenCode Free provider, or `None` when the tier is off.
+///
+/// Opt-in through the `opencode_free_enabled` preference, with
+/// `LUCIDOS_OPENCODE_FREE` as the launch env fallback. Off by default, so a
+/// workspace that never asked for it is unaffected.
+///
+/// Three things are deliberate. The key is empty, so no `Authorization` header
+/// is sent: the relay rejects a bearer it does not recognise. The attribution
+/// headers follow OpenRouter's convention, which the relay honours. The
+/// User-Agent names Lucidos, because some free models are gated to another
+/// client's User-Agent and impersonating it is not an option we take.
+fn build_opencode_free_provider(
+    enabled_pref: Option<String>,
+    default_model: &str,
+) -> Option<OpenAiProvider> {
+    let enabled = enabled_pref
+        .map(|v| reads_as_true(&v))
+        .or_else(|| {
+            std::env::var("LUCIDOS_OPENCODE_FREE")
+                .ok()
+                .map(|v| reads_as_true(&v))
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+    match OpenAiProvider::new_with_base_url(
+        String::new(),
+        default_model.to_string(),
+        OPENCODE_FREE_BASE_URL,
+        opencode_free_headers(),
+        true,
+    ) {
+        Ok(p) => {
+            crate::log!("[Startup] OpenCode Free provider configured (keyless)");
+            Some(p)
+        }
+        Err(e) => {
+            crate::log!("[Startup] Failed to build OpenCode Free provider: {}", e);
+            None
+        }
+    }
+}
+
 /// Build the local OpenAI-compatible provider (Ollama / LM Studio / vLLM /
 /// llama.cpp). Opt-in: only built when the user signalled local use via the
 /// `local_base_url` preference (`base_url_pref`), a `local` credential
@@ -697,7 +794,7 @@ fn build_local_provider(
 mod tests {
     use super::*;
     use crate::test_support::{
-        delete_credential, seed_credential, setup_test_db, teardown_test_db,
+        delete_credential, seed_credential, seed_preference, setup_test_db, teardown_test_db,
     };
 
     /// Build a non-mock context with no Vertex and the boot-without-provider gate
@@ -750,6 +847,7 @@ mod tests {
             || std::env::var("LUCIDOS_XAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_LOCAL_BASE_URL").is_ok()
             || std::env::var("LUCIDOS_LOCAL_API_KEY").is_ok()
+            || std::env::var("LUCIDOS_OPENCODE_FREE").is_ok()
             || crate::llm::openai::codex_detect::load().is_some()
     }
 
@@ -995,6 +1093,73 @@ mod tests {
             "an xai credential must build + report the xai backend"
         );
         teardown_test_db(&db).await;
+    }
+
+    /// The keyless tier is installed by a preference alone, with no credential
+    /// anywhere. It is also the one provider that must never be reachable by
+    /// accident, so the off case is asserted in the same test.
+    #[tokio::test]
+    async fn the_free_tier_is_configured_by_its_preference_and_never_a_credential() {
+        let (pool, db) = setup_test_db().await;
+        let ctx = unconfigured_ctx(true);
+
+        // Default (unset) leaves it out of the configured set.
+        let (provider, _) = install(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        assert!(
+            !provider
+                .configured_providers()
+                .expect("a provider set is reported")
+                .contains(&crate::llm::ProviderKind::OpenCodeFree),
+            "the free tier must be off until the user turns it on"
+        );
+
+        seed_preference(&pool, PREF_OPENCODE_FREE_ENABLED, "true")
+            .await
+            .unwrap();
+        let (provider, selection) =
+            install(build_active_provider(Some(&pool), &ctx).await.unwrap());
+        assert_eq!(selection, ProviderSelection::Real);
+        assert!(
+            provider
+                .configured_providers()
+                .expect("routing provider reports a set")
+                .contains(&crate::llm::ProviderKind::OpenCodeFree),
+            "the preference alone must build and report the keyless backend"
+        );
+
+        // No credential service exists for it, so nothing can be stored and
+        // nothing can be sent as a bearer.
+        assert!(
+            !PROVIDER_CREDENTIAL_SERVICES.contains(&"opencode-free"),
+            "the keyless tier must have no credential service"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// Lucidos identifies itself and nobody else. The relay gates `big-pickle`
+    /// on the OpenCode CLI's own User-Agent, so the tempting fix for a 429 is
+    /// to borrow it. This pins the honest header instead, and pins that the
+    /// attribution list carries no credential.
+    #[test]
+    fn the_keyless_headers_name_lucidos_and_carry_no_credential() {
+        let headers = opencode_free_headers();
+        let ua = headers
+            .iter()
+            .find(|(n, _)| n == "User-Agent")
+            .map(|(_, v)| v.as_str())
+            .expect("the keyless provider states a User-Agent");
+        assert!(ua.starts_with("Lucidos/"), "{ua}");
+        assert!(
+            !headers.iter().any(|(n, _)| n == "Authorization"),
+            "the relay rejects a bearer, so none may be built"
+        );
+        for (name, value) in &headers {
+            let lower = value.to_ascii_lowercase();
+            assert!(
+                !lower.contains("opencode") && !lower.contains("hermes"),
+                "{name} names another client: {value}"
+            );
+        }
     }
 
     /// Web search resolves over the CONFIGURED PROVIDER SET, not the chat

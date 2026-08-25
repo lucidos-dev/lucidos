@@ -60,8 +60,8 @@ stop_workspace() {
     gw_port="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
     slug="$(workspace_slug)"
     if [ -n "$gw_pid" ] && kill -0 "$gw_pid" 2>/dev/null; then
-        if curl -sk -X POST "https://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1 \
-           || curl -s -X POST "http://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1; then
+        if gateway_curl -sk -X POST "https://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1 \
+           || gateway_curl -s -X POST "http://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1; then
             echo "Asked shared gateway to stop workspace '$slug' (gateway left running for peers)"
             stopped="1"
         fi

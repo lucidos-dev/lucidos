@@ -2,13 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   computeHeaderCollapse,
   iconsRowWidth,
+  mobileCollapseCount,
   type HeaderCollapseInput,
 } from './useHeaderActionCollapse';
 
 // Pins the progressive-collapse math for the DESKTOP content-pane header's
-// right icon cluster. There is no mobile counterpart to pin: that header
-// collapses every action unconditionally, so it has no math (see the hook, and
-// the reason in ContentHeaderActions).
+// right icon cluster, plus the one rule its mobile counterpart has. Mobile
+// measures nothing (see the hook, and the reason in ContentHeaderActions), so
+// its whole decision is the count function at the bottom of this file.
 //
 // Real-ish numbers at the default 16px root: every header action is a
 // 2.25rem (36px) .icon-btn.header-icon (so is the ⋯ trigger and the bell) and
@@ -260,6 +261,34 @@ describe('computeHeaderCollapse', () => {
       const { collapsed } = computeHeaderCollapse({ ...input, containerWidth: w });
       expect(collapsed).toBeGreaterThanOrEqual(prev);
       prev = collapsed;
+    }
+  });
+});
+
+// Mobile's whole decision, which reads no box at all.
+describe('mobileCollapseCount', () => {
+  it('folds a set of two or more, whatever the width', () => {
+    expect(mobileCollapseCount(2)).toBe(2);
+    expect(mobileCollapseCount(3)).toBe(3);
+    expect(mobileCollapseCount(4)).toBe(4);
+  });
+
+  it('leaves a LONE action on the row: ⋯ would stand in the same box', () => {
+    expect(mobileCollapseCount(1)).toBe(0);
+  });
+
+  it('has nothing to fold when the view carries no context actions', () => {
+    expect(mobileCollapseCount(0)).toBe(0);
+  });
+
+  it('never leaves more than one control before the bell', () => {
+    // The bound the centred cluster's edge reserve is sized against: whatever
+    // the count, the trailing cluster is the ⋯ trigger or one action, plus the
+    // bell. Two icon boxes, never three.
+    for (let n = 0; n <= 6; n++) {
+      const collapsed = mobileCollapseCount(n);
+      const standing = n - collapsed + (collapsed > 0 ? 1 : 0);
+      expect(standing, `${n} actions leave ${standing} controls`).toBeLessThanOrEqual(1);
     }
   });
 });

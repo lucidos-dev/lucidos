@@ -3,7 +3,7 @@ pub mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::core::{McpServer, McpServerStore};
 use crate::engine::context::{estimate_tokens_from_chars, tool_definitions_chars};
@@ -14,18 +14,65 @@ use types::McpTool;
 
 /// Running server state.
 struct RunningServer {
-    client: McpClient,
+    /// The stdio connection, locked per server. JSON-RPC over one pipe pair is
+    /// sequential, so two calls to ONE server take turns. Calls to different
+    /// servers never meet, and nothing but a call locks this.
+    client: Arc<Mutex<McpClient>>,
+    /// What the server advertised at connect, readable without the client
+    /// lock. A running server's manifest never changes, so this is the very
+    /// list `client.tools` holds. Keeping it out here is what lets tool
+    /// assembly read it while a call is in flight.
+    tools: Arc<[McpTool]>,
     /// The registry row as it stood when the process started, kept in step for
     /// the fields the request path reads: `auto_approve` and `disabled_tools`.
     /// `tools` on it is NOT maintained, because a running server's tools are
-    /// read off `client` and a stopped one's off a fresh DB row.
+    /// the snapshot above and a stopped one's come off a fresh DB row.
     server_config: McpServer,
+}
+
+/// What one dispatch takes off the registry, so the guard is released before
+/// anything waits on the server.
+///
+/// Deliberately not the whole [`RunningServer`]: only immutable handles and the
+/// two display values a call reports back. Whether a tool is switched off is a
+/// live read at dispatch, never a field of this.
+struct CallTarget {
+    client: Arc<Mutex<McpClient>>,
+    tools: Arc<[McpTool]>,
+    server_name: String,
+    auto_approve: bool,
+}
+
+impl RunningServer {
+    fn target(&self) -> CallTarget {
+        CallTarget {
+            client: Arc::clone(&self.client),
+            tools: Arc::clone(&self.tools),
+            server_name: self.server_config.name.clone(),
+            auto_approve: self.server_config.auto_approve,
+        }
+    }
+}
+
+/// What the model is told when it calls a tool the user switched off.
+fn disabled_tool_refusal(server_id: &str, wire_name: &str) -> String {
+    format!(
+        "MCP tool '{}' is switched off for server '{}' and was NOT run. \
+         Do not retry it. Tell the user it is disabled, and let them \
+         re-enable it in Settings if they want it back.",
+        wire_name, server_id
+    )
 }
 
 /// Manages MCP server lifecycle: start, stop, tool discovery, tool calls.
 pub struct McpManager {
     /// Currently running servers keyed by server id.
-    running: Arc<Mutex<HashMap<String, RunningServer>>>,
+    ///
+    /// The guard covers map work only, never an await into a server process.
+    /// It used to be held across the tool call itself. One slow server then
+    /// stalled tool assembly for every thread in the workspace, and two
+    /// servers could never work at once.
+    running: Arc<RwLock<HashMap<String, RunningServer>>>,
     pool: sqlx::PgPool,
     /// Registry mutations announce through here. Held rather than passed per
     /// call because `McpServerStore`'s mutators require it: registering a
@@ -186,7 +233,7 @@ pub enum McpStopOutcome {
 impl McpManager {
     pub fn new(pool: sqlx::PgPool, event_bus: crate::engine::event_bus::EventBus) -> Self {
         Self {
-            running: Arc::new(Mutex::new(HashMap::new())),
+            running: Arc::new(RwLock::new(HashMap::new())),
             pool,
             event_bus,
         }
@@ -254,13 +301,14 @@ impl McpManager {
         &self,
         server: &McpServer,
     ) -> Result<McpStartOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        {
-            let running = self.running.lock().await;
-            if let Some(entry) = running.get(&server.id) {
-                return Ok(McpStartOutcome::AlreadyRunning {
-                    tool_count: entry.client.tools.len(),
-                });
-            }
+        let already_running = self
+            .running
+            .read()
+            .await
+            .get(&server.id)
+            .map(|entry| entry.tools.len());
+        if let Some(tool_count) = already_running {
+            return Ok(McpStartOutcome::AlreadyRunning { tool_count });
         }
 
         let tool_count = self.start_server_internal(server).await?;
@@ -287,12 +335,18 @@ impl McpManager {
         crate::core::mcp_servers::validate_server_id(&server.id)?;
         // MCP servers are invoked as part of LLM tool calls today, so default to Agent.
         // If engine-internal MCP usage is added, that call site should pass ActorMode::Engine.
-        let client =
-            McpClient::connect(&server.command, &server.args, &server.env, ActorMode::Agent)
-                .await?;
-        let tool_count = client.tools.len();
+        let client = McpClient::connect(
+            &server.id,
+            &server.command,
+            &server.args,
+            &server.env,
+            ActorMode::Agent,
+        )
+        .await?;
+        let tools = Arc::clone(&client.tools);
+        let tool_count = tools.len();
 
-        if let Err(e) = McpServerStore::set_tools(&self.pool, &server.id, &client.tools).await {
+        if let Err(e) = McpServerStore::set_tools(&self.pool, &server.id, &tools).await {
             // The server IS up, so this is not a start failure. It only means
             // the page will keep quoting the previous manifest.
             log!(
@@ -302,11 +356,11 @@ impl McpManager {
             );
         }
 
-        let mut running = self.running.lock().await;
-        running.insert(
+        self.running.write().await.insert(
             server.id.clone(),
             RunningServer {
-                client,
+                client: Arc::new(Mutex::new(client)),
+                tools,
                 server_config: server.clone(),
             },
         );
@@ -315,16 +369,24 @@ impl McpManager {
     }
 
     /// Stop a running server.
+    ///
+    /// The entry leaves the registry first, and the process is killed after the
+    /// guard is gone: a shutdown waits on the process, and nothing else may
+    /// queue behind that.
     pub async fn stop_server(
         &self,
         id: &str,
     ) -> Result<McpStopOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let mut running = self.running.lock().await;
-        match running.remove(id) {
-            Some(mut entry) => {
-                entry.client.shutdown().await;
+        let removed = self.running.write().await.remove(id);
+        match removed {
+            Some(RunningServer {
+                client,
+                server_config,
+                ..
+            }) => {
+                client.lock().await.shutdown().await;
                 Ok(McpStopOutcome::Stopped {
-                    name: entry.server_config.name,
+                    name: server_config.name,
                 })
             }
             None => Ok(McpStopOutcome::WasNotRunning),
@@ -343,11 +405,9 @@ impl McpManager {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         // Stop first. Deleting the row while the process runs would leave it
         // orphaned, with nothing left that names it.
-        {
-            let mut running = self.running.lock().await;
-            if let Some(mut entry) = running.remove(id) {
-                entry.client.shutdown().await;
-            }
+        let removed = self.running.write().await.remove(id);
+        if let Some(entry) = removed {
+            entry.client.lock().await.shutdown().await;
         }
 
         McpServerStore::unregister(&self.pool, &self.event_bus, id, actor).await
@@ -374,7 +434,7 @@ impl McpManager {
         // `get_tool_definitions` reads. Without this a tool switched off while
         // the server is up keeps riding every request until the next restart.
         if let Some(stored) = &stored {
-            let mut running = self.running.lock().await;
+            let mut running = self.running.write().await;
             if let Some(entry) = running.get_mut(id) {
                 entry.server_config.disabled_tools = stored.clone();
             }
@@ -393,14 +453,14 @@ impl McpManager {
         &self,
     ) -> Result<Vec<McpServerStatus>, Box<dyn std::error::Error + Send + Sync>> {
         let servers = McpServerStore::list(&self.pool).await?;
-        let running = self.running.lock().await;
+        let running = self.running.read().await;
 
         Ok(servers
             .into_iter()
             .map(|server| {
                 let running_entry = running.get(&server.id);
                 let (tools, tools_source) = match running_entry {
-                    Some(entry) => (entry.client.tools.as_slice(), McpToolsSource::Live),
+                    Some(entry) => (&*entry.tools, McpToolsSource::Live),
                     None if server.tools_observed_at.is_none() => {
                         (&[][..], McpToolsSource::NeverObserved)
                     }
@@ -412,22 +472,64 @@ impl McpManager {
     }
 
     /// Set auto_approve for a server.
+    /// `actor` is the device that asked. Auto-approve decides whether this
+    /// server's tool calls prompt at all. The `McpServerUpdated` row is
+    /// therefore the audit trail for a widened grant, and it named nobody: the
+    /// actor was hardcoded `None` here.
     pub async fn set_auto_approve(
         &self,
         id: &str,
         auto_approve: bool,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        McpServerStore::set_auto_approve(&self.pool, &self.event_bus, id, auto_approve, None)
+        McpServerStore::set_auto_approve(&self.pool, &self.event_bus, id, auto_approve, actor)
             .await?;
 
         // Update in-memory config too
-        let mut running = self.running.lock().await;
+        let mut running = self.running.write().await;
         if let Some(entry) = running.get_mut(id) {
             entry.server_config.auto_approve = auto_approve;
         }
 
         let action = if auto_approve { "enabled" } else { "disabled" };
         Ok(format!("Auto-approve {} for MCP server '{}'.", action, id))
+    }
+
+    /// Why this call must not reach the process, or `None` to go ahead.
+    ///
+    /// Read live off the registry, never off a snapshot. Every condition here
+    /// is the user's, and every one can move while the call waits its turn: a
+    /// call can sit on the client lock for the whole MCP timeout. Answering
+    /// from what was true on arrival is how a Stop, a Remove or a switched-off
+    /// tool lands in that window and is ignored.
+    async fn dispatch_refusal(
+        &self,
+        server_id: &str,
+        wire_name: &str,
+        client: &Arc<Mutex<McpClient>>,
+    ) -> Option<String> {
+        let running = self.running.read().await;
+        let Some(entry) = running.get(server_id) else {
+            return Some(format!(
+                "MCP server '{}' was stopped or removed, so tool '{}' was NOT run. \
+                 Do not retry it. Tell the user, and let them start the server \
+                 again if they want it back.",
+                server_id, wire_name
+            ));
+        };
+        if !Arc::ptr_eq(&entry.client, client) {
+            return Some(format!(
+                "MCP server '{}' was restarted, so tool '{}' was NOT run: the \
+                 process it was called against is gone. Retry it.",
+                server_id, wire_name
+            ));
+        }
+        entry
+            .server_config
+            .disabled_tools
+            .iter()
+            .any(|d| d == wire_name)
+            .then(|| disabled_tool_refusal(server_id, wire_name))
     }
 
     /// Call an MCP tool. Starts the server on-demand if not running.
@@ -438,49 +540,57 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<(String, String, bool), Box<dyn std::error::Error + Send + Sync>> {
-        // Ensure server is running (on-demand start)
-        {
-            let running = self.running.lock().await;
-            if !running.contains_key(server_id) {
-                drop(running);
-                // Start the server
+        // Take a handle and let the registry go. Each lookup is its own
+        // statement so the guard is dropped at the semicolon: holding a read
+        // guard across the on-demand start below would deadlock against the
+        // write the start ends with.
+        let existing = self
+            .running
+            .read()
+            .await
+            .get(server_id)
+            .map(RunningServer::target);
+        let target = match existing {
+            Some(target) => target,
+            None => {
                 let server = McpServerStore::get(&self.pool, server_id)
                     .await?
                     .ok_or_else(|| format!("MCP server '{}' not found", server_id))?;
                 self.start_server_internal(&server).await?;
+                self.running
+                    .read()
+                    .await
+                    .get(server_id)
+                    .map(RunningServer::target)
+                    .ok_or_else(|| {
+                        format!("MCP server '{}' not running after start attempt", server_id)
+                    })?
             }
-        }
-
-        let mut running = self.running.lock().await;
-        let entry = running
-            .get_mut(server_id)
-            .ok_or_else(|| format!("MCP server '{}' not running after start attempt", server_id))?;
-
-        let server_name = entry.server_config.name.clone();
-        let auto_approve = entry.server_config.auto_approve;
+        };
 
         // Dispatch is the gate, not the definition list. Omitting a disabled
         // tool from the next request is what makes the switch cheap. It is not
         // what enforces it: a call the model already generated is still in
         // flight, and a resumed turn carries the old definitions. Refusing here
         // makes switching a tool off take effect on the call.
+        //
+        // Asked twice, and the second one is the gate. This is the cheap
+        // refusal, so an already-off tool never queues behind a slow call just
+        // to be turned away at the end of it.
         let wire_name = format!("mcp__{}__{}", server_id, tool_name);
-        if entry.server_config.disabled_tools.contains(&wire_name) {
-            return Err(format!(
-                "MCP tool '{}' is switched off for server '{}' and was NOT run. \
-                 Do not retry it. Tell the user it is disabled, and let them \
-                 re-enable it in Settings if they want it back.",
-                wire_name, server_id
-            )
-            .into());
+        if let Some(refusal) = self
+            .dispatch_refusal(server_id, &wire_name, &target.client)
+            .await
+        {
+            return Err(refusal.into());
         }
 
         // `tool_name` is the wire name the model was shown, which is not always
         // what the server calls the tool. Resolve before dispatching.
-        let target = resolve_wire_tool_name(server_id, &entry.client.tools, tool_name)
+        let tool = resolve_wire_tool_name(server_id, &target.tools, tool_name)
             .map(|t| t.name.clone())
             .ok_or_else(|| {
-                let available: Vec<String> = wire_tool_names(server_id, &entry.client.tools)
+                let available: Vec<String> = wire_tool_names(server_id, &target.tools)
                     .into_iter()
                     .flatten()
                     .collect();
@@ -492,21 +602,37 @@ impl McpManager {
                 )
             })?;
 
-        let result = entry.client.call_tool(&target, arguments).await?;
+        // The one lock held across the call, and it covers this server alone.
+        let result = {
+            let mut client = target.client.lock().await;
+            // The real gate, asked once this call has the server to itself.
+            // Waiting for it can take the whole MCP timeout, and whatever the
+            // user did in that window has to win.
+            if let Some(refusal) = self
+                .dispatch_refusal(server_id, &wire_name, &target.client)
+                .await
+            {
+                return Err(refusal.into());
+            }
+            client.call_tool(&tool, arguments).await?
+        };
 
-        Ok((result, server_name, auto_approve))
+        Ok((result, target.server_name, target.auto_approve))
     }
 
     /// Get tool definitions for all running servers, namespaced as mcp__{server_id}__{tool_name}.
+    ///
+    /// Runs once per LLM call, off the manifest snapshots, so it never waits on
+    /// a tool call in flight.
     pub async fn get_tool_definitions(&self) -> Vec<ToolDefinition> {
-        let running = self.running.lock().await;
+        let running = self.running.read().await;
         let mut tools = Vec::new();
 
         for (server_id, entry) in running.iter() {
             for offer in tool_offers(
                 server_id,
                 &entry.server_config.name,
-                &entry.client.tools,
+                &entry.tools,
                 &entry.server_config.disabled_tools,
             ) {
                 if offer.wire_name.is_none() {
@@ -536,7 +662,7 @@ impl McpManager {
                 return Vec::new();
             }
         };
-        let running = self.running.lock().await;
+        let running = self.running.read().await;
 
         let mut summaries = Vec::new();
         for server in servers {
@@ -1274,10 +1400,22 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"stub","version":"1"}}}\n' "$id"
       ;;
     *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$STUB_TOOLS"
+      if [ -n "$STUB_TOOLS_LIST_ERROR" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"%s"}}\n' "$id" "$STUB_TOOLS_LIST_ERROR"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$STUB_TOOLS"
+      fi
       ;;
     *'"method":"tools/call"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"stub ran"}]}}\n' "$id"
+      : > "$STUB_CALL_STARTED_FILE"
+      if [ -n "$STUB_CALL_DELAY" ]; then
+        sleep "$STUB_CALL_DELAY"
+      fi
+      if [ -n "$STUB_CALL_FLOOD_BYTES" ]; then
+        head -c "$STUB_CALL_FLOOD_BYTES" /dev/zero | tr '\000' 'x'
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"stub ran"}]}}\n' "$id"
+      fi
       ;;
   esac
 done
@@ -1288,6 +1426,7 @@ done
         command: String,
         env: HashMap<String, String>,
         pid_file: std::path::PathBuf,
+        call_started_file: std::path::PathBuf,
     }
 
     impl StubServer {
@@ -1301,19 +1440,49 @@ done
                 std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let pid_file = dir.path().join("stub.pid");
+            let call_started_file = dir.path().join("call-started");
             let env = HashMap::from([
                 (
                     "STUB_TOOLS".to_string(),
                     serde_json::to_string(tools).unwrap(),
                 ),
                 ("STUB_PID_FILE".to_string(), pid_file.display().to_string()),
+                (
+                    "STUB_CALL_STARTED_FILE".to_string(),
+                    call_started_file.display().to_string(),
+                ),
             ]);
             Self {
                 _dir: dir,
                 command: script.display().to_string(),
                 env,
                 pid_file,
+                call_started_file,
             }
+        }
+
+        /// Sleep before answering every `tools/call`, so another server can be
+        /// shown running while this one is busy.
+        fn slow_to_answer(mut self, seconds: u32) -> Self {
+            self.env
+                .insert("STUB_CALL_DELAY".to_string(), seconds.to_string());
+            self
+        }
+
+        /// Answer `tools/call` with a run of bytes and no newline, the shape a
+        /// broken or hostile server uses to grow the reader's buffer.
+        fn floods_on_call(mut self, bytes: usize) -> Self {
+            self.env
+                .insert("STUB_CALL_FLOOD_BYTES".to_string(), bytes.to_string());
+            self
+        }
+
+        /// Fail `tools/list` with a JSON-RPC error, which is NOT the same as
+        /// advertising no tools.
+        fn fails_tools_list(mut self, message: &str) -> Self {
+            self.env
+                .insert("STUB_TOOLS_LIST_ERROR".to_string(), message.to_string());
+            self
         }
 
         /// Whether the spawned process is still alive. `kill -0` only probes.
@@ -1327,6 +1496,35 @@ done
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         }
+
+        /// Whether a `tools/call` has reached the process.
+        fn call_started(&self) -> bool {
+            self.call_started_file.exists()
+        }
+
+        /// Block until a `tools/call` reaches the process, so what follows is
+        /// measured against a call genuinely in flight.
+        async fn await_call_started(&self) {
+            for _ in 0..250 {
+                if self.call_started() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the stub never received a tools/call");
+        }
+
+        /// Block until the process is gone, which `Drop for McpClient` sees to
+        /// with `start_kill` on every path that abandons a client.
+        async fn await_exit(&self) {
+            for _ in 0..150 {
+                if !self.is_alive() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("the stub outlived the client that spawned it");
+        }
     }
 
     async fn manager_with(
@@ -1339,6 +1537,18 @@ done
             .await
             .unwrap();
         (McpManager::new(pool.clone(), bus.clone()), bus)
+    }
+
+    /// One manager over several stub servers, for the tests that need two
+    /// processes at once.
+    async fn manager_with_all(pool: &sqlx::PgPool, stubs: &[(&str, &StubServer)]) -> McpManager {
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        for (id, stub) in stubs {
+            McpServerStore::register(pool, &bus, id, id, &stub.command, &[], &stub.env, None)
+                .await
+                .unwrap();
+        }
+        McpManager::new(pool.clone(), bus)
     }
 
     /// The round trip the whole feature rests on: connect, cache what the
@@ -1557,6 +1767,251 @@ done
         // Removing again removes nothing, which is what the route turns into a
         // 404 rather than a silent success.
         assert!(!manager.remove_server("stub", None).await.unwrap());
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // The third-party boundary
+    // -----------------------------------------------------------------------
+
+    /// One slow MCP server must not stall the workspace. The global lock was
+    /// held across the call. A second server could not run, and tool assembly
+    /// for every thread queued behind whatever was in flight.
+    #[tokio::test]
+    async fn two_mcp_servers_run_tool_calls_concurrently() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let slow = StubServer::new(&priced_tools(&["alpha"])).slow_to_answer(3);
+        let quick = StubServer::new(&priced_tools(&["beta"]));
+        let manager = manager_with_all(&pool, &[("slow", &slow), ("quick", &quick)]).await;
+        manager.start_server("slow").await.unwrap();
+        manager.start_server("quick").await.unwrap();
+
+        let budget = std::time::Duration::from_millis(1500);
+        let busy = manager.call_tool("slow", "alpha", serde_json::json!({}));
+        let meanwhile = async {
+            slow.await_call_started().await;
+            let answered = tokio::time::timeout(
+                budget,
+                manager.call_tool("quick", "beta", serde_json::json!({})),
+            )
+            .await
+            .expect("a call to another server must not wait for the slow one")
+            .expect("the quick server answers");
+            let definitions = tokio::time::timeout(budget, manager.get_tool_definitions())
+                .await
+                .expect("tool assembly must not wait for a call in flight");
+            (answered, definitions)
+        };
+        let (slow_result, (answered, definitions)) = tokio::join!(busy, meanwhile);
+
+        assert_eq!(answered.0, "stub ran");
+        assert_eq!(definitions.len(), 2, "both servers are still offered");
+        assert_eq!(
+            slow_result.expect("the slow server answers in the end").0,
+            "stub ran"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Two calls to ONE server share a single stdio pipe pair, so they have to
+    /// take turns. Each must still get its own answer.
+    #[tokio::test]
+    async fn two_calls_to_one_server_take_turns() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(1);
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        let started = std::time::Instant::now();
+        let (first, second) = tokio::join!(
+            manager.call_tool("stub", "alpha", serde_json::json!({})),
+            manager.call_tool("stub", "beta", serde_json::json!({})),
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(first.expect("the first call answers").0, "stub ran");
+        assert_eq!(second.expect("the second call answers").0, "stub ran");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1800),
+            "the two must queue rather than share the pipe: {elapsed:?}"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The switch is read at dispatch, not when the call arrived. A call can
+    /// queue behind another on the same server for the whole MCP timeout. A
+    /// snapshot taken on arrival would let it run after the user said no.
+    #[tokio::test]
+    async fn a_tool_switched_off_while_a_call_queues_is_still_refused() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(3);
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        let busy = manager.call_tool("stub", "alpha", serde_json::json!({}));
+        let meanwhile = async {
+            stub.await_call_started().await;
+            // Queued behind the call in flight, and switched off while it
+            // waits. It passes the arrival check and must fail the dispatch
+            // one.
+            let queued = manager.call_tool("stub", "beta", serde_json::json!({}));
+            let switch_off = async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                manager
+                    .set_disabled_tools("stub", &["mcp__stub__beta".to_string()], None)
+                    .await
+                    .unwrap()
+                    .expect("the server exists");
+            };
+            let (queued, ()) = tokio::join!(queued, switch_off);
+            queued
+        };
+        let (busy, queued) = tokio::join!(busy, meanwhile);
+
+        assert_eq!(
+            busy.expect("the call in flight still answers").0,
+            "stub ran"
+        );
+        let refused = queued.expect_err("a tool switched off mid-queue must not run");
+        assert!(refused.to_string().contains("switched off"), "{refused}");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Stop is the user's word, and a call queued behind a slow one must not
+    /// outlive it. The queued call wakes before the shutdown does, since it
+    /// reached the client lock first, so only the live check turns it away.
+    #[tokio::test]
+    async fn a_call_queued_when_the_server_is_stopped_is_refused() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let stub = StubServer::new(&priced_tools(&["alpha", "beta"])).slow_to_answer(3);
+        let (manager, _bus) = manager_with(&pool, "stub", &stub).await;
+        manager.start_server("stub").await.unwrap();
+
+        let busy = manager.call_tool("stub", "alpha", serde_json::json!({}));
+        let meanwhile = async {
+            stub.await_call_started().await;
+            let queued = manager.call_tool("stub", "beta", serde_json::json!({}));
+            let stop = async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                manager.stop_server("stub").await.unwrap()
+            };
+            tokio::join!(queued, stop)
+        };
+        let (busy, (queued, stopped)) = tokio::join!(busy, meanwhile);
+
+        assert_eq!(
+            busy.expect("the call already in flight still answers").0,
+            "stub ran"
+        );
+        let refused = queued.expect_err("a call queued past a Stop must not run");
+        assert!(
+            refused.to_string().contains("stopped or removed"),
+            "{refused}"
+        );
+        assert!(matches!(stopped, McpStopOutcome::Stopped { .. }));
+        assert!(!stub.is_alive(), "Stop still reaches the process");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A server that emits bytes without a newline used to grow the read buffer
+    /// for the whole 30s deadline. The cap ends the call instead, and the
+    /// message names the server and the limit.
+    #[tokio::test]
+    async fn an_oversized_frame_errors_instead_of_growing() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let flooder = StubServer::new(&priced_tools(&["alpha"]))
+            .floods_on_call(client::MAX_FRAME_BYTES + 1_000_000);
+        let (manager, _bus) = manager_with(&pool, "flood", &flooder).await;
+        manager.start_server("flood").await.unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            manager.call_tool("flood", "alpha", serde_json::json!({})),
+        )
+        .await
+        .expect("the cap has to fire well before the 30s deadline")
+        .expect_err("an over-long frame is a protocol fault, not a result");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("flood"),
+            "the server must be named: {message}"
+        );
+        assert!(
+            message.contains(&client::MAX_FRAME_BYTES.to_string()),
+            "the limit must be stated: {message}"
+        );
+        assert!(message.contains("newline"), "{message}");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// A `tools/list` that failed is a failure, never a server with no tools.
+    /// Reporting it as empty left a healthy-looking row contributing nothing.
+    #[tokio::test]
+    async fn a_failed_tools_list_is_a_start_failure_not_an_empty_server() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let broken = StubServer::new(&[]).fails_tools_list("catalog backend is down");
+        let (manager, bus) = manager_with(&pool, "broken", &broken).await;
+
+        let error = manager
+            .start_server("broken")
+            .await
+            .expect_err("a probe that could not run is not a start");
+        let message = error.to_string();
+        assert!(message.contains("tools/list"), "{message}");
+        assert!(message.contains("catalog backend is down"), "{message}");
+        assert!(
+            message.contains("broken"),
+            "the server must be named: {message}"
+        );
+
+        // The abandoned client takes its process with it. Nothing calls
+        // `shutdown` on this path, so `Drop` is what has to do it.
+        broken.await_exit().await;
+
+        // Nothing is left running, and the page still reads unknown rather
+        // than "no tools".
+        let status = manager.list_servers().await.unwrap().remove(0);
+        assert!(!status.running);
+        assert_eq!(status.tools_source, McpToolsSource::NeverObserved);
+        assert!(status.tools.is_empty());
+        assert!(manager.get_tool_definitions().await.is_empty());
+
+        // A server that genuinely advertises nothing is the other thing, and
+        // it starts.
+        let empty = StubServer::new(&[]);
+        McpServerStore::register(
+            &pool,
+            &bus,
+            "empty",
+            "Empty",
+            &empty.command,
+            &[],
+            &empty.env,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.start_server("empty").await.unwrap(),
+            McpStartOutcome::Started { tool_count: 0 }
+        );
+        let empty_status = manager
+            .list_servers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "empty")
+            .expect("the empty server is listed");
+        assert!(empty_status.running);
+        assert_eq!(empty_status.tools_source, McpToolsSource::Live);
+        assert!(empty_status.tools.is_empty());
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

@@ -13,6 +13,7 @@ import {
 } from '../../store/pendingUploads';
 import { addAttachedImageHash, rememberSessionBlobUrl } from './pastedImages';
 import { generateUuid } from '../../utils/uuid';
+import { sniffImageBytes, imageRejectionMessage } from '../../utils/imageBytes';
 
 const PLUGIN_EXT = '.lucidos-plugin';
 
@@ -32,15 +33,31 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
   // turn, so everything downstream works off a stable copy. A regular in-memory
   // File (photo picker, camera capture) round-trips through this as a cheap
   // no-op copy.
-  let file: File;
+  let bytes: ArrayBuffer;
   try {
-    const bytes = await source.arrayBuffer();
-    file = new File([bytes], source.name || 'pasted-image', { type: source.type });
+    bytes = await source.arrayBuffer();
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     showToast(`Image upload failed: could not read the image (${reason})`, 'error');
     return;
   }
+
+  // Ask the server's own question here, on the bytes, before anything is
+  // drawn. Every inbound path (paste, drop, file picker, camera) funnels
+  // through this function, and each of them gated on the DECLARED type only.
+  // A macOS clipboard flavour can declare `image/png` and hand over zero
+  // bytes. That drew a chip with a broken thumbnail, then failed at the
+  // upload seconds later in a different corner of the screen.
+  const name = source.name || 'pasted-image';
+  const verdict = sniffImageBytes(new Uint8Array(bytes));
+  if (verdict.kind !== 'accepted') {
+    showToast(imageRejectionMessage(verdict, name, source.type), 'error');
+    return;
+  }
+
+  // The sniffed mime, not the declared one. A wrong declared type is what
+  // makes the browser guess at the preview.
+  const file = new File([bytes], name, { type: verdict.mime });
 
   // Show the preview immediately, then upload in the background. The blob
   // URL is handed off twice: first to the pending entry (preview while

@@ -396,3 +396,86 @@ describe('attachImageToActiveDraft snapshots clipboard bytes before the thread-s
     expect(toasts.value[0].message).toContain('could not read the image');
   });
 });
+
+/** Regression: a macOS Chrome paste of a screenshot declared `image/png` and
+ *  handed over ZERO bytes. The composer gated on the declared type, so it drew
+ *  a chip with a broken thumbnail. The real reason arrived seconds later as an
+ *  upload toast. The gate now reads the bytes the way the engine does, before
+ *  the chip exists. */
+describe('attachImageToActiveDraft refuses bytes the server would refuse', () => {
+  /** A source whose declared type is a lie the old gate believed. */
+  function sourceOf(name: string, type: string, ...content: number[]): File {
+    return {
+      name,
+      type,
+      arrayBuffer: async () => new Uint8Array(content).buffer,
+    } as unknown as File;
+  }
+
+  let objectUrls: number;
+
+  beforeEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    vi.mocked(uploadThreadBlob).mockReset();
+    vi.mocked(awaitThreadStarted).mockImplementation(async () => {});
+    objectUrls = 0;
+    (globalThis as any).URL.createObjectURL = () => { objectUrls++; return 'blob:fake'; };
+  });
+
+  afterEach(() => {
+    _resetPendingUploadsForTesting();
+    _resetComposeDraftsForTesting();
+    (globalThis as any).URL.createObjectURL = () => 'blob:fake';
+  });
+
+  /** No chip, no preview URL, no upload, and one toast naming this paste. */
+  function expectRefused(fragment: string) {
+    expect(objectUrls, 'a refused image must not get a preview URL').toBe(0);
+    expect(pendingUploads.value.get('t-1'), 'a refused image must not draw a chip').toBeUndefined();
+    expect(uploadThreadBlob).not.toHaveBeenCalled();
+    expect(getDraft('t-1').image_hashes).toEqual([]);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain(fragment);
+  }
+
+  it('refuses the clipboard shape that failed: image/png declared, zero bytes', async () => {
+    await attachImageToActiveDraft(sourceOf('image.png', 'image/png'));
+    expectRefused('is empty (0 bytes)');
+  });
+
+  it('names TIFF instead of reciting the allowlist', async () => {
+    await attachImageToActiveDraft(sourceOf('shot.tiff', 'image/tiff', 0x49, 0x49, 0x2a, 0x00, 0x08));
+    expectRefused(`that's a TIFF image`);
+  });
+
+  it('refuses bytes it cannot place and reports what declared them', async () => {
+    await attachImageToActiveDraft(sourceOf('image.png', 'image/png', 0x13, 0x37, 0x42));
+    expectRefused('(labelled image/png)');
+  });
+
+  it('never recites the allowlist the 415 used to', async () => {
+    await attachImageToActiveDraft(sourceOf('image.png', 'image/png'));
+    expect(toasts.value[0].message).not.toContain('allowed:');
+  });
+
+  it('still attaches an allowlisted image, and uploads the sniffed mime', async () => {
+    let uploaded: File | null = null;
+    vi.mocked(uploadThreadBlob).mockImplementation(async (_threadId: string, file: File) => {
+      uploaded = file;
+      return { hash: 'sha-real-png', mime: file.type, byte_size: file.size };
+    });
+
+    // Declared `application/octet-stream`, but the bytes are a PNG. The server
+    // would store it, so the composer must not refuse it.
+    await attachImageToActiveDraft(
+      sourceOf('shot', 'application/octet-stream',
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+    );
+
+    expect(toasts.value).toEqual([]);
+    expect(uploadThreadBlob).toHaveBeenCalledTimes(1);
+    expect(uploaded!.type).toBe('image/png');
+    expect(getDraft('t-1').image_hashes).toEqual(['sha-real-png']);
+  });
+});

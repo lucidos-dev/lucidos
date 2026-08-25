@@ -119,12 +119,14 @@ pub const CORRECT_MEMORY_BY_ID: &str = "correct_memory_by_id";
 pub const SEARCH_MEMORY: &str = "search_memory";
 pub const MEMORY_SOURCE: &str = "memory_source";
 
-// Events — grouped `events` tool (emit/query/count) from the capability parity
-// manifest; the flat per-verb names below stay as back-compat aliases.
+// Events: the grouped `events` tool (emit/query/count/event_types) from the
+// capability parity manifest. The flat per-verb names below stay as back-compat
+// aliases.
 pub const EVENTS: &str = "events";
 pub const EMIT_EVENT: &str = "emit_event";
 pub const QUERY_EVENTS: &str = "query_events";
 pub const COUNT_EVENTS: &str = "count_events";
+pub const LIST_EVENT_TYPES: &str = "list_event_types";
 
 // Thread queries (script/trigger-facing introspection) — grouped `threads` tool
 // (list/count) from the capability parity manifest; the flat names below stay as
@@ -146,9 +148,6 @@ pub const APPLY_CHANGE: &str = "apply_change";
 pub const THREAD_QUEUE: &str = "thread_queue";
 pub const LIST_THREAD_QUEUE: &str = "list_thread_queue";
 pub const UPDATE_THREAD_QUEUE_POLICY: &str = "update_thread_queue_policy";
-
-// Context management
-pub const DISMISS_FROM_CONTEXT: &str = "dismiss_from_context";
 
 // Todo list (Lucidos Agent's runtime progress visibility — chat + trigger surfaces only)
 pub const TODO_WRITE: &str = "todo_write";

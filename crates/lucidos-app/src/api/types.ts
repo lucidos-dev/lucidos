@@ -222,6 +222,10 @@ export interface ApiResult {
   credential_request?: { service: string; prompt: string; base_url: string; auth_type: AuthType };
   auth_url?: string;
   cron_preview?: CronPreview;
+  /** Non-fatal notes about a write that succeeded. Today: an event type in a
+   *  trigger's `on` list that this workspace has never emitted. Separate from
+   *  `cron_preview.warnings`, which is about the schedule. */
+  warnings?: string[];
 }
 
 export interface UploadResponse {

@@ -59,6 +59,11 @@ pub(super) fn image_content_block(img: crate::api::ChatImage) -> ContentBlock {
 /// before it counts against the budget, so a large photo can't blow the
 /// provider's per-image limit. The hint text labels the two groups so the
 /// LLM can tell stale from current.
+///
+/// ADR 0109 retired the body region, so the message is one text block again
+/// plus its images. The tail the mode adds, the context panel and the working
+/// understanding, is appended by the agentic loop to whichever message is
+/// newest.
 pub(super) fn build_user_content_with_images(
     user_message_text: String,
     workspace: &std::path::Path,

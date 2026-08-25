@@ -25,6 +25,14 @@ describe('contextLabel', () => {
   it('no window and no message count: just the tokens', () => {
     expect(contextLabel(900, null, null, false)).toBe('900 tokens');
   });
+
+  /** A usage over the window means the WINDOW is wrong, and the counter is
+   *  where that shows. Clamping it read as "exactly full", which is how a real
+   *  240k Claude Code prompt sat behind a healthy-looking 100%. */
+  it('over the window: reports the real percentage, never a clamped 100%', () => {
+    expect(contextLabel(240_919, 200_000, null, false)).toBe('241k / 200k (120%)');
+    expect(contextLabel(240_919, 200_000, null, true)).toBe('120%');
+  });
 });
 
 /** Which form is SHOWN is a width question the row answers in CSS (the

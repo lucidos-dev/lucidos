@@ -1,4 +1,5 @@
 use super::events_snapshot::{
+    rename_legacy_section_size, rename_legacy_section_size_in_payload,
     strip_app_capture_in_tool_result, strip_context_capture_sections,
     strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_result_content,
 };
@@ -168,8 +169,8 @@ fn context_capture_strip_drops_sections_and_tools_stamps_marker() {
             "model": "claude-opus-4-7",
             "context_window": 200_000,
             "sections": [
-                { "name": "system", "char_count": 10_000, "content": "A".repeat(10_000) },
-                { "name": "history", "char_count": 5_000 },
+                { "name": "system", "budget_delta_chars": 10_000, "content_chars": 10_000, "content": "A".repeat(10_000) },
+                { "name": "history", "budget_delta_chars": 5_000, "content_chars": 5_000 },
             ],
             "tools": ["search", "edit"],
             "estimated_total_tokens": 4_200,
@@ -188,6 +189,64 @@ fn context_capture_strip_drops_sections_and_tools_stamps_marker() {
     assert_eq!(obj.get("context_window"), Some(&json!(200_000)));
     assert_eq!(obj.get("estimated_total_tokens"), Some(&json!(4_200)));
     assert!(obj.get("usage").is_some(), "usage preserved");
+}
+
+/// The read paths serve stored sections verbatim, so the serde alias never
+/// runs on them. A months-old row must still arrive with a size the viewer
+/// can read.
+#[test]
+fn a_stored_char_count_reaches_the_client_as_the_budget_delta() {
+    let mut sections = json!([
+        { "name": "System Instructions", "char_count": 49_380 },
+        { "name": "Conversation", "char_count": 500 },
+    ]);
+    rename_legacy_section_size(&mut sections);
+    assert_eq!(sections[0]["budget_delta_chars"], 49_380);
+    assert_eq!(sections[1]["budget_delta_chars"], 500);
+    assert!(sections[0].get("char_count").is_none());
+    assert!(
+        sections[0].get("content_chars").is_none(),
+        "nobody measured the content size when this row was written"
+    );
+}
+
+/// A row written today already spells it right, and the rename must not touch
+/// it. A row carrying both keys keeps the current one.
+#[test]
+fn a_current_row_passes_through_the_rename_untouched() {
+    let mut sections = json!([
+        { "name": "Conversation", "budget_delta_chars": 600, "content_chars": 645_368 },
+        { "name": "Odd", "budget_delta_chars": 7, "char_count": 9 },
+    ]);
+    let before = sections.clone();
+    rename_legacy_section_size(&mut sections);
+    assert_eq!(sections, before);
+}
+
+/// `ContextAssembled` is the retired predecessor. The snapshot never strips
+/// it, so its sections reach the viewer through the payload arm.
+#[test]
+fn the_payload_arm_renames_a_legacy_assembled_row() {
+    let mut payload = json!({
+        "model": "claude-opus-4-7",
+        "sections": [{ "name": "System Instructions", "char_count": 147_800 }],
+        "tools": [],
+    });
+    rename_legacy_section_size_in_payload(&mut payload);
+    assert_eq!(payload["sections"][0]["budget_delta_chars"], 147_800);
+}
+
+/// A payload with no sections, and a sections value that is not an array,
+/// both pass through rather than panicking.
+#[test]
+fn the_rename_is_a_no_op_on_a_payload_with_nothing_to_rename() {
+    let mut stripped = json!({ "sections_stripped": true });
+    rename_legacy_section_size_in_payload(&mut stripped);
+    assert_eq!(stripped, json!({ "sections_stripped": true }));
+
+    let mut corrupt = json!({ "sections": "not an array" });
+    rename_legacy_section_size_in_payload(&mut corrupt);
+    assert_eq!(corrupt, json!({ "sections": "not an array" }));
 }
 
 #[test]
@@ -342,4 +401,79 @@ fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
 #[test]
 fn an_untokened_caller_is_left_to_the_ordinary_local_api_rules() {
     assert!(refuse_event_waits_for_another_thread(&HeaderMap::new(), Uuid::new_v4()).is_ok());
+}
+
+// ── the Apply gate reads the parking facts off the row ──
+//
+// `guard_change_action` (api/changes.rs) is a thin wrapper: it asks
+// `available_thread_actions_for` and refuses anything absent. So these tests
+// ARE the server-side gate, and they also pin the `SELECT`. Drop a column from
+// it and `ThreadActionFacts` fails to build the row, which no unit test over
+// the pure predicate would ever notice.
+
+/// Seed the minimum a coding-agent thread with a proposed change needs.
+#[cfg(test)]
+async fn seed_parked_cc_thread(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    live_event_waits: i32,
+    active_children: i32,
+) {
+    sqlx::query(
+        "INSERT INTO thread_summaries
+            (thread_id, is_coding_agent, status, coding_agent_proposed,
+             live_event_wait_count, active_children_count)
+         VALUES ($1, true, 'idle', true, $2, $3)",
+    )
+    .bind(thread_id)
+    .bind(live_event_waits)
+    .bind(active_children)
+    .execute(pool)
+    .await
+    .expect("seed thread_summaries");
+}
+
+#[tokio::test]
+async fn a_parked_thread_is_refused_apply_and_discard_server_side() {
+    use crate::engine::thread_lifecycle::Action;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    let (pool, db_name) = setup_test_db().await;
+
+    let subscribed = Uuid::new_v4();
+    seed_parked_cc_thread(&pool, subscribed, 1, 0).await;
+    let actions = super::available_thread_actions_for(&pool, subscribed)
+        .await
+        .expect("query the parked thread's actions");
+    assert!(
+        !actions.contains(&Action::Apply) && !actions.contains(&Action::Discard),
+        "a thread holding a live event wait must not be resolvable: {:?}",
+        actions
+    );
+
+    let with_child = Uuid::new_v4();
+    seed_parked_cc_thread(&pool, with_child, 0, 1).await;
+    let actions = super::available_thread_actions_for(&pool, with_child)
+        .await
+        .expect("query the parent's actions");
+    assert!(
+        !actions.contains(&Action::Apply),
+        "an active sub-thread must withhold Apply too: {:?}",
+        actions
+    );
+
+    // The control, and the escape hatch: with nothing left to wake it, the same
+    // row is resolvable again. This is the state Stop waiting produces.
+    let settled = Uuid::new_v4();
+    seed_parked_cc_thread(&pool, settled, 0, 0).await;
+    let actions = super::available_thread_actions_for(&pool, settled)
+        .await
+        .expect("query the settled thread's actions");
+    assert!(
+        actions.contains(&Action::Apply) && actions.contains(&Action::Discard),
+        "clearing the wait must restore both: {:?}",
+        actions
+    );
+
+    teardown_test_db(&db_name).await;
 }

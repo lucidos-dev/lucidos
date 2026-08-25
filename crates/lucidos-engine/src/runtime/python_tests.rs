@@ -485,6 +485,11 @@ async fn ensure_venv_makes_python_bin_executable() {
 /// head start measures host speed instead. On a loaded host a cold interpreter
 /// has not reached step 1, so the marker never exists and the read fails with
 /// `NotFound`.
+///
+/// Each write lands through `os.replace`, the same witness the hard-ceiling
+/// test below uses. A plain `open(...).write(...)` creates the file before it
+/// flushes. The watcher could cancel inside that window, and the read would
+/// then call an empty marker a survivor.
 #[tokio::test]
 async fn execute_kills_subprocess_when_future_dropped() {
     let dir = tempdir().unwrap();
@@ -497,7 +502,17 @@ async fn execute_kills_subprocess_when_future_dropped() {
     // If kill_on_drop works, the subprocess dies between step 1 and
     // step 3, so marker stays "alive".
     let code = format!(
-        "open('{m}', 'w').write('alive')\nimport time\ntime.sleep(2)\nopen('{m}', 'w').write('survived')",
+        "import os, time\n\
+         def mark(word):\n\
+        \x20   f = open('{m}.tmp', 'w')\n\
+        \x20   f.write(word)\n\
+        \x20   f.flush()\n\
+        \x20   os.fsync(f.fileno())\n\
+        \x20   f.close()\n\
+        \x20   os.replace('{m}.tmp', '{m}')\n\
+         mark('alive')\n\
+         time.sleep(2)\n\
+         mark('survived')",
         m = marker_str,
     );
 
@@ -631,6 +646,11 @@ async fn sync_execution_is_bounded_by_the_hard_ceiling() {
 /// past the ceiling, then writes "survived". A child that outlived the expiry
 /// overwrites it; a killed one cannot. We read the marker after the script's
 /// own sleep would have elapsed, so a survivor has had its chance.
+///
+/// Each write lands through `os.replace`, so the marker is only ever absent or
+/// one of the two whole words. The plain `open(...).write(...)` this replaced
+/// left the kill a window between creating the file and flushing it: a loaded
+/// host read the empty file back and this test called the child a survivor.
 #[tokio::test]
 async fn the_execution_timeout_kills_the_python_child() {
     let dir = tempdir().unwrap();
@@ -639,7 +659,17 @@ async fn the_execution_timeout_kills_the_python_child() {
     let marker = dir.path().join("marker.txt");
     let marker_str = marker.to_string_lossy().replace('\\', "\\\\");
     let code = format!(
-        "open('{m}', 'w').write('alive')\nimport time\ntime.sleep(6)\nopen('{m}', 'w').write('survived')",
+        "import os, time\n\
+         def mark(word):\n\
+        \x20   f = open('{m}.tmp', 'w')\n\
+        \x20   f.write(word)\n\
+        \x20   f.flush()\n\
+        \x20   os.fsync(f.fileno())\n\
+        \x20   f.close()\n\
+        \x20   os.replace('{m}.tmp', '{m}')\n\
+         mark('alive')\n\
+         time.sleep(6)\n\
+         mark('survived')",
         m = marker_str,
     );
 

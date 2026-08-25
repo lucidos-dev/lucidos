@@ -679,7 +679,7 @@ describe('synthesizeContextCapture — legacy event projection', () => {
     const result = synthesizeContextCapture({
       thinking: { text: 'Context: 36510 tokens, 1 messages', context_tokens: 36510, context_messages: 1 },
       tokensMeasured: { input_tokens: 23500 },
-      assembled: { sections: [{ name: 'System', content: 'sys', char_count: 3 }], tools: ['read_file'], model: 'claude-opus-4-7' },
+      assembled: { sections: [{ name: 'System', content: 'sys', budget_delta_chars: 3 }], tools: ['read_file'], model: 'claude-opus-4-7' },
     });
     expect(result.producer).toBe('main_llm');
     expect(result.model).toBe('claude-opus-4-7');
@@ -708,18 +708,19 @@ describe('synthesizeContextCapture — legacy event projection', () => {
   // put a character count in a token field: about 2.5x the truth, presented
   // as authoritative. The Context Viewer scales its section rows against this
   // headline, so the lie propagated to every row in the tree. Zero is the
-  // honest answer, and the sections keep their real `char_count`s.
+  // honest answer, and the sections keep their real budget deltas. The engine
+  // renames a legacy `char_count` before it reaches here.
   it('synthesizeContextCapture reports no tokens rather than a char count', () => {
     const result = synthesizeContextCapture({
       assembled: {
-        sections: [{ name: 'System', char_count: 147_800 }],
+        sections: [{ name: 'System', budget_delta_chars: 147_800 }],
         tools: [],
         model: 'claude-opus-4-7',
       },
     });
     expect(result.estimated_total_tokens).toBe(0);
     expect(result.usage).toBeUndefined();
-    expect(result.sections[0].char_count).toBe(147_800);
+    expect(result.sections[0].budget_delta_chars).toBe(147_800);
   });
 
   // Even-older rows where only Thinking ever fired (capture_context off).

@@ -171,8 +171,13 @@ standing "every time X happens" rule is a *trigger* instead.
 `--on` repeats to watch several types. `--condition` is a JSON object filtering
 the event's own payload fields, applied to every `--on`. `--timeout-secs` is
 required and capped at 24 h. `--reason` is one line the user reads in the
-subscription indicator. A refusal comes back as a `400` with the reason: read it
+waiting indicator. A refusal comes back as a `400` with the reason: read it
 rather than retrying.
+
+While a wait is live, a change you already proposed cannot be applied or
+discarded (ADR 0106). It is not final: you will wake and may commit again. So
+park freely, but do not tell the user their change is ready to Apply until you
+have stopped watching.
 
 ### `lucidos spawn-thread --to <ws> [--relation child|top] [--cc] [--repo <name>] --message <text> --title <text>`
 

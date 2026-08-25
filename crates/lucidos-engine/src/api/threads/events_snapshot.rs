@@ -66,6 +66,20 @@ pub(in crate::api) async fn get_thread_events_snapshot(
             strip_context_capture_sections(row);
             strip_tool_result_content(row);
         }
+        // Sections that survive to the client are served verbatim, so a
+        // pre-rename row has to be respelled the way the viewer reads it. Two
+        // event types reach here with sections: `include_context` keeps a
+        // `ContextCaptured`'s, and `ContextAssembled` is the retired
+        // predecessor, which nothing strips. A stripped row has none left, so
+        // this is a no-op there. Gated on the type for the same reason
+        // `strip_context_capture_sections` is: another event's `sections` key
+        // would mean something else.
+        if matches!(
+            row.event_type.as_str(),
+            "ContextCaptured" | "ContextAssembled"
+        ) {
+            rename_legacy_section_size_in_payload(&mut row.payload);
+        }
     }
 
     // Aggregate fetch is best-effort — absence just means no snapshot to apply
@@ -188,7 +202,7 @@ pub(in crate::api) async fn get_context_capture(
         ));
     }
 
-    let sections = payload_obj
+    let mut sections = payload_obj
         .get("sections")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
@@ -196,8 +210,44 @@ pub(in crate::api) async fn get_context_capture(
         .get("tools")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
+    rename_legacy_section_size(&mut sections);
 
     Ok(Json(ContextCapturePayload { sections, tools }))
+}
+
+/// Spell a stored section's size the way the client reads it today.
+///
+/// A section's budget delta was called `char_count` for months. `ContextSection`
+/// carries `serde(alias = "char_count")` for that, but this endpoint and the
+/// `include_context` snapshot serve `payload->'sections'` VERBATIM, so serde
+/// never runs on them. Without this a months-old capture reaches the Context
+/// Viewer with no size field at all, and every row renders `NaN`.
+///
+/// Only the key moves. `content_chars` stays absent, which is what absent
+/// means: nobody measured it when the row was written.
+pub(super) fn rename_legacy_section_size(sections: &mut serde_json::Value) {
+    let Some(array) = sections.as_array_mut() else {
+        return;
+    };
+    for section in array {
+        let Some(obj) = section.as_object_mut() else {
+            continue;
+        };
+        if obj.contains_key("budget_delta_chars") {
+            continue;
+        }
+        if let Some(value) = obj.remove("char_count") {
+            obj.insert("budget_delta_chars".to_string(), value);
+        }
+    }
+}
+
+/// [`rename_legacy_section_size`] applied to an event payload's `sections`.
+pub(super) fn rename_legacy_section_size_in_payload(payload: &mut serde_json::Value) {
+    let Some(sections) = payload.get_mut("sections") else {
+        return;
+    };
+    rename_legacy_section_size(sections);
 }
 
 /// Drop `sections` (and `tools`) from `ContextCaptured` payloads on the snapshot

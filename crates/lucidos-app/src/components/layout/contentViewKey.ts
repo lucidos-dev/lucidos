@@ -1,4 +1,4 @@
-import type { InlineForm, PanelOverlay } from '../../store/store';
+import type { InlineForm, PanelOverlay, SettingsSubview } from '../../store/store';
 
 /** Short opaque digest of free text (FNV-1a, 32-bit, hex).
  *
@@ -57,12 +57,29 @@ export function inlineFormKey(form: InlineForm): string {
   }
 }
 
+/** The content-pane identity of one Settings sub-section.
+ *
+ *  Exported because a deep link that must land at the TOP of a sub-section drops
+ *  that view's remembered scroll by this key. `openWhatsNew`
+ *  (`store/actions/menu.ts`) is the one caller, and the two have to name the
+ *  same view. */
+export function settingsViewKey(subview: SettingsSubview): string {
+  return `settings:${subview}`;
+}
+
 /** Identity of whatever the content pane is currently showing: the one answer to
  *  "has this pane navigated". Both consumers key off it, and they have to agree,
  *  or the pane restores a scroll position from a view it no longer shows, or
  *  covers one it never left. Returns null when there is nothing to key on, so
  *  the scroll memory skips and the navigation cover has no arriving view to
  *  hide.
+ *
+ *  Settings resolves down to its SUB-SECTION, for the reason `inlineFormKey`
+ *  exists: `activeMenuItem` is `'settings'` for all twenty of them, so a switch
+ *  between two read as no navigation at all. All twenty then shared one
+ *  remembered offset, and opening What's New restored wherever the reader last
+ *  parked on Models. `settingsSubview` is REQUIRED rather than defaulted, so a
+ *  caller that forgets it fails to compile.
  *
  *  `app-ui` is deliberately ONE key for every app, the only overlay not resolved
  *  down to the thing it displays. An app switch keeps the same iframe element
@@ -71,7 +88,11 @@ export function inlineFormKey(form: InlineForm): string {
  *  strictly better than a timed fade over a frame that may still be blank.
  *  There is no scroll position to keep apart either: the body is `overflow:
  *  hidden` under an app, and the app scrolls inside its own document. */
-export function contentViewKey(active: string | null, overlay: PanelOverlay): string | null {
+export function contentViewKey(
+  active: string | null,
+  overlay: PanelOverlay,
+  settingsSubview: SettingsSubview,
+): string | null {
   if (overlay) {
     if (overlay.type === 'form') return `form:${inlineFormKey(overlay.form)}`;
     if (overlay.type === 'file-preview') return `file:${overlay.path}`;
@@ -79,5 +100,6 @@ export function contentViewKey(active: string | null, overlay: PanelOverlay): st
     if (overlay.type === 'notification-detail') return `notification:${overlay.notification.id}`;
     return overlay.type;
   }
+  if (active === 'settings') return settingsViewKey(settingsSubview);
   return active;
 }

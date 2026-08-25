@@ -1,9 +1,10 @@
 use super::super::process_helpers::{
     build_system_knowhow_section, build_trigger_knowhow_section, build_trigger_started_event,
-    classify_or_fallback, summarize_or_fallback, TriggerContext, APPLY_VERIFY_DEV_ADDENDUM,
-    APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
+    classify_or_fallback, forced_classification, summarize_or_none, summary_is_too_thin,
+    TriggerContext, APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, ENGINE_RESTART_RULE,
+    FORCE_QUERY_CLASSIFICATION_ENV,
 };
-use super::{build_capture_sections, build_loaded_knowhow_block};
+use super::{build_capture_sections, build_loaded_knowhow_block, TurnTail};
 use crate::core::knowhow::KnowhowSummary;
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 use crate::engine::thread_events::{
@@ -54,13 +55,25 @@ fn run_build(
         setup_reminder,
         thread_depth_context,
         user_message,
-        "[CURRENT TIME]\nNow: Monday, August 17, 2026 at 15:02 Europe/Oslo (UTC+2).\n\
-         The same instant in UTC: Monday, August 17, 2026 at 13:02.\n[END CURRENT TIME]",
+        // Engine Build and Client URL empty, so the row set stays what the
+        // per-section tests below assert. The two are filled in by
+        // `build_capture_sections_surfaces_the_two_relocated_tail_blocks`.
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: CLOCK_BLOCK,
+        },
         loaded,
         resume,
         false,
     )
 }
+
+/// The clock block a turn really carries, so the capture row's size is a
+/// realistic one rather than a stub.
+const CLOCK_BLOCK: &str =
+    "[CURRENT TIME]\nNow: Monday, August 17, 2026 at 15:02 Europe/Oslo (UTC+2).\n\
+     The same instant in UTC: Monday, August 17, 2026 at 13:02.\n[END CURRENT TIME]";
 
 /// After Phase 1 of the trigger-knowhow-discovery refactor, `TriggerContext`
 /// no longer carries `knowhow_ids` or `event_payload`. The synthetic
@@ -154,25 +167,117 @@ fn build_trigger_started_event_records_the_resolved_model_and_effort() {
     assert_eq!(reasoning_effort.as_deref(), Some("low"));
 }
 
+/// The deadline these tests run against. The real ones come from
+/// `engine::aux_purpose::budget_for`; here any finite value does, since every
+/// case either resolves at once or hangs forever.
+const TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A paragraph long enough to clear the thin-output floor for any turn count.
+fn thick_summary() -> String {
+    "Fixed the summariser. ".repeat(40)
+}
+
+/// A hang yields nothing, so the caller falls back to its cached summary
+/// rather than to a line claiming the turns were resolved (ADR 0102).
 #[tokio::test(start_paused = true)]
-async fn summarize_falls_back_when_flash_hangs() {
+async fn summarize_yields_nothing_when_flash_hangs() {
     let hang = pending::<Result<String, Box<dyn std::error::Error + Send + Sync>>>();
-    let result = summarize_or_fallback(hang, 7).await;
-    assert_eq!(result, "(7 earlier messages not shown)");
+    assert_eq!(summarize_or_none(hang, 7, TEST_DEADLINE).await, None);
 }
 
 #[tokio::test(start_paused = true)]
-async fn summarize_falls_back_on_provider_error() {
+async fn summarize_yields_nothing_on_provider_error() {
     let err =
         async { Err::<String, Box<dyn std::error::Error + Send + Sync>>("vertex 503".into()) };
-    let result = summarize_or_fallback(err, 4).await;
-    assert_eq!(result, "(4 earlier messages not shown)");
+    assert_eq!(summarize_or_none(err, 4, TEST_DEADLINE).await, None);
+}
+
+/// An empty answer is a failure, not a summary. A blank paragraph would
+/// otherwise overwrite a good cached one.
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_on_a_blank_answer() {
+    let blank = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>("  \n ".into()) };
+    assert_eq!(summarize_or_none(blank, 9, TEST_DEADLINE).await, None);
+}
+
+/// The measured bad roll: 24 output tokens, roughly 100 chars, for a segment
+/// covering many turns. It is a SUCCESS to everything downstream, so before
+/// the floor it was cached and then held for about five turns.
+#[tokio::test(start_paused = true)]
+async fn summarize_yields_nothing_on_a_thin_answer() {
+    let thin = async {
+        Ok::<String, Box<dyn std::error::Error + Send + Sync>>(
+            "The assistant worked on the thread.".into(),
+        )
+    };
+    assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
+}
+
+/// The floor scales with the turns covered, so a short segment is allowed a
+/// short paragraph. Two turns require 120 chars, which this clears while
+/// staying far under what a 19-turn segment would owe.
+#[tokio::test(start_paused = true)]
+async fn a_short_segment_may_have_a_short_summary() {
+    let text = "Fixed the login redirect, and confirmed the session cookie now survives \
+                a reload. Nothing else was touched in this segment.";
+    let short = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text.into()) };
+    assert_eq!(
+        summarize_or_none(short, 2, TEST_DEADLINE).await,
+        Some(text.to_string())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn summarize_returns_the_paragraph_it_got() {
+    let text = thick_summary();
+    let expected = text.clone();
+    let ok = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text) };
+    assert_eq!(
+        summarize_or_none(ok, 9, TEST_DEADLINE).await,
+        Some(expected)
+    );
+}
+
+/// The floor counts CHARACTERS, not bytes. The summariser writes in the user's
+/// language, so a Norwegian or CJK paragraph is the ordinary case rather than
+/// an exotic one. At 3 bytes per character, a byte count would let a
+/// third-length CJK summary clear the floor and be cached for five turns.
+#[tokio::test(start_paused = true)]
+async fn a_multibyte_summary_is_measured_in_characters() {
+    // 250 CJK characters at 3 bytes each: 750 bytes, over the 19-turn floor of
+    // 600, but 250 characters, well under it.
+    let text = "要約".repeat(125);
+    assert!(
+        text.len() > 600,
+        "the byte count would have passed the floor"
+    );
+    assert!(
+        text.chars().count() < 600,
+        "the character count must not pass it"
+    );
+    let thin = async { Ok::<String, Box<dyn std::error::Error + Send + Sync>>(text) };
+    assert_eq!(summarize_or_none(thin, 19, TEST_DEADLINE).await, None);
+}
+
+/// The floor's own arithmetic, without a model. The requirement scales per
+/// covered turn and stops at the cap, so a long thread never owes a
+/// proportionally longer paragraph.
+#[test]
+fn the_thin_output_floor_scales_then_caps() {
+    // 100 chars is the measured bad roll. Fine for one turn, not for many.
+    assert!(!summary_is_too_thin(100, 1));
+    assert!(summary_is_too_thin(100, 19));
+    // The cap: 40 turns asks no more than 10 turns past it would.
+    assert!(!summary_is_too_thin(600, 40));
+    assert!(summary_is_too_thin(599, 40));
+    // Zero covered turns can demand nothing.
+    assert!(!summary_is_too_thin(0, 0));
 }
 
 #[tokio::test(start_paused = true)]
 async fn classify_falls_back_when_flash_hangs() {
     let hang = pending::<Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>>>();
-    let result = classify_or_fallback(hang).await;
+    let result = classify_or_fallback(hang, TEST_DEADLINE).await;
     let default = QueryClassification::default();
     assert_eq!(result.needs_memory, default.needs_memory);
     assert_eq!(result.needs_file_list, default.needs_file_list);
@@ -185,11 +290,80 @@ async fn classify_falls_back_on_provider_error() {
     let err = async {
         Err::<QueryClassification, Box<dyn std::error::Error + Send + Sync>>("bad json".into())
     };
-    let result = classify_or_fallback(err).await;
+    let result = classify_or_fallback(err, TEST_DEADLINE).await;
     assert!(result.needs_memory);
     assert!(result.needs_file_list);
     assert!(result.needs_credentials);
     assert!(result.sub_queries.is_empty());
+}
+
+/// `all` is what the eval harness sets on both arms: every section retrieved,
+/// so the curated context mode has memory to curate rather than none.
+#[test]
+fn the_all_pin_retrieves_every_section() {
+    let pinned = forced_classification(Some("all")).expect("`all` is a pin");
+    assert!(pinned.needs_memory);
+    assert!(pinned.needs_file_list);
+    assert!(pinned.needs_credentials);
+    assert!(pinned.sub_queries.is_empty());
+}
+
+#[test]
+fn the_none_pin_retrieves_nothing() {
+    let pinned = forced_classification(Some("none")).expect("`none` is a pin");
+    assert!(!pinned.needs_memory);
+    assert!(!pinned.needs_file_list);
+    assert!(!pinned.needs_credentials);
+    assert!(pinned.sub_queries.is_empty());
+}
+
+/// The pin is opt-in. Unset has to leave every ordinary workspace on the
+/// classifier it has always used.
+#[test]
+fn no_pin_means_the_classifier_runs_as_before() {
+    assert!(forced_classification(None).is_none());
+}
+
+/// A typo must not silently pin the classification to something, and must not
+/// kill the engine either. It falls through to the ordinary classifier, and the
+/// pin reader logs the ignored value.
+#[test]
+fn a_value_that_is_neither_all_nor_none_is_ignored() {
+    assert!(forced_classification(Some("yes")).is_none());
+    assert!(forced_classification(Some("true")).is_none());
+    assert!(forced_classification(Some("")).is_none());
+    assert!(forced_classification(Some("   ")).is_none());
+    assert!(forced_classification(Some("all,none")).is_none());
+}
+
+/// Surrounding whitespace and a shouted spelling both come free with a shell
+/// export, and neither should cost a paid run its pin. `ALL` reaching the
+/// engine as "no pin" would be silent: the arms would classify live again and
+/// go back to voiding the pairs this exists to save.
+#[test]
+fn a_padded_or_shouted_pin_is_still_a_pin() {
+    assert!(forced_classification(Some("  all  ")).is_some());
+    assert!(forced_classification(Some("ALL")).is_some());
+    assert!(forced_classification(Some(" None\n")).is_some());
+    assert_eq!(
+        forced_classification(Some("NONE")).map(|c| c.needs_memory),
+        Some(false)
+    );
+}
+
+/// The eval harness exports this name and this value from its own copies of
+/// both strings, in `crates/lucidos-eval/src/workspace.rs`. That crate does not
+/// depend on the engine (ADR 0087 decision 15), so nothing but a literal joins
+/// the two sides. Rename or re-spell either and the harness keeps exporting the
+/// old one: nothing fails to compile, the pin silently stops working, and the
+/// run goes back to voiding the pairs it exists to save. This is the tripwire.
+#[test]
+fn the_pin_is_the_name_and_value_the_eval_harness_exports() {
+    assert_eq!(
+        FORCE_QUERY_CLASSIFICATION_ENV,
+        "LUCIDOS_FORCE_QUERY_CLASSIFICATION"
+    );
+    assert!(forced_classification(Some("all")).is_some());
 }
 
 /// Regression: an earlier version of the system prompt said
@@ -627,6 +801,67 @@ fn build_capture_sections_filters_empty_sections() {
     );
 }
 
+/// The two blocks ADR 0084 moved out of the system prompt are billed where
+/// they now ride: the request tail, one row each. Without their own rows the
+/// viewer's budget bar would lose them entirely, since they left the System
+/// Instructions row and joined nothing.
+///
+/// Engine Build is empty on a packaged install, which is why it filters out
+/// above rather than being unconditional like the clock.
+#[test]
+fn build_capture_sections_surfaces_the_two_relocated_tail_blocks() {
+    let sections = build_capture_sections(
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &TurnTail {
+            engine_build: "[ENGINE BUILD]\nCURRENT\n[END ENGINE BUILD]",
+            client_url: "[CLIENT URL]\nhttps://localhost:5173\n[END CLIENT URL]",
+            current_time: CLOCK_BLOCK,
+        },
+        &[],
+        &[],
+        false,
+    );
+
+    let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "System Instructions",
+            "User Message",
+            "Engine Build",
+            "Client URL",
+            "Current Time"
+        ]
+    );
+    for name in ["Engine Build", "Client URL", "Current Time"] {
+        let row = sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("section {name} missing"));
+        assert_eq!(
+            row.role,
+            ContextRole::User,
+            "{name} rides in the user message"
+        );
+        assert_eq!(row.group, Some("The request".to_string()), "{name}");
+    }
+}
+
 /// Phase 5.2: each loaded knowhow doc gets its own collapsible row under
 /// the "Loaded knowhow" inner group. Char count reflects the body so the
 /// viewer's budget bar stays honest even when capture_body is false.
@@ -671,10 +906,13 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
     assert_eq!(knowhow[0].name, "knowhow: doc-a");
     assert_eq!(knowhow[1].name, "knowhow: doc-b");
     assert!(knowhow.iter().all(|s| s.role == ContextRole::User));
-    // char_count is real (capture_body is false so content is None, but
-    // the viewer's budget bar reads char_count, not the body).
-    assert_eq!(knowhow[0].char_count, "BODY A".chars().count());
-    assert_eq!(knowhow[1].char_count, "BODY BBBB".chars().count());
+    // Both sizes are real (capture_body is false so content is None, but
+    // the viewer's budget bar reads the delta, not the body). Nothing else
+    // counts a knowhow doc's chars, so the delta is its own size.
+    assert_eq!(knowhow[0].budget_delta_chars, "BODY A".chars().count());
+    assert_eq!(knowhow[1].budget_delta_chars, "BODY BBBB".chars().count());
+    assert_eq!(knowhow[0].content_chars, Some("BODY A".chars().count()));
+    assert_eq!(knowhow[1].content_chars, Some("BODY BBBB".chars().count()));
     assert!(knowhow.iter().all(|s| s.content.is_none()));
 }
 
@@ -748,11 +986,14 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
     assert!(prior.iter().any(|s| s.name == "ToolUse: query_events"));
     assert!(prior.iter().any(|s| s.name == "ToolUse: load_knowhow"));
     assert!(prior.iter().all(|s| s.group.is_none()));
-    // capture_body=false so bodies are dropped; char_count still reflects
+    // capture_body=false so bodies are dropped; both sizes still reflect
     // the assembled "ToolUse: …\n\nToolResult:\n…" body so the viewer's
     // prior-messages budget stays accurate.
     assert!(prior.iter().all(|s| s.content.is_none()));
-    assert!(prior.iter().all(|s| s.char_count > 0));
+    assert!(prior.iter().all(|s| s.budget_delta_chars > 0));
+    assert!(prior
+        .iter()
+        .all(|s| s.content_chars == Some(s.budget_delta_chars)));
 }
 
 #[test]
@@ -784,7 +1025,7 @@ fn build_capture_sections_includes_device_preferences_context() {
         .expect("device/preferences section must be captured");
     assert_eq!(section.group.as_deref(), Some("Identity & profile"));
     assert_eq!(section.role, ContextRole::User);
-    assert!(section.char_count > 0);
+    assert!(section.budget_delta_chars > 0);
 }
 
 /// Capturing a body honors the `capture_body` flag: rows get full bodies
@@ -814,7 +1055,11 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "user",
-        "clock",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: "clock",
+        },
         &docs,
         &[],
         true,
@@ -836,7 +1081,11 @@ fn build_capture_sections_honors_capture_body_flag() {
         "",
         "",
         "user",
-        "clock",
+        &TurnTail {
+            engine_build: "",
+            client_url: "",
+            current_time: "clock",
+        },
         &docs,
         &[],
         false,
@@ -852,6 +1101,56 @@ fn build_capture_sections_honors_capture_body_flag() {
     let kh_off = off.iter().find(|s| s.name == "knowhow: doc").unwrap();
     assert_eq!(kh_on.content.as_deref(), Some("BODY"));
     assert!(kh_off.content.is_none());
+}
+
+/// The cap clips the BODY and never either count.
+///
+/// The Context Viewer's budget bar and the eval's utilisation axis read
+/// `budget_delta_chars`, and a region-size question reads `content_chars`.
+/// Both are the true assembled length here whatever the body does. ADR 0110's
+/// full capture lifts the cap, and that gate must not move either number.
+#[test]
+fn a_capped_body_still_reports_its_true_length() {
+    let long = "x".repeat(20_000);
+    let sections = run_build(
+        &long,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user",
+        &[],
+        &[],
+    );
+    let system = sections
+        .iter()
+        .find(|s| s.name == "System Instructions")
+        .expect("the system prompt is always a section");
+    assert_eq!(
+        system.budget_delta_chars,
+        long.chars().count(),
+        "the delta is the assembled length, not the persisted one"
+    );
+    assert_eq!(
+        system.content_chars,
+        Some(long.chars().count()),
+        "a clipped body does not move the region's size"
+    );
+    let body = system.content.as_deref().unwrap_or_default();
+    assert!(
+        body.chars().count() < system.budget_delta_chars,
+        "an over-cap body is clipped by default"
+    );
 }
 
 /// The chat-agent prompt must nudge use of `ask_user_question` for

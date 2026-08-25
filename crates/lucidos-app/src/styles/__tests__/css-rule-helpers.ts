@@ -4,7 +4,9 @@
  * below-header anchor, the per-pane toast columns, the transcript fades), and
  * each had grown its own byte-identical copy of the two string functions.
  *
- * Two tools here, and picking the wrong one is the trap this header exists for.
+ * Two readers here, and picking the wrong one is the trap this header exists
+ * for. `styleSheetPaths` feeds either one when the scan is over every sheet
+ * rather than a named file.
  *
  * `block` + `decl` resolve the FIRST TEXTUAL match, which is right for the
  * common case: one rule you can name, and a handful of its declarations. It is
@@ -21,6 +23,28 @@
  */
 import { expect } from 'vitest';
 import postcss, { type AtRule, type Container, type Declaration, type Document } from 'postcss';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readdirSync, statSync } from 'node:fs';
+// @ts-expect-error: same
+import { resolve } from 'node:path';
+
+/** Every stylesheet under `root`, recursively, as absolute paths. It skips
+ *  `__tests__` so a fixture never reads as shipping CSS. Shared because a scan
+ *  asking "does any sheet do X" has to see all of them, and three suites had
+ *  grown the same walk. */
+export function styleSheetPaths(root: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(root)) {
+    const path: string = resolve(root, entry);
+    if (statSync(path).isDirectory()) {
+      if (entry === '__tests__') continue;
+      out.push(...styleSheetPaths(path));
+    } else if (path.endsWith('.css')) {
+      out.push(path);
+    }
+  }
+  return out;
+}
 
 /** Body of the first rule/at-rule block whose header matches `needle`, starting
  *  the search at `from`. Brace-matched, so a nested block (a `:root` inside a

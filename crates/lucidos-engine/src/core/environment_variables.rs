@@ -348,15 +348,16 @@ fn unquote(s: &str) -> String {
 /// is the consolidation that retires the legacy per-workspace `.env` mechanism
 /// (`load_workspace_env`) in favour of the single DB-backed store.
 ///
-/// Self-idempotent: the file is removed after a successful import, so a later
+/// Self-idempotent: the file is removed once every line has landed, so a later
 /// boot finds nothing to do. Invalid- or reserved-named lines are skipped with a
 /// log line (the engine owns those names). Each imported row announces
 /// `EnvironmentVariableSet` like any other write, because the write path owns
 /// the emit and a backfill is not special: these variables genuinely start
-/// existing here. It cannot spam a restart, since the file is deleted after the
-/// import. The store is non-secret, which is correct here: `.env` held only
-/// non-secret config (paths, CLI config dirs, identifiers); real secrets live in
-/// the credential / OAuth stores.
+/// existing here. It cannot spam a restart: the file is deleted once the import
+/// is clean, and a retained one re-imports only the keys the DB still lacks.
+/// The store is non-secret, which is correct here: `.env` held
+/// only non-secret config (paths, CLI config dirs, identifiers); real secrets
+/// live in the credential / OAuth stores.
 ///
 /// Best-effort: read/parse/delete errors are logged, never fatal — a broken
 /// `.env` must not stop the engine from booting.
@@ -382,6 +383,8 @@ pub async fn migrate_env_file_to_db(
     };
 
     let mut imported = 0usize;
+    let mut failed = 0usize;
+    let mut already = 0usize;
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -395,9 +398,28 @@ pub async fn migrate_env_file_to_db(
         let value = unquote(raw_val.trim());
         match validate_name(key) {
             Ok(()) => {
+                // The DB wins over the file, which is what makes a retained
+                // file safe to re-read. A retry boot must not overwrite a value
+                // the user edited in Settings meanwhile, and must not re-emit
+                // `EnvironmentVariableSet` for a row that already landed.
+                match EnvironmentVariableStore::get(pool, key).await {
+                    Ok(Some(_)) => {
+                        already += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        failed += 1;
+                        crate::log!("[EnvMigration] Could not read '{}' from the DB: {}", key, e);
+                        continue;
+                    }
+                }
                 match EnvironmentVariableStore::upsert(pool, event_bus, key, &value, None).await {
                     Ok(_) => imported += 1,
-                    Err(e) => crate::log!("[EnvMigration] Failed to import '{}': {}", key, e),
+                    Err(e) => {
+                        failed += 1;
+                        crate::log!("[EnvMigration] Failed to import '{}': {}", key, e);
+                    }
                 }
             }
             Err(rejection) => crate::log!(
@@ -408,10 +430,29 @@ pub async fn migrate_env_file_to_db(
         }
     }
 
+    // A line that failed to import still exists only in this file, so deleting
+    // it now would lose the variable for good. A transient DB error at boot is
+    // exactly when that happens. Keep the file and retry next boot.
+    //
+    // The retry is quiet. The loop skips a key the DB already holds, so a later
+    // boot imports only what is still missing and announces nothing for the
+    // rest. That also bounds a permanently failing line: the file stays, and
+    // every boot after the first does the same small read and no writes.
+    if failed > 0 {
+        crate::log!(
+            "[EnvMigration] Imported {} var(s), skipped {} already in the DB, {} failed, so data/.env stays for the next boot",
+            imported,
+            already,
+            failed
+        );
+        return;
+    }
+
     match std::fs::remove_file(&env_path) {
         Ok(()) => crate::log!(
-            "[EnvMigration] Imported {} var(s) from data/.env into the DB and removed the file",
-            imported
+            "[EnvMigration] Imported {} var(s) from data/.env into the DB, skipped {} already there, and removed the file",
+            imported,
+            already
         ),
         Err(e) => crate::log!(
             "[EnvMigration] Imported {} var(s) but failed to delete {}: {}",

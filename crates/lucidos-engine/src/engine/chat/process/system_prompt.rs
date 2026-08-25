@@ -149,6 +149,12 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
 /// reply with `[Open thread](thread:<ws>/<uuid>)`, which is the user's only
 /// affordance for opening the thread that was just spawned.
 ///
+/// The trigger form is named there for a reason beyond completeness. Told to
+/// link a trigger, the agent reads the ban as covering the target's id, and
+/// reaches for the panel link instead. That is the reported bug
+/// (docs/plans/2026-08-24-a-trigger-is-a-link.md), so the carve-out says which
+/// half of a link the name goes in.
+///
 /// Mirrored for coding agents by `agent_session::prompts::NAMES_NOT_IDS_RULE`,
 /// tuned there to commits and worktrees. Change both together.
 const NAMES_NOT_IDS_RULE: &str = "NAMING THINGS TO THE USER, NEVER A RAW ID OR SHA:\n\
@@ -166,8 +172,9 @@ const NAMES_NOT_IDS_RULE: &str = "NAMING THINGS TO THE USER, NEVER A RAW ID OR S
      still takes the uuid, and tool results still carry them.\n\
      A MARKDOWN LINK TARGET IS NOT PROSE, so keep writing the links: \
      `[Open thread](thread:<ws>/<uuid>)` for a thread you spawned, pasted exactly as the tool \
-     result gives it to you, and `[Habit Tracker](app:habit-tracker)` for an app. Dropping one \
-     because it holds a uuid leaves the user no way to open what you just started.\n\
+     result gives it to you, `[Habit Tracker](app:habit-tracker)` for an app, \
+     `[Nightly digest](trigger:<id>)` for a trigger. The NAME goes in the label, the id in the \
+     target. Dropping one because it holds a uuid leaves the user no way to open it.\n\
      ONE EXCEPTION: the user asked for the raw value, or needs it to paste somewhere. Then give \
      it, wrapped in <copy>…</copy> tags.";
 
@@ -310,6 +317,27 @@ pub(crate) const SETUP_INTERVIEW_RULE: &str =
      questions ARE the work there, so ask them rather than guessing a kit. Skip \
      the load if you already loaded it earlier in this thread.";
 
+/// The todo list where the `todo_write` tool exists, which is everywhere the
+/// *self-curated context mode* is off.
+const TODO_LIST_RULE: &str = "TODO LIST (todo_write, live progress in the prompt bar):\n\
+     - Use it for a multi-step request (3+ steps) so the user watches the plan \
+     tick along; skip it for trivial single-step work.\n\
+     - Call once at the start with every item `pending`, then re-call flipping \
+     one to `in_progress` before you start it and to `completed` when it's done.";
+
+/// The same list under the mode, which withdraws `todo_write` from the schema.
+///
+/// One list, one write surface. Ordering a call the array does not offer is
+/// what this replaces: the model met the instruction on every mode-on turn and
+/// had nothing to call.
+const TODO_LIST_RULE_CONTEXT_MODE: &str =
+    "TODO LIST (a [TODO] heading in your working understanding, live progress \
+     in the prompt bar):\n\
+     - Use it for a multi-step request (3+ steps) so the user watches the plan \
+     tick along; skip it for trivial single-step work.\n\
+     - Write the whole list under the heading, and rewrite it as items move. \
+     The mode's own section below owns the marks. There is no todo tool here.";
+
 /// The workspace-independent body of every chat system prompt. Rule consts sit
 /// in it as double-underscore-delimited placeholder tokens that
 /// [`static_prompt_body`] resolves.
@@ -353,7 +381,7 @@ CONTENT TAXONOMY (intent, knowhow, script, trigger; each scoped to an app, a kno
 - Intent: what the user wants, in their terms. Goals, conditions, outcomes. Stable. Frontmatter: `name`, optional `knowhow` (ids, each the path under data/knowhow/ without .md and including subdirectories, e.g. 'weather/api'; engine-shipped docs take the 'system-knowhow/' prefix).
 - Knowhow: how to achieve it, in technical terms. API details, formats, quirks, workarounds. This is YOUR memory and you maintain it: when you discover a quirk, a better approach or a failure mode, update the relevant file. Frontmatter: `name`, optional `description` (what semantic discovery matches against).
 - Script: code invoked by an intent or knowhow. Trigger: a scheduled or event-driven task.
-Change an intent only when the user's goal changes, and never put technical detail in one.
+Change an intent only when the user's goal changes, and never put technical detail in one. Write the knowhow file BEFORE the intent that needs it, so the procedure has somewhere to live.
 
 SCRIPT FILES (under apps/, triggers/, knowhow/scripts/):
 - Every script the engine spawns gets the `lucidos` CLI on PATH and LUCIDOS_WORKSPACE set. Write data with `lucidos data write`, not raw HTTP to the engine, and emit or read domain events with `lucidos events emit` / `lucidos events query`. Full reference: load_knowhow('system-knowhow/lucidos-cli').
@@ -389,11 +417,9 @@ ACTION FIRST, NO CLARIFICATION LOOPS:
 
 __ASK_USER_QUESTION_RULE__
 
-TODO LIST (todo_write, live progress in the prompt bar):
-- Use it for a multi-step request (3+ steps) so the user watches the plan tick along; skip it for trivial single-step work.
-- Call once at the start with every item `pending`, then re-call flipping one to `in_progress` before you start it and to `completed` when it's done.
+__TODO_LIST_RULE__
 
-TOOLS: Use efficiently, don't loop. One call per file, and don't re-read a file you just wrote. Prefer edit_file over write_file for an existing file, and its json_path + new_value mode for a .json or .slides file.
+TOOLS: Use efficiently, don't loop. One call per file, and don't re-read a file you just wrote. Prefer edit_file over write_file for an existing file, and its json_path + new_value mode for a .json or .slides file. edit_file answers "N of M occurrences replaced": N < M means the rest are still there.
 
 MEMORY CORRECTIONS (the `memory` tool):
 - When the user says a memory is wrong ("I don't work at Acme Corp"), pass a broad search_query ("Acme") and a specific wrong_fact ("User works at Acme Corp"), plus an optional `correction` to replace it. A correction persists across memory rebuilds.
@@ -425,8 +451,10 @@ LOOKING UP SPECIFIC DATA (numbers, ids, dates, amounts, addresses):
 - Find the file with list_files, or glob_files / grep_files on a larger workspace, then read_file it. A memory summary says WHAT a file contains, never the exact values inside it.
 - A PDF is stored as a binary artifact with no text extraction, and read_file says so (unless a legacy .txt sidecar exists, which it surfaces automatically).
 
-SEARCHING FILES:
+SEARCHING FILES, AND WORKING ON CODE:
 - glob_files finds files by path pattern and grep_files regex-searches contents, both relative to data/. Prefer them over run_bash with find, rg or grep: structured, faster, and they respect workspace boundaries.
+- A REGISTERED REPOSITORY IS REACHABLE THE SAME WAY: pass `repo` to read_file, glob_files, grep_files or edit_file. NEVER `cd` into a checkout to cat, sed, grep or awk it, which returns raw untruncated bytes and walks target/.
+- A repo edit needs `commit: false` and commits NOTHING: say so, and point at git diff. run_coding_agent instead for anything adding or deleting files, or that should land as a reviewable change.
 
 LONG-RUNNING WORK, AND THE REPEATED-CALL GUARD:
 - run_bash and run_python are synchronous with a 300s ceiling and WILL kill anything longer mid-stream. For longer work spawn run_bash_background, or run_python_background when the script needs scientific packages. Drain either with bash_output(task_id, wait_secs=N), using the FULL 120 for anything long, and cancel with bash_kill(task_id).
@@ -452,6 +480,7 @@ REFRESHING OPEN WINDOWS:
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception.
+- LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
 - Link a UI panel by its bare name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Apps and other plugins are downloaded from `[Plugins](app-store)`; call it the Plugins panel, never the retired "App Store" or "Store".
 
 __NAMES_NOT_IDS_RULE__
@@ -490,38 +519,6 @@ CRITICAL RULES:
 
 __REPEATED_ACTION_RULE__"#;
 
-/// The per-turn ENGINE BUILD section: what the running engine is, and whether
-/// the user has switched onto a newer one.
-///
-/// The four states are not the same claim, so none of them may collapse into
-/// another. Source-ahead is split from wedged because the advice inverts:
-/// source-ahead resolves by waiting, while a wedged rebuild resolves only by
-/// relaunching, and the agent must not send the user round that loop.
-///
-/// Deliberately no build id in the text. The user cannot look one up on any
-/// screen, so it would only invite the agent to quote a hex string at them.
-/// See `.claude/rules/glossary.md` and the prompt's own NAMES NOT IDS rule.
-fn engine_build_section(status: &crate::engine::engine_version::VersionStatus) -> String {
-    let state = if status.update_available {
-        "A NEWER ENGINE IS BUILT AND THE USER HAS NOT SWITCHED ONTO IT YET, so an applied \
-         restart-requiring change is NOT live."
-    } else if status.rebuild_wedged {
-        "NO REBUILD CAN DELIVER THE RESTART-REQUIRING CHANGE ON MAIN: one already succeeded and \
-         produced nothing switchable. Do not offer Switch or Rebuild; relaunch instead."
-    } else if status.source_behind_head {
-        "A RESTART-REQUIRING CHANGE IS ON MAIN WITH NO BUILD BEHIND IT YET (rebuilding, or \
-         it failed), so there is nothing to switch onto: do not tell them to."
-    } else {
-        "THE RUNNING ENGINE IS CURRENT, matching both the built binary and main. Any applied \
-         restart-requiring change IS live, and the user HAS restarted if one needed it."
-    };
-    format!(
-        "\n\nENGINE BUILD (rebuilt every turn, never stale):\n{state}\nThis is the answer to \
-         \"has the user restarted?\". Never ask, and never infer it from what you applied \
-         earlier: they restart when they like, including mid-turn."
-    )
-}
-
 /// Resolve every placeholder token in [`SYSTEM_PROMPT_BASE`] and append the
 /// coding-surface section, yielding the workspace-independent body of the chat
 /// system prompt.
@@ -530,11 +527,23 @@ fn engine_build_section(status: &crate::engine::engine_version::VersionStatus) -
 /// here so it is the SAME number `run_agentic_loop` enforces. A prompt naming a
 /// number the loop does not use is exactly the fabricated engine internal the
 /// ENGINE INTERNALS section warns against.
-fn static_prompt_body(has_lucidos_source: bool, max_tool_calls: usize) -> String {
+///
+/// `mode` is here for the same reason. The mode withdraws `todo_write`, so a
+/// body that cannot vary orders a call the tools array does not offer.
+fn static_prompt_body(
+    has_lucidos_source: bool,
+    max_tool_calls: usize,
+    mode: super::context_mode::ContextMode,
+) -> String {
     let apply_verify_rule = if has_lucidos_source {
         format!("{}{}", APPLY_VERIFY_RULE, APPLY_VERIFY_DEV_ADDENDUM)
     } else {
         APPLY_VERIFY_RULE.to_string()
+    };
+    let todo_list_rule = if mode.is_on() {
+        TODO_LIST_RULE_CONTEXT_MODE
+    } else {
+        TODO_LIST_RULE
     };
 
     let body = SYSTEM_PROMPT_BASE
@@ -547,6 +556,7 @@ fn static_prompt_body(has_lucidos_source: bool, max_tool_calls: usize) -> String
             WORKSPACE_ASSETS_KNOWHOW_RULE,
         )
         .replace("__SETUP_INTERVIEW_RULE__", SETUP_INTERVIEW_RULE)
+        .replace("__TODO_LIST_RULE__", todo_list_rule)
         .replace("__TRIGGER_VS_EVENT_WAIT_RULE__", TRIGGER_VS_EVENT_WAIT_RULE)
         .replace("__NAMES_NOT_IDS_RULE__", NAMES_NOT_IDS_RULE)
         .replace("__NO_IMPERSONATION_RULE__", NO_IMPERSONATION_RULE)
@@ -561,24 +571,29 @@ fn static_prompt_body(has_lucidos_source: bool, max_tool_calls: usize) -> String
 }
 
 impl LucidosEngine {
-    /// Build the full chat system prompt for this turn plus the mandatory
-    /// missing-preference keys and whether an image provider is available
-    /// (consumed by the tools list).
+    /// Build the full chat system prompt for this turn, plus the mandatory
+    /// missing-preference keys.
     ///
-    /// Reads no clock, deliberately: the result is a cached prefix tier, so
-    /// anything volatile in it costs a full rewrite per turn. `super::turn_clock`
-    /// owns that rule and the tail block the reading moved to.
+    /// Reads no clock, no build state and no request origin, deliberately: the
+    /// result is a cached prefix tier, so anything volatile in it costs a full
+    /// rewrite per turn. `super::turn_clock` and `super::turn_tail` own that
+    /// rule and the tail blocks the readings moved to.
     pub(super) async fn build_chat_system_prompt(
         &self,
         user_timezone: &str,
         user_language: &str,
         device_id: Option<&str>,
-        is_trigger: bool,
+        // `Some` on a trigger fire, which is the whole of what "is this a
+        // trigger" means to the caller too (`trigger.is_some()`).
         trigger: &Option<TriggerContext>,
         // This turn's resolved tool-call cap. Passed in rather than read here
         // so it is the SAME number `run_agentic_loop` enforces.
         max_tool_calls: usize,
-    ) -> (String, Vec<&'static str>, bool) {
+        // This workspace's tool gates and the intent snapshot behind one of
+        // them, read once per turn by the caller. Shared so the prompt and the
+        // tools array cannot disagree about what this workspace can do.
+        capabilities: &crate::engine::tools::TurnCapabilities,
+    ) -> (String, Vec<&'static str>) {
         // Timezone RULES only. The reading itself rides at the tail of the user
         // message, so this whole block stays byte-identical turn to turn and
         // thread to thread. See `super::turn_clock`.
@@ -650,62 +665,72 @@ impl LucidosEngine {
 
         let has_lucidos_source = crate::paths::has_lucidos_source();
 
+        // Read once and used twice, by the body and by the mode's own section
+        // below. Two reads of the same snapshot could not disagree, but one
+        // name says plainly that the two are the same mode.
+        let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
+
         let system_prompt = format!(
             "{}{}",
             system_prompt,
-            static_prompt_body(has_lucidos_source, max_tool_calls)
+            static_prompt_body(has_lucidos_source, max_tool_calls, context_mode)
         );
 
         // Whether the user has restarted onto the newest build is a FACT the
-        // engine holds. It is stated here rather than left to be inferred from
+        // engine holds. It is stated rather than left to be inferred from
         // having applied a `requires_restart` change earlier in the thread. The
         // prescribed probe (fetch a served asset) cannot answer for a
         // backend-only change, which alters no served asset. Dev-only, on the
         // same gate as the apply-verify addendum that reads it.
+        //
+        // Only the POINTER is here. The state itself is a per-turn value, so it
+        // rides in the message tail (`super::turn_tail`).
         let system_prompt = if has_lucidos_source {
             format!(
                 "{}{}",
                 system_prompt,
-                engine_build_section(&self.version_status().await)
+                super::turn_tail::ENGINE_BUILD_POINTER
             )
         } else {
             system_prompt
         };
 
-        let api_port = std::env::var("LUCIDOS_API_PORT").unwrap_or_else(|_| "3000".to_string());
-        let frontend_url = if let Some(origin) = self.frontend_origin.lock().unwrap().as_ref() {
-            origin.clone()
-        } else {
-            // No request origin observed yet: the engine serves the frontend
-            // itself, so its own TLS setting decides the scheme (never hardcode
-            // http/https, see the intra-host scheme rule).
-            let scheme = crate::net_config::tls_scheme();
-            let port = std::env::var("VITE_PORT").unwrap_or_else(|_| api_port.clone());
-            format!("{}://localhost:{}", scheme, port)
-        };
-        let system_prompt = format!("{}\n\nThe Lucidos client the user is talking to you from is at {}. To see an app UI, use capture_app, never browser_open.",
-            system_prompt, frontend_url);
+        // Same split, same reason: the URL comes from the last observed request
+        // origin, so the cached tier gets the instruction and the tail gets the
+        // reading.
+        let system_prompt = format!("{}{}", system_prompt, super::turn_tail::CLIENT_URL_POINTER);
 
         // No auto-detected browser-login domain list here, deliberately:
         // `docs/adr/0067-browser-login-domains-never-reach-the-prompt.md`.
 
-        let apps_section = self
-            .app_manager
-            .list_apps()
-            .map(|apps| super::workspace_payload::build_apps_section(&apps))
-            .unwrap_or_default();
+        // A read that FAILED is not a workspace with no apps, and the prompt
+        // renders the two identically. So the agent tells the user they have
+        // none, and nothing anywhere says the scan broke. Same treatment as the
+        // preference read above: degrade the turn, but name what happened.
+        let apps_section = match self.app_manager.list_apps() {
+            Ok(apps) => super::workspace_payload::build_apps_section(&apps),
+            Err(e) => {
+                log!(
+                    "[Chat] app list read failed ({}); this turn's prompt names no apps",
+                    e
+                );
+                String::new()
+            }
+        };
 
-        let data_dir = self.workspace_path.join(crate::core::DATA_DIR);
-        let all_intents = crate::core::IntentStore::load_all(&data_dir);
-        let intents_section = if !all_intents.is_empty() {
+        // The SAME snapshot the `execute_intent` gate was derived from, not a
+        // second scan of `data/`. Two scans can disagree inside one turn, and
+        // one direction is harmful: an intent created between them lists here
+        // while the tool to run it was never offered.
+        let intents_section = if capabilities.intents.is_empty() {
+            String::new()
+        } else {
             let mut section = String::from("\n\n## Available Intents\n\n");
             section.push_str("Stored descriptions of what the user wants. Use execute_intent(intent_id) to fulfill one. Each intent is paired with knowhow that tells you how to achieve it.\n\n");
-            for p in &all_intents {
+            for p in &capabilities.intents {
                 section.push_str(&format!("- **{}** (id: `{}`)\n", p.name, p.id));
             }
             section
-        } else {
-            String::new()
         };
 
         let kh_dirs = self.knowhow_dirs();
@@ -729,8 +754,6 @@ impl LucidosEngine {
             system_prompt, apps_section, intents_section, knowhow_section, system_knowhow_section
         );
 
-        let image_provider_available = self.current_image_provider().await.is_some();
-
         let system_prompt = {
             let mut section = format!("{}\n\n## Images\n\n\
                 Images in the conversation are numbered sequentially (1-based) across all messages — user-pasted and generated. \
@@ -745,7 +768,7 @@ impl LucidosEngine {
                 you see — do NOT claim you have no image or ask the user to re-send it. \
                 You can save any conversation image to an artifact file with the save_thread_image tool \
                 (e.g., image: 'thread:1', path: 'artifacts/photos/reaction.jpg').", system_prompt);
-            if image_provider_available {
+            if capabilities.gates.image_provider {
                 section.push_str(" You can also generate or edit images with the generate_image tool. \
                     To edit an existing image, reference it as 'thread:N' where N is its position in the thread, \
                     or use an artifact path like 'artifacts/photo.png'. \
@@ -759,25 +782,29 @@ impl LucidosEngine {
         // the provider's prompt cache keys on. The per-trigger knowhow listing
         // is trigger-only for the same reason, so it lives here rather than in
         // the unconditional knowhow section above.
-        let system_prompt = if is_trigger {
-            let trigger_knowhow_section = trigger
-                .as_ref()
-                .map(|t| {
-                    let triggers_dir = self.workspace_path.join(crate::core::TRIGGERS_DIR);
-                    build_trigger_knowhow_section(&triggers_dir, &t.slug)
-                })
-                .unwrap_or_default();
-            format!(
-                "{}{}{}",
-                system_prompt,
-                trigger_knowhow_section,
-                crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM
-            )
-        } else {
-            system_prompt
+        let system_prompt = match trigger {
+            Some(t) => {
+                let triggers_dir = self.workspace_path.join(crate::core::TRIGGERS_DIR);
+                format!(
+                    "{}{}{}",
+                    system_prompt,
+                    build_trigger_knowhow_section(&triggers_dir, &t.slug),
+                    crate::scheduler::user_tasks::TRIGGER_SYSTEM_ADDENDUM
+                )
+            }
+            None => system_prompt,
         };
 
-        (system_prompt, missing_pref_keys, image_provider_available)
+        // ADR 0085 decision 8: the standing re-read rule belongs in the cached
+        // prefix, because it never changes. Empty when the mode is off, so the
+        // control arm's prompt is byte-identical to a build without the mode.
+        let system_prompt = format!(
+            "{}{}",
+            system_prompt,
+            super::context_mode::system_prompt_section(context_mode, capabilities.schedule)
+        );
+
+        (system_prompt, missing_pref_keys)
     }
 }
 
@@ -823,13 +850,17 @@ mod tests {
     use super::super::super::process_helpers::{
         APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE, LOOK_BEFORE_ASSESSING_RULE,
     };
-    use super::{
-        coding_surface_section, engine_build_section, static_prompt_body,
-        workspace_identity_section, ASK_USER_QUESTION_RULE, NAMES_NOT_IDS_RULE,
-        NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE, TRIGGER_VS_EVENT_WAIT_RULE,
-        WORKSPACE_ASSETS_KNOWHOW_RULE,
+    use super::super::context_mode::ContextMode;
+    use super::super::turn_tail::{
+        client_url_block, engine_build_block, version_status, BUILD_STATES, CLIENT_URL_POINTER,
+        ENGINE_BUILD_POINTER,
     };
-    use crate::engine::engine_version::VersionStatus;
+    use super::{
+        coding_surface_section, static_prompt_body, workspace_identity_section,
+        ASK_USER_QUESTION_RULE, NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
+        TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
+    };
+    use crate::llm::ToolCapabilities;
     use std::path::{Path, PathBuf};
 
     /// Ceiling on the engine-authored text every chat turn pays for before the
@@ -848,11 +879,146 @@ mod tests {
     /// because this number alone lets one runaway schema hide behind twenty
     /// lean ones.
     ///
-    /// Raised to 108,050 after the ceiling drifted over unnoticed. 794 of the
-    /// overage arrived through docs-only diffs, which skipped this suite until
-    /// `/harden` grew a `system-knowhow/**` row. The other 79 are the `env_vars`
-    /// summary naming its second consumer. Measured total is 108,023.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 108_050;
+    /// Raised by 339 for ADR 0088's second half, to a measured 108,589. Both
+    /// halves buy a stable cached tier, and the gates in the same change move
+    /// NOTHING here: this meter bills the engine-authored surface, so
+    /// [`flat_chat_tools`] resolves every gate open.
+    ///
+    /// - **135** for the `ENGINE BUILD` split. One 374-character section
+    ///   became a 307-character pointer plus a 202-character tail block: the
+    ///   pointer says where the reading is, the block says what it reads. In
+    ///   return the four states stop rewriting the whole 21,668-token system
+    ///   tier when the build flips mid-window.
+    /// - **204** for the client-URL sentence, which was never in this meter at
+    ///   all. It is always-loaded text and now says so.
+    ///
+    /// Raised by 1,893 for ADR 0093, to a measured 110,522. It buys the `repo`
+    /// argument on four file tools and `edit_file`'s `commit` (1,362), plus the
+    /// prompt lines routing code work to them (531). This is the rare addition
+    /// that PAYS for itself inside the same window. No file tool could reach a
+    /// code repo at all, so the agent read one through `run_bash` with `sed`
+    /// and `grep -rn`: 115 bash calls in one measured nightly thread, against 4
+    /// `grep_files`. Each of those spends far more context in untruncated
+    /// output than the schemas cost per turn. Trims in the same change gave
+    /// 627 back.
+    ///
+    /// Raised by 2,432 for ADR 0085's context mode, to a measured 112,954:
+    /// 2,053 for its re-read rule and note guidance, 379 for `todo_write`'s
+    /// `notes` property. The largest raise here, and it buys an EXPERIMENT.
+    /// None of it reaches a workspace with the mode off, which today is every
+    /// one. It comes out again when the eval reports
+    /// (`docs/temporary-measures.md`). The meter bills it anyway, by the rule
+    /// that opens every tool gate in [`flat_chat_tools`].
+    ///
+    /// Raised by 1,319 more when the model took over that curation, to a
+    /// measured 114,273. Four parts, in
+    /// `docs/plans/2026-08-20-model-curated-context-mode.md`:
+    ///
+    /// - **136** for the body region, which has to say where the bodies sit.
+    /// - **223** for a recovery table that went from two rows to five.
+    /// - **909** for version 2 of the note guidance, which now states the
+    ///   release half of the loop as well as the note-writing half.
+    /// - **51** for `dismiss_from_context`'s widened schema.
+    ///
+    /// Only the last reaches a workspace with the mode off, a tool schema not
+    /// being gated on the flag. The rest goes when the experiment does.
+    ///
+    /// Raised by 539 when the mode inverted its default, then by 471 for the
+    /// prose that inversion needs, to a measured 115,283
+    /// (`docs/plans/2026-08-21-persist-on-demand-context-mode.md`):
+    ///
+    /// - **539** for `keep_in_context`, the verb that states the model still
+    ///   wants a body.
+    /// - **471** for version 3 of the note guidance and the mode's rule block,
+    ///   which now state a deadline rather than an option.
+    ///
+    /// None of it reaches a workspace with the mode off. The keep verb is
+    /// shaped OUT of a mode-off array, so unlike its opposite it is not even
+    /// offered there. The meter bills both anyway, by the rule that opens
+    /// every gate in [`flat_chat_tools`].
+    ///
+    /// Raised by 239 when `run_coding_agent`'s `model` gained a JSON-schema
+    /// enum, to a measured 115,522. The union of both backends' model ids is
+    /// 317 chars of frozen shape. No description could state it instead, and
+    /// it replaced examples the description no longer has to carry.
+    ///
+    /// Raised by 94 for the one sentence ordering the knowhow write before the
+    /// intent, to a measured 115,616. The block already said never to put
+    /// technical detail in an intent. A model holding procedure with nowhere
+    /// to put it inlined it anyway. Both eval arms did that on T05, having
+    /// read the longer rule first. A prohibition needs the step that makes
+    /// obeying it possible, and that step is worthless after the tool call.
+    ///
+    /// Raised by 187 for `run_bash`'s never-detach clause, to a measured
+    /// 115,803. `&` binds looser than `&&`, so a backgrounded chain holds the
+    /// call's pipes. The tool used to report a timeout for a launch that had
+    /// already succeeded (ADR 0100). The fix reports the survivor, but the
+    /// agent still has to not write it. `running-python.md` carries the full
+    /// anti-pattern, and a model reaching for `run_bash` never loads that.
+    ///
+    /// Raised by 6 for the seventh provider name in `manage_models`, to a
+    /// measured 115,809. `opencode-free` is one value in a closed enum the
+    /// tool validates against, and a name the agent must be able to send.
+    /// Adding a provider without it would make the enum lie.
+    ///
+    /// Raised by 635 for ADR 0109, to a measured 116,444. The mode's fixed
+    /// rent went UP, and the plan expected it to fall, so the split is worth
+    /// stating:
+    ///
+    /// - **+575** in tool schemas. `scratchpad` arrived and
+    ///   `dismiss_from_context` left, and the note verb is the larger schema.
+    /// - **+60** in the mode's rule block and note guidance, which now state a
+    ///   one-round deadline and three answers instead of a release rule.
+    ///
+    /// What fell is not on this meter. The context ledger and the body region
+    /// rode in the user message of every lean request, sized with the bodies
+    /// they described. All of that is gone. This
+    /// meter bills the fixed half only, so it shows the new tool and not the
+    /// variable block that paid for it.
+    ///
+    /// Earlier raises are in `git blame`, each with its reason in its own
+    /// commit message. The three most recent: **252** for the trigger link
+    /// form, 6 for `opencode-free`, and 187 for `run_bash`'s never-detach
+    /// clause.
+    ///
+    /// The 252 buys a link form that did not exist. A trigger was the one
+    /// first-class thing the agent names with no way to link it, so it linked
+    /// the Triggers panel instead (ADR 0112). Two places pay: the FILE
+    /// REFERENCES bullet carrying the form, and one clause in
+    /// [`NAMES_NOT_IDS_RULE`] exempting the id in its target. Both are resident
+    /// because the choice is made in the reply itself, where no knowhow load
+    /// can reach.
+    ///
+    /// Raised by 149 for ADR 0113, to a measured 116,845. A persisted system
+    /// event is now awaitable, so `await_event` states which families the gate
+    /// admits and which frames it refuses. The knowhow cannot carry it: the
+    /// name is chosen in the call, and a refused one spends a turn.
+    ///
+    /// **LOWERED to a measured 115,112** by the self-curated context mode.
+    ///
+    /// The meter bills the mode OFF, which is the larger array: the mode adds
+    /// no tool and withdraws `todo_write`. That is the same worst-case rule
+    /// this meter always applied, reaching the other arm. See
+    /// [`flat_chat_tools`].
+    ///
+    /// Raised by 164 to a measured 115,276, for the `events` tool's fourth
+    /// action, `event_types`. A subscription now refuses a name the engine
+    /// never emits, and that refusal has to send the caller somewhere. This is
+    /// the only surface answering which names exist here.
+    ///
+    /// Raised by 63 to a measured 115,339, for one sentence of the mode's rule
+    /// block that was false. It told the model a finished turn's tool calls are
+    /// never sent back. The resume builder rebuilds the last few of them, with
+    /// their addresses, on every follow-up turn. So the model was told to price
+    /// a round it was not being charged for, and told nothing about the one it
+    /// was. The true sentence runs 63 characters longer.
+    ///
+    /// Raised by 230 to a measured 115,569 by ADR 0119. A condition key became
+    /// a *field path* and gained `$nin`, `$regex` and `$or`. The vocabulary is
+    /// resident because it is chosen while writing the call: a condition naming
+    /// an operator that does not exist is refused, and one naming a field the
+    /// old way silently matches nothing.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 115_569;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -861,12 +1027,26 @@ mod tests {
     /// servers, and `generate_image` (present only when an image provider is
     /// configured). The grouped manifest tools are billed separately because
     /// they have a different owner, `crate::capability_manifest`.
+    ///
+    /// **Every capability gate is resolved OPEN here except the image one**,
+    /// which is the same set this measured before ADR 0088 gated anything.
+    /// The meter is the engine-authored surface, not one workspace's array, so
+    /// a gate closing somewhere reclaims nothing this ratchet may spend.
+    ///
+    /// The context mode is the exception, and it is that same rule applied.
+    /// The mode CLOSES a family rather than opening one: it takes `todo_write`
+    /// away. Billing it on would reclaim a schema almost every workspace pays
+    /// for, so the meter bills the mode OFF, which is the larger array.
     fn flat_chat_tools() -> Vec<crate::llm::provider::ToolDefinition> {
-        let mut flat = crate::llm::tools::get_default_tools();
+        let billed = ToolCapabilities {
+            email_account: true,
+            intent: true,
+            image_provider: false,
+            context_mode: false,
+        };
+        let mut flat = crate::llm::tools::get_default_tools(&billed);
         flat.push(crate::llm::tools::get_notification_tool());
-        flat.push(crate::llm::get_navigate_ui_tool());
-        flat.push(crate::llm::tools::get_save_thread_image_tool());
-        flat.push(crate::llm::tools::get_view_image_tool());
+        flat.extend(crate::llm::tools::chat_tail_tools(&billed));
         flat
     }
 
@@ -881,11 +1061,20 @@ mod tests {
     /// The four always-loaded areas, measured separately so a regression report
     /// says WHICH one grew.
     fn always_loaded_areas() -> Vec<(&'static str, usize)> {
-        // Neither variant is uniformly larger, so measure both and bill the
-        // worse case.
+        // Neither source variant is uniformly larger, so measure both and bill
+        // the worse case.
+        //
+        // The mode is billed OFF, for the reason `flat_chat_tools` bills it
+        // off: that is the configuration almost every workspace runs. Its
+        // todo rule is 31 chars longer, against a `todo_write` schema of
+        // nearly a thousand that a mode-on workspace does not pay at all.
         let body = std::cmp::max(
-            static_prompt_body(true, 500).chars().count(),
-            static_prompt_body(false, 500).chars().count(),
+            static_prompt_body(true, 500, ContextMode::Off)
+                .chars()
+                .count(),
+            static_prompt_body(false, 500, ContextMode::Off)
+                .chars()
+                .count(),
         );
 
         let flat: usize = flat_chat_tools().iter().map(wire_chars).sum();
@@ -901,35 +1090,53 @@ mod tests {
         .chars()
         .count();
 
-        // Billed at its WORST case, like the body above. Built per turn rather
-        // than spliced into `static_prompt_body`, so without this it would be
-        // always-loaded text sitting outside the only meter that watches
-        // always-loaded text.
-        let engine_build = [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (false, true, true),
-        ]
-        .into_iter()
-        .map(|(update_available, source_behind_head, rebuild_wedged)| {
-            engine_build_section(&version_status(
-                update_available,
-                source_behind_head,
-                rebuild_wedged,
-            ))
-            .chars()
-            .count()
-        })
-        .max()
-        .expect("four states");
+        // Both halves of each ADR 0084 split, because both are always-loaded:
+        // the pointer in the cached system block and the reading in the
+        // message tail. Built per turn rather than spliced into
+        // `static_prompt_body`, so without this they would be always-loaded
+        // text sitting outside the only meter that watches it.
+        //
+        // The build state is billed at its WORST case, like the body above.
+        let engine_build = ENGINE_BUILD_POINTER.chars().count()
+            + BUILD_STATES
+                .into_iter()
+                .map(|(update, behind, wedged)| {
+                    engine_build_block(&version_status(update, behind, wedged))
+                        .chars()
+                        .count()
+                })
+                .max()
+                .expect("four states");
+
+        // The URL itself is a runtime reading rather than engine-authored
+        // text, so only the pointer and the block's delimiters are billed.
+        let client_url = CLIENT_URL_POINTER.chars().count() + client_url_block("").chars().count();
+
+        // The mode's rule block and note guidance, billed at the same
+        // worst-case rule as the tool schemas above. It reaches only a
+        // workspace running the mode, and this meter measures the
+        // engine-authored surface rather than one workspace's prompt.
+        let context_mode = super::super::context_mode::system_prompt_section(
+            super::super::context_mode::ContextMode::On,
+            super::super::context_mode::SweepSchedule::default(),
+        )
+        .chars()
+        .count();
 
         vec![
             ("static prompt body + rule consts", body),
             ("flat tool schemas, JSON wire form", flat),
             ("grouped manifest tool schemas, JSON wire form", grouped),
             ("System Knowhow routing list", knowhow),
-            ("ENGINE BUILD section (dev, per turn)", engine_build),
+            (
+                "experimental context mode rule + note guidance",
+                context_mode,
+            ),
+            (
+                "ENGINE BUILD (dev): pointer + widest tail block",
+                engine_build,
+            ),
+            ("client URL: pointer + tail block delimiters", client_url),
         ]
     }
 
@@ -1002,25 +1209,34 @@ mod tests {
     const PER_TOOL_CEILING_EXCEPTIONS: &[(&str, usize, &str)] = &[
         (
             "await_event",
-            2_550,
+            2_845,
             "four tests pin thirteen distinct phrases on it (forward-only plus \
              the arming race, spent-and-resubscribe, the consecutive cap, the \
              own-child carve-out), each one a failure that reached a user, and \
-             `condition` carries the operator set that makes a filter valid",
+             `condition` carries the operator set that makes a filter valid. \
+             Raised from 2,550 by ADR 0113: `event_type` now names the three \
+             families the gate admits and the transient frames it refuses, \
+             because the wait it grants is the one surface that says so before \
+             a name is spent. Raised from 2,700 by ADR 0119: `condition` now \
+             states the field-path rule and three more operators, and both are \
+             chosen while writing the call, where no knowhow load can reach",
         ),
         (
             "run_coding_agent",
-            2_600,
+            2_850,
             "eleven parameters; the source-checkout precondition is pinned in \
              BOTH the description and `folder` because a packaged install's \
              agent believed the unconditional wording and narrated a spawn the \
              engine refuses, and the spawn-ack-is-not-a-result rule stays \
              inline rather than behind the knowhow pointer because it fires at \
-             spawn time, before anything would be loaded",
+             spawn time, before anything would be loaded. Raised from 2,600 by \
+             `model`'s own JSON-schema enum: 317 chars of frozen shape, the \
+             union of both backends' model ids, replacing the examples its \
+             description used to carry",
         ),
         (
             "triggers",
-            2_950,
+            2_980,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
@@ -1029,7 +1245,9 @@ mod tests {
              `model` and `reasoning_effort` add 202 characters of frozen shape \
              before a word of prose (a null-union each, and the six-value \
              effort enum), and they are declared once, on create, because the \
-             union across operations is first-wins",
+             union across operations is first-wins. Raised from 2,950 by ADR \
+             0119: `on` carries the condition operator set, so three new names \
+             and the field-path rule land here rather than in the knowhow",
         ),
         (
             "navigate_ui",
@@ -1053,6 +1271,19 @@ mod tests {
              ASK_USER_QUESTION_RULE and this schema, and pinned by a test in \
              each place; the nested question / options / label object is 434 \
              chars of frozen shape",
+        ),
+        (
+            "edit_file",
+            2_000,
+            "two modes that share one property bag, so `json_path` / `new_value` \
+             and `old_string` / `new_string` are both always present and each \
+             must say which mode it belongs to. On top of that frozen shape, \
+             ADR 0093 added a second TARGET: `repo` and `commit` are 424 chars \
+             carrying the one thing a reader cannot infer, that a repo edit \
+             writes a checkout the user has open and records nothing. The \
+             refusal wording is pinned by a test, and `commit` has to name \
+             run_coding_agent, since a reviewable change is the alternative it \
+             is being chosen over",
         ),
         (
             "follow_up_child_thread",
@@ -1081,11 +1312,19 @@ mod tests {
         ),
         (
             "events",
-            1_650,
-            "one property added to a domain already at 1,485: `thread_id` is \
+            1_960,
+            "two properties added to a domain already at 1,485. `thread_id` is \
              the read half of finding a past conversation, and it has to say \
              which `event_type` to pair it with or the filter returns the \
-             whole transcript including every streamed token",
+             whole transcript including every streamed token. `event_id` is \
+             ADR 0085's dereference, and it has to state the `evt-<32 hex>` \
+             form, because a pointer the model cannot spell back is a pointer \
+             it will not use. It also has to say that a call's address returns \
+             the pair: a lookup that answers with two rows and never said so \
+             reads as a bug. Raised from 1,860 by the `event_types` action, a \
+             fourth action and so a fourth summary line: it is where a \
+             subscription's refusal sends the caller, and no other surface \
+             answers which names exist",
         ),
     ];
 
@@ -1150,6 +1389,50 @@ mod tests {
                 &crate::capability_manifest::llm_tools()
             ),
         );
+    }
+
+    /// Diagnostic dump, not an assertion: what a workspace is actually SENT,
+    /// at each gate setting.
+    ///
+    /// The sibling ranking below measures the engine-authored surface, which
+    /// is deliberately gate-blind. This one answers the other question, the
+    /// one ADR 0088 priced: how many characters does THIS workspace pay for.
+    /// Note it sums the schema objects only, so the array's own brackets and
+    /// separators (73 characters at 72 tools) are not in the figure.
+    ///
+    ///   cargo test -p lucidos-engine --lib print_gated_array_sizes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn print_gated_array_sizes() {
+        let wire = |caps: &ToolCapabilities| {
+            let tools: Vec<_> = crate::llm::tools::get_default_tools(caps)
+                .into_iter()
+                .chain([crate::llm::tools::get_notification_tool()])
+                .chain(crate::capability_manifest::llm_tools())
+                .chain(crate::llm::tools::chat_tail_tools(caps))
+                .collect();
+            let chars: usize = tools.iter().map(wire_chars).sum();
+            (tools.len(), chars)
+        };
+        for (label, caps) in [
+            (
+                "every gate open, the mode off",
+                ToolCapabilities::all_open(),
+            ),
+            (
+                "no email account, no intent, image provider on",
+                ToolCapabilities {
+                    email_account: false,
+                    intent: false,
+                    image_provider: true,
+                    context_mode: false,
+                },
+            ),
+            ("no capability at all", ToolCapabilities::default()),
+        ] {
+            let (n, chars) = wire(&caps);
+            println!("{label}: {n} schemas, {chars} wire chars");
+        }
     }
 
     /// Diagnostic dump, not an assertion: every tool schema ranked by wire
@@ -1270,9 +1553,10 @@ mod tests {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
 
         let mut haystack = format!(
-            "{}{}",
-            static_prompt_body(true, 500),
-            static_prompt_body(false, 500)
+            "{}{}{}",
+            static_prompt_body(true, 500, ContextMode::Off),
+            static_prompt_body(false, 500, ContextMode::Off),
+            static_prompt_body(true, 500, ContextMode::On)
         );
         let mut tools = flat_chat_tools();
         tools.extend(crate::capability_manifest::llm_tools());
@@ -1348,6 +1632,30 @@ mod tests {
             missing.is_empty(),
             "placeholder(s) in the prompt template with no matching .replace(\"…\", …) \
              in the substitution chain, so the raw token would reach the model: {missing:?}"
+        );
+    }
+
+    /// The prompt never orders a tool call the mode has withdrawn.
+    ///
+    /// `todo_write` is absent from the mode-on tools array, so the base body's
+    /// standing "call it at the start" instruction was unfollowable on every
+    /// mode-on turn. The list lives under a `[TODO]` heading instead.
+    #[test]
+    fn the_mode_on_body_points_at_the_todo_heading_rather_than_the_tool() {
+        let off = static_prompt_body(false, 500, ContextMode::Off);
+        let on = static_prompt_body(false, 500, ContextMode::On);
+
+        assert!(
+            off.contains("todo_write"),
+            "the tool exists whenever the mode is off, so the prompt names it"
+        );
+        assert!(
+            !on.contains("todo_write"),
+            "the mode withdraws the tool, so nothing may tell the model to call it"
+        );
+        assert!(
+            on.contains("[TODO]"),
+            "the mode-on body has to say where the list goes instead"
         );
     }
 
@@ -1447,6 +1755,52 @@ mod tests {
             "a 'when X finishes' clause is something to wait for; a \
              pre-approval attached to it covers the action once X has happened \
              rather than replacing X:\n{section}"
+        );
+    }
+
+    /// A trigger was the one first-class thing the agent names in a reply with
+    /// no link form of its own. So it linked the Triggers PANEL, and when told
+    /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
+    /// The section has to carry the form AND keep the two destinations apart.
+    ///
+    /// Source-scanned and scoped to the section, like
+    /// `the_state_change_section_excludes_the_threads_own_child`: this is plain
+    /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps this test's own
+    /// prose from satisfying its assertions.
+    #[test]
+    fn the_file_references_section_links_a_trigger_not_just_the_panel() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // The heading, not the cross-reference to it in NAMES_NOT_IDS_RULE.
+        let from = src
+            .find("FILE REFERENCES:\n")
+            .expect("the prompt no longer has a FILE REFERENCES section");
+        let section = &src[from..];
+        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+
+        assert!(
+            section.contains("(trigger:<id>)"),
+            "without the link form the agent has nothing to write but the panel \
+             link, which is the reported bug:\n{section}"
+        );
+        assert!(
+            section.contains("`triggers` action 'list'"),
+            "a link form the agent cannot fill in is not a link form: the \
+             section must say where the id comes from:\n{section}"
+        );
+        assert!(
+            section.contains("[Triggers](triggers)` is the LIST"),
+            "both links exist and mean different things, so the section must \
+             say which is which or the panel link keeps winning:\n{section}"
+        );
+        // Says WHY the trigger link is worth writing: the row carries the
+        // actions. Drop this and the two links read as interchangeable.
+        assert!(
+            section.contains("Run once"),
+            "the section must name what the trigger link lands on:\n{section}"
         );
     }
 
@@ -1797,155 +2151,6 @@ mod tests {
         );
     }
 
-    fn version_status(
-        update_available: bool,
-        source_behind_head: bool,
-        rebuild_wedged: bool,
-    ) -> VersionStatus {
-        VersionStatus {
-            build_id: "test".to_string(),
-            update_available,
-            disk_build_id: None,
-            packaged: false,
-            build_state: "idle",
-            source_behind_head,
-            head_commit: None,
-            rebuild_wedged,
-            build_failure: None,
-            shared_build_in_progress: false,
-            build_elapsed_ms: None,
-            pending_commits: None,
-        }
-    }
-
-    /// Nothing pending, so an applied restart-requiring change IS live and the
-    /// user HAS restarted. Stated affirmatively, because "no update available"
-    /// is a double negative the model has to reason through at exactly the
-    /// moment it is guessing.
-    #[test]
-    fn a_current_engine_says_so_affirmatively() {
-        let section = engine_build_section(&version_status(false, false, false));
-
-        assert!(
-            section.contains("RUNNING ENGINE IS CURRENT"),
-            "must state the current case in the affirmative:\n{section}"
-        );
-        assert!(
-            section.contains("HAS \nrestarted") || section.contains("HAS restarted"),
-            "must answer the restart question outright:\n{section}"
-        );
-    }
-
-    /// A built-but-not-switched engine is the one case where "the user has not
-    /// restarted" is true, and it is the only case that may say so.
-    #[test]
-    fn a_built_but_unswitched_engine_says_the_change_is_not_live() {
-        let section = engine_build_section(&version_status(true, false, false));
-
-        assert!(
-            section.contains("HAS NOT SWITCHED ONTO IT YET"),
-            "must state that the user has not switched:\n{section}"
-        );
-        assert!(
-            section.contains("is NOT live"),
-            "must draw the consequence for an applied change:\n{section}"
-        );
-    }
-
-    /// Source ahead with no binary behind it is NOT "the user has not
-    /// switched": there is nothing to switch onto, so telling them to restart
-    /// sends them to a button that would do nothing.
-    #[test]
-    fn source_ahead_of_a_built_binary_does_not_tell_the_user_to_switch() {
-        let section = engine_build_section(&version_status(false, true, false));
-
-        assert!(
-            section.contains("NO BUILD BEHIND IT YET"),
-            "must distinguish source-ahead from binary-ready:\n{section}"
-        );
-        assert!(
-            section.contains("nothing to switch onto"),
-            "must not send the user to a switch that cannot work:\n{section}"
-        );
-    }
-
-    /// A wedged rebuild is source-ahead with the advice inverted: waiting for a
-    /// build and pressing Rebuild are both dead ends, so the section must say so
-    /// rather than reuse the "rebuilding, or it failed" wording that invites
-    /// both.
-    #[test]
-    fn a_wedged_rebuild_does_not_send_the_user_round_the_loop() {
-        let section = engine_build_section(&version_status(false, true, true));
-
-        assert!(
-            section.contains("NO REBUILD CAN DELIVER"),
-            "must state that rebuilding is futile:\n{section}"
-        );
-        assert!(
-            !section.contains("NO BUILD BEHIND IT YET"),
-            "must not fall through to the retryable source-ahead wording:\n{section}"
-        );
-        assert!(
-            section.contains("relaunch instead"),
-            "must name the one thing that does resolve it:\n{section}"
-        );
-    }
-
-    /// The four cases must be genuinely different text. Collapsing any two
-    /// would restore the guess this section exists to remove.
-    #[test]
-    fn the_four_build_states_are_distinct() {
-        let sections = [
-            engine_build_section(&version_status(false, false, false)),
-            engine_build_section(&version_status(true, false, false)),
-            engine_build_section(&version_status(false, true, false)),
-            engine_build_section(&version_status(false, true, true)),
-        ];
-
-        for (i, a) in sections.iter().enumerate() {
-            for b in &sections[i + 1..] {
-                assert_ne!(a, b, "two build states render the same text");
-            }
-        }
-    }
-
-    /// It answers the question the addendum forwards to it, and says the
-    /// answer can change under the agent's feet: the user restarts on their own
-    /// schedule, including while a turn is running.
-    #[test]
-    fn the_section_answers_the_restart_question_and_dates_itself() {
-        let section = engine_build_section(&version_status(false, false, false));
-
-        assert!(
-            section.contains("has the user restarted?"),
-            "must name the question it settles:\n{section}"
-        );
-        assert!(
-            section.contains("rebuilt every turn"),
-            "must say it is fresh, or a long thread will treat it as stale:\n{section}"
-        );
-        assert!(
-            section.contains("mid-turn"),
-            "must warn that the answer can change during a turn:\n{section}"
-        );
-    }
-
-    /// No build id in the text. The user cannot look one up on any screen, so
-    /// putting it here only invites the agent to quote a hex string at them.
-    #[test]
-    fn the_section_carries_no_build_id() {
-        let mut status = version_status(true, false, false);
-        status.build_id = "deadbeef1".to_string();
-        status.disk_build_id = Some("cafebabe2".to_string());
-
-        let section = engine_build_section(&status);
-
-        assert!(
-            !section.contains("deadbeef1") && !section.contains("cafebabe2"),
-            "a build id is meaningless to the user and must not be quotable:\n{section}"
-        );
-    }
-
     /// The prompt's WORKSPACE line must never carry a `$HOME`-rooted absolute
     /// path. Runs against the REAL `$HOME`, read-only, so it is safe under the
     /// parallel test runner and fails on the very machine that would leak.
@@ -2021,6 +2226,14 @@ mod tests {
             rule.contains("A MARKDOWN LINK TARGET IS NOT PROSE")
                 && rule.contains("[Open thread](thread:<ws>/<uuid>)"),
             "rule must exempt markdown link targets so spawned-thread links survive:\n{rule}"
+        );
+        // A trigger link is the case the carve-out was reported missing on: the
+        // agent read the ban as covering the id in the target and linked the
+        // Triggers PANEL instead of the trigger. The exemption must name the
+        // form and say which half of the link the name goes in.
+        assert!(
+            rule.contains("(trigger:<id>)") && rule.contains("The NAME goes in the label"),
+            "rule must exempt the trigger link form and place the name in the label:\n{rule}"
         );
     }
 

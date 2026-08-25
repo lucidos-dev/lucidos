@@ -415,8 +415,11 @@
      * via depthStyle() in ThreadDrawer.tsx); 0 keeps top-level rows aligned.
      * `--thread-row-pad-left` is the row's left padding — i.e. where the thread-
      * name text starts. Shared so the bottom-edge divider `::after` below can
-     * begin at the same x (lines the divider's left up with the title text). */
-    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth, 0) * 1rem);
+     * begin at the same x (lines the divider's left up with the title text).
+     * The depth term comes from the wrapper, so the status mark outside this row
+     * indents by exactly the same amount. Its `0px` fallback keeps a
+     * hypothetical wrapper-less row on the un-indented column. */
+    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth-offset, 0px));
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: 0.5rem;
@@ -472,15 +475,32 @@
 }
 
 /* `position: relative` anchors the row wrapper's absolutely-positioned
- * children (status dot, disclosure chevron, the lifted-child accent bar). */
+ * children (status dot, disclosure chevron, the lifted-child accent bar).
+ *
+ * `--thread-row-title-line` is the height of ONE line of the row title, stated
+ * rather than left at `line-height: normal`. The status dot centers on the
+ * title's first line by taking this as its own box height (see
+ * `.thread-row-wrap > .thread-status`). That needs a line box CSS can name, and
+ * `normal` is font metrics. It moves with the user's font-family preference, so
+ * a dot placed against it drifts per font. 0.9375rem is 1.15x the title's
+ * 0.8125rem, which is what Fira Code's `normal` resolved to, so row heights and
+ * the wrapped-title rhythm are unchanged.
+ *
+ * `--thread-depth-offset` is how far this row's content column is pushed right
+ * by its nesting depth. It lives on the wrapper because BOTH the row and the
+ * status mark read it, and the mark is the wrapper's child rather than the
+ * row's. Sharing one definition is what keeps a sub-thread's mark the same
+ * distance from its own title as a top-level row's is. */
 .thread-row-wrap {
     position: relative;
+    --thread-row-title-line: 0.9375rem;
+    --thread-depth-offset: calc(var(--thread-depth, 0) * 1rem);
 }
 
 /* x-position of the lifted-child accent bar: one indent step deeper per level,
  * so each nesting level's accent bar starts a step further right than its
- * parent. (The status dot no longer rides this column — it's pinned to a fixed
- * left inset on the wrapper, see below.) `--thread-depth` is set inline by
+ * parent. It is its own column, left of the status mark, which indents by the
+ * same step from a different origin. `--thread-depth` is set inline by
  * depthStyle() in ThreadDrawer.tsx and inherits down to the row + its
  * pseudo-elements. */
 .thread-row-wrap.is-nested {
@@ -489,8 +509,8 @@
 }
 
 /* No vertical sub-thread rail: nested rows read as indented via their title
- * offset alone, with no gray guide line. (The status dot sits in a fixed left
- * column and no longer signals depth.) The `::before` is kept
+ * offset alone, with no gray guide line. The status mark indents with that
+ * title, so depth is already legible without a rail. The `::before` is kept
  * (transparent) purely so the lifted-child accent BAR below can light it —
  * that's a state cue, not a divider. */
 .thread-row-wrap.is-nested .thread-row::before {
@@ -763,6 +783,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 .thread-row-title-row {
     display: block;
     min-width: 0;
+    line-height: var(--thread-row-title-line);
 }
 
 .thread-row-title {
@@ -787,9 +808,15 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     white-space: nowrap;
 }
 
+/* The chip rides the title's first line, so it must not be taller than that
+ * line. It is an inline-block, so it would inherit `--thread-row-title-line` as
+ * its content height and add its padding on top. That grows the line box and
+ * slides the title off the status dot centered on it. Its own tight line-height
+ * keeps the chip inside the line. */
 .draft-indicator {
     display: inline-block;
     font-size: var(--font-size-2xs);
+    line-height: 1.2;
     font-weight: 500;
     color: var(--text-muted);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
@@ -878,16 +905,30 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     height: var(--icon-size-md);
 }
 
-/* The dot hangs off the row WRAPPER, not the `.thread-row` itself, so it keeps a
- * fixed left column at every depth — it stays in the same place whether the row
- * is a thread, sub-thread, or sub-sub-thread, instead of tracking the title's
- * per-depth indent. The wrapper and row share the same top edge, so the `top`
- * values below still center the dot on the title line. */
+/* The mark is the row's SIBLING, hanging off the wrapper rather than sitting
+ * inside `.thread-row`. That is what the z-index below is for, and it is why the
+ * mark has to take the row's depth from the wrapper instead of inheriting it as
+ * layout.
+ *
+ * Horizontally it rides its title's column, one indent step further right per
+ * nesting level, via `--thread-depth-offset`. The 0.375rem is the gap it keeps
+ * left of the title text, and it is the same gap at every depth. A sub-thread's
+ * mark therefore belongs to that sub-thread, rather than to the column of a row
+ * several levels above it.
+ *
+ * Vertically this box IS the title's first line, rather than a constant tuned
+ * to look like it. The wrapper and the row share a top edge, so `--space-sm`
+ * starts the box where that line starts. That is the row's own padding-top,
+ * from base `.list-row`. One `--thread-row-title-line` of height ends the box
+ * where the line ends. `.thread-status` is a centering flex row, so whichever
+ * mark the status draws lands on the line's center. Dot, spinner, "?" badge and
+ * pause glyph are all shorter than the line. A literal `top` here is the bug
+ * this replaced: no one value is right for two fonts at once. */
 .thread-row-wrap > .thread-status {
     position: absolute;
-    left: 0.375rem;
-    top: 1.0625rem;
-    transform: translateY(-50%);
+    left: calc(0.375rem + var(--thread-depth-offset, 0px));
+    top: var(--space-sm);
+    height: var(--thread-row-title-line);
     /* Paint above the row. The dot is the wrapper's FIRST child and `.thread-row`
      * (its sibling) is `position: relative`, so both are positioned siblings with
      * `z-index: auto` and paint in DOM order — without this the row paints AFTER
@@ -937,21 +978,9 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     .thread-row.thread-row-has-family .thread-row-left {
         padding-bottom: 1.625rem;
     }
-
-    /* Centers the dot on the title's first line. 1.125rem read a hair high
-     * (it sat above the line's optical center); 1.25rem drops it back onto the
-     * text — the long-standing value before a May icon-shrink bundled in a 2px
-     * up-nudge. */
-    .thread-row-wrap > .thread-status {
-        top: 1.25rem;
-    }
 }
 
 @media (max-width: 768px) {
-    .thread-row-wrap > .thread-status {
-        top: 1.3125rem;
-    }
-
     .thread-row-actions .icon-btn.header-icon {
         width: 1.75rem;
         height: 1.5rem;

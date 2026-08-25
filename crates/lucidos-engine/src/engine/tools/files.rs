@@ -306,34 +306,244 @@ impl LucidosEngine {
     }
 }
 
+/// What an edit changed, so the result can state a count.
+///
+/// Text mode carries both numbers because they can differ, and the difference
+/// is the whole point: without `replace_all` the edit rewrites the first match
+/// and leaves the rest, which the old single-line result reported exactly as it
+/// reported a complete rewrite.
+#[derive(Debug)]
+pub(crate) enum EditOutcome {
+    Text {
+        replaced: usize,
+        occurrences: usize,
+    },
+    /// JSON mode sets one value at one pointer. No occurrence count applies.
+    JsonValueSet,
+}
+
+impl EditOutcome {
+    /// The parenthetical the tool result carries, or empty for JSON mode.
+    fn summary(&self) -> String {
+        match self {
+            EditOutcome::JsonValueSet => String::new(),
+            EditOutcome::Text {
+                replaced,
+                occurrences,
+            } if replaced == occurrences => {
+                format!(" ({replaced} of {occurrences} occurrences replaced)")
+            }
+            EditOutcome::Text {
+                replaced,
+                occurrences,
+            } => format!(
+                " ({replaced} of {occurrences} occurrences replaced, pass replace_all for the rest)"
+            ),
+        }
+    }
+}
+
+/// Where an edit landed, and what that implies about durability.
+pub(crate) enum EditTarget {
+    /// A `data/` file, committed to the workspace repo.
+    Workspace { commit: String },
+    /// A registered repository's working tree. Deliberately uncommitted: see
+    /// `docs/adr/0093-file-tools-reach-registered-repos.md`.
+    RepoWorkingTree,
+}
+
 pub(crate) struct FileEditResult {
     pub path: String,
-    pub commit: String,
+    pub outcome: EditOutcome,
+    pub target: EditTarget,
+}
+
+impl FileEditResult {
+    /// The `[ACTION COMPLETED]` line the LLM sees. A repo edit says the tree is
+    /// dirty in place of a commit sha, because that is the fact the next actor
+    /// needs: nothing has been recorded, and `git diff` is where the work is.
+    pub(crate) fn tool_message(&self) -> String {
+        match &self.target {
+            EditTarget::Workspace { commit } => format!(
+                "[ACTION COMPLETED] UPDATED: {}{} (commit: {})",
+                self.path,
+                self.outcome.summary(),
+                commit
+            ),
+            EditTarget::RepoWorkingTree => format!(
+                "[ACTION COMPLETED] UPDATED: {}{} (repo working tree, NOT committed: review with \
+                 git diff, or hand it to run_coding_agent to land as a reviewable change)",
+                self.path,
+                self.outcome.summary()
+            ),
+        }
+    }
+}
+
+/// Whether `commit` agrees with the target it was passed alongside.
+///
+/// `commit: false` is *required* with `repo` rather than merely defaulted, so
+/// the recorded tool call states the consequence. A user reading the step sees
+/// an uncommitted write as such, instead of inferring it from a missing
+/// argument.
+fn check_commit_pairing(has_repo: bool, commit: Option<bool>) -> Result<(), String> {
+    match (has_repo, commit) {
+        (true, Some(true)) => Err(
+            "A repo edit is never committed. Pass commit: false, or use run_coding_agent to land \
+             the work as a reviewable change."
+                .to_string(),
+        ),
+        (true, None) => Err(
+            "A repo edit must state commit: false. It writes the working tree and commits \
+             nothing, and the call has to say so."
+                .to_string(),
+        ),
+        (false, Some(false)) => Err(
+            "commit: false needs `repo`. Everything the file tools write under data/ is \
+             committed; use run_python for an uncommitted workspace write."
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Apply a text-mode edit, returning the new content and what it did.
+///
+/// Counting before replacing is the whole feature: `replacen(.., 1)` rewrites
+/// the first match and leaves the rest, and the caller previously had no way to
+/// tell that from a complete rewrite.
+///
+/// An empty `old` is refused outright rather than only when `new` is empty too.
+/// Rust matches the empty pattern at every character boundary, so
+/// `replace("", "x")` turns `ab` into `xaxbx`. That is never an edit anyone
+/// asked for, and against a repo it is a corrupted source file with no commit
+/// to recover from.
+fn apply_text_edit(
+    content: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    path: &str,
+) -> Result<(String, EditOutcome), String> {
+    if old.is_empty() {
+        return Err(
+            "old_string is empty. Text mode needs the exact text to find; to create a file or \
+             replace it whole, use write_file."
+                .into(),
+        );
+    }
+    if old == new {
+        return Err("old_string and new_string are identical".into());
+    }
+    let occurrences = content.matches(old).count();
+    if occurrences == 0 {
+        return Err(format!("old_string not found in '{}'", path));
+    }
+    let (replaced, out) = if replace_all {
+        (occurrences, content.replace(old, new))
+    } else {
+        (1, content.replacen(old, new, 1))
+    };
+    Ok((
+        out,
+        EditOutcome::Text {
+            replaced,
+            occurrences,
+        },
+    ))
+}
+
+/// Every input `edit_file_at_path` takes. A struct rather than nine positional
+/// arguments, so a call site reads as the tool call it mirrors.
+pub(crate) struct EditFileArgs<'a> {
+    pub raw_path: &'a str,
+    /// A registered repository's name or id. `raw_path` is relative to its root
+    /// instead of to `data/`.
+    pub repo: Option<&'a str>,
+    pub json_path: Option<&'a str>,
+    pub new_value: Option<serde_json::Value>,
+    pub old_string: Option<&'a str>,
+    pub new_string: Option<&'a str>,
+    pub replace_all: bool,
+    /// `Some(false)` is required with `repo`, so the recorded call states that
+    /// nothing was committed. Without `repo` the edit always commits, so `None`
+    /// and `Some(true)` both say something true and are both accepted. The two
+    /// pairings that would lie are refused.
+    pub commit: Option<bool>,
+    pub message: Option<&'a str>,
 }
 
 impl LucidosEngine {
-    /// Edit a file at the given data-relative path and commit the change.
-    /// Supports JSON mode (json_path + new_value) and text mode (old_string + new_string).
-    #[allow(clippy::too_many_arguments)]
+    /// Resolve `(repo, repo-relative path)` to a display path and an absolute
+    /// one. The display path is `<repo name>/<path>`, so a tool result never
+    /// leaks the checkout's absolute location back to the model.
+    pub(crate) async fn resolve_repo_path(
+        &self,
+        repo_arg: &str,
+        relative: &str,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        let repo = super::repo_files::resolve_repo(self.pool(), repo_arg).await?;
+        let full = super::repo_files::resolve_in_repo(std::path::Path::new(&repo.path), relative)?;
+        let display = format!("{}/{}", repo.name, relative.trim_start_matches("./"));
+        Ok((display, full))
+    }
+
+    /// The file list `glob_files` and `grep_files` walk for a `repo` argument.
+    /// Resolved here rather than inside the tools' `spawn_blocking` because
+    /// enumeration shells out to git, which belongs on the async runtime.
+    pub(crate) async fn repo_search_entries(
+        &self,
+        repo_arg: &str,
+    ) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+        let repo = super::repo_files::resolve_repo(self.pool(), repo_arg).await?;
+        super::repo_files::repo_entries(std::path::Path::new(&repo.path)).await
+    }
+}
+
+impl LucidosEngine {
+    /// Edit a file in one of two modes, JSON (`json_path` + `new_value`) or
+    /// text (`old_string` + `new_string`), against one of two targets.
+    ///
+    /// A `data/` target is committed to the workspace repo and announced, as it
+    /// always has been. A `repo` target writes a registered repository's
+    /// working tree and stops there: no commit, no index write, no event. The
+    /// `commit` argument may state the target's own default but never
+    /// contradict it, so no call can commit into someone's checkout.
     pub(crate) async fn edit_file_at_path(
         &self,
-        raw_path: &str,
-        json_path: Option<&str>,
-        new_value: Option<serde_json::Value>,
-        old_string: Option<&str>,
-        new_string: Option<&str>,
-        replace_all: bool,
-        message: Option<&str>,
+        args: EditFileArgs<'_>,
     ) -> Result<FileEditResult, String> {
-        let (data_path, full_path) = self.resolve_data_path(raw_path)?;
-        let path = data_path.as_str();
-        if let Some(reason) = read_only_reason(path) {
-            return Err(format!("Cannot edit '{}': {}", path, reason));
-        }
+        let EditFileArgs {
+            raw_path,
+            repo,
+            json_path,
+            new_value,
+            old_string,
+            new_string,
+            replace_all,
+            commit,
+            message,
+        } = args;
+
+        // Checked before the read, so a rejected call never touches disk.
+        check_commit_pairing(repo.is_some(), commit)?;
+
+        let (path, full_path) = match repo {
+            Some(repo_arg) => self.resolve_repo_path(repo_arg, raw_path).await?,
+            None => {
+                let (data_path, full_path) = self.resolve_data_path(raw_path)?;
+                if let Some(reason) = read_only_reason(&data_path) {
+                    return Err(format!("Cannot edit '{}': {}", data_path, reason));
+                }
+                (data_path, full_path)
+            }
+        };
+        let path = path.as_str();
 
         let content = std::fs::read_to_string(&full_path)
             .map_err(|_| format!("File '{}' not found", path))?;
 
+        let mut outcome = EditOutcome::JsonValueSet;
         let new_content = if let Some(jp) = json_path {
             let nv = new_value.ok_or("json_path requires new_value parameter")?;
             let mut doc: serde_json::Value = serde_json::from_str(&content)
@@ -359,26 +569,26 @@ impl LucidosEngine {
             }
             serde_json::to_string_pretty(&doc).unwrap() + "\n"
         } else if let Some(os) = old_string {
-            let ns = new_string.unwrap_or("");
-            if os.is_empty() && ns.is_empty() {
-                return Err(
-                    "Provide either json_path + new_value or old_string + new_string".into(),
-                );
-            }
-            if os == ns {
-                return Err("old_string and new_string are identical".into());
-            }
-            if !content.contains(os) {
-                return Err(format!("old_string not found in '{}'", path));
-            }
-            if replace_all {
-                content.replace(os, ns)
-            } else {
-                content.replacen(os, ns, 1)
-            }
+            let (edited, text_outcome) =
+                apply_text_edit(&content, os, new_string.unwrap_or(""), replace_all, path)?;
+            outcome = text_outcome;
+            edited
         } else {
             return Err("Provide either json_path + new_value or old_string + new_string".into());
         };
+
+        // A repo edit stops at the write. Nothing below applies to it. The lock
+        // guards the workspace tree, the commit and the announcements are about
+        // `data/`, and an app id cannot come from a repo path.
+        if repo.is_some() {
+            std::fs::write(&full_path, &new_content)
+                .map_err(|e| format!("Failed to write file: {}", e))?;
+            return Ok(FileEditResult {
+                path: path.to_string(),
+                outcome,
+                target: EditTarget::RepoWorkingTree,
+            });
+        }
 
         let app_existed_before = data_path_app_id(path)
             .map(|id| self.app_manager.app_exists(id))
@@ -423,8 +633,100 @@ impl LucidosEngine {
         let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
         Ok(FileEditResult {
             path: path.to_string(),
-            commit: sha_short.to_string(),
+            outcome,
+            target: EditTarget::Workspace {
+                commit: sha_short.to_string(),
+            },
         })
+    }
+}
+
+/// Everything `read_file` does once a path has resolved: binary detection, the
+/// PDF and image arms, line slicing and chunked text.
+///
+/// `display_path` is what the result names, and is the caller's vocabulary: a
+/// `data/`-relative path for a workspace file, `<repo>/<path>` for a repo one.
+/// Splitting it from `full_path` is what lets both callers share this: the
+/// workspace read had the two equal only by coincidence.
+fn read_resolved_file(
+    display_path: &str,
+    full_path: &std::path::Path,
+    args: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let extension = lowercase_extension(display_path);
+
+    if crate::core::is_binary_extension(&extension) {
+        if !full_path.exists() {
+            return Ok(format!(
+                "[FILE NOT FOUND] '{}' does not exist",
+                display_path
+            ));
+        }
+        if extension == "pdf" {
+            // A legacy sidecar from before PDF extraction was removed still
+            // surfaces. The engine cannot regenerate one, but older workspaces
+            // still carry useful ones.
+            let text_sidecar = format!("{}.txt", full_path.display());
+            let text_sidecar_path = std::path::Path::new(&text_sidecar);
+            if text_sidecar_path.exists() {
+                if let Ok(text) = std::fs::read_to_string(text_sidecar_path) {
+                    return Ok(format!("[PDF Text Content]\n\n{}", text));
+                }
+            }
+
+            return Ok(format!(
+                "[Binary file: {} - PDF text extraction has been removed from \
+                 Lucidos. The PDF is stored as a binary artifact; text content \
+                 is not available.]",
+                display_path
+            ));
+        }
+        if let Some(media_type) = image_media_type(&extension) {
+            let size = match std::fs::metadata(full_path) {
+                Ok(m) => m.len(),
+                Err(e) => return Err(format!("reading image file: {}", e).into()),
+            };
+            if size > IMAGE_MAX_BYTES {
+                let mb = size as f64 / (1024.0 * 1024.0);
+                return Ok(format!(
+                    "Image too large to read directly ({:.1} MB). Max 25MB; \
+                     smaller images are automatically resized to fit.",
+                    mb
+                ));
+            }
+            return match std::fs::read(full_path) {
+                Ok(bytes) => Ok(encode_image_for_read(bytes, media_type)),
+                Err(e) => Err(format!("reading image file: {}", e).into()),
+            };
+        }
+        return Ok(format!(
+            "[Binary file: {} - Cannot display binary content. File exists and is {} bytes.]",
+            display_path,
+            std::fs::metadata(full_path)
+                .map(|m| m.len().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        ));
+    }
+
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let line_window = line_window_from_args(args);
+    match std::fs::read_to_string(full_path) {
+        Ok(content) => {
+            // The slice is its own chunk, so sanitize from offset 0.
+            let (text, sanitize_offset) = match line_window {
+                Some((start, count)) => (slice_lines(&content, start, count), 0),
+                None => (content, offset),
+            };
+            Ok(sanitize_file_content_for_llm(
+                text,
+                display_path,
+                sanitize_offset,
+            ))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("reading file: file not found: {}", display_path).into())
+        }
+        Err(e) => Err(format!("reading file: {}", e).into()),
     }
 }
 
@@ -657,6 +959,19 @@ impl LucidosEngine {
             "read_file" => {
                 let raw_path = args["path"].as_str().unwrap_or("");
 
+                // A registered repository is addressed by name, never by path,
+                // so `path` is repo-relative and skips `normalize_data_path`
+                // entirely. Ahead of archive traversal, which would otherwise
+                // claim any repo path with a `.zip` segment and then resolve it
+                // against `data/`. Everything past resolution is shared.
+                if let Some(repo_arg) = args.get("repo").and_then(|v| v.as_str()) {
+                    let (display, full) = match self.resolve_repo_path(repo_arg, raw_path).await {
+                        Ok(p) => p,
+                        Err(e) => return Ok(format!("Error: {}", e)),
+                    };
+                    return read_resolved_file(&display, &full, args);
+                }
+
                 // Archive traversal: a path like
                 // `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html` reads the named
                 // entry out of the zip on the fly, so the LLM doesn't need to drop to
@@ -700,79 +1015,7 @@ impl LucidosEngine {
                     Ok(p) => p,
                     Err(e) => return Ok(format!("Error: {}", e)),
                 };
-                let path = data_path.as_str();
-
-                let extension = lowercase_extension(path);
-                let is_binary = crate::core::is_binary_extension(&extension);
-
-                if is_binary {
-                    // For binary files, check if it exists and return info
-                    if full_path.exists() {
-                        if extension == "pdf" {
-                            // Pre-extracted sidecar from before PDF extraction was removed
-                            // still surfaces — there is no way for the engine to regenerate
-                            // one, but legacy sidecars in older workspaces remain useful.
-                            let text_sidecar = format!("{}.txt", full_path.display());
-                            let text_sidecar_path = std::path::Path::new(&text_sidecar);
-                            if text_sidecar_path.exists() {
-                                if let Ok(text) = std::fs::read_to_string(text_sidecar_path) {
-                                    return Ok(format!("[PDF Text Content]\n\n{}", text));
-                                }
-                            }
-
-                            Ok(format!(
-                                "[Binary file: {} - PDF text extraction has been removed from \
-                                 Lucidos. The PDF is stored as a binary artifact; text content \
-                                 is not available.]",
-                                path
-                            ))
-                        } else if let Some(media_type) = image_media_type(&extension) {
-                            let size = match std::fs::metadata(&full_path) {
-                                Ok(m) => m.len(),
-                                Err(e) => return Err(format!("reading image file: {}", e).into()),
-                            };
-                            if size > IMAGE_MAX_BYTES {
-                                let mb = size as f64 / (1024.0 * 1024.0);
-                                Ok(format!(
-                                    "Image too large to read directly ({:.1} MB). Max 25MB; \
-                                     smaller images are automatically resized to fit.",
-                                    mb
-                                ))
-                            } else {
-                                match std::fs::read(&full_path) {
-                                    Ok(bytes) => Ok(encode_image_for_read(bytes, media_type)),
-                                    Err(e) => Err(format!("reading image file: {}", e).into()),
-                                }
-                            }
-                        } else {
-                            Ok(format!("[Binary file: {} - Cannot display binary content. File exists and is {} bytes.]",
-                                path,
-                                std::fs::metadata(&full_path)
-                                    .map(|m| m.len().to_string())
-                                    .unwrap_or_else(|_| "unknown".to_string())
-                            ))
-                        }
-                    } else {
-                        Ok(format!("[FILE NOT FOUND] '{}' does not exist", path))
-                    }
-                } else {
-                    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let line_window = line_window_from_args(args);
-                    match std::fs::read_to_string(&full_path) {
-                        Ok(content) => {
-                            // The slice is its own chunk, so sanitize from offset 0.
-                            let (text, sanitize_offset) = match line_window {
-                                Some((start, count)) => (slice_lines(&content, start, count), 0),
-                                None => (content, offset),
-                            };
-                            Ok(sanitize_file_content_for_llm(text, path, sanitize_offset))
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            Err(format!("reading file: file not found: {}", path).into())
-                        }
-                        Err(e) => Err(format!("reading file: {}", e).into()),
-                    }
-                }
+                read_resolved_file(data_path.as_str(), &full_path, args)
             }
             "write_file" => {
                 let content = args["content"].as_str().unwrap_or("");
@@ -869,30 +1112,34 @@ impl LucidosEngine {
             }
             "edit_file" => {
                 let raw_path = args["path"].as_str().unwrap_or("");
+                let repo = args.get("repo").and_then(|v| v.as_str());
                 match self
-                    .edit_file_at_path(
+                    .edit_file_at_path(EditFileArgs {
                         raw_path,
-                        args.get("json_path").and_then(|v| v.as_str()),
-                        args.get("new_value").cloned(),
-                        args.get("old_string").and_then(|v| v.as_str()),
-                        args.get("new_string").and_then(|v| v.as_str()),
-                        args["replace_all"].as_bool().unwrap_or(false),
-                        args.get("message").and_then(|v| v.as_str()),
-                    )
+                        repo,
+                        json_path: args.get("json_path").and_then(|v| v.as_str()),
+                        new_value: args.get("new_value").cloned(),
+                        old_string: args.get("old_string").and_then(|v| v.as_str()),
+                        new_string: args.get("new_string").and_then(|v| v.as_str()),
+                        replace_all: args["replace_all"].as_bool().unwrap_or(false),
+                        commit: args.get("commit").and_then(|v| v.as_bool()),
+                        message: args.get("message").and_then(|v| v.as_str()),
+                    })
                     .await
                 {
-                    Ok(r) => Ok(format!(
-                        "[ACTION COMPLETED] UPDATED: {} (commit: {})",
-                        r.path, r.commit
-                    )),
+                    Ok(r) => Ok(r.tool_message()),
                     Err(e) if e.contains("old_string not found") => {
                         // Show file content so the LLM can retry with the correct old_string
-                        let shown = match self
-                            .resolve_data_path(raw_path)
-                            .map_err(|e| e.to_string())
-                            .and_then(|(_, p)| {
-                                std::fs::read_to_string(p).map_err(|e| e.to_string())
-                            }) {
+                        let resolved = match repo {
+                            Some(repo_arg) => self
+                                .resolve_repo_path(repo_arg, raw_path)
+                                .await
+                                .map(|(_, p)| p),
+                            None => self.resolve_data_path(raw_path).map(|(_, p)| p),
+                        };
+                        let shown = match resolved
+                            .and_then(|p| std::fs::read_to_string(p).map_err(|e| e.to_string()))
+                        {
                             Ok(content) if content.len() > 15000 => {
                                 format!("{}...\n[truncated, {} total chars — call read_file to see the rest]",
                                     &content[..content.floor_char_boundary(15000)], content.len())
@@ -930,9 +1177,17 @@ impl LucidosEngine {
                     .get("limit")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize);
+                let repo_entries = match args.get("repo").and_then(|v| v.as_str()) {
+                    Some(repo_arg) => match self.repo_search_entries(repo_arg).await {
+                        Ok(entries) => Some(entries),
+                        Err(e) => return Ok(format!("Error: {}", e)),
+                    },
+                    None => None,
+                };
                 let workspace = self.workspace_path().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    search::glob_files(&workspace, &pattern, limit)
+                let result = tokio::task::spawn_blocking(move || match repo_entries {
+                    Some(entries) => search::glob_entries(entries, &pattern, limit),
+                    None => search::glob_files(&workspace, &pattern, limit),
                 })
                 .await
                 .map_err(|e| format!("glob_files task panicked: {}", e))?;
@@ -972,16 +1227,31 @@ impl LucidosEngine {
                     .get("context_lines")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as usize);
+                let repo_entries = match args.get("repo").and_then(|v| v.as_str()) {
+                    Some(repo_arg) => match self.repo_search_entries(repo_arg).await {
+                        Ok(entries) => Some(entries),
+                        Err(e) => return Ok(format!("Error: {}", e)),
+                    },
+                    None => None,
+                };
                 let workspace = self.workspace_path().to_path_buf();
-                let result = tokio::task::spawn_blocking(move || {
-                    search::grep_files(
+                let result = tokio::task::spawn_blocking(move || match repo_entries {
+                    Some(entries) => search::grep_entries(
+                        entries,
+                        &pattern,
+                        path_glob.as_deref(),
+                        case_insensitive,
+                        max_matches,
+                        context_lines,
+                    ),
+                    None => search::grep_files(
                         &workspace,
                         &pattern,
                         path_glob.as_deref(),
                         case_insensitive,
                         max_matches,
                         context_lines,
-                    )
+                    ),
                 })
                 .await
                 .map_err(|e| format!("grep_files task panicked: {}", e))?;

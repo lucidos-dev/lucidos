@@ -118,10 +118,24 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
 /// the card the test exists to prove absent.
 ///
 /// Read/write rather than a plain mutex, so the tree writers keep running
-/// concurrently with EACH OTHER (`app_coding_agent_concurrent_apply` is about
-/// two applies overlapping, so serializing those would gut it) and only the
-/// snapshot window is exclusive. Writers take `read()`, the snapshot takes
-/// `write()`.
+/// concurrently with EACH OTHER and only the exclusive windows are exclusive.
+/// Writers take `read()`.
+///
+/// TWO KINDS of holder take `write()`, and the second is easy to miss.
+///
+/// The snapshot is the first. The second is **any test that MERGES**. The
+/// engine refuses to merge into a tree with uncommitted changes. A `read()`
+/// holder may be part-way through creating a file it has not committed. That
+/// refusal reached `app_coding_agent_concurrent_apply` as `Cannot merge: the
+/// repository has uncommitted changes`, on one full run out of two. Merging
+/// needs the tree QUIET, not merely un-snapshotted.
+///
+/// A merging test still takes ONE guard for its whole window, so requests it
+/// fires inside that window overlap exactly as before. What `write()` costs is
+/// the concurrency BETWEEN tests, which was the unsound part. It costs nothing
+/// WITHIN a test, which is what those tests are about.
+///
+/// An apply the test expects to be REFUSED merges nothing and needs no guard.
 ///
 /// **Every writer has to take it, so this is an obligation on new tests too.**
 /// A lock the checkpoint test holds against only SOME writers still lets the
@@ -129,7 +143,8 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
 /// trigger tests (their script files appearing and being removed), the
 /// file-edit tests, the CLI data-write test, and the app-seeding helper. If you
 /// add a test that creates, edits or deletes a non-ignored file under the e2e
-/// workspace, take a `read()` guard across that mutation. Writes under
+/// workspace, take a `read()` guard across that mutation, or a `write()` one if
+/// the mutation is a merge. Writes under
 /// `.lucidos/` and `data/blobs/` need nothing: the workspace gitignores both, so
 /// no snapshot ever sees them.
 ///

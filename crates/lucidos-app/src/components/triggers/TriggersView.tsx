@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
-import { triggers, triggerGroups, collapsedTriggerGroupIds, showToast } from '../../store/store';
+import { triggers, triggerGroups, collapsedTriggerGroupIds, expandTriggerGroup, triggerScrollTarget, showToast } from '../../store/store';
 import { openAddTrigger } from '../../store/actions/triggers';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -11,6 +11,9 @@ import { LoadableError } from '../shared/LoadableError';
 import { ListRowAddCard } from '../shared/ListRowAddCard';
 import { ListSkeletonOf } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
+import { applyNavFocus } from '../shared/focusMarker';
+import { resolveTriggerScrollStep } from './triggerScrollStep';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 const UNGROUPED_KEY = '__ungrouped__';
 
@@ -27,6 +30,9 @@ export function TriggersView() {
   const triggersLoadable = triggers.value;
   const groupsLoadable = triggerGroups.value;
   const showTriggersLoading = useDelayedLoading(triggersLoadable);
+  // Scopes the deep-link row lookup to this panel's own list, which is what
+  // keeps it off a chat link wearing the same attribute. See the effect below.
+  const listRef = useRef<HTMLDivElement>(null);
   const [newGroupName, setNewGroupName] = useState<string | null>(null);
   // Enter and blur BOTH call commitNewGroup; committing unmounts the field,
   // which fires a trailing blur that would POST the same name again (409
@@ -56,7 +62,7 @@ export function TriggersView() {
 
   return (
     <div class="content-view active">
-      <div class="list-rows">
+      <div class="list-rows" ref={listRef}>
         <LoadingFade showSkeleton={showTriggersLoading} skeleton={<ListSkeletonOf fill containerClass="trigger-group-section" row={() => <TriggerItem />} />}>
           {triggersLoadable.status === 'loaded' ? (
             <TriggersLoaded
@@ -66,6 +72,7 @@ export function TriggersView() {
               setNewGroupName={setNewGroupName}
               commitNewGroup={commitNewGroup}
               creatingGroupRef={creatingGroupRef}
+              listRef={listRef}
             />
           ) : null}
         </LoadingFade>
@@ -81,6 +88,7 @@ function TriggersLoaded({
   setNewGroupName,
   commitNewGroup,
   creatingGroupRef,
+  listRef,
 }: {
   triggersData: TriggerInfo[];
   groupsLoadable: typeof triggerGroups.value;
@@ -88,6 +96,7 @@ function TriggersLoaded({
   setNewGroupName: (v: string | null) => void;
   commitNewGroup: () => void;
   creatingGroupRef: { current: boolean };
+  listRef: { current: HTMLDivElement | null };
 }) {
   // Group registry is small; if it failed, fall back to a flat panel under
   // "Ungrouped" so the user still sees their triggers. The failure surfaces
@@ -111,6 +120,37 @@ function TriggersLoaded({
 
   const collapsed = collapsedTriggerGroupIds.value;
   const ungroupedTriggers = byGroup.get(UNGROUPED_KEY) ?? [];
+
+  // Trigger deep link: once the rows have rendered, scroll the targeted one
+  // into view and mark it. `resolveTriggerScrollStep` owns the decision and is
+  // unit-tested without a DOM; this effect only carries it out. Mirrors
+  // StoreTab's `pluginScrollTarget` effect.
+  useEffect(() => {
+    const step = resolveTriggerScrollStep(triggerScrollTarget.value, triggersData, collapsed);
+    if (step.kind === 'idle') return;
+    if (step.kind === 'drop') {
+      triggerScrollTarget.value = null;
+      return;
+    }
+    if (step.kind === 'expand') {
+      expandTriggerGroup(step.groupId);
+      return; // The anchor mounts on the next render; the target survives.
+    }
+    // Scoped to THIS panel's list, never `document`. A trigger link in a chat
+    // message carries the same `data-trigger-id`, and the transcript sits
+    // earlier in the DOM. Mobile mounts every pane at once, so a document-wide
+    // query returned the link the user had just tapped. It marked that link,
+    // scrolled the transcript, and spent the target before reaching the row.
+    // A link never sits inside the Triggers list, so the scope settles this by
+    // construction rather than by a tie-break.
+    const el = listRef.current?.querySelector<HTMLElement>(
+      `[data-trigger-id="${CSS.escape(step.triggerId)}"]`,
+    );
+    if (!el) return;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    applyNavFocus(el);
+    triggerScrollTarget.value = null;
+  }, [triggerScrollTarget.value, triggersData, collapsed, listRef]);
 
   const creatingGroup = newGroupName !== null;
   const createInputRef = useRef<HTMLInputElement>(null);
@@ -163,6 +203,7 @@ function TriggersLoaded({
           type="text"
           value={newGroupName ?? ''}
           placeholder="Group name"
+          {...PROSE_TEXT_ATTRS}
           tabIndex={creatingGroup ? 0 : -1}
           // Clipped is not hidden: without this a screen reader would find a
           // "Group name" field sitting in the panel at all times, doing

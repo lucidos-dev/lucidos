@@ -56,6 +56,24 @@ describe("the follow's live term", () => {
     expect(exchangeMarksThreadLive(true, status, false)).toBe(true);
   });
 
+  it('is true for a turn that armed an event wait and worked on', () => {
+    // The agent's watch is armed mid-turn and the turn carries on, so the
+    // thread is live and a scroll must retire the follow. The park used to
+    // speak for the whole turn, which read "Done ✓" over a working agent.
+    const worked = makeExchange({ type: 'MessageReceived', text: 'run the suite' }, [
+      step(1, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+      step(2, {
+        type: 'EventWaitStarted', wait_id: 'w1', tool_use_id: 't1',
+        on: [{ event_type: 'E2ELockReleased' }], reason: 'the lock',
+        expires_at: '2026-08-06T12:00:00Z', watermark: 10,
+      }),
+      step(3, { type: 'CodingAgentToolCalled', name: 'Bash', args: {} }),
+    ]);
+    const status = exchangeStatus(worked, '', true, false, true, false, false);
+    expect(status).toBe('coding-agent-working');
+    expect(exchangeMarksThreadLive(true, status, false)).toBe(true);
+  });
+
   it('is false for a thread parked on a question, where nothing is being appended', () => {
     const asked = makeExchange({
       type: 'UserQuestionAsked', tool_use_id: 't1', cc_session_id: 's1', question: 'which?',

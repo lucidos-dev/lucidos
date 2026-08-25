@@ -6,11 +6,12 @@ use chrono::{DateTime, Utc};
 mod build;
 mod resume;
 
-pub(crate) use build::build_session_messages;
 pub use build::format_child_thread_completed_block;
+pub(crate) use build::{build_session_messages, newest_conversation_summary, CachedSummary};
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
-    find_orphan_tool_called_ids, RESUME_VERBATIM_TOOL_TAIL,
+    find_orphan_tool_called_ids, parse_event_address, synthesize_tool_use_id, with_event_address,
+    RESUME_VERBATIM_TOOL_TAIL,
 };
 
 impl EventStore {
@@ -108,25 +109,25 @@ impl EventStore {
     }
 }
 
-/// Walk every `ContextDismissed` event in the stream and collect the set of
-/// dismissed event ids. The agent emits these via the `dismiss_from_context`
-/// tool — see `engine/tools/mod.rs::execute_dismiss_from_context`. The
-/// resume helper consults this set to drop both `(ToolCalled, ToolResult)`
-/// pairs (matched on the `ToolCalled.id`) and `ChildThreadCompleted` blocks.
-fn collect_dismissed_event_ids(events: &[EventRow]) -> std::collections::HashSet<String> {
-    let mut dismissed = std::collections::HashSet::new();
-    for event in events {
-        if event.event_type == "ContextDismissed" {
-            if let Some(id) = event
-                .payload
-                .get("dismissed_event_id")
-                .and_then(|v| v.as_str())
-            {
-                dismissed.insert(id.to_string());
-            }
-        }
-    }
-    dismissed
+/// The handles a `ContextDismissed` dropped from future resume context.
+///
+/// They came from the retired `dismiss_from_context` tool (ADR 0109), so no new
+/// ones are written and every row is historical. The resume helper consults
+/// this set to drop both `(ToolCalled, ToolResult)` pairs (matched on the
+/// `ToolCalled.id`) and `ChildThreadCompleted` blocks.
+///
+/// **A keep does not cancel one** (ADR 0109's amendment). A keep moves an
+/// item's clock, and a dismissal is a standing drop.
+pub(crate) fn collect_dismissed_event_ids(
+    events: &[EventRow],
+) -> std::collections::HashSet<String> {
+    events
+        .iter()
+        .filter(|event| event.event_type == "ContextDismissed")
+        .filter_map(|event| event.payload.get("dismissed_event_id"))
+        .filter_map(|value| value.as_str())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

@@ -401,6 +401,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    // Validate the migrated config once, here, so a refused entry stops the
+    // boot with a message naming it. The proxy routes load the same file per
+    // request. Without this call the first news of a bad `apis.json` is a 500,
+    // on whichever proxy somebody happens to use first.
+    if let Err(e) = lucidos_engine::api::validate_proxy_config(&workspace_path) {
+        log!("[Startup] apis.json is not usable: {}", e);
+        return Err(format!("apis.json is not usable: {e}").into());
+    }
+
     let database_url = lucidos_engine::core::database_url();
     log!("[Startup] Connecting to PostgreSQL...");
 
@@ -503,7 +512,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (llm, web_search)
         }
         ProviderBuildOutcome::FailFast => {
-            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter / xAI credential (Settings → Models → Providers) or OPENAI_API_KEY / ANTHROPIC_API_KEY / LUCIDOS_OPENROUTER_API_KEY / LUCIDOS_XAI_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
+            panic!("No LLM provider configured. Set VERTEX_PROJECT_ID (Claude/Gemini via Vertex), configure an OpenAI / Anthropic / OpenRouter / xAI credential (Settings → Models → Providers) or OPENAI_API_KEY / ANTHROPIC_API_KEY / LUCIDOS_OPENROUTER_API_KEY / LUCIDOS_XAI_API_KEY, set a local OpenAI-compatible base URL (Settings → Models → Providers or LUCIDOS_LOCAL_BASE_URL), turn on the keyless OpenCode Free tier (Settings → Models → Providers or LUCIDOS_OPENCODE_FREE=1), LUCIDOS_BOOT_WITHOUT_PROVIDER=1 (boot into provider onboarding), or LUCIDOS_MODEL=mock (for testing).");
         }
     };
     drop(boot_pool);
@@ -916,6 +925,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // engine while every other request fails. Not dev-only: a packaged
     // install's bundled Postgres can die too. See ADR 0037.
     let _db_health_probe = shared_engine.spawn_db_health_probe();
+    // One-shot, idempotent: rebuild `ContextCaptured` rows for the auxiliary
+    // model calls the engine made before it recorded them. Spawned rather
+    // than awaited, unlike the backfills above. Nothing reads these rows
+    // synchronously, so boot must not grow with the size of the events table.
+    // See `core::aux_context_backfill`.
+    let aux_backfill = shared_engine.clone();
+    tokio::spawn(async move {
+        match lucidos_engine::core::aux_context_backfill::backfill_auxiliary_captures(
+            aux_backfill.pool(),
+            &aux_backfill.event_bus,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => log!(
+                "[AuxContextBackfill] reconstructed {} auxiliary model call(s)",
+                n
+            ),
+            Err(e) => log!("[AuxContextBackfill] failed: {}", e),
+        }
+    });
     let api_port = std::env::var("LUCIDOS_API_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())

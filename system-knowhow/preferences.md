@@ -73,14 +73,23 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `chat_reasoning_effort` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `high` | Default thinking budget for NEW threads (a running thread reuses its own last-used effort; clamped per model). |
 | `image_model` | global | `auto` \| `imagen-4` \| `gpt-image-1` \| `gpt-image-1.5` \| `gpt-image-2` | `auto` | Model used by `generate_image`. |
 | `model_title` | global | a model id | `gemini-3-flash-preview` | Background model for thread titles. |
+| `reasoning_title` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for title generation. Naming a thread needs none of it. |
 | `model_image_description` | global | a model id | `gemini-3-flash-preview` | Background model that describes uploaded images. |
-| `model_memory` | global | a model id | `gemini-3-flash-preview` | Background model for memory extraction. |
+| `reasoning_image_description` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for describing an image. Captioning is perception, so the default spends nothing on deliberation. |
+| `model_memory` | global | a model id | `gemini-3-flash-preview` | Background model for the two memory calls every turn makes: extracting facts, and classifying what the turn needs retrieved. It no longer writes the conversation summary (see `model_conversation_summary`). |
+| `reasoning_memory` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `none` | Thinking budget for fact extraction and query classification. Both return short JSON on every turn. |
+| `model_conversation_summary` | global | a model id | (the `model_memory` model) | Background model that writes a thread's *conversation summary*: the paragraph standing in for its older assistant turns. Split out of `model_memory`, so it inherits that value until you set this one. Its input can be 80k tokens, far larger than any other background call. |
+| `reasoning_conversation_summary` | global | `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | `low` | Thinking budget for the conversation summary. Measured output length does not track this setting, so raising it is unlikely to help: the summariser's failures are calls that never complete. |
 | `vertex_region` | global | text | `europe-west1` | Google Vertex AI region. |
 | `local_base_url` | global | URL | `http://localhost:11434/v1` | Base URL for the `local` OpenAI-compatible provider. |
+| `opencode_free_enabled` | global | `true` \| `false` | `false` | Off by default. `true` makes the keyless OpenCode Free models available in the picker. No account and no API key: requests go anonymously to a third-party relay, and several of those free models may train on what they receive. Turn it on only if the user asked for free models and accepts that. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `mobile_header_sticky` | global | `true` \| `false` | `true` | Keep the mobile header always visible. |
 | `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. No effect on desktop, Android, or a normal Safari tab, which all open a new tab. `safari` hands it to the Safari app; `ask` opens the OS share sheet so iOS offers every installed browser, including the user's real default; `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
+| `self_curated_context_mode` | global | `true` \| `false` | `false` | **Experimental**, and off unless the user asked for it. `true` puts a chat or trigger thread in *self-curated context mode*. Tool results are then swept away in batches: every ten rounds the sweep takes everything more than five rounds old, and the call that made each one goes with it. Nothing stands in their place, and doing nothing holds a result until then. The agent keeps its picture of the job in a *working understanding* it writes as ordinary text in its own reply, and holds one item longer by naming its `evt-<hex>` address under a `[KEEP OPEN]` heading there. A *context panel* at the tail of every round states how full the prompt is, what each item costs and how long it has left. Everything else rides as it always did, except that the previous turn's tool calls are not re-sent, the conversation summariser does not run, and `todo_write` is withdrawn because the checklist moved into the same block. The cost is a re-fetch: a result the agent needed and did not write down takes a round to read back. Coding-agent threads are unaffected. |
+| `self_curated_context_expire_after_rounds` | global | 1-1000 | `5` | How old a tool result has to be before a sweep may take it, in rounds. Only read when `self_curated_context_mode` is `true`. With the default sweep interval an item lives 6 to 15 rounds and averages ten. Provisional: the prompt and the panel both quote whatever is in force. |
+| `self_curated_context_sweep_every_rounds` | global | 1-1000 | `10` | How often the sweep runs, in rounds. Only read when `self_curated_context_mode` is `true`. Removing a pair from the middle of the request invalidates every cached byte after it, so the pass is scheduled rather than run every round: nine rounds in ten are pure appends. Setting it to `1` restores a per-round drop and pays that cost every round. |
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
@@ -99,9 +108,10 @@ globally does nothing on a device that has its own `theme=light` override. Use
 `set_preference` refuses them (it returns a hint pointing at the right Settings
 surface):
 
-- `command_guard`, `command_guard_judge`, `model_command_judge` — the command
-  guard (safety gate over the agent's own bash/python). Settings → Permissions
-  only. You must not disable your own safety gate.
+- `command_guard`, `command_guard_judge`, `model_command_judge`,
+  `reasoning_command_judge`: the command guard (safety gate over the agent's own
+  bash/python) and the model selection its LLM judge runs on. Settings →
+  Permissions only. You must not disable or weaken your own safety gate.
 - `backup_last_run` — internal backup state (the last run's outcome), not a
   setting. The backup *schedule*, *provider*, and *retention* ARE settable (see
   the table above); use `get_backup_status` to read the current schedule, next /

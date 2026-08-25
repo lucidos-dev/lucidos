@@ -50,6 +50,7 @@ import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { showToast, visibleWorkspaceName } from '../../store/store';
 import { offersWorkspaceWindow, openWorkspaceWindow, workspaceWindowLabel } from '../../utils/workspaceWindow';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
+import { replaceOnPlainClick } from '../../utils/documentNavigation';
 import { rememberLastWorkspaceCount, recallLastWorkspaceCount } from '../../utils/lastWorkspace';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
 
@@ -181,7 +182,12 @@ export function workspacesMenuRow({
 
   if (manageHref !== null) {
     return (
-      <a class="brand-menu-item" role="menuitem" href={manageHref} onClick={onNavigate}>
+      <a
+        class="brand-menu-item"
+        role="menuitem"
+        href={manageHref}
+        onClick={replaceOnPlainClick(manageHref, onNavigate)}
+      >
         {body}
       </a>
     );
@@ -312,7 +318,7 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
         class="brand-menu-ws-row is-unreachable"
         role="menuitem"
         href={manageHref}
-        onClick={onNavigate}
+        onClick={replaceOnPlainClick(manageHref, onNavigate)}
         data-tooltip={hint}
         aria-label={`${w.name} · ${hint}`}
         key={w.id}
@@ -412,7 +418,7 @@ export function workspaceSwitcherList(props: SwitcherListProps) {
           class="brand-menu-ws-row brand-menu-ws-manage"
           role="menuitem"
           href={manageHref}
-          onClick={onNavigate}
+          onClick={replaceOnPlainClick(manageHref, onNavigate)}
         >
           Manage workspaces
         </a>

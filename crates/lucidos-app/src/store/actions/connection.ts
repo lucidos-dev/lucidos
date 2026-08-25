@@ -7,6 +7,7 @@ import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAILURE_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
+import { loadPreferences } from './preferences';
 import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
@@ -179,6 +180,10 @@ function runResumeSync(): void {
   markLoadedThreadsStale();
 
   void loadUnreadNotifications();
+  // Preferences have no SSE re-trigger beyond `PreferencesChanged` /
+  // `LanguageSet` / `TimezoneSet`. A resume is the only other chance to
+  // recover a fetch that was cancelled at startup or during this outage.
+  void loadPreferences();
   // Re-send any compose draft the engine never received. Paired with the same
   // flush in `useStartup`'s onResume, and needed separately from it: this path
   // runs on a reconnect the 5s health poll notices with no wake at all (a

@@ -68,6 +68,7 @@ pub mod boot_report;
 pub mod capability_manifest;
 pub mod core;
 pub mod engine;
+pub mod gateway_auth;
 pub mod llm;
 pub mod mcp;
 pub mod memory;
@@ -114,7 +115,7 @@ pub mod __wasm_test_internals {
     pub use crate::api::proxy_wasm_signer::{
         build_wasmtime_engine, load_wasm_modules, BodyMode, CompiledModule, CredentialHandle,
         SecretResolver, SignInput, SignInputBody, SignOutput, WasmManifest, WasmSignerLayer,
-        CAP_REPLACE_BODY,
+        CAP_READ_PRIOR_HEADERS, CAP_REPLACE_BODY, WITHHELD_HEADER_VALUE,
     };
     pub use wasmtime::Engine;
 

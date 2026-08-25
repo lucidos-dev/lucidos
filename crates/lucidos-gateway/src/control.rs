@@ -5,6 +5,7 @@
 //! per-workspace health), create (provision a stack), rename (registry-only
 //! edit), delete-to-trash, and a manual restart for an unhealthy stack.
 
+use crate::auth;
 use crate::error::ApiError;
 use crate::net_config;
 use crate::server::{GatewayState, RestoreStatus};
@@ -12,14 +13,17 @@ use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::routing::{delete, get, post, put};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub fn router() -> Router<GatewayState> {
     Router::new()
         .route("/workspaces", get(list).post(create))
+        // Register a directory that already exists, without provisioning or
+        // starting anything. `create`'s sibling for a tree somebody else owns.
+        .route("/workspaces/adopt", post(adopt))
         // Fresh aggregate unread total across running workspaces, computed on
         // demand. The desktop dock badge reads this on its nudge (and periodic
         // tick) so a just-read notification reflects immediately, rather than
@@ -36,6 +40,14 @@ pub fn router() -> Router<GatewayState> {
         // Gateway self-update: is a rebuilt binary waiting, and adopt it (re-exec).
         .route("/gateway/status", get(gateway_status))
         .route("/gateway/reload", post(gateway_reload))
+        // Ask the release check to poll now (ADR 0108). Kept off
+        // `/gateway/status`, which the picker hits every 2s and which must
+        // never wait on an outbound request.
+        .route("/gateway/check-updates", post(gateway_check_updates))
+        // Write the machine-global release-check preference. The matching READ
+        // is the `release_check` field on `/gateway/status`, so there is one
+        // place the frontend gets the whole answer.
+        .route("/release-check", put(set_release_check_config))
         // Machine-global network bind (the gateway's own bind + the engine
         // inherit toggle) — the picker's Network access control writes
         // ~/.lucidos/network.toml here.
@@ -208,6 +220,22 @@ struct CreateBody {
 }
 
 #[derive(Deserialize)]
+struct AdoptBody {
+    /// Absolute path to an existing directory. Its basename slugifies to the
+    /// workspace address.
+    dir: String,
+    /// Display name. Absent leaves an existing entry's name alone, and names a
+    /// new one after its directory.
+    #[serde(default)]
+    name: Option<String>,
+    /// Absent means false for a NEW entry and unchanged for an existing one.
+    /// The picker owns this toggle exactly as it owns the display name, so a
+    /// re-adopt must not silently undo it.
+    #[serde(default)]
+    autostart: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct RenameBody {
     name: String,
 }
@@ -266,6 +294,31 @@ async fn create(
     // user can act on, not a 500.
     let status = state.create_workspace(name).await?;
     Ok(Json(json!({ "workspace": status })))
+}
+
+/// Register an existing directory as a workspace, and start nothing.
+///
+/// The response carries the registry entry, the allocated `port` included, so
+/// the caller can boot its own engine there. The gateway adopts that engine on
+/// its next supervise tick, and from then on the workspace is a regular one:
+/// healthy in the picker, proxied, stoppable and restartable.
+///
+/// Deliberately NOT a `WorkspaceStatus` like [`create`]'s. That shape carries
+/// `health`, and at this instant nothing is running yet, whatever the caller is
+/// about to boot. Reporting health here would describe the gap rather than the
+/// registration that worked.
+async fn adopt(
+    State(state): State<GatewayState>,
+    Json(body): Json<AdoptBody>,
+) -> Result<Json<Value>, ApiError> {
+    let ws = state
+        .adopt_workspace(
+            std::path::Path::new(body.dir.trim()),
+            body.name.as_deref(),
+            body.autostart,
+        )
+        .await?;
+    Ok(Json(json!({ "workspace": ws })))
 }
 
 /// Restore a local encrypted backup archive into a NEW workspace. Multipart body:
@@ -382,12 +435,70 @@ async fn restore_status(State(state): State<GatewayState>) -> Json<RestoreStatus
 /// build id, whether a newer gateway binary is on disk waiting to be adopted, and
 /// whether this is a packaged build (the picker hides the dev-only self-reload
 /// control when `packaged`).
+///
+/// It also carries `release_check`, the machine's answer to "is a newer Lucidos
+/// PUBLISHED" (ADR 0108). That is the last known answer only: this route is
+/// polled every 2s and must never wait on the origin. An older gateway omits
+/// the field, and the frontend reads that as no offer.
 async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
     Json(json!({
         "build_id": state.build_id(),
         "update_available": state.gateway_update_available().await,
         "packaged": state.packaged(),
+        "release_check": state.release_check().snapshot(),
     }))
+}
+
+/// Body for a release-check poll request. Absent means an ordinary refresh,
+/// which the staleness gate may answer from the last known result.
+#[derive(Deserialize, Default)]
+struct CheckUpdatesBody {
+    /// The Settings button, which asks for a poll now. Still floored at one a
+    /// minute, so the button cannot be mashed into a burst.
+    #[serde(default)]
+    force: bool,
+}
+
+/// POST /~/api/v1/control/gateway/check-updates: poll if the answer is stale,
+/// then return the fresh `release_check` object.
+///
+/// Concurrent callers coalesce inside the check, so N open windows asking at
+/// once still produce one outbound request.
+async fn gateway_check_updates(
+    State(state): State<GatewayState>,
+    body: Option<Json<CheckUpdatesBody>>,
+) -> Json<Value> {
+    let force = body.map(|Json(b)| b.force).unwrap_or_default();
+    Json(state.release_check().refresh(force).await)
+}
+
+/// Body for the release-check preference write. Each field is optional, so the
+/// first-run notice can acknowledge without also restating `enabled`.
+#[derive(Deserialize)]
+struct ReleaseCheckBody {
+    enabled: Option<bool>,
+    notice_acknowledged: Option<bool>,
+}
+
+/// PUT /~/api/v1/control/release-check: write `~/.lucidos/updates.toml` and
+/// return the resulting state. The check re-reads the file on every tick, so a
+/// change takes effect with no gateway restart.
+async fn set_release_check_config(
+    State(state): State<GatewayState>,
+    Json(body): Json<ReleaseCheckBody>,
+) -> Result<Json<Value>, ApiError> {
+    let check = state.release_check();
+    let mut cfg = check.config();
+    if let Some(enabled) = body.enabled {
+        cfg.enabled = enabled;
+    }
+    if let Some(acknowledged) = body.notice_acknowledged {
+        cfg.notice_acknowledged = acknowledged;
+    }
+    check
+        .set_config(&cfg)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(check.snapshot()))
 }
 
 /// Adopt the on-disk gateway binary by re-exec'ing this process onto it (same
@@ -484,26 +595,28 @@ async fn rename(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The device the caller is on, from the header the app sends on every mutating
-/// request. Absent for every non-browser client (the dev launcher, `stop.sh`,
-/// the packaged smoke test), which is what keeps those teardowns unattributed.
+/// The device the caller is on, as `enforce` AUTHENTICATED it. Absent for every
+/// non-browser client (the dev launcher, `stop.sh`, the packaged smoke test),
+/// which is what keeps those teardowns unattributed.
 ///
-/// A display hint only, exactly as it is at the engine's own endpoints: it names
-/// who to credit, never what they may do. Authorization for this whole surface
-/// is [`control_authz`] plus the gateway's loopback bind, neither of which reads
-/// this header.
-fn requesting_device(headers: &HeaderMap) -> Option<&str> {
-    header_str(headers, crate::stack::HEADER_DEVICE_ID)
+/// Read from the request extension, never from the inbound header, for the same
+/// reason [`crate::proxy`] re-injects rather than forwards. This value reaches
+/// the engine's restart-intent endpoint, where it is the device-actor half of
+/// `switch_was_user_initiated`. A client-chosen one would let any paired caller
+/// attribute a restart, and the auto-resume it authorizes, to any device it
+/// cared to name.
+fn requesting_device(device: Option<&auth::AuthenticatedDevice>) -> Option<&str> {
+    device.map(|d| d.0.as_str())
 }
 
 async fn restart(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
 ) -> Result<StatusCode, ApiError> {
     reject_invalid_id(&id)?;
     state
-        .restart_workspace(&id, requesting_device(&headers))
+        .restart_workspace(&id, requesting_device(device.as_deref()))
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)
@@ -515,11 +628,11 @@ async fn restart(
 async fn stop(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
+    device: Option<Extension<auth::AuthenticatedDevice>>,
 ) -> Result<StatusCode, ApiError> {
     reject_invalid_id(&id)?;
     state
-        .stop_workspace(&id, requesting_device(&headers))
+        .stop_workspace(&id, requesting_device(device.as_deref()))
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)
@@ -725,5 +838,21 @@ mod authz_tests {
         assert!(!referer_is_app_iframe("https://h/dev/api/v1/threads")); // shell API
         assert!(!referer_is_app_iframe("https://h/")); // root
         assert!(!referer_is_app_iframe("https://h/appworkspace/")); // slug literally "appworkspace"
+    }
+
+    #[test]
+    fn requesting_device_names_only_an_authenticated_caller() {
+        // The value reaches the engine's restart-intent route, where it is the
+        // device-actor half of `switch_was_user_initiated`. It comes from the
+        // extension `enforce` stamps, so a client cannot choose it.
+        let device = auth::AuthenticatedDevice("device-1".into());
+        assert_eq!(requesting_device(Some(&device)), Some("device-1"));
+    }
+
+    #[test]
+    fn requesting_device_is_absent_for_a_caller_that_proved_no_device() {
+        // The dev launcher, `stop.sh` and the packaged smoke test all land here.
+        // Their teardowns stay unattributed rather than borrowing a name.
+        assert_eq!(requesting_device(None), None);
     }
 }

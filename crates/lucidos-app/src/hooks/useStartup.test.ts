@@ -65,7 +65,7 @@ const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
   ['reg?.update()', 'a new frontend build is never picked up by the service worker'],
   ['syncClientUpdateFromBuild(', 'the client-update badge misses a build that landed while away'],
   ['checkEngineVersion(', 'an engine build that finished while away shows as still spinning'],
-  ['recheckAppUpdateOnResume(', 'a packaged release goes unannounced until the next poll'],
+  ['refreshReleaseCheck(', 'a published release goes unannounced until the gateway backstop fires'],
   ['flushPendingPreferenceWrites(', 'a settings change WebKit aborted at suspend never reaches the engine, so the device and the server disagree until the next reload'],
   ['flushUndeliveredComposeDrafts(', 'a draft whose PUT failed while offline is never re-sent, and since a draft lives only in memory it dies with the next iOS eviction'],
 ];
@@ -73,11 +73,12 @@ const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
 describe('useStartup resume reconciliation', () => {
   const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onResume()');
 
-  // Proves the brace match actually bounded the handler. `startAppUpdateChecks`
-  // is called once in the effect body and never on resume, so seeing it here
-  // would mean the slice overran and every assertion below had become vacuous.
+  // Proves the brace match actually bounded the handler.
+  // `startAppUpdateProgress` is called once in the effect body and never on
+  // resume. Seeing it here would mean the slice overran, and every assertion
+  // below had become vacuous.
   it('bounds the handler rather than swallowing the whole effect', () => {
-    expect(body).not.toContain('startAppUpdateChecks(');
+    expect(body).not.toContain('startAppUpdateProgress(');
     expect(body.length).toBeGreaterThan(0);
   });
 
@@ -104,7 +105,7 @@ describe('useStartup external-link delegation', () => {
   const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onGlobalClick(');
 
   it('bounds the handler rather than swallowing the whole effect', () => {
-    expect(body).not.toContain('startAppUpdateChecks(');
+    expect(body).not.toContain('startAppUpdateProgress(');
     expect(body.length).toBeGreaterThan(0);
   });
 

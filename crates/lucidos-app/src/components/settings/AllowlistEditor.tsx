@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { showToast, showConfirm } from '../../store/store';
+import { showToast, showConfirm, permissionGrantsVersion } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { toFailed, type Loadable } from '../../store/types';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
+import { toFailed, loadingIfFresh, type Loadable } from '../../store/types';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -99,11 +100,31 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   const [patterns, setPatterns] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const showLoading = useDelayedLoading(loadable);
+  const dirty = loadable.status === 'loaded' && serializeAllowlist(header, patterns) !== loadable.data;
+  /** Bumped by every local write of the rows. `dirty` cannot stand in for it:
+   *  `dirty` gates whether a reload STARTS, and it is read at render time,
+   *  while a reply lands between renders. So a reload begun on a clean editor
+   *  would still overwrite a draft typed while it was in flight. */
+  const edits = useRef(0);
 
-  useEffect(() => {
-    setLoadable({ status: 'loading' });
+  /** Wrap a local write of the rows, so a reload in flight drops its reply. */
+  function edit(apply: () => void): void {
+    edits.current++;
+    apply();
+  }
+
+  function reload() {
+    const startedAt = edits.current;
+    // Keep the rows through the round-trip, so only a first read shows a
+    // loader and an SSE-driven re-read swaps in place.
+    setLoadable(loadingIfFresh);
     props.load()
       .then((contents) => {
+        // A draft appeared under this read, so the file it holds is older than
+        // what is on screen. Dropping the error below is right for the same
+        // reason: the rows the user is editing are still there, and their Save
+        // reports its own result.
+        if (edits.current !== startedAt) return;
         const parsed = parseAllowlist(contents);
         setHeader(parsed.header);
         setPatterns(parsed.patterns);
@@ -113,12 +134,23 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
         // serialize() canonicalizes whitespace and comment placement.
         setLoadable({ status: 'loaded', data: serializeAllowlist(parsed.header, parsed.patterns) });
       })
-      .catch((e) => setLoadable(toFailed(e)));
-    // props.load is a stable API-client function; load once on mount.
-  }, []);
+      .catch((e) => {
+        if (edits.current !== startedAt) return;
+        setLoadable(toFailed(e));
+      });
+  }
+
+  // props.load is a stable API-client function; load once on mount.
+  useEffect(reload, []);
+
+  // The agent grants a permission by writing this very file, so the editor has
+  // to follow it (ADR 0118). Paused while dirty: unsaved patterns are the
+  // user's and a re-read would drop them. Save and Revert both clear dirty,
+  // which is when a frame held back during the edit lands.
+  useVersionedRefresh(permissionGrantsVersion.value, dirty, reload);
 
   function setPatternAt(i: number, value: string) {
-    setPatterns((prev) => prev.map((p, idx) => (idx === i ? value : p)));
+    edit(() => setPatterns((prev) => prev.map((p, idx) => (idx === i ? value : p))));
   }
 
   async function deletePatternAt(i: number) {
@@ -128,7 +160,7 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
     if (pattern && !(await showConfirm(`Delete permission "${pattern}"?`, 'Delete', { variant: 'danger' }))) {
       return;
     }
-    setPatterns((prev) => prev.filter((_, idx) => idx !== i));
+    edit(() => setPatterns((prev) => prev.filter((_, idx) => idx !== i)));
   }
 
   async function save() {
@@ -138,9 +170,11 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
       await props.save(next);
       // Re-parse so trimmed/empty rows collapse to their persisted form.
       const parsed = parseAllowlist(next);
-      setHeader(parsed.header);
-      setPatterns(parsed.patterns);
-      setLoadable({ status: 'loaded', data: next });
+      edit(() => {
+        setHeader(parsed.header);
+        setPatterns(parsed.patterns);
+        setLoadable({ status: 'loaded', data: next });
+      });
       showToast('Saved', 'info');
     } catch (e) {
       showToast(`Save failed: ${errorDetail(e)}`, 'error');
@@ -152,8 +186,10 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   function revert() {
     if (loadable.status !== 'loaded') return;
     const parsed = parseAllowlist(loadable.data);
-    setHeader(parsed.header);
-    setPatterns(parsed.patterns);
+    edit(() => {
+      setHeader(parsed.header);
+      setPatterns(parsed.patterns);
+    });
   }
 
   if (loadable.status === 'failed') {
@@ -167,8 +203,6 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
       </div>
     );
   }
-
-  const dirty = loadable.status === 'loaded' && serializeAllowlist(header, patterns) !== loadable.data;
 
   return (
     <div class="settings-section">
@@ -199,7 +233,7 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
               <button
                 type="button"
                 class="action-btn"
-                onClick={() => setPatterns((prev) => [...prev, ''])}
+                onClick={() => edit(() => setPatterns((prev) => [...prev, '']))}
               >
                 Add pattern
               </button>

@@ -337,6 +337,19 @@ pub(super) async fn create_trigger(
         return ApiResult::err("At least one cron expression or an event subscription is required");
     }
 
+    // Every entry in the `on` array. A trigger armed on a name the engine never
+    // emits looks armed and never fires.
+    let event_warnings = match crate::core::event_subscription::check_subscriptions(
+        &state.pool,
+        &subscriptions,
+        crate::core::event_subscription::SubscriptionSurface::Trigger,
+    )
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(msg) => return ApiResult::err(msg),
+    };
+
     // Read timezone from preferences (default to UTC) before validating cron: the
     // guard reports its next-run preview in the trigger's own timezone.
     let timezone = PreferenceStore::get(&state.pool, "timezone")
@@ -443,7 +456,10 @@ pub(super) async fn create_trigger(
         )
         .await;
 
-    ApiResult::ok_with_cron_preview(CronPreview::from_validated(&validated))
+    ApiResult::ok_for_trigger(
+        Some(CronPreview::from_validated(&validated)),
+        event_warnings,
+    )
 }
 
 /// Update an existing trigger
@@ -515,6 +531,20 @@ pub(super) async fn update_trigger(
 
     let normalized_on: Option<Vec<EventSubscription>> =
         request.on.map(EventSubscription::normalize_list);
+
+    // Only what this request supplies. An `on:` list left absent keeps whatever
+    // the trigger already had, and re-refusing it would strand a trigger the
+    // user can no longer rename.
+    let event_warnings = match crate::core::event_subscription::check_subscriptions(
+        &state.pool,
+        normalized_on.as_deref().unwrap_or_default(),
+        crate::core::event_subscription::SubscriptionSurface::Trigger,
+    )
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(msg) => return ApiResult::err(msg),
+    };
 
     // None = absent (keep existing); Some(empty) = clear all; Some(non-empty) = replace.
     // The new shape always serializes as an array — apply_update reads it back
@@ -611,10 +641,10 @@ pub(super) async fn update_trigger(
 
     // Only an update that actually rewrote the schedule has a preview to report;
     // one that only renamed the trigger says nothing about its cron.
-    match validated {
-        Some(ref v) => ApiResult::ok_with_cron_preview(CronPreview::from_validated(v)),
-        None => ApiResult::ok(),
-    }
+    ApiResult::ok_for_trigger(
+        validated.as_ref().map(CronPreview::from_validated),
+        event_warnings,
+    )
 }
 
 /// Delete a trigger

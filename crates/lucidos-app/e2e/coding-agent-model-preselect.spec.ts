@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessage, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, waitAndClick, waitForVisibleElement,
+  waitForActiveSession, waitAndClick, waitForVisibleElement, pickModelPair,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -28,7 +28,8 @@ test.describe('CC model pre-session selection', () => {
 
     await waitAndClick(page, '.commands-btn-active', undefined, 15_000);
     await waitAndClick(page, '.control-item', 'Model');
-    await waitAndClick(page, '.control-option', 'Haiku');
+    // Two steps: the model, then one of its tiers. Only the tier reports.
+    await pickModelPair(page, 'haiku');
 
     let sentThreadId: string | null = null;
     page.on('request', (req) => {
@@ -55,11 +56,10 @@ test.describe('CC model pre-session selection', () => {
     await waitAndClick(page, '.control-item', 'Model');
     await waitForVisibleElement(page, '.control-option');
 
-    // Haiku should be marked as current (has control-option-current class)
+    // Haiku is the checked model. A step-1 row carries the model id alone.
     const currentOption = page.locator('.control-option-current:visible').first();
     await expect(currentOption).toBeVisible({ timeout: 5_000 });
-    const currentLabel = await currentOption.locator('.control-option-label').textContent();
-    expect((currentLabel ?? '').replace(/✓/g, '').trim()).toBe('Haiku 4.5');
+    expect(await currentOption.getAttribute('data-value')).toBe('haiku');
 
     // Cleanup
     await page.keyboard.press('Escape');

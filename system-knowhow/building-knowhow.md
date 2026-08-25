@@ -5,7 +5,7 @@ description: Use when writing or updating a knowhow file (API quirks, payload sh
 
 # Building Knowhow
 
-How to write a knowhow file the engine LLM will actually find and use. The intent/knowhow/script taxonomy and frontmatter shape are in `docs/taxonomy.md` and the engine system prompt — don't restate them. The standalone-vs-app-scoped placement rule is in CLAUDE.md and `system-knowhow/best-practices.md` — apply, don't restate.
+How to write a knowhow file the engine LLM will actually find and use. The intent/knowhow/script taxonomy and frontmatter shape are in `docs/taxonomy.md` and the engine system prompt: don't restate them. The standalone-vs-app-scoped placement rule is in CLAUDE.md and `system-knowhow/best-practices.md`: apply, don't restate. The doc-vs-reference rule below is this file's own, because it changes how you write the file and not only where it sits.
 
 ## When knowhow is the right artifact
 
@@ -21,6 +21,47 @@ Knowhow captures *technical detail you'd otherwise re-derive*: API quirks, paylo
 
 If a fact is stable across users and would be the same in every workspace, it might belong in `docs/` or `system-knowhow/` instead. If it's specific to *this* workspace's setup, it's knowhow.
 
+## Where the file goes: a doc, or one doc's reference
+
+A knowhow **doc** is a file the engine lists for routing. A file below the
+listing depth is a **reference**: it belongs to the doc above it, and only that
+doc reaches it. Placement is what decides which one you wrote.
+
+| Root | Listed as docs | Anything deeper |
+|---|---|---|
+| `data/knowhow/` (and the shared `~/.lucidos/knowhow/`) | `<name>.md` and `<group>/<name>.md` | a reference |
+| `data/apps/<id>/knowhow/` | `<name>.md` | a reference |
+| `data/triggers/<slug>/knowhow/` | `<name>.md` | a reference |
+
+So a doc in a group folder is fine (`lucidos-ops/release-process`), and a file
+under an app or a trigger sits at that root. The app or the trigger is already
+the group.
+
+**Split the supporting material out when a doc has a lot of it.** A long
+endpoint table, a field-by-field payload dump, a matrix of error codes: each is
+worth keeping, and none is worth a row in every thread's routing list. Put them
+in a folder named after the doc:
+
+```
+data/knowhow/
+  lucidos-ops/
+    release-process.md        ← the doc, listed
+    release-process/
+      phase-table.md          ← a reference
+      rollback-matrix.md      ← a reference
+```
+
+**The doc pulls its own references in.** Name each one and its full id in the
+doc body, so a thread that loaded the doc knows what to call next:
+
+```markdown
+The phase-by-phase table is in `lucidos-ops/release-process/phase-table`.
+Load it with `load_knowhow` before you start a release.
+```
+
+Nothing else routes to a reference. It stays loadable by full id forever, but a
+reference no doc names is one nothing can find.
+
 ## Lifecycle: load-once-stays-loaded
 
 When the engine LLM calls `load_knowhow` on a doc, the body lives in the `[LOADED KNOWHOW]` block of every subsequent turn's user message — the LLM does **not** need to re-call `load_knowhow` for the same id later in the thread. Calling it twice for the same id is a no-op (the loaded set is keyed by id; the second insert overwrites with the same body). The engine restores the loaded set from events on restart, so the doc stays loaded across engine restarts within the same thread. There is no auto-unload and no LRU; once loaded, a knowhow doc stays loaded for the whole thread's lifetime — matching Claude Code Skills (loaded once → persists for the session) and Codex AGENTS.md (re-sent each turn via stateless conversation history).
@@ -32,7 +73,7 @@ Practical implication for knowhow authors: write the body assuming it will be in
 A new top-level knowhow file shows up in retrieval forever — confirm before adding one. Skip questions only when the user has already answered them.
 
 1. **Is this stable workspace knowledge, or a one-shot answer?** If they just need the answer once, give it in chat or save it under `artifacts/`. Knowhow is for things that should be reused across future threads.
-2. **Top-level or app-scoped?** Top-level (`data/knowhow/`) is workspace-wide. App-scoped (`data/apps/<id>/knowhow/`) is loaded only in threads that involve that app. If the file only makes sense inside one app, scope it there.
+2. **Top-level or app-scoped?** Both are listed for routing and loaded on demand with `load_knowhow`, never injected whole. What placement changes is where the doc lives and how it is addressed: app-scoped (`data/apps/<id>/knowhow/<name>.md`) answers to the id `<id>/<name>`, and a thread with that app open sees it named again in its own block. If the file only makes sense inside one app, scope it there.
 3. **What phrases would the user say when this becomes relevant?** The `description` is what the engine LLM sees in every thread — list the synonyms / keywords the user actually uses. Confirm them with the user; they know their own vocabulary better than you do.
 4. **Augment instead of fork.** If a knowhow on the topic exists, propose updating it rather than creating a new file. Confirm with the user before splitting one knowhow into two.
 
@@ -40,7 +81,7 @@ A short append to a knowhow you're already maintaining in the current task does 
 
 ## The `description` field is for retrieval, not for humans
 
-The engine LLM sees every knowhow's name + description in every thread (the body only loads when the LLM chooses to read it). It picks what to load by reading those descriptions and matching them against the user's message. Write descriptions in terms of *what the user would be saying when this becomes relevant*, not as a tagline.
+The engine LLM sees every knowhow doc's name + description in every thread (the body only loads when the LLM chooses to read it). A reference is not listed, so its description does no routing. It picks what to load by reading those descriptions and matching them against the user's message. Write descriptions in terms of *what the user would be saying when this becomes relevant*, not as a tagline.
 
 Bad:
 

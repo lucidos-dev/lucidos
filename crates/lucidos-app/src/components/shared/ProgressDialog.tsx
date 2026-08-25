@@ -33,6 +33,11 @@ export function progressDialogBody(props: {
     // becoming a Tab stop. A committed phase has no Cancel, so it has no
     // focusable control at all. Focus goes here then, leaving whatever button
     // opened the dialog.
+    //
+    // It paints no focus ring. The box is containment, not a control. The
+    // dialog also opens by itself while the user is typing, which is when
+    // Chrome carries :focus-visible into a programmatic focus. The suppression
+    // is in components.css, beside the confirm dialog's.
     <div ref={props.panelRef} class="progress-dialog-body" tabIndex={-1}>
       <h2 class="confirm-title">{title}</h2>
       <DialogMessage message={message} />

@@ -1146,11 +1146,7 @@ async fn cross_workspace_unread_total(subscriptions: &[PushSubscription]) -> Opt
 /// dev/packaged TLS mismatch still connects (`.claude/rules/rust.md`
 /// § Intra-host scheme).
 async fn ask_gateway_unread_total(gateway_port: &str) -> Option<i64> {
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
+    let client = match crate::gateway_auth::client_builder().build() {
         Ok(client) => client,
         Err(e) => {
             log!(

@@ -104,7 +104,7 @@ describe('a turn parked on an event wait', () => {
   });
 
   /** Setting the wait up is an action that COMPLETED. The thread sleeping
-   *  afterwards is the subscription indicator's business, not this row's, so
+   *  afterwards is the waiting indicator's business, not this row's, so
    *  the row must not shimmer as in-progress for however many hours the wait
    *  runs. */
   it('reads as a finished step, not an in-progress one', () => {
@@ -125,6 +125,53 @@ describe('a turn parked on an event wait', () => {
     const exchange = getExchanges(map, id)[0];
     expect(exchangeStatus(exchange, '', true)).toBe('done');
     expect(getLabel(exchange)).toBe('Done');
+  });
+
+  /** **A turn the agent worked on after arming is not parked.** A coding agent
+   *  arms its watch through a CLI call inside the turn. The call can answer
+   *  that the event already happened, or something can stand the watch down
+   *  (ADR 0059), and the agent then carries straight on.
+   *
+   *  Reading that turn as done cost the reader their follow. `scrollState` asks
+   *  the last exchange whether the thread is live, and a scroll retires a
+   *  standing follow only while it is. On the reported thread the header read
+   *  "Done ✓" over an agent 24 minutes into its work, with Stop in the prompt
+   *  row beside it. Scrolling up left the follow toggle lit. */
+  it('reads as working when the agent works on after arming the wait', () => {
+    const { map, id } = makeThread('thread-1', 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'run the suite' },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'lucidos await-event --on E2ELockReleased' }, tool_use_id: 'toolu_1' },
+      ...park.slice(2),
+      { type: 'CodingAgentToolResult', name: '', result: 'ALREADY HAPPENED, before this subscription existed.', tool_use_id: 'toolu_1' },
+      { type: 'CodingAgentTextStreamed', text: 'The lock is free, so I retry now.' },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: './scripts/e2e-api.sh' }, tool_use_id: 'toolu_2' },
+      // The suite acquiring the lock stands the agent's own watch down.
+      { type: 'EventWaitCanceled', wait_id: 'w1', cause: 'agent_stand_down', reason: REASON },
+      { type: 'CodingAgentToolCalled', name: 'TaskOutput', args: { block: true }, tool_use_id: 'toolu_3' },
+    ] as ThreadEvent[]);
+
+    const exchange = getExchanges(map, id)[0];
+    expect(exchangeStatus(exchange, '', true, false, /* threadIsCC */ true, /* threadIdle */ false))
+      .toBe('coding-agent-working');
+  });
+
+  /** The same turn, in the seconds between the CLI answering and the agent's
+   *  next call. The answer alone is the agent running again, so the park stops
+   *  speaking there rather than at the next tool call. On the reported thread
+   *  that gap was seven seconds, and it can be much longer. */
+  it('reads as working from the moment the awaiting call answers', () => {
+    const { map, id } = makeThread('thread-1', 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'run the suite' },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'lucidos await-event --on E2ELockReleased' }, tool_use_id: 'toolu_1' },
+      ...park.slice(2),
+      { type: 'CodingAgentToolResult', name: '', result: 'ALREADY HAPPENED, before this subscription existed.', tool_use_id: 'toolu_1' },
+    ] as ThreadEvent[]);
+
+    const exchange = getExchanges(map, id)[0];
+    expect(exchangeStatus(exchange, '', true, false, /* threadIsCC */ true, /* threadIdle */ false))
+      .toBe('coding-agent-working');
   });
 
   /** An attached delivery resumes THIS exchange: its steps land under the same

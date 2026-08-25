@@ -2,7 +2,11 @@
 # stage_runtime.sh — assemble the self-contained Lucidos runtime tree (the 7
 # RESOURCE_NAMES: lucidos-engine + lucidos-gateway + lucidos (CLI) + frontend +
 # relocatable PostgreSQL 18 + pgvector + sdk + system-knowhow) that both delivery
-# vehicles share:
+# vehicles share. The LIST itself lives in scripts/lib/resource_contract.sh, which
+# this file deliberately does not source: install.sh fetches this lib over the
+# network when piped, so a transitive dependency would have to be published
+# beside it. The build scripts own the contract check; this one takes named
+# resources and stages them.
 #
 #   • build-dmg.sh        (macOS) stages into bundle-resources/, wraps it in a
 #                         .app via `cargo tauri build`, codesigns, notarizes.
@@ -176,13 +180,23 @@ stage_runtime_fetch_postgres() {
 
 # ── assemble (offline — unit-tested with fake inputs) ────────────────────────
 
-# stage_runtime_assemble <stage-dir> <engine-bin> <gateway-bin> <cli-bin> \
-#                        <frontend-dist> <pg-prefix> <sdk-dist> <system-knowhow-dir>
-# Assemble the 7-resource self-contained runtime tree into a CLEAN <stage-dir>:
-#   lucidos-engine, lucidos-gateway, lucidos, frontend/, postgres/, sdk/,
-#   system-knowhow/.
-# Pure cp/chmod over already-built inputs (no network/toolchain), so the unit test
-# drives it with fakes. Prints <stage-dir> on success. Mirrors build-dmg.sh's step 4.
+# stage_runtime_assemble <stage-dir> <name>=<path> ...
+# Assemble the self-contained runtime tree into a CLEAN <stage-dir>, one entry
+# per named resource. Pure cp/chmod over already-built inputs (no
+# network/toolchain), so the unit test drives it with fakes. Prints <stage-dir>
+# on success. Mirrors build-dmg.sh's step 4.
+#
+# NAMED, not positional. It used to take eight ordered paths, so adding a
+# resource meant a new argument in the middle of two call sites and swapping any
+# two of the same kind staged a tree that looked fine. The name is the
+# destination, so a caller cannot be wrong about which input is which, and a
+# missing one is a missing NAME rather than a shifted list.
+#
+# What each entry is kept honest by the resource contract, not by this function:
+# scripts/lib/resource_contract.sh owns the set, and its
+# resource_contract_assert_staged reads the tree this writes. A directory input
+# is copied recursively; an executable file is copied and chmod +x'd. Anything
+# else is refused rather than guessed at.
 #
 # `lucidos` (the CLI) is load-bearing, not optional: the engine resolves it as a
 # sibling of `lucidos-engine` (find_lucidos_cli_dir) to launch the Claude Code
@@ -195,31 +209,51 @@ stage_runtime_fetch_postgres() {
 # desktop/gateway launcher + install service to <resources>/system-knowhow);
 # omitting it silently degrades every packaged install to no reference docs.
 stage_runtime_assemble() {
-    local stage="$1" engine="$2" gateway="$3" cli="$4" frontend="$5" pg_prefix="$6" sdk="$7" system_knowhow="$8"
-    [ -x "$engine" ]    || { echo "ERROR: engine binary not found/executable: $engine" >&2; return 1; }
-    [ -x "$gateway" ]   || { echo "ERROR: gateway binary not found/executable: $gateway" >&2; return 1; }
-    [ -x "$cli" ]       || { echo "ERROR: lucidos CLI binary not found/executable: $cli" >&2; return 1; }
-    [ -d "$frontend" ]  || { echo "ERROR: frontend dist not found: $frontend" >&2; return 1; }
-    [ -d "$pg_prefix" ] || { echo "ERROR: postgres prefix not found: $pg_prefix" >&2; return 1; }
-    [ -d "$sdk" ]       || { echo "ERROR: sdk dist not found: $sdk" >&2; return 1; }
-    [ -d "$system_knowhow" ] || { echo "ERROR: system-knowhow dir not found: $system_knowhow" >&2; return 1; }
+    local stage="$1"; shift
+    [ -n "$stage" ] || { echo "ERROR: stage_runtime_assemble needs a stage dir" >&2; return 1; }
+    [ "$#" -ge 1 ] || { echo "ERROR: stage_runtime_assemble needs at least one <name>=<path>" >&2; return 1; }
+
+    # Validate EVERY entry before touching the stage. The first act below is an
+    # `rm -rf`, so a refusal halfway through would leave the caller with no tree
+    # at all and no way to tell that from a fresh checkout.
+    local entry name path seen=""
+    for entry in "$@"; do
+        case "$entry" in
+            *=*) ;;
+            *) echo "ERROR: stage_runtime_assemble expects <name>=<path>, got '$entry'" >&2; return 1 ;;
+        esac
+        name="${entry%%=*}"
+        path="${entry#*=}"
+        [ -n "$name" ] || { echo "ERROR: empty resource name in '$entry'" >&2; return 1; }
+        case " $seen " in
+            *" $name "*) echo "ERROR: resource '$name' given twice" >&2; return 1 ;;
+        esac
+        seen="$seen $name"
+        if [ -d "$path" ]; then
+            continue
+        elif [ -f "$path" ] && [ -x "$path" ]; then
+            continue
+        elif [ -e "$path" ]; then
+            echo "ERROR: resource '$name' is neither a directory nor an executable: $path" >&2
+            return 1
+        else
+            echo "ERROR: resource '$name' not found: $path" >&2
+            return 1
+        fi
+    done
 
     rm -rf "$stage" || return 1
     mkdir -p "$stage" || return 1
-    cp "$engine" "$stage/lucidos-engine"   || return 1
-    cp "$gateway" "$stage/lucidos-gateway" || return 1
-    # The `lucidos` CLI — sibling of the engine so find_lucidos_cli_dir resolves
-    # it for the CC permission MCP server, the lucidos-cli skill, and script PATH.
-    cp "$cli" "$stage/lucidos"             || return 1
-    chmod +x "$stage/lucidos-engine" "$stage/lucidos-gateway" "$stage/lucidos" || return 1
-    cp -R "$frontend" "$stage/frontend"    || return 1
-    cp -R "$pg_prefix" "$stage/postgres"   || return 1
-    # The JS SDK (/api/v1/sdk.js) used by app-UI iframes; the engine finds it via
-    # LUCIDOS_SDK_DIR (set by the desktop/gateway launcher to <resources>/sdk).
-    cp -R "$sdk" "$stage/sdk"              || return 1
-    # The engine-shipped reference knowhow, resolved at runtime via
-    # LUCIDOS_SYSTEM_KNOWHOW_DIR (→ <resources>/system-knowhow).
-    cp -R "$system_knowhow" "$stage/system-knowhow" || return 1
+    for entry in "$@"; do
+        name="${entry%%=*}"
+        path="${entry#*=}"
+        if [ -d "$path" ]; then
+            cp -R "$path" "$stage/$name" || return 1
+        else
+            cp "$path" "$stage/$name" || return 1
+            chmod +x "$stage/$name" || return 1
+        fi
+    done
 
     printf '%s\n' "$stage"
 }

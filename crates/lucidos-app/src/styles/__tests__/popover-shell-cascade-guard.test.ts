@@ -1,12 +1,12 @@
 /**
  * The prompt-bar popover shell must load BEFORE the surfaces that override it.
  *
- * `.prompt-bar-popover` and a surface class (`.event-wait-panel`,
+ * `.prompt-bar-popover` and a surface class (`.waiting-panel`,
  * `.todo-panel`) land on the SAME element, one via `panelClass`, at the same
  * specificity (one class each). Nothing but source order decides which
  * `max-width` wins. While the shell lived inside `todo-list.css` it therefore
- * beat every rule in `event-waits.css`, which `chat.css` imports first: the
- * subscription panel's `max-width: min(26rem, fit)` lost to the shell's bare
+ * beat every rule in `waiting-indicator.css`, which `chat.css` imports first: the
+ * waiting panel's `max-width: min(26rem, fit)` lost to the shell's bare
  * fit cap and the panel grew to the full viewport width, running out of the
  * thread pane and leaving its description on one unbroken line. `.todo-panel`
  * hid the bug, being declared after the shell inside one file.

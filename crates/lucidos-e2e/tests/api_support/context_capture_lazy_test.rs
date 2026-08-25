@@ -19,6 +19,11 @@ use uuid::Uuid;
 
 /// Seed a chat thread + a ContextCaptured event with real `sections` and
 /// `tools` arrays. Returns `(thread_id, event_id)`.
+///
+/// The sections are written in the PRE-RENAME shape, spelling a section's
+/// budget delta `char_count`. That is what months of stored rows look like.
+/// The read paths serve them verbatim. So this fixture is what proves an old
+/// capture still reaches the Context Viewer with a size it can read.
 async fn seed_thread_with_capture(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
     let thread_id = Uuid::new_v4();
     let event_id = Uuid::new_v4();
@@ -137,13 +142,26 @@ async fn context_endpoint_returns_full_sections_and_tools() {
     let sections = body["sections"].as_array().expect("sections array");
     assert_eq!(sections.len(), 2);
     assert_eq!(sections[0]["name"], "system");
-    assert_eq!(sections[0]["char_count"], 12_345);
+    // The stored key was `char_count`, and the endpoint serves sections
+    // verbatim, so nothing but the boundary rename puts it where the viewer
+    // reads it.
+    assert_eq!(sections[0]["budget_delta_chars"], 12_345);
+    assert!(
+        sections[0].get("char_count").is_none(),
+        "the old key must not reach the client: {}",
+        sections[0]
+    );
+    assert!(
+        sections[0].get("content_chars").is_none(),
+        "nobody measured the region when this row was written"
+    );
     assert_eq!(
         sections[0]["content"].as_str().map(|s| s.len()),
         Some(12_345),
         "full section body returned"
     );
     assert_eq!(sections[1]["name"], "history");
+    assert_eq!(sections[1]["budget_delta_chars"], 4_321);
     assert_eq!(sections[1]["role"], "prior_message");
 
     let tools = body["tools"].as_array().expect("tools array");
@@ -235,4 +253,59 @@ async fn snapshot_include_context_true_preserves_sections() {
         payload.get("sections_stripped").is_none(),
         "include_context=true must NOT stamp sections_stripped, got: {payload}"
     );
+    // Same boundary rename as the lazy fetch. A bug-report dump that spelled
+    // the size two ways depending on when the row was written is a dump
+    // nobody can read with one query.
+    assert_eq!(payload["sections"][0]["budget_delta_chars"], 12_345);
+    assert!(payload["sections"][0].get("char_count").is_none());
+}
+
+/// A capture written today passes through untouched, both keys intact.
+#[tokio::test]
+async fn context_endpoint_serves_both_sizes_of_a_current_capture() {
+    let pool = pool().await;
+    let thread_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+    let marker = unique_marker("api-context-capture-current");
+    seed_chat_thread_summary(&pool, thread_id, "idle").await;
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, created, aggregate_id, aggregate, thread_id) \
+         VALUES ($1, 'ContextCaptured', $2, NOW(), $3::text, 'thread', $3)",
+    )
+    .bind(event_id)
+    .bind(serde_json::json!({
+        "producer": "main_llm",
+        "model": format!("claude-opus-4-7 {marker}"),
+        "context_window": 200_000,
+        "sections": [
+            { "name": "System Instructions", "budget_delta_chars": 900, "content_chars": 900, "role": "system" },
+            { "name": "Conversation", "budget_delta_chars": 600, "content_chars": 645_368, "role": "user" },
+        ],
+        "tools": [],
+        "estimated_total_tokens": 600,
+        "trimmed": false,
+    }))
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("seed ContextCaptured");
+
+    let client = http_client();
+    let url = format!("{}/api/v1/events/{}/context", base_url(), event_id);
+    let body: Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("context request failed")
+        .json()
+        .await
+        .expect("invalid JSON");
+
+    let sections = body["sections"].as_array().expect("sections array");
+    assert_eq!(sections[0]["budget_delta_chars"], 900);
+    assert_eq!(sections[0]["content_chars"], 900);
+    // The one row where the two part. The delta is what the loop added; the
+    // region is the whole message array.
+    assert_eq!(sections[1]["budget_delta_chars"], 600);
+    assert_eq!(sections[1]["content_chars"], 645_368);
 }

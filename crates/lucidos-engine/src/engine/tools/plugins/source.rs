@@ -205,6 +205,64 @@ pub(crate) fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
 /// Atomic-per-file copy: write to `<dest>.tmp` then rename. Caller is
 /// responsible for ensuring the parent dir exists.
 pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
+    write_via_tmp(dst, |tmp| {
+        std::fs::copy(src, tmp)
+            .map(|_| ())
+            .map_err(|e| format!("copy {:?} to {:?}: {}", src, tmp, e))
+    })
+}
+
+/// [`copy_atomic`] for bytes the caller already holds. The merge path writes
+/// the merged content this way, since there is no source file to copy from.
+pub(crate) fn write_atomic(bytes: &[u8], dst: &Path) -> Result<(), String> {
+    write_via_tmp(dst, |tmp| {
+        std::fs::write(tmp, bytes).map_err(|e| format!("write {:?}: {}", tmp, e))
+    })
+}
+
+/// [`write_atomic`], then take the file mode from `mode_of`.
+///
+/// A merged file replaces one the plugin shipped, so it must end up with the
+/// mode a plain install would have given it. `copy_atomic` gets that free
+/// (`std::fs::copy` carries the source's permission bits), but `std::fs::write`
+/// creates a fresh file at the default mode. Without this, updating an
+/// executable plugin script silently drops its executable bit, and only for the
+/// files that merged cleanly.
+pub(crate) fn write_atomic_like(bytes: &[u8], dst: &Path, mode_of: &Path) -> Result<(), String> {
+    write_via_tmp(dst, |tmp| {
+        std::fs::write(tmp, bytes).map_err(|e| format!("write {:?}: {}", tmp, e))?;
+        let Ok(meta) = std::fs::metadata(mode_of) else {
+            // Shipped file unreadable: the copy path would have failed already,
+            // so the default mode is the least surprising outcome here.
+            return Ok(());
+        };
+        // Set on the temp file, so the rename publishes content and mode
+        // together and no reader sees one without the other.
+        std::fs::set_permissions(tmp, meta.permissions())
+            .map_err(|e| format!("set mode on {:?}: {}", tmp, e))
+    })
+}
+
+/// The git file mode for `path`: `0o100755` when its owner-execute bit is set,
+/// `0o100644` otherwise. Git records only those two for a regular file.
+pub(crate) fn git_file_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o100 != 0)
+            .unwrap_or(false);
+        if executable {
+            return 0o100755;
+        }
+    }
+    0o100644
+}
+
+/// Fill a uniquely-named sibling of `dst`, then rename it over `dst`. A rename
+/// within one directory is atomic, so a reader sees the old file or the new
+/// one, never a half-written one.
+fn write_via_tmp(dst: &Path, fill: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {:?}: {}", parent, e))?;
     }
@@ -213,7 +271,7 @@ pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
         dst.extension().and_then(|s| s.to_str()).unwrap_or("plugin"),
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::copy(src, &tmp).map_err(|e| format!("copy {:?} → {:?}: {}", src, tmp, e))?;
-    std::fs::rename(&tmp, dst).map_err(|e| format!("rename {:?} → {:?}: {}", tmp, dst, e))?;
+    fill(&tmp)?;
+    std::fs::rename(&tmp, dst).map_err(|e| format!("rename {:?} to {:?}: {}", tmp, dst, e))?;
     Ok(())
 }

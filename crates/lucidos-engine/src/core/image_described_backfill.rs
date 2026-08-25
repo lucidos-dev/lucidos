@@ -188,6 +188,7 @@ async fn backfill_with_batch_size(
                         // creation time wasn't recorded. Default to NOW() —
                         // sequence ordering preserves causality regardless.
                         created: None,
+                        broadcast: true,
                     })
                     .await?;
                 if inserted.is_some() {

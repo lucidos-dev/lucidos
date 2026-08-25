@@ -1,4 +1,9 @@
 import { updateAvailable, engineBuilding, engineBuildDetail, engineNewVersionReady, engineVersionPending, engineRebuildWedged, embeddingModelStatus, tailscaleServeRun } from '../../store/store';
+import { crossWorkspaceUnreadTotal } from '../../store/actions/app-badge';
+// One cap for both header counts, so the mark and the menu rows cannot start
+// eliding at different numbers. Each site's own box is its own business; the
+// number at which a count stops being spelled out is shared.
+import { countLabel } from './NotificationsMenuRows';
 import { backgroundActivities, type BackgroundActivity } from '../../store/backgroundActivity';
 import { openBackgroundActivityToast } from '../../store/actions/backgroundActivity';
 import { openEngineVersionToast } from '../../store/actions/engine-update';
@@ -71,6 +76,44 @@ export function brandBadgeTooltip(activities: BackgroundActivity[]): string | un
  *  `brandBadgeTooltip`, whose doc comment holds the rule. */
 function hasToastDetail(activities: BackgroundActivity[]): boolean {
   return activities.some((a) => !!(a.detail || a.note || a.action || a.secondaryAction));
+}
+
+/** The unread count in words, or `null` when there is nothing to say.
+ *
+ *  Lives here with the badge, but is spoken by the MARK: see
+ *  {@link UnreadBrandBadge} for why the badge itself is silent. */
+export function unreadBadgeLabel(count: number): string | null {
+  if (count <= 0) return null;
+  return count === 1 ? '1 unread notification' : `${count} unread notifications`;
+}
+
+/** The unread count on the mark, and the ONLY in-app mirror of the app-icon
+ *  badge. Both read `crossWorkspaceUnreadTotal`, so they cannot show different
+ *  numbers.
+ *
+ *  It rides the mark rather than the bell because the bell is not on every
+ *  pane: `ContentHeaderActions` owns it, so the thread pane and the threads
+ *  drawer carried no count at all. The mark is on all three.
+ *
+ *  It sits at the mark's BOTTOM-right corner, not the top-right the bell and
+ *  the filter button use for a count. The artwork puts its sparkle top-right,
+ *  and a resident badge there leaves the brand as three plain squares. The
+ *  state badge above covers it only while something is happening.
+ *
+ *  PURELY VISUAL, and that is why it carries neither a tooltip nor a name. It
+ *  is `pointer-events: none` in CSS, so the tap and the hover both belong to
+ *  the mark underneath. A `data-tooltip` here could never fire: `useTooltip`
+ *  resolves its target by walking UP from the hovered element, and this badge
+ *  is never that element. The mark speaks the count instead, through
+ *  {@link unreadBadgeLabel} in its own label and tooltip. */
+export function UnreadBrandBadge() {
+  const count = crossWorkspaceUnreadTotal.value;
+  if (count <= 0) return null;
+  return (
+    <span class="badge brand-unread-badge" aria-hidden="true">
+      {countLabel(count)}
+    </span>
+  );
 }
 
 /** The brand badge shared by the desktop brand label and the mobile mark.

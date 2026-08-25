@@ -1575,7 +1575,7 @@ jobs:
             rc_attempt=0
             while [ "$served_version" != "$rc_version" ]; do
               if [ "$(date +%s)" -ge "$rc_deadline" ]; then
-                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. Last read: $served_version. Expected: $rc_version."
+                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. THIS VERDICT IS PER-POP: the other front-door legs fetch the same origin from their own Cloudflare POPs and report independently, so legs quoting the SAME last-read value are one propagation fault reported several times rather than several faults. Last read: $served_version. Expected: $rc_version."
                 exit 1
               fi
               sleep "$FD_RC_VERSION_POLL_SECS"
@@ -1597,7 +1597,7 @@ jobs:
               echo "    re-read $rc_attempt at $(( $(date +%s) - rc_started ))s: this POP now serves $served_version (want $rc_version)"
             done
             if [ "$rc_attempt" -gt 0 ]; then
-              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from a single vantage point. Recorded here so the run does not read as a clean first-try pass."
+              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from ONE POP (it does confirm both the edge and the origin, but Cloudflare anycast gives that Mac no route to another POP). Expect sibling legs to report their own POPs separately. Recorded here so the run does not read as a clean first-try pass."
             fi
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi
@@ -2840,7 +2840,7 @@ jobs:
             rc_attempt=0
             while [ "$served_version" != "$rc_version" ]; do
               if [ "$(date +%s)" -ge "$rc_deadline" ]; then
-                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. Last read: $served_version. Expected: $rc_version."
+                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. THIS VERDICT IS PER-POP: the other front-door legs fetch the same origin from their own Cloudflare POPs and report independently, so legs quoting the SAME last-read value are one propagation fault reported several times rather than several faults. Last read: $served_version. Expected: $rc_version."
                 exit 1
               fi
               sleep "$FD_RC_VERSION_POLL_SECS"
@@ -2858,7 +2858,7 @@ jobs:
               echo "    re-read $rc_attempt at $(( $(date +%s) - rc_started ))s: this POP now serves $served_version (want $rc_version)"
             done
             if [ "$rc_attempt" -gt 0 ]; then
-              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from a single vantage point. Recorded here so the run does not read as a clean first-try pass."
+              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from ONE POP (it does confirm both the edge and the origin, but Cloudflare anycast gives that Mac no route to another POP). Expect sibling legs to report their own POPs separately. Recorded here so the run does not read as a clean first-try pass."
             fi
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi

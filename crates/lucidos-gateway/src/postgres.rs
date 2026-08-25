@@ -176,7 +176,9 @@ impl From<BoxError> for ProvisionError {
 /// A handle to a provisioned workspace database, used on workspace delete.
 #[derive(Clone, Debug)]
 pub enum PgHandle {
-    /// No database was provisioned. Used only for failed/unstarted stacks.
+    /// The gateway provisioned no database here. Three cases: a stack whose
+    /// provisioning failed, one that never started, and an adopted external
+    /// engine, whose database came from whoever launched it.
     External,
     Docker {
         container: String,

@@ -8,6 +8,7 @@ import {
 } from '../../store/actions/backgroundActivity';
 import { isTauri, isIOS, isAndroid, isStandalone } from '../../utils/platform';
 import { openExternalUrl } from '../../utils/openExternalUrl';
+import { copyToClipboard } from '../../utils/clipboard';
 import {
   getConnectInfo,
   tailscaleUp,
@@ -19,12 +20,15 @@ import {
 import { getNetworkConfig, getTailnetStatus } from '../../api/client';
 import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
 import { Explainer } from '../shared/Explainer';
+import { AddDeviceSection } from './AddDeviceSection';
+import type { PairTarget } from './AddDeviceSection';
 import type { NetworkConfigResponse, TailnetStatusResponse } from '../../api/types';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { openSettingsSubview } from '../../store/actions/menu';
 
 const TAILSCALE_DOWNLOAD_URL = 'https://tailscale.com/download';
 const TAILSCALE_IOS_URL = 'https://apps.apple.com/app/tailscale/id1470499037';
@@ -207,27 +211,78 @@ export type ConnectUrlRow = { label: string; url: string; hint: string };
  *  dead copyable URL is the bug this page was built around. It prefers the
  *  MagicDNS name, which resolves to that same address for any device on the
  *  tailnet and is what a person can retype. */
-export function tailnetConnectRows(input: {
-  scope: string;
+export function tailnetConnectRows(input: TailnetInput & { scope: string }): ConnectUrlRow[] {
+  if (input.workspaceServeUrl) {
+    // Always HTTPS: the engine builds this one, and only from `https://`.
+    // Printed verbatim, never rebuilt from `tailnetOrigin` plus the scope: the
+    // engine verified this exact string, and reassembling it lets the two
+    // disagree about it.
+    return [{ label: 'Tailscale', url: input.workspaceServeUrl, hint: tailnetHint(true) }];
+  }
+  const origin = tailnetOrigin(input);
+  if (origin === null) return [];
+  return [
+    {
+      label: 'Tailscale',
+      url: workspaceUrlAt(origin, input.scope),
+      hint: tailnetHint(origin.startsWith('https:')),
+    },
+  ];
+}
+
+/** What it takes to know whether a tailnet address reaches this machine, and
+ *  which name to use for it. Shared by the two consumers below. */
+export interface TailnetInput {
   here: { protocol: string; hostname: string; port: string };
   tailnetIp: string | null;
   magicDnsName: string | null;
   workspaceServeUrl: string | null;
   bind: string;
-}): ConnectUrlRow[] {
-  if (input.workspaceServeUrl) {
-    // Always HTTPS: the engine builds this one, and only from `https://`.
-    return [{ label: 'Tailscale', url: input.workspaceServeUrl, hint: tailnetHint(true) }];
-  }
+}
+
+/** Pure: the tailnet ORIGIN that reaches this machine, or `null` for none.
+ *
+ *  The host half of {@link tailnetConnectRows}, lifted out so a second
+ *  consumer cannot grow its own copy of the rule. Connect URLs adds this
+ *  workspace's path to it; the pairing QR adds the picker's. They must not
+ *  disagree about which host is reachable.
+ *
+ *  A verified serve URL wins, and contributes its origin. That is a prefix of
+ *  the string the engine verified rather than a reassembly of it, so the
+ *  verbatim rule above survives. Otherwise the plain-HTTP address counts only
+ *  while something is listening on it, and prefers the MagicDNS name, which is
+ *  what a person can retype. */
+export function tailnetOrigin(input: TailnetInput): string | null {
+  if (input.workspaceServeUrl) return originOf(input.workspaceServeUrl);
   const ip = input.tailnetIp;
-  if (!ip || !tailnetServesThisReader(input.bind, ip, input.here.hostname)) return [];
-  return [
-    {
-      label: 'Tailscale',
-      url: workspaceUrlAt(originAtHost(input.here, input.magicDnsName ?? ip), input.scope),
-      hint: tailnetHint(input.here.protocol === 'https:'),
-    },
-  ];
+  if (!ip || !tailnetServesThisReader(input.bind, ip, input.here.hostname)) return null;
+  return originAtHost(input.here, input.magicDnsName ?? ip);
+}
+
+/** Pure: the scheme-host-port of an absolute URL, or `null` if it is not one.
+ *  Hand-parsed nothing: `URL` is the one thing that agrees with the browser
+ *  about what an origin is. */
+function originOf(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Pure: the origin to send a NEW device to, so it can pair.
+ *
+ *  Tailscale first, then the LAN, then nothing. Both branches answer with an
+ *  address some other device can open, which is the whole difficulty: the
+ *  machine minting a pairing code is usually reading this page over loopback,
+ *  and a QR pointing at `127.0.0.1` helps nobody.
+ *
+ *  `lan` is whatever the Local network row resolved to. It reaches here on the
+ *  packaged desktop app alone, since detecting a LAN address needs the bridge.
+ *  `null` is a real answer: the section then shows the code by itself, for a
+ *  device that already knows an address. */
+export function pairingOrigin(input: TailnetInput & { lan: LanRowState | null }): string | null {
+  return tailnetOrigin(input) ?? (input.lan?.kind === 'url' ? input.lan.url : null);
 }
 
 /** The sentence under a tailnet URL, by what that address can actually do.
@@ -440,12 +495,7 @@ export function deviceSetupState(device: {
 
 /** A connect URL with a copy-to-clipboard button. */
 function UrlRow({ label, url, hint }: { label: string; url: string; hint?: string }) {
-  const copy = useCallback(() => {
-    navigator.clipboard.writeText(url).then(
-      () => showToast('Copied to clipboard', 'success'),
-      () => showToast('Failed to copy', 'error'),
-    );
-  }, [url]);
+  const copy = useCallback(() => copyToClipboard(url), [url]);
   return (
     <div class="list-row">
       <div class="list-row-info">
@@ -754,6 +804,53 @@ export function MobileAccessPage() {
     host.kind === 'on-tailnet' &&
     tailnetAddressIsServed(bind, host.ip, window.location.hostname);
 
+  // `null`, not `{kind:'none'}`: off the bridge we cannot see this machine's
+  // interfaces at all, and "No LAN address detected" would be a finding we
+  // never made. Computed here rather than inside Connect URLs, because the
+  // pairing QR falls back to the same address.
+  const lan: LanRowState | null =
+    connectInfo.status === 'loaded' && netConfig.status === 'loaded'
+      ? lanRowAvoidingTailnet(
+        netConfig.data.gateway_bind,
+        connectInfo.data.lan_ip,
+        connectInfo.data.tailscale.tailnet_ip,
+        connectInfo.data.port,
+        )
+      : null;
+  // Served under `/<slug>/`, so `/~/…` reaches the gateway rather than the
+  // engine. Same rule, and the same reasoning, as `WorkspaceSwitcher`'s
+  // `canList`.
+  const gatewayIsOurOrigin = WORKSPACE_ID !== null;
+  // The first read that failed, or null. Connect URLs renders it, and Add a
+  // device uses it to say "could not work out an address" instead of "there
+  // is none". Those are different claims and only one of them is supportable.
+  const connectReadsError =
+    netConfig.status === 'failed' ? netConfig.error
+    : tailnetStatus.status === 'failed' ? tailnetStatus.error
+    : showMachineHalf && connectInfo.status === 'failed' ? connectInfo.error
+    : null;
+
+  /** Where a NEW device should point.
+   *
+   *  `pairingOrigin` shares `tailnetOrigin` with the Connect URLs row, so the
+   *  QR and that row cannot name different hosts. Off the gateway it answers
+   *  `none`: the section is hidden behind `canMint` there anyway, and
+   *  `location.port` would be the engine's, which builds a dead address. */
+  function pairTarget(): PairTarget {
+    if (!gatewayIsOurOrigin) return { kind: 'none' };
+    if (connectReadsError !== null) return { kind: 'unknown' };
+    if (!connectUrlsReady || tailnetStatus.status !== 'loaded') return { kind: 'resolving' };
+    const url = pairingOrigin({
+      here: window.location,
+      tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
+      magicDnsName: tailnetStatus.data.magic_dns_name,
+      workspaceServeUrl: tailnetStatus.data.workspace_serve_url,
+      bind,
+      lan,
+    });
+    return url === null ? { kind: 'none' } : { kind: 'origin', url };
+  }
+
   const reload = useCallback(() => {
     // Fetched on EVERY platform: this is the only reading of concern 1 a
     // browser has, and it is also what proves a remote device is on the tailnet
@@ -874,13 +971,8 @@ export function MobileAccessPage() {
         {body}
       </div>
     );
-    const failure =
-      netConfig.status === 'failed' ? netConfig.error
-      : tailnetStatus.status === 'failed' ? tailnetStatus.error
-      : showMachineHalf && connectInfo.status === 'failed' ? connectInfo.error
-      : null;
-    if (failure !== null) {
-      return shell(<LoadableError noun="connect info" error={failure} />);
+    if (connectReadsError !== null) {
+      return shell(<LoadableError noun="connect info" error={connectReadsError} />);
     }
     // `connectUrlsReady` is the whole condition. The two status checks beside
     // it are what narrows the types below, which it cannot do from up there.
@@ -897,7 +989,7 @@ export function MobileAccessPage() {
       tailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
       magicDnsName: tailnet.magic_dns_name,
       workspaceServeUrl: tailnet.workspace_serve_url,
-      bind: servingBind(netConfig.data, WORKSPACE_ID !== null),
+      bind,
     });
     // Nothing honest to list. Says so rather than rendering a bare heading, and
     // rather than vanishing: the anchor is a search destination, so an absent
@@ -910,17 +1002,6 @@ export function MobileAccessPage() {
         </div>,
       );
     }
-    // `null`, not `{kind:'none'}`: off the bridge we cannot see this machine's
-    // interfaces at all, and "No LAN address detected" would be a finding we
-    // never made.
-    const lan: LanRowState | null = connect
-      ? lanRowAvoidingTailnet(
-        netConfig.data.gateway_bind,
-        connect.lan_ip,
-        connect.tailscale.tailnet_ip,
-        connect.port,
-        )
-      : null;
     return shell(
       <div class="list-rows">
         {connect && (
@@ -1086,6 +1167,26 @@ export function MobileAccessPage() {
   return (
     <>
       {connectUrlsSection()}
+
+      {/* Directly under the addresses, because it is what you DO with one:
+          Connect URLs says where the other device should point, and this
+          gets that device let in. */}
+      <AddDeviceSection canMint={gatewayIsOurOrigin} target={pairTarget()} />
+
+      {/* Directly under Add a device, because adding one and un-adding one are
+          the same question asked twice. The LIST moved to Settings -> Devices,
+          where each device's push and preferences already were, but this line
+          has to stay: browsing is how people find Revoke, and a search hit only
+          helps somebody who already knows the word. */}
+      <div class="settings-section">
+        <p class="settings-section-desc">
+          Devices already paired are listed under{' '}
+          <button class="accent-link" onClick={() => openSettingsSubview('devices')}>
+            Settings → Devices
+          </button>
+          , where you can revoke one.
+        </p>
+      </div>
 
       {/* The one static paragraph on this page, so the one thing behind an
           explainer. Everything else here is a `state.kind` branch of the setup

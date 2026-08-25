@@ -59,10 +59,7 @@ async fn install_app_fixture(scratch: &Path, bus: &dyn EventBusEmitter) {
         scratch,
         bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install app fixture must succeed");
@@ -181,10 +178,7 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
             &scratch,
             &bus,
             &unpacked,
-            SourceType::Archive,
-            false,
-            None,
-            None,
+            InstallContext::plain(SourceType::Archive, false),
         )
         .await
         .expect("install must succeed");
@@ -668,10 +662,10 @@ async fn installed_summary_surfaces_setup_thread_and_app_id() {
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        Some(setup_tid),
+        InstallContext {
+            setup_thread_id: Some(setup_tid),
+            ..InstallContext::plain(SourceType::Archive, false)
+        },
     )
     .await
     .expect("install with a setup thread must succeed");

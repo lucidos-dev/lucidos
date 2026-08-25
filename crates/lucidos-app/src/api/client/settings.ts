@@ -1,4 +1,4 @@
-import { API, json, text } from './_core';
+import { API, ApiError, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type {
   AuthType,
@@ -157,10 +157,40 @@ export function deleteCredentialApi(
   });
 }
 
-export function getCredentialValue(
+/** A credential's plaintext, for the Copy buttons and the edit form's prefill.
+ *
+ *  Two steps: mint a one-shot reveal token for this row, then spend it. The
+ *  token lives 30 seconds and dies on use, so the plaintext is never one bare
+ *  GET away. See ADR 0117 for what that does and does not close.
+ *
+ *  Retried once on a 403, because a spent token is a state only this function
+ *  can recover from. The service worker re-issues a `GET` whose response was
+ *  lost (`fetchWithRetry` in `public/sw.js`), and the server already redeemed
+ *  the token on the attempt that vanished. So the retry that exists to rescue a
+ *  flaky connection would otherwise turn one into a hard failure. Re-minting is
+ *  exactly what a second click would do. */
+export async function getCredentialValue(
   id: string
 ): Promise<{ auth_type: string; auth_value: string }> {
-  return json(`${API}/credential-value?id=${encodeURIComponent(id)}`);
+  try {
+    return await revealCredentialOnce(id);
+  } catch (err) {
+    if (err instanceof ApiError && err.httpCode === 403) return revealCredentialOnce(id);
+    throw err;
+  }
+}
+
+/** One mint-then-spend round trip. */
+async function revealCredentialOnce(
+  id: string
+): Promise<{ auth_type: string; auth_value: string }> {
+  const { token } = await json<{ token: string; expires_in_secs: number }>(
+    `${API}/credential-reveal-token?id=${encodeURIComponent(id)}`,
+    { method: 'POST' }
+  );
+  return json(
+    `${API}/credential-value?id=${encodeURIComponent(id)}&token=${encodeURIComponent(token)}`
+  );
 }
 
 export function getEmailAccount(name: string): Promise<EmailAccountInfo> {
@@ -218,6 +248,37 @@ export function registerDevice(deviceId: string, userAgent: string): Promise<Api
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ device_id: deviceId, user_agent: userAgent }),
+  });
+}
+
+/** What the engine did with a hand-over claim. Every value is an ordinary
+ *  answer: `already-done` and `no-such-device` both mean "stop asking". */
+export type HandOverOutcome = 'moved' | 'already-done' | 'no-such-device';
+
+/**
+ * Move this device's row from the id it used to report to the one it reports
+ * now, keeping its push subscription and its device-scoped preferences.
+ *
+ * Called once, early in boot, and only when the two differ. See
+ * `docs/plans/2026-08-22-one-device-identity-minted-at-the-gateway.md`.
+ *
+ * **It asserts the id being adopted, overriding the default stamp.** This is
+ * the one request whose subject is a change of identity, and `localStorage`
+ * still holds the OLD id here by design: nothing is written until the row has
+ * moved. `fetchWithDefaults` would therefore claim the identity being left.
+ * The engine refuses that (`foreign_hand_over` in `api/settings.rs`) whenever
+ * the gateway is not the one asserting the header. Behind an up-to-date
+ * gateway this value is replaced by the authenticated id, which is the same
+ * id. `docs/plans/2026-08-22-device-hand-over-must-not-need-a-fresh-gateway.md`
+ */
+export function handOverDevice(
+  oldDeviceId: string,
+  deviceId: string,
+): Promise<ApiResult & { outcome?: HandOverOutcome }> {
+  return json(`${API}/devices/hand-over`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-lucidos-device-id': deviceId },
+    body: JSON.stringify({ old_device_id: oldDeviceId, device_id: deviceId }),
   });
 }
 

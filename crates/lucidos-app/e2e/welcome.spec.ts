@@ -1,6 +1,22 @@
-import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, assertUserMessagesVisible, waitForVisibleInput } from './helpers';
+import { test, expect, Locator, Page } from './fixtures';
+import { navigateToApp, assertHealthy, assertUserMessagesVisible, waitForVisibleInput, isMobileViewport } from './helpers';
 import { clearAllThreads, resetWelcomePreference } from './db-helpers';
+
+/** Press the setup-interview button the way the running device would.
+ *
+ *  A touch project TAPS. `composeHandlers` (promptFocus.ts) runs the action on
+ *  `touchend`, the gesture a phone actually produces, and the only one that
+ *  survives a reflow mid-press.
+ *
+ *  A mouse press does not survive it. Pressing the button blurs the composer,
+ *  the composer resizes, and at a phone width the welcome below it moves before
+ *  the browser synthesizes the `click`. That press lands on `.thread-content`,
+ *  so the button never fires. Desktop has no touch, so `tap()` would throw and
+ *  the mouse path is the real one there. */
+async function pressInterview(page: Page, button: Locator): Promise<void> {
+  if (isMobileViewport(page)) await button.tap();
+  else await button.click();
+}
 
 /**
  * Welcome surface: show until dismissed, its one action (the setup interview),
@@ -70,7 +86,7 @@ test.describe('Welcome surface', () => {
     // It SENDS rather than prefilling (startSetupInterview), so the interview
     // starts on one gesture: the seeded sentence lands in the transcript as a
     // user message and the prompt is left empty.
-    await start.click();
+    await pressInterview(page, start);
     await assertUserMessagesVisible(page, ['Help me get the most out of Lucidos']);
     const input = await waitForVisibleInput(page, 10_000);
     await expect.poll(async () => (await input.inputValue()).trim(), { timeout: 5_000 }).toBe('');
@@ -93,7 +109,7 @@ test.describe('Welcome surface', () => {
     // Click 1: declining keeps the draft AND sends nothing (startSetupInterview
     // bails on a false return from applySuggestion).
     const start = page.locator('.welcome-setup-interview-btn:visible').first();
-    await start.click();
+    await pressInterview(page, start);
     const dialog = page.locator('.confirm-dialog');
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await dialog.getByRole('button', { name: 'Keep my draft' }).click();
@@ -105,7 +121,7 @@ test.describe('Welcome surface', () => {
     // VISIBLE prompt has to give way to the seeded sentence: the normal compose
     // sync skips a focused, non-empty textarea to protect in-flight typing, so
     // applySuggestion force-syncs it (requestPromptOverrideSync).
-    await start.click();
+    await pressInterview(page, start);
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await dialog.getByRole('button', { name: 'Replace' }).click();
     await expect(dialog).toHaveCount(0);

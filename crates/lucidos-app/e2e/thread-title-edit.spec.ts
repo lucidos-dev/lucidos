@@ -12,6 +12,8 @@ import {
   getVisibleTitleText,
   getMobileTitleHeight,
   disableMobileHeaderSticky,
+  enableMobileHeaderSticky,
+  disarmFollowSeed,
 } from './helpers';
 
 test.describe('Thread title editing — desktop', () => {
@@ -125,6 +127,13 @@ test.describe('Thread title editing — mobile', () => {
 
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+  });
+
+  // One test below turns the global header pin off. It is global and the e2e
+  // database resets only between projects, so put it back. See
+  // `disableMobileHeaderSticky`.
+  test.afterEach(async ({ page }) => {
+    await enableMobileHeaderSticky(page);
   });
 
   test('title appears in mobile header and can be edited', async ({ page }) => {
@@ -293,6 +302,10 @@ test.describe('Thread title editing — mobile', () => {
   });
 
   test('title hides with header on scroll down', async ({ page }) => {
+    // The follow seed ships ARMED, and a rider is carried back to the live edge
+    // by any scroll that is not their own gesture. This test parks the reader at
+    // the top and drags down from there, so it starts them disarmed.
+    await disarmFollowSeed(page);
     // "Keep header visible" defaults ON, which pins the header and disables
     // hide-on-scroll. This test asserts the header (and sticky title bar) scroll
     // off, so opt out of the sticky pin before the page boots.
@@ -342,12 +355,11 @@ test.describe('Thread title editing — mobile', () => {
     }, undefined, { timeout: 5_000 });
 
     // Park the reader at the top FIRST, so what follows is a real scroll down.
-    // Sending a message arms the standing follow (scrollState.ts), and while it
-    // is armed content growth writes the reader back to the live edge, so the
-    // filler above already left us at the bottom and a scroll to where we
-    // already are produces no delta for hide-on-scroll to act on. Moving
-    // scrollTop ourselves is also what retires the follow, since it is not a
-    // follow write.
+    // The filler above grew the transcript, and growth leaves the reader at the
+    // bottom. A scroll to where we already are gives hide-on-scroll no delta to
+    // act on. This write sticks only because the test disarmed the follow. An
+    // armed follow answers growth by writing the reader back to the live edge,
+    // and only a reader GESTURE retires it (scrollState.ts `onScroll`).
     await page.evaluate(() => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
       if (container) container.scrollTop = 0;

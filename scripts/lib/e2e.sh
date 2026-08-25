@@ -459,6 +459,28 @@ stop_e2e_background_guards() {
 # failures, and only the (independently computed) umbrella code kept that run
 # honest. Nothing is masked in the other direction: a real non-zero overall_rc is
 # passed through untouched.
+# ── report_webkit_excluded ───────────────────────────────────────────
+# Say that mobile-webkit was left out, given a non-empty first argument.
+#
+#   report_webkit_excluded "$SKIP_WEBKIT"
+#
+# mobile-webkit costs about 15 GB of macOS VM compressor and is run separately
+# for that reason (docs/e2e-test-decisions.md). The project is DROPPED from the
+# per-project table rather than recorded, so the table stays a record of what
+# ran. That leaves the suite with a hole in it, and a run whose last words are
+# "every project passed" is how such a hole goes unnoticed.
+#
+# Lives here beside report_project_exit_codes, and for the same reason: what it
+# guards against is a harness misreport, and a guard with no test is the bet
+# that produced the misreport.
+report_webkit_excluded() {
+    [ -n "${1:-}" ] || return 0
+    echo ""
+    echo "[e2e] mobile-webkit was EXCLUDED by --no-webkit and did NOT run."
+    echo "[e2e] Coverage is incomplete until it runs on its own, on a cold host:"
+    echo "[e2e]   ./scripts/e2e-browser.sh --webkit"
+}
+
 report_project_exit_codes() {
     local overall="$1"; shift
     local entry name rc unknown=""

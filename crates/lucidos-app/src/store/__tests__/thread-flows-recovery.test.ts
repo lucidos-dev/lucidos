@@ -624,8 +624,8 @@ describe('Flow: Edge cases', () => {
       {
         type: 'ContextAssembled',
         sections: [
-          { name: 'System Instructions', content: 'You are a helpful assistant.', char_count: 28 },
-          { name: 'User Message', content: 'Search my notes', char_count: 15 },
+          { name: 'System Instructions', content: 'You are a helpful assistant.', budget_delta_chars: 28 },
+          { name: 'User Message', content: 'Search my notes', budget_delta_chars: 15 },
         ],
         tools: ['search_memory', 'read_file'],
         model: 'claude-opus-4-7',

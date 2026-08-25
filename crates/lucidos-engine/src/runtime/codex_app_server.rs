@@ -342,7 +342,10 @@ pub(super) async fn app_server_driver_task(
     // EOF (recv = None) or this bounded deadline passes (a grandchild
     // holding the pipe open would otherwise stall the wind-down forever).
     let mut child_death_drain_deadline: Option<tokio::time::Instant> = None;
-    let mut child_exit_logged = false;
+    // True once the `child.wait()` arm below has reaped the child. It gates the
+    // teardown's process-group kill, so it names the reaping rather than the
+    // logging it also drives.
+    let mut child_reaped = false;
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     // All stdin writes go through this macro: bounded so a wedged child
@@ -671,7 +674,7 @@ pub(super) async fn app_server_driver_task(
                     "[CodexAppServer] app-server child died (status={}) — draining remaining stdout",
                     format_exit_status(&wait_result),
                 );
-                child_exit_logged = true;
+                child_reaped = true;
                 child_death_drain_deadline = Some(
                     tokio::time::Instant::now() + std::time::Duration::from_millis(500),
                 );
@@ -702,14 +705,30 @@ pub(super) async fn app_server_driver_task(
     drop(approval_tasks);
 
     // Reap the child. The persistent process has no clean-exit path of its
-    // own — the driver kills it on wind-down (a no-op if it already died).
+    // own, so the driver kills it on wind-down (a no-op if it already died).
     // It is its own process-group leader (`isolate_in_process_group` at spawn),
     // so signalling only the leader would orphan everything the session
     // spawned; tear the group down first, as the CC driver does.
+    //
+    // Only while the child is unreaped, which is the kill helper's own
+    // precondition. It waits out its grace before the SIGKILL. A pid freed by
+    // the reap can be recycled inside that grace, so the signal could land on
+    // an unrelated process group. The CC driver guards the same call the same
+    // way.
+    //
+    // The cost is real, so do not "fix" it by dropping the guard. A descendant
+    // outliving the reaped leader is left orphaned, and the drain deadline
+    // above only stops us waiting on it. We take that over a stray SIGKILL,
+    // which on this host can reach another workspace's engine.
     #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        super::spawn_env::graceful_kill_child_process_group(pid, std::time::Duration::from_secs(3))
+    if !child_reaped {
+        if let Some(pid) = child_pid {
+            super::spawn_env::graceful_kill_child_process_group(
+                pid,
+                std::time::Duration::from_secs(3),
+            )
             .await;
+        }
     }
     let _ = child.start_kill();
     let wait_result =
@@ -728,7 +747,7 @@ pub(super) async fn app_server_driver_task(
     if !stderr_text.trim().is_empty() {
         log!("[CodexAppServer] codex stderr: {}", stderr_text.trim());
     }
-    if !child_exit_logged {
+    if !child_reaped {
         log!(
             "[CodexAppServer] app-server child exited (pid={} status={})",
             child_pid

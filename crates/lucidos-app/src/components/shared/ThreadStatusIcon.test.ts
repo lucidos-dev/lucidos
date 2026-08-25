@@ -20,6 +20,9 @@ describe('statusTooltip', () => {
     expect(title).toBe('Waiting');
     expect(text).toMatch(/child thread/);
     expect(text).toMatch(/subscribed/);
+    // The dot now outranks `changes`, so a parked thread with a real change
+    // wears it. The copy has to account for the change it is covering.
+    expect(text).toMatch(/proposed change/);
   });
 
   it('gives every hoverable dot a non-empty title and explanation', () => {
@@ -44,11 +47,15 @@ describe('paused', () => {
     expect(resolveVisualStatus('paused', false, false, false)).toBe('paused');
   });
 
-  // Outranks `changes` for the same reason `failed` does. In practice the pair
-  // never collide: the backend resolves them first, writing `waiting` (not
-  // `paused`) for an interrupted thread that already proposed a change.
+  // Outranks `changes` for the same reason `failed` does, and this is the ONLY
+  // place that precedence lives. The backend used to resolve it first, writing
+  // `waiting` instead of the verdict for an interrupted thread with a change.
+  // That lost the verdict to the dying turn's drain, so the pair reaches here
+  // now and this case is live rather than theoretical.
   it('outranks a proposed change and active children', () => {
     expect(resolveVisualStatus('paused', true, true, true)).toBe('paused');
+    expect(resolveVisualStatus('paused', false, true, false)).toBe('paused');
+    expect(resolveVisualStatus('failed', false, true, false)).toBe('failed');
   });
 
   it('paints the pause glyph, not a dot and never progress-dot-failed', () => {
@@ -77,19 +84,39 @@ describe('live event waits', () => {
   });
 
   // The turn wins while it is running: the thread is not merely watching, it
-  // is working, and the subscription indicator says what it is watching for.
+  // is working, and the waiting indicator says what it is watching for.
   it('does not mask a running turn', () => {
     expect(resolveVisualStatus('running', false, false, true)).toBe('running');
   });
 
-  // A proposed change needs the user; a subscription does not. Hiding the
-  // changes dot behind a wait would hide the Apply the user is looking for.
-  it('yields to a proposed change', () => {
-    expect(resolveVisualStatus('idle', false, true, true)).toBe('changes');
+  // A parked thread's change is not final: it wakes on its delivery and may
+  // commit again on the same branch. Reading it as "Changes to review" invited
+  // an Apply that merges a live branch. The gate in `availableThreadActions`
+  // now withholds the button on these same two facts.
+  it('outranks a proposed change', () => {
+    expect(resolveVisualStatus('idle', false, true, true)).toBe('waiting');
   });
 
   it('reads the same as active children, which is the point', () => {
     expect(resolveVisualStatus('idle', true, false, false))
       .toBe(resolveVisualStatus('idle', false, false, true));
+  });
+
+  // Every combination of the two waiting causes against a proposed change,
+  // pinned so the precedence cannot be flipped back by accident.
+  it('resolves the four cause combinations', () => {
+    expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
+    expect(resolveVisualStatus('idle', false, true, false)).toBe('changes');
+    expect(resolveVisualStatus('idle', true, true, false)).toBe('waiting');
+    expect(resolveVisualStatus('idle', true, true, true)).toBe('waiting');
+  });
+
+  // The verdict statuses stay ahead of both: they describe what happened to the
+  // turn, which outranks what the thread is watching for.
+  it('never masks failed, running, question or paused', () => {
+    expect(resolveVisualStatus('failed', true, true, true)).toBe('failed');
+    expect(resolveVisualStatus('running', true, true, true)).toBe('running');
+    expect(resolveVisualStatus('waiting_for_user_answer', true, true, true)).toBe('question');
+    expect(resolveVisualStatus('paused', true, true, true)).toBe('paused');
   });
 });

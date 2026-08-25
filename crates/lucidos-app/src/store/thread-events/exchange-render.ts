@@ -196,7 +196,7 @@ export interface LegacyContextEvents {
   tokensMeasured?: { input_tokens?: number };
   /** `total_chars` is deliberately absent: it is a CHARACTER count, and its
    *  only use was standing in for a token total, a different unit. The
-   *  per-section `char_count`s carry the same information honestly. */
+   *  per-section budget deltas carry the same information honestly. */
   assembled?: { sections?: ContextSection[]; tools?: string[]; model?: string };
 }
 
@@ -311,6 +311,17 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
       case 'MemorySearched': {
         const results = (event as { results?: number }).results ?? 0;
         steps.push({ description: memoryRecalledLabel(results), outcome: 'success' });
+        break;
+      }
+      // The agent's own document under the self-curated context mode. It never
+      // reaches the chat as prose, so a row of its own is the only sign the
+      // agent wrote one. The body rides on the `responseEvents` step, which is
+      // the path with a `detail` to fold it into.
+      case 'WorkingUnderstandingWritten': {
+        steps.push({
+          description: 'Updated its working understanding',
+          outcome: 'success',
+        });
         break;
       }
       case 'ThoughtStreamed': {
@@ -582,6 +593,18 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         pushStep({ type: 'step', description: memoryRecalledLabel(results), outcome: 'success', detail, created });
         break;
       }
+      // See the same case in `exchangeSteps`.
+      case 'WorkingUnderstandingWritten': {
+        const wu = event as { document?: string };
+        pushStep({
+          type: 'step',
+          description: 'Updated its working understanding',
+          outcome: 'success',
+          detail: wu.document || undefined,
+          created,
+        });
+        break;
+      }
       case 'ThoughtStreamed': {
         // Stay pending until the next visible output supersedes us. See the
         // longer comment in `exchangeSteps`.
@@ -670,7 +693,6 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         );
         if (resolved) {
           if (toolResult.result !== undefined) resolved.result = toolResult.result;
-          if (toolResult.images?.length) resolved.result_images = toolResult.images;
           // Always stamp the source event id so a re-fetch path can address
           // this step. Snapshot replays of stripped rows additionally stamp
           // `result_stripped`, which the step-detail modal gates the
@@ -1342,9 +1364,10 @@ export function resumeEngineNote(exchange: Exchange): { text: string; toolCount:
 
 /** SessionEnded reasons that represent deliberate lifecycle events, NOT system
  *  interruptions. Derived from the generated contract, minus `shutdown` and
- *  `panic`. The seven plain strings below are retired reasons that still
- *  appear on legacy DB rows, listed so historical exchanges render as normal
- *  lifecycle ends. */
+ *  `panic`. The plain strings below are retired reasons that still appear on
+ *  legacy DB rows, listed so historical exchanges render as normal lifecycle
+ *  ends. `stale_resume` is the exception: it is still current, so the spread
+ *  above already covers it. */
 const NORMAL_SESSION_END_REASONS: ReadonlySet<string> = new Set<string>([
   ...SESSION_END_REASONS.filter(r => r !== 'shutdown' && r !== 'panic'),
   'completed',
@@ -1585,7 +1608,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // the slot the delivered event lands in. Without this flag the generic
   // "steps but nothing ended it" fallthrough reads a parked turn as
   // 'streaming'. It is not working: it did its work and parked, and the live
-  // state belongs to the subscription indicator.
+  // state belongs to the waiting indicator.
   let isParkedOnEventWait = false;
   // Did the exchange reach a "completed" state BEFORE any abort or shutdown?
   // Then the abort is a system-injected prompt crash and the user's work was
@@ -1656,7 +1679,24 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
       case 'CodingAgentToolCalled':
       case 'CodingAgentTextStreamed':
       case 'CodingAgentPromptSent':
-        isCCWaiting = false; isComplete = false; isWaitingForAnswer = false; break;
+        isCCWaiting = false; isComplete = false; isWaitingForAnswer = false;
+        // Work after the park says the turn never parked. A coding agent arms
+        // its watch through a CLI call inside the turn. It carries on when the
+        // call answers that the event already happened, and when the work
+        // itself stands the watch down (ADR 0059). The chain below reads its
+        // real endings first (`CodingAgentIdled`, a normal `SessionEnded`), so
+        // a turn that did park keeps its verdict.
+        isParkedOnEventWait = false;
+        break;
+      // The awaiting CLI call ANSWERING is the agent running again, so it
+      // clears the park too, and nothing else. It comes back the moment the
+      // event has already happened, seconds before the agent's next call, and
+      // the turn must not read done in between. A lone arm rather than a fourth
+      // label above: a result can land after `CodingAgentIdled`, where clearing
+      // `isCCWaiting` would revive a finished turn. It matches no id, because
+      // the CLI route mints its own `cli-<uuid>` for the wait and no agent
+      // result carries it (`docs/code-review-priors.md`).
+      case 'CodingAgentToolResult': isParkedOnEventWait = false; break;
       case 'UserQuestionAsked':
       case 'CodingAgentPermissionRequest':
       case 'CommandPermissionRequested':
@@ -1673,7 +1713,9 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
       // ordinary machinery. A CANCEL does not: it closes the dangling call so
       // the next turn is sendable, and the thread settles (`status_transitions`
       // maps `EventWaitCanceled` to Idle). Leaving the flag set there is what
-      // keeps a stopped wait reading "Done" instead of "Aborted".
+      // keeps a stopped wait reading "Done" instead of "Aborted". A turn that
+      // stood its own watch down and kept working clears the flag above,
+      // through the work it went on to do.
       case 'EventWaitDelivered':
       case 'EventWaitExpired':
         isParkedOnEventWait = false; break;

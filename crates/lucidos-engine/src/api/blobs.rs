@@ -88,12 +88,14 @@ pub(super) async fn post_blob(
 
     // write_blob sniffs the mime against the allowlist; on rejection
     // it returns BlobError::UnsupportedMime → 415 with no disk write.
+    // The error carries what the bytes turned out to be, so the 415 names
+    // this upload's format rather than reciting the allowlist.
     let resolved = match write_blob(&state.workspace_path, &bytes) {
         Ok(r) => r,
-        Err(BlobError::UnsupportedMime) => {
+        Err(e @ BlobError::UnsupportedMime(_)) => {
             return Err(ApiError::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported image mime (allowed: jpeg, png, webp, gif, heic)",
+                e.to_string(),
             ));
         }
         Err(BlobError::Io(e)) => return Err(ApiError::internal(e.to_string())),

@@ -219,6 +219,14 @@ const BUILD_SLOT_RULE: &str = "\n\nHEAVY BUILDS TAKE A BUILD SLOT: Sessions run 
 /// the tool timeout KILLS the command, so maxing it out is only safe when the
 /// run fits. An uncertain estimate belongs on the background path. Applies to
 /// chat-style prompts only; merge-conflict sessions run no builds.
+///
+/// The subagent arm exists because Claude Code flipped its `Agent` tool to
+/// async by default. A launch now returns before the work does, so a `/harden`
+/// Phase 2 fan-out yields three detached agents and no reports. Facing a hard
+/// "do not end the turn" with no named wait, one session improvised two stalls:
+/// a filler subagent whose whole prompt was the word `placeholder`, then a
+/// fabricated question that parked a live thread on an unanswerable card.
+/// Naming `run_in_background: false` is what removes the incentive.
 const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN: When your turn \
     ends (you go idle), the Lucidos engine terminates your whole process group — you and every \
     process you spawned. A command started with `run_in_background` (or `&` / `nohup` / any \
@@ -242,7 +250,17 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
     ENTIRE accumulated output, not just the new part, so an un-redirected chatty build re-floods \
     your context on every wait. Redirected, the wait is nearly free and you `tail` the log for \
     detail. Tick on a short interval only when you deliberately want live \
-    progress or an early abort — never as the default way to wait.";
+    progress or an early abort, never as the default way to wait. \
+    SUBAGENTS ARE BACKGROUND WORK TOO: under Claude Code the `Agent` tool runs one in the \
+    BACKGROUND BY DEFAULT, returning the instant it launches and delivering its report later \
+    as a `<task-notification>`. That notification never reaches you if your turn ended first, \
+    because the subagent dies with your process group. Launch a subagent whose result you need \
+    with `run_in_background: false`, which blocks and hands you the report inline. A fan-out \
+    still costs ONE wait: put every `Agent` call in a single assistant message and they run in \
+    parallel. For one you already backgrounded, block on its task id with `TaskOutput`, \
+    `block: true`, `timeout: 600000`. NEVER improvise a stall instead: a filler subagent, a \
+    sleep loop, or a fabricated question to hold the turn open. Those waste the turn, and a \
+    fabricated question also parks the thread on a card the user must clear.";
 
 /// Send the coding agent's DECISIONS through the structured `AskUserQuestion`
 /// tool, which the Lucidos UI renders as clickable buttons. Forbids post-work
@@ -365,6 +383,14 @@ const ASK_USER_QUESTION_RULE: &str =
      they'll tell you in a new message. Ask to DECIDE, never to CONFIRM finished work. Approving \
      a plan you have not implemented yet is a DECISION and is never covered by this paragraph, \
      however finished the plan document itself feels.\n\n\
+     NEVER FABRICATE A QUESTION TO STALL: do not call `AskUserQuestion` to keep your turn \
+     alive, to hold a background process open, or as a placeholder you expect to be \
+     discarded. There is no discard path. Every call is parsed, emitted as a \
+     `UserQuestionAsked` event, and rendered as a real card that parks the thread and waits \
+     for a human. So a dummy question costs the user an interruption they have to clear. \
+     Worse, if your own background work then streams steps into the thread it OVERTAKES the \
+     card and kills its buttons, so nobody can clear it at all. When you need to wait, use \
+     the blocking wait named in the background-process rule.\n\n\
      NEVER parallel-call `AskUserQuestion` alongside other tools — if you're asking a \
      question, stop the assistant message after the `AskUserQuestion` tool_use and do not \
      include any sibling tool_uses (no Bash, no Read, no TaskOutput, no second \
@@ -394,7 +420,8 @@ const APPLY_CONFIRMATION_NOTE: &str = "APPLYING YOUR WORK: Concretely, a questio
 
 /// Permission allowlist rule — Claude Code ONLY. Lucidos passes
 /// `--allowedTools` when spawning CC, which overrides settings.json permission
-/// rules, so tool allowlist edits MUST go in `~/.lucidos/cc-allowed-tools`.
+/// rules, so tool allowlist edits MUST go in the workspace's
+/// `.lucidos/cc-allowed-tools` (ADR 0095).
 /// None of this applies to Codex (it uses its own sandbox + approval-policy
 /// model — approval cards raised by the app-server's `requestApproval`, not
 /// `--allowedTools`), so [`append_backend_rules`] appends this only in the
@@ -406,13 +433,13 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     seeing the permission prompt. \
     Three ways to remember a granted permission, picked via the buttons on the prompt card: \
     (1) `Always allow Tool(scope)` (narrow) and (2) `Always allow` (broad) append to \
-    `~/.lucidos/cc-allowed-tools` (one entry per line, blank lines and `#` comments ignored). \
+    `<workspace>/.lucidos/cc-allowed-tools` (one entry per line, blank lines and `#` comments \
+    ignored). It is PER WORKSPACE, not machine-global: a grant made here binds here and nowhere \
+    else, so the same yes in another workspace is asked again there (ADR 0095). \
     The file is read on each subprocess spawn — the next Claude Code session (or `claude_code` tool \
     call) picks it up immediately, no engine restart needed. The currently-running subprocess \
     keeps its frozen `--allowedTools` flag, so a freshly-persisted entry only takes effect on \
-    the next session. The compiled-in default is at \
-    `crates/lucidos-engine/src/engine/claude_code/mod.rs` (`DEFAULT_CC_ALLOWED_TOOLS`); editing it \
-    only helps fresh installs; existing users keep their seeded file. \
+    the next session. \
     Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted via the broad button — CC's \
     `acceptEdits` mode routes them through `--permission-prompt-tool` for its protected paths \
     (`.claude/`, `.git/`, which never auto-approve in any mode) and auto-approves them \
@@ -480,7 +507,7 @@ const CODEX_CLI_RULE: &str = "\n\n\
     this thread to a Lucidos event, then FINISH your session. It returns immediately and \
     blocks nothing. The engine re-opens this thread with a follow-up message when the event \
     lands, or tells you the deadline passed. Use it instead of a sleep-and-recheck loop \
-    whenever you are waiting on something the engine emits (a change appearing, a trigger \
+    whenever you wait on something the engine persists (a change appearing, a trigger \
     firing). NOT for a child you spawned: its completion already re-opens this thread. \
     Do NOT poll for it afterwards, and do NOT keep the session alive waiting.\n\
     - `lucidos event-waits list` / `... cancel [--wait-id <id>|--all]`: read or stop this \
@@ -551,6 +578,10 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     FINISHED and the user gets no signal that you are stuck. Blocked on the user: ask with this \
     tool. Work finished: don't ask at all, just hand it off. What is always wrong is ending a \
     turn with an unanswered question sitting in your prose. \
+    NEVER FABRICATE A QUESTION TO STALL: do not call `ask_user_question` to keep your turn \
+    alive, to hold a background process open, or as a placeholder you expect to be discarded. \
+    There is no discard path. Every call renders a real card that parks the thread and waits \
+    for a human, so a dummy question costs the user an interruption they have to clear. \
     NEVER parallel-call `ask_user_question` alongside other tools — if you're asking a \
     question, stop the assistant message after the `ask_user_question` tool call and do not \
     include any sibling tool calls.";
@@ -641,7 +672,7 @@ const NO_IMPERSONATION_RULE: &str = "\n\n\
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
 /// point where the two coding-agent backends diverge. Claude Code prompts gain
-/// [`PERMISSION_CONFIG_RULE`] (the `--allowedTools` / `~/.lucidos/cc-allowed-tools`
+/// [`PERMISSION_CONFIG_RULE`] (the `--allowedTools` / `cc-allowed-tools`
 /// mechanics are CC-only); Codex prompts replace [`ASK_USER_QUESTION_RULE`]
 /// with [`CODEX_ASK_USER_QUESTION_RULE`] and append [`CODEX_CLI_RULE`]. Each
 /// backend gets ONLY its own section: the CC permission-config rule would be
@@ -1418,6 +1449,19 @@ mod tests {
                 // change without weakening the rule.
                 "re-dumps the task's ENTIRE accumulated output",
                 "REDIRECT ITS OUTPUT TO A LOG FILE",
+                // A subagent is background work, and Claude Code's `Agent` tool
+                // now runs one in the background by DEFAULT. Without this arm
+                // the rule reads as Bash-only. That gap met a hard "don't end
+                // the turn" and produced two invented stalls: a filler subagent
+                // whose prompt was one word, then a fabricated question that
+                // parked a live thread on a card nobody could answer. Pin the
+                // default that removes the incentive, the one-message fan-out
+                // that keeps it cheap, and the ban on improvising a stall.
+                "SUBAGENTS ARE BACKGROUND WORK TOO",
+                "`run_in_background: false`",
+                "single assistant message",
+                "NEVER improvise a stall",
+                "fabricated question",
             ] {
                 assert!(
                     prompt.contains(needle),
@@ -1436,6 +1480,15 @@ mod tests {
             assert!(
                 full.contains("BACKGROUND PROCESSES DON'T SURVIVE A TURN"),
                 "worktree_system_prompt must keep the background-process rule for {:?}",
+                agent,
+            );
+            // The subagent arm rides the same shared base. Codex has no
+            // subagent tool, so for it these bytes are inert rather than wrong.
+            // One copy is what stops the two backends drifting on what a
+            // background wait means.
+            assert!(
+                full.contains("SUBAGENTS ARE BACKGROUND WORK TOO"),
+                "worktree_system_prompt must keep the subagent arm for {:?}",
                 agent,
             );
         }
@@ -1474,23 +1527,23 @@ mod tests {
     /// Backend labels are `CodingAgent::as_str()` values, kebab-case, so the
     /// table reads the same as every other public surface naming a backend.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
-        ("worktree", "claude-code", 21668),
-        ("worktree", "codex", 20380),
+        ("worktree", "claude-code", 23148),
+        ("worktree", "codex", 21592),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 15163),
-        ("external_repo", "codex", 13875),
-        ("recovery", "claude-code", 20263),
-        ("recovery", "codex", 18975),
-        ("external_repo_recovery", "claude-code", 15039),
-        ("external_repo_recovery", "codex", 13751),
-        ("app_worktree", "claude-code", 17804),
-        ("app_worktree", "codex", 16516),
-        ("app_worktree_recovery", "claude-code", 16368),
-        ("app_worktree_recovery", "codex", 15080),
+        ("external_repo", "claude-code", 16643),
+        ("external_repo", "codex", 15087),
+        ("recovery", "claude-code", 21743),
+        ("recovery", "codex", 20187),
+        ("external_repo_recovery", "claude-code", 16519),
+        ("external_repo_recovery", "codex", 14963),
+        ("app_worktree", "claude-code", 19284),
+        ("app_worktree", "codex", 17728),
+        ("app_worktree_recovery", "claude-code", 17848),
+        ("app_worktree_recovery", "codex", 16292),
         ("conflict_resolution", "claude-code", 5343),
         ("conflict_resolution", "codex", 6577),
     ];
@@ -1899,6 +1952,36 @@ mod tests {
             assert!(
                 prompt.contains("None of these") && prompt.contains("still welcome"),
                 "{label} must keep a meaningful opt-out option legal",
+            );
+            // A third "don't ask" case, distinct from the post-work
+            // confirmation above. One session held its turn open by asking
+            // "placeholder - not a real question, will not be sent". That label
+            // is the belief to kill: it expected a discard path. Pin the ban
+            // AND the mechanism, since a ban whose reason is dropped gets
+            // re-derived away by the next model.
+            for needle in [
+                "NEVER FABRICATE A QUESTION TO STALL",
+                "There is no discard path",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must forbid a question asked only to stall, and say why it \
+                     cannot work (missing: {needle:?})",
+                );
+            }
+        }
+
+        // `append_backend_rules` swaps the whole rule for the Codex variant, so
+        // a ban written once reaches one backend. Both copies carry it.
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            let full = append_backend_rules(worktree_system_prompt("feature/x", "dev"), agent);
+            assert!(
+                full.contains("NEVER FABRICATE A QUESTION TO STALL"),
+                "the stall ban must survive the {:?} rule swap",
+                agent,
             );
         }
     }
@@ -2357,7 +2440,7 @@ mod tests {
         );
     }
 
-    /// The permission-config rule (`--allowedTools` / `~/.lucidos/cc-allowed-tools`
+    /// The permission-config rule (`--allowedTools` / `cc-allowed-tools`
     /// mechanics) is Claude-Code-only and must be appended for CC and ONLY for
     /// CC — mirroring how [`CODEX_CLI_RULE`] is Codex-only. Codex
     /// permissions surface through its own sandbox + approval-policy model
@@ -2383,7 +2466,8 @@ mod tests {
         for needle in [
             "PERMISSION CONFIG:",
             "--allowedTools",
-            "~/.lucidos/cc-allowed-tools",
+            "<workspace>/.lucidos/cc-allowed-tools",
+            "PER WORKSPACE",
         ] {
             assert!(
                 cc.contains(needle),

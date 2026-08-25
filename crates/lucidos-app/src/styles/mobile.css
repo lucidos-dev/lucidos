@@ -426,14 +426,6 @@
     .toast {
         max-width: 100%;
     }
-
-    .toast-message {
-        min-width: 0;
-    }
-
-    #tooltip {
-        max-width: calc(100vw - 2rem);
-    }
 }
 
 
@@ -457,6 +449,12 @@
         will-change: transform;
         background: var(--header-gradient);
         padding-top: env(safe-area-inset-top, 0px);
+        /* The inline inset belongs to the ROWS here, not to this column.
+           `.pane-header` pads the desktop bar, where the header IS one row of
+           controls. This header is a column, and the app-shell banners at its
+           foot span the window. The inherited inset floated each bar a glyph's
+           width inside both screen edges, its border stopping short of each. */
+        padding-inline: 0;
         flex-direction: column;
         align-items: stretch;
         height: auto;
@@ -468,6 +466,16 @@
     /* mobile-thread-title-row is no longer in the header — it lives inside
        .thread-content (scroll container) so it swipes with the pane. */
     .app-header[data-mobile-view="content"] .mobile-content-header { display: flex; }
+
+    /* Where that inset lives now. It goes on the section rather than on the
+       `.mobile-header-row` inside it, so the row's box is unchanged. The row is
+       what every centred cluster is positioned against, and what its
+       non-overlap reserve is derived from. */
+    .mobile-threads-header,
+    .mobile-thread-header,
+    .mobile-content-header {
+        padding-inline: var(--header-padding-x);
+    }
 
     /* Row inside each mobile header (icons + title).
 
@@ -600,10 +608,23 @@
         z-index: 2;
     }
 
-    /* Badge position reset for smaller mobile icons */
+    /* Badge position reset for smaller mobile icons.
+
+       The offset parks the badge ON the button's corner, so its ring straddles
+       the edge: roughly half the arc falls outside the control, on the bare
+       bar. No single colour matches both halves, so the veil is dropped and
+       the ring keeps the bar it has always had. Mobile is therefore unchanged,
+       and the dark notch the veil removes on desktop is still there on the
+       half of the arc that crosses a toggled square. Ending that needs the
+       badge back INSIDE the box, which is a layout change this is not.
+
+       The mark's two badges are already inside their host, and header-mark.css
+       has them keep whatever veil the slot carries. See --header-control-veil
+       in panels/shell.css. */
     .badge {
         top: -0.125rem;
         right: -0.125rem;
+        --header-control-veil: 0%;
     }
 
     .mobile-header-row .hamburger-panel {

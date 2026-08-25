@@ -59,7 +59,8 @@ impl CodingAgentChangeOps for LucidosEngine {
             };
 
             // `files` is the change's full file list, not necessarily
-            // conflicting — Tier 2 has no worktree yet to probe.
+            // conflicting: this Tier-3 spawn has no worktree path in hand to
+            // probe.
             let prompt = engine
                 .start_merge_and_get_prompt(
                     thread_id,
@@ -99,12 +100,12 @@ impl CodingAgentChangeOps for LucidosEngine {
             let request_id = Uuid::new_v4();
             let cancel_token = tokio_util::sync::CancellationToken::new();
             // Direct run_direct_agent (bypasses process_message_with_steps):
-            // engine-driven Tier-1 merge orchestration. The prompt is
+            // engine-driven Tier-3 merge orchestration. The prompt is
             // engine-synthesized via `start_merge_and_get_prompt`, and the
             // call needs `Some(change_id)` to bind CC to the change row.
             // process_message_with_steps has a conflict_change_id param but
             // also does its own MR emit + title gen + register_thread_queued,
-            // which Tier-1 merge has already arranged via `emit_automated_prompt`.
+            // which this merge has already arranged via `emit_automated_prompt`.
             let result = engine
                 .run_direct_agent(
                     request_id,

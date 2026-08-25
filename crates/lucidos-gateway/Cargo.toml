@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 lucidos-tailscale = { path = "../lucidos-tailscale" }
+lucidos-local-token = { path = "../lucidos-local-token" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -29,11 +30,24 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros", "multipart"] }
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+tower = { version = "0.5", features = ["util", "limit"] }
+# `catch-panic` and `timeout` are the hook socket's, and are load-bearing rather
+# than hygiene. That listener is the one surface a user may point at the open
+# internet, and it shares this process with every workspace's supervisor.
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "fs", "set-header", "timeout"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 dotenvy = "0.15"
+# Inbound auth stores a digest of each paired device's credential, never the
+# credential. A leaked store then grants nobody remote reuse. A leaf crypto
+# crate already in the lockfile via the engine, so it does not widen the
+# gateway's dependency surface in any real sense.
+sha2 = "0.10"
+# A pairing code is eight digits somebody types into a phone. The Access page
+# offers a QR instead, so the phone scans the whole pairing URL. `svg` is a
+# pure-code feature and `image` is the crate's only dependency, gated off here,
+# so this adds exactly one crate and nothing under it.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 [dev-dependencies]
 tempfile = "3"

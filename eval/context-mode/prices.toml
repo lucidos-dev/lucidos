@@ -1,0 +1,119 @@
+# Per-million-token prices, pinned.
+#
+# Cost is computed from these and the event store's token counts, never from a
+# provider bill: a bill is not attributable per thread, and the eval's whole
+# cost claim is per thread (I8).
+#
+# This file goes stale by design. It is checked in so a result is reproducible,
+# and its hash lands on every run row. Re-pricing an old run against new numbers
+# would change a published result, so instead add a row and re-run.
+#
+# That rule covers a price that MOVED. It does not cover a row that was wrong
+# from the start, and on 2026-08-24 the Anthropic rows were. They carried an
+# older generation's rates: Opus 4.1's $15/$75 sat under the Opus 5 id, and
+# Sonnet 5 was priced at Sonnet 4.6's $3/$15. Both are corrected here against
+# the published Anthropic table. Reproducibility is unharmed, because each run
+# row pins the hash of the file it was priced with.
+#
+# The three rows did NOT move by one factor, so read the factor per row:
+#
+#   claude-opus-5@default        3.0x   every published figure came from here
+#   claude-opus-5@default[1m]    4.5x   never run against
+#   claude-sonnet-5              1.5x   never run against
+#
+# So EVERY DOLLAR FIGURE PUBLISHED FROM A RUN BEFORE 2026-08-24 IS 3x HIGH,
+# because every one of them was priced at the base Opus row. Say "priced at
+# `claude-opus-5@default`" rather than "on Anthropic models" when correcting
+# one, since the other two factors differ.
+#
+# Every ratio WITHIN a model survives, because all four of its line items moved
+# together. A ratio BETWEEN models does not: Opus used to cost 3x Sol on a
+# cache read and now costs the same. The OpenAI and stealth rows never moved.
+#
+# Add a row for any model the eval may run against, including the cheap model
+# the smoke configuration uses. A missing row fails the run rather than
+# defaulting to zero.
+#
+# "Runs against" covers auxiliary work as well as the model under test. A thread
+# bills its title, memory and summary calls to the extractor default, and those
+# tokens are priced at that model's rate, not the one under test.
+#
+# `input_per_mtok` prices FRESH input alone, which is the stored input total
+# with both cache counts taken out of it. The harness derives that in one place,
+# `InputSplit`, because the total the providers report already contains them.
+
+[[model]]
+# Cache creation is the 5-minute write, which Anthropic bills at 1.25x input.
+# Cache read is 0.1x input. Both hold for every Anthropic row below.
+id = "claude-opus-5@default"
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_per_mtok = 0.5
+cache_creation_per_mtok = 6.25
+
+[[model]]
+# Identical to the row above, and deliberately so. Anthropic prices the full
+# 1M window at the standard rate for Claude 4.6 and later, so the `[1m]` tier
+# carries no premium. The row stays because a missing id fails the run.
+id = "claude-opus-5@default[1m]"
+input_per_mtok = 5.0
+output_per_mtok = 25.0
+cache_read_per_mtok = 0.5
+cache_creation_per_mtok = 6.25
+
+[[model]]
+# $2/$10 launched as introductory pricing and is now the standard price. The
+# increase to $3/$15 was announced for 2026-09-01 and then cancelled, so this
+# model was never billed at the rates this row used to carry.
+id = "claude-sonnet-5"
+input_per_mtok = 2.0
+output_per_mtok = 10.0
+cache_read_per_mtok = 0.20
+cache_creation_per_mtok = 2.50
+
+[[model]]
+# Checked on 2026-08-24 and correct. The dev workspace's own
+# `data/artifacts/token-cost/pricing.json` prices this id at Haiku 3.5's
+# $0.80/$4.00, which is the same defect the Opus row had. That file is not
+# this one's source, and nothing here follows it.
+id = "claude-haiku-4-5"
+input_per_mtok = 1.0
+output_per_mtok = 5.0
+cache_read_per_mtok = 0.10
+cache_creation_per_mtok = 1.25
+
+[[model]]
+# Free while the stealth window is open, so every cost figure in an ox-alpha run
+# is 0.00. That is not a saving: it means the cost axis measures nothing, and
+# the run is read on quality, rounds and utilisation alone. Re-price and re-run
+# if it ever starts billing.
+id = "stealth/ox-alpha"
+input_per_mtok = 0.0
+output_per_mtok = 0.0
+cache_read_per_mtok = 0.0
+cache_creation_per_mtok = 0.0
+
+[[model]]
+# The zero here is a real economic fact, unlike ox-alpha's four. OpenAI caches
+# by automatic prefix matching, with no breakpoints and no write fee, where
+# Anthropic bills a write at 1.25x. The engine also stores no cache-write count
+# for OpenAI at all, so this term is zero whichever way it is read.
+id = "gpt-5.6-sol"
+input_per_mtok = 5.0
+output_per_mtok = 30.0
+cache_read_per_mtok = 0.5
+cache_creation_per_mtok = 0.0
+
+[[model]]
+# Never the model under test, and observed on every run all the same. The
+# fixture seeds `chat_model` alone and deletes every other preference row, so
+# title, memory and summary work resolves to the memory extractor's default.
+#
+# Vertex prices context caching at 0.1x input. Cache creation is 0.00 because
+# Vertex bills cached storage per hour rather than per write, and the engine's
+# Vertex provider records no cache counts at all.
+id = "gemini-3-flash-preview"
+input_per_mtok = 0.50
+output_per_mtok = 3.00
+cache_read_per_mtok = 0.05
+cache_creation_per_mtok = 0.0

@@ -7,8 +7,9 @@ const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[("ThreadArchived", "archive
 fn start_events_with_transitions_set_running() {
     // Start classification is about exchange grouping (UI), not status.
     // Some Start events (MissingHardeningDetected, MergeConflictDetected) don't
-    // set status=running in event_bus.rs. This test only checks that Start events
-    // that DO have a status transition always set Running (never idle/waiting).
+    // set status=running in event_bus_projection_thread.rs. This test only
+    // checks that Start events with a status transition always set Running
+    // (never idle/waiting).
     let transitions: std::collections::HashMap<&str, StatusTransition> =
         status_transitions().into_iter().collect();
     for event_type in all_persisted_event_types() {

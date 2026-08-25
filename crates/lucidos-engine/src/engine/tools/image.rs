@@ -39,38 +39,86 @@ fn looks_like_description_prompt(prompt: &str) -> bool {
     })
 }
 
+const IMAGE_HANDLE_PREFIX: &str = "img-";
+
+/// Whether a reference is an [`image_handle`](crate::core::events::image_handle),
+/// as opposed to a path under `data/artifacts/`.
+///
+/// The hex body is what decides, not the prefix alone. An artifact really can
+/// be called `img-cat.png`, and claiming that as a handle would answer a
+/// perfectly good file read with "handle not found". A wrong-length hex body
+/// IS claimed, so a mistyped handle says so instead of turning into a missing
+/// file.
+fn is_image_handle(reference: &str) -> bool {
+    reference
+        .strip_prefix(IMAGE_HANDLE_PREFIX)
+        .is_some_and(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// The two shapes that name an image already in this thread, as opposed to a
+/// path under `data/artifacts/`. `img-<hex>` is the stable handle of ADR 0085
+/// Decision 11. `thread:N` is the positional form it replaces, kept working
+/// because existing threads and existing habits both still use it.
+pub(crate) fn is_thread_image_ref(reference: &str) -> bool {
+    reference.starts_with("thread:") || is_image_handle(reference)
+}
+
+/// Pick out the one image a reference names. One resolver for both forms, so
+/// every tool taking an image reference accepts both.
+fn find_thread_image<'a>(
+    images: &'a [crate::core::events::ThreadImage],
+    reference: &str,
+) -> Result<&'a crate::core::events::ThreadImage, String> {
+    let total = images.len();
+    if is_image_handle(reference) {
+        // Compared in full, never as a prefix: a truncated handle would
+        // silently resolve to whichever image happened to sort first. Case
+        // folded, because the `evt-` address the model also handles round-trips
+        // through `Uuid::parse_str`, which accepts either case.
+        return images
+            .iter()
+            .find(|i| i.handle.eq_ignore_ascii_case(reference))
+            .ok_or_else(|| {
+                format!(
+                    "Image handle '{reference}' not found. Thread contains \
+                     {total} images total."
+                )
+            });
+    }
+    let index_str = reference.strip_prefix("thread:").ok_or_else(|| {
+        format!(
+            "Invalid image reference '{}': expected 'thread:N' or an \
+             'img-<hex>' handle",
+            reference
+        )
+    })?;
+    let index: usize = index_str
+        .parse()
+        .map_err(|_| format!("Invalid thread image index in '{}'", reference))?;
+    if index == 0 {
+        return Err(format!(
+            "Thread image index must be 1 or greater (got '{}')",
+            reference
+        ));
+    }
+    images.iter().find(|i| i.index == index).ok_or_else(|| {
+        format!(
+            "Thread image '{}' not found. Thread contains {} images total.",
+            reference, total
+        )
+    })
+}
+
 pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
     workspace: &Path,
     events: &[E],
     refs: &[String],
 ) -> Result<Vec<ChatImage>, Box<dyn std::error::Error + Send + Sync>> {
     let images = walk_thread_images(workspace, events);
-    let total = images.len();
 
     let mut result = Vec::with_capacity(refs.len());
     for reference in refs {
-        let index_str = reference.strip_prefix("thread:").ok_or_else(|| {
-            format!(
-                "Invalid image reference '{}': expected 'thread:N' format",
-                reference
-            )
-        })?;
-        let index: usize = index_str
-            .parse()
-            .map_err(|_| format!("Invalid thread image index in '{}'", reference))?;
-        if index == 0 {
-            return Err(format!(
-                "Thread image index must be 1 or greater (got '{}')",
-                reference
-            )
-            .into());
-        }
-        let img = images.iter().find(|i| i.index == index).ok_or_else(|| {
-            format!(
-                "Thread image '{}' not found. Thread contains {} images total.",
-                reference, total
-            )
-        })?;
+        let img = find_thread_image(&images, reference)?;
         // walk_thread_images yields empty base64 when the user-image blob
         // is missing on disk (partial backup-restore). The numbering slot
         // exists so downstream history annotations stay stable; we
@@ -148,8 +196,8 @@ impl LucidosEngine {
                  text descriptions. To describe or analyse an image, just describe it \
                  directly in your reply: you have native vision over recent images in the \
                  conversation. If the image was posted earlier and you can no longer see \
-                 it, call view_image (e.g. image: 'thread:2') first to bring it back into \
-                 view, then describe it."
+                 it, call view_image with its 'img-<hex>' handle first to bring it back \
+                 into view, then describe it."
                     .into(),
             );
         }
@@ -203,7 +251,27 @@ impl LucidosEngine {
         );
 
         // Call the provider
+        let input_image_bytes: usize = input_images.iter().map(Vec::len).sum();
         let result = provider.generate(prompt, input_images, size).await?;
+
+        // Account for the call. OpenAI's image endpoints report tokens and
+        // those are recorded; Imagen prices per image and reports none, so
+        // that row carries no usage. The row exists either way, because an
+        // image the engine paid for must not be missing from the ledger.
+        crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::ImageGen,
+        )
+        .record_usage(
+            // The serving model id, not `provider.name()`, which is a display
+            // label ("OpenAI gpt-image-2"). Every other capture site records
+            // the model, and a cost breakdown groups on it.
+            &result.model,
+            prompt.chars().count() + input_image_bytes,
+            crate::engine::aux_capture::usage_from_image(result.input_tokens, result.output_tokens),
+        )
+        .await;
 
         // Compress the result through the same pipeline as user images
         let compressed = ChatImage {
@@ -262,10 +330,14 @@ impl LucidosEngine {
         let reference = args
             .get("image")
             .and_then(|v| v.as_str())
-            .ok_or("image is required (e.g. 'thread:1')")?;
+            .ok_or("image is required (an 'img-<hex>' handle, or 'thread:1')")?;
 
-        if !reference.starts_with("thread:") {
-            return Err("image must be a thread reference (e.g. 'thread:1')".into());
+        if !is_thread_image_ref(reference) {
+            return Err(
+                "image must name an image already in this thread: its 'img-<hex>' \
+                 handle, or 'thread:1'"
+                    .into(),
+            );
         }
 
         let artifact_path = args
@@ -300,11 +372,12 @@ impl LucidosEngine {
     }
 
     /// Re-load an image posted earlier in the thread back into the model's
-    /// vision. Resolves a `thread:N` reference to bytes and returns the
-    /// `[IMAGE_CONTENT:<type>]\n<base64>` sentinel, which the agentic loop
-    /// (`parse_image_content_marker`) lifts into a real `ContentBlock::Image` —
-    /// the same path `read_file` uses for image files. This is the only way the
-    /// model can see an image that has aged out of the auto-included window.
+    /// vision. Takes an `img-<hex>` handle or a `thread:N` reference, and
+    /// returns the `[IMAGE_CONTENT:<type>]\n<base64>` sentinel. The agentic
+    /// loop (`parse_image_content_marker`) lifts that into a real
+    /// `ContentBlock::Image`, the same path `read_file` uses for image files.
+    /// This is the only way the model can see an image that has aged out of
+    /// the auto-included window.
     pub(crate) async fn execute_view_image(
         &self,
         args: &serde_json::Value,
@@ -313,28 +386,18 @@ impl LucidosEngine {
         let reference = args
             .get("image")
             .and_then(|v| v.as_str())
-            .ok_or("image is required (e.g. 'thread:1')")?;
+            .ok_or("image is required (an 'img-<hex>' handle, or 'thread:1')")?;
 
-        if !reference.starts_with("thread:") {
+        if !is_thread_image_ref(reference) {
             return Err(
-                "image must be a thread reference like 'thread:1'. To view an \
-                 image file saved under data/artifacts/, use read_file instead."
+                "image must name an image already in this thread: its 'img-<hex>' \
+                 handle, or 'thread:1'. To view an image file saved under \
+                 data/artifacts/, use read_file instead."
                     .into(),
             );
         }
 
-        let events = self
-            .event_store
-            .get_thread_events(&thread_id.to_string())
-            .await?;
-        // resolve_thread_image_refs validates the ref (format, index range,
-        // missing-blob) and errors with an actionable message, so on Ok the vec
-        // holds exactly the one requested image.
-        let mut resolved =
-            resolve_thread_image_refs(&self.workspace_path, &events, &[reference.to_string()])?;
-        let img = resolved
-            .pop()
-            .ok_or("internal: resolve_thread_image_refs returned no image")?;
+        let img = self.resolve_thread_image(reference, thread_id).await?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(&img.base64)?;
 
         crate::log!("[Image] view_image loaded {} into vision", reference);
@@ -344,44 +407,40 @@ impl LucidosEngine {
         ))
     }
 
-    /// Resolve an image reference to raw bytes.
-    /// Supports:
-    /// - "thread:N" — Nth image in the conversation (1-based)
-    /// - artifact path — reads from data/artifacts/...
+    /// Load one of this thread's images, by `img-<hex>` handle or `thread:N`.
+    ///
+    /// The single reader for both, so every tool taking an image reference
+    /// resolves it identically and reports the same errors. It used to be
+    /// duplicated here and in [`resolve_thread_image_refs`], with the two
+    /// copies wording their failures differently.
+    async fn resolve_thread_image(
+        &self,
+        reference: &str,
+        thread_id: uuid::Uuid,
+    ) -> Result<ChatImage, Box<dyn std::error::Error + Send + Sync>> {
+        let events = self
+            .event_store
+            .get_thread_events(&thread_id.to_string())
+            .await?;
+        // On Ok the vec holds exactly the one requested image: the resolver
+        // validates the form, the range and the missing-blob case, and errors
+        // with a message the model can act on.
+        resolve_thread_image_refs(&self.workspace_path, &events, &[reference.to_string()])?
+            .pop()
+            .ok_or_else(|| "internal: resolve_thread_image_refs returned no image".into())
+    }
+
+    /// Resolve an image reference to raw bytes. Three shapes:
+    /// - `img-<hex>`: the stable handle of an image already in the thread
+    /// - `thread:N`: Nth image in the conversation (1-based)
+    /// - an artifact path, read from `data/artifacts/`
     async fn resolve_image_reference(
         &self,
         reference: &str,
         thread_id: uuid::Uuid,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(index_str) = reference.strip_prefix("thread:") {
-            let target_index: usize = index_str
-                .parse()
-                .map_err(|_| format!("Invalid thread image index: {}", index_str))?;
-            if target_index == 0 {
-                return Err("Thread image index must be 1 or greater".into());
-            }
-
-            let events = self
-                .event_store
-                .get_thread_events(&thread_id.to_string())
-                .await?;
-            let images = crate::core::events::walk_thread_images(&self.workspace_path, &events);
-            let total = images.len();
-
-            let img = images
-                .into_iter()
-                .find(|i| i.index == target_index)
-                .ok_or_else(|| {
-                    format!(
-                        "Thread image {} not found. Thread contains {} images total.",
-                        target_index, total
-                    )
-                })?;
-
-            if img.base64.is_empty() {
-                return Err("Image missing base64 data".into());
-            }
-
+        if is_thread_image_ref(reference) {
+            let img = self.resolve_thread_image(reference, thread_id).await?;
             Ok(base64::engine::general_purpose::STANDARD.decode(&img.base64)?)
         } else {
             // Artifact path — read from data/ directory
@@ -407,7 +466,9 @@ mod tests {
     use crate::core::blobs::write_blob;
     use crate::core::events::EventRow;
     use crate::llm::tool_names as tn;
-    use crate::llm::tools::{get_default_tools, get_save_thread_image_tool, get_view_image_tool};
+    use crate::llm::tools::{
+        get_default_tools, get_save_thread_image_tool, get_view_image_tool, ToolCapabilities,
+    };
     use std::path::Path;
 
     /// Minimal valid PNG with a per-test discriminator byte so each call
@@ -425,8 +486,17 @@ mod tests {
     /// — mirrors the post-Phase-3b storage shape so the tests exercise the
     /// real walk_thread_images + resolve_thread_image_refs path.
     fn message_event_with_blobs(workspace: &Path, n: u8) -> (Vec<String>, EventRow) {
-        let hashes: Vec<String> = (0..n)
-            .map(|i| write_blob(workspace, &png_with_marker(i)).unwrap().hash)
+        let markers: Vec<u8> = (0..n).collect();
+        message_event_from_markers(workspace, &markers)
+    }
+
+    /// Same, with the discriminators named. A repeated marker is the SAME
+    /// image under content-addressing. So a test about two distinct messages
+    /// picks disjoint markers, or it compares a picture with itself.
+    fn message_event_from_markers(workspace: &Path, markers: &[u8]) -> (Vec<String>, EventRow) {
+        let hashes: Vec<String> = markers
+            .iter()
+            .map(|m| write_blob(workspace, &png_with_marker(*m)).unwrap().hash)
             .collect();
         let event = EventRow::new(
             "MessageReceived",
@@ -509,10 +579,173 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(
-            err.contains("thread:"),
-            "error should explain expected format, got: {}",
+            err.contains("thread:") && err.contains("img-"),
+            "error should name both accepted forms, got: {}",
             err
         );
+    }
+
+    // ------------------------------------------------------------------
+    // The stable image handle (ADR 0085 Decision 11)
+    // ------------------------------------------------------------------
+
+    /// The handle resolves to the same bytes `thread:N` does, so the two are
+    /// two names for one image rather than two lookups that can disagree.
+    #[test]
+    fn a_handle_and_its_thread_index_name_the_same_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 3);
+        let events = vec![event];
+
+        let walked = crate::core::events::walk_thread_images(tmp.path(), &events);
+        let second = &walked[1];
+        assert!(second.handle.starts_with("img-"), "{}", second.handle);
+
+        let by_handle =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&second.handle))
+                .unwrap();
+        let by_index =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:2".to_string()]).unwrap();
+        assert_eq!(by_handle[0].base64, by_index[0].base64);
+    }
+
+    /// THE point of the handle. `thread:N` counts from the start of the
+    /// thread, so an image arriving earlier renumbers every later one. A
+    /// handle noted in one turn must still name its own picture after that.
+    #[test]
+    fn a_handle_survives_the_renumbering_that_breaks_thread_n() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let target = crate::core::events::walk_thread_images(tmp.path(), &events)[0]
+            .handle
+            .clone();
+        let before =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&target)).unwrap();
+        let before_by_index =
+            resolve_thread_image_refs(tmp.path(), &events, &["thread:1".to_string()]).unwrap();
+        assert_eq!(before[0].base64, before_by_index[0].base64);
+
+        // An earlier message now carries two other images, so every index
+        // shifts by two.
+        let (_older_hashes, older) = message_event_from_markers(tmp.path(), &[40, 41]);
+        let shifted = vec![older, events.into_iter().next().unwrap()];
+
+        let after = resolve_thread_image_refs(tmp.path(), &shifted, &[target]).unwrap();
+        assert_eq!(
+            after[0].base64, before[0].base64,
+            "the handle must still name its own image"
+        );
+        let now_at_index_1 =
+            resolve_thread_image_refs(tmp.path(), &shifted, &["thread:1".to_string()]).unwrap();
+        assert_ne!(
+            now_at_index_1[0].base64, before[0].base64,
+            "this test is only meaningful if thread:1 really did move"
+        );
+    }
+
+    /// A user image's handle is derived from the blob hash already in the
+    /// payload. That is what lets the history annotation print the handle
+    /// without reading a blob, and what keeps the metadata walk read-free.
+    #[test]
+    fn a_user_images_handle_comes_from_the_hash_the_payload_already_carries() {
+        use crate::core::events::{image_handle, ImageRef};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let walked = crate::core::events::walk_thread_images(tmp.path(), &events);
+        for (i, hash) in hashes.iter().enumerate() {
+            assert_eq!(walked[i].handle, image_handle(ImageRef::BlobHash(hash)));
+        }
+        // And the metadata-only walk agrees, so the two never diverge.
+        let meta = crate::core::events::walk_thread_images_meta(tmp.path(), &events);
+        assert_eq!(meta[0].handle, walked[0].handle);
+        assert_eq!(meta[1].handle, walked[1].handle);
+    }
+
+    /// A handle nobody minted is refused. The refusal says how many images
+    /// the thread holds, so the model can tell "wrong id" from "no images".
+    #[test]
+    fn an_unknown_handle_is_refused_rather_than_falling_back_to_a_position() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["img-0000000000000000".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("not found"), "got: {}", err);
+        assert!(err.contains("2 images total"), "got: {}", err);
+    }
+
+    /// An artifact really can be called `img-cat.png`. Claiming every `img-`
+    /// string as a handle would answer a perfectly good file read with
+    /// "handle not found", so the hex body is what decides.
+    #[test]
+    fn an_artifact_path_that_merely_starts_with_img_is_not_a_handle() {
+        assert!(!is_thread_image_ref("img-cat.png"));
+        assert!(!is_thread_image_ref("img-notes/screenshot.png"));
+        assert!(!is_thread_image_ref("img-"));
+        // A wrong-length hex body IS a handle, so a mistyped one says so
+        // rather than turning into a missing file.
+        assert!(is_thread_image_ref("img-abc"));
+        assert!(is_thread_image_ref("img-0123456789abcdef"));
+        assert!(is_thread_image_ref("thread:2"));
+    }
+
+    /// The `evt-` address the model also handles round-trips through
+    /// `Uuid::parse_str`, which accepts either case. An image handle folds the
+    /// same way, so one habit works for both.
+    #[test]
+    fn a_handle_resolves_whatever_case_the_model_writes_it_in() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let handle = crate::core::events::walk_thread_images(tmp.path(), &events)[1]
+            .handle
+            .clone();
+        // Only the hex body: the `img-` prefix is the literal that marks the
+        // namespace, and folding it would make `IMG-` a handle too.
+        let hex = handle.strip_prefix("img-").expect("handle is prefixed");
+        let shouted = format!("img-{}", hex.to_uppercase());
+        assert_ne!(shouted, handle, "the fixture must have hex letters in it");
+
+        let lower =
+            resolve_thread_image_refs(tmp.path(), &events, std::slice::from_ref(&handle)).unwrap();
+        let upper = resolve_thread_image_refs(tmp.path(), &events, &[shouted]).unwrap();
+        assert_eq!(lower[0].base64, upper[0].base64);
+    }
+
+    /// A truncated handle must not resolve. Prefix matching would hand back
+    /// whichever image happened to come first, silently and wrongly.
+    #[test]
+    fn a_truncated_handle_does_not_resolve() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_hashes, event) = message_event_with_blobs(tmp.path(), 2);
+        let events = vec![event];
+
+        let full = crate::core::events::walk_thread_images(tmp.path(), &events)[0]
+            .handle
+            .clone();
+        let truncated: String = full.chars().take(full.chars().count() - 4).collect();
+        assert!(
+            resolve_thread_image_refs(tmp.path(), &events, &[truncated]).is_err(),
+            "a prefix of a handle is not a handle"
+        );
+    }
+
+    #[test]
+    fn view_image_tool_advertises_the_handle_and_still_accepts_thread_n() {
+        let tool = get_view_image_tool();
+        let desc = tool.parameters["properties"]["image"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("img-"), "must advertise the handle: {desc}");
+        assert!(desc.contains("thread:"), "must keep thread:N: {desc}");
     }
 
     #[test]
@@ -572,7 +805,7 @@ mod tests {
 
     #[test]
     fn run_coding_agent_tool_has_optional_images_parameter() {
-        let tools = get_default_tools();
+        let tools = get_default_tools(&ToolCapabilities::all_open());
         let tool = tools
             .iter()
             .find(|t| t.name == tn::RUN_CODING_AGENT)

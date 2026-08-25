@@ -5,20 +5,47 @@ use uuid::Uuid;
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 
-// Background model preference keys
+// Background model preference keys. Each is half of a *model selection*: the
+// paired `reasoning_*` key below carries the effort. The pairing is resolved
+// per `ContextPurpose` in `engine::aux_purpose`.
 pub const PREF_MODEL_TITLE: &str = "model_title";
 pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
+/// Model for fact extraction and query classification.
+///
+/// It used to cover history summarisation too, which is now
+/// [`PREF_MODEL_CONVERSATION_SUMMARY`]. That key falls back to this one when
+/// unset, so a workspace that pinned a model here keeps summarising on it.
 pub const PREF_MODEL_MEMORY: &str = "model_memory";
+/// Model the *conversation summary* is written by, split out of
+/// [`PREF_MODEL_MEMORY`] so the summariser can be named, found and tuned.
+pub const PREF_MODEL_CONVERSATION_SUMMARY: &str = "model_conversation_summary";
 /// Model the *command guard*'s LLM *judge* uses to classify the ambiguous
 /// middle (ADR 0002, Phase 3). Configurable so a workspace can trade
 /// accuracy/cost; defaults to [`DEFAULT_COMMAND_JUDGE_MODEL`] when unset.
 pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
+
+// The reasoning-effort half of each background *model selection*. Every one
+// defaults to the effort its call site used to hardcode, so splitting the knob
+// out changed nothing on the day it shipped. The single exception is image
+// description: see `engine::aux_purpose`.
+pub const PREF_REASONING_TITLE: &str = "reasoning_title";
+pub const PREF_REASONING_IMAGE_DESCRIPTION: &str = "reasoning_image_description";
+pub const PREF_REASONING_MEMORY: &str = "reasoning_memory";
+pub const PREF_REASONING_CONVERSATION_SUMMARY: &str = "reasoning_conversation_summary";
+/// Effort the command-guard judge runs at. Internal like its model sibling: the
+/// agent must not tune its own safety gate.
+pub const PREF_REASONING_COMMAND_JUDGE: &str = "reasoning_command_judge";
 
 /// Default model for the command-guard judge — a cheap, fast model (Haiku) per
 /// ADR 0002. Mirrored on the frontend in
 /// `crates/lucidos-app/src/store/actions/preferences.ts`
 /// (`DEFAULT_COMMAND_JUDGE_MODEL`).
 pub const DEFAULT_COMMAND_JUDGE_MODEL: &str = "claude-haiku-4-5";
+
+/// Default effort for the command-guard judge. It returns a short JSON verdict,
+/// so it buys nothing from deliberation. It also sits in front of every
+/// ambiguous command, so a waiting user pays the latency.
+pub const DEFAULT_COMMAND_JUDGE_REASONING: &str = "none";
 
 // Chat preference keys (also written by frontend Settings UI)
 pub const PREF_CHAT_MODEL: &str = "chat_model";
@@ -48,11 +75,16 @@ pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";
 /// `crates/lucidos-app/src/components/settings/LocalProviderSettings.tsx`.
 pub const DEFAULT_LOCAL_BASE_URL: &str = "http://localhost:11434/v1";
 
+// The keyless OpenCode Free tier, off unless the user turns it on (also written
+// by frontend Settings UI). A preference rather than a credential because there
+// is no secret: the relay serves the free models anonymously.
+pub const PREF_OPENCODE_FREE_ENABLED: &str = "opencode_free_enabled";
+
 // Image generation model (also written by frontend Settings UI)
 pub const PREF_IMAGE_MODEL: &str = "image_model";
 
 // When off, ContextCaptured still fires per LLM call but section
-// bodies are dropped — only the name + char_count survives. Defaults
+// bodies are dropped. Only the name and the two sizes survive. Defaults
 // to "true" to preserve historical behavior.
 pub(crate) const PREF_CAPTURE_CONTEXT: &str = "capture_context";
 
@@ -68,6 +100,23 @@ pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
 // more misses, pay no per-command LLM cost/latency). Only consulted when the
 // master `command_guard` toggle is on.
 pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
+
+/// The *self-curated context mode*, a workspace-wide opt-in. Off by default:
+/// the mode ships dark, and ADR 0087's eval decides whether it ever graduates.
+/// Read once per turn by `LucidosEngine::read_turn_capabilities`, so every
+/// thread in the workspace assembles its prompt the same way.
+///
+/// Tracked as a temporary measure with a removal condition. See
+/// `docs/temporary-measures.md`.
+pub const PREF_SELF_CURATED_CONTEXT_MODE: &str = "self_curated_context_mode";
+
+/// How old a tool result must be before a sweep may take it, in rounds.
+pub const PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS: &str =
+    "self_curated_context_expire_after_rounds";
+
+/// How often the sweep runs, in rounds.
+pub const PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS: &str =
+    "self_curated_context_sweep_every_rounds";
 
 /// How many tool calls the Lucidos Agent may make in a single turn (chat and
 /// trigger alike) before the agentic loop stops with its `[ENGINE-LIMIT]`
@@ -399,6 +448,90 @@ impl PreferenceStore {
             .map(|opt| opt.map(|v| v != "false").unwrap_or(true))
     }
 
+    /// Read the *self-curated context mode* toggle.
+    ///
+    /// Total by construction, and the direction is the point. An absent row and
+    /// an unreadable one both resolve OFF, because OFF is today's behaviour.
+    /// Resolving ON would drop long-term memory and the conversation history
+    /// out of a thread nobody opted in, on a transient database error
+    /// (`.claude/rules/rust.md`).
+    pub async fn self_curated_context_mode(pool: &PgPool) -> bool {
+        match Self::get(pool, PREF_SELF_CURATED_CONTEXT_MODE).await {
+            Ok(value) => value.as_deref() == Some("true"),
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {}. Leaving the self-curated context mode off",
+                    PREF_SELF_CURATED_CONTEXT_MODE,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// When results leave, as this workspace has it set.
+    ///
+    /// Both numbers are provisional, so they live beside the mode's own key
+    /// rather than in the binary. An unreadable row falls back to the default,
+    /// which is the behaviour the prompt describes.
+    ///
+    /// Returns the schedule itself rather than a pair of bare `usize`. The two
+    /// numbers are adjacent and interchangeable to the compiler. A
+    /// transposition at the call site would run the whole workspace on the
+    /// wrong schedule and say nothing.
+    pub(crate) async fn self_curated_context_schedule(
+        pool: &PgPool,
+    ) -> crate::engine::SweepSchedule {
+        crate::engine::SweepSchedule::new(
+            Self::rounds_pref(
+                pool,
+                PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
+                crate::engine::DEFAULT_EXPIRE_AFTER_ROUNDS,
+            )
+            .await,
+            Self::rounds_pref(
+                pool,
+                PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
+                crate::engine::DEFAULT_SWEEP_EVERY_ROUNDS,
+            )
+            .await,
+        )
+    }
+
+    /// A round count from a preference row, or the default.
+    ///
+    /// Parsed as `f64` and rounded, matching what the catalog validates
+    /// (`PrefValue::Number`). It accepts `"20.0"` there. An integer-only parse
+    /// here would store that value, show it in Settings, and sweep at the
+    /// default anyway. A value that will not parse says so, rather than falling
+    /// back in silence.
+    async fn rounds_pref(pool: &PgPool, key: &str, fallback: usize) -> usize {
+        match Self::get(pool, key).await {
+            Ok(Some(raw)) => match raw.trim().parse::<f64>() {
+                Ok(n) if n >= 1.0 && n.is_finite() => n.round() as usize,
+                _ => {
+                    log!(
+                        "[Preferences] {} is not a round count ({:?}). Using {}",
+                        key,
+                        raw,
+                        fallback
+                    );
+                    fallback
+                }
+            },
+            Ok(None) => fallback,
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {}. Using {}",
+                    key,
+                    e,
+                    fallback
+                );
+                fallback
+            }
+        }
+    }
+
     /// The model the command-guard judge runs on, defaulting to
     /// [`DEFAULT_COMMAND_JUDGE_MODEL`] (Haiku) when unset. DB errors are logged
     /// and treated as unset — the judge falls back to the default model rather
@@ -414,6 +547,25 @@ impl PreferenceStore {
                     e
                 );
                 DEFAULT_COMMAND_JUDGE_MODEL.to_string()
+            }
+        }
+    }
+
+    /// The effort the command-guard judge runs at, the other half of its
+    /// *model selection*. Defaults to `none`: the judge answers with a short
+    /// JSON verdict, and it sits in front of every ambiguous command the agent
+    /// runs. Total in the same way [`Self::command_judge_model`] is.
+    pub async fn command_judge_reasoning(pool: &PgPool) -> String {
+        match Self::get(pool, PREF_REASONING_COMMAND_JUDGE).await {
+            Ok(Some(e)) if !e.trim().is_empty() => e,
+            Ok(_) => DEFAULT_COMMAND_JUDGE_REASONING.to_string(),
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {}. Using the default judge effort",
+                    PREF_REASONING_COMMAND_JUDGE,
+                    e
+                );
+                DEFAULT_COMMAND_JUDGE_REASONING.to_string()
             }
         }
     }

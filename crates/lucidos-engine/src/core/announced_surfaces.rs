@@ -190,6 +190,7 @@ pub const TABLES: &[TableRule] = &[
                 "DeviceRenamed",
                 "DevicePushChanged",
                 "DeviceDeleted",
+                "DeviceHandedOver",
             ],
             exempt: &[],
         },
@@ -332,13 +333,22 @@ pub const TABLES: &[TableRule] = &[
         owners: &["core/pinned_apps.rs"],
         announcement: Announcement::Announced {
             events: &["PinnedAppPinned", "PinnedAppUnpinned"],
-            exempt: &[ExemptWriter {
-                function: "delete_for_device",
-                why: "The cascade from DeviceStore::delete. The device is gone, \
-                      and DeviceDeleted already tells every client to drop it; \
-                      an unpin event per pinned app would be noise about a \
-                      device that no longer exists.",
-            }],
+            exempt: &[
+                ExemptWriter {
+                    function: "delete_for_device",
+                    why: "The cascade from DeviceStore::delete. The device is gone, \
+                          and DeviceDeleted already tells every client to drop it; \
+                          an unpin event per pinned app would be noise about a \
+                          device that no longer exists.",
+                },
+                ExemptWriter {
+                    function: "move_device",
+                    why: "The cascade from DeviceStore::hand_over, which announces \
+                          DeviceHandedOver. The pins themselves are unchanged; only \
+                          the device id naming them moved, so a pin event per app \
+                          would report a change nobody made.",
+                },
+            ],
         },
     },
     TableRule {
@@ -440,6 +450,26 @@ pub const TABLES: &[TableRule] = &[
                  that was already broadcast, and the reconcile/backfill writers \
                  repair drift in that derivation rather than introducing new \
                  state.",
+        },
+    },
+    TableRule {
+        table: "webhook_deliveries",
+        owners: &["core/webhook_deliveries.rs"],
+        announcement: Announcement::Silent {
+            reason: "The nonce ledger a delivery claims before it emits. Holds \
+                     no payload, is listed nowhere, and its only reader is the \
+                     next delivery. What a delivery DID is the pinned domain \
+                     event it emitted, which announces already; a second event \
+                     per arrival would describe the mechanism rather than a \
+                     state change anyone made.",
+        },
+    },
+    TableRule {
+        table: "webhooks",
+        owners: &["core/webhooks.rs"],
+        announcement: Announcement::Announced {
+            events: &["WebhookCreated", "WebhookUpdated", "WebhookDeleted"],
+            exempt: &[],
         },
     },
 ];

@@ -85,7 +85,7 @@ pub(crate) async fn ff_main_to(
             // it was detached, e.g. by a failed `pull --rebase`) and resets the
             // working tree + index to match the new main.
             //
-            // This sync MUST land, so it waits out a concurrent `.git/index.lock`
+            // This sync MUST land, so it waits out a concurrent lock-file
             // holder instead of giving up on the first collision. `main` is already
             // advanced at this point, so a repo-root working tree left at the old
             // commit reads as "every file the merge added has been deleted" -- and
@@ -99,7 +99,7 @@ pub(crate) async fn ff_main_to(
             // aborts a stale rebase and re-attaches a detached HEAD, and HEAD is
             // already on main here.
             let sync_err =
-                match git_cmd_await_index_lock(&["checkout", "-f", "main"], repo_root).await {
+                match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {
                     Ok(o) if o.status.success() => None,
                     Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
                     Err(e) => Some(e),
@@ -195,8 +195,17 @@ pub(crate) async fn catchup_and_ff_to_main(
 
 /// Catch up in the merge worktree, then fast-forward main to the temp branch.
 /// Retries up to 3 times (re-catching up each time) before removing the worktree.
-/// On success, removes the worktree and deletes both branches.
 /// Returns (pre_merge_sha, post_merge_sha) on success for revert tracking.
+///
+/// Throwaway state is reclaimed on BOTH exits, and only when it really is
+/// throwaway. `temp_branch != feature_branch` means the merge ran in a Tier-3
+/// temp worktree on a `merge-tmp/` branch this attempt created, so the tree and
+/// both branches go. Equal names mean the session ran in the THREAD's own
+/// worktree on the REAL change branch (Tier 2, and a pruned-temp re-attach).
+/// Neither is this call's to delete: a session teardown never reclaims a
+/// worktree (ADR 0035), and dropping the change branch costs the thread its
+/// resumability the way `SessionEndAction::KeepEmptyBranch` describes. The
+/// Tier-2 fast path in `apply_change` keeps both for exactly that reason.
 ///
 /// Serialized via MERGE_MUTEX -- only one merge-to-main at a time.
 pub(crate) async fn ff_merge_to_main(
@@ -223,9 +232,16 @@ pub(crate) async fn ff_merge_to_main(
         // Worktree stays alive until merge succeeds so retries can re-catchup
         match ff_main_to(repo_root, &branch_sha, &main_sha).await {
             Ok(shas) => {
-                let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
-                let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
-                let _ = git_cmd(&["branch", "-D", feature_branch], repo_root).await;
+                if temp_branch == feature_branch {
+                    log!(
+                        "[Changes] ff-merge applied {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
+                        feature_branch
+                    );
+                } else {
+                    let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
+                    let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
+                    let _ = git_cmd(&["branch", "-D", feature_branch], repo_root).await;
+                }
                 push_main_in_background(repo_root);
                 return Ok(shas);
             }
@@ -424,10 +440,10 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         .or_unknown(true);
     if !head_ok {
         log!("[Changes] HEAD is detached -- re-attaching to main");
-        // Same index-lock contention as the sync in ff_main_to: a detached HEAD
-        // that stays detached because a concurrent artifact commit held the lock
-        // makes every later `git status` report false dirty files.
-        match git_cmd_await_index_lock(&["checkout", "-f", "main"], repo_root).await {
+        // Same lock contention as the sync in ff_main_to: a detached HEAD that
+        // stays detached because a concurrent artifact commit held a lock makes
+        // every later `git status` report false dirty files.
+        match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {
             Ok(o) if o.status.success() => {}
             Ok(o) => log!(
                 "[Changes] Failed to re-attach HEAD: {}",

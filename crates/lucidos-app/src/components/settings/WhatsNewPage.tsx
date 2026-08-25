@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { changelogReleases, latestTauriAppNotes, lucidosRelease, lucidosReleaseDirty } from '../../store/store';
+import { changelogReleases, latestTauriAppNotes, lucidosRelease, lucidosReleaseDirty, whatsNewTargetRelease } from '../../store/store';
 import { loadChangelog, markWhatsNewSeen } from '../../store/actions/whatsNew';
 import { packagedUpdateVersion } from '../../store/actions/app-update';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -28,6 +28,27 @@ export function releaseRowIsOpen(
   toggled: Record<string, boolean>,
 ): boolean {
   return toggled[version] ?? openByDefault;
+}
+
+/**
+ * Which release in the history list opens by default.
+ *
+ * `target` is the release an update offer sent the reader here to READ, and it
+ * wins: an offer's whole subject is that one release, so opening the release
+ * they are RUNNING would answer a question nobody asked.
+ *
+ * It wins only when the list can actually show it. A packaged client's announced
+ * version can name nothing on screen, which a dev workspace reproduces by
+ * reporting a CalVer app build id. Falling back there leaves the panel as it is
+ * on every other way in, rather than opening nothing at all.
+ */
+export function defaultOpenRelease(
+  target: string | null,
+  running: string | null,
+  known: readonly ChangelogRelease[],
+): string | null {
+  if (target && known.some((r) => r.version === target)) return target;
+  return running;
 }
 
 /** The chip a row wears, when it wears one: `Running` for the release you are
@@ -74,7 +95,9 @@ function ReleaseRow({
   }
 
   return (
-    <div class={`whats-new-release${mark ? ` is-${mark.kind}` : ''}`}>
+    // `data-release` is how a deep link finds its row: the panel brings the
+    // release an update offer named into view once that row exists.
+    <div class={`whats-new-release${mark ? ` is-${mark.kind}` : ''}`} data-release={release.version}>
       <button
         type="button"
         class="whats-new-release-header"
@@ -188,7 +211,8 @@ export function offeredRelease(
 /**
  * Settings > System > What's New: every published release, newest first, with
  * the one you are running open and marked, and any release being offered above
- * it.
+ * it. Arriving from an update offer opens the release that offer announced
+ * instead.
  */
 export function WhatsNewPage() {
   const loadable = changelogReleases.value;
@@ -196,10 +220,39 @@ export function WhatsNewPage() {
   const dirty = lucidosReleaseDirty.value;
   const showSkeleton = useDelayedLoading(loadable);
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
+  const [target, setTarget] = useState<string | null>(null);
 
   useEffect(() => {
     void loadChangelog();
   }, []);
+
+  // The release an update offer sent the reader here to READ, taken into this
+  // visit's own state and cleared. It is a navigation parameter. Held in the
+  // signal it would re-open the same row on a visit made for another reason,
+  // and it would fight the reader's own toggles.
+  useEffect(() => {
+    const requested = whatsNewTargetRelease.value;
+    if (!requested) return;
+    whatsNewTargetRelease.value = null;
+    setTarget(requested);
+  }, [whatsNewTargetRelease.value]);
+
+  // Bring that release into view once its row exists.
+  //
+  // `nearest` scrolls NOTHING when the row is already visible, which is the
+  // ordinary case: the deep link dropped this view's remembered scroll, so the
+  // panel opens at the top and the announced release is the first row. It earns
+  // its place in the one case no remount covers, the panel already open and
+  // scrolled somewhere else when the offer is tapped.
+  //
+  // Escaped, because a version is not a literal this file wrote: it arrives from
+  // an update manifest. A stray quote in one would make `querySelector` throw
+  // out of an effect, taking the panel with it.
+  useEffect(() => {
+    if (!target || loadable.status !== 'loaded') return;
+    const row = document.querySelector(`[data-release="${CSS.escape(target)}"]`);
+    row?.scrollIntoView({ block: 'nearest' });
+  }, [target, loadable.status]);
 
   // Opening the panel is reading it, so the dot clears here rather than on any
   // particular scroll or click. Two things gate that, and both exist because the
@@ -228,6 +281,10 @@ export function WhatsNewPage() {
   // marking the newest and claiming something untrue. Reachable whenever RELEASE
   // is bumped ahead of its changelog entry.
   const hasCurrent = releases.some((r) => r.version === release);
+  // Which row opens by itself. The Available row above is not in this list and
+  // keeps its own unconditional open: it IS the announced release whenever it
+  // exists.
+  const openRelease = defaultOpenRelease(target, release, releases);
   // The `*` is the same marker Settings > System > Versions uses for the same
   // fact, and the tooltip is the same sentence the Lucidos menu's version row
   // carries. One wording for one condition, in all three places.
@@ -275,7 +332,7 @@ export function WhatsNewPage() {
       >
         {loadable.status === 'loaded' ? (
           <div class="whats-new-list">
-            {releases.map((r) => row(r, r.version === release ? runningMark : undefined, r.version === release))}
+            {releases.map((r) => row(r, r.version === release ? runningMark : undefined, r.version === openRelease))}
           </div>
         ) : null}
       </LoadingFade>

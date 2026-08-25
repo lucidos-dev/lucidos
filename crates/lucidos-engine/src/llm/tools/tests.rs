@@ -6,7 +6,7 @@ use crate::llm::tool_names as tn;
 /// tool list, which has its own native `TodoWrite`.
 #[test]
 fn todo_write_is_in_chat_agent_default_tools() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let found = tools.iter().find(|t| t.name == tn::TODO_WRITE);
     assert!(
         found.is_some(),
@@ -38,7 +38,7 @@ fn todo_write_is_in_chat_agent_default_tools() {
 
 #[test]
 fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::LOAD_KNOWHOW)
@@ -118,7 +118,7 @@ fn plugins_grouped_tool_exposes_register_marketplace() {
 /// buttons.
 #[test]
 fn ask_user_question_tool_is_in_default_set() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::ASK_USER_QUESTION)
@@ -159,7 +159,7 @@ fn ask_user_question_tool_is_in_default_set() {
 /// produced the button, so the ban has to replace it rather than sit beside it.
 #[test]
 fn ask_user_question_description_bans_a_text_entry_escape_option() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let desc = &tools
         .iter()
         .find(|t| t.name == tn::ASK_USER_QUESTION)
@@ -197,7 +197,7 @@ fn ask_user_question_description_bans_a_text_entry_escape_option() {
 /// doesn't currently render it.
 #[test]
 fn ask_user_question_per_question_schema_matches_cc() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::ASK_USER_QUESTION)
@@ -271,7 +271,7 @@ fn ask_user_question_per_question_schema_matches_cc() {
 /// being killed at it has already burned the turn.
 #[test]
 fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::RUN_PYTHON)
@@ -306,7 +306,7 @@ fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
 /// scientific-python workloads.
 #[test]
 fn run_python_background_is_in_chat_agent_default_tools() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::RUN_PYTHON_BACKGROUND)
@@ -376,7 +376,7 @@ fn run_python_background_is_in_chat_agent_default_tools() {
 /// instead of silently re-enabling the antipattern.
 #[test]
 fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::BASH_OUTPUT)
@@ -613,7 +613,7 @@ fn changes_grouped_tool_exposes_list_and_apply() {
 /// grouped tool from `capability_manifest::llm_tools()`.
 #[test]
 fn consolidated_flat_tools_are_not_advertised() {
-    let default_tools = get_default_tools();
+    let default_tools = get_default_tools(&ToolCapabilities::all_open());
     let default_names: Vec<&str> = default_tools.iter().map(|t| t.name.as_str()).collect();
     let grouped_names: Vec<String> = crate::capability_manifest::llm_tools()
         .iter()
@@ -681,10 +681,13 @@ fn consolidated_flat_tools_are_not_advertised() {
     }
 }
 
-/// The grouped `events` tool consolidated emit/query/count. Pin its action enum
-/// and that the flat names still resolve as aliases.
+/// The grouped `events` tool consolidated emit, query, count and event_types.
+/// Pin its action enum and that the flat names still resolve as aliases.
+///
+/// `event_types` is load-bearing for a subscription: a name outside the engine's
+/// set is refused, and this action is where the caller reads the real names.
 #[test]
-fn events_grouped_tool_exposes_emit_query_count() {
+fn events_grouped_tool_exposes_every_action() {
     let tools = crate::capability_manifest::llm_tools();
     let tool = tools
         .iter()
@@ -700,8 +703,13 @@ fn events_grouped_tool_exposes_emit_query_count() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(action_names, vec!["emit", "query", "count"]);
-    for alias in [tn::EMIT_EVENT, tn::QUERY_EVENTS, tn::COUNT_EVENTS] {
+    assert_eq!(action_names, vec!["emit", "query", "count", "event_types"]);
+    for alias in [
+        tn::EMIT_EVENT,
+        tn::QUERY_EVENTS,
+        tn::COUNT_EVENTS,
+        tn::LIST_EVENT_TYPES,
+    ] {
         let domain = crate::capability_manifest::domain_for_tool(alias)
             .unwrap_or_else(|| panic!("alias {alias} must resolve"));
         assert_eq!(domain.name, "events");
@@ -844,7 +852,7 @@ fn send_notification_schema_exposes_optional_app_id() {
 /// scope.
 #[test]
 fn await_event_description_says_a_delivery_spends_the_subscription() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::AWAIT_EVENT)
@@ -884,7 +892,7 @@ fn await_event_description_says_a_delivery_spends_the_subscription() {
 /// the check.
 #[test]
 fn await_event_description_says_an_already_happened_match_is_reported_not_delivered() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::AWAIT_EVENT)
@@ -918,7 +926,7 @@ fn await_event_description_says_an_already_happened_match_is_reported_not_delive
 /// call, and an unbounded standing rule is a trigger's job.
 #[test]
 fn await_event_description_names_the_real_subscription_cap() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::AWAIT_EVENT)
@@ -953,7 +961,7 @@ fn await_event_description_names_the_real_subscription_cap() {
 /// claim, and the exclusion is only allowed after it.
 #[test]
 fn await_event_description_carves_out_the_threads_own_child() {
-    let tools = get_default_tools();
+    let tools = get_default_tools(&ToolCapabilities::all_open());
     let tool = tools
         .iter()
         .find(|t| t.name == tn::AWAIT_EVENT)
@@ -992,7 +1000,7 @@ fn await_event_description_carves_out_the_threads_own_child() {
 /// runtime: it has to fail here, before the name ever ships.
 #[test]
 fn every_built_in_tool_name_is_wire_safe() {
-    let offenders: Vec<String> = get_default_tools()
+    let offenders: Vec<String> = get_default_tools(&ToolCapabilities::all_open())
         .into_iter()
         .chain(crate::capability_manifest::llm_tools())
         .map(|t| t.name)
@@ -1003,5 +1011,456 @@ fn every_built_in_tool_name_is_wire_safe() {
         "tool names must match ^[a-zA-Z0-9_-]{{1,128}}$, or the Anthropic API \
          rejects every request carrying them: {:?}",
         offenders
+    );
+}
+
+// ===== Capability gates (ADR 0088) =====
+
+/// The names a workspace is offered, from both registry tables, in wire order.
+fn offered_names(caps: &ToolCapabilities) -> Vec<String> {
+    get_default_tools(caps)
+        .into_iter()
+        .chain(chat_tail_tools(caps))
+        .map(|t| t.name)
+        .collect()
+}
+
+/// The four schemas that resolve an account before they do anything.
+const MAILBOX_TOOLS: [&str; 4] = [
+    tn::SEND_EMAIL,
+    tn::READ_EMAILS,
+    tn::READ_EMAIL,
+    tn::SAVE_EMAIL_ATTACHMENT,
+];
+
+/// A workspace with no email account is offered no mailbox schema. That is
+/// 2,664 wire characters it pays for on every request of every thread and can
+/// never act on.
+#[test]
+fn a_workspace_with_no_email_account_is_offered_no_mailbox_tool() {
+    let names = offered_names(&ToolCapabilities::default());
+    for tool in MAILBOX_TOOLS {
+        assert!(
+            !names.contains(&tool.to_string()),
+            "{tool} needs an account to resolve, so a workspace with none must \
+             not be offered it"
+        );
+    }
+}
+
+/// `configure_email` is the exception, and it is load-bearing. It is the only
+/// writer of the first `email_accounts` row: the settings UI reaches
+/// `EmailStore::upsert` only when editing an existing credential. Gate it and
+/// a fresh workspace can never set email up at all.
+#[test]
+fn configure_email_survives_the_gate_so_email_can_be_set_up_at_all() {
+    let names = offered_names(&ToolCapabilities::default());
+    assert!(
+        names.contains(&tn::CONFIGURE_EMAIL.to_string()),
+        "gating configure_email makes the first email account unreachable"
+    );
+}
+
+/// One account opens all five.
+#[test]
+fn one_email_account_opens_the_whole_family() {
+    let caps = ToolCapabilities {
+        email_account: true,
+        ..ToolCapabilities::default()
+    };
+    let names = offered_names(&caps);
+    for tool in MAILBOX_TOOLS.into_iter().chain([tn::CONFIGURE_EMAIL]) {
+        assert!(
+            names.contains(&tool.to_string()),
+            "{tool} must be offered once the workspace has an account"
+        );
+    }
+}
+
+/// `execute_intent` takes an intent id, so a workspace with no intent has
+/// nothing to pass it.
+#[test]
+fn execute_intent_is_offered_exactly_when_an_intent_exists() {
+    assert!(
+        !offered_names(&ToolCapabilities::default()).contains(&tn::EXECUTE_INTENT.to_string()),
+        "no intent exists, so execute_intent has no argument that resolves"
+    );
+
+    let caps = ToolCapabilities {
+        intent: true,
+        ..ToolCapabilities::default()
+    };
+    assert!(
+        offered_names(&caps).contains(&tn::EXECUTE_INTENT.to_string()),
+        "one intent must open the tool that runs it"
+    );
+}
+
+/// The gate ADR 0088 extends, asserted through the same table as the two it
+/// adds rather than through the `if` it used to be.
+#[test]
+fn generate_image_is_offered_exactly_when_a_provider_is_configured() {
+    assert!(
+        !offered_names(&ToolCapabilities::default()).contains(&tn::GENERATE_IMAGE.to_string()),
+        "no provider can synthesize an image, so nothing may offer to"
+    );
+
+    let caps = ToolCapabilities {
+        image_provider: true,
+        ..ToolCapabilities::default()
+    };
+    let names = offered_names(&caps);
+    assert!(names.contains(&tn::GENERATE_IMAGE.to_string()));
+    // Reading an image the thread already has needs no generation provider,
+    // so those two must not have been swept up by the same gate.
+    for always in [tn::VIEW_IMAGE, tn::SAVE_THREAD_IMAGE] {
+        assert!(
+            offered_names(&ToolCapabilities::default()).contains(&always.to_string()),
+            "{always} reads an existing image and needs no provider"
+        );
+    }
+}
+
+/// Invariant 20. The mode ADDS no tool, and takes one away: the checklist
+/// moved into the working understanding, so `todo_write` is shaped out.
+///
+/// Off, `todo_write` is byte-for-byte the schema every workspace had before the
+/// mode landed, and so is every other schema in the array. That is what makes
+/// the eval's control arm a real baseline rather than this build wearing a
+/// label. Off is also the overwhelmingly common case, and their prose is billed
+/// on every request of every thread that sees them.
+#[test]
+fn the_mode_on_array_is_a_strict_subset_of_the_mode_off_one() {
+    // `all_open` is the widest array, which is the mode OFF: the mode closes a
+    // family rather than opening one.
+    let control = ToolCapabilities::all_open();
+    let lean = ToolCapabilities {
+        context_mode: true,
+        ..ToolCapabilities::all_open()
+    };
+
+    let lean_names = offered_names(&lean);
+    let control_names = offered_names(&control);
+    for name in &lean_names {
+        assert!(
+            control_names.contains(name),
+            "{name} is offered under the mode and nowhere else, so the mode adds a tool"
+        );
+    }
+    assert!(!lean_names.contains(&tn::TODO_WRITE.to_string()));
+    assert!(control_names.contains(&tn::TODO_WRITE.to_string()));
+    for retired in ["keep_in_context", "scratchpad", "dismiss_from_context"] {
+        assert!(
+            !control_names.contains(&retired.to_string())
+                && !lean_names.contains(&retired.to_string()),
+            "{retired} is retired, in both arms"
+        );
+    }
+
+    // And nothing ELSE moves with the flag. The array is the first cache
+    // segment. A schema shifting on it would cost every lean workspace a tier
+    // rewrite it was never told about.
+    let others = |caps: &ToolCapabilities| {
+        serde_json::to_string(
+            &get_default_tools(caps)
+                .into_iter()
+                .chain(chat_tail_tools(caps))
+                .filter(|t| t.name != tn::TODO_WRITE)
+                .collect::<Vec<_>>(),
+        )
+        .expect("the tools array serializes")
+    };
+    assert_eq!(others(&control), others(&lean));
+}
+
+/// **The array is a pure function of workspace configuration.** Two callers in
+/// one workspace, however they differ, resolve the same capabilities and so
+/// must serialize to the same bytes. Anthropic keys the first cache segment on
+/// exactly those bytes, and the measured cross-thread warmth depends on it
+/// (ADR 0088 decision 2).
+///
+/// The type carries most of the guarantee: `get_default_tools` takes only
+/// `&ToolCapabilities`, which holds nothing thread-shaped. This pins the
+/// serialization too, since a builder reading a clock or a thread id would
+/// pass the type check and fail here.
+#[test]
+fn two_callers_in_one_workspace_get_a_byte_identical_array() {
+    let wire = |caps: &ToolCapabilities| {
+        serde_json::to_string(
+            &get_default_tools(caps)
+                .into_iter()
+                .chain(chat_tail_tools(caps))
+                .collect::<Vec<_>>(),
+        )
+        .expect("the tools array serializes")
+    };
+
+    for caps in [
+        ToolCapabilities::default(),
+        ToolCapabilities::all_open(),
+        ToolCapabilities {
+            email_account: true,
+            intent: false,
+            image_provider: true,
+            context_mode: false,
+        },
+    ] {
+        assert_eq!(
+            wire(&caps),
+            wire(&caps),
+            "one workspace's array must be byte-identical for every caller"
+        );
+    }
+}
+
+/// Closing a gate must only REMOVE schemas, never move the survivors. The
+/// order is the cache prefix, so a reorder costs every workspace a rewrite of
+/// the whole tools tier.
+#[test]
+fn a_closed_gate_removes_schemas_without_reordering_the_survivors() {
+    let all = offered_names(&ToolCapabilities::all_open());
+    let none = offered_names(&ToolCapabilities::default());
+
+    assert!(none.len() < all.len(), "the gates must remove something");
+    let surviving: Vec<&String> = all.iter().filter(|n| none.contains(n)).collect();
+    let actual: Vec<&String> = none.iter().collect();
+    assert_eq!(
+        surviving, actual,
+        "a gated array must be the ungated one with rows deleted, in order"
+    );
+}
+
+/// Every schema the chat agent is offered comes from a table row. A family
+/// added without a gate therefore does not reach the model at all. That is
+/// ADR 0088's "state its gate, or state that it has none" made structural
+/// rather than left to review.
+#[test]
+fn every_offered_schema_comes_from_a_gated_registry_row() {
+    let from_rows: Vec<String> = FAMILIES
+        .iter()
+        .chain(CHAT_TAIL)
+        .flat_map(|(_, build)| build.render(&ToolCapabilities::all_open()))
+        .map(|t| t.name)
+        .collect();
+
+    assert_eq!(
+        from_rows,
+        offered_names(&ToolCapabilities::all_open()),
+        "a schema reached the array from somewhere other than a registry row"
+    );
+}
+
+/// The wire order of the array, frozen.
+///
+/// The order IS the prefix Anthropic keys its first cache segment on. Moving
+/// a schema therefore rewrites the whole 27,000-token tier, for every
+/// workspace on the build. Nothing else notices: the budget meter sums, the
+/// gate tests check membership, and a reorder changes neither.
+///
+/// This list is a RATCHET, like the schema-size ceilings. Appending a tool is
+/// a one-line diff here and a deliberate cache event; a reorder is a large
+/// diff, which is the point.
+///
+/// `keep_in_context` and `scratchpad` left the list when the self-curated
+/// context mode stopped adding tools: the keep became a `[KEEP OPEN]` line in
+/// the working understanding, and the document became ordinary text. Both were
+/// gated on the mode, so a control array is untouched by their going. A lean
+/// array pays a rewrite on this build regardless, since the whole mode prompt
+/// changed.
+const FROZEN_WIRE_ORDER: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_python",
+    "run_python_background",
+    "run_bash",
+    "run_bash_background",
+    "bash_output",
+    "bash_kill",
+    "list_files",
+    "glob_files",
+    "grep_files",
+    "copy_file",
+    "delete_file",
+    "reload_proxy_modules",
+    "proxy_request",
+    "http_request",
+    "import_file",
+    "git_clone",
+    "get_backup_status",
+    "fetch_news",
+    "browser_open",
+    "browser_extract",
+    "browser_click",
+    "browser_type",
+    "browser_eval",
+    "browser_screenshot",
+    "browser_close",
+    "browser_forget_login",
+    "browser_clear_data",
+    "web_search",
+    "request_credential",
+    "configure_email",
+    "send_email",
+    "read_emails",
+    "read_email",
+    "save_email_attachment",
+    "create_app",
+    "list_apps",
+    "load_knowhow",
+    "refresh_app",
+    "capture_app",
+    "connect_oauth_account",
+    "run_thread",
+    "run_coding_agent",
+    "follow_up_child_thread",
+    "execute_intent",
+    "ask_user_question",
+    "await_event",
+    "list_event_waits",
+    "cancel_event_wait",
+    // The mode adds no tool now, so nothing sits here but `todo_write`, which
+    // the mode takes AWAY. `dismiss_from_context`, `keep_in_context` and
+    // `scratchpad` all left, each in its own change.
+    "todo_write",
+    "send_notification",
+    "notifications",
+    "preferences",
+    "triggers",
+    "trigger_groups",
+    "events",
+    "changes",
+    "threads",
+    "memory",
+    "thread_queue",
+    "env_vars",
+    "manage_models",
+    "manage_repositories",
+    "mcp",
+    "plugins",
+    "navigate_ui",
+    "save_thread_image",
+    "view_image",
+    "generate_image",
+];
+
+/// The whole engine-authored array, in the order `chat::process::run` splices
+/// it. MCP tools are excluded: they are discovered from running servers, so
+/// they are the workspace's own ordering rather than the engine's.
+fn chat_wire_order(caps: &ToolCapabilities) -> Vec<String> {
+    get_default_tools(caps)
+        .into_iter()
+        .chain([get_notification_tool()])
+        .chain(crate::capability_manifest::llm_tools())
+        .chain(chat_tail_tools(caps))
+        .map(|t| t.name)
+        .collect()
+}
+
+#[test]
+fn the_wire_order_is_frozen() {
+    assert_eq!(
+        chat_wire_order(&ToolCapabilities::all_open()),
+        FROZEN_WIRE_ORDER,
+        "the tools array reordered. That rewrites the first cache segment for \
+         every workspace on this build, so it is only ever deliberate: update \
+         FROZEN_WIRE_ORDER in the same change, and say why the order moved."
+    );
+}
+
+/// Exactly which tools may address a *registered repository*, checked as a
+/// schema fact rather than as a policy nobody re-reads.
+///
+/// The three reads plus `edit_file` are the whole surface. `write_file`,
+/// `delete_file` and `copy_file` are excluded on purpose: creating and deleting
+/// repo files is structural work belonging to `run_coding_agent`, which lands
+/// it as a reviewable change (ADR 0093).
+#[test]
+fn only_the_reads_and_edit_file_accept_a_repo_argument() {
+    let tools = get_default_tools(&ToolCapabilities::all_open());
+    let takes_repo = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} must be registered"))
+            .parameters
+            .get("properties")
+            .and_then(|p| p.get("repo"))
+            .is_some()
+    };
+
+    for name in [tn::READ_FILE, tn::GLOB_FILES, tn::GREP_FILES, tn::EDIT_FILE] {
+        assert!(takes_repo(name), "{name} must accept `repo`");
+    }
+    for name in [tn::WRITE_FILE, tn::DELETE_FILE, tn::COPY_FILE] {
+        assert!(
+            !takes_repo(name),
+            "{name} must NOT accept `repo`: a repo write goes through run_coding_agent"
+        );
+    }
+}
+
+/// `commit` belongs to `edit_file` alone, and its description has to state the
+/// consequence. The agent is about to modify a checkout the user has open, and
+/// the only record is the working tree.
+#[test]
+fn edit_file_commit_flag_states_that_nothing_is_committed() {
+    let tools = get_default_tools(&ToolCapabilities::all_open());
+    let edit = tools.iter().find(|t| t.name == tn::EDIT_FILE).unwrap();
+    let commit = edit
+        .parameters
+        .get("properties")
+        .and_then(|p| p.get("commit"))
+        .expect("edit_file must expose `commit`");
+    let desc = commit
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+
+    assert_eq!(commit.get("type").and_then(|v| v.as_str()), Some("boolean"));
+    assert!(desc.contains("false"), "got: {desc:?}");
+    assert!(desc.contains("commits nothing"), "got: {desc:?}");
+    assert!(desc.contains("git diff"), "got: {desc:?}");
+
+    for name in [tn::WRITE_FILE, tn::COPY_FILE, tn::DELETE_FILE] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert!(
+            tool.parameters
+                .get("properties")
+                .and_then(|p| p.get("commit"))
+                .is_none(),
+            "{name} must not offer `commit`: everything it writes is committed"
+        );
+    }
+}
+
+/// The `repo` argument is spelled once (`repo_arg`) so four schemas cannot
+/// drift. This pins that they really are identical.
+#[test]
+fn every_repo_argument_is_the_same_schema() {
+    let tools = get_default_tools(&ToolCapabilities::all_open());
+    let schema_for = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .parameters
+            .get("properties")
+            .and_then(|p| p.get("repo"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} must accept `repo`"))
+    };
+
+    let baseline = schema_for(tn::READ_FILE);
+    for name in [tn::GLOB_FILES, tn::GREP_FILES, tn::EDIT_FILE] {
+        assert_eq!(schema_for(name), baseline, "{name} drifted from read_file");
+    }
+    let desc = baseline
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        desc.contains("manage_repositories"),
+        "the arg must name how to discover a repo: {desc:?}"
     );
 }

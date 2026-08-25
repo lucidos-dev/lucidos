@@ -6,7 +6,7 @@ import type { App } from '../types';
 const switchMenuItem = vi.fn();
 const openSettingsSubview = vi.fn();
 const setActiveMenu = vi.fn();
-vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview, setActiveMenu }));
+vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview, setActiveMenu, openBackupSettings: vi.fn() }));
 
 const openAppById = vi.fn();
 const exitAppFullscreen = vi.fn(() => false);

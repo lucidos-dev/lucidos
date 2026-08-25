@@ -4223,6 +4223,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "libc",
+ "lucidos-local-token",
  "lucidos-tailscale",
  "objc2",
  "objc2-app-kit",
@@ -4253,6 +4254,9 @@ dependencies = [
  "clap",
  "dirs",
  "lucidos-build-slot",
+ "lucidos-local-token",
+ "lucidos-tailscale",
+ "qrcode",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4310,6 +4314,7 @@ dependencies = [
  "kamadak-exif",
  "lettre",
  "libc",
+ "lucidos-local-token",
  "lucidos-tailscale",
  "mail-parser",
  "native-tls",
@@ -4347,6 +4352,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucidos-eval"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "fastembed",
+ "lucidos-engine",
+ "lucidos-local-token",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "toml 0.8.23",
+ "uuid",
+]
+
+[[package]]
 name = "lucidos-gateway"
 version = "0.1.0"
 dependencies = [
@@ -4356,17 +4381,24 @@ dependencies = [
  "dotenvy",
  "futures",
  "libc",
+ "lucidos-local-token",
  "lucidos-tailscale",
+ "qrcode",
  "reqwest 0.12.28",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml 0.8.23",
  "tower",
  "tower-http",
 ]
+
+[[package]]
+name = "lucidos-local-token"
+version = "0.1.0"
 
 [[package]]
 name = "lucidos-tailscale"
@@ -5793,6 +5825,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
@@ -8247,6 +8285,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -9368,7 +9407,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

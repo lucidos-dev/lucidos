@@ -2,7 +2,7 @@
 //! "this thread is watching" pair.
 //!
 //! The count says HOW MANY and drives the Waiting status dot. The list says
-//! WHICH, and is the whole content of the subscription indicator: the reason,
+//! WHICH, and fills the waiting indicator's subscriptions section: the reason,
 //! the subscription chips, the countdown, the Stop waiting button.
 //!
 //! The frontend also folds its own list from a thread's `EventWait*` events.
@@ -488,6 +488,56 @@ async fn the_waits_reach_both_the_aggregate_and_the_thread_summary() {
         .expect("the thread is in the drawer list");
     assert_eq!(summary.live_event_wait_count, 1);
     assert_eq!(summary.live_event_waits, aggregate.live_event_waits);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression: a poison domain row must not wedge the boot rebuild.
+///
+/// A domain event's `aggregate_id` is the event TYPE, not a uuid. One
+/// `emit_event("EventWaitStarted", ...)` therefore wrote a permanent row whose
+/// `aggregate_id` was that literal, and `LIVE_WAITS_SQL` casts
+/// `aggregate_id::uuid`. The whole query failed, the cache came up empty, and
+/// every live wait was silently dropped on every boot after.
+///
+/// The emit boundary now refuses the name
+/// (`event_subscription::validate_emittable_event_type`), so this test writes
+/// the row in raw SQL. That is deliberate: events are append-only, so a row
+/// written before the boundary existed is still out there, and the query has to
+/// survive it on its own. `aggregate = 'thread'` in the WHERE clause is what
+/// does that, and this test is what stops it being tidied away.
+#[tokio::test]
+async fn a_non_uuid_domain_row_cannot_break_the_boot_rebuild() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let (thread_id, wait_id) = idle_thread_with_wait(&bus, &pool).await;
+
+    // The poison row, exactly as `emit_event` used to write it.
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id) \
+         VALUES ($1, 'EventWaitStarted', $2, 'domain', 'EventWaitStarted')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(serde_json::json!({ "summary": "an app made this up" }))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cache = crate::engine::event_wait::LiveWaits::new();
+    let loaded = crate::engine::event_wait::rebuild_live_waits(&pool, &cache)
+        .await
+        .expect("a non-uuid domain aggregate_id must not fail the rebuild");
+
+    assert_eq!(loaded, 1, "the real wait is still loaded");
+    let rebuilt: Vec<Uuid> = cache
+        .for_thread(thread_id)
+        .await
+        .iter()
+        .map(|w| w.wait_id)
+        .collect();
+    assert_eq!(rebuilt, vec![wait_id]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

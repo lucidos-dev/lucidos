@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.28.0"
+LUCIDOS_DEFAULT_VERSION="0.29.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -671,7 +671,7 @@ launch_runtime() {
     done <<EOF
 $(append_tls_env "$(service_runtime_env_pairs "$runtime_dir" "$data" "$LUCIDOS_PORT")")
 EOF
-    exec env "${envargs[@]}" "$runtime_dir/lucidos-gateway"
+    exec env "${envargs[@]}" "$(service_runtime_program "$runtime_dir")"
 }
 
 # ── service registration (default) ───────────────────────────────────────────
@@ -688,7 +688,7 @@ register_service() {
 
     local runtime_root gateway_bin env_block mode
     runtime_root="$(service_runtime_root "$prefix")"
-    gateway_bin="$runtime_root/lucidos-gateway"
+    gateway_bin="$(service_runtime_program "$runtime_root")"
     env_block="$(service_runtime_env_pairs "$runtime_root" "$data" "$LUCIDOS_PORT")"
     env_block="$(append_tls_env "$env_block")"
     env_block="$(append_provider_creds "$env_block")"

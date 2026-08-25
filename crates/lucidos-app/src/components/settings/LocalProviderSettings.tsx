@@ -16,8 +16,9 @@ const LOCAL_SERVICE = 'local';
  *  the `local_base_url` preference; an optional API key is stored as a `local`
  *  credential (most local servers ignore it — the engine omits the
  *  Authorization header when it's empty). The engine builds the provider only
- *  when a base URL or key is configured, and the change takes effect on the next
- *  engine restart.
+ *  when a base URL or key is configured. Both take effect at once: the engine's
+ *  provider subscriber watches the `local_base_url` preference as well as the
+ *  credential, so neither needs a restart.
  *
  *  Renders only the provider block; the enclosing "Providers" `settings-section`
  *  is owned by `SettingsView`. */

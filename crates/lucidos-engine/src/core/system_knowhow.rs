@@ -13,13 +13,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::core::knowhow::{Knowhow, KnowhowStore, KnowhowSummary};
+use crate::core::knowhow::{Knowhow, KnowhowListDepth, KnowhowStore, KnowhowSummary};
 
 pub struct SystemKnowhowStore;
 
 impl SystemKnowhowStore {
+    /// Every `.md` in the shipped tree, at any depth. A workspace root lists
+    /// docs only, but this corpus is curated in the repo: what ships is the
+    /// catalog, and a stray depth is a bug we fix at the source.
     pub fn load_summaries(dir: &Path) -> Vec<KnowhowSummary> {
-        KnowhowStore::load_summaries(dir)
+        KnowhowStore::load_summaries(dir, KnowhowListDepth::Unbounded)
     }
 
     pub fn load(dir: &Path, id: &str) -> Option<Knowhow> {
@@ -123,6 +126,25 @@ mod tests {
             .collect();
         assert!(ids.contains(&"best-practices".to_string()));
         assert!(ids.contains(&"lucidos-cli".to_string()));
+    }
+
+    /// A workspace root lists docs only, and the shipped corpus does not. The
+    /// depth cap is about a user's own files, so it must not reach this tree:
+    /// `shipped_system_knowhow_files_all_parse` walks every file at any depth.
+    #[test]
+    fn load_summaries_lists_a_doc_at_any_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_doc(
+            &tmp.path().join("scripts").join("deep").join("helper.md"),
+            "Helper",
+            "Body.",
+        );
+
+        let ids: Vec<String> = SystemKnowhowStore::load_summaries(tmp.path())
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["scripts/deep/helper".to_string()]);
     }
 
     #[test]

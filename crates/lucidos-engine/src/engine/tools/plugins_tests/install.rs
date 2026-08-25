@@ -84,18 +84,18 @@ async fn install_without_source_succeeds_and_omits_from_in_summary() {
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (msg, _files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install must succeed even with no source field");
-    assert_eq!(msg, "Installed Sourceless Plugin v0.1.0 (1 files).");
+    assert_eq!(
+        write.summary,
+        "Installed Sourceless Plugin v0.1.0 (1 files)."
+    );
 
     let events = bus.emitted_events();
     assert_eq!(events.len(), 1);
@@ -143,7 +143,12 @@ fn prepare_install_request_returns_sentinel_and_registers_pending() {
     let archive = build_fixture_archive(&archive_dir, "preview-body");
     let pending = fresh_pending_map();
 
-    let result = prepare_install_request(&scratch, &pending, archive.to_str().unwrap());
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Default::default(),
+    );
 
     assert!(
         result.starts_with(PLUGIN_INSTALL_REQUEST_PREFIX),
@@ -184,7 +189,12 @@ fn prepare_install_request_lists_overwrites_when_files_already_exist() {
     std::fs::write(scratch.join("data/knowhow/fixture.md"), "existing").unwrap();
     let pending = fresh_pending_map();
 
-    let result = prepare_install_request(&scratch, &pending, archive.to_str().unwrap());
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Default::default(),
+    );
     let payload = parse_sentinel_payload(&result);
     let overwrites: Vec<&str> = payload["overwrites"]
         .as_array()
@@ -207,7 +217,8 @@ fn prepare_install_request_returns_error_string_on_invalid_source() {
     let scratch = fresh_workspace();
     let pending = fresh_pending_map();
 
-    let result = prepare_install_request(&scratch, &pending, "not-a-real-source");
+    let result =
+        prepare_install_request(&scratch, &pending, "not-a-real-source", &Default::default());
 
     assert!(result.starts_with("Error:"), "got: {}", result);
     assert!(
@@ -231,7 +242,12 @@ async fn cancel_pending_install_emits_event_and_drops_staging() {
     let archive = build_fixture_archive(&archive_dir, "to-cancel");
     let pending = fresh_pending_map();
 
-    let result = prepare_install_request(&scratch, &pending, archive.to_str().unwrap());
+    let result = prepare_install_request(
+        &scratch,
+        &pending,
+        archive.to_str().unwrap(),
+        &Default::default(),
+    );
     let payload = parse_sentinel_payload(&result);
     let install_id = payload["install_id"].as_str().unwrap().to_string();
 
@@ -318,20 +334,17 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (msg, _files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install must succeed");
 
     assert_eq!(
-        msg, "Installed With Setup v0.1.0 (1 files).",
+        write.summary, "Installed With Setup v0.1.0 (1 files).",
         "a manifest with setup must not widen the summary beyond the one line"
     );
 
@@ -539,10 +552,7 @@ async fn latest_install_round_trips_id_version_source_and_files() {
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install must succeed");
@@ -861,14 +871,11 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (_msg, files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install must succeed");
@@ -878,7 +885,7 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
     // 1. None of the installed files may be left untracked/dirty. Before the
     //    fix, every one of these reported `WT_NEW` (the `?? data/apps/...`
     //    lines from the bug report).
-    for rel in &files {
+    for rel in &write.installed_files {
         let repo_path = format!("data/{}", rel);
         let status = repo
             .status_file(std::path::Path::new(&repo_path))
@@ -905,7 +912,7 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
     // 3. The commit's tree actually contains every installed file (one commit
     //    across both `apps/` and `knowhow/`).
     let tree = head_commit.tree().expect("commit tree");
-    for rel in &files {
+    for rel in &write.installed_files {
         let repo_path = format!("data/{}", rel);
         assert!(
             tree.get_path(std::path::Path::new(&repo_path)).is_ok(),
@@ -914,8 +921,12 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
         );
     }
     assert!(
-        files.contains(&"apps/git-track-plugin/index.html".to_string())
-            && files.contains(&"knowhow/git-track.md".to_string()),
+        write
+            .installed_files
+            .contains(&"apps/git-track-plugin/index.html".to_string())
+            && write
+                .installed_files
+                .contains(&"knowhow/git-track.md".to_string()),
         "fixture must span apps/ and knowhow/ to prove a single multi-dir commit"
     );
 

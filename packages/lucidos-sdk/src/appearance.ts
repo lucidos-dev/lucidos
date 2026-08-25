@@ -159,6 +159,21 @@ export function resolveTheme(theme: ThemePref, prefersLight: boolean): ResolvedT
 }
 
 /**
+ * How long the shell and every app iframe wait before sampling the OS
+ * appearance, once something suggests it moved.
+ *
+ * Backgrounding an iOS app makes UIKit flip its trait collection to the
+ * opposite appearance and straight back, to render both app-switcher snapshots
+ * (rdar://7213631). WKWebView passes each flip into the page as a real
+ * `prefers-color-scheme` change. The delay is long enough for the second half
+ * of that pair to land, and short enough to read as immediate.
+ *
+ * A skew between the surfaces would only mean one repainting before another,
+ * so this is here for the single definition rather than for agreement.
+ */
+export const SYSTEM_THEME_SETTLE_MS = 300;
+
+/**
  * Which font a stored value selects, defaulting to {@link DEFAULT_FONT_FAMILY}.
  *
  * Every surface resolves the KEY once and then reads both maps with it, rather

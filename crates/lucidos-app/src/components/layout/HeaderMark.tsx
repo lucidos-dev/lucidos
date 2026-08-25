@@ -1,10 +1,13 @@
 import { useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
+import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease, unreadCount } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
-import { openSettingsSubview } from '../../store/actions/menu';
+import { openWhatsNew, switchMenuItem } from '../../store/actions/menu';
+import { crossWorkspaceUnreadTotal, peerWorkspaces, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
+import { openWorkspaceNotifications } from '../../api/client/control';
+import { WORKSPACE_ID } from '../../utils/basePath';
 import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { composeHandlers } from '../chat/promptFocus';
@@ -12,7 +15,8 @@ import { focusSearchInput } from '../search/searchEverywhereActions';
 import { Overlay } from '../shared/Overlay';
 import { ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
-import { BrandBadge } from './BrandBadge';
+import { BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
+import { notificationsMenuGroup } from './NotificationsMenuRows';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
 import { WorkspacesMenuRow } from './WorkspaceSwitcher';
 
@@ -173,6 +177,25 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             in under the user's eyes rather than waiting for the next open. */}
         {connectionNoticeRow(connectionStatus.value, visibleWorkspaceName.value)}
 
+        {/* Where the unread notifications are, this workspace included. It
+            LEADS the panel because it is the news the mark's badge just
+            advertised, and the icon badge before that: a user who opened the
+            menu because something said "1" must not have to hunt. Renders
+            nothing, separator included, when everything is read. */}
+        {notificationsMenuGroup({
+          peers: peerWorkspaces.value,
+          ownUnread: unreadCount.value,
+          ownId: WORKSPACE_ID,
+          ownName: visibleWorkspaceName.value,
+          onOpenOwn: () => { onClose(); switchMenuItem('notifications'); },
+          onOpenPeer: (row) => {
+            onClose();
+            // `id` is non-null for a peer: peers only exist behind the gateway,
+            // and every row there comes from the control listing.
+            if (row.id) openWorkspaceNotifications(row.id);
+          },
+        })}
+
         {/* What you are running, and the answer to the question a version
             number raises. It leads the menu because it is identity rather than
             an action: the bar no longer says the word "Lucidos" anywhere, so
@@ -190,7 +213,10 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
           // surfaces get the sentence instead.
           aria-label={versionLabel}
           data-tooltip={versionLabel}
-          onClick={() => { onClose(); openSettingsSubview('whats-new'); }}
+          // Names no release: this row is about the one you are RUNNING, which
+          // is what the panel opens by itself. Going through `openWhatsNew`
+          // anyway is what clears a target an update offer left behind.
+          onClick={() => { onClose(); openWhatsNew(); }}
         >
           <LucidosMarkIcon />
           Lucidos
@@ -302,9 +328,17 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
   // the rest of it in full. Same table as the bar and the menu notice, so a
   // hover and a glance cannot disagree.
   const sentence = connectionNoticeSentence(status, visibleWorkspaceName.value, 'short');
-  const label = inRow
-    ? 'Lucidos menu'
-    : `Lucidos menu · ${sentence ?? connectionPhrase(status, visibleWorkspaceName.value)}`;
+  // The unread count is spoken HERE rather than on the badge that draws it.
+  // That badge is `pointer-events: none` and aria-hidden. Neither a pointer nor
+  // a screen reader reaches it; the mark is the element both land on. Without
+  // this the count would be silent on the two panes the bell never appears on,
+  // which is the whole reason it rides the mark.
+  const unread = unreadBadgeLabel(crossWorkspaceUnreadTotal.value);
+  const label = [
+    'Lucidos menu',
+    unread,
+    inRow ? null : (sentence ?? connectionPhrase(status, visibleWorkspaceName.value)),
+  ].filter(Boolean).join(' · ');
 
   return (
     <>
@@ -331,7 +365,18 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
           // Only the cluster mark is the connection light, so only it carries
           // the attribute the state rules key on (see the component doc).
           data-conn={inRow ? undefined : status}
-          onClick={() => setOpen(!open)}
+          onClick={() => {
+            // Re-read the peer counts on the way in, so the notifications group
+            // is current rather than as of the last resume or tick.
+            //
+            // `WorkspacesMenuRow` deliberately hangs its own fetch off its
+            // EXPAND instead, and that rule still holds for it: it has nothing
+            // cached, so a fetch there would put Refresh and Restart behind a
+            // spinner. The group does have a cache, renders from it instantly,
+            // and this only corrects it.
+            if (!open) void refreshOtherWorkspacesUnread();
+            setOpen(!open);
+          }}
           aria-haspopup="menu"
           aria-expanded={open}
           // Colour and motion carry the connection state visually on the cluster
@@ -348,6 +393,10 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
           {inRow ? <LucidosMarkIcon /> : <span class="brand-mark-glyph"><LucidosMarkIcon /></span>}
         </button>
         <BrandBadge />
+        {/* The unread count, on the OPPOSITE corner from the state badge above
+            so the two coexist. See `UnreadBrandBadge` for why it is the bottom
+            one, and why it is not a button. */}
+        <UnreadBrandBadge />
       </span>
 
       <LucidosMenu

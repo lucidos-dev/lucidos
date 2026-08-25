@@ -9,11 +9,15 @@ import { sendMessage } from '../../store/actions/chat';
 import { fetchCodingAgentCommands, type CodingAgentCommandDef, type CodingAgentCommandsResponse, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import type { CodingAgent } from '../../api/types';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
-import { isTextInput } from '../../utils/dom';
+import { focusIfNeeded, isTextInput } from '../../utils/dom';
 import { errorDetail } from '../../utils/errorDetail';
-import { focusIfNeeded } from './promptFocus';
 import { Overlay } from '../shared/Overlay';
-import { availableReasoningOptions, reconcileReasoningEffort } from './codingAgentOptions';
+import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
+import {
+  decodePair, pairLabelOf, type ModelChoice, type ModelRow, type TierChoice,
+} from '../../store/modelSelection';
+import { ControlOptionList, type ControlOption } from '../shared/ControlOptionList';
+import { ModelSelectionPicker } from '../shared/ModelSelectionPicker';
 import { FrontendPreviewSection } from './FrontendPreviewSection';
 import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 
@@ -46,6 +50,18 @@ function hasAnyCommands(control: unknown[], builtin: string[], skill: string[]):
 type ListItem =
   | { type: 'control'; subtype: string; label: string }
   | { type: 'slash'; name: string };
+
+/** The control commands to OFFER.
+ *
+ *  A *model selection* is one thing, so it is one entry: the `set_model` rows
+ *  carry the tier too. The backend still serves `set_reasoning_effort`, and the
+ *  request this menu sends to reconcile a live session still uses it. It is
+ *  never a row the user picks on its own. */
+export function offeredControlCommands(
+  commands: readonly CodingAgentCommandDef[],
+): CodingAgentCommandDef[] {
+  return commands.filter(c => c.subtype !== 'set_reasoning_effort');
+}
 
 interface Props {
   threadId?: string;
@@ -98,14 +114,45 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const effectiveSkillCommands = isClaudeCode ? skillCommands.value : [];
   const effectiveModel = pendingModel ?? currentModel.value;
   const selectedReasoningEffort = pendingReasoningEffort ?? currentReasoningEffort.value;
-  const reasoningOptions = controlCommands.value
-    .find(command => command.subtype === 'set_reasoning_effort')
-    ?.params[0]?.options ?? [];
-  const effectiveReasoningEffort = reconcileReasoningEffort(
-    selectedReasoningEffort,
-    effectiveModel,
-    reasoningOptions,
-  ) as CodingAgentReasoningEffort | null;
+  const optionsOf = (subtype: string) =>
+    controlCommands.value.find(command => command.subtype === subtype)?.params[0]?.options ?? [];
+  // The served model rows already carry their tiers, so this is the same shape
+  // the Lucidos Agent's registry adapter produces.
+  const modelChoices: ModelChoice[] = optionsOf('set_model').map(o => ({
+    value: o.value,
+    label: o.label,
+    description: o.description,
+    reasoningEfforts: o.reasoning_efforts ?? [],
+  }));
+  const tierVocabulary: TierChoice[] = optionsOf('set_reasoning_effort');
+  // No model picked yet means the backend's own default, which IS the
+  // `default` row. Asking that row keeps the compose view (no session, no
+  // recorded model) offering the universally-accepted tiers.
+  const tierModel = effectiveModel ?? 'default';
+  const selection = useModelSelection({
+    models: modelChoices,
+    vocabulary: tierVocabulary,
+    model: tierModel,
+    effort: selectedReasoningEffort,
+    onChange: applySelectionOverride,
+  });
+
+  /** Record a pick where this surface's picks live, never an account
+   *  preference. Compose writes the draft's own override, or the pending slot
+   *  before a draft exists. An active thread writes the global pending signals,
+   *  which `loadCommands` clears once the live session has adopted the value.
+   *
+   *  Both halves land together, because the pair is picked whole. */
+  function applySelectionOverride(patch: ModelSelectionPatch) {
+    const model = patch.model === 'default' ? null : patch.model as CodingAgentModelValue;
+    const effort = patch.reasoningEffort as CodingAgentReasoningEffort | null;
+    if (inCompose) {
+      updateComposeSelection(composeThreadId ?? null, { ccModel: model, ccReasoningEffort: effort });
+      return;
+    }
+    codingAgentPendingModel.value = model;
+    codingAgentPendingReasoningEffort.value = effort;
+  }
 
   function clearRetryTimer() {
     if (retryTimerRef.current !== null) {
@@ -318,14 +365,22 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     }
   }, [open.value, activeCommand.value]);
 
-  // Focus options list when entering options view
+  // Focus the options view on entry, so its arrow keys are live. The model
+  // picker focuses whichever of its own two steps is showing.
   useEffect(() => {
-    optionsListRef.current?.focus();
+    if (activeCommand.value !== null && activeCommand.value !== 'set_model') {
+      focusIfNeeded(optionsListRef.current);
+    }
   }, [activeCommand.value]);
 
   function selectCommand(subtype: string) {
     activeCommand.value = subtype;
     paramValues.value = {};
+    // The filter box is shared with the command list behind it, so a query
+    // typed to FIND this command must not also narrow its options.
+    filter.value = '';
+    // The model picker seeds its own highlight, since only it knows which of
+    // its two steps is showing.
     highlightIndex.value = 0;
   }
 
@@ -351,42 +406,40 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     });
   }
 
-  /** Send a control request with a single option value (for commands with options).
-   *  Always captures the selection in a pending preference — for pre-session and
-   *  no-active-session this is the only path; for active sessions it's a fallback
-   *  that survives the race where the live session ends between menu render and
-   *  click (idle exit removes it from agent_sessions, sendCodingAgentControl returns 404).
-   *  When a live session accepts the control, loadCommands() clears pending on
-   *  the next refresh. */
+  /** Send a control request with a single option value, for a command that
+   *  serves options. A *model selection* has its own path, `pickModelSelection`,
+   *  because it is a pair and it records a pending pick.
+   *
+   *  With no live session there is nothing to send, and this command has no
+   *  pending slot to park the choice in, so it only reports. */
   async function selectOption(cmd: CodingAgentCommandDef, value: string, label: string) {
-    let reconciledEffort: CodingAgentReasoningEffort | null = null;
-    let effortChanged = false;
-    if (cmd.subtype === 'set_model') {
-      const next = value === 'default' ? null : value as CodingAgentModelValue;
-      reconciledEffort = reconcileReasoningEffort(
-        selectedReasoningEffort,
-        value,
-        reasoningOptions,
-      ) as CodingAgentReasoningEffort | null;
-      effortChanged = selectedReasoningEffort !== null
-        && reconciledEffort !== selectedReasoningEffort;
-      // Compose → per-draft override (persisted via the debounced compose PUT),
-      // or the PENDING slot before a draft exists; active thread → the global
-      // pending signal. Never leaks across drafts and never writes a global from compose.
-      if (inCompose) {
-        updateComposeSelection(composeThreadId ?? null, {
-          ccModel: next,
-          ...(effortChanged ? { ccReasoningEffort: reconciledEffort } : {}),
-        });
-      } else {
-        codingAgentPendingModel.value = next;
-        if (effortChanged) codingAgentPendingReasoningEffort.value = reconciledEffort;
-      }
-    } else if (cmd.subtype === 'set_reasoning_effort') {
-      const next = value as CodingAgentReasoningEffort;
-      if (inCompose) updateComposeSelection(composeThreadId ?? null, { ccReasoningEffort: next });
-      else codingAgentPendingReasoningEffort.value = next;
+    if (!threadId || !hasActiveSession.value) {
+      showToast(`${cmd.label}: ${label}`, 'success');
+      close();
+      return;
     }
+    sending.value = true;
+    const result = await sendCodingAgentControl(threadId, {
+      subtype: cmd.subtype,
+      [cmd.params[0].key]: value,
+    });
+    sending.value = false;
+    if (result !== 'error') showToast(`${cmd.label}: ${label}`, 'success');
+    close();
+  }
+
+  /** Apply a whole *model selection*, the picker's final answer.
+   *
+   *  A live session is reconciled with TWO control requests. The channel
+   *  preserves request order, so the model lands before the tier it accepts. If
+   *  the session exits between them, the pending pick recorded above carries
+   *  the tier into the next spawn or follow-up instead. */
+  async function pickModelSelection(encoded: string) {
+    const cmd = controlCommands.value.find(c => c.subtype === 'set_model');
+    if (!cmd) return;
+    const pair = decodePair(encoded);
+    const label = pairLabelOf(selection.rows, encoded);
+    selection.pick(encoded);
 
     if (!threadId || !hasActiveSession.value) {
       showToast(`${cmd.label}: ${label}`, 'success');
@@ -394,48 +447,40 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       return;
     }
     sending.value = true;
-    const request: Record<string, string> = { subtype: cmd.subtype, [cmd.params[0].key]: value };
-    const result = await sendCodingAgentControl(threadId, request);
-    let reconciliationResult: 'ok' | 'pending' | 'error' | null = null;
-    if (result === 'ok') {
-      if (cmd.subtype === 'set_model') {
-        currentModel.value = value as CodingAgentModelValue;
-      } else if (cmd.subtype === 'set_reasoning_effort') {
-        currentReasoningEffort.value = value as CodingAgentReasoningEffort;
-      }
-    }
-    // Keep the live runtime pair coherent too. The control channel preserves
-    // request order, so the model lands before the compatible effort. If the
-    // session exits between requests, the pending signal above carries the
-    // reconciled value into the next spawn/follow-up instead.
-    if (result === 'ok' && effortChanged && reconciledEffort !== null) {
-      reconciliationResult = await sendCodingAgentControl(threadId, {
+    const result = await sendCodingAgentControl(threadId, {
+      subtype: cmd.subtype,
+      [cmd.params[0].key]: pair.model,
+    });
+    let tierResult: 'ok' | 'pending' | 'error' | null = null;
+    if (result === 'ok') currentModel.value = pair.model as CodingAgentModelValue;
+    if (result === 'ok' && pair.effort) {
+      const tier = pair.effort as CodingAgentReasoningEffort;
+      tierResult = await sendCodingAgentControl(threadId, {
         subtype: 'set_reasoning_effort',
-        effort: reconciledEffort,
+        effort: tier,
       });
-      if (reconciliationResult === 'ok') {
-        currentReasoningEffort.value = reconciledEffort;
-      }
+      if (tierResult === 'ok') currentReasoningEffort.value = tier;
     }
     sending.value = false;
-    if (result !== 'error' && reconciliationResult !== 'error') {
+    if (result !== 'error' && tierResult !== 'error') {
       showToast(`${cmd.label}: ${label}`, 'success');
     }
     close();
   }
 
-  /** Look up the current value for a control command and return its display label.
-   *  Uses backend-returned per-thread values or pending overrides. No cross-thread leaking. */
+  /** The MODEL currently in force, as a label. Backend-returned per-thread
+   *  values or pending overrides, so nothing leaks across threads. */
+  function currentModelLabel(): string | null {
+    if (!effectiveModel) return null;
+    const opt = optionsOf('set_model').find(o => o.value === effectiveModel);
+    return opt?.label ?? effectiveModel;
+  }
+
+  /** What a control row shows after its label. A model selection shows the
+   *  whole pair, because that is what one pick sets. */
   function currentValueLabel(subtype: string): string | null {
-    const values: Record<string, string | null> = {
-      set_model: effectiveModel,
-      set_reasoning_effort: effectiveReasoningEffort,
-    };
-    const val = values[subtype];
-    if (!val) return null;
-    const cmd = controlCommands.value.find(c => c.subtype === subtype);
-    const opt = cmd?.params[0]?.options?.find(o => o.value === val);
-    return opt?.label ?? val;
+    if (subtype !== 'set_model') return null;
+    return currentModelLabel() ? selection.label : null;
   }
 
   async function submit() {
@@ -482,7 +527,8 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   const cmd = controlCommands.value.find(c => c.subtype === activeCommand.value);
   const hasOptions = cmd && cmd.params.length === 1 && cmd.params[0].options?.length;
   const q = filter.value.toLowerCase();
-  const filteredControl = q ? controlCommands.value.filter(c => c.label.toLowerCase().includes(q)) : controlCommands.value;
+  const offeredControl = offeredControlCommands(controlCommands.value);
+  const filteredControl = q ? offeredControl.filter(c => c.label.toLowerCase().includes(q)) : offeredControl;
   const filteredBuiltin = q ? effectiveBuiltinCommands.filter(sc => sc.toLowerCase().includes(q)) : effectiveBuiltinCommands;
   const filteredSkills = q ? effectiveSkillCommands.filter(sc => sc.toLowerCase().includes(q)) : effectiveSkillCommands;
 
@@ -493,16 +539,32 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     ...filteredSkills.map(sc => ({ type: 'slash' as const, name: sc })),
   ] : [];
 
-  const optionItems = hasOptions
-    ? (cmd.subtype === 'set_reasoning_effort'
-      ? availableReasoningOptions(cmd.params[0].options!, effectiveModel)
-      : cmd.params[0].options!)
+  /** The muted note beside a model's row. The Default row also names what it
+   *  resolves to, so the user sees what they inherit. */
+  function modelNote(row: ModelRow): string | undefined {
+    const current = row.value === 'default' ? currentModelLabel() : null;
+    if (!current) return row.description;
+    return row.description ? `${row.description} (currently ${current})` : `Currently ${current}`;
+  }
+
+  // A model selection has its own picker, with its own steps and keyboard.
+  // Every other option-bearing command (today none, but `set_permission_mode`
+  // could grow options) renders as served.
+  const showsModelPicker = cmd?.subtype === 'set_model';
+  const optionItems: ControlOption[] = hasOptions && !showsModelPicker
+    ? cmd.params[0].options!
     : [];
 
   function handleKeyDown(e: KeyboardEvent) {
+    // The picker consumes and stops every key it owns, so anything reaching
+    // here while it is up is a key neither of us handles.
+    if (showsModelPicker) return;
     if (e.key === 'Escape') {
       e.preventDefault();
-      if (cmd) { activeCommand.value = null; highlightIndex.value = 0; }
+      // Clear the query on the way out too. It is the option filter, and the
+      // command list behind this view would read it as its own and show
+      // nothing.
+      if (cmd) { activeCommand.value = null; filter.value = ''; highlightIndex.value = 0; }
       else close();
       return;
     }
@@ -573,14 +635,16 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
       >
           {!cmd ? (
             <div class="control-list">
-              <input
-                type="text"
-                class="control-input control-filter"
-                placeholder="Filter commands..."
-                value={filter.value}
-                ref={filterRef}
-                onInput={(e: Event) => { filter.value = (e.target as HTMLInputElement).value; highlightIndex.value = 0; }}
-              />
+              <div class="control-filter-bar">
+                <input
+                  type="text"
+                  class="control-input control-filter"
+                  placeholder="Filter commands..."
+                  value={filter.value}
+                  ref={filterRef}
+                  onInput={(e: Event) => { filter.value = (e.target as HTMLInputElement).value; highlightIndex.value = 0; }}
+                />
+              </div>
               {sections.map(section => (
                 <Fragment key={section.label}>
                   <div class="control-section-label">{section.label}</div>
@@ -616,37 +680,31 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
                   missing button. */}
               {threadId && !q && <FrontendPreviewSection threadId={threadId} />}
             </div>
+          ) : showsModelPicker ? (
+            <ModelSelectionPicker
+              label={cmd.label}
+              selection={selection}
+              disabled={sending.value}
+              describeModel={modelNote}
+              // Back to the command list, not out of the menu: this picker was
+              // opened from a row there.
+              back={{
+                label: 'All commands',
+                onBack: () => { activeCommand.value = null; highlightIndex.value = 0; },
+              }}
+              onPick={(encoded) => void pickModelSelection(encoded)}
+            />
           ) : hasOptions ? (
-            <div class="control-list" tabIndex={0} ref={optionsListRef}>
-              <div class="control-section-label">{cmd.label}</div>
-              {(() => {
-                const isModelCmd = cmd.subtype === 'set_model';
-                const isEffortCmd = cmd.subtype === 'set_reasoning_effort';
-                return optionItems.map((opt, i) => {
-                const isCurrent = (isModelCmd && opt.value !== 'default' && opt.value === effectiveModel)
-                  || (isEffortCmd && opt.value === effectiveReasoningEffort);
-                const defaultLabel = isModelCmd && opt.value === 'default' ? currentValueLabel('set_model') : null;
-                const desc = defaultLabel
-                  ? `${opt.description} (currently ${defaultLabel})`
-                  : opt.description;
-                return (
-                  <button
-                    key={opt.value}
-                    class={`control-item control-option${i === highlightIndex.value ? ' control-item-active' : ''}${isCurrent ? ' control-option-current' : ''}`}
-                    disabled={sending.value}
-                    onClick={() => void selectOption(cmd, opt.value, opt.label)}
-                    onMouseEnter={() => { highlightIndex.value = i; }}
-                  >
-                    <span class="control-option-label">
-                      {isCurrent && <span class="control-checkmark">&#10003;</span>}
-                      {opt.label}
-                    </span>
-                    <span class="control-option-desc">{desc}</span>
-                  </button>
-                );
-              });
-              })()}
-            </div>
+            <ControlOptionList
+              label={cmd.label}
+              options={optionItems}
+              currentValue={null}
+              highlightIndex={highlightIndex.value}
+              disabled={sending.value}
+              listRef={optionsListRef}
+              onPick={(opt) => void selectOption(cmd, opt.value, opt.label)}
+              onHighlight={(i) => { highlightIndex.value = i; }}
+            />
           ) : (
             <div class="control-form">
               <div class="control-form-title">{cmd.label}</div>

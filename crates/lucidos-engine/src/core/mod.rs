@@ -1,6 +1,7 @@
 pub mod announced_surfaces;
 pub mod apps;
 pub mod artifacts;
+pub mod aux_context_backfill;
 pub mod backup;
 pub mod blobs;
 pub mod changes;
@@ -12,6 +13,7 @@ pub mod email;
 pub mod environment_variables;
 pub mod event_subscription;
 pub mod events;
+pub mod grants;
 pub mod home_path;
 pub mod image_described_backfill;
 pub mod image_migration;
@@ -33,6 +35,8 @@ pub mod store;
 pub mod system_knowhow;
 pub mod user_dir;
 pub mod user_path;
+pub mod webhook_deliveries;
+pub mod webhooks;
 
 use std::borrow::Cow;
 
@@ -243,8 +247,9 @@ pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
 pub use environment_variables::{EnvironmentVariable, EnvironmentVariableStore};
+pub use grants::{grants_dir, GrantFile};
 pub use intents::{Intent, IntentStore};
-pub use knowhow::{Knowhow, KnowhowDirs, KnowhowStore, KnowhowSummary};
+pub use knowhow::{Knowhow, KnowhowDirs, KnowhowListDepth, KnowhowStore, KnowhowSummary};
 pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
 pub use oauth_registry::OAuthProviderRow;
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
@@ -402,12 +407,19 @@ pub use preferences::{
     DEFAULT_MAX_TOOL_CALLS, MIN_MAX_TOOL_CALLS, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT,
     PREF_CODING_AGENT_CLAUDE_PATH, PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL,
     PREF_LOCAL_BASE_URL, PREF_MAX_TOOL_CALLS, PREF_MODEL_COMMAND_JUDGE,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_VERTEX_REGION,
+    PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
+    PREF_MODEL_TITLE, PREF_OPENCODE_FREE_ENABLED, PREF_REASONING_COMMAND_JUDGE,
+    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
+    PREF_REASONING_TITLE, PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
+    PREF_SELF_CURATED_CONTEXT_MODE, PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
+    PREF_VERTEX_REGION,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
     ThreadEventRow, ThreadSummary,
 };
+pub use webhook_deliveries::{Claim, DeliveryLedger};
+pub use webhooks::{Webhook, WebhookStore};
 
 /// Reset the index to match HEAD's tree before staging. Drops entries a
 /// previous `commit_*` staged without committing. No-op on a fresh repo with
@@ -429,10 +441,19 @@ pub fn reset_index_to_head(
 /// shapes are classified and documented, and what
 /// [`retry_while_repo_contended`] retries on.
 ///
-/// **`Index` / `Locked`, lost the index lock.** `.git/index.lock` is
-/// CROSS-PROCESS and non-blocking. Any other writer of the repo holds it for
-/// its own index write, and a git2 write inside that window fails outright
-/// rather than waiting.
+/// **`Locked`, lost a git lock file.** Every git lock is CROSS-PROCESS and
+/// non-blocking, so a writer inside another writer's window fails outright
+/// rather than waiting. `Locked` is libgit2's single answer for "a lock file
+/// blocked this", whatever the lock was.
+///
+/// Match on the CODE alone: the class only says where libgit2 noticed. It writes
+/// `Index` for `.git/index.lock`, and `Os` for every other lock. A held
+/// `refs/heads/main.lock` takes the second route, and both are locks an ordinary
+/// write meets:
+///
+/// ```text
+/// {"error":"failed to lock file '<ws>/.git/refs/heads/main.lock' for writing: ; class=Os (2); code=Locked (-14)"}
+/// ```
 ///
 /// **`Reference` / `Modified`, lost the HEAD compare-and-swap.** `commit_index`
 /// reads the parent with `repo.head()`, then asks libgit2 to move HEAD off
@@ -444,11 +465,11 @@ pub fn reset_index_to_head(
 /// {"error":"old reference value does not match; class=Reference (4); code=Modified (-15)"}
 /// ```
 pub fn is_transient_repo_contention(e: &git2::Error) -> bool {
-    matches!(
-        (e.class(), e.code()),
-        (git2::ErrorClass::Index, git2::ErrorCode::Locked)
-            | (git2::ErrorClass::Reference, git2::ErrorCode::Modified)
-    )
+    e.code() == git2::ErrorCode::Locked
+        || matches!(
+            (e.class(), e.code()),
+            (git2::ErrorClass::Reference, git2::ErrorCode::Modified)
+        )
 }
 
 /// Run a git2 repository write, retrying briefly while another writer of the
@@ -552,6 +573,32 @@ pub fn commit_data_paths_added(
     data_relative_paths: &[String],
     message: &str,
 ) -> Result<String, git2::Error> {
+    commit_data_paths_with_overrides(workspace_path, data_relative_paths, &[], message)
+}
+
+/// [`commit_data_paths_added`], but recording chosen paths from a buffer
+/// instead of from the working tree.
+///
+/// A plugin update that merges the user's local edits needs the two to differ.
+/// The working tree gets the merge, and the commit records upstream's bytes, so
+/// the recorded commit stays a byte-exact copy of what the plugin shipped. That
+/// is the baseline the NEXT update diffs against. Commit the merge into it and
+/// the following update reads the patch as upstream's own content, sees no
+/// local modification, and silently discards it.
+///
+/// Each override carries its git file mode, because `add_frombuffer` records
+/// exactly what it is handed. Only the buffer path needs telling, since
+/// `add_path` reads the mode off disk. An executable file must not be recorded
+/// as `100644` just because its bytes arrived from memory.
+///
+/// An override for a path not listed in `data_relative_paths` is ignored: the
+/// list decides what the commit covers.
+pub fn commit_data_paths_with_overrides(
+    workspace_path: &std::path::Path,
+    data_relative_paths: &[String],
+    overrides: &[(String, Vec<u8>, u32)],
+    message: &str,
+) -> Result<String, git2::Error> {
     // Validate before the retry loop: a rejected path is the caller's answer,
     // not contention, so re-checking it on every attempt buys nothing.
     for p in data_relative_paths {
@@ -567,11 +614,42 @@ pub fn commit_data_paths_added(
         let mut index = repo.index()?;
         reset_index_to_head(&repo, &mut index)?;
         for p in data_relative_paths {
-            index.add_path(std::path::Path::new(&format!("data/{}", p)))?;
+            let repo_relative = format!("data/{}", p);
+            match overrides.iter().find(|(path, _, _)| path == p) {
+                Some((_, bytes, mode)) => index.add_frombuffer(
+                    &blob_index_entry(&repo_relative, git2::Oid::zero(), *mode),
+                    bytes,
+                )?,
+                None => index.add_path(std::path::Path::new(&repo_relative))?,
+            }
         }
         index.write()?;
         commit_index(&repo, message)
     })
+}
+
+/// A regular-file index entry for `repo_relative`, naming blob `id`.
+///
+/// Two callers with two needs. `Index::add_frombuffer` hashes the buffer and
+/// fills the id in itself, so it takes `Oid::zero()`. `merge_file_from_index`
+/// reads the id to find the blob, so it takes a real one. Neither consults the
+/// stat fields, which is why they stay zeroed. `mode` is `0o100644` or
+/// `0o100755`, the only two git records for a regular file.
+pub fn blob_index_entry(repo_relative: &str, id: git2::Oid, mode: u32) -> git2::IndexEntry {
+    git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: repo_relative.as_bytes().to_vec(),
+    }
 }
 
 /// Open the workspace repo, stage the deletion of the given `data/`-relative
@@ -1533,7 +1611,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "correct_memory" | "correct_memory_by_id" => "Updating memory...".to_string(),
         "search_memory" => search_label("Searching memory", args),
         "memory_source" => "Tracing a memory to its conversation...".to_string(),
-        "dismiss_from_context" => "Dismissing from context...".to_string(),
         "query_events" => format!(
             "Querying {} events...",
             args["event_type"].as_str().unwrap_or("all")
@@ -1542,6 +1619,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some(event_type) => format!("Counting {} events...", event_type),
             None => "Counting events...".to_string(),
         },
+        "list_event_types" => "Listing event types...".to_string(),
         "notifications" | "read_notifications" => match args["action"].as_str() {
             Some("mark_read") => "Marking notification read...".to_string(),
             Some("mark_all_read") => "Marking all notifications read...".to_string(),
@@ -1636,6 +1714,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 Some(event_type) => format!("Counting {} events...", event_type),
                 None => "Counting events...".to_string(),
             },
+            Some("event_types") => "Listing event types...".to_string(),
             // `query` (and any unrecognised action) → query label.
             _ => format!(
                 "Querying {} events...",

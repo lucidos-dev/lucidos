@@ -13,7 +13,7 @@ import { randomUUID } from 'crypto';
  *     test (simulating lucidos-cli's MCP subprocess).
  *   - Wait for the engine to emit CodingAgentPermissionRequest. The engine
  *     promotes that event into its own divider exchange (initiator panel,
- *     "Claude Code" chip), with the PermissionBody as the body — not inline in
+ *     "Claude" chip), with the PermissionBody as the body, not inline in
  *     the prior CC response panel.
  *   - Click Allow → engine resolves the oneshot via /api/v1/mcp/consent (driven
  *     by the click), responds to the still-blocked permission-prompt POST
@@ -69,7 +69,9 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
         .locator('.initiator-panel-lucidos:visible:has(.permission-body)')
         .first();
       await expect(panel).toBeVisible({ timeout: 15_000 });
-      await expect(panel.locator('.initiator-label')).toHaveText('Claude Code');
+      // The SHORT "Claude", not the full product name: the divider chip is the
+      // one place the coding agent's name is shortened (`describeExecutor`).
+      await expect(panel.locator('.initiator-label')).toHaveText('Claude');
       const body = panel.locator('.initiator-body .permission-body').first();
       await expect(body).toContainText(/Edit/);
       await expect(body).toContainText(`/tmp/cc-perm-e2e-${suffix}.txt`);

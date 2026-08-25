@@ -9,7 +9,7 @@ async fn recent_thread_messages_for_extraction_returns_oldest_first() {
     let thread = Uuid::new_v4();
     insert_thread(&pool, thread, "Test").await;
     insert_message(&pool, thread, "MessageReceived", "regnr bil").await;
-    insert_message(&pool, thread, "ResponseGenerated", "Ola Hansen (eier)").await;
+    insert_message(&pool, thread, "ResponseGenerated", "Example Owner (eier)").await;
     insert_message(&pool, thread, "MessageReceived", "tlf til verkstedet").await;
 
     let ctx = store
@@ -18,9 +18,9 @@ async fn recent_thread_messages_for_extraction_returns_oldest_first() {
         .expect("get context");
 
     assert!(ctx.contains("regnr bil"), "ctx={}", ctx);
-    assert!(ctx.contains("Ola Hansen (eier)"), "ctx={}", ctx);
+    assert!(ctx.contains("Example Owner (eier)"), "ctx={}", ctx);
     let first_pos = ctx.find("regnr bil").unwrap();
-    let second_pos = ctx.find("Ola Hansen").unwrap();
+    let second_pos = ctx.find("Example Owner").unwrap();
     assert!(first_pos < second_pos, "oldest first; ctx={}", ctx);
 
     teardown_test_db(&db).await;

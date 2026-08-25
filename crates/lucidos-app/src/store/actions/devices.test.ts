@@ -21,12 +21,24 @@ vi.mock('../../api/client', () => ({
   renameDevice: vi.fn(),
   setDevicePush: (...args: unknown[]) => setDevicePush(...args),
   deleteDevice: vi.fn(),
+  handOverDevice: (...args: unknown[]) => handOverDeviceMock(...args),
   setPreference: (...args: unknown[]) => setPreference(...args),
+}));
+
+const pairingSession = vi.fn();
+const handOverDeviceMock = vi.fn();
+vi.mock('../../api/client/pairing', () => ({
+  pairingSession: (...args: unknown[]) => pairingSession(...args),
 }));
 
 vi.mock('../store', () => ({
   showToast: (...args: unknown[]) => showToast(...args),
   showConfirm: vi.fn(),
+}));
+
+const postClientLog = vi.fn();
+vi.mock('../../utils/clientLog', () => ({
+  postClientLog: (...args: unknown[]) => postClientLog(...args),
 }));
 
 function makeDevice(id: string, push_enabled: boolean) {
@@ -222,5 +234,245 @@ describe('reconcileDeviceIdWithNativeStore', () => {
     await pending;
     expect(storage.read(KEY)).toBe('fresh-uuid');
     expect(storage.setItem).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * One device identity, minted at the gateway. The engine keyed its row on a
+ * UUID this browser minted. The gateway keyed the pairing on one of its own.
+ * So a single phone was two devices, with nothing joining them. Boot now
+ * adopts the gateway's id and asks the engine to move the row onto it.
+ *
+ * Pure (deps injected), so these tests need no DOM and no gateway.
+ */
+describe('adoptGatewayDeviceIdentity', () => {
+  const KEY = 'lucidos-device-id';
+
+  function makeStorage(init: Record<string, string> = {}) {
+    const m = new Map(Object.entries(init));
+    return {
+      getItem: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+      setItem: vi.fn((k: string, v: string) => {
+        m.set(k, v);
+      }),
+      read: (k: string) => (m.has(k) ? (m.get(k) as string) : null),
+    };
+  }
+
+  it('adopts the gateway id and hands the old row over to it', async () => {
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'minted-locally' });
+    const handOver = vi.fn().mockResolvedValue(undefined);
+
+    const named = await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'paired-device' }),
+      storage,
+      handOver,
+    });
+
+    expect(named).toBe(true);
+    expect(storage.read(KEY)).toBe('paired-device');
+    expect(handOver).toHaveBeenCalledWith('minted-locally', 'paired-device');
+  });
+
+  it('leaves the localStorage id alone when no gateway answers', async () => {
+    // A browser on a direct engine port. There is no paired-devices list there,
+    // so there is no second identity for this one to be confused with.
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'minted-locally' });
+    const handOver = vi.fn();
+
+    const named = await adoptGatewayDeviceIdentity({
+      session: async () => ({}),
+      storage,
+      handOver,
+    });
+
+    expect(named).toBe(false);
+    expect(storage.read(KEY)).toBe('minted-locally');
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(handOver).not.toHaveBeenCalled();
+  });
+
+  it('hands nothing over on a first run, having no old row to move', async () => {
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage();
+    const handOver = vi.fn();
+
+    await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'paired-device' }),
+      storage,
+      handOver,
+    });
+
+    expect(storage.read(KEY)).toBe('paired-device');
+    expect(handOver).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op on every load after the first', async () => {
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'paired-device' });
+    const handOver = vi.fn();
+    const previousId = vi.fn();
+
+    await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'paired-device' }),
+      storage,
+      handOver,
+      previousId,
+    });
+
+    expect(handOver).not.toHaveBeenCalled();
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(previousId).not.toHaveBeenCalled();
+  });
+
+  it('recovers the id from the native store after a desktop reinstall', async () => {
+    // A reinstall re-buckets the WKWebView container, so localStorage AND the
+    // pairing cookie are gone. The window pairs again under a new name, and the
+    // native store is the only place the old one survived.
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage();
+    const handOver = vi.fn().mockResolvedValue(undefined);
+    const remember = vi.fn().mockResolvedValue(undefined);
+
+    await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'paired-again' }),
+      storage,
+      handOver,
+      previousId: async () => 'before-reinstall',
+      remember,
+    });
+
+    expect(handOver).toHaveBeenCalledWith('before-reinstall', 'paired-again');
+    expect(storage.read(KEY)).toBe('paired-again');
+    expect(remember).toHaveBeenCalledWith('paired-again');
+  });
+
+  it("prefers this webview's own last id over the native store's", async () => {
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'minted-locally' });
+    const handOver = vi.fn().mockResolvedValue(undefined);
+    const previousId = vi.fn().mockResolvedValue('stale-native');
+
+    await adoptGatewayDeviceIdentity({
+      session: async () => ({ device_id: 'paired-device' }),
+      storage,
+      handOver,
+      previousId,
+      remember: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(handOver).toHaveBeenCalledWith('minted-locally', 'paired-device');
+    expect(previousId).not.toHaveBeenCalled();
+  });
+
+  it('forgets nothing when the hand-over fails, so the next load retries', async () => {
+    // THE failure that strands a row: commit the new id first and the only
+    // reference to the old one is gone, with its push subscription and its
+    // preferences under it. Nothing is written until the row has moved.
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage({ [KEY]: 'minted-locally' });
+    const remember = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      adoptGatewayDeviceIdentity({
+        session: async () => ({ device_id: 'paired-device' }),
+        storage,
+        handOver: vi.fn().mockRejectedValue(new Error('engine said 500')),
+        previousId: async () => null,
+        remember,
+      }),
+    ).rejects.toThrow('engine said 500');
+
+    expect(storage.read(KEY)).toBe('minted-locally');
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('keeps the native memory too when the hand-over fails after a reinstall', async () => {
+    // Same rule on the path where localStorage is already empty: the native
+    // store must still name the old row on the next attempt.
+    const { adoptGatewayDeviceIdentity } = await import('./devices');
+    const storage = makeStorage();
+    const remember = vi.fn().mockResolvedValue(undefined);
+
+    await expect(
+      adoptGatewayDeviceIdentity({
+        session: async () => ({ device_id: 'paired-again' }),
+        storage,
+        handOver: vi.fn().mockRejectedValue(new Error('engine said 500')),
+        previousId: async () => 'before-reinstall',
+        remember,
+      }),
+    ).rejects.toThrow('engine said 500');
+
+    expect(storage.read(KEY)).toBe(null);
+    expect(remember).not.toHaveBeenCalled();
+  });
+
+  it('swallows the failure at the production entry, and adopts nothing', async () => {
+    // The caller is boot, so a rejection must not wedge it. It reports "no
+    // gateway adopted us", which is true: the id is unchanged.
+    const { adoptGatewayDeviceId } = await import('./devices');
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'paired-device', local: false });
+    handOverDeviceMock.mockRejectedValue(new Error('engine said 500'));
+    localStorage.setItem(KEY, 'minted-locally');
+
+    await expect(adoptGatewayDeviceId(null)).resolves.toBe(false);
+    expect(localStorage.getItem(KEY)).toBe('minted-locally');
+  });
+
+  it('leaves a breadcrumb naming both ids when the hand-over is refused', async () => {
+    // Swallowing it is right, staying silent is not. A hand-over refused on
+    // every load strands the migration, and the only symptom the user sees is
+    // one device rendering as two rows. This puts it in `engine.log`.
+    const { adoptGatewayDeviceId } = await import('./devices');
+    postClientLog.mockClear();
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'paired-device', local: false });
+    handOverDeviceMock.mockRejectedValue(new Error('400 cannot hand a row over to'));
+    localStorage.setItem(KEY, 'minted-locally');
+
+    await expect(adoptGatewayDeviceId(null)).resolves.toBe(false);
+
+    expect(postClientLog).toHaveBeenCalledWith(
+      'devices',
+      'hand_over_failed',
+      expect.objectContaining({
+        old_device_id: 'minted-locally',
+        device_id: 'paired-device',
+        reason: expect.stringContaining('cannot hand a row over to'),
+      }),
+    );
+  });
+
+  it('leaves no breadcrumb when the hand-over lands', async () => {
+    const { adoptGatewayDeviceId } = await import('./devices');
+    postClientLog.mockClear();
+    pairingSession.mockResolvedValue({ paired: true, device_id: 'paired-device', local: false });
+    handOverDeviceMock.mockResolvedValue({ success: true, outcome: 'moved' });
+    localStorage.setItem(KEY, 'minted-locally');
+
+    await expect(adoptGatewayDeviceId(null)).resolves.toBe(true);
+    expect(postClientLog).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Source scan: the adoption must be awaited in boot, before anything registers
+ * a device. `registerCurrentDevice` upserts the row, and the engine refuses a
+ * hand-over once the new id has one, so the wrong order does not fail loudly.
+ * It just means the migration silently never runs.
+ */
+describe('boot order', () => {
+  it('awaits the gateway adoption in main.tsx, and registers nowhere near it', async () => {
+    // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
+    const { readFileSync } = await import('node:fs');
+    const main = readFileSync(
+      new URL('../../main.tsx', import.meta.url),
+      'utf8',
+    );
+    expect(main).toContain('await adoptGatewayDeviceId(');
+    expect(main).not.toContain('registerCurrentDevice');
   });
 });

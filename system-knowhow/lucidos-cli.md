@@ -270,7 +270,7 @@ $ lucidos threads list --status running --limit 5 | jq '.[].title'
 
 - `--status <list>` restricts to exactly the statuses you name, out of `idle`, `running`, `waiting`, `waiting_for_user_answer`, `paused`, `failed`. These are the same values each returned row's `status` field carries, so you can filter on what you read; the kebab spelling `waiting-for-user-answer` is accepted too. Repeatable (`--status running --status failed`) and comma-separated (`--status running,failed`) are the same request. An unrecognized or empty value is an error listing the valid ones, never a silently empty list.
 - `--active` selects the union above. Kept exactly as it was for existing callers; reach for it when you genuinely want "the loop is mid-flow in either direction", such as a badge counting threads the user has something invested in. Passing it together with `--status` is refused: they are two answers to one question.
-- The `--active` union contains only those two statuses. It never contains `waiting` (the coding-agent thread has stopped and proposed changes the user must act on, so the loop has paused), `failed` (the response is over, whether it errored or was interrupted with nobody resuming it), or `paused` (the user's own version switch interrupted that turn and the engine resumes it by itself). `--status` reaches all three by name, which is the only way to ask for them.
+- The `--active` union contains only those two statuses. It never contains `failed`, the response being over whether it errored or was interrupted with nobody resuming it. Nor `paused`, where the user's own version switch interrupted that turn and the engine resumes it by itself. `--status` reaches both by name, which is the only way to ask for them. It also reaches `waiting`, which nothing writes any more: it meant the coding agent had stopped with changes to review, and only older rows carry it.
 - `--source` is a comma-separated list of `chat`, `trigger`, `coding-agent`. Legacy `claude_code` is also accepted. Omit for all sources.
 - `--limit` clamps to `1..=1000` server-side, default 100.
 - `--parent <uuid>` restricts to that thread's **direct** children only, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
@@ -385,7 +385,9 @@ replaces, and polling for the event as well is strictly worse than either.
 
 Reach for it whenever the thing you are waiting on is something the engine
 emits: a change appearing (`ChangeProposed`), a trigger firing
-(`TriggerExecuted`), a workspace domain event your own scripts emit. It is
+(`TriggerExecuted`), a backup finishing (`BackupCompleted` / `BackupFailed`), a
+workspace domain event your own scripts emit. Any persisted event works, and a
+transient frame such as `BackupProgress` is refused by name. It is
 **not** for external state with no Lucidos event (a third-party API you can only
 re-query, a file another process may write): nothing would ever be delivered, so
 poll for those.
@@ -424,12 +426,15 @@ yourself a few minutes ago.
 
 - `--on` names the event type, PascalCase past tense. Repeat it to watch
   several: any one of them re-opens the thread.
-- `--condition` is a JSON object filtering the event's OWN payload fields (the
-  ones `lucidos events query` prints), applied to every `--on` name. Equality by
+- `--condition` is a JSON object filtering the event's OWN payload by field
+  path (a dot reads one level down), applied to every `--on` name. Equality by
   default, or an operator object: `{"$eq":v}`, `{"$ne":v}`, `{"$lt":n}`,
-  `{"$lte":n}`, `{"$gt":n}`, `{"$gte":n}`, `{"$in":[…]}`. One field beyond the
-  payload is always filterable on a thread event: `thread_id`, supplied by the
-  engine from the thread the event belongs to, so
+  `{"$lte":n}`, `{"$gt":n}`, `{"$gte":n}`, `{"$in":[…]}`, `{"$nin":[…]}`,
+  `{"$regex":"…"}`. `$or` in key position takes a list of whole conditions;
+  see `system-knowhow/triggers.md` § "What a condition can say" for the full
+  language. One field beyond the payload is always filterable on a thread
+  event: `thread_id`, supplied by the engine from the thread the event
+  belongs to, so
   `--condition '{"thread_id":"<uuid>"}'` scopes the wait to one thread. It will
   not appear in what `lucidos events query` prints (the event row carries the
   thread in its own column), and a **domain event** belongs to no thread and so
@@ -557,7 +562,7 @@ Pass exactly one of `--wait-id <ID>` (from `list`), `--on <EVENT_TYPE>`, or
 `--all`. None is defaulted: a bare call would have to guess between stopping one
 and stopping every one, and both guesses are wrong. Stopping is silent, so
 nothing interrupts you: the subscription simply ends, the user sees it leave the
-subscription indicator, and the transcript records what was stopped.
+waiting indicator, and the transcript records the stop.
 
 **`--on` is the one to reach for when the answer arrived some other way**, and
 it is the safe middle: it needs no id, so nothing has to be read out of `list`
@@ -866,7 +871,7 @@ $ lucidos models delete --id z-ai/glm-5.2                   # user models only
 ```
 
 `provider` is one of `vertex`, `anthropic`, `openai`, `openrouter`, `xai`,
-`local`.
+`opencode-free`, `local`.
 
 **`--context-window` is worth setting on every model you add.** It's the model's
 context window in tokens, and it sizes the engine's context budget. Omit it and
@@ -1097,6 +1102,8 @@ The preview registers **no service worker** and cannot do push: a dev server emi
 
 List the merged user + system-knowhow catalog. Wraps `GET /api/v1/knowhow` and echoes the engine's payload verbatim: `{ "knowhow": [{ "id", "name", "description" }] }`. Engine-shipped reference docs carry the `system-knowhow/` id prefix; user-curated knowhow uses its path under `data/knowhow/` without `.md`. Read `.knowhow[].id` to find the id to pass to `read`.
 
+The catalog holds knowhow *docs*. A doc's own reference files sit below the listed depth, so `list` does not show them and `read` still takes their full id. See `system-knowhow/building-knowhow.md` § "Where the file goes".
+
 ```bash
 $ lucidos knowhow list
 {"knowhow":[{"id":"audit-checklist","name":"Audit checklist","description":"..."},{"id":"system-knowhow/building-an-app","name":"Building an App","description":"Use when the user wants to build..."},...]}
@@ -1192,6 +1199,150 @@ Output is the response body on **stdout**. With `--include`, the status line and
 | Apply a coding-agent-proposed change from a script | `lucidos changes apply <id>` (never hand-roll the HTTP call — actor stamps as "You") |
 
 If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against an API the workspace already owns a credential for, that's drift — add an `apis.json` entry and switch the script to `lucidos proxy`.
+
+### `lucidos pair` (mint a code that lets a device in)
+
+Lucidos authenticates every caller that reaches it over the network. A device is
+paired once and then remembered, so a stranger who reaches the port is refused.
+
+```bash
+lucidos pair                        # print a code, and where to enter it.
+lucidos pair --qr                   # draw it as a QR to scan.
+lucidos pair --host mac.ts.net      # pick the hostname the QR points at.
+lucidos pair --label "My iPhone"    # name the device in the paired list.
+lucidos pair --port 5300            # a gateway on an unusual port.
+```
+
+Run it in a terminal on the machine Lucidos runs on, then type the code into the
+device you want to let in. It works once and expires in five minutes.
+
+**Reach for it only when nothing is paired yet, and know where it lives.** The
+desktop app pairs its own window on launch. Any paired device can add the next
+one from **Settings → Access → Add a device**. `lucidos` is on no `PATH`
+either: a desktop install keeps it at `Lucidos.app/Contents/Resources/lucidos`,
+and a headless one under the install prefix in `runtime/current/`.
+
+**`--qr` needs an address the phone can reach.** This command talks to
+`127.0.0.1`, and a QR aimed there helps nobody. So it resolves a hostname from
+the interface list: the MagicDNS name, else the tailnet address, else whatever
+`--host` says (which implies `--qr`). Tailscale is only picking a name to
+print, and the auth decision reads none of it.
+
+**Then it knocks on the door.** Holding a tailnet address is not the same as
+being reachable at it, and both defaults get that wrong in opposite
+directions. The packaged gateway binds loopback, where `<name>:<port>` is
+dead. `tailscale serve` fronts 443 on that same name and answers where the
+gateway's own port does not.
+
+So both origins are probed, and the first that answers wins. With neither
+answering there is no QR, and the command says which knob to turn. An explicit
+`--host` is never refused: probing then only picks which of its two origins to
+use.
+
+The QR is drawn black on white. A dark terminal would otherwise invert it, and
+many scanners refuse that. `NO_COLOR` drops the escapes.
+
+**From an already-paired device there is no terminal step at all.** Settings →
+Access → Add a device mints the same code and shows the same QR.
+
+**A browser has to pair too, even on that same machine.** Proving you are local
+means reading a file only your user can read, and a browser cannot read files.
+So a browser on the host goes through the same code as a phone does.
+
+Only a process on that machine can mint a code, which is what stops a remote
+caller from pairing itself in. An already-paired device may also mint one, so
+you can add a tablet without walking back to your desk.
+
+Nothing you run from a coding-agent session, a trigger or a script needs this.
+Those already prove they are local, and the CLI attaches that proof itself.
+
+### `lucidos webhooks list | create | update --id <id> | delete --id <id>`
+
+An endpoint a third party posts to, emitting one **pinned** domain event that a
+trigger can react to. The event is fixed when you create the webhook, so an
+endpoint you gave GitHub can only ever fire that one event.
+
+```bash
+lucidos webhooks list
+lucidos webhooks create --name deploys --event-type DeployFinished
+lucidos webhooks update --id <uuid> --enabled false
+lucidos webhooks delete --id <uuid>
+```
+
+`create` prints the webhook plus a **token**, and that is the only time the
+token exists in readable form. Only its digest is stored. A sender presents it
+as `Authorization: Bearer <token>`.
+
+**A signed webhook gets no token**, and that is what makes it usable. GitHub
+cannot attach one, so a hook holding both verifiers would refuse every real
+delivery. Configure `--hmac` and the hook authenticates by signature alone.
+
+Deliveries go to `{host}:{hook_port}/<slug>/<webhook-id>`, on the gateway's
+*hook socket* rather than its main port. `list` prints the path half of that as
+`delivery_path`; the host and port are your own. The hook port is the gateway's
+plus ten, so 5261 in dev and 5262 packaged.
+
+GitHub, Stripe and Slack authenticate by signing the request body with a shared
+secret. Save that secret as a credential, then name it in `--hmac`:
+
+```bash
+lucidos webhooks create --name github --event-type PullRequestOpened \
+  --hmac '{"credential":"example-repo-webhook",
+           "signature_header":"X-Hub-Signature-256",
+           "prefix":"sha256=","template":"{body}"}'
+```
+
+The secret stays in the credential; the webhook holds only its name. Slack adds
+`"timestamp_header":"X-Slack-Request-Timestamp"` with
+`"template":"v0:{timestamp}:{body}"` and `"prefix":"v0="`. Stripe packs both
+fields into one header, so it takes `"signature_key":"v1"` and
+`"timestamp_key":"t"` with `"template":"{timestamp}.{body}"`.
+
+A webhook needs at least one verifier and every one it has must pass. There is
+no LLM tool and no SDK namespace for any of this, deliberately: a webhook opens
+a publicly reachable door, so only you create one.
+
+#### What a delivery becomes
+
+Always three keys: `{summary, headers, payload}`. The sender's body is under
+`payload`, so a trigger condition reads `payload.action`. `headers` holds the
+request headers you allow-listed, read as `headers.X-GitHub-Event`. `summary` is
+the sender's own if the body has one, and a generated line otherwise.
+
+`--headers` is that allow-list. Without it the map is empty:
+
+```bash
+lucidos webhooks update --id <uuid> --headers '["X-GitHub-Event"]'
+```
+
+**`Authorization` and the hook's own signature header are refused**, since the
+event log is append-only and a carried secret would stay on it for good.
+
+#### Deduping a resend
+
+Senders resend. GitHub retries a slow response and has a Redeliver button,
+Stripe retries for days. By default Lucidos emits on every arrival, so a resend
+fires your triggers twice, and the log shows you how often it happens.
+
+`--dedupe` opts out of that. Name the header carrying the sender's own delivery
+id, and a resend inside the window emits nothing:
+
+```bash
+lucidos webhooks update --id <uuid> \
+  --dedupe '{"header":"X-GitHub-Delivery","window_secs":3600}'
+```
+
+The resend answers 200 with `"duplicate": true` and the event id the first
+delivery emitted, so the sender stops retrying. A resend that lands while the
+first delivery is still being handled gets a 503 instead: that one can still
+fail, and telling the sender "done" would lose the delivery. Omit `header`
+and the key is a digest of the body, which collapses two identical bodies inside
+the window. `window_secs` defaults to an hour and is capped at seven days;
+`0` switches deduping back off.
+
+Leaving it off is a real choice, not just the lazy one. Every arrival stays on
+the log, so allow-list the delivery-id header and a script trigger can count how
+often a sender resends.
 
 ## Workspace resolution
 

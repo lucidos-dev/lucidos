@@ -87,10 +87,28 @@ where
         }
 
         let mut encoder = GzipEncoder::with_quality(writer, Level::Fastest);
+
+        // Open the stream with one comment frame, flushed at once.
+        //
+        // Load-bearing on WebKit, which fires `EventSource.onopen` only once
+        // body BYTES arrive, where Chromium fires it on the response headers.
+        // Nothing else here writes until the first event or the first
+        // keep-alive tick, and gzip buffers its own header until a flush. So
+        // Safari and the iOS PWA sat at `connecting` for up to
+        // `SSE_KEEPALIVE_INTERVAL` after every page load.
+        //
+        // A comment line is ignored by every EventSource parser, so this
+        // changes what a client SEES not at all. If it cannot be written the
+        // client is already gone, and the loop below would exit on its first
+        // write anyway.
+        if encoder.write_all(KEEPALIVE_FRAME).await.is_ok() {
+            let _ = encoder.flush().await;
+        }
+
         let mut keepalive = tokio::time::interval(SSE_KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // First tick fires immediately — skip it so we don't send a keep-alive
-        // before the first real event has had a chance to arrive.
+        // First tick fires immediately, and the open frame above has just
+        // covered it, so skip it.
         keepalive.tick().await;
         tokio::pin!(json_stream);
         loop {
@@ -480,11 +498,7 @@ async fn restart_via_gateway(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // Loopback call to the co-located gateway; accept its self-signed dev cert
     // (harmless for the plain-http packaged case) and bypass any ambient proxy.
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
-        .build()
-    {
+    let client = match crate::gateway_auth::client_builder().build() {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("gateway restart client build failed: {e}");
@@ -703,6 +717,11 @@ pub(super) struct EventsQueryParams {
     /// pre-existing caller sends, so the filter can only ever narrow.
     #[serde(default)]
     thread_id: Option<uuid::Uuid>,
+    /// Resolve one event by primary key. A `String` rather than a `Uuid`,
+    /// unlike the two cursors above. This is the address an agent noted from
+    /// a tool result, so it arrives in the `evt-<32 hex>` form.
+    #[serde(default)]
+    event_id: Option<String>,
     #[serde(default = "default_events_limit")]
     limit: i64,
 }
@@ -804,6 +823,20 @@ pub(super) async fn query_events(
     if let Err(msg) = validate_cursor_pair(q.before_event_id, q.after_event_id) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
+    // Refused rather than ignored: a malformed address silently dropped would
+    // widen a one-row lookup into the newest 100 events of every type.
+    let event_id = match q.event_id.as_deref() {
+        None => None,
+        Some(raw) => match crate::core::store::parse_event_address(raw) {
+            Some(id) => Some(id),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("event_id '{raw}' is not a uuid or an 'evt-<32 hex>' address"),
+                ))
+            }
+        },
+    };
     let result = state
         .event_store
         .query_events_paged(
@@ -814,6 +847,7 @@ pub(super) async fn query_events(
                 before_event_id: q.before_event_id,
                 after_event_id: q.after_event_id,
                 thread_id: q.thread_id,
+                event_id,
             },
             limit,
         )
@@ -833,102 +867,34 @@ pub(super) async fn query_events(
     }
 }
 
-/// Well-known persisted event types, always offered by `/events/types` even on
-/// a workspace whose `events` table has no row of that type yet.
+/// The engine's own event names merged with every type this workspace's store
+/// has seen, sorted. Feeds the trigger form's `on_event:` dropdown.
 ///
-/// The trigger-config `on_event:` dropdown merges this constant with
-/// `distinct_event_types()`. A type absent here cannot be subscribed to until
-/// the workspace happens to produce one, which is backwards on a fresh install.
+/// The engine half is **derived**, never restated. `event_type_catalog` builds
+/// it from the two enumerations the engine keeps. So a rename reaches this list
+/// and the subscription validator in one commit, and every engine name offered
+/// here validates. A hand-copied constant was the previous shape, and it had
+/// drifted: 32 names, no `SystemEvent` at all, though the scheduler routes
+/// every persisted system frame to the trigger matcher.
 ///
-/// Membership rule, so additions stay auditable: a name belongs here iff a
-/// trigger subscribed to it would actually fire. That means a persisted
-/// **`ThreadEvent`** variant not on the `ThreadEvent::is_per_token_streaming`
-/// blocklist.
-///
-/// **No `SystemEvent` name belongs here.** The scheduler routes exactly one
-/// variant to the trigger matcher, `SystemEvent::DomainEvent`, so seeding
-/// `NotificationCreated` offers a subscription that can never fire.
-/// `TriggerCompleted` and `TriggerStarted` ARE here, because both names exist
-/// on `ThreadEvent` too and it is the thread-side emit that reaches the matcher.
-///
-/// Kept sorted, and `known_event_types_are_triggerable_thread_events` enforces both.
-const KNOWN_EVENT_TYPES: &[&str] = &[
-    "BackgroundBashCompleted",
-    "BackgroundBashStarted",
-    "ChangeApplied",
-    "ChangeApplyFailed",
-    "ChangeDiscarded",
-    "ChangeHardened",
-    "ChangeProposed",
-    "ChangeReverted",
-    "ChildThreadCompleted",
-    "CodingAgentIdled",
-    "CodingAgentPermissionRequest",
-    "CodingAgentUserMessageSent",
-    "CommandPermissionRequested",
-    "ContinuationStarted",
-    "CredentialRequested",
-    "McpPermissionRequested",
-    "MergeConflictDetected",
-    "MessageReceived",
-    "ResponseAborted",
-    "ResponseCanceled",
-    "ResponseFailed",
-    "ResponseGenerated",
-    "SessionEnded",
-    "SessionStarted",
-    "ThreadArchived",
-    "ThreadStarted",
-    "ThreadTitleGenerated",
-    "TriggerCompleted",
-    "TriggerStarted",
-    "UserQuestionAnswered",
-    "UserQuestionAsked",
-    "WorktreeCleaned",
-];
-
-/// Return known event types merged with any additional types from the database.
+/// The store half carries the workspace's own domain events, which no
+/// enumeration can know about. `event_type_catalog` runs it through the
+/// validator too, so a retired engine name still holding rows is dropped. The
+/// dropdown offers no name the next subscription refuses.
 pub(super) async fn event_types(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    let db_types = state
-        .event_store
-        .distinct_event_types()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to query event types: {}", e),
-            )
-        })?;
-    let mut all: Vec<String> = KNOWN_EVENT_TYPES.iter().map(|s| s.to_string()).collect();
-    for t in db_types {
-        if !all.contains(&t) {
-            all.push(t);
-        }
-    }
+    let catalog = crate::core::event_subscription::event_type_catalog(
+        &state.event_store,
+        crate::core::event_subscription::SubscriptionSurface::Trigger,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let mut all: Vec<String> = catalog.engine.into_iter().map(str::to_string).collect();
+    all.extend(catalog.workspace);
     all.sort();
     Ok(Json(all))
-}
-
-/// Validate an event type submitted to `POST /api/v1/events/emit`.
-///
-/// Domain events sent over HTTP come from app UIs (untrusted). After
-/// `to_sse_json()` unwraps `DomainEvent` to `{"type": <event_type>, ...}`,
-/// the wire shape of a domain event is identical to a system frame. Without
-/// this guard, an app could call `emit_event("NotificationCreated", {...})`
-/// and forge a notification on every connected SSE client.
-fn validate_emittable_event_type(event_type: &str) -> Result<(), String> {
-    if event_type.is_empty() {
-        return Err("event_type is required".into());
-    }
-    if crate::engine::event_bus::SystemEvent::is_reserved_type_name(event_type) {
-        return Err(format!(
-            "event_type '{}' is reserved for system events and cannot be emitted via this API",
-            event_type
-        ));
-    }
-    Ok(())
 }
 
 pub(super) async fn emit_event(
@@ -936,7 +902,9 @@ pub(super) async fn emit_event(
     headers: HeaderMap,
     Json(body): Json<EmitEventRequest>,
 ) -> Response {
-    if let Err(msg) = validate_emittable_event_type(&body.event_type) {
+    if let Err(msg) =
+        crate::core::event_subscription::validate_emittable_event_type(&body.event_type)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": msg })),
@@ -1024,6 +992,31 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    /// A browser must not wait for an event to learn the stream is open.
+    ///
+    /// WebKit fires `EventSource.onopen` on the first body BYTES, where
+    /// Chromium fires it on the response headers. Nothing was written until the
+    /// first event or the first keep-alive tick. So Safari and the iOS PWA sat
+    /// at `connecting` for up to 30 seconds after every page load.
+    #[tokio::test]
+    async fn the_gzipped_stream_writes_its_first_bytes_before_any_event() {
+        // A stream that never yields: exactly the common case, a page that
+        // connects while nothing is happening in the workspace.
+        let silent = futures::stream::pending::<String>();
+        let response = gzipped_sse_response(silent);
+        let mut body = futures::StreamExt::boxed(response.into_body().into_data_stream());
+
+        // Generously under SSE_KEEPALIVE_INTERVAL, and far under the 10s a
+        // browser test waits. The open frame makes this immediate.
+        let next = futures::StreamExt::next(&mut body);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .expect("the stream must announce itself without waiting for an event")
+            .expect("the stream must not end")
+            .expect("the first frame must not be an error");
+        assert!(!first.is_empty(), "an empty frame tells WebKit nothing");
+    }
+
     /// Regression: `read_app_version` must read fresh from disk on every call.
     /// A cached value makes a version bump from an applied change invisible to
     /// the health endpoint until an engine restart.
@@ -1066,11 +1059,6 @@ mod tests {
         // Returns "unknown" when the file is missing.
         std::fs::remove_file(&version_file).unwrap();
         assert_eq!(read_app_version(), "unknown");
-    }
-
-    #[test]
-    fn validate_emittable_event_type_rejects_empty() {
-        assert!(validate_emittable_event_type("").is_err());
     }
 
     /// Regression (ADR 0014): an engine built from a source checkout must report
@@ -1124,116 +1112,38 @@ mod tests {
         assert!(accepts_gzip(&h("gzip, deflate;q=0")));
     }
 
-    /// Spoofing prevention: an untrusted app must not emit a domain event whose
-    /// name collides with a `SystemEvent` variant. After the SSE unwrap, the
-    /// wire frame would be indistinguishable from a real system frame, and a
-    /// forged `NotificationCreated` would reach every connected client.
-    #[test]
-    fn validate_emittable_event_type_rejects_reserved_system_names() {
-        for name in [
-            "NotificationCreated",
-            "NotificationRead",
-            "PreferencesChanged",
-            "AppDeleted",
-            "Toast",
-            "DomainEvent",
-            "ChangesUpdated",
-            "TriggerCreated",
-            "ThreadEvent",
-        ] {
-            assert!(
-                validate_emittable_event_type(name).is_err(),
-                "{name} should be rejected as reserved",
-            );
-        }
-    }
-
-    #[test]
-    fn validate_emittable_event_type_accepts_domain_names() {
-        for name in [
-            "SlidePresenterState",
-            "SlideRemoteCommand",
-            "HabitCompleted",
-            "MyCustomEvent",
-        ] {
-            assert!(
-                validate_emittable_event_type(name).is_ok(),
-                "{name} should be allowed as a domain event",
-            );
-        }
-    }
-
-    /// Every seeded name must be one a trigger can actually fire on.
+    /// What the dropdown offers on a workspace whose store is empty. Every
+    /// name in it has to be one a trigger can actually fire on.
     ///
-    /// `/events/types` feeds the trigger `on_event:` dropdown, so a name the
-    /// matcher never sees offers a subscription that silently never fires.
-    /// `KNOWN_EVENT_TYPES` states the membership rule; this test enforces it by
-    /// requiring `thread_lifecycle::classify_event` to recognise every string.
-    /// That matcher is keyed on `ThreadEvent` variant names plus their legacy
-    /// aliases, so it catches a typo, a retired name, and a `SystemEvent` name.
-    ///
-    /// This is still a containment check, not a derivation: it cannot say "a
-    /// new triggerable variant landed and nobody seeded it". Deriving the list
-    /// needs variant enumeration neither enum offers today, see
-    /// `docs/plans/2026-08-05-event-read-surface-drift.md` § D7.
+    /// The old hand-written constant needed a containment check here, since
+    /// nothing tied it to the enums. The list is derived now, and its own
+    /// module proves every entry validates. What is left to pin is the two
+    /// gates the derivation applies, and one name the dropdown lost once.
     #[test]
-    fn known_event_types_are_triggerable_thread_events() {
-        for name in KNOWN_EVENT_TYPES {
+    fn the_dropdown_seed_offers_only_names_a_trigger_can_fire_on() {
+        use crate::core::event_subscription::{known_names, SubscriptionSurface};
+        let seed = known_names::subscribable_event_type_names(SubscriptionSurface::Trigger);
+
+        for name in &seed {
             assert!(
-                crate::engine::thread_lifecycle::classify_event(name).is_some(),
-                "KNOWN_EVENT_TYPES entry '{name}' is not a ThreadEvent name \
-                 (thread_lifecycle::classify_event returned None). If it is a \
-                 SystemEvent, it does not belong here at all: the scheduler only \
-                 forwards SystemEvent::DomainEvent to the trigger matcher, so the \
-                 on_event: dropdown would offer a subscription that can never fire.",
+                crate::engine::thread_lifecycle::classify_event(name).is_some()
+                    || crate::engine::event_bus::SystemEvent::is_persisted_type_name(name),
+                "'{name}' is neither a ThreadEvent nor a persisted SystemEvent, so \
+                 the matcher never sees it and the dropdown would offer a \
+                 subscription that can never fire.",
             );
         }
 
-        // The scheduler's other gate: `ThreadEvent::is_per_token_streaming`
-        // variants are dropped before the matcher, so seeding one would be the
-        // same broken promise by a different route.
-        for streaming in [
-            "TextStreamed",
-            "ThoughtStreamed",
-            "CodingAgentTextStreamed",
-            "CodingAgentThoughtStreamed",
-        ] {
-            assert!(
-                !KNOWN_EVENT_TYPES.contains(&streaming),
-                "'{streaming}' is on the is_per_token_streaming blocklist; the \
-                 matcher never sees it, so it must not be offered as an on_event: \
-                 target.",
-            );
+        // The one gate a persisted name can still fail: a per-token streaming
+        // variant is dropped before the matcher.
+        for streaming in crate::core::event_subscription::PER_TOKEN_STREAMING_EVENT_TYPES {
+            assert!(!seed.contains(streaming), "'{streaming}' never reaches it");
         }
-    }
 
-    /// The constant is kept sorted and duplicate-free so additions stay
-    /// reviewable. (`event_types` sorts its merged output regardless, so this
-    /// is about the source, not the response.)
-    #[test]
-    fn known_event_types_is_sorted_and_unique() {
-        let mut sorted = KNOWN_EVENT_TYPES.to_vec();
-        sorted.sort_unstable();
-        assert_eq!(
-            KNOWN_EVENT_TYPES,
-            &sorted[..],
-            "keep KNOWN_EVENT_TYPES in alphabetical order",
-        );
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            KNOWN_EVENT_TYPES.len(),
-            "KNOWN_EVENT_TYPES contains a duplicate",
-        );
-    }
-
-    /// Regression: without `ChildThreadCompleted` in the seed list, a workspace
-    /// can only subscribe a trigger to a child thread's outcome after one has
-    /// completed. Being notified when a child thread finishes is exactly the
-    /// thing you wire up beforehand.
-    #[test]
-    fn known_event_types_seeds_child_thread_completed() {
-        assert!(KNOWN_EVENT_TYPES.contains(&"ChildThreadCompleted"));
+        // Regression: with this name absent, a workspace could only subscribe
+        // to a child thread's outcome after one had already completed. Being
+        // told when a child finishes is what you wire up beforehand.
+        assert!(seed.contains(&"ChildThreadCompleted"));
     }
 
     #[test]

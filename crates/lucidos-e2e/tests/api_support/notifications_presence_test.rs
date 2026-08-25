@@ -592,6 +592,90 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
         });
 }
 
+/// POST a notification with an arbitrary body and read the stored row back.
+///
+/// The list endpoint is the only place the persisted `tap` is observable over
+/// HTTP, which is what the derived-default tests below need to see.
+async fn create_and_read_back(body: serde_json::Value) -> serde_json::Value {
+    let resp = http_client()
+        .post(format!("{}/api/v1/notifications", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .expect("create notification request");
+    assert_eq!(resp.status(), 200, "create notification should succeed");
+    let created: serde_json::Value = resp.json().await.expect("parse create response");
+    let id = created["notification_id"]
+        .as_str()
+        .expect("notification_id in response")
+        .to_string();
+
+    let resp = http_client()
+        .get(format!("{}/api/v1/notifications?limit=100", base_url()))
+        .send()
+        .await
+        .expect("list notifications request");
+    assert_eq!(resp.status(), 200, "list notifications should succeed");
+    let listed: serde_json::Value = resp.json().await.expect("parse list response");
+    listed["notifications"]
+        .as_array()
+        .expect("notifications array")
+        .iter()
+        .find(|n| n["id"].as_str() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("notification {} missing from the list", id))
+        .clone()
+}
+
+/// A tapless notification that names a source event deep-links to it, so one
+/// tap lands on the event instead of on the inbox card.
+#[tokio::test]
+async fn a_tapless_notification_with_an_event_navigates_to_it() {
+    let thread = uuid::Uuid::new_v4().to_string();
+    let event = uuid::Uuid::new_v4().to_string();
+    let row = create_and_read_back(serde_json::json!({
+        "title": unique_marker("derived-tap"),
+        "message": "should deep-link to the event",
+        "thread_id": thread,
+        "event_id": event,
+    }))
+    .await;
+
+    assert_eq!(row["tap"]["kind"], "navigate", "tap was {}", row["tap"]);
+    assert_eq!(row["tap"]["to"]["target"], "thread");
+    assert_eq!(row["tap"]["to"]["id"], thread);
+    assert_eq!(row["tap"]["to"]["event_id"], event);
+}
+
+/// A thread with no event is provenance, not a destination: the engine stamps
+/// one on every `send_notification`. That case keeps opening the card.
+#[tokio::test]
+async fn a_tapless_notification_without_an_event_opens_the_card() {
+    let row = create_and_read_back(serde_json::json!({
+        "title": unique_marker("thread-only-tap"),
+        "message": "should open the inbox card",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+    }))
+    .await;
+
+    assert_eq!(row["tap"]["kind"], "modal", "tap was {}", row["tap"]);
+}
+
+/// An explicit tap always wins, even where the derivation would have picked
+/// something else.
+#[tokio::test]
+async fn an_explicit_tap_survives_the_derivation() {
+    let row = create_and_read_back(serde_json::json!({
+        "title": unique_marker("explicit-tap"),
+        "message": "caller asked for the card",
+        "thread_id": uuid::Uuid::new_v4().to_string(),
+        "event_id": uuid::Uuid::new_v4().to_string(),
+        "tap": { "kind": "modal" },
+    }))
+    .await;
+
+    assert_eq!(row["tap"]["kind"], "modal", "tap was {}", row["tap"]);
+}
+
 /// Pull `data.notification_id` out of an SSE `data: {json}` line. Returns None
 /// if the line isn't JSON or lacks the field.
 fn extract_notification_id(line: &str) -> Option<String> {

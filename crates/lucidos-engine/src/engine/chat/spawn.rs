@@ -73,27 +73,11 @@ impl LucidosEngine {
             // default model.
             if !has_explicit_title {
                 if let Some(ref extractor) = title_engine.extractor {
-                    let title_model = crate::core::PreferenceStore::get(
-                        &title_engine.pool,
-                        crate::core::PREF_MODEL_TITLE,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                    match extractor.provider_for_model(&title_model) {
-                        Ok(provider) => {
+                    match super::title_call(&title_engine.pool, extractor).await {
+                        Ok(call) => {
                             // Spawned child threads carry no images on their first prompt.
-                            emit_generated_title(
-                                &bus,
-                                provider.as_ref(),
-                                child_thread_id,
-                                &msg,
-                                None,
-                                None,
-                                0,
-                            )
-                            .await;
+                            emit_generated_title(&bus, &call, child_thread_id, &msg, None, None, 0)
+                                .await;
                         }
                         Err(e) => {
                             log!("[FanOut] Failed to build title provider: {}", e)

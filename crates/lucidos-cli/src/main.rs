@@ -39,6 +39,7 @@ mod http;
 mod knowhow;
 mod mcp_permission_server;
 mod notify;
+mod pair;
 mod planned;
 mod proxy;
 mod spawn_thread;
@@ -88,8 +89,9 @@ enum Command {
     /// passed. Nothing is blocked while you are subscribed, and you must not
     /// sit in a sleep-and-recheck loop waiting for it.
     ///
-    /// Use it for anything the engine emits: a change appearing
-    /// (`ChangeProposed`), a trigger firing, a workspace domain event. NOT for
+    /// Use it for anything the engine persists: a change appearing
+    /// (`ChangeProposed`), a trigger firing, a backup finishing
+    /// (`BackupCompleted`), a workspace domain event. NOT for
     /// external state with no Lucidos event, which has nothing to deliver, and
     /// NOT for a thread you spawned as your own child: that one already re-opens
     /// this thread with its result when it finishes, so a wait on its
@@ -102,6 +104,31 @@ enum Command {
     /// rule that fires every time, create a trigger instead.
     #[command(name = "await-event")]
     AwaitEvent(AwaitEventArgs),
+    /// Mint a one-time code that pairs a device with this machine's gateway.
+    ///
+    /// The gateway authenticates every network caller, and a browser cannot
+    /// read the machine-local token file, so even a browser here has to pair.
+    /// Run this in a terminal, then type the code into the device.
+    ///
+    /// The code works once and expires in five minutes.
+    Pair {
+        /// Gateway port, when it is not on 5252 (packaged) or 5251 (dev).
+        #[arg(long)]
+        port: Option<u16>,
+        /// What to call the device in the paired list.
+        #[arg(long)]
+        label: Option<String>,
+        /// Also draw the code as a QR, so a phone scans instead of typing.
+        ///
+        /// Needs an address the phone can reach. That is this machine's
+        /// MagicDNS name, or its tailnet address, or whatever `--host` says.
+        #[arg(long)]
+        qr: bool,
+        /// The hostname a phone should open, when the tailnet answer is wrong
+        /// or absent. Implies `--qr`.
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Run a heavy build under a *build slot*, so parallel worktrees cannot
     /// pile N full compiles onto one host and OOM it.
     ///
@@ -365,6 +392,19 @@ enum Command {
         #[command(subcommand)]
         action: generated::McpCmd,
     },
+    /// Manage inbound webhooks: `list`, `create`, `update --id <id>`, or
+    /// `delete --id <id>`. A webhook is an endpoint a third party posts to,
+    /// emitting one PINNED domain event that a caller cannot change. `create`
+    /// prints its bearer token exactly once, because only the digest is stored.
+    /// Deliveries arrive on the gateway's hook socket, at
+    /// `{host}:{hook_port}/<slug>/<webhook-id>`, never on the main surface.
+    /// Generated from the capability parity manifest; routed through the
+    /// gateway-safe HTTP client. Deliberately NOT an agent capability, so there
+    /// is no LLM tool and no SDK namespace.
+    Webhooks {
+        #[command(subcommand)]
+        action: generated::WebhooksCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -507,7 +547,7 @@ enum EventWaitsCmd {
     /// one on this thread; exactly one of the three.
     ///
     /// There is no re-entry, so nothing interrupts you: the subscription simply
-    /// stops, the user sees it leave the subscription indicator, and the
+    /// stops, the user sees it leave the waiting indicator, and the
     /// transcript records what was stopped.
     Cancel {
         /// The subscription to stop, from `event-waits list`.
@@ -545,7 +585,7 @@ pub(crate) struct AwaitEventArgs {
     #[arg(long = "timeout-secs")]
     pub(crate) timeout_secs: i64,
     /// One short line, in the user's language, saying what you are waiting for
-    /// and why. The user reads it in the subscription indicator, and it is how
+    /// and why. The user reads it in the waiting indicator, and it is how
     /// they tell a sleeping thread from a stalled one.
     #[arg(long)]
     pub(crate) reason: String,
@@ -1099,6 +1139,22 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 },
             )
         }
+        Command::Pair {
+            port,
+            label,
+            qr,
+            host,
+        } => {
+            pair::cmd_pair(pair::PairArgs {
+                port,
+                label: label.as_deref(),
+                // `--host` is only useful for a QR, so asking for one is
+                // implied rather than a second flag the user must remember.
+                qr: qr || host.is_some(),
+                host: host.as_deref(),
+            })?;
+            Ok(0)
+        }
         Command::AwaitEvent(args) => {
             let ws = resolve_from_env()?;
             await_event::cmd_await_event(
@@ -1274,6 +1330,11 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
         Command::Mcp { action } => {
             let ws = resolve_from_env()?;
             generated::dispatch_mcp(&ws, action)?;
+            Ok(0)
+        }
+        Command::Webhooks { action } => {
+            let ws = resolve_from_env()?;
+            generated::dispatch_webhooks(&ws, action)?;
             Ok(0)
         }
     }

@@ -150,7 +150,7 @@ export function ImageIcon({ className }: { className?: string }) {
   );
 }
 
-/** Clock face for the *subscription indicator* (an event wait's countdown). */
+/** Clock face for the *waiting indicator* (an event wait's countdown). */
 export function EventWaitClockIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -244,7 +244,7 @@ export function FollowLiveEdgeIcon() {
  *  ink (points at the extremes against bars at the extremes), so the mark
  *  visibly changed size on every click while the body under it was also
  *  moving: reported as the layout dancing. Brightness already answers "is it
- *  on" (see `.response-controls` in styles/chat/response.css), which is
+ *  on" (see `.turn-controls` in styles/chat/input-messages.css), which is
  *  exactly how the neighbouring steps control has always worked.
  *
  *  Kept here rather than reusing `ChevronDownIcon`, which hardcodes a 1.25rem
@@ -261,9 +261,10 @@ export function FullResponseIcon() {
 }
 
 /** Two arrowheads, pointing at each other to fold this turn away and apart to
- *  unfold it. The third of the response header's controls, and the odd one out:
- *  the other two flip a setting that spans the transcript, this one folds THIS
- *  turn to its `⋯` stub.
+ *  unfold it. Worn by both turn headers: the third of the response header's
+ *  controls, the initiator header's only one. The odd one out of that run: the
+ *  other two flip a transcript-wide setting, this one folds THIS turn to its
+ *  `⋯` stub.
  *
  *  It was drawn with a full-width line between the two, on the reasoning that
  *  the line is what the arrows are being squashed onto. Three horizontal marks
@@ -292,7 +293,7 @@ export function FullResponseIcon() {
  *  The exception is bought with a different currency. That flip was pure cost,
  *  because `aria-pressed` plus the brightness rule already answered "is it on",
  *  so the movement bought nothing. This control is exempt from that brightness
- *  rule (see `.response-controls` in styles/chat/response.css), because bright
+ *  rule (see `.turn-controls` in styles/chat/input-messages.css), because bright
  *  meaning FOLDED inverts what bright means on the two controls beside it. So
  *  direction is not one state cue among two here, it is the only one there is.
  *  It also points the way the next click goes, agreeing with the tooltip

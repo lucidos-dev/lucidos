@@ -393,17 +393,31 @@ async fn ff_main_to_leaves_clean_working_tree() {
 }
 
 #[test]
-fn index_lock_collision_is_told_apart_from_a_real_git_failure() {
-    assert!(is_index_lock_collision(
+fn lock_file_collision_is_told_apart_from_a_real_git_failure() {
+    assert!(is_lock_file_collision(
         "fatal: Unable to create '/ws/.git/index.lock': File exists.\n\n\
          Another git process seems to be running in this repository"
     ));
+    // Any of the repo's locks can be the contended one, not just the index.
+    assert!(is_lock_file_collision(
+        "error: cannot lock ref 'refs/heads/main': Unable to create \
+         '/ws/.git/refs/heads/main.lock': File exists."
+    ));
     // Not a lock collision -- these must fail on the first attempt, never retry.
-    assert!(!is_index_lock_collision(
+    assert!(!is_lock_file_collision(
         "error: Your local changes to the following files would be overwritten by checkout"
     ));
-    assert!(!is_index_lock_collision("fatal: invalid reference: main"));
-    assert!(!is_index_lock_collision(""));
+    assert!(!is_lock_file_collision("fatal: invalid reference: main"));
+    // A file the repo happens to track, named in an unrelated failure.
+    assert!(!is_lock_file_collision(
+        "error: unable to create file Cargo.lock: File exists"
+    ));
+    // A lock git could not create for a PERSISTENT reason. Retrying it waits out
+    // a holder that does not exist, then reports the same error a second later.
+    assert!(!is_lock_file_collision(
+        "fatal: Unable to create '/ws/.git/HEAD.lock': Permission denied"
+    ));
+    assert!(!is_lock_file_collision(""));
 }
 
 /// Regression (2026-08-03): `ff_main_to` advanced `main` and then lost the race
@@ -713,14 +727,14 @@ async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() 
 /// reasons must come back on the first attempt, not after the full budget.
 ///
 /// The ceiling is CALIBRATED against this host, not a fixed millisecond count.
-/// What the retry costs is `INDEX_LOCK_RETRIES` backoffs of sleep plus that many
+/// What the retry costs is `LOCK_FILE_RETRIES` backoffs of sleep plus that many
 /// extra `git` forks, and only the sleep half is predictable: a fork that takes
 /// 90ms on an idle machine took 838ms during a full-suite run (which forks
 /// constantly), so the old flat 500ms bound was measuring fork latency and
 /// failed on load alone. Timing one bare `git_cmd` of the same failing command
 /// first prices a fork here and now, and the assertion rides on that.
 #[tokio::test]
-async fn git_cmd_await_index_lock_does_not_retry_a_real_failure() {
+async fn git_cmd_await_lock_file_does_not_retry_a_real_failure() {
     let (_tmp, repo) = make_test_repo().await;
     let failing = ["checkout", "-f", "no-such-branch"];
 
@@ -730,16 +744,16 @@ async fn git_cmd_await_index_lock_does_not_retry_a_real_failure() {
     let one_fork = control_started.elapsed();
 
     let started = std::time::Instant::now();
-    let out = git_cmd_await_index_lock(&failing, &repo).await.unwrap();
+    let out = git_cmd_await_lock_file(&failing, &repo).await.unwrap();
     let elapsed = started.elapsed();
 
     assert!(!out.status.success());
-    // Burning the budget costs INDEX_LOCK_RETRIES sleeps AND that many more
+    // Burning the budget costs LOCK_FILE_RETRIES sleeps AND that many more
     // forks, so it overshoots this by an order of magnitude. Deliberately loose
     // enough to absorb one slow fork: on a loaded host, fork jitter is larger
     // than a single 50ms backoff, so no wall-clock bound can tell one stray
     // retry from none, and pretending otherwise is what made this flake.
-    let ceiling = one_fork * 2 + INDEX_LOCK_RETRIES * INDEX_LOCK_BACKOFF / 2;
+    let ceiling = one_fork * 2 + LOCK_FILE_RETRIES * LOCK_FILE_BACKOFF / 2;
     assert!(
         elapsed < ceiling,
         "a non-lock failure must not burn the retry budget: took {elapsed:?}, \

@@ -297,15 +297,19 @@ export function ContentHeaderActions({ layout }: Props) {
   // reach the clusters. Above it the reserve is sized for the widest cluster
   // this row can carry and the measurement finds everything fits.
   //
-  // Mobile collapses EVERYTHING, at every width and every action count, so the
-  // trailing cluster is always ⋯ + the bell (or the bell alone, for a view with
-  // no context actions). It predates the desktop row being centred and is a
-  // different answer to the same question: a phone's row cannot afford a
-  // reserve wide enough for a variable cluster, so it makes the cluster
-  // constant instead, which is what lets the chevrons be pinned to a fixed span
-  // that agrees with the thread pane's. This is also why mobile collapses a
-  // lone action, which the desktop rule deliberately never does (⋯ replaces it
-  // 1:1 and saves nothing).
+  // Mobile collapses EVERYTHING, at every width, bar the exception below. The
+  // trailing cluster is therefore ⋯ + the bell, or the bell alone for a view
+  // with no context actions. It predates the desktop row being centred and
+  // answers the same
+  // question differently. A phone's row cannot afford a reserve wide enough for
+  // a cluster that grows with the action count. So it bounds the cluster
+  // instead, which pins the chevrons to a fixed span agreeing with the thread
+  // pane's.
+  //
+  // One exception, and it agrees with the desktop rule rather than departing
+  // from it: a view carrying exactly ONE action keeps that action's own icon.
+  // The ⋯ trigger would stand in the same box, so the cluster is two boxes
+  // either way and the menu buys only a tap. See `mobileCollapseCount`.
   const hostRef = useRef<HTMLDivElement>(null);
   // Three or more context actions fold whole, at any width: see
   // `alwaysCollapseFrom`. Two still ride the row when there is room for them.

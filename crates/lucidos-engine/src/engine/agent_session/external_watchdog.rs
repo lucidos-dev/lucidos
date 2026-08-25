@@ -17,8 +17,15 @@
 //! spawn dispatcher consumes and turns into a fresh `--resume`. Same outcome
 //! as the in-loop watchdog's auto-recovery path — but reachable from
 //! outside the wedged loop.
+//!
+//! The same tick reconciles the OTHER direction, in
+//! `settle_orphaned_running`. The scan above asks "for each live session, is it
+//! stuck?", which cannot see a thread that fell OUT of `agent_sessions`. A
+//! subprocess that dies without emitting a terminal leaves exactly that: a
+//! projection stuck at `running` with nothing coming back for it. Before this
+//! pass existed, only a user Stop or the boot sweep cleared one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +33,7 @@ use uuid::Uuid;
 
 use crate::engine::change_ops::now_epoch_millis;
 use crate::engine::event_bus::EventBus;
+use crate::engine::thread_events::MessageOrigin;
 use crate::engine::types::AgentSession;
 
 use super::lifecycle::{watchdog_gate, WatchdogGate};
@@ -107,6 +115,56 @@ pub(super) fn external_watchdog_decision(input: ExternalWatchdogInput) -> Extern
     }
 }
 
+/// Event types that prove a coding agent was DEMONSTRABLY producing output on
+/// this thread, and that its own output is the last thing that happened.
+///
+/// This is the orphan pass's positive fingerprint, and it replaced a negative
+/// one. "Old `last_activity` and no live session" looks like proof that nothing
+/// is coming, and is not. A thread waiting for a capacity slot matches it
+/// exactly, and the holders are plural: the `thread_queue` table for background
+/// spawns, an in-memory pool for user-initiated ones. Enumerating every holder
+/// is a losing game where one miss ABORTS live work.
+///
+/// An agent that streamed a tool result and then stopped is a different claim,
+/// and one the thread's own event log can settle. Nothing merely WAITING has
+/// agent output as its newest event. A queued thread's newest event is its
+/// `MessageReceived` or `ContinuationRequested`.
+///
+/// Enumerated rather than inverted, so the unknown direction is safe. A new
+/// event type is absent from this list and therefore never settles. An
+/// "everything except" list would settle it by default.
+const AGENT_PRODUCED_OUTPUT_EVENT_TYPES: &[&str] = &[
+    "CodingAgentTextStreamed",
+    "CodingAgentToolCalled",
+    "CodingAgentToolResult",
+    "ContextCaptured",
+];
+
+/// The orphan pass's quiet window, in whole seconds for `make_interval`.
+///
+/// Rounds UP, so any positive limit is at least one second. Truncating turned a
+/// sub-second `limit_ms` into a ZERO-second window, which silently disables the
+/// guard: every `running` row is older than `now()`. Production passes 12
+/// minutes and never noticed, but the tests pass 50 ms.
+fn quiet_window_secs(limit_ms: i64) -> i64 {
+    // `i64::div_ceil` is still unstable, hence the explicit rounding. The
+    // `.max(1)` also covers a zero or negative limit, so no input yields the
+    // unguarded window.
+    ((limit_ms + 999) / 1000).max(1)
+}
+
+/// Drop every orphan candidate that still holds a live `agent_sessions` entry.
+///
+/// The SQL half cannot see that map, so this is the last of the four
+/// exclusions. It is why the query is allowed to be generous. Pure, so the
+/// exclusion is testable without a database.
+fn orphans_without_live_session(candidates: Vec<Uuid>, live: &HashSet<Uuid>) -> Vec<Uuid> {
+    candidates
+        .into_iter()
+        .filter(|tid| !live.contains(tid))
+        .collect()
+}
+
 /// Owns the periodic scan + ContinuationRequested emission. Constructed once at
 /// engine startup; lives for the duration of the process.
 pub(crate) struct ExternalWatchdog {
@@ -168,8 +226,13 @@ impl ExternalWatchdog {
         // lock, then emit OUTSIDE the lock. Holding the mutex across the
         // `event_bus.emit` await would block every `agent_session` insert
         // for the duration of a DB write.
+        let live: HashSet<Uuid>;
         let mut candidates: Vec<StuckSession> = {
             let sessions = self.agent_sessions.lock().await;
+            // Taken under the SAME lock as the stuck scan. Reading the map at a
+            // different instant would let the orphan pass below settle a
+            // session that registered in between.
+            live = sessions.keys().copied().collect();
             sessions
                 .iter()
                 .filter_map(|(tid, s)| {
@@ -230,11 +293,101 @@ impl ExternalWatchdog {
             }
             candidates = keep;
         }
+        // Runs on every tick, including the common one where nothing is stuck:
+        // an orphan is by definition a thread the stuck scan cannot see.
+        self.settle_orphaned_running(&live).await;
+
         if candidates.is_empty() {
             return;
         }
 
         self.recover_stuck(candidates).await;
+    }
+
+    /// Reconcile the projection against the live-session map, the opposite
+    /// direction from the scan above.
+    ///
+    /// [`Self::tick`] asks "for each live session, is it stuck?", so a thread
+    /// that fell OUT of `agent_sessions` is invisible to it. That is the wedge:
+    /// a subprocess dies without a terminal, and the projection keeps saying
+    /// `running` until a user clicks Stop or the engine reboots.
+    ///
+    /// A candidate must clear all five below. The rationale for each is in
+    /// `docs/plans/2026-08-24-a-subagent-wait-is-not-a-fabricated-question.md`.
+    ///
+    /// * `is_coding_agent`, and `status = 'running'`, which alone spares a
+    ///   question park (`ThreadStatus::WaitingForUserAnswer`).
+    /// * `last_activity` older than the quiet window, by the DATABASE clock
+    ///   (ADR 0053).
+    /// * a NEWEST event in [`AGENT_PRODUCED_OUTPUT_EVENT_TYPES`], which is the
+    ///   load-bearing one. It also spares an unactuated `ContinuationRequested`.
+    /// * no `queued` `thread_queue` row, kept as depth.
+    /// * no live `agent_sessions` entry, re-read under the lock HERE, not from
+    ///   the tick's opening snapshot, which is a round-trip stale (Codex).
+    async fn settle_orphaned_running(&self, live_at_snapshot: &HashSet<Uuid>) {
+        let candidates: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+            "SELECT ts.thread_id FROM thread_summaries ts \
+             WHERE ts.is_coding_agent = true \
+               AND ts.status = 'running' \
+               AND ts.last_activity < now() - make_interval(secs => $1) \
+               AND ( \
+                   SELECT e.event_type FROM events e \
+                   WHERE e.aggregate_id = ts.thread_id::text \
+                   ORDER BY e.sequence DESC LIMIT 1 \
+               ) = ANY($2) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM thread_queue q \
+                   WHERE q.thread_id = ts.thread_id AND q.status = 'queued' \
+               )",
+        )
+        .bind(quiet_window_secs(self.limit_ms))
+        .bind(AGENT_PRODUCED_OUTPUT_EVENT_TYPES)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                log!("[ExternalWatchdog] orphan settle query failed: {}", e);
+                return;
+            }
+        };
+
+        // Re-read the map AFTER the query. The opening snapshot is one DB
+        // round-trip stale, and settling a session that registered in that gap
+        // aborts a turn that is working.
+        let orphans = {
+            let sessions = self.agent_sessions.lock().await;
+            let live_now: HashSet<Uuid> = sessions.keys().copied().collect();
+            orphans_without_live_session(candidates, &live_now)
+        };
+        // The snapshot still narrows the set, so a session alive at either
+        // observation is spared.
+        for thread_id in orphans_without_live_session(orphans, live_at_snapshot) {
+            match crate::engine::claude_code::settle_stuck_running_thread(
+                &self.pool,
+                &self.event_bus,
+                thread_id,
+                Some(MessageOrigin::system()),
+                crate::engine::claude_code::SettleTerminal::StuckProjection,
+            )
+            .await
+            {
+                Ok(true) => log!(
+                    "[ExternalWatchdog] thread={} was `running` with no live session and \
+                     nothing for {}min, settled",
+                    thread_id,
+                    self.limit_ms / 60_000,
+                ),
+                // Something settled it between the query and now. The helper
+                // re-checks `running` itself, so this is the expected race.
+                Ok(false) => {}
+                Err(e) => log!(
+                    "[ExternalWatchdog] settling orphaned thread={} failed: {}",
+                    thread_id,
+                    e
+                ),
+            }
+        }
     }
 
     /// The mutate + emit half of a tick. Split out from [`tick`] so tests can
@@ -479,6 +632,24 @@ mod tests {
     fn zero_last_event_skips() {
         let out = external_watchdog_decision(input(NOW, 0, false, 0, false));
         assert_eq!(out, ExternalWatchdogDecision::Skip);
+    }
+
+    /// A zero-second window is not a short window, it is NO window: every
+    /// `running` row is older than `now()`, so the orphan pass would settle a
+    /// thread that started milliseconds ago. Rounding up is what keeps a
+    /// sub-second limit an exclusion rather than an open gate.
+    #[test]
+    fn quiet_window_never_rounds_down_to_zero_seconds() {
+        assert_eq!(quiet_window_secs(EXTERNAL_WATCHDOG_LIMIT_MS), 720);
+        assert_eq!(quiet_window_secs(1000), 1);
+        for sub_second in [0, 1, 50, 999] {
+            assert_eq!(
+                quiet_window_secs(sub_second),
+                1,
+                "a {sub_second}ms limit must still exclude anything active in the \
+                 last second, never collapse to an unguarded 0s window",
+            );
+        }
     }
 
     /// Phase A (the root-cause fix): a tool in flight past the hung-tool ceiling

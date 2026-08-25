@@ -1,6 +1,149 @@
 use super::super::*;
 use super::*;
 
+/// The next broadcast frame carrying a thread event of this type, so an
+/// interleaved projection broadcast cannot make the assertion below flaky.
+async fn next_thread_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<EmittedEvent>,
+    event_type: &str,
+) -> EmittedEvent {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a frame within 5s")
+            .expect("the bus stays open");
+        if let BusEvent::Thread { event, .. } = &frame.typed {
+            if event.event_type() == event_type {
+                return frame;
+            }
+        }
+    }
+}
+
+/// The next broadcast frame carrying a system event of this type.
+async fn next_system_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<EmittedEvent>,
+    event_type: &str,
+) -> EmittedEvent {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a frame within 5s")
+            .expect("the bus stays open");
+        if let BusEvent::System(se) = &frame.typed {
+            if se.stored_event_type() == event_type {
+                return frame;
+            }
+        }
+    }
+}
+
+/// The plumbing Bug 2 was missing. `MAX_EVENT_TRIGGER_DEPTH` can only reach a
+/// thread event if the emitting run's chain depth does, and the bus is where
+/// that depth is read.
+///
+/// The scope here is the one `thread_queue::executor` puts around a fire, and
+/// the read is the one `EventBus::emit` does. A user's own turn is outside any
+/// scope and must stay at zero, or the cap would start refusing ordinary work.
+#[tokio::test]
+async fn a_thread_event_carries_the_emitting_runs_trigger_depth() {
+    use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let mut frames = bus.subscribe();
+
+    let thread_id = Uuid::new_v4();
+    emit_thread_message(&bus, thread_id, None, "an ordinary turn").await;
+    assert_eq!(
+        next_thread_frame(&mut frames, "MessageReceived")
+            .await
+            .depth,
+        0,
+        "an event emitted outside any fire is nobody's chain link"
+    );
+
+    EVENT_TRIGGER_DEPTH
+        .scope(2, async {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ResponseGenerated {
+                    text: "the fire's own answer".into(),
+                    images: vec![],
+                    model: None,
+                    reasoning_effort: None,
+                },
+                meta: EventMeta {
+                    channel: Some(EventChannel::Chat),
+                    ..EventMeta::NONE
+                },
+            })
+            .await
+            .expect("emit inside the fire");
+        })
+        .await;
+    assert_eq!(
+        next_thread_frame(&mut frames, "ResponseGenerated")
+            .await
+            .depth,
+        2,
+        "a fire's own event carries the fire's depth, so the cap can see it"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The same read, for the system carrier. `TriggerExecuted` is the frame a
+/// fire's own completion writes. A trigger may subscribe to it, so it is the
+/// one that has to carry the fire's depth.
+///
+/// `thread_queue::executor` records it INSIDE the fire's
+/// `EVENT_TRIGGER_DEPTH.scope`, which is what makes this read answer the fire's
+/// depth. Recording it after the scope resolved stamped 0 and left such a
+/// trigger uncapped.
+#[tokio::test]
+async fn a_system_frame_carries_the_emitting_runs_trigger_depth() {
+    use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let mut frames = bus.subscribe();
+
+    let recorded = |bus: &EventBus, status: &'static str| {
+        let bus = bus.clone();
+        async move {
+            bus.emit(BusEvent::System(SystemEvent::TriggerExecuted {
+                trigger_id: "nightly-backup".into(),
+                payload: serde_json::json!({ "status": status }),
+            }))
+            .await
+            .expect("emit")
+        }
+    };
+
+    recorded(&bus, "success").await;
+    assert_eq!(
+        next_system_frame(&mut frames, "TriggerExecuted")
+            .await
+            .depth,
+        0,
+        "a scheduled run outside any chain starts one at zero"
+    );
+
+    EVENT_TRIGGER_DEPTH
+        .scope(2, recorded(&bus, "failure"))
+        .await;
+    assert_eq!(
+        next_system_frame(&mut frames, "TriggerExecuted")
+            .await
+            .depth,
+        2,
+        "the frame a fire records is a link in that fire's chain"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
 // --- Recursion guard tests ---
 #[tokio::test]
 async fn test_recursion_guard_allows_shallow_threads() {

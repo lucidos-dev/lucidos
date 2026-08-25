@@ -1,3 +1,6 @@
+// @vitest-environment jsdom
+// This file renders markdown, and the sanitizer runs on a real DOM.
+// The default `node` environment has none.
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';

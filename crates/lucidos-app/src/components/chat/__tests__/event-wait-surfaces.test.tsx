@@ -1,3 +1,6 @@
+// @vitest-environment jsdom
+// This file renders markdown, and the sanitizer runs on a real DOM.
+// The default `node` environment has none.
 /** The two surfaces an event wait gets, and the composer line under them.
  *
  *  The transcript ROW is the RECORD and the indicator is the LIVE state; the
@@ -22,7 +25,7 @@ import { dirname, resolve } from 'node:path';
 import type { ComponentChildren, VNode } from 'preact';
 import { eventDeliveryBody, eventWaitRowBody, triggerFiredBody } from '../chat-exchange-parts';
 import { formatDeliveredPayload } from '../CreateThreadView';
-import { eventWaitIndicatorBody } from '../EventWaitPanel';
+import { waitingIndicatorBody } from '../WaitingPanel';
 import * as promptInputHelpers from '../prompt-input-helpers';
 import {
   PLACEHOLDER_ANSWERING,
@@ -622,7 +625,7 @@ describe('triggerFiredBody', () => {
   });
 });
 
-describe('EventWaitIndicator', () => {
+describe('the waiting indicator, on a subscription', () => {
   const wait = (over: Partial<EventWaitSummary> = {}): EventWaitSummary => ({
     wait_id: 'w1',
     on: [{ event_type: 'ChangeProposed' }],
@@ -630,35 +633,34 @@ describe('EventWaitIndicator', () => {
     expires_at: '2026-08-06T12:00:00Z',
     ...over,
   });
+  const noSubThreads = { threads: [], unresolved: 0 };
+  const body = (waits: EventWaitSummary[]) =>
+    waitingIndicatorBody({ waits, subThreads: noSubThreads, onClick: () => {} });
 
   it('renders nothing when the thread holds no subscription', () => {
-    expect(eventWaitIndicatorBody({ waits: [], onClick: () => {} })).toBeNull();
+    expect(body([])).toBeNull();
   });
 
   /** ONE state. A subscribed thread is idle and there is nothing for the user
    *  to do, so the indicator reports presence rather than a mode. It carried a
    *  `parked` / `watching` split while a wait could hold a turn; ADR 0049
    *  removed that, and a reintroduced `data-state` here would be that
-   *  distinction coming back. */
+   *  distinction coming back. The accent it wears now is not that split: it is
+   *  unconditional, and the button renders only while the thread is parked. */
   it('reports presence with no mode of its own', () => {
-    const rendered = eventWaitIndicatorBody({ waits: [wait()], onClick: () => {} });
-    const button = findByRole(rendered, 'event-wait-indicator');
+    const button = findByRole(body([wait()]), 'waiting-indicator');
     expect(button).not.toBeNull();
     expect(button?.props['data-state']).toBeUndefined();
-    expect(button?.props['aria-label']).toContain('Watching for an event');
+    expect(button?.props['aria-label']).toContain('Waiting for');
   });
 
   it('names the single wait, and counts them when there are several', () => {
-    const one = eventWaitIndicatorBody({ waits: [wait()], onClick: () => {} });
-    expect(findByRole(one, 'event-wait-indicator')?.props['data-tooltip']).toBe(
+    expect(findByRole(body([wait()]), 'waiting-indicator')?.props['data-tooltip']).toBe(
       'waiting for the release build',
     );
 
-    const many = eventWaitIndicatorBody({
-      waits: [wait(), wait({ wait_id: 'w2' })],
-      onClick: () => {},
-    });
-    expect(findByRole(many, 'event-wait-indicator')?.props['data-tooltip']).toBe('2 subscriptions');
+    const many = body([wait(), wait({ wait_id: 'w2' })]);
+    expect(findByRole(many, 'waiting-indicator')?.props['data-tooltip']).toBe('2 subscriptions');
   });
 });
 

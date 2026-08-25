@@ -1,4 +1,4 @@
-import { API, API_BASE, json, mutatingFetch, throwIfNotOk } from './_core';
+import { API, API_BASE, json, mutatingFetch, retryTransientRead, throwIfNotOk } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type { App, PinnedAppEntry } from '../../store/types';
 import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
@@ -49,22 +49,71 @@ export async function uploadPluginArchive(file: File): Promise<PluginArchiveUplo
   return res.json();
 }
 
+export interface PluginLocalChangesResult {
+  /** Paths whose local edit was merged into the new version. */
+  merged: string[];
+  /** Paths where the edit and upstream's touched the same lines. */
+  conflicted: string[];
+  /** Paths replaced outright: a trigger definition, a binary, or the keep
+   *  control switched off. Each has a copy in `saved_paths`. */
+  replaced: string[];
+  /** Paths the user had deleted that upstream still ships, so they came back.
+   *  These have no saved copy: a deletion has no content to keep. */
+  restored: string[];
+  /** `data/`-relative copies of every edit the update discarded. */
+  saved_paths: string[];
+}
+
 export interface PluginConfirmInstallResponse {
   summary: string;
   installed_files: string[];
   /** Set when the plugin shipped `setup` instructions: the Lucidos Agent thread
    *  spawned to walk the user through them. The frontend navigates here. */
   setup_thread_id?: string;
+  /** What the install did to files the user had locally edited. Absent when it
+   *  met none, which is every fresh install. */
+  local_changes?: PluginLocalChangesResult;
 }
 
 /** User accepted the staged install in the install panel. The engine writes
  *  files into `data/`, emits `PluginInstalled`, and (if any `auth-modules/`
- *  files were touched) auto-reloads the WASM signer map. */
-export async function confirmPluginInstall(installId: string): Promise<PluginConfirmInstallResponse> {
+ *  files were touched) auto-reloads the WASM signer map.
+ *
+ *  `keepLocalChanges` is the panel's keep control. True merges the user's local
+ *  edits into the new version; false takes a clean upstream copy and saves
+ *  those edits aside. Omitting the flag means keep, so a caller that never
+ *  showed the control cannot silently discard a patch. */
+export async function confirmPluginInstall(
+  installId: string,
+  keepLocalChanges = true,
+): Promise<PluginConfirmInstallResponse> {
   const res = await mutatingFetch(
-    `${API}/plugins/install/${encodeURIComponent(installId)}/confirm`,
+    `${API}/plugins/install/${encodeURIComponent(installId)}/confirm`
+      + `?keep_local_changes=${keepLocalChanges}`,
     { method: 'POST' },
   );
+  await throwIfNotOk(res);
+  return res.json();
+}
+
+export interface PluginProposeUpstreamResponse {
+  /** `data/`-relative path of the generated patch. */
+  patch_path: string;
+  /** The thread that will take the patch to the plugin's author. */
+  thread_id: string;
+}
+
+/** Offer the user's local patch to the plugin's author. The engine derives the
+ *  diff, writes it under `data/artifacts/`, and spawns a thread to take it from
+ *  there. It performs no GitHub operation itself. */
+export async function proposePluginUpstream(
+  id: string,
+): Promise<PluginProposeUpstreamResponse> {
+  const res = await mutatingFetch(`${API}/plugins/propose-upstream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
+  });
   await throwIfNotOk(res);
   return res.json();
 }
@@ -206,8 +255,14 @@ export function unpinAppApi(appId: string, deviceId: string): Promise<ApiResult>
 }
 
 // --- Events ---
+
+/** The trigger event-type picker's only source of names.
+ *
+ *  Retried once on a transport failure. The picker caches the verdict, so one
+ *  dropped fetch would otherwise render "Failed to load event types". A 4xx or
+ *  5xx is a real verdict and is not retried. */
 export function fetchEventTypes(): Promise<string[]> {
-  return json(`${API}/events/types`);
+  return retryTransientRead(() => json(`${API}/events/types`));
 }
 
 // --- Knowhow ---
@@ -217,9 +272,12 @@ export interface KnowhowEntry {
   description: string;
 }
 
-/** Process-wide cache for the knowhow list — multiple consumers (trigger form,
- *  file-preview 404 hint) hit the same endpoint and don't need their own copy.
- *  Holds the in-flight promise so concurrent first-callers share the request. */
+/** Process-wide cache for the knowhow list. Its one consumer, the file-preview
+ *  404 hint, refetches on every mount, so the cache is what keeps reopening a
+ *  preview off the endpoint. It holds the in-flight promise, so concurrent
+ *  first-callers share the request, and a rejection clears it so the next
+ *  caller retries. Nothing invalidates it: a knowhow file added this session is
+ *  missing from the hint until the page reloads. */
 let knowhowEntriesCache: Promise<KnowhowEntry[]> | null = null;
 
 export function fetchKnowhowEntries(): Promise<KnowhowEntry[]> {

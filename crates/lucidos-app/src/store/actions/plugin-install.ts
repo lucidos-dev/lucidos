@@ -1,9 +1,10 @@
-import { activeInlineForm, panelOverlay, showConfirm, showToast, closeInlineFormIfActive } from '../store';
+import { activeInlineForm, panelOverlay, showToast, closeInlineFormIfActive } from '../store';
 import type { PluginInstallForm } from '../store';
 import {
   ApiError,
   confirmPluginInstall,
   cancelPluginInstall,
+  proposePluginUpstream,
   stagePluginInstall,
   type PluginConfirmInstallResponse,
 } from '../../api/client';
@@ -36,22 +37,11 @@ export function openPluginInstallRequest(request: PluginInstallRequest): void {
  *  imports its catalog refresh from there, so the call would otherwise close
  *  an import cycle. */
 export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
-  // An update overwrites the plugin's shipped content. If the user has locally
-  // modified that content (the "Modified" badge), warn before staging: the
-  // update will discard their changes. A fresh install, or an update with no
-  // local edits, proceeds straight through.
-  if (plugin.status === 'update_available' && plugin.modified) {
-    const paths = plugin.modified_paths ?? [];
-    const changed = paths.length
-      ? ` Changed: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? ', …' : ''}.`
-      : '';
-    const ok = await showConfirm(
-      `You've locally modified "${plugin.name}". Updating to v${plugin.version} will overwrite your changes.${changed}`,
-      'Update anyway',
-      { title: 'Overwrite local changes?', variant: 'danger' },
-    );
-    if (!ok) return;
-  }
+  // No pre-stage warning about local edits any more. An update used to discard
+  // them, so a blanket "this will overwrite your changes" prompt was the only
+  // warning available. The engine merges them now, and the staged panel states
+  // the real outcome per file. A prompt here would duplicate that, and claim
+  // the opposite of what happens.
   try {
     openPluginInstallRequest(await stagePluginInstall(plugin.source));
   } catch (e) {
@@ -90,6 +80,7 @@ export function markPluginInstalled(
         at: new Date().toISOString(),
         summary: result.summary,
         installed_files: result.installed_files,
+        local_changes: result.local_changes,
       },
     },
   };
@@ -104,7 +95,10 @@ export function markPluginInstalled(
  *  A failure closes the panel: the engine pops the pending entry up-front, so a
  *  failed confirm has no second chance, and leaving the panel open just wedges
  *  the user with disabled buttons. */
-export async function confirmPluginInstallAction(form: PluginInstallForm): Promise<void> {
+export async function confirmPluginInstallAction(
+  form: PluginInstallForm,
+  keepLocalChanges = true,
+): Promise<void> {
   const {
     install_id: installId,
     plugin_name: pluginName,
@@ -119,7 +113,7 @@ export async function confirmPluginInstallAction(form: PluginInstallForm): Promi
   // `threads.ts` already documents that it can throw.
   let result: PluginConfirmInstallResponse;
   try {
-    result = await confirmPluginInstall(installId);
+    result = await confirmPluginInstall(installId, keepLocalChanges);
   } catch (e) {
     showToast(`Install failed: ${errorDetail(e)}`, 'error');
     closeInlineFormIfActive(form);
@@ -182,4 +176,33 @@ export async function cancelPluginInstallAction(form: PluginInstallForm): Promis
     }
   }
   closeInlineFormIfActive(form);
+}
+
+/** Offer the user's local patch for `pluginId` to the plugin's author.
+ *
+ *  The engine derives the diff, writes it under `data/artifacts/`, and spawns a
+ *  thread. We drop the user into that thread, because the thread IS the work:
+ *  it is where the fork, the branch and the pull request happen, and where any
+ *  question about them gets asked. */
+export async function proposePluginUpstreamAction(
+  pluginId: string,
+  pluginName: string,
+): Promise<void> {
+  let result: Awaited<ReturnType<typeof proposePluginUpstream>>;
+  try {
+    result = await proposePluginUpstream(pluginId);
+  } catch (e) {
+    showToast(`Couldn't prepare a patch for ${pluginName}: ${errorDetail(e)}`, 'error');
+    return;
+  }
+  // Guarded separately: the patch is already written and committed, so a failed
+  // navigation is not a failed proposal and must not say it was.
+  try {
+    focusThread(result.thread_id);
+  } catch (e) {
+    showToast(
+      `Saved your ${pluginName} patch to data/${result.patch_path}, but couldn't open the thread: ${errorDetail(e)}`,
+      'error',
+    );
+  }
 }

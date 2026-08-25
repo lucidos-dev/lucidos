@@ -5,9 +5,10 @@
 //! `engine::tools::*`; this module owns only the wire contract.
 //!
 //! Schemas are grouped per-domain into child modules, each sitting next to
-//! the family it describes. `get_default_tools()` is the single entry point:
-//! it splices each family in display order, so the LLM still sees the whole
-//! tool surface in one vec. The per-domain families:
+//! the family it describes. [`FAMILIES`] splices them in display order, so the
+//! LLM still sees the whole tool surface in one vec. Every row of that table
+//! names a [`Gate`]. That is ADR 0088's rule made structural: a family states
+//! its gate, or states it has none. The per-domain families:
 //!
 //! - `browser` — autonomous browser-driving tools
 //! - `file` — read/write/edit/list/glob/grep/copy/delete/import
@@ -15,7 +16,6 @@
 //! - `email` — configure/send/read/save attachment
 //! - `apps` — create/list/refresh/capture + load_knowhow
 //! - `notifications` — send (reading/clearing the inbox is the grouped tool below)
-//! - `memory` — dismiss-from-context (correction is the grouped `memory` tool)
 //! - `threads`: run_thread, run_coding_agent, follow_up_child_thread
 //!   (list/count is the grouped `threads` tool)
 //! - `web` — web_search, fetch_news
@@ -55,7 +55,6 @@ mod email;
 mod exec;
 mod file;
 mod images;
-mod memory;
 mod misc;
 mod notifications;
 mod proxy;
@@ -82,49 +81,190 @@ pub(crate) const MAX_TIMEOUT_SECS: u64 = 300;
 pub(crate) const BG_DEFAULT_TIMEOUT_SECS: u64 = 600;
 pub(crate) const BG_MAX_TIMEOUT_SECS: u64 = 3600;
 
-/// The chat-agent default tool set, in the exact order the LLM sees it. Each
-/// family contributes its slice via a child-module builder; the splice order
-/// here IS the wire order, so do not reorder the calls.
-pub fn get_default_tools() -> Vec<ToolDefinition> {
-    let mut tools: Vec<ToolDefinition> = Vec::new();
-    tools.extend(file::read_write_edit_tools()); // read_file, write_file, edit_file
-    tools.extend(exec::exec_tools()); // run_python(_background), run_bash(_background), bash_output, bash_kill
-    tools.extend(file::search_tools()); // list_files, glob_files, grep_files, copy_file, delete_file
-    tools.extend(proxy::proxy_tools()); // reload_proxy_modules, proxy_request, http_request
-    tools.extend(file::import_file_tools()); // import_file
-    tools.extend(misc::git_clone_tools()); // git_clone
-    tools.extend(misc::backup_status_tools()); // get_backup_status
-                                               // get_preferences/set_preference → grouped `preferences` tool; the trigger +
-                                               // trigger-group family → grouped `triggers`/`trigger_groups` tools; env-var
-                                               // management → grouped `env_vars` tool (set_environment_variable kept as a
-                                               // back-compat alias). All spliced from `capability_manifest::llm_tools()` by
-                                               // the chat/intent callers.
-    tools.extend(web::fetch_news_tools()); // fetch_news
-    tools.extend(browser::browser_tools()); // browser_* family
-    tools.extend(web::web_search_tools()); // web_search
-    tools.extend(misc::request_credential_tools()); // request_credential
-    tools.extend(email::email_tools()); // configure/send/read emails + save attachment
-    tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_app, capture_app
-    tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
-    tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent, follow_up_child_thread
-                                          // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
-                                          // (spliced via capability_manifest::llm_tools()).
-    tools.extend(misc::execute_intent_tools()); // execute_intent
-                                                // emit/query/count events and list/apply changes are the grouped `events` /
-                                                // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
-                                                // list_threads/count_threads are the grouped `threads` manifest tool (spliced
-                                                // via capability_manifest::llm_tools()); run_thread / run_coding_agent /
-                                                // follow_up_child_thread stay standalone above (threads::spawn_tools()).
-                                                // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
-                                                // manifest tool (spliced via capability_manifest::llm_tools()).
-                                                // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
-                                                // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
-    tools.extend(misc::ask_user_question_tools()); // ask_user_question
-    tools.extend(misc::await_event_tools()); // await_event
-    tools.extend(misc::event_wait_agent_tools()); // list_event_waits, cancel_event_wait
-    tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context
-    tools.extend(misc::todo_write_tools()); // todo_write
-    tools
+/// What the WORKSPACE is configured to do, as the registry's gates read it.
+///
+/// A pure function of workspace configuration, and of nothing else: not the
+/// thread, not the thread kind, not the caller. That is what keeps every
+/// thread in a workspace on one byte-identical array, sharing a single
+/// prompt-cache entry (ADR 0088 decision 2).
+///
+/// Resolved once per turn by `LucidosEngine::read_turn_capabilities`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolCapabilities {
+    /// The workspace has at least one configured email account.
+    pub email_account: bool,
+    /// The workspace has at least one intent.
+    pub intent: bool,
+    /// An image-generation provider is configured.
+    pub image_provider: bool,
+    /// The *self-curated context mode* is on for this workspace.
+    ///
+    /// Unlike the three above it opens no family. It CLOSES one. The mode adds
+    /// no tool and takes `todo_write` away, because the checklist moved into
+    /// the working understanding. A schema billed on every request that
+    /// nothing calls is the cost bug the mode exists to fix.
+    pub context_mode: bool,
+}
+
+impl ToolCapabilities {
+    /// Every [`Gate`] open, which is the whole engine-authored surface rather
+    /// than one workspace's array. For tests asking whether a schema is
+    /// registered at all, which no gate should be able to answer for them.
+    ///
+    /// `context_mode` is not a gate and is off here. It shapes rather than
+    /// gates, and what it does is CLOSE a family, so the widest array is the
+    /// one with the mode off.
+    pub fn all_open() -> Self {
+        Self {
+            email_account: true,
+            intent: true,
+            image_provider: true,
+            context_mode: false,
+        }
+    }
+}
+
+/// Why a tool family is, or is not, offered to a workspace.
+///
+/// Every row of [`FAMILIES`] and [`CHAT_TAIL`] carries one, so a new family
+/// cannot arrive resident by omission: the row does not compile without it.
+/// [`Gate::Ungated`] is how a family states that it has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// No gate. Every workspace can act on this family.
+    Ungated,
+    /// At least one configured email account.
+    EmailAccount,
+    /// At least one intent.
+    Intent,
+    /// A configured image-generation provider.
+    ImageProvider,
+}
+
+impl Gate {
+    fn is_open(self, caps: &ToolCapabilities) -> bool {
+        match self {
+            Gate::Ungated => true,
+            Gate::EmailAccount => caps.email_account,
+            Gate::Intent => caps.intent,
+            Gate::ImageProvider => caps.image_provider,
+        }
+    }
+}
+
+/// How a family's schemas are rendered, once its gate says they are offered.
+///
+/// Separate from [`Gate`], which answers WHETHER. This answers WHAT SHAPE, and
+/// almost every family answers `Fixed`: its bytes are the same in every
+/// workspace on this build. `Shaped` is for a family whose schema is itself a
+/// function of workspace configuration, which today is `todo_write`: the
+/// self-curated context mode takes it away. Reading the capabilities is the
+/// only way to vary a schema: an `if` at the splice site is what ADR 0088
+/// replaced.
+#[derive(Clone, Copy)]
+pub enum Build {
+    /// Same bytes in every workspace.
+    Fixed(fn() -> Vec<ToolDefinition>),
+    /// Bytes shaped by workspace configuration.
+    Shaped(fn(&ToolCapabilities) -> Vec<ToolDefinition>),
+}
+
+impl Build {
+    fn render(self, caps: &ToolCapabilities) -> Vec<ToolDefinition> {
+        match self {
+            Build::Fixed(build) => build(),
+            Build::Shaped(build) => build(caps),
+        }
+    }
+}
+
+/// One registry row: the gate deciding whether a workspace is offered this
+/// family, and the builder that renders its schemas.
+type FamilyRow = (Gate, Build);
+
+/// The chat-agent default tool set, in the exact order the LLM sees it.
+///
+/// The row order here IS the wire order. Reordering it rewrites the first
+/// cache segment for every workspace, so do not.
+const FAMILIES: &[FamilyRow] = &[
+    (Gate::Ungated, Build::Fixed(file::read_write_edit_tools)), // read_file, write_file, edit_file
+    (Gate::Ungated, Build::Fixed(exec::exec_tools)), // run_python(_background), run_bash(_background), bash_output, bash_kill
+    (Gate::Ungated, Build::Fixed(file::search_tools)), // list_files, glob_files, grep_files, copy_file, delete_file
+    (Gate::Ungated, Build::Fixed(proxy::proxy_tools)), // reload_proxy_modules, proxy_request, http_request
+    (Gate::Ungated, Build::Fixed(file::import_file_tools)), // import_file
+    (Gate::Ungated, Build::Fixed(misc::git_clone_tools)), // git_clone
+    (Gate::Ungated, Build::Fixed(misc::backup_status_tools)), // get_backup_status
+    // Spliced from `capability_manifest::llm_tools()` by the chat and intent
+    // callers rather than here:
+    // - get_preferences/set_preference → grouped `preferences` tool
+    // - the trigger and trigger-group family → `triggers` / `trigger_groups`
+    // - env-var management → `env_vars`, with set_environment_variable an alias
+    (Gate::Ungated, Build::Fixed(web::fetch_news_tools)), // fetch_news
+    (Gate::Ungated, Build::Fixed(browser::browser_tools)), // browser_* family
+    (Gate::Ungated, Build::Fixed(web::web_search_tools)), // web_search
+    (Gate::Ungated, Build::Fixed(misc::request_credential_tools)), // request_credential
+    // `configure_email` is the ONLY writer of the first `email_accounts` row,
+    // so gating it on having one would make email setup unreachable. The four
+    // schemas that operate on an account are the ones the engine would refuse.
+    (Gate::Ungated, Build::Fixed(email::configure_email_tools)), // configure_email
+    (Gate::EmailAccount, Build::Fixed(email::mailbox_tools)), // send_email, read_emails, read_email, save_email_attachment
+    (Gate::Ungated, Build::Fixed(apps::app_tools)), // create_app, list_apps, load_knowhow, refresh_app, capture_app
+    (Gate::Ungated, Build::Fixed(misc::connect_oauth_tools)), // connect_oauth_account
+    (Gate::Ungated, Build::Fixed(threads::spawn_tools)), // run_thread, run_coding_agent, follow_up_child_thread
+    // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
+    // (spliced via capability_manifest::llm_tools()).
+    (Gate::Intent, Build::Fixed(misc::execute_intent_tools)), // execute_intent
+    // emit/query/count events and list/apply changes are the grouped `events` /
+    // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
+    // list_threads/count_threads are the grouped `threads` manifest tool (spliced
+    // via capability_manifest::llm_tools()); run_thread / run_coding_agent /
+    // follow_up_child_thread stay standalone above (threads::spawn_tools()).
+    // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
+    // manifest tool (spliced via capability_manifest::llm_tools()).
+    // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
+    // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
+    (Gate::Ungated, Build::Fixed(misc::ask_user_question_tools)), // ask_user_question
+    (Gate::Ungated, Build::Fixed(misc::await_event_tools)),       // await_event
+    (Gate::Ungated, Build::Fixed(misc::event_wait_agent_tools)), // list_event_waits, cancel_event_wait
+    // Ungated, so every workspace is offered it. Shaped, because the mode
+    // adds no tool and takes this one away: the checklist moved into the
+    // working understanding, and two write surfaces for one list is the cost
+    // bug twice over.
+    (Gate::Ungated, Build::Shaped(misc::todo_write_tools)), // todo_write
+];
+
+/// The schemas the chat caller splices AFTER the grouped manifest set, so
+/// they cannot live in [`FAMILIES`] without moving on the wire.
+///
+/// Same table shape for the same reason. `generate_image` is the gate ADR
+/// 0088 extends, so it belongs to the one mechanism rather than to an `if`
+/// at the splice site.
+const CHAT_TAIL: &[FamilyRow] = &[
+    (Gate::Ungated, Build::Fixed(misc::navigate_ui_tools)), // navigate_ui
+    // view_image re-loads an earlier thread image into vision. It needs no
+    // image *generation* provider, so it is ungated unlike `generate_image`.
+    (Gate::Ungated, Build::Fixed(images::thread_image_tools)), // save_thread_image, view_image
+    (Gate::ImageProvider, Build::Fixed(images::generation_tools)), // generate_image
+];
+
+/// Splice one registry table down to the families this workspace can use.
+fn offered(rows: &[FamilyRow], caps: &ToolCapabilities) -> Vec<ToolDefinition> {
+    rows.iter()
+        .filter(|(gate, _)| gate.is_open(caps))
+        .flat_map(|(_, build)| build.render(caps))
+        .collect()
+}
+
+/// The chat-agent default tool set for a workspace: [`FAMILIES`] with every
+/// closed gate dropped.
+pub fn get_default_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition> {
+    offered(FAMILIES, caps)
+}
+
+/// The chat-only tail, spliced after `send_notification` and the grouped
+/// manifest set. See [`CHAT_TAIL`].
+pub fn chat_tail_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition> {
+    offered(CHAT_TAIL, caps)
 }
 
 #[cfg(test)]

@@ -5,11 +5,10 @@ import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement
  *  the signal-driven Preact render to apply the open state before returning,
  *  so callers can immediately assert on overlay/input visibility.
  *
- *  Goes through `clickHeaderAction` rather than the bare `.file-search-btn`:
- *  the mobile content header folds every context action into its `⋯` menu, so
- *  on both phone projects the search button has no header rendering at all.
- *  Where the action sits is the layout's business; opening search is this
- *  spec's. */
+ *  Goes through `clickHeaderAction` rather than the bare `.file-search-btn`.
+ *  Files carries one context action today, so it rides the row on every
+ *  project, but a second one would fold both into the `⋯` menu. Where the
+ *  action sits is the layout's business; opening search is this spec's. */
 async function openFileSearch(page: Page): Promise<void> {
   await blurActiveElement(page);
   await page.waitForTimeout(100);

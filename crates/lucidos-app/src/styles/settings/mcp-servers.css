@@ -117,39 +117,9 @@
     color: var(--text-secondary);
 }
 
-/* The disclosure for the tool list. A plain button reset, so it reads as the
-   quiet line of metadata it is rather than as a control. */
-.mcp-tools-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    margin-top: var(--space-sm);
-    padding: 0;
-    background: none;
-    border: none;
-    color: var(--text-secondary);
-    /* No `font` shorthand: base.css already hands a button the inherited
-       family, and the shorthand would reset font-feature-settings with it
-       (.claude/rules/frontend-css.md). Only the size differs from the body. */
-    font-size: var(--font-size-sm);
-    cursor: pointer;
-}
-
-@media (hover: hover) {
-    .mcp-tools-toggle:hover {
-        color: var(--text-primary);
-    }
-}
-
-.mcp-tools-toggle:focus-visible {
-    outline: 0.125rem solid transparent;
-    box-shadow: var(--focus-ring);
-    border-radius: 0.25rem;
-}
-
-.mcp-tools-toggle svg {
-    flex-shrink: 0;
-}
+/* The disclosure for the tool list is `.settings-disclosure-toggle`, in
+   settings/base.css. It carried a byte-identical copy of that rule until the
+   Models list grew a second one. */
 
 .mcp-row-actions {
     align-items: center;

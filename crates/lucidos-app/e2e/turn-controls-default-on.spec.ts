@@ -79,8 +79,10 @@ async function openThread(page: Page, threadId: string): Promise<void> {
   await ensureOnThreadPane(page);
 }
 
+// Scoped to the RESPONSE header's run: the initiator header carries a
+// `.turn-controls` run too, and its lone control is the fold.
 const control = (page: Page, role: 'toggle-steps' | 'toggle-details') =>
-  page.locator(`.response-controls [data-role="${role}"]:visible`).first();
+  page.locator(`.response-header .turn-controls [data-role="${role}"]:visible`).first();
 
 test.describe('Turn controls default on', () => {
   test('an untouched transcript shows every prose block and the steps, and each control turns its own off and back on', async ({ page }) => {

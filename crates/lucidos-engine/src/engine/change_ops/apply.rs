@@ -5,9 +5,58 @@ use crate::engine::git_ops::{
     commits_in_range, ff_main_to, files_have_client_update, find_branch_merge_in_main,
     find_worktree_for_branch, has_branch_commits, is_harden_marker_present,
     push_main_in_background, recover_no_commits_branch, worktree_add, worktrees_dir,
-    NoCommitsRecovery, MERGE_MUTEX,
+    NoCommitsRecovery, WorktreeLookup, MERGE_MUTEX,
 };
 use crate::engine::{ApplyResult, ApplyStatus};
+
+/// Pick the worktree the hardening session runs in, given what git said about
+/// `branch_name`.
+///
+/// Reuse an existing worktree when one is on disk: the producing Claude Code
+/// session has exited, but its worktree and branch lock survive, and
+/// `git worktree add` would fail with "branch already used by worktree".
+/// That is what broke nightly trigger applies, which POST apply immediately
+/// after the session exits.
+///
+/// The lookup is a parameter rather than an inner call so a test can drive the
+/// `Unknown` arm against a real repo. Unknown refuses, because the `NotFound`
+/// arm force-removes `fresh_path`. That path is derived from the change id, so
+/// a second Apply aims at the same directory a live hardening session may be
+/// working in. Apply is user-initiated and retryable, so refusing costs a click.
+pub(crate) async fn resolve_harden_worktree(
+    repo_root: &Path,
+    branch_name: &str,
+    fresh_path: &Path,
+    lookup: WorktreeLookup,
+) -> Result<PathBuf, String> {
+    match lookup {
+        WorktreeLookup::Found(existing) => {
+            log!(
+                "[Changes] Reusing existing worktree {} for hardening of branch {}",
+                existing.display(),
+                branch_name
+            );
+            Ok(existing)
+        }
+        WorktreeLookup::Unknown => Err(format!(
+            "Could not determine which worktree holds branch {} (git worktree list gave no \
+             answer). Refusing to clear the hardening worktree on a guess. Try Apply again.",
+            branch_name
+        )),
+        WorktreeLookup::NotFound => {
+            let wt_str = fresh_path.to_string_lossy().into_owned();
+            let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], repo_root).await;
+            match worktree_add(repo_root, fresh_path, &[branch_name]).await {
+                Ok(o) if o.status.success() => Ok(fresh_path.to_path_buf()),
+                Ok(o) => Err(format!(
+                    "Failed to create worktree for hardening: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )),
+                Err(e) => Err(format!("Failed to create worktree for hardening: {}", e)),
+            }
+        }
+    }
+}
 
 impl LucidosEngine {
     /// Mark a change applied without merging anything: delete the branch ref,
@@ -399,46 +448,20 @@ impl LucidosEngine {
 
             let repo_root = std::path::PathBuf::from(&change.repo_root);
 
-            // Reuse an existing CC worktree on this branch if one's still on
-            // disk (the producing Claude Code session has exited, but its worktree and
-            // branch lock survive). Without this, `git worktree add` below
-            // would fail with "branch already used by worktree" — which is
-            // what broke nightly trigger applies (orchestrator POSTs apply
-            // immediately after CC exits, before any cleanup pass).
-            let wt_path = if let Some(existing) =
-                find_worktree_for_branch(&repo_root, &change.branch_name).await
-            {
-                log!(
-                    "[Changes] Reusing existing worktree {} for hardening of branch {}",
-                    existing.display(),
-                    change.branch_name
-                );
-                existing
-            } else {
-                let wt_path = worktrees_dir(self.workspace_path())
-                    .join(format!("harden-{}", change_id.as_simple()));
-                let wt_str = wt_path.to_string_lossy().into_owned();
-                let _ = git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
-                match worktree_add(&repo_root, &wt_path, &[&change.branch_name]).await {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        let msg = format!(
-                            "Failed to create worktree for hardening: {}",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        );
+            let lookup = find_worktree_for_branch(&repo_root, &change.branch_name).await;
+            let fresh_path = worktrees_dir(self.workspace_path())
+                .join(format!("harden-{}", change_id.as_simple()));
+            let wt_path =
+                match resolve_harden_worktree(&repo_root, &change.branch_name, &fresh_path, lookup)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(msg) => {
                         self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
                             .await;
                         return Err(msg.into());
                     }
-                    Err(e) => {
-                        let msg = format!("Failed to create worktree for hardening: {}", e);
-                        self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
-                            .await;
-                        return Err(msg.into());
-                    }
-                }
-                wt_path
-            };
+                };
 
             log!(
                 "[Changes] Not hardened — spawning hardening recovery for change {} (thread {})",
@@ -701,7 +724,21 @@ impl LucidosEngine {
 
         // Tier 2: dead session with worktree on disk — try ff, else resume CC for merge
         if let Some(thread_id) = change.thread_id {
-            if let Some(wt_path) = find_worktree_for_branch(&repo_root, &change.branch_name).await {
+            let lookup = find_worktree_for_branch(&repo_root, &change.branch_name).await;
+            // An unknown lookup must not silently downgrade the tier. Tier 3
+            // force-removes its temp tree and can fast-forward main without ever
+            // running the auto-commit below over the real worktree.
+            if matches!(lookup, WorktreeLookup::Unknown) {
+                let msg = format!(
+                    "Could not determine which worktree holds branch {} (git worktree list gave \
+                     no answer). Refusing to merge without it. Try Apply again.",
+                    change.branch_name
+                );
+                self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
+                    .await;
+                return Err(msg.into());
+            }
+            if let WorktreeLookup::Found(wt_path) = lookup {
                 // Auto-commit any uncommitted CC work before merging
                 auto_commit_worktree(&wt_path, "Coding agent changes (pre-merge auto-commit)")
                     .await;

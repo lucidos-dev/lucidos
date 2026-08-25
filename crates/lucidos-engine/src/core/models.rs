@@ -359,8 +359,8 @@ mod tests {
         assert!(
             models
                 .iter()
-                .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin() && m.enabled),
-            "Sonnet 4.6 stays an enabled builtin: Sonnet 5 is added above it, not swapped in"
+                .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin() && !m.enabled),
+            "Sonnet 4.6 is still SEEDED, and switched off by the prior-generation prune"
         );
         // Ordered by sort_order: Fable 5 (0) sorts before Opus 5 (5) before
         // Sonnet 5 (7) before Opus 4.8 (10), grouping the current generation at
@@ -407,14 +407,19 @@ mod tests {
     /// The Grok family is seeded on the xAI provider, with every window
     /// DECLARED. The id-shape fallback has no rule for a `grok-` id, so an
     /// undeclared row would budget a 2M model at 200k.
+    ///
+    /// The window is asserted on all four, including the two the
+    /// prior-generation prune switched off. A disabled row still has to carry a
+    /// true window: routing loads it, so a saved `chat_model` naming one is
+    /// budgeted from this column.
     #[tokio::test]
     async fn migration_seeds_the_grok_family_on_xai_with_declared_windows() {
         let (pool, db_name) = setup_test_db().await;
-        for (id, label, window) in [
-            ("grok-4.6", "Grok 4.6", 500_000),
-            ("grok-4.5", "Grok 4.5", 500_000),
-            ("grok-4.20", "Grok 4.20", 2_000_000),
-            ("grok-4.3", "Grok 4.3", 1_000_000),
+        for (id, label, window, enabled) in [
+            ("grok-4.6", "Grok 4.6", 500_000, true),
+            ("grok-4.5", "Grok 4.5", 500_000, false),
+            ("grok-4.20", "Grok 4.20", 2_000_000, true),
+            ("grok-4.3", "Grok 4.3", 1_000_000, false),
         ] {
             let m = ModelStore::get(&pool, id)
                 .await
@@ -423,7 +428,7 @@ mod tests {
             assert_eq!(m.provider, "xai", "{id}");
             assert_eq!(m.label, label, "{id}");
             assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
-            assert!(m.enabled, "{id} is enabled by default");
+            assert_eq!(m.enabled, enabled, "{id}");
             assert_eq!(m.context_window, Some(window), "{id}");
         }
 
@@ -436,6 +441,113 @@ mod tests {
                 .is_none(),
             "the seed must not create an OpenRouter-prefixed row"
         );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The keyless free tier is seeded with every window DECLARED, since these
+    /// ids share no shape the fallback could read. Seeding does not switch the
+    /// tier on: the provider is built from the `opencode_free_enabled`
+    /// preference, so the rows stay filtered out until the user opts in.
+    #[tokio::test]
+    async fn migration_seeds_the_free_tier_with_declared_windows() {
+        let (pool, db_name) = setup_test_db().await;
+        for (id, label, window) in [
+            ("laguna-s-2.1-free", "Laguna S 2.1 (free)", 256_000),
+            (
+                "nemotron-3.5-lightning-free",
+                "Nemotron 3.5 Lightning (free)",
+                262_144,
+            ),
+            ("x-preview-f-free", "Ox Alpha (free)", 1_000_000),
+            (
+                "nemotron-3-ultra-free",
+                "Nemotron 3 Ultra (free)",
+                1_000_000,
+            ),
+            (
+                "muse-spark-1.2-contributor-free",
+                "Muse Spark 1.2 (free)",
+                1_048_576,
+            ),
+            ("hy3-free", "Hy3 (free)", 190_000),
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must be seeded"));
+            assert_eq!(m.provider, "opencode-free", "{id}");
+            assert_eq!(m.label, label, "{id}");
+            assert!(m.is_builtin(), "{id} must be a builtin (disable-only)");
+            assert!(m.enabled, "{id} is enabled by default");
+            assert_eq!(m.context_window, Some(window), "{id}");
+        }
+
+        // The relay serves big-pickle only to the OpenCode CLI's own
+        // User-Agent, so a seeded row would never answer us.
+        assert!(
+            ModelStore::get(&pool, "big-pickle")
+                .await
+                .unwrap()
+                .is_none(),
+            "big-pickle is User-Agent gated and must not be seeded"
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The prior generation of every family is switched off, and KEPT.
+    ///
+    /// Both halves matter. A retired model leaves the picker, and its row has to
+    /// survive, because `model_registry::load_from_db` loads disabled rows so a
+    /// saved `chat_model` naming one still routes. Delete instead, and a bare
+    /// `grok-4.5` falls to the id-shape guess and lands on Vertex.
+    #[tokio::test]
+    async fn migration_switches_off_the_prior_generation_of_every_family() {
+        let (pool, db_name) = setup_test_db().await;
+        for id in [
+            "claude-opus-4-8@default",
+            "claude-opus-4-8@default[1m]",
+            "claude-opus-4-7",
+            "claude-opus-4-7[1m]",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6[1m]",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.3-codex",
+            "grok-4.5",
+            "grok-4.3",
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must keep its row, disable-only"));
+            assert!(m.is_builtin(), "{id}");
+            assert!(!m.enabled, "{id} must be switched off");
+        }
+
+        // The current lineup, which the prune must not reach. Opus 5 in
+        // particular is `DEFAULT_CHAT_MODEL`: switch it off and a fresh install
+        // resolves to a model its own picker will not show.
+        for id in [
+            "claude-fable-5",
+            "claude-opus-5@default",
+            "claude-sonnet-5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5-pro",
+            "grok-4.6",
+            "grok-4.20",
+            "z-ai/glm-5.2",
+            "gemini-3.1-pro-preview",
+        ] {
+            let m = ModelStore::get(&pool, id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} must be seeded"));
+            assert!(m.enabled, "{id} must stay on");
+        }
         pool.close().await;
         teardown_test_db(&db_name).await;
     }

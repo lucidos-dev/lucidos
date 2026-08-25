@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged, preferences } from '../../store/store';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 
@@ -158,5 +158,40 @@ describe('settings search: the Access connect URLs row', () => {
     const entry = findSettingsEntry('access:urls');
     expect(entry?.subview).toBe('access');
     expect(entry?.anchor).toBe('access:urls');
+  });
+});
+
+describe('settings search: the Paired devices row', () => {
+  it('resolves to the Devices subview and its anchor', () => {
+    // Pairing and push are one row now, so Revoke is found where the device
+    // is, not under Access. Two lists under one word were the confusion.
+    const entry = findSettingsEntry('devices:paired');
+    expect(entry?.subview).toBe('devices');
+    expect(entry?.anchor).toBe('devices:list');
+  });
+
+  it('is findable by the word the user is actually after', async () => {
+    // Gated on the gateway having served the page, which is what `<base href>`
+    // says. The suite's DOM stub stamps none, so the entry is hidden by
+    // default and this reloads the module with one.
+    const stub = document.querySelector;
+    (document as unknown as { querySelector: (s: string) => unknown }).querySelector = (s) =>
+      s === 'base' ? { getAttribute: () => '/dev/' } : null;
+    vi.resetModules();
+    try {
+      const { getSettingsSearchResults: search } = await import('./searchIndex');
+      expect(search('revoke', 20).some((r) => r.id === 'devices:paired')).toBe(true);
+      expect(search('paired', 20).some((r) => r.id === 'devices:paired')).toBe(true);
+    } finally {
+      (document as unknown as { querySelector: unknown }).querySelector = stub;
+      vi.resetModules();
+    }
+  });
+
+  it('is withheld where no row can carry a Revoke button', () => {
+    // No gateway served this page, so no device is paired and nothing on the
+    // list revokes. A hit landing on nothing is worse than no hit at all.
+    expect(getSettingsSearchResults('revoke', 20).some((r) => r.id === 'devices:paired'))
+      .toBe(false);
   });
 });

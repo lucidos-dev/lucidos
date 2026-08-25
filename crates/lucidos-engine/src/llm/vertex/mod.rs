@@ -105,6 +105,21 @@ pub async fn get_cached_access_token(
     Ok(token)
 }
 
+/// Run a subprocess with a wall-clock ceiling, killing it on timeout so it
+/// cannot outlive this call. Extracted so the timeout itself is testable
+/// against a real wedged child, without waiting out the 60s production value.
+async fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output, Box<dyn std::error::Error + Send + Sync>> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(result) => Ok(result?),
+        Err(_) => Err(format!("{label} timed out after {}s", timeout.as_secs()).into()),
+    }
+}
+
 /// Acquire a fresh Vertex access token (uncached). ADC-direct first
 /// (packaged-friendly, no binary), then the `gcloud` subprocess fallback.
 async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -120,10 +135,13 @@ async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send
         }
     }
 
-    let output = Command::new("gcloud")
-        .args(["auth", "application-default", "print-access-token"])
-        .output()
-        .await?;
+    // `gcloud` does its own network token exchange. A wedged one hangs the
+    // chat turn with no terminal event, the same hang class as the ADC
+    // client above. So it is bounded to the same `adc::TOKEN_REQUEST_TIMEOUT`
+    // (60s).
+    let mut cmd = Command::new("gcloud");
+    cmd.args(["auth", "application-default", "print-access-token"]);
+    let output = run_with_timeout(cmd, adc::TOKEN_REQUEST_TIMEOUT, "gcloud").await?;
 
     if output.status.success() {
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -186,6 +204,32 @@ impl VertexProvider {
             streaming_client,
             token_cache,
         })
+    }
+
+    /// Cap every HTTP attempt this provider makes at `timeout`, streaming
+    /// included. Builder-style, so the ordinary constructors keep their
+    /// unbounded-stream behaviour and only the caller that wants a bound pays
+    /// for it.
+    ///
+    /// The one caller is [`crate::memory::MemoryExtractor`], which serves
+    /// *auxiliary model calls*. Each of those runs under a deadline from
+    /// `engine::aux_purpose`, and that deadline can only contain the provider's
+    /// retries if one attempt is itself bounded. Without this, the 900s default
+    /// meant the first attempt outlived any deadline worth setting, so the
+    /// three retries behind it never happened.
+    pub fn with_request_timeout(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()?;
+        self.streaming_client = reqwest::Client::builder()
+            .timeout(timeout)
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()?;
+        Ok(self)
     }
 
     /// Snapshot the current region. URL builders call this per-request.
@@ -367,6 +411,31 @@ impl LlmProvider for VertexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wedged subprocess (a `gcloud` that hangs on its network exchange)
+    /// must be killed at the timeout rather than left running forever. Uses a
+    /// real `sleep` child and a millisecond-scale timeout so the test proves
+    /// the mechanism without waiting out the 60s production value.
+    #[tokio::test]
+    async fn a_wedged_command_is_killed_at_the_timeout() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let err = run_with_timeout(cmd, Duration::from_millis(50), "test-command")
+            .await
+            .expect_err("a command that outlives its timeout must error");
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    /// A command that finishes well inside the timeout still returns its
+    /// output normally: the bound must not fire early on ordinary success.
+    #[tokio::test]
+    async fn a_fast_command_completes_normally() {
+        let cmd = Command::new("true");
+        let output = run_with_timeout(cmd, Duration::from_secs(5), "test-command")
+            .await
+            .expect("a fast command must not be treated as wedged");
+        assert!(output.status.success());
+    }
 
     #[test]
     fn vertex_host_covers_global_multiregion_and_specific_region() {

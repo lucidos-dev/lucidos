@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'preact/hooks';
-import { artifactRevision, filePreviewSource, filePreviewEditing, openImagePopup, showToast } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewEditing, openImagePopup, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -7,6 +7,7 @@ import { renderCsvTable } from '../../utils/csv';
 import { SlidesPreview } from './SlidesPreview';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { ApiError, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
 import { openFilePreview, refreshFilePreview } from '../../store/actions/artifacts';
 import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
@@ -14,6 +15,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
+import { withPreviewRevision } from './previewRevision';
 import {
   bridgePreviewIframeLinks,
   documentDeclaresBase,
@@ -34,6 +36,20 @@ export function basename(path: string): string {
   return path.split('/').pop() || '';
 }
 
+/** The URL the preview fetches: the file's own `/data/` URL, cache-busted only
+ *  when the revision stamp names THIS file.
+ *
+ *  Matched on the path rather than taken from `openFilePreviewRevision`, which
+ *  is what the repo preview reads: this component also renders inside the file
+ *  preview modal, which can show a different file than the content pane. */
+export function previewUrl(
+  base: string,
+  path: string,
+  stamp: { path: string; rev: number } | null,
+): string {
+  return withPreviewRevision(base, stamp && stamp.path === path ? stamp.rev : 0);
+}
+
 interface Props {
   path: string;
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
@@ -43,9 +59,7 @@ interface Props {
 
 export function FilePreviewInline({ path, layout }: Props) {
   const ext = path.split('.').pop()?.toLowerCase() || '';
-  const rev = artifactRevision.value;
-  const base = lucidos.data.url(path);
-  const url = rev ? `${base}?v=${rev}` : base;
+  const url = previewUrl(lucidos.data.url(path), path, filePreviewRevision.value);
   const sourceMode = filePreviewSource.value && RENDERABLE_EXTS.includes(ext);
   const editing = filePreviewEditing.value && isEditableDataFile(path);
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
@@ -76,24 +90,97 @@ export function FilePreviewInline({ path, layout }: Props) {
   );
 }
 
+/** How the toolbar looks for a draft in a given state. Both buttons exist in
+ *  every state (see EditorToolbar), so this answers three questions instead of
+ *  picking a button set: is the Cancel slot open, which label does the primary
+ *  button wear, and what does that button do.
+ *
+ *  `showSaving` is the DELAYED flag, never the raw one. It governs what the
+ *  toolbar LOOKS like. What it can DO is the raw flag's job, see EditorToolbar.
+ *
+ *  Pure and exported, so the branch is checkable without a DOM. */
+export function editorToolbarState(dirty: boolean, showSaving: boolean) {
+  return {
+    cancelOpen: dirty,
+    label: showSaving ? 'saving' : dirty ? 'save' : 'close',
+    action: dirty ? 'save' : 'close',
+  } as const;
+}
+
+/** Every label the primary button can wear. Only the current one is rendered.
+ *  `.file-editor-primary-label` reserves the widest of them, so the button
+ *  holds its width as the label changes. */
+const PRIMARY_LABELS = { save: 'Save', saving: 'Saving…', close: 'Close' } as const;
+
+/** The editor's button set. No unsaved changes: a single neutral Close.
+ *  Unsaved changes: red Cancel (discard) plus blue Save. Exported and kept
+ *  hook-free so `vnodeToText` can render it directly in tests.
+ *
+ *  This mounts both buttons in both states, and the state decides how they
+ *  look rather than whether they exist. Returning two different trees is what
+ *  made a save snap. Preact found a fragment where a button had been, so it
+ *  rebuilt the row. A rebuilt element gives a transition no two ends to run
+ *  between. The send/cancel morph holds one JSX position for the same reason.
+ *
+ *  The two saving flags are separate on purpose. `saving` is raw and makes the
+ *  buttons inert the instant the request goes out. Nobody can then hit Cancel
+ *  on a write already on the wire and read the exit as a discard. `showSaving`
+ *  is delayed and decides only what the row looks like. `.is-saving` is what
+ *  lets a button be inert without yet wearing the disabled dim. */
+export function EditorToolbar({ dirty, saving, showSaving, onClose, onCancel, onSave }: {
+  dirty: boolean;
+  saving: boolean;
+  showSaving: boolean;
+  onClose: () => void;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  const { cancelOpen, label, action } = editorToolbarState(dirty, showSaving);
+  return (
+    <div class={`file-editor-actions${showSaving ? ' is-saving' : ''}`}>
+      <div class={`file-editor-cancel-slot${cancelOpen ? ' is-open' : ''}`}>
+        <button
+          class="action-btn action-btn-danger"
+          onClick={onCancel}
+          disabled={saving || !cancelOpen}
+        >
+          Cancel
+        </button>
+      </div>
+      <button class="action-btn" onClick={action === 'save' ? onSave : onClose} disabled={saving}>
+        <span class="file-editor-primary-label">{PRIMARY_LABELS[label]}</span>
+      </button>
+    </div>
+  );
+}
+
 /** Inline editor for a text data file. Fetches the current raw content, lets
  *  the user edit it in a textarea, and writes it back via PUT /api/v1/data.
  *  Mounted by FilePreviewInline only while `filePreviewEditing` is on for an
- *  editable path. Save/Cancel live here (not in the header) so the draft state
- *  stays local to the editor.
+ *  editable path. Save/Cancel/Close live here (not in the header) so the
+ *  draft state stays local to the editor.
  *
  *  The toolbar is right-aligned with Save rightmost, and Save stays on the
  *  neutral blue `action-btn` rather than the green `action-btn-confirm`: green
  *  reads as accepting something already on screen (Apply / Accept), the same
- *  reason the welcome CTA keeps the blue default. */
+ *  reason the welcome CTA keeps the blue default.
+ *
+ *  A successful save does not leave edit mode. It clears the dirty state, so
+ *  the toolbar settles back to the single Close button. The user decides when
+ *  to return to the read view.
+ *
+ *  A save to a local file returns in a few tens of milliseconds. So the toolbar
+ *  shows the in-flight state only once the save runs past SPINNER_DELAY_MS. The
+ *  raw flag flashed it. The label swapped to Saving… and back inside a frozen
+ *  box, which slid the text sideways and back for one frame. Same delay gate
+ *  every loader in the app uses, and for the same reason. */
 function FileEditor({ path, url }: { path: string; url: string }) {
   // Freeze the fetch URL at mount. While editing, the editor is the source of
-  // truth; a later artifactRevision bump (e.g. an SSE Artifact* event triggering
-  // loadArtifacts) must NOT refetch and tear the textarea out from under the
-  // user mid-edit. The draft is already protected from being overwritten, but a
-  // refetch would still flash a spinner and drop focus. Each edit session
-  // remounts FileEditor (it's gated on `editing`), so a fresh url is captured
-  // per session.
+  // truth. A later revision bump (an SSE Artifact* event naming this file) must
+  // NOT refetch and tear the textarea out from under the user mid-edit. The
+  // draft is already protected from being overwritten, but a refetch would
+  // still flash a spinner and drop focus. Each edit session remounts FileEditor
+  // (it's gated on `editing`), so a fresh url is captured per session.
   const [fetchUrl] = useState(url);
   const { loadable, showLoading } = useLoadableFetch<string>(
     () => fetch(fetchUrl).then(r => {
@@ -104,13 +191,26 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   );
   // `null` = not yet seeded from the fetch (distinct from an empty file `''`).
   const [draft, setDraft] = useState<string | null>(null);
+  // The last-saved content. Starts as the fetched content and moves to the
+  // draft on each successful save. `dirty` compares against this, not the
+  // original fetch, so it tracks changes since the last save.
+  const [baseline, setBaseline] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // `useDelayedFlag` raises its flag on a timer and drops it in an EFFECT, which
+  // preact runs after the paint. So the frame that ends a slow save would still
+  // wear the Saving… label, on a button the raw flag has already made live.
+  // Anding with the raw flag retires the two together, in one render.
+  const delayElapsed = useDelayedFlag(saving);
+  const showSaving = saving && delayElapsed;
 
-  // Seed the draft once from the loaded content. A later refetch (e.g. an
-  // unrelated artifactRevision bump) must NOT clobber in-progress edits, so the
-  // guard only seeds while the draft is still null.
+  // Seed the draft and baseline once from the loaded content. A later refetch
+  // must NOT clobber in-progress edits, so the guard only seeds while the
+  // draft is still null.
   useEffect(() => {
-    if (loadable.status === 'loaded' && draft === null) setDraft(loadable.data);
+    if (loadable.status === 'loaded' && draft === null) {
+      setDraft(loadable.data);
+      setBaseline(loadable.data);
+    }
   }, [loadable, draft]);
 
   if (loadable.status === 'failed') {
@@ -120,19 +220,15 @@ function FileEditor({ path, url }: { path: string; url: string }) {
     return showLoading ? <div class="loading-spinner" /> : null;
   }
 
-  // `loadable.data` is the content as fetched at mount and stays that way for
-  // the whole edit session: the fetch url is frozen (see `fetchUrl` above) and
-  // the draft is seeded from it exactly once. So it is a stable baseline for
-  // "no unsaved changes", not a value that can drift under the comparison.
-  const dirty = draft !== loadable.data;
+  const dirty = draft !== baseline;
 
   const save = async () => {
     setSaving(true);
     try {
       await saveDataFile(path, draft);
       showToast('File saved', 'success');
-      filePreviewEditing.value = false;
-      refreshFilePreview(); // bump revision so the rendered view re-fetches
+      setBaseline(draft);
+      refreshFilePreview(); // bump revision so the read view re-fetches on Close
     } catch (e) {
       showToast(`Failed to save: ${errorDetail(e)}`, 'error');
     } finally {
@@ -140,21 +236,30 @@ function FileEditor({ path, url }: { path: string; url: string }) {
     }
   };
 
+  const leaveEditMode = () => { filePreviewEditing.value = false; };
+
   return (
     <div class="file-editor">
       <div class="file-editor-toolbar">
-        <button class="action-btn action-btn-danger" onClick={() => { filePreviewEditing.value = false; }} disabled={saving}>
-          Cancel
-        </button>
-        <button class="action-btn" onClick={save} disabled={saving || !dirty}>
-          {saving ? 'Saving…' : 'Save'}
-        </button>
+        <EditorToolbar
+          dirty={dirty}
+          saving={saving}
+          showSaving={showSaving}
+          onClose={leaveEditMode}
+          onCancel={leaveEditMode}
+          onSave={save}
+        />
       </div>
+      {/* A save never disables the textarea. `save` writes the draft it
+          captured and makes that content the baseline. So a keystroke landing
+          mid-save leaves the draft ahead of it, and the toolbar correctly says
+          there are unsaved changes. Disabling only dimmed the file's text for
+          an instant. A delayed disable would be worse: it would take the field
+          from someone typing in it. */}
       <textarea
         class="file-editor-textarea"
         value={draft}
         spellcheck={false}
-        disabled={saving}
         onInput={(e) => setDraft((e.target as HTMLTextAreaElement).value)}
       />
     </div>

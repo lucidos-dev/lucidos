@@ -2,15 +2,17 @@
 //! driver. Re-exported from `agentic_loop`'s mod.rs so existing
 //! `agentic_loop::X` and `super::X` paths keep resolving.
 
+use crate::core::store::with_event_address;
 use crate::engine::{InjectedPrompt, InjectedPromptKind};
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
-use crate::llm::{get_default_tools, get_notification_tool};
+use crate::llm::{get_default_tools, get_notification_tool, ToolCapabilities};
 use crate::llm::{ContentBlock, Message, MessageContent};
 use std::collections::HashSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::super::chat::process::working_understanding as wu;
 use super::super::LucidosEngine;
 
 /// Build a fresh `EventMeta` for a `ResponseCanceled` emit by copying the
@@ -593,7 +595,10 @@ pub(crate) fn effective_flush_text<'a>(
 
 /// Build the tool list for intent sub-loops.
 /// Notification tools must be included explicitly — they're not in get_default_tools().
-pub(crate) fn build_intent_tools() -> Vec<ToolDefinition> {
+///
+/// `caps` is the caller's workspace gates, so a sub-loop is offered the same
+/// families the chat turn above it was (ADR 0088).
+pub(crate) fn build_intent_tools(caps: &ToolCapabilities) -> Vec<ToolDefinition> {
     // `await_event` is dropped alongside `execute_intent`, and for a sharper
     // reason than recursion: an intent sub-loop runs INSIDE the caller's turn
     // and returns a string, so a subscription registered here outlives the only
@@ -602,7 +607,7 @@ pub(crate) fn build_intent_tools() -> Vec<ToolDefinition> {
     // to wait for. (Before subscriptions became non-blocking this was refused for
     // a different reason, a park with no turn to end; that one is gone, this
     // one is not.)
-    let mut tools: Vec<_> = get_default_tools()
+    let mut tools: Vec<_> = get_default_tools(caps)
         .into_iter()
         .filter(|t| t.name != tn::EXECUTE_INTENT && t.name != tn::AWAIT_EVENT)
         .collect();
@@ -1010,6 +1015,17 @@ pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
     ToolResultSplit::shared(result.to_string())
 }
 
+/// One finished tool call, as the wire-block builder needs it.
+pub(crate) struct ToolOutput {
+    /// The provider's own id for the call, which pairs result to `tool_use`.
+    /// Meaningful only inside this turn, and the reason `event_id` exists.
+    pub tool_use_id: String,
+    /// What the model sees.
+    pub text: String,
+    /// The originating `ToolCalled` event id, or `None` when its emit failed.
+    pub event_id: Option<uuid::Uuid>,
+}
+
 /// Build the user message's content blocks from this iteration's tool outputs.
 ///
 /// CRITICAL: every `ToolResult` block must come before any `Image` or `Text`
@@ -1022,16 +1038,21 @@ pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
 /// end to end. It was inline and unreachable from any test for three months,
 /// which is precisely how the image lift below came to be dead code.
 pub(crate) fn build_tool_result_blocks(
-    tool_outputs: &[(String, String)],
+    tool_outputs: &[ToolOutput],
     instruction: &str,
 ) -> Vec<ContentBlock> {
     let mut result_blocks: Vec<ContentBlock> = Vec::new();
     let mut trailing_blocks: Vec<ContentBlock> = Vec::new();
-    for (tool_use_id, result) in tool_outputs {
+    for ToolOutput {
+        tool_use_id,
+        text: result,
+        event_id,
+    } in tool_outputs
+    {
         if let Some((screenshot_b64, dom_text)) = parse_app_capture_marker(result) {
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
-                content: dom_text.to_string(),
+                content: with_event_address(dom_text.to_string(), event_id.as_ref()),
             });
             // Fit the screenshot to the model size target (compress only if
             // over) so a large retina capture can't trip the provider's
@@ -1054,7 +1075,10 @@ pub(crate) fn build_tool_result_blocks(
         {
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.clone(),
-                content: crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT.to_string(),
+                content: with_event_address(
+                    crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT.to_string(),
+                    event_id.as_ref(),
+                ),
             });
             // No fit_for_llm here: read_file's encode_image_for_read already
             // fit the image before emitting the IMAGE_CONTENT marker, so this
@@ -1068,7 +1092,7 @@ pub(crate) fn build_tool_result_blocks(
         }
         result_blocks.push(ContentBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
-            content: result.clone(),
+            content: with_event_address(result.clone(), event_id.as_ref()),
         });
     }
     // Append images and instruction text AFTER all ToolResult blocks.
@@ -1185,17 +1209,26 @@ pub(crate) const MAX_TODO_WAKE_NUDGE: usize = 1;
 /// mistake `APPLY_VERIFY_DEV_ADDENDUM` made, whose ready-made negative sentence
 /// got quoted back as a finding with the check behind it never run. See
 /// `docs/plans/2026-08-10-the-agent-checks-state-instead-of-assuming-it.md`.
-pub(crate) fn todo_wake_nudge_instruction(open_items: usize) -> String {
+/// `curated` is true under *self-curated context mode*, which withdraws
+/// `todo_write` whole. Naming a tool the model was never shown offers it an
+/// action it cannot take, so option two names the heading it writes instead.
+pub(crate) fn todo_wake_nudge_instruction(open_items: usize, curated: bool) -> String {
+    let update_the_list = if curated {
+        "rewrite the `[TODO]` heading of your working understanding, marking what is done as \
+         `- [x]` and dropping what you are no longer doing"
+    } else {
+        "call `todo_write` to mark what is done as completed, and to drop what you are no longer \
+         doing"
+    };
     format!(
         "STOP, do not finish this turn yet. Your todo list still has {open_items} unfinished \
          item(s), and NOTHING will re-open this thread: you hold no event-wait subscription and \
          no background task is running. No wake is scheduled, whatever your answer says. Do one \
          of these three now, then finish: (1) call `await_event` if that work is waiting on \
-         something happening in Lucidos, so the thread re-opens when it does; (2) call \
-         `todo_write` to mark what is done as completed, and to drop what you are no longer \
-         doing; (3) hand back to the user, deciding for yourself how to say that you are not \
-         watching for anything. Whichever you choose, do not tell the user you are watching, \
-         monitoring, or will report back, unless you armed a subscription in this turn."
+         something happening in Lucidos, so the thread re-opens when it does; (2) \
+         {update_the_list}; (3) hand back to the user, deciding for yourself how to say that you \
+         are not watching for anything. Whichever you choose, do not tell the user you are \
+         watching, monitoring, or will report back, unless you armed a subscription in this turn."
     )
 }
 
@@ -1319,6 +1352,28 @@ pub(crate) fn terminal_result(
 /// an order of magnitude more than every bounded path can produce together,
 /// while still ending a turn that is genuinely spinning.
 pub(crate) const NON_TOOL_ROUND_SLACK: usize = 100;
+
+/// What the engine says back when a reply carried only the working
+/// understanding.
+///
+/// A user message is required rather than optional: the next round appends the
+/// panel and the document to whatever is last, and a trailing assistant message
+/// would take them as a prefill.
+pub(crate) const NOTED_CARRY_ON: &str =
+    "Your working understanding is updated. Carry on with the work.";
+
+/// Whether a reply that made no tool call was bookkeeping rather than an
+/// answer.
+///
+/// The model writes its document beside its next action, but the design record
+/// measured 82% of notes written alone in a round. A lone write would otherwise
+/// end the turn with an empty answer, abandoning the task.
+///
+/// So the span is spliced out first, and what is left decides. Nothing left is
+/// bookkeeping and the turn continues. Something left is the answer.
+pub(crate) fn reply_was_bookkeeping_alone(wrote_document: bool, visible: Option<&str>) -> bool {
+    wrote_document && visible.is_none_or(str::is_empty)
+}
 
 /// The `[ENGINE-LIMIT]` message for the user's tool-call cap.
 ///
@@ -1457,12 +1512,16 @@ pub(crate) fn push_explicit_image_pin(pins: &mut Vec<usize>, idx: usize) {
 /// A message can carry both when the model batches an explicit view alongside a
 /// capture; pinning is per-message, so the capture rides along. Rare, bounded,
 /// and preferable to dropping the image the model actually asked for.
+///
+/// Matched as a PREFIX, not for equality. [`with_event_address`] appends the
+/// result's `[evt-…]` address after this text, so an equality test silently
+/// stopped recognising the marker and unpinned every explicitly viewed image.
 pub(crate) fn holds_explicitly_requested_image(blocks: &[ContentBlock]) -> bool {
     blocks.iter().any(|b| {
         matches!(
             b,
             ContentBlock::ToolResult { content, .. }
-                if content == crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT
+                if content.starts_with(crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT)
         )
     })
 }
@@ -1602,6 +1661,46 @@ pub(crate) async fn ensure_terminator_emitted(
     .await;
 }
 
+/// The failure sibling of [`ensure_terminator_emitted`], sharing its gate.
+/// Emits an ANCHORED `ResponseFailed` unless a terminator already landed for
+/// `request_event_id`.
+///
+/// Every error exit that happens once an exchange exists funnels through
+/// here, which is what makes `process_message_with_steps` the single owner of
+/// a turn's terminator. Its callers used to each bolt on their own
+/// `ResponseFailed` with `EventMeta::NONE`, because the pre-loop exits emitted
+/// nothing. Anchorless, those copies walked straight past the gate. So every
+/// in-loop failure wrote the event twice and fired every subscribed trigger
+/// twice. Anchor the emit and the gate does its job.
+pub(crate) async fn ensure_failure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    error: &str,
+) {
+    if crate::engine::thread_events::has_terminator_for(pool, thread_id, request_event_id).await {
+        return;
+    }
+
+    bus.emit_or_log(
+        crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                error: error.to_string(),
+            },
+            meta: crate::engine::thread_events::EventMeta {
+                request_event_id: Some(request_event_id),
+                channel,
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+        },
+        "[AgenticLoop] ResponseFailed (turn failed outside the loop)",
+    )
+    .await;
+}
+
 /// Static parts of a ContextCaptured event built once by `chat::process`
 /// before the loop starts: section list (system + memory + history + …),
 /// the tool list, and the model id. The loop appends a dynamic
@@ -1625,6 +1724,50 @@ pub(crate) struct ContextCaptureSeed<'a> {
     pub capture_body: bool,
 }
 
+/// Cap on the `Conversation` body, matching what `chat::process` applies to
+/// every other section body. The eval lifts it (ADR 0110): this section IS the
+/// message array, the largest addressable region a context benchmark exists to
+/// look at, and 8 KB of it says nothing.
+const CONVERSATION_PERSIST_MAX: usize = 8_000;
+
+/// The `Conversation` capture row, and the one row where a section's two sizes
+/// disagree by construction.
+///
+/// `budget_delta_chars` is what the tool loop ADDED. Every static section is
+/// already concatenated into `messages[0]`, so counting the array whole would
+/// bill the bundle twice against `estimated_total_tokens`. `bundled_total` is
+/// what those sections already declare, and `context_chars` is what the budget
+/// measured over the trimmed array.
+///
+/// `content_chars` is the array's real size, which is the region an eval sizes.
+/// Measuring it costs one serialization on a workspace with `capture_context`
+/// off, where the body would otherwise not be built. That is the price of the
+/// field being true rather than sometimes true.
+pub(crate) fn conversation_section(
+    messages: &[Message],
+    bundled_total: usize,
+    context_chars: usize,
+    capture_body: bool,
+) -> crate::engine::ContextSection {
+    let serialized = serialize_messages_for_capture(messages);
+    let content_chars = serialized.chars().count();
+    let cap = crate::engine::eval_capture::body_cap(CONVERSATION_PERSIST_MAX);
+    let content = capture_body.then(|| match cap {
+        Some(cap) if serialized.len() > cap => {
+            crate::engine::context::truncate_head_tail(&serialized, cap)
+        }
+        _ => serialized,
+    });
+    crate::engine::ContextSection {
+        name: "Conversation".to_string(),
+        content,
+        budget_delta_chars: context_chars.saturating_sub(bundled_total),
+        content_chars: Some(content_chars),
+        role: crate::engine::ContextRole::User,
+        group: None,
+    }
+}
+
 /// Render the in-flight `messages` array as a compact text body for the
 /// `Conversation` section's persisted content. Each message is prefixed with
 /// its role; tool calls/results are summarized inline so the dump stays
@@ -1639,7 +1782,9 @@ pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
             MessageContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        ContentBlock::Text { text } => out.push_str(text),
+                        ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                            out.push_str(text)
+                        }
                         ContentBlock::ToolUse {
                             name, input, id, ..
                         } => {
@@ -1666,4 +1811,90 @@ pub(crate) fn serialize_messages_for_capture(messages: &[Message]) -> String {
         out.push_str("\n\n");
     }
     out
+}
+
+/// Record a failed action so no round rule lets it go (ADR 0109).
+///
+/// Manus found that leaving mistakes in context is what stops a model repeating
+/// them. Three paths in the loop end a tool call as failed, and two of them
+/// `continue` before reaching the third. So the marking lives here rather than
+/// at whichever site happens to be biggest.
+pub(super) fn note_failure(
+    failed: &mut std::collections::HashSet<String>,
+    tool_called_event_id: Option<uuid::Uuid>,
+    mode: crate::engine::chat::process::context_mode::ContextMode,
+) {
+    if let Some(handle) = tool_called_event_id.filter(|_| mode.is_on()) {
+        failed.insert(crate::engine::chat::process::context_mode::event_address(
+            handle,
+        ));
+    }
+}
+
+/// Read the working understanding out of a reply and persist what it wrote.
+///
+/// Both terminal paths run this. A cancelled round wrote its document before
+/// the user pressed stop, and the document is the one thing the mode promises
+/// outlives a turn. Losing it there also flushed the raw markup to the
+/// transcript, because a splice needs the spans this parse produces.
+///
+/// **A keep is deliberately not applied here.** It needs `panel_first_seen` and
+/// the live message array, neither of which a cancelled round goes on to use.
+/// The emitted `ContextKeptOpen` is what the eval counts as held, so recording
+/// one for a request that never carried it would be a durable lie. The live
+/// path applies keeps itself, from the returned `keep_open`.
+///
+/// `end` says who stopped the text. A cut reply keeps only the blocks the model
+/// closed, so pressing Stop mid-write cannot replace the document with the
+/// fragment: see [`wu::ParsedReply::drop_unclosed`].
+pub(crate) async fn read_working_understanding(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: uuid::Uuid,
+    raw_text: &str,
+    end: wu::ReplyEnd,
+    live_document: &mut wu::WorkingUnderstanding,
+    live_todo: &mut Vec<crate::engine::thread_events::TodoItem>,
+    live_todo_notes: &Option<String>,
+) -> (wu::ParsedReply, wu::Applied) {
+    let mut parsed = wu::parse_message(wu::ASSISTANT_ROLE, raw_text);
+    if end == wu::ReplyEnd::Truncated {
+        parsed.drop_unclosed();
+    }
+    let (next_document, applied) = wu::apply_spans(live_document, &parsed);
+    if parsed.wrote_something() {
+        *live_document = next_document;
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::WorkingUnderstandingWritten {
+                    document: live_document.to_document(),
+                },
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            },
+            "[AgenticLoop] WorkingUnderstandingWritten",
+        )
+        .await;
+    }
+    // The checklist is CONSUMED, never stored. It goes to the projection, and
+    // the render regenerates the section from there, so the two engine-written
+    // statuses reach the model.
+    if let Some(items) = applied.todo.clone().filter(|items| items != live_todo) {
+        live_todo.clone_from(&items);
+        bus.emit_or_log(
+            crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::TodoListWritten {
+                    items,
+                    // Carried through, never cleared. The settle path follows
+                    // the same rule: a re-emit without it erases what the agent
+                    // wrote before the mode was turned on.
+                    notes: live_todo_notes.clone(),
+                },
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            },
+            "[AgenticLoop] TodoListWritten (working understanding)",
+        )
+        .await;
+    }
+    (parsed, applied)
 }

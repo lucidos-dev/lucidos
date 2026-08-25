@@ -1,3 +1,6 @@
+// @vitest-environment jsdom
+// This file renders markdown, and the sanitizer runs on a real DOM.
+// The default `node` environment has none.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 

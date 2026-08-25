@@ -40,7 +40,6 @@ vi.mock('../../components/chat/scrollState', () => ({
 
 vi.mock('../../components/chat/promptFocus', () => ({
   focusPromptNow: vi.fn(),
-  focusIfNeeded: vi.fn(),
 }));
 
 import { handleArchiveThread } from '../actions/threads';

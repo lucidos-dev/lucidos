@@ -1,7 +1,7 @@
 pub(crate) mod child_follow_up;
 mod events;
 mod images;
-mod process;
+pub(in crate::engine) mod process;
 mod process_cc;
 mod process_helpers;
 mod recovery;
@@ -11,8 +11,9 @@ mod spawn;
 mod title;
 
 pub(crate) use events::make_message_received;
+pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;
 pub(crate) use process::PreEmittedOrigin;
-pub(crate) use title::{emit_generated_title, generate_thread_title};
+pub(crate) use title::{emit_generated_title, generate_thread_title, title_call};
 
 // event_bus_tests reaches these via chat::* — gated to test builds since
 // non-test code goes through super::recursion_guard directly.

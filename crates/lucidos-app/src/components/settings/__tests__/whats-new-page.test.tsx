@@ -1,10 +1,19 @@
+// @vitest-environment jsdom
+// This file renders markdown, and the sanitizer runs on a real DOM.
+// The default `node` environment has none.
 /**
- * Settings > System > What's New: the three decisions the panel makes, all
+ * Settings > System > What's New: the four decisions the panel makes, all
  * pulled out as pure functions so they can be held here rather than inferred
  * from a component that reads a hook.
  */
 import { describe, it, expect } from 'vitest';
-import { releaseRowIsOpen, releaseNotesBody, offeredRelease, stripReleaseHeading } from '../WhatsNewPage';
+import {
+  releaseRowIsOpen,
+  releaseNotesBody,
+  offeredRelease,
+  stripReleaseHeading,
+  defaultOpenRelease,
+} from '../WhatsNewPage';
 import type { ChangelogRelease } from '../../../api/client';
 
 const RELEASE: ChangelogRelease = {
@@ -43,6 +52,50 @@ describe('releaseRowIsOpen', () => {
     // A RELEASE bump ahead of its changelog entry. Marking the newest instead
     // would state something untrue about what is running.
     expect(releaseRowIsOpen('0.26.3', isRunning('0.26.3', '9.9.9'), {})).toBe(false);
+  });
+});
+
+describe('defaultOpenRelease', () => {
+  const LIST: ChangelogRelease[] = [
+    { version: '0.27.0', date: '2026-08-14', notes: '- the new thing' },
+    { version: '0.26.3', date: '2026-08-11', notes: '- an old thing' },
+  ];
+
+  it('opens the release an update offer sent the reader here to read', () => {
+    // The bug: the offer announced 0.27.0 and the panel expanded 0.26.3, the
+    // release already running. The Available row used to cover for it, and no
+    // longer does once the list itself carries the offered release.
+    expect(defaultOpenRelease('0.27.0', '0.26.3', LIST)).toBe('0.27.0');
+  });
+
+  it('opens the running release when no offer sent them', () => {
+    // Every other way in: the Lucidos menu's version row, Search Everywhere,
+    // the System sub-panel list.
+    expect(defaultOpenRelease(null, '0.26.3', LIST)).toBe('0.26.3');
+  });
+
+  it('falls back when the target names nothing on screen', () => {
+    // A packaged client's announced version can disagree with every row. On a
+    // dev workspace it is a CalVer app build id. Opening nothing at all would
+    // be worse than opening what the panel opens anyway.
+    expect(defaultOpenRelease('2026.08.13.1', '0.26.3', LIST)).toBe('0.26.3');
+  });
+
+  it('opens nothing when neither the target nor the running release is listed', () => {
+    expect(defaultOpenRelease('9.9.9', null, LIST)).toBe(null);
+  });
+
+  it('still answers before the list has loaded', () => {
+    // The panel renders an empty list while the changelog is in flight, and the
+    // target must not be adopted against nothing.
+    expect(defaultOpenRelease('0.27.0', '0.26.3', [])).toBe('0.26.3');
+  });
+
+  it('leaves a toggled row alone, whatever it decided', () => {
+    // The two compose: this picks the DEFAULT, and the reader's own answer
+    // still wins through `releaseRowIsOpen`.
+    const open = defaultOpenRelease('0.27.0', '0.26.3', LIST);
+    expect(releaseRowIsOpen('0.27.0', open === '0.27.0', { '0.27.0': false })).toBe(false);
   });
 });
 

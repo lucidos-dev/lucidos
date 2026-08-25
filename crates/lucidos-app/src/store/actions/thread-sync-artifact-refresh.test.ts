@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
-// What refreshes an open file preview: `loadArtifacts` bumps `artifactRevision`,
-// which is the cache-buster in the preview URL. These tests pin WHICH inbound
-// thread events reach it, which is the whole contract that replaced the
-// `refresh_file` tool the agent used to have to call by hand.
+// Two contracts, deliberately apart. `loadArtifacts` refreshes the Files LIST,
+// and these tests pin which inbound thread events reach it: that is what
+// replaced the `refresh_file` tool the agent used to have to call by hand.
+// `invalidateFilePreview` re-reads the OPEN PREVIEW, and takes a path, because
+// a write to another file must not restart a video the user is watching.
 const loadArtifacts = vi.fn();
+const invalidateFilePreview = vi.fn();
 vi.mock('./artifacts', () => ({
   loadArtifacts,
+  invalidateFilePreview,
   openFilePreview: vi.fn(),
   openUrl: vi.fn(),
   normalizeDataPath: vi.fn((p: string) => p),
@@ -14,6 +17,7 @@ vi.mock('./artifacts', () => ({
 
 vi.mock('./menu', () => ({
   switchMenuItem: vi.fn(), openSettingsSubview: vi.fn(), setActiveMenu: vi.fn(),
+  openBackupSettings: vi.fn(),
 }));
 vi.mock('./apps', () => ({
   openAppById: vi.fn(), refreshAppUI: vi.fn(), captureAppUI: vi.fn(), openCredentialRequest: vi.fn(),
@@ -104,5 +108,101 @@ describe('artifact refresh on inbound thread events', () => {
       event: { type: 'FileRefreshRequested', path: 'artifacts/notes.md' },
     });
     expect(loadArtifacts).not.toHaveBeenCalled();
+  });
+});
+
+// A `ToolResult` carries no path, and the engine announces one only for
+// `artifacts/` writes. So the path comes from the paired `ToolCalled`, which is
+// the only way an open `knowhow/` or `apps/` preview learns its file changed.
+describe('the open preview re-reads only the path the tool wrote', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function toolCalled(name: string, args: Record<string, unknown>, eventId?: string) {
+    return { thread_id: 'thread-A', event_id: eventId, event: { type: 'ToolCalled', name, args } };
+  }
+
+  function toolResultPairedWith(name: string, toolCalledEventId?: string) {
+    return {
+      thread_id: 'thread-A',
+      event: { type: 'ToolResult', name, result: 'ok', tool_called_event_id: toolCalledEventId },
+    };
+  }
+
+  it.each([
+    ['write_file', { path: 'knowhow/ops/deploy.md' }, 'knowhow/ops/deploy.md'],
+    ['edit_file', { path: 'apps/demo/index.html' }, 'apps/demo/index.html'],
+    ['delete_file', { path: 'artifacts/old.md' }, 'artifacts/old.md'],
+    ['copy_file', { source: 'a.md', destination: 'artifacts/b.md' }, 'artifacts/b.md'],
+    ['edit_file', { path: 'knowhow/ops/deploy.md', commit: true }, 'knowhow/ops/deploy.md'],
+  ])('offers %s its written path', (name, args, expected) => {
+    handleThreadEvent(toolCalled(name, args));
+    handleThreadEvent(toolResultPairedWith(name));
+    expect(invalidateFilePreview).toHaveBeenCalledWith(expected);
+  });
+
+  // The one signal the drain gives is that SOMETHING landed. Invalidating on
+  // it is exactly the blanket reload this replaced.
+  it('leaves the preview alone on a bash_output drain', () => {
+    handleThreadEvent(toolResultPairedWith('bash_output'));
+    expect(loadArtifacts).toHaveBeenCalledTimes(1);
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('leaves the preview alone when a background task completes', () => {
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      event: { type: 'BackgroundBashCompleted', task_id: 't1', command: 'sleep 1', exit_code: 0 },
+    });
+    expect(loadArtifacts).toHaveBeenCalledTimes(1);
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('offers nothing when the tool named no path', () => {
+    handleThreadEvent(toolCalled('write_file', {}));
+    handleThreadEvent(toolResultPairedWith('write_file'));
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  // `import_file`'s destination is relative to `artifacts/imported/`, not to
+  // `data/`, and is optional. `ArtifactImported` announces the path the engine
+  // settled on, so that event is what refreshes an imported file.
+  it('offers nothing for import_file, whose destination is in another frame', () => {
+    handleThreadEvent(toolCalled('import_file', { source_path: '/tmp/x.png', destination: 'x.png' }));
+    handleThreadEvent(toolResultPairedWith('import_file'));
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  // With `repo`, an `edit_file` path is relative to that repository's root and
+  // the edit writes nothing under `data/`. Reading it as a data path would
+  // attribute a repo file to the data tree.
+  it('offers nothing for a repo-scoped edit_file', () => {
+    handleThreadEvent(toolCalled('edit_file', { path: 'src/main.rs', repo: 'r1', commit: false }));
+    handleThreadEvent(toolResultPairedWith('edit_file'));
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  // A tool between the call and its result must not let the recorded path be
+  // attributed to whatever finishes next.
+  it('drops a recorded path when another tool result arrives first', () => {
+    handleThreadEvent(toolCalled('write_file', { path: 'artifacts/a.md' }));
+    handleThreadEvent(toolResultPairedWith('web_search'));
+    handleThreadEvent(toolResultPairedWith('bash_output'));
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('drops a recorded path when the result pairs with a different call', () => {
+    handleThreadEvent(toolCalled('write_file', { path: 'artifacts/a.md' }, 'call-1'));
+    handleThreadEvent(toolResultPairedWith('write_file', 'call-2'));
+    expect(invalidateFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('keeps only the newest call, so a superseded path is never used', () => {
+    handleThreadEvent(toolCalled('write_file', { path: 'artifacts/a.md' }));
+    handleThreadEvent(toolCalled('write_file', { path: 'artifacts/b.md' }));
+    handleThreadEvent(toolResultPairedWith('write_file'));
+    expect(invalidateFilePreview).toHaveBeenCalledTimes(1);
+    expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/b.md');
   });
 });

@@ -2,12 +2,18 @@
 import { lucidos } from './index';
 import { installScrollMemory } from './scroll';
 import { installKeyboardForwarding } from './keyboardForward';
+import { installTooltips } from './tooltip';
 import { primeExternalLinkTarget } from './ui';
 
 export * from './index';
 
 if (typeof document !== 'undefined') {
   installScrollMemory();
+  // A themed tooltip on any data-tooltip element, with no init call from the
+  // app. The two options differ from the host shell, because an app author
+  // never wires a touch affordance by hand: any data-tooltip answers a long
+  // press, and the tooltip clears itself shortly after the finger lifts.
+  installTooltips({ longPressNeedsOptIn: false, hideAfterLongPressMs: 2000 });
   // Warm the external-link target so the click handler below can read it
   // synchronously (the "Ask" mode's share sheet needs the click's user
   // activation intact). Done here rather than leaning on applyPreferences,

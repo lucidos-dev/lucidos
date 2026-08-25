@@ -10,7 +10,7 @@ import { randomUUID } from 'crypto';
  * CC thread (mirroring what the engine would do after intercepting CC's
  * AskUserQuestion tool_use). UserQuestionAsked starts its OWN exchange — the
  * QuestionBody renders as the body of an initiator panel (the asking agent's
- * chip — "Claude Code" in a CC thread), NOT inline in the prior CC response
+ * chip, the short "Claude" in a CC thread), NOT inline in the prior CC response
  * panel. The browser must:
  *   - Render a divider initiator panel containing the question + options.
  *   - Persist a UserQuestionAnswered event after the user clicks an option.
@@ -93,8 +93,10 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
         .locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Pick option ${suffix}"))`)
         .first();
       await expect(panel).toBeVisible({ timeout: 10_000 });
-      // Chip on the divider reads the asking agent — "Claude Code" in a CC thread.
-      await expect(panel.locator('.initiator-label')).toHaveText('Claude Code');
+      // Chip on the divider reads the asking agent. It is the SHORT "Claude" in
+      // a CC thread: this row is the app's tightest on a phone, so the coding
+      // agent's own name is shortened here and nowhere else (`describeExecutor`).
+      await expect(panel.locator('.initiator-label')).toHaveText('Claude');
       // Pending body carries `data-tool-use-id` and exposes the option buttons.
       const pendingBody = panel.locator(`.initiator-body .question-body[data-tool-use-id="${toolUseId}"]`).first();
       await expect(pendingBody).toBeVisible();

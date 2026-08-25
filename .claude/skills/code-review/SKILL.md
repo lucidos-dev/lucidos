@@ -26,6 +26,14 @@ subagents (faster, independent perspectives). If it does not (e.g. Codex),
 perform each angle inline as a focused sequential pass yourself — the procedure
 and output contract are identical either way.
 
+**Under Lucidos, a subagent fan-out passes `run_in_background: false`.** Put
+every `Agent` call for one round in ONE assistant message, so they still run in
+parallel, and set that flag on each. The tool backgrounds a subagent by default
+and delivers its report later as a notification. Lucidos tears your process
+group down when the turn ends, so that notification never arrives. The flag is
+what makes each call block and return its report inline. Never wait by
+launching a filler agent, sleeping, or asking a placeholder question.
+
 ## Effort scaling
 
 The arg picks the recipe. Default to **medium** when no arg is passed.

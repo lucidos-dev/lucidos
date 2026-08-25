@@ -1,17 +1,17 @@
 use super::error::ApiError;
 use super::settings::{AllowlistRequest, AllowlistResponse};
 use super::*;
+use crate::core::grants::{self, GrantFile};
 use crate::core::mcp_servers::validate_server_id;
 use crate::core::{McpServer, McpServerStore};
 use crate::engine::cc_permission::{PermissionEntry, DENIAL_REASON};
-use crate::engine::claude_code::{append_allowed_tool_pattern, derive_allow_pattern, AllowScope};
+use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
 use crate::engine::event_bus::BusEvent;
-use crate::engine::mcp_permission::{read_mcp_allowed_tools_file, write_mcp_allowed_tools_file};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::mcp::{McpCostTotals, McpStartOutcome, McpStopOutcome};
 
 /// Dispatch an "Always allow" grant to the right storage. `Narrow` / `Broad`
-/// append to `~/.lucidos/cc-allowed-tools` (CC reads it on next spawn);
+/// append to `<workspace>/.lucidos/cc-allowed-tools` (CC reads it on next spawn);
 /// `Session` records into the per-thread in-memory allow set the engine
 /// checks before each prompt. Returns silently for tools whose scope yields
 /// no derivable pattern (e.g. `Edit` with `Broad` — `BROAD_ALLOW_INEFFECTIVE`).
@@ -25,7 +25,8 @@ fn record_allow_grant(state: &AppState, entry: &PermissionEntry, scope: AllowSco
             pending.allow_session(entry.thread_id, pattern);
         }
         AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = append_allowed_tool_pattern(state.engine.user_dir(), &pattern) {
+            let dir = state.engine.grants_dir();
+            if let Err(e) = grants::append(&dir, GrantFile::CodingAgentTools, &pattern) {
                 crate::log!("[MCP] Failed to persist allow pattern {:?}: {}", pattern, e);
             }
         }
@@ -40,7 +41,7 @@ pub(super) struct McpConsentResponse {
     /// from the original prompt's tool_name + input and remembers it so
     /// future identical-pattern requests skip the prompt. Where the pattern
     /// is recorded depends on scope:
-    ///   * `narrow` / `broad` — appended to `~/.lucidos/cc-allowed-tools`
+    ///   * `narrow` / `broad`: appended to `<workspace>/.lucidos/cc-allowed-tools`
     ///     and handed to CC via `--allowedTools` on every spawn.
     ///   * `session` — inserted into the engine's in-memory per-thread
     ///     allow set; lost on engine restart but works for tools/paths CC
@@ -117,14 +118,20 @@ pub(super) struct McpAutoApproveRequest {
 }
 
 /// PUT /api/v1/mcp/auto-approve — Set auto-approve for an MCP server.
+///
+/// The store emits `McpServerUpdated` from inside its write path. So this
+/// handler resolves the device actor and hands it over, the way every other
+/// mutating endpoint in this router does.
 pub(super) async fn set_mcp_auto_approve(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<McpAutoApproveRequest>,
 ) -> impl IntoResponse {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match state
         .engine
         .mcp_manager
-        .set_auto_approve(&body.server_id, body.auto_approve)
+        .set_auto_approve(&body.server_id, body.auto_approve, actor)
         .await
     {
         Ok(msg) => Json(serde_json::json!({ "success": true, "message": msg })).into_response(),
@@ -323,20 +330,15 @@ pub(super) async fn set_mcp_disabled_tools(
     Ok(Json(serde_json::json!({ "disabled_tools": stored })))
 }
 
-/// GET /api/v1/mcp-allowed-tools: the raw `~/.lucidos/mcp-allowed-tools`, the
+/// GET /api/v1/mcp-allowed-tools: this workspace's raw `mcp-allowed-tools`, the
 /// chat MCP permission allowlist. The MCP counterpart of the
 /// `cc-allowed-tools` pair in `api/settings.rs`; a missing file returns the
 /// seeded header.
 pub(super) async fn get_mcp_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, ApiError> {
-    let dir = state.engine.user_dir().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "User directory not configured",
-        )
-    })?;
-    let contents = read_mcp_allowed_tools_file(dir)
+    let dir = state.engine.grants_dir();
+    let contents = grants::read_raw(&dir, GrantFile::McpTools)
         .map_err(|e| ApiError::internal(format!("Failed to read mcp-allowed-tools: {e}")))?;
     Ok(Json(AllowlistResponse { contents }))
 }
@@ -345,17 +347,12 @@ pub(super) async fn get_mcp_allowed_tools(
 /// it fresh on each prompt, so an edit takes effect on the next gated MCP call.
 pub(super) async fn put_mcp_allowed_tools(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<AllowlistRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let dir = state.engine.user_dir().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "User directory not configured",
-        )
-    })?;
-    write_mcp_allowed_tools_file(dir, &body.contents)
-        .map_err(|e| ApiError::internal(format!("Failed to write mcp-allowed-tools: {e}")))?;
-    Ok(StatusCode::NO_CONTENT)
+    super::settings::write_grant_file(&state, &headers, GrantFile::McpTools, &body.contents)
+        .await
+        .map_err(|(status, message)| ApiError::new(status, message))
 }
 
 /// Routes for the `/mcp/*` surface, plus the `mcp-allowed-tools` editor.

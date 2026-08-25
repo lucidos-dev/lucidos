@@ -53,8 +53,11 @@ pub(super) async fn broadcast_changes(state: &AppState) {
     if let Err(e) = r2 {
         crate::log!("[Changes] broadcast: enrich applied titles: {}", e);
     }
-    if let Err(e) = crate::core::changes::enrich_thread_active(pool, &mut pending).await {
-        crate::log!("[Changes] broadcast: enrich pending thread_active: {}", e);
+    if let Err(e) = crate::core::changes::enrich_thread_unsettled(pool, &mut pending).await {
+        crate::log!(
+            "[Changes] broadcast: enrich pending thread_unsettled: {}",
+            e
+        );
     }
 
     state
@@ -117,10 +120,10 @@ pub(super) async fn list_changes(
     r2.map_err(ApiError::db)?;
     r3.map_err(ApiError::db)?;
 
-    // Flag pending changes whose thread is mid-turn so the UI disables Apply
-    // (and drops them from Apply All) — the same gate the per-change endpoint
-    // enforces server-side via guard_change_action.
-    crate::core::changes::enrich_thread_active(pool, &mut pending)
+    // Flag pending changes whose thread has not settled, mid-turn or parked, so
+    // the UI disables Apply and the bulk paths drop them. Same gate the
+    // per-change endpoint enforces server-side via guard_change_action.
+    crate::core::changes::enrich_thread_unsettled(pool, &mut pending)
         .await
         .map_err(ApiError::db)?;
 
@@ -309,17 +312,18 @@ pub(super) async fn apply_all_changes(
     if all_pending.is_empty() {
         return Err(ApiError::bad_request("No pending changes"));
     }
-    // Exclude changes whose thread is still mid-turn. Apply All calls
-    // `engine.apply_change` directly, bypassing the per-change
-    // `guard_change_action` gate, so without this it would merge a branch while
-    // the coding agent is still producing commits on it — racing the session's
-    // next proposal (real thread 76b4ee76).
-    let live_filtered = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
-        .await
-        .map_err(ApiError::db)?;
+    // Exclude changes whose thread has not settled: mid-turn, or parked and due
+    // to wake (ADR 0106). Apply All calls `engine.apply_change` directly, which
+    // bypasses the per-change `guard_change_action` gate. Without this it would
+    // merge a branch the coding agent is still committing on, racing the
+    // session's next proposal (real thread 76b4ee76).
+    let live_filtered =
+        crate::core::changes::drop_unsettled_thread_changes(&state.pool, all_pending)
+            .await
+            .map_err(ApiError::db)?;
     if live_filtered.is_empty() {
         return Err(ApiError::bad_request(
-            "All pending changes belong to threads that are still working — wait for them to finish, then apply.",
+            "All pending changes belong to threads that are still working or waiting for something. Wait for them to finish, then apply.",
         ));
     }
     // Also drop changes with no files left. The per-change endpoint 409s those
@@ -493,15 +497,15 @@ pub(super) async fn discard_all_changes(
     if all_pending.is_empty() {
         return Err(ApiError::bad_request("No pending changes"));
     }
-    // Skip changes whose thread is mid-turn — discarding would delete the
-    // branch/worktree out from under the live coding-agent session. Mirrors the
-    // Apply All filter and the per-change `guard_change_action` gate.
-    let pending = crate::core::changes::drop_live_thread_changes(&state.pool, all_pending)
+    // Skip changes whose thread has not settled, mid-turn or parked. Discarding
+    // would delete the branch and worktree out from under a session that is
+    // still going. Mirrors the Apply All filter and `guard_change_action`.
+    let pending = crate::core::changes::drop_unsettled_thread_changes(&state.pool, all_pending)
         .await
         .map_err(ApiError::db)?;
     if pending.is_empty() {
         return Err(ApiError::bad_request(
-            "All pending changes belong to threads that are still working — wait for them to finish, then discard.",
+            "All pending changes belong to threads that are still working or waiting for something. Wait for them to finish, then discard.",
         ));
     }
     let mut discarded = 0;

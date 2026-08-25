@@ -47,34 +47,40 @@ fn generate_cross_validation_fixture() -> String {
     let mut cases = Vec::new();
 
     // availableThreadActions: the full cross product of thread_types ×
-    // statuses × sections × pending × descendants_block_archive ×
-    // has_unsent_draft × is_saved. Adding a `ThreadStatus` variant widens the
-    // fixture automatically; do not hardcode the case count here, it drifts.
+    // statuses × sections × pending × descendants_block_archive × live_event_waits
+    // × active_children × has_unsent_draft × is_saved. Adding a `ThreadStatus`
+    // variant widens the fixture automatically; do not hardcode the case count
+    // here, it drifts.
     for (tt_str, tt) in &thread_types {
         for (st_str, st) in &statuses {
             for (sec_str, sec) in &sections {
                 for &pending in &bools {
                     for &dba in &bools {
-                        for &draft in &bools {
-                            for &saved in &bools {
-                                let actions: Vec<&str> = available_thread_actions(
-                                    *tt, *st, *sec, pending, dba, draft, saved,
-                                )
-                                .iter()
-                                .map(|a| match a {
-                                    Action::DiscardDraft => "discard_draft",
-                                    Action::Discard => "discard",
-                                    Action::Apply => "apply",
-                                    Action::Archive => "archive",
-                                    Action::Save => "save",
-                                    Action::Unsave => "unsave",
-                                })
-                                .collect();
-                                cases.push(format!(
-                                        r#"    {{ "fn": "availableThreadActions", "args": [{:?}, {:?}, {:?}, {}, {}, {}, {}], "expected": [{}] }}"#,
-                                        tt_str, st_str, sec_str, pending, dba, draft, saved,
+                        for &waits in &bools {
+                            for &children in &bools {
+                                for &draft in &bools {
+                                    for &saved in &bools {
+                                        let actions: Vec<&str> = available_thread_actions(
+                                            *tt, *st, *sec, pending, dba, waits, children, draft,
+                                            saved,
+                                        )
+                                        .iter()
+                                        .map(|a| match a {
+                                            Action::DiscardDraft => "discard_draft",
+                                            Action::Discard => "discard",
+                                            Action::Apply => "apply",
+                                            Action::Archive => "archive",
+                                            Action::Save => "save",
+                                            Action::Unsave => "unsave",
+                                        })
+                                        .collect();
+                                        cases.push(format!(
+                                        r#"    {{ "fn": "availableThreadActions", "args": [{:?}, {:?}, {:?}, {}, {}, {}, {}, {}, {}], "expected": [{}] }}"#,
+                                        tt_str, st_str, sec_str, pending, dba, waits, children, draft, saved,
                                         actions.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>().join(", ")
                                     ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -226,18 +232,21 @@ fn generate_typescript() -> String {
     out.push_str("  storedSection: ArchiveState,\n");
     out.push_str("  hasPendingChanges: boolean,\n");
     out.push_str("  descendantsBlockArchive: boolean,\n");
+    out.push_str("  hasLiveEventWaits: boolean,\n");
+    out.push_str("  hasActiveChildren: boolean,\n");
     out.push_str("  hasUnsentDraft: boolean,\n");
     out.push_str("  isSaved: boolean,\n");
     out.push_str("): Action[] {\n");
     out.push_str("  const actions: Action[] = [];\n");
     out.push_str("  const live = status === 'running' || status === 'waiting_for_user_answer';\n");
+    out.push_str("  const willResume = hasLiveEventWaits || hasActiveChildren;\n");
     out.push_str(
         "  const codingAgentPending = hasPendingChanges && threadType === 'claude_code';\n",
     );
     out.push_str("  if (hasUnsentDraft) actions.push('discard_draft');\n");
     out.push_str("  if (!live) {\n");
     out.push_str("    if (codingAgentPending) {\n");
-    out.push_str("      actions.push('discard', 'apply');\n");
+    out.push_str("      if (!willResume) actions.push('discard', 'apply');\n");
     out.push_str("    } else if (storedSection === 'inbox' && !descendantsBlockArchive) {\n");
     out.push_str("      actions.push('archive');\n");
     out.push_str("    }\n");

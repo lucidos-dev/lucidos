@@ -74,7 +74,7 @@ mod todo_wake_nudge_tests {
 
     #[test]
     fn the_instruction_offers_three_equal_options_and_states_the_count() {
-        let text = todo_wake_nudge_instruction(3);
+        let text = todo_wake_nudge_instruction(3, false);
 
         assert!(text.contains('3'), "states the open count: {text}");
         // The three ways out, each nameable. A gate that only said "you are not
@@ -92,13 +92,32 @@ mod todo_wake_nudge_tests {
         );
     }
 
+    /// The mode withdraws `todo_write` whole, so the nudge may not name it.
+    /// An offered action the model cannot take is a round spent on a refusal.
+    #[test]
+    fn under_the_mode_the_nudge_names_the_heading_and_not_the_tool() {
+        let text = todo_wake_nudge_instruction(2, true);
+
+        assert!(
+            !text.contains("todo_write"),
+            "names a withdrawn tool: {text}"
+        );
+        assert!(text.contains("[TODO]"), "names the heading: {text}");
+        // The other two ways out are unchanged: neither depends on the mode.
+        assert!(text.contains("await_event"), "still offers arming: {text}");
+        assert!(
+            text.contains("hand back to the user"),
+            "still offers handing back: {text}"
+        );
+    }
+
     #[test]
     fn the_instruction_hands_over_no_ready_made_user_facing_sentence() {
         // The failure mode `APPLY_VERIFY_DEV_ADDENDUM` had: a quotable sentence
         // in the prompt gets repeated at the user as a finding, with the work
         // behind it never done. Option 3 therefore says to decide the wording,
         // and supplies none.
-        let text = todo_wake_nudge_instruction(1);
+        let text = todo_wake_nudge_instruction(1, false);
 
         assert!(
             text.contains("deciding for yourself how to say"),

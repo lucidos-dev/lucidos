@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
+import { activeMenuItem, panelOverlay, settingsSubview, notificationDetailPending, parseRepoPath, scaledDurationMs } from '../../store/store';
 import { contentViewKey } from './contentViewKey';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
@@ -57,6 +57,9 @@ function hostsAppUiIframe(): boolean {
 export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   const active = activeMenuItem.value;
   const overlay = panelOverlay.value;
+  // Part of the view key, so a Settings sub-section switch is a navigation like
+  // any other rather than a swap the pane never notices.
+  const subview = settingsSubview.value;
 
   const isAppUi = overlay?.type === 'app-ui';
 
@@ -75,7 +78,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
     useDelayedFlag(notificationDetailPending.value !== null) && !overlay;
 
   const bodyRef = useRef<HTMLDivElement>(null);
-  const viewKey = contentViewKey(active, overlay);
+  const viewKey = contentViewKey(active, overlay, subview);
   // resetOnEmpty: this body hosts every view; without it, a stale scrollTop
   // from the prior view persists on the DOM and reappears when content grows.
   useScrollMemory(bodyRef, viewKey ? contentScrollKey(viewKey) : null, { resetOnEmpty: true });

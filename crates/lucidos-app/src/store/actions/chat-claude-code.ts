@@ -85,7 +85,9 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
           return;
         } catch (applyErr) {
           clearApplyingNow(threadId);
-          showToast(`Failed to apply changes: ${errorDetail(applyErr)}`, 'error', { key: `applying-${threadId}` });
+          showToast(changeToastMessage('Failed to apply changes', threadId, errorDetail(applyErr)), 'error', {
+            key: `applying-${threadId}`,
+          });
           return;
         }
       }
@@ -93,9 +95,16 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
       showToast('No pending changes to apply', 'warning', { key: `applying-${threadId}` });
       return;
     }
-    // API failed — clear optimistic state immediately
+    // API failed, so clear the optimistic state immediately. Every keyed error
+    // toast in this file names its thread and its cause. A keyed toast REPLACES
+    // the spinner raised at the top, and that spinner did name the thread. A
+    // bare "Failed to start apply" says neither which thread failed nor why: an
+    // auth refusal, a 5xx and a worktree conflict all read alike, and two
+    // threads applying at once become indistinguishable.
     clearApplyingNow(threadId);
-    showToast('Failed to start apply', 'error', { key: `applying-${threadId}` });
+    showToast(changeToastMessage('Failed to start apply', threadId, errorDetail(e)), 'error', {
+      key: `applying-${threadId}`,
+    });
   }
 }
 
@@ -114,7 +123,10 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
     await discardCCChanges(threadId);
     // Success toast fires from the SSE ChangeDiscarded handler — same key replaces the spinner.
   } catch (e) {
-    showToast(`Failed to discard changes: ${errorDetail(e)}`, 'error', { key: `discarding-${threadId}` });
+    // Keyed, so it replaces the named spinner above. Same rule as apply.
+    showToast(changeToastMessage('Failed to discard changes', threadId, errorDetail(e)), 'error', {
+      key: `discarding-${threadId}`,
+    });
   } finally {
     const next = new Set(discardingCCThreadIds.value);
     next.delete(threadId);

@@ -234,6 +234,7 @@ fn the_registration_result_says_nothing_is_blocking() {
     let engine_side = super::register::registered_tool_result_text(
         &wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0),
         None,
+        &[],
     );
     assert!(engine_side.contains("ChangeProposed"), "{engine_side}");
     assert!(
@@ -292,7 +293,7 @@ fn every_subscription_text_says_where_the_subscription_stands() {
     let shapes: Vec<(&str, String, &str)> = vec![
         (
             "registration",
-            super::register::registered_tool_result_text(&w, None),
+            super::register::registered_tool_result_text(&w, None, &[]),
             "Nothing is blocking",
         ),
         (
@@ -300,6 +301,7 @@ fn every_subscription_text_says_where_the_subscription_stands() {
             super::register::registered_tool_result_text(
                 &w,
                 Some(&lookback_of(&[("ChangeProposed", payload.clone(), 26)])),
+                &[],
             ),
             "will NOT deliver anything below",
         ),
@@ -430,6 +432,73 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
         "the gate must see the thread-scoped wait and stand the fan-in down, or \
          the parent gets two turns for one completion: {:?}",
         row.payload
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The persisted probe, and the exact hole the live incident fell through.
+///
+/// The parent armed one wait on `CodingAgentIdled OR ChildThreadCompleted` for
+/// one child. `CodingAgentIdled` landed first, so the delivery names the
+/// child's TERMINAL. The fan-in then asked about the completion CARD's id,
+/// found nothing, and drove a second turn beside the wait's re-entry.
+///
+/// The other half is what keeps the widening safe. A wake stands down only for
+/// the terminal it was told about. A later completion of the same child
+/// carries a different terminal row, so it still wakes the parent.
+#[tokio::test]
+async fn a_delivery_naming_the_childs_terminal_stands_the_fan_in_down() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    seed_thread(&bus, parent_id).await;
+
+    let child_terminal_id = Uuid::new_v4();
+    let completion_card_id = Uuid::new_v4();
+    seed_thread_event(
+        &bus,
+        parent_id,
+        ThreadEvent::EventWaitDelivered {
+            wait_id: Uuid::new_v4(),
+            event_id: child_terminal_id,
+            event_type: "CodingAgentIdled".into(),
+            payload: json!({"thread_id": child_id.to_string(), "has_changes": true}),
+            matched_index: 0,
+        },
+    )
+    .await;
+
+    assert!(
+        !wait_delivery_names_any(&pool, parent_id, &[completion_card_id.to_string()]).await,
+        "precondition: asking about the card alone is what missed, and still does"
+    );
+    assert!(
+        wait_delivery_names_any(
+            &pool,
+            parent_id,
+            &[
+                completion_card_id.to_string(),
+                child_terminal_id.to_string()
+            ],
+        )
+        .await,
+        "the wait already carried this terminal to the parent, so the fan-in stands down"
+    );
+
+    let second_completion = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    assert!(
+        !wait_delivery_names_any(&pool, parent_id, &second_completion).await,
+        "a later completion of the same child has its own terminal, and must still wake"
+    );
+
+    let other_parent = Uuid::new_v4();
+    assert!(
+        !wait_delivery_names_any(&pool, other_parent, &[child_terminal_id.to_string()]).await,
+        "a delivery on another thread says nothing about this parent"
     );
 
     pool.close().await;
@@ -921,6 +990,173 @@ async fn catch_up_on_an_empty_subscription_list_queries_nothing() {
     teardown_test_db(&db_name).await;
 }
 
+// ── persisted system events (ADR 0113) ──────────────────────────────
+
+/// The frame the tests below wait on. A finished backup is a durable fact, and
+/// no thread event and no domain event accompanies it. So a wait on the frame
+/// itself is the only way to hear about it.
+fn a_backup_completion() -> crate::engine::event_bus::SystemEvent {
+    let started = Utc::now();
+    crate::engine::event_bus::SystemEvent::BackupCompleted {
+        filename: "lucidos-backup-2026.tar.zst".into(),
+        size_bytes: 4096,
+        started_at: started,
+        finished_at: started,
+    }
+}
+
+/// Live and replay must agree, byte for byte, or a wait resolves only when the
+/// engine happened to be up. Four views of one backup are compared here: the
+/// live frame, the stored row, the row through `waits_matching_row`, and the
+/// catch-up scan.
+#[tokio::test]
+async fn a_persisted_system_event_resolves_a_wait_live_and_on_replay() {
+    use crate::core::event_subscription::matchable_system_payload;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let watermark = max_sequence(&pool).await;
+    let event = a_backup_completion();
+    let emitted = bus
+        .emit(BusEvent::System(event.clone()))
+        .await
+        .unwrap()
+        .expect("a persisted frame writes a row");
+
+    // 1. The live view, built the way the dispatcher builds it. The condition
+    // names `filename`, a field of the event itself, which is what the
+    // flattening is for.
+    let live = matchable_system_payload(&event);
+    let wait = wait_with(
+        Uuid::new_v4(),
+        vec![sub(
+            "BackupCompleted",
+            Some(json!({"filename": "lucidos-backup-2026.tar.zst"})),
+        )],
+        watermark,
+    );
+    assert_eq!(
+        waits_matching(
+            std::slice::from_ref(&wait),
+            event.stored_event_type(),
+            &live
+        )
+        .len(),
+        1,
+        "the live frame must resolve the wait: {live:?}",
+    );
+
+    // 2. The stored row, replayed. Identical object, so a condition cannot hold
+    // on one path and fail on the other.
+    let row = crate::core::store::EventStore::new(pool.clone())
+        .get_event_by_id(emitted.event_id)
+        .await
+        .unwrap()
+        .expect("the backup row");
+    assert_eq!(row.event_type, "BackupCompleted");
+    assert!(
+        row.thread_id.is_none(),
+        "a system frame belongs to no thread: {:?}",
+        row.thread_id
+    );
+    assert_eq!(
+        matchable_payload(&row.event_type, row.payload.clone(), row.thread_id),
+        live,
+        "the row's view and the live view must be the same bytes: {:?}",
+        row.payload
+    );
+    assert_eq!(
+        waits_matching_row(std::slice::from_ref(&wait), &row).len(),
+        1
+    );
+
+    // 3. And through the scan itself, which is the path that covers a backup
+    // finishing while the engine was down.
+    let (id, event_type, payload, idx) = catch_up_from_watermark(&pool, &wait)
+        .await
+        .unwrap()
+        .expect("the row is after the watermark");
+    assert_eq!(id, emitted.event_id);
+    assert_eq!(event_type, "BackupCompleted");
+    assert_eq!(idx, 0);
+    assert_eq!(payload, live);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A transient frame writes no row, so it must reach no matcher either. The
+/// gate refuses it live, and there is nothing behind it to replay.
+#[tokio::test]
+async fn a_transient_system_frame_writes_no_row_and_resolves_nothing() {
+    use crate::core::event_subscription::is_subscribable_system_event;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let watermark = max_sequence(&pool).await;
+    let progress = crate::engine::event_bus::SystemEvent::BackupProgress {
+        phase: "dumping".into(),
+        progress: 2,
+        total: 5,
+    };
+    assert!(
+        !is_subscribable_system_event(&progress),
+        "the live gate must drop it before any wait sees it"
+    );
+    assert!(bus
+        .emit(BusEvent::System(progress))
+        .await
+        .unwrap()
+        .is_none());
+
+    let wait = wait_with(Uuid::new_v4(), vec![sub("BackupProgress", None)], watermark);
+    assert!(
+        catch_up_from_watermark(&pool, &wait)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing was written, so the scan has nothing to find"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The boot rebuild reads `aggregate_id::uuid`, and a system row's is the
+/// literal `global`. The `aggregate = 'thread'` scope is what keeps that cast
+/// from failing the whole query, which would leave the cache empty forever.
+#[tokio::test]
+async fn rebuild_survives_a_system_event_row_in_the_store() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let wait_id = emit_subscribe(&bus, thread_id, vec![sub("BackupCompleted", None)]).await;
+    bus.emit(BusEvent::System(a_backup_completion()))
+        .await
+        .unwrap()
+        .expect("a persisted frame writes a row");
+    let aggregate_id: String =
+        sqlx::query_scalar("SELECT aggregate_id FROM events WHERE event_type = 'BackupCompleted'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        aggregate_id, "global",
+        "precondition: the row's aggregate_id is not a uuid"
+    );
+
+    let waits = LiveWaits::new();
+    assert_eq!(rebuild_live_waits(&pool, &waits).await.unwrap(), 1);
+    let recovered = waits.take(wait_id).await.expect("the wait came back");
+    assert_eq!(recovered.on[0].event_type, "BackupCompleted");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 // ── the arming lookback ─────────────────────────────────────────────
 
 /// The report is the only part of a registration result the model has to act on
@@ -938,6 +1174,7 @@ fn the_arming_lookback_leads_the_result_and_names_the_trap() {
             json!({"file_count": 11}),
             26,
         )])),
+        &[],
     );
 
     let report_at = text
@@ -972,10 +1209,28 @@ fn the_arming_lookback_leads_the_result_and_names_the_trap() {
 #[test]
 fn an_empty_lookback_leaves_the_registration_result_untouched() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
-    let plain = super::register::registered_tool_result_text(&w, None);
-    let empty = super::register::registered_tool_result_text(&w, Some(&ArmingLookback::default()));
+    let plain = super::register::registered_tool_result_text(&w, None, &[]);
+    let empty =
+        super::register::registered_tool_result_text(&w, Some(&ArmingLookback::default()), &[]);
     assert_eq!(plain, empty);
     assert!(!plain.contains("ALREADY HAPPENED"), "{plain}");
+}
+
+/// A warning nobody reads is the same bug one layer up. It leads the result,
+/// ahead of even the lookback, because it is the one line saying this wait may
+/// be watching for nothing.
+#[test]
+fn a_warning_leads_the_registration_result() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ReleaseFinnished", None)], 0);
+    let warning = crate::core::event_subscription::never_emitted_warning("ReleaseFinnished");
+    let text = super::register::registered_tool_result_text(
+        &w,
+        Some(&lookback_of(&[("ReleaseFinnished", json!({}), 5)])),
+        &[warning],
+    );
+    assert!(text.starts_with("WARNING: "), "{text}");
+    assert!(text.contains("ReleaseFinnished"), "{text}");
+    assert!(text.contains("Subscribed to"), "{text}");
 }
 
 /// Ages are rendered at the granularity the window makes meaningful. Anything
@@ -990,6 +1245,7 @@ fn the_report_renders_an_age_the_model_can_act_on() {
             ("ChangeProposed", json!({}), 5),
             ("ChangeProposed", json!({}), 134),
         ])),
+        &[],
     );
     assert!(text.contains("5s ago"), "{text}");
     assert!(text.contains("2m 14s ago"), "{text}");
@@ -1005,6 +1261,7 @@ fn a_fat_payload_is_truncated_but_still_identifies_its_event() {
     let text = super::register::registered_tool_result_text(
         &w,
         Some(&lookback_of(&[("ChangeProposed", huge, 12)])),
+        &[],
     );
 
     assert!(
@@ -1035,6 +1292,7 @@ fn truncating_a_payload_never_splits_a_character() {
     let text = super::register::registered_tool_result_text(
         &w,
         Some(&lookback_of(&[("ChangeProposed", emoji, 1)])),
+        &[],
     );
     assert!(text.contains("payload truncated"), "{text}");
     assert!(text.is_char_boundary(text.len()));
@@ -1048,7 +1306,7 @@ fn a_truncated_report_says_so_and_says_what_to_do() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ToolCalled", None)], 0);
     let mut found = lookback_of(&[("ToolCalled", json!({"name": "run_bash"}), 3)]);
     found.more = true;
-    let text = super::register::registered_tool_result_text(&w, Some(&found));
+    let text = super::register::registered_tool_result_text(&w, Some(&found), &[]);
     assert!(text.contains("More matched than are shown"), "{text}");
     assert!(text.contains("condition"), "{text}");
     assert!(text.contains("trigger"), "{text}");
@@ -2077,23 +2335,115 @@ async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
 }
 
 #[tokio::test]
-async fn a_never_emitted_event_type_is_flagged_on_expiry_only() {
+async fn a_never_emitted_event_type_is_flagged_at_registration() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
-    use super::register::event_type_ever_emitted;
+    use crate::core::event_subscription::{
+        check_subscriptions, event_type_ever_emitted, SubscriptionSurface,
+    };
 
     let thread_id = Uuid::new_v4();
     seed_thread(&bus, thread_id).await;
     assert!(event_type_ever_emitted(&pool, "MessageReceived").await);
     assert!(!event_type_ever_emitted(&pool, "ReleaseFinnished").await);
 
-    // The note rides on the expiry, which is the first moment the model can
-    // learn it: registration accepts an unknown name on purpose, so a typo is
-    // invisible until the deadline.
+    // The note rides on registration, not on the expiry up to 24 hours later.
+    // The name is still accepted: a domain event is legitimate before its
+    // first emit.
+    let warnings = check_subscriptions(
+        &pool,
+        &[sub("ReleaseFinnished", None)],
+        SubscriptionSurface::Wait,
+    )
+    .await
+    .expect("a domain event nobody has emitted yet is accepted");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("never been emitted"), "{warnings:?}");
+    assert!(warnings[0].contains("ReleaseFinnished"), "{warnings:?}");
+
+    let quiet = check_subscriptions(
+        &pool,
+        &[sub("ChangeProposed", None)],
+        SubscriptionSurface::Wait,
+    )
+    .await
+    .expect("a known engine name is accepted");
+    assert!(
+        quiet.is_empty(),
+        "a known name warns about nothing: {quiet:?}"
+    );
+
+    // The expiry note stays, covering a wait armed before this check existed.
     let w = wait_with(thread_id, vec![sub("ReleaseFinnished", None)], 0);
     let text = expiry_reentry_text(&w, &["ReleaseFinnished".to_string()]);
     assert!(text.contains("never emitted"), "{text}");
     assert!(text.contains("ReleaseFinnished"), "{text}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The escape hatch. A workspace that has emitted `CredentialStored` owns that
+/// name, and no edit-distance rule may take it away.
+#[tokio::test]
+async fn a_name_this_workspace_has_emitted_is_never_refused() {
+    use crate::core::event_subscription::{check_subscriptions, SubscriptionSurface};
+    use crate::engine::event_bus::SystemEvent;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    // Before the first emit the name reads as a misspelling of
+    // `CredentialCreated`, and it is refused.
+    let err = check_subscriptions(
+        &pool,
+        &[sub("CredentialStored", None)],
+        SubscriptionSurface::Wait,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("CredentialCreated"), "{err}");
+
+    bus.emit(BusEvent::System(SystemEvent::DomainEvent {
+        event_type: "CredentialStored".to_string(),
+        payload: json!({"summary": "the vault took a write"}),
+        depth: 0,
+        transient: false,
+        actor: None,
+    }))
+    .await
+    .unwrap()
+    .expect("a domain event writes a row");
+
+    let warnings = check_subscriptions(
+        &pool,
+        &[sub("CredentialStored", None)],
+        SubscriptionSurface::Wait,
+    )
+    .await
+    .expect("the store proves the name is real");
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Every entry in the list, not just the first. A partly armed subscription
+/// reads as a success while watching for less than the caller asked.
+#[tokio::test]
+async fn a_dead_name_after_a_live_one_refuses_the_whole_call() {
+    use crate::core::event_subscription::{check_subscriptions, SubscriptionSurface};
+
+    let (pool, db_name) = setup_test_db().await;
+    let subs = vec![
+        sub("ResponseGenerated", None),
+        sub("CredentialRequestResolved", None),
+    ];
+    let err = check_subscriptions(&pool, &subs, SubscriptionSurface::Wait)
+        .await
+        .unwrap_err();
+    assert!(err.contains("CredentialRequestResolved"), "{err}");
+    assert!(err.contains("CredentialRequested"), "{err}");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

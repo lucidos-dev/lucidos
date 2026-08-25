@@ -8,7 +8,7 @@
 //!
 //! Factored out of the `LucidosEngine` impl as a free function so the tests
 //! below can drive every action against a real Postgres pool + EventBus without
-//! booting the full engine, the same shape as `dismiss_from_context_impl`.
+//! booting the full engine, the same shape as `query_events_impl`.
 
 use uuid::Uuid;
 

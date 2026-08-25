@@ -32,11 +32,11 @@ pub fn get_notification_tool() -> ToolDefinition {
                 },
                 "tap": {
                     "type": "object",
-                    "description": "Where a tap lands. `{\"kind\":\"modal\"}` (the default) opens the inbox modal. `{\"kind\":\"navigate\",\"to\":{…}}` takes the same router args `navigate_ui` does, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`."
+                    "description": "Where a tap lands. Omitted: the `event_id` you passed, else the inbox card. `{\"kind\":\"modal\"}` forces the card. `{\"kind\":\"navigate\",\"to\":{…}}` takes the same router args `navigate_ui` does, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`."
                 },
                 "event_id": {
                     "type": "string",
-                    "description": "Event uuid inside the originating thread; the \"Open thread\" button and a `navigate` tap scroll to it and pulse it on land. Pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
+                    "description": "Event uuid inside the originating thread. A tap then lands on it and pulses it, so pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
                 }
             },
             "required": ["title", "message"]

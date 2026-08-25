@@ -58,6 +58,7 @@ fn todo_list_written_serializes_with_type_tag_and_items() {
                 status: TodoStatus::Pending,
             },
         ],
+        notes: None,
     };
     let serialized = serde_json::to_value(&event).unwrap();
     assert_eq!(serialized["type"], "TodoListWritten");
@@ -67,9 +68,51 @@ fn todo_list_written_serializes_with_type_tag_and_items() {
     assert_eq!(serialized["items"][1]["status"], "pending");
 }
 
+/// ADR 0085's *todo notes*, and the two shapes they must serialize into.
+///
+/// Present, the field is on the wire. Absent, the key is not there at all. A
+/// payload written before the field existed and one written with the mode off
+/// are then byte-identical. Every stored row replays through this enum, so a
+/// required field would break every list ever written.
+#[test]
+fn todo_list_written_carries_notes_only_when_there_are_notes() {
+    let with = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: Some("collect.sh needs bash 5".into()),
+    };
+    let json = serde_json::to_value(&with).unwrap();
+    assert_eq!(json["notes"], "collect.sh needs bash 5");
+    let parsed: ThreadEvent = serde_json::from_value(json).unwrap();
+    assert!(
+        matches!(parsed, ThreadEvent::TodoListWritten { notes: Some(n), .. } if n.contains("bash 5"))
+    );
+
+    let without = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: None,
+    };
+    let json = serde_json::to_value(&without).unwrap();
+    assert!(
+        json.get("notes").is_none(),
+        "an unnoted list must not carry the key at all: {json}"
+    );
+
+    // A row from before the field existed reads back as unnoted.
+    let legacy: ThreadEvent =
+        serde_json::from_value(serde_json::json!({"type": "TodoListWritten", "items": []}))
+            .expect("a pre-notes payload still parses");
+    assert!(matches!(
+        legacy,
+        ThreadEvent::TodoListWritten { notes: None, .. }
+    ));
+}
+
 #[test]
 fn todo_list_written_round_trips_through_serde_with_empty_items() {
-    let event = ThreadEvent::TodoListWritten { items: Vec::new() };
+    let event = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: None,
+    };
     let json = serde_json::to_value(&event).unwrap();
     let parsed: ThreadEvent = serde_json::from_value(json.clone()).unwrap();
     let reserialized = serde_json::to_value(&parsed).unwrap();
@@ -108,6 +151,7 @@ fn todo_list_written_round_trips_through_serde_with_every_status() {
                 status: TodoStatus::Abandoned,
             },
         ],
+        notes: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     let parsed: ThreadEvent = serde_json::from_value(json.clone()).unwrap();
@@ -117,7 +161,10 @@ fn todo_list_written_round_trips_through_serde_with_every_status() {
 
 #[test]
 fn todo_list_written_event_type_is_todo_list_written() {
-    let event = ThreadEvent::TodoListWritten { items: Vec::new() };
+    let event = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: None,
+    };
     assert_eq!(event.event_type(), "TodoListWritten");
 }
 
@@ -126,7 +173,10 @@ fn todo_list_written_event_type_is_todo_list_written() {
 /// the next `todo_write` call.
 #[test]
 fn todo_list_written_is_persisted() {
-    let event = ThreadEvent::TodoListWritten { items: Vec::new() };
+    let event = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: None,
+    };
     assert!(event.is_persisted());
 }
 
@@ -134,6 +184,9 @@ fn todo_list_written_is_persisted() {
 /// firehose. Triggers may legitimately subscribe via `on_event:`.
 #[test]
 fn todo_list_written_is_not_per_token_streaming() {
-    let event = ThreadEvent::TodoListWritten { items: Vec::new() };
+    let event = ThreadEvent::TodoListWritten {
+        items: Vec::new(),
+        notes: None,
+    };
     assert!(!event.is_per_token_streaming());
 }

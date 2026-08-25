@@ -11,8 +11,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::super::chat::process::working_understanding as wu;
 use super::super::context::{
-    estimate_message_chars, estimate_tokens_from_chars, trim_context_if_needed,
+    estimate_message_chars, estimate_tokens_from_chars, trim_context_if_needed, RecoveryClause,
+    TrimGuards,
 };
 use super::super::types::*;
 use super::super::LucidosEngine;
@@ -104,6 +106,11 @@ impl LucidosEngine {
         // against. Passing it also freezes the cap for the turn, so a mid-turn
         // Settings change cannot move it under a running loop.
         max_tool_calls: usize,
+        // What the turn's setup resolved about the context mode: whether it is
+        // on, and the notes the thread already had. Everything else the mode
+        // does lives in this loop, because a round is a fact only the loop
+        // holds.
+        curated: crate::engine::chat::process::context_mode::CuratedTurn,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // EventMeta for this request — all persisted events in this cycle share the same context
         let meta = crate::engine::thread_events::EventMeta {
@@ -151,8 +158,9 @@ impl LucidosEngine {
         // the terminator all call a "tool call".
         let mut tool_calls_made = 0usize;
         // Capture before the loop pushes assistant/tool messages and shifts the index.
-        // Maintained across rounds: trim pass 2 may remove older messages, which
-        // shifts the captured index down by the number removed (handled below).
+        // Maintained across rounds: the trimmer's removal pass may drop older
+        // messages, which shifts the captured index down by the number removed
+        // (handled below).
         let mut user_message_idx = messages.len().saturating_sub(1);
         // Messages whose image bytes must survive trim pass 0 for the whole turn.
         // Split by provenance because only one side needs a bound:
@@ -197,6 +205,47 @@ impl LucidosEngine {
         let mut cached_list_files: Option<String> = None;
         let mut modified_app_uis: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // The section list THIS round sent, which is the seed's until the panel
+        // replaces its own row. Read by every `ContextCaptured` below, so a
+        // capture always describes its own round rather than replaying round
+        // 1's.
+        let mut capture_sections: Vec<crate::engine::ContextSection> =
+            capture_seed.sections.to_vec();
+        // The system prompt's size, for the panel and for the capture total.
+        // Read once: it is the same bytes on every round of this turn, which is
+        // what keeps the system cache tier stable (ADR 0084).
+        let system_chars: usize = capture_seed
+            .sections
+            .iter()
+            .find(|s| s.name == "System Instructions")
+            .map(|s| s.budget_delta_chars)
+            .unwrap_or(0);
+        // What the model has held open this turn, in the `evt-<hex>` form the
+        // panel prints. A keep moves the item's clock and exempts nothing, so
+        // this set only orders what the wall reaches last and prices the
+        // panel's held-open line.
+        let mut held_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // A failed action is never cut by the trimmer. Manus found that
+        // leaving mistakes in context is what stops a model repeating them.
+        let mut failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // `panel_first_seen` is what makes the age column real: without it
+        // every row would report as arriving this round. A keep OVERWRITES an
+        // entry here, and that is the whole of what a keep does.
+        let mut panel_first_seen: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // When results leave. Frozen for the turn, so a mid-turn Settings
+        // change cannot move the schedule under a running loop.
+        let schedule = curated.schedule;
+        let mode_on = curated.mode.is_on();
+        // The document and the checklist the tail renders every round. Seeded
+        // from what the thread already had, and replaced as spans are parsed.
+        let mut live_document = curated.document.clone();
+        let mut live_todo = curated.todo.clone();
+        let live_todo_notes = curated.todo_notes.clone();
+        // What the last reply's parse could not read, and what it held open.
+        // Reported in the NEXT round's framing, which is the first surface the
+        // model reads after writing.
+        let mut notices = wu::RoundNotices::default();
 
         // Agent loop
         loop {
@@ -265,7 +314,7 @@ impl LucidosEngine {
                 ));
             }
 
-            // Pin the current turn's user message so pass 2 cannot drop it
+            // Pin the current turn's user message so removal cannot drop it
             // (`Some(user_message_idx)`), and keep every tracked image-bearing
             // message's bytes for the whole turn (`keep_image_idxs`). The
             // recent-tail rule alone fails once enough tool rounds shift a
@@ -273,25 +322,132 @@ impl LucidosEngine {
             // strips the request line from every subsequent call (model reports
             // "I lost track of what you asked"), and stripping its image blinds
             // the model to what it was looking at.
+            // What no STUBBING pass may cut: every failed action, and nothing
+            // else. A keep is deliberately absent, so the wall can always cut
+            // and a keep can never wedge the model's own turn.
+            let protected: crate::engine::context::ProtectedAddresses = failed.clone();
+
+            // The sweep, before the trim so the backstop sees the smaller
+            // array. Ages are noted first, so a result arriving this round is
+            // recorded as arriving now and survives to be read.
+            if mode_on {
+                use crate::engine::chat::process::context_panel as panel;
+                let sweeping = schedule.is_sweep_round(rounds);
+                // Last round's panel and document go first. The trimmer then
+                // never counts ~10 KB it is about to lose anyway, and never
+                // evicts a pair of real history for it. The model's own spans
+                // fold ONLY on a sweep round: the penultimate cache breakpoint
+                // sits on last round's assistant message.
+                panel::collapse_tail_blocks(messages, sweeping);
+                panel::note_first_seen(&mut panel_first_seen, messages, rounds);
+                let sweep = crate::engine::chat::process::context_mode::sweep_expired_pairs(
+                    messages,
+                    &panel_first_seen,
+                    rounds,
+                    schedule,
+                );
+                if !sweep.removed.is_empty() {
+                    log!(
+                        "[Context] swept {} pair(s) and {} message(s) on round {} of thread {}",
+                        sweep.removed.len(),
+                        sweep.messages_dropped,
+                        rounds,
+                        thread_id
+                    );
+                }
+                // Position-aware, because a sweep cuts mid-array. The removal
+                // bookkeeping below assumes contiguous removal from index 1,
+                // which this is not.
+                user_message_idx = sweep.remap(user_message_idx);
+                for idx in user_image_idxs
+                    .iter_mut()
+                    .chain(explicit_image_idxs.iter_mut())
+                {
+                    *idx = sweep.remap(*idx);
+                }
+            }
+            // Built AFTER the sweep, because it is a COPY of the two pin lists
+            // and the sweep remaps them. Built before, every index in it is one
+            // too high once a message goes, and pass 0 strips the user's image.
             let mut keep_image_idxs = user_image_idxs.clone();
             keep_image_idxs.extend_from_slice(&explicit_image_idxs);
+            // The panel and the document, for whatever array it is handed.
+            // Called twice a round: once to size the room the trim has to
+            // leave, once for real once the trim is done.
+            let render_tail_blocks = |messages: &[Message]| -> (String, String) {
+                use crate::engine::chat::process::context_panel as panel;
+                let items = panel::tool_result_items(messages, &panel_first_seen, rounds, schedule);
+                let fixed_chars = system_chars + capture_seed.tool_defs_chars;
+                let view = panel::PanelView {
+                    items: &items,
+                    fixed: panel::FixedRegions {
+                        system_chars,
+                        tool_defs_chars: capture_seed.tool_defs_chars,
+                    },
+                    held_open: &held_open,
+                    budget_chars: message_budget + fixed_chars,
+                    round: rounds,
+                    schedule,
+                };
+                // The document renders LAST, after the panel, and the panel's
+                // total counts it. It is the thinking surface and the panel is
+                // a dashboard.
+                let document_block = wu::render(&live_document, &live_todo, &notices);
+                let rendered = view.render(
+                    messages.iter().map(estimate_message_chars).sum::<usize>()
+                        + fixed_chars
+                        + document_block.chars().count(),
+                );
+                (rendered, document_block)
+            };
+            // Both blocks are appended after the trim, so the trim is told they
+            // are coming. Sized on the pre-trim array, which can only overstate
+            // them: the trim drops panel rows and shrinks the figures on the
+            // ones it keeps, and the document does not depend on the array.
+            //
+            // Capped at half the budget. The document has no ceiling, and a
+            // runaway one must not evict the conversation to make room.
+            let tail_reserve = if mode_on {
+                let (panel, document) = render_tail_blocks(messages);
+                (panel.chars().count() + document.chars().count()).min(message_budget / 2)
+            } else {
+                0
+            };
             let trim_outcome = trim_context_if_needed(
                 messages,
-                message_budget,
+                message_budget - tail_reserve,
                 Some(user_message_idx),
                 &keep_image_idxs,
+                TrimGuards {
+                    protected: &protected,
+                    held_open: &held_open,
+                    // Decision 2 states the recovery command once per request,
+                    // in the standing instructions. The control arm keeps it in
+                    // every stub, because that is ADR 0087's baseline.
+                    recovery: if mode_on {
+                        RecoveryClause::Omit
+                    } else {
+                        RecoveryClause::State
+                    },
+                },
             );
             let removed_count = trim_outcome.messages_removed;
-            // `trimmed` reports ANY content loss, not just pass-2 eviction —
-            // passes 1/1.5 replace tool-result bodies with a truncation note,
-            // which the UI previously showed as an untrimmed turn.
+            // `trimmed` reports ANY content loss, not just eviction. The
+            // stubbing passes replace tool-result bodies with a note, which the
+            // UI previously showed as an untrimmed turn.
             let trimmed = trim_outcome.any();
-            // Pass 2 of trim removes oldest messages from index 1; the protected
-            // index guard ensures every removal sits strictly below
+            // Which passes did it, ascending. `trimmed` alone cannot tell an
+            // addressed stub from pass 5's silent removal, and that is the
+            // distinction a reader of a full context most needs.
+            let trim_passes: Vec<u8> = (0..8)
+                .filter(|bit| trim_outcome.passes & (1 << bit) != 0)
+                .collect();
+            // Removal takes oldest messages from index 1; the protected index
+            // guard ensures every removal sits strictly below
             // user_message_idx, so it shifts down by removed_count.
             user_message_idx = user_message_idx.saturating_sub(removed_count);
-            // Every pin sits at or above pass 2's eviction floor (which is the
-            // minimum over the pins), so none of them was removed — the uniform
+            // Every pin sits at or above the eviction floor (which is the
+            // minimum over the pins), so none of them was removed. The uniform
             // shift stays exact and no pin can end up aliasing a different
             // message.
             for idx in user_image_idxs
@@ -304,8 +460,33 @@ impl LucidosEngine {
             // The primary fix ensures correct block ordering, but this catches any
             // edge case where pairing breaks (trimming bugs, injection ordering, etc.)
             crate::llm::validate::validate_tool_use_pairing(messages);
-            // Always measure AFTER trimming — pass 0 strips images even when pass 2
-            // removes no messages, so pre-trim chars can be wildly inflated.
+
+            // ADR 0109's context panel: what the model is holding, how big each
+            // piece is, and how full it is. Built AFTER the trim, so its figures
+            // are the request that goes out rather than the one that was
+            // assembled. Appended to the newest message, never edited into an
+            // older one: a cache breakpoint sits on the last message, so a byte
+            // changed earlier re-writes the whole suffix.
+            if mode_on {
+                use crate::engine::chat::process::context_panel as panel;
+                // Re-rendered after the sweep and the trim. Every row then
+                // reports what the request is about to send, rather than what
+                // it held a moment ago. Ages were noted before the sweep.
+                let (rendered, document_block) = render_tail_blocks(messages);
+                capture_sections.retain(|section| {
+                    section.name != panel::PANEL_SECTION && section.name != wu::SECTION
+                });
+                capture_sections.push(panel::panel_section(&rendered));
+                capture_sections.push(wu::capture_section(&document_block));
+                panel::append_to_tail(messages, rendered);
+                panel::append_to_tail(messages, document_block);
+                // The framing answers the round that wrote it, so it is spent
+                // once rendered.
+                notices = wu::RoundNotices::default();
+            }
+
+            // Always measure AFTER trimming. Pass 0 strips images even when no
+            // message is removed, so pre-trim chars can be wildly inflated.
             let context_chars: usize = messages.iter().map(estimate_message_chars).sum();
 
             // chars-to-tokens at the measured 2.5 chars/token display rate, not
@@ -374,10 +555,16 @@ impl LucidosEngine {
                     // post-response repair paths below strip the tag and synthesise
                     // a real tool call. See `inline_question_repair` /
                     // `inline_tool_call_repair`.
+                    // The working understanding is the model's private notes.
+                    // Without this the user watches it typed at them every
+                    // round. Same shape as the two repairs beside it: once the
+                    // opening fragment lands, stop flushing and let the final
+                    // splice below emit the cleaned text.
                     if crate::engine::inline_question_repair::buffer_contains_inline_tag(&text)
                         || crate::engine::inline_tool_call_repair::buffer_contains_inline_tool_call(
                             &text,
                         )
+                        || (mode_on && text.contains(wu::MARKER_PREFIX))
                     {
                         return;
                     }
@@ -394,6 +581,10 @@ impl LucidosEngine {
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
                             aggregate: None,
+                            // Per-token streaming never reaches the trigger
+                            // matcher, so the depth is answered rather than
+                            // resolved: this closure runs off-task anyway.
+                            depth: 0,
                         });
                         // Persist new text since last persistence point
                         let mut last = persisted_len.lock().unwrap();
@@ -460,12 +651,36 @@ impl LucidosEngine {
                     }
                 }
                 _ = cancel_future => {
-                    let partial = raw_buffer.lock().unwrap().clone();
-                    // Persist any remaining un-persisted text
+                    let raw_partial = raw_buffer.lock().unwrap().clone();
+                    // A stopped round still wrote what it wrote. Persisting it
+                    // here is what keeps the document, and the parse it returns
+                    // is what lets the flush below carry prose rather than
+                    // markup. `Truncated`, because the Stop is what ended the
+                    // text: only a block the model closed before it is kept.
+                    // The error arm deliberately persists nothing at all, since
+                    // an `Err` can also cut a block short of its marker.
+                    let partial = if mode_on {
+                        let (parsed, _) = read_working_understanding(
+                            &self.event_bus,
+                            thread_id,
+                            &raw_partial,
+                            wu::ReplyEnd::Truncated,
+                            &mut live_document,
+                            &mut live_todo,
+                            &live_todo_notes,
+                        )
+                        .await;
+                        wu::strip_faulted_markup(&wu::splice_spans_out(&raw_partial, &parsed.spans))
+                    } else {
+                        raw_partial
+                    };
+                    // The delta is measured against the spliced text, so a
+                    // splice that shortened it below what already streamed
+                    // flushes nothing. `get` rather than a slice: the cut can
+                    // land off a char boundary.
                     {
                         let last = *last_persisted_len.lock().unwrap();
-                        if partial.len() > last {
-                            let remaining = &partial[last..];
+                        if let Some(remaining) = partial.get(last..).filter(|r| !r.is_empty()) {
                             self.event_bus.emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
                                     thread_id,
@@ -516,36 +731,17 @@ impl LucidosEngine {
             // section instead carries the *delta* — bytes added by the
             // tool loop on iter 2+ — so the section list sums to the live
             // total: system_prompt + context_chars.
-            let static_total: usize = capture_seed.sections.iter().map(|s| s.char_count).sum();
-            let system_chars: usize = capture_seed
-                .sections
-                .iter()
-                .find(|s| s.name == "System Instructions")
-                .map(|s| s.char_count)
-                .unwrap_or(0);
-            let bundled_total = static_total - system_chars;
-            let conversation_extra = context_chars.saturating_sub(bundled_total);
-            // When `capture_body` is on, fill the Conversation body so the
-            // modal shows what was actually sent (assistant text + tool I/O
-            // accumulated by the loop). Capped at SECTION_PERSIST_MAX (8 KB
-            // — same cap chat::process applies to other section bodies) to
-            // keep large tool outputs from bloating every events row.
-            const CONVERSATION_PERSIST_MAX: usize = 8_000;
-            let conversation_body = capture_seed.capture_body.then(|| {
-                let serialized = serialize_messages_for_capture(messages);
-                if serialized.len() > CONVERSATION_PERSIST_MAX {
-                    super::super::context::truncate_head_tail(&serialized, CONVERSATION_PERSIST_MAX)
-                } else {
-                    serialized
-                }
-            });
-            let conversation = crate::engine::ContextSection {
-                name: "Conversation".to_string(),
-                content: conversation_body,
-                char_count: conversation_extra,
-                role: crate::engine::ContextRole::User,
-                group: None,
-            };
+            let static_total: usize = capture_sections.iter().map(|s| s.budget_delta_chars).sum();
+            let bundled_total = static_total.saturating_sub(system_chars);
+            // The body it fills is what the loop actually sent: assistant text
+            // plus tool I/O. The section also reports the array's real size,
+            // which the delta above deliberately does not.
+            let conversation = conversation_section(
+                messages,
+                bundled_total,
+                context_chars,
+                capture_seed.capture_body,
+            );
             // Tool schemas are part of every request and the trim budget already
             // subtracts them, so the reported total must include them too —
             // otherwise the Context Viewer under-reports what was actually sent.
@@ -561,12 +757,12 @@ impl LucidosEngine {
             let tool_definitions = crate::engine::ContextSection {
                 name: format!("Tool Definitions ({})", capture_seed.tools.len()),
                 content: None,
-                char_count: capture_seed.tool_defs_chars,
+                budget_delta_chars: capture_seed.tool_defs_chars,
+                content_chars: Some(capture_seed.tool_defs_chars),
                 role: crate::engine::ContextRole::System,
                 group: None,
             };
-            let iter_sections: Vec<_> = capture_seed
-                .sections
+            let iter_sections: Vec<_> = capture_sections
                 .iter()
                 .cloned()
                 .chain(std::iter::once(tool_definitions))
@@ -621,6 +817,9 @@ impl LucidosEngine {
                             estimated_total_tokens,
                             usage,
                             trimmed,
+                            trim_passes: trim_passes.clone(),
+                            purpose: crate::engine::ContextPurpose::Turn,
+                            reconstructed: false,
                         },
                         meta: meta.clone(),
                     },
@@ -744,6 +943,97 @@ impl LucidosEngine {
                     );
                 }
             }
+            // The working understanding, read the moment the reply lands. It
+            // arranges the NEXT round, so a keep written now is in force before
+            // the pass that drops pairs. That is the ordering the tool call
+            // used to guarantee by running earlier.
+            //
+            // The raw text is kept for history. The span stays in the message
+            // array, where the sweep folds it, and is spliced out of everything
+            // the user reads.
+            //
+            // ONE accessor for both, and it is `history_text`, never
+            // `content`. Gemini narrates its plan in ordinary text beside a
+            // `functionCall` and keeps that off the screen by leaving `content`
+            // empty. Reading `content` would ignore every document and every
+            // keep that model writes on a tool-call round.
+            let raw_history_text: Option<String> = response.history_text().map(str::to_string);
+            let (parsed, applied) = if mode_on {
+                read_working_understanding(
+                    &self.event_bus,
+                    thread_id,
+                    raw_history_text.as_deref().unwrap_or(""),
+                    // The model stopped here, so a block it left open is its
+                    // own mistake. The fault reaches it in the next round's
+                    // framing, and what it wrote still lands.
+                    wu::ReplyEnd::Complete,
+                    &mut live_document,
+                    &mut live_todo,
+                    &live_todo_notes,
+                )
+                .await
+            } else {
+                (wu::ParsedReply::default(), wu::Applied::default())
+            };
+            let wrote_document = parsed.wrote_something();
+            if wrote_document || !parsed.faults.is_empty() {
+                notices.faults = applied.faults;
+                // A keep is consumed too, so a later rewrite cannot re-assert
+                // one. It OVERWRITES the first-seen round, which is the whole
+                // mechanism: `note_first_seen` never would.
+                //
+                for address in applied.keep_open {
+                    // Resolved against what the request is CARRYING, never
+                    // against `panel_first_seen`: see `is_resident`.
+                    if !crate::engine::chat::process::context_panel::carries_address(
+                        messages, &address,
+                    ) {
+                        // No recovery call here on purpose. It is stated once
+                        // per request, in the standing instructions.
+                        notices.faults.push(format!(
+                            "`{address}` names nothing your context is carrying, so nothing was \
+                             held open."
+                        ));
+                        continue;
+                    }
+                    crate::engine::chat::process::context_panel::hold_open(
+                        &mut panel_first_seen,
+                        &address,
+                        rounds,
+                    );
+                    held_open.insert(address.clone());
+                    notices.held_open.push(address.clone());
+                    if let Some(id) = crate::core::store::parse_event_address(&address) {
+                        self.event_bus
+                            .emit_or_log(
+                                crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event:
+                                        crate::engine::thread_events::ThreadEvent::ContextKeptOpen {
+                                            kept_open_event_id: id,
+                                        },
+                                    meta: crate::engine::thread_events::EventMeta::NONE,
+                                },
+                                "[AgenticLoop] ContextKeptOpen",
+                            )
+                            .await;
+                    }
+                }
+            }
+            // The splice runs over `content`, which is the half the user reads.
+            // The span offsets came from `history_text`, and the two are the
+            // same string whenever `content` is set: `model_only_text` is never
+            // set beside it. Where `content` is empty nothing reaches the user
+            // anyway, so there is nothing to splice.
+            //
+            // A fault runs it too. An opening the parse could not read leaves no
+            // span, so the splice alone would hand the whole block to the user.
+            let spliced_something = wrote_document || !parsed.faults.is_empty();
+            if let Some(raw) = response.content.as_deref().filter(|_| spliced_something) {
+                let cleaned = wu::strip_faulted_markup(&wu::splice_spans_out(raw, &parsed.spans));
+                response.content = (!cleaned.is_empty()).then_some(cleaned);
+            }
+
             // Final flush — send any remaining buffered text and persist
             // remainder. This includes the assistant's preamble on a tool-call
             // turn ("Let me organize the cards…" before write_file): the loop
@@ -758,8 +1048,9 @@ impl LucidosEngine {
                 // so force the flush/persist to the cleaned text — the final
                 // `response.content` both repairs leave behind. Otherwise fall
                 // back to the raw stream / content as before.
-                let cleaned_override = (inline_repair.is_some() || tool_call_repair.is_some())
-                    .then(|| response.content.as_deref().unwrap_or(""));
+                let cleaned_override =
+                    (inline_repair.is_some() || tool_call_repair.is_some() || spliced_something)
+                        .then(|| response.content.as_deref().unwrap_or(""));
                 let effective: &str = effective_flush_text(
                     cleaned_override,
                     raw.as_str(),
@@ -954,6 +1245,41 @@ impl LucidosEngine {
                     }
                 }
 
+                // A reply carrying ONLY the working understanding is
+                // bookkeeping, not an answer. With the span spliced out and
+                // nothing left addressed to the user, the turn continues rather
+                // than ending mid-task. It costs the round the old tool call
+                // cost, and it never abandons the work. The round backstop
+                // above bounds it, like every other path that continues without
+                // executing a tool call.
+                // Lazily, like the wake check below: an ordinary turn must
+                // not pay `clean_response` twice, and only a round that wrote a
+                // document can be bookkeeping.
+                let visible = wrote_document
+                    .then(|| response.content.as_deref().map(|c| self.clean_response(c)))
+                    .flatten();
+                if reply_was_bookkeeping_alone(wrote_document, visible.as_deref()) {
+                    // The raw text, span included, so the fold has something to
+                    // collapse on the next sweep.
+                    if let Some(text) = raw_history_text.as_deref() {
+                        messages.push(Message {
+                            role: "assistant".to_string(),
+                            content: MessageContent::Text(text.to_string()),
+                        });
+                    }
+                    // A user message, because the next round appends the panel
+                    // and the document to whatever is last.
+                    messages.push(Message {
+                        role: "user".to_string(),
+                        content: MessageContent::Text(NOTED_CARRY_ON.to_string()),
+                    });
+                    log!(
+                        "[AgenticLoop] thread={} reply carried only the working understanding, continuing",
+                        thread_id
+                    );
+                    continue;
+                }
+
                 // The WAKE CHECK. A turn about to end with open todo work and
                 // nothing to re-open the thread. Its closing paragraph very
                 // often promises to keep watching, with nothing behind it.
@@ -1005,7 +1331,7 @@ impl LucidosEngine {
                     }
                     messages.push(Message {
                         role: "user".to_string(),
-                        content: MessageContent::Text(todo_wake_nudge_instruction(open)),
+                        content: MessageContent::Text(todo_wake_nudge_instruction(open, mode_on)),
                     });
                     self.event_bus
                         .emit_or_log(
@@ -1190,7 +1516,7 @@ impl LucidosEngine {
             }
 
             // Execute each tool call
-            let mut tool_outputs = Vec::new();
+            let mut tool_outputs: Vec<ToolOutput> = Vec::new();
             let mut had_errors = false;
             // Set if an `ask_user_question` call in THIS iteration errored, then
             // copied into `question_ask_failed_last_iter` after the loop so the
@@ -1213,9 +1539,14 @@ impl LucidosEngine {
                 |messages: &mut Vec<Message>, response: &LlmResponse, result_text: &str| {
                     // 1. Assistant message with tool_use blocks (from the LLM's response)
                     let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-                    if let Some(content_text) = &response.content {
-                        let t: String = content_text.clone();
-                        assistant_blocks.push(ContentBlock::Text { text: t });
+                    // The RAW reply, span included. `history_text` reads
+                    // `content`, which the splice above has already cleaned for
+                    // the user, and the array is where the fold collapses a
+                    // superseded document.
+                    if let Some(content_text) = raw_history_text.as_deref() {
+                        assistant_blocks.push(ContentBlock::Text {
+                            text: content_text.to_string(),
+                        });
                     }
                     for tc in &response.tool_calls {
                         assistant_blocks.push(ContentBlock::ToolUse {
@@ -1489,6 +1820,42 @@ impl LucidosEngine {
                     })
                     .await;
 
+                // The mode withdraws `todo_write` from the tools array, so a
+                // call for it can only come from a cached prompt or a
+                // hallucination. Refused rather than run, because the handler
+                // writes `TodoListWritten` and never touches `live_todo`: the
+                // list rendered back next round would be the old one, and the
+                // model's next document write would then overwrite the
+                // projection with it. One list, one write surface.
+                if mode_on && tool_call.name == tn::TODO_WRITE {
+                    last_call_was_error = true;
+                    had_errors = true;
+                    note_failure(&mut failed, tool_called_event_id, curated.mode);
+                    let refusal = crate::engine::chat::process::context_mode::TODO_TOOL_REFUSAL;
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                    name: tool_call.name.clone(),
+                                    result: refusal.to_string(),
+                                    images: vec![],
+                                    success: false,
+                                    tool_called_event_id,
+                                },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ToolResult (todo_write refused, context mode)",
+                        )
+                        .await;
+                    tool_outputs.push(ToolOutput {
+                        tool_use_id: tool_call.id.clone(),
+                        text: refusal.to_string(),
+                        event_id: tool_called_event_id,
+                    });
+                    continue;
+                }
+
                 // Command guard (ADR 0002): classify bash/python commands before
                 // dispatch. `Catastrophic` is hard-blocked; `IrreversibleDanger`
                 // on a chat channel pauses and asks the user (this call blocks
@@ -1533,6 +1900,7 @@ impl LucidosEngine {
                         crate::engine::event_wait::AwaitEventOutcome::Refused(msg) => {
                             last_call_was_error = true;
                             had_errors = true;
+                            note_failure(&mut failed, tool_called_event_id, curated.mode);
                             (msg, false)
                         }
                     };
@@ -1552,7 +1920,11 @@ impl LucidosEngine {
                             "[AgenticLoop] ToolResult (await_event)",
                         )
                         .await;
-                    tool_outputs.push((tool_call.id.clone(), result));
+                    tool_outputs.push(ToolOutput {
+                        tool_use_id: tool_call.id.clone(),
+                        text: result,
+                        event_id: tool_called_event_id,
+                    });
                     continue;
                 }
 
@@ -1609,6 +1981,7 @@ impl LucidosEngine {
                     if !success {
                         last_call_was_error = true;
                         had_errors = true;
+                        note_failure(&mut failed, tool_called_event_id, curated.mode);
                     }
                     self.event_bus
                         .emit_or_log(
@@ -1626,7 +1999,11 @@ impl LucidosEngine {
                             "[AgenticLoop] ToolResult (event-wait agent surface)",
                         )
                         .await;
-                    tool_outputs.push((tool_call.id.clone(), result));
+                    tool_outputs.push(ToolOutput {
+                        tool_use_id: tool_call.id.clone(),
+                        text: result,
+                        event_id: tool_called_event_id,
+                    });
                     continue;
                 }
 
@@ -1884,7 +2261,15 @@ impl LucidosEngine {
                         .await;
                 }
 
-                tool_outputs.push((tool_call.id.clone(), split.llm_text));
+                if is_error {
+                    note_failure(&mut failed, tool_called_event_id, curated.mode);
+                }
+
+                tool_outputs.push(ToolOutput {
+                    tool_use_id: tool_call.id.clone(),
+                    text: split.llm_text,
+                    event_id: tool_called_event_id,
+                });
 
                 // A trigger hit an ungranted side-effect: its block is now
                 // recorded as a failed ToolResult — stop running the rest of
@@ -1925,8 +2310,15 @@ impl LucidosEngine {
 
             // 1. Add the assistant's tool_use response as a message
             let mut assistant_blocks = Vec::new();
-            if let Some(text) = &response.content {
-                assistant_blocks.push(ContentBlock::Text { text: text.clone() });
+            // The RAW reply, span included. Gemini's plan narration is barred
+            // from the screen but belongs in its own turn. The working
+            // understanding belongs in the array so the sweep can fold it.
+            // Without either, the next round starts having forgotten what it
+            // decided to do.
+            if let Some(text) = raw_history_text.as_deref() {
+                assistant_blocks.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
             }
             for tc in &response.tool_calls {
                 assistant_blocks.push(ContentBlock::ToolUse {

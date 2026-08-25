@@ -103,6 +103,11 @@ exchange, and the model reads the turn it was in before the wait as history.
 attention-needing, and archivable (archiving still cancels every live wait, so
 that is not a way to strand one). Coding-agent threads can subscribe.
 
+**Amended by ADR 0106.** All three of those still hold. What this ADR did not
+weigh is the state its own last sentence made reachable: a coding-agent thread
+holding a proposed change *and* a subscription. Such a thread can no longer
+Apply or Discard until it stops being woken.
+
 **Migration.** Live rows can carry `status = 'waiting_for_event'` and an
 unpaired `await_event` call. A migration rewrites the status to `idle` and
 recomputes the blocking counters with the current predicate; a boot sweep

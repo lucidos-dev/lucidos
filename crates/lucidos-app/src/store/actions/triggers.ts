@@ -4,6 +4,7 @@ import {
   selectedTriggerIds,
   setSelectedTriggerIds,
   panelOverlay,
+  triggerScrollTarget,
   closeInlineForm,
   showToast,
   showConfirm,
@@ -82,6 +83,18 @@ export function openEditTrigger(triggerId: string): void {
   revealContentPane();
 }
 
+/** Go to a trigger: the Triggers panel, scrolled to that trigger's ROW and
+ *  marked with the navigation focus marker.
+ *
+ *  The row rather than the edit form, because the row is where every
+ *  affordance a "here is your trigger" pointer means lives: Run once, the
+ *  pause toggle, the last-run OK or failed chip, the schedule. The form is for
+ *  changing the configuration, and the row is one tap from it. See
+ *  ADR 0112 and docs/plans/2026-08-24-a-trigger-is-a-link.md.
+ *
+ *  Every route to a trigger comes through here, so they all land the same way:
+ *  a `trigger:<id>` chat link, a notification tap, the notification's Open
+ *  trigger button, a Search Everywhere hit, `navigate_ui`. */
 export async function navigateToTrigger(triggerId: string, source?: string): Promise<void> {
   // `source` names where the navigate originated (e.g. a thread label) so a
   // genuine-miss toast says where it came from instead of swallowing it.
@@ -107,7 +120,12 @@ export async function navigateToTrigger(triggerId: string, source?: string): Pro
     showToast(`Couldn't open trigger "${triggerId}"${from} — triggers failed to load`, 'error');
     return;
   }
-  setActiveMenu('triggers', { type: 'form', form: { type: 'trigger', triggerId } });
+  // A null overlay, so an edit form already open on another trigger closes and
+  // the list itself is what shows. `TriggersView`'s effect consumes the target
+  // once the rows render, expanding the trigger's group first if it is
+  // collapsed.
+  setActiveMenu('triggers');
+  triggerScrollTarget.value = triggerId;
   pushNavState();
   // Canonical helper: mobile swipe to content pane AND desktop expand of
   // collapsed split. The earlier `if (isMobile()) navigateToPane('content')`
@@ -150,13 +168,15 @@ interface SubmitTriggerParams {
   reasoningEffort: string | null;
 }
 
-/** Surface the engine's non-fatal cron advice after a successful save.
+/** Surface the engine's non-fatal advice after a successful save: the cron
+ *  warnings, then the event-type ones.
  *
- *  Warnings only: a schedule that can never fire is rejected outright and
- *  arrives as `error`. The next-run preview needs no toast, since the reload
- *  below renders it on the trigger's own row. */
-function surfaceCronWarnings(result: ApiResult): void {
-  for (const warning of result.cron_preview?.warnings ?? []) {
+ *  Warnings only, in both families. A schedule that can never fire, and an
+ *  event type the engine never emits, are both rejected outright and arrive as
+ *  `error`. The next-run preview needs no toast, since the reload below renders
+ *  it on the trigger's own row. */
+function surfaceWriteWarnings(result: ApiResult): void {
+  for (const warning of [...(result.cron_preview?.warnings ?? []), ...(result.warnings ?? [])]) {
     showToast(warning, 'warning');
   }
 }
@@ -213,7 +233,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         showToast(data.error || 'Failed to update trigger', 'error');
         return false;
       }
-      surfaceCronWarnings(data);
+      surfaceWriteWarnings(data);
     } else {
       const data = await createTrigger({
         name: name.trim(),
@@ -236,7 +256,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         showToast(data.error || 'Failed to create trigger', 'error');
         return false;
       }
-      surfaceCronWarnings(data);
+      surfaceWriteWarnings(data);
     }
 
     closeTriggerForm();

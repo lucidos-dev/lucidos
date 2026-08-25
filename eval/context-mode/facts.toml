@@ -1,0 +1,284 @@
+# The fact register: twenty-three facts, each established once and probed later.
+#
+# `tier` says how cheaply the fact can be re-derived. Tier 1 is a fact in a
+# file, tier 2 a fact in an event payload, tier 3 a fact from an earlier thread,
+# and tier 4 one stated earlier in the same turn. It groups the report and
+# scores nothing.
+#
+# Three regexes per fact, and they answer three different questions.
+#
+#   census_regex  What counts as stating the fact, with its specific value, in
+#                 T12's handover. The handover scorer's whole definition.
+#                 "the cron is 0 6" counts and "runs early each morning" does
+#                 not.
+#   stated_regex  The loose form of the fact, used to prove the establishing
+#                 task actually said it. A prompt states the fact; the census
+#                 regex wants the exact value the model works out from it.
+#   topic_regex   What a question about this fact looks like, so a failure that
+#                 asked is told from one that guessed.
+#
+# `established_by` says how the establishing task puts the fact in front of the
+# model, and the loader reads it to pick the haystack.
+#
+#   prompt  Said in the task's prompt. The default, so only the exceptions
+#           carry the field.
+#   answer  Said in the scripted reply to the task's question.
+#   work    Established by doing the task: a script fails, an event lands, a
+#           knowhow file gets written. There is no text to check.
+#   seed    Written in a seeded document the task asks the agent to read. No
+#           prompt says it, and unlike `work` there is text: the loader checks
+#           the census regex matches somewhere in the seed tree.
+#
+# A probed fact the register cannot show was said is refused at load. F05 was
+# probed on three tasks and stated in none, and the pilot read every miss as
+# retention.
+#
+# Regexes are TOML literal strings, so a backslash is a backslash.
+#
+# One deviation from the plan, and it is a notation fix. F16's cron is written
+# here in the engine's six-field form. Five fields would never match a stored
+# trigger.
+
+[[fact]]
+id = "F01"
+statement = 'Reports are named YYYY-MM-DD-health.md'
+tier = 1
+established_in = "T01"
+census_regex = '\d{4}-\d{2}-\d{2}-health\.md|YYYY-MM-DD-health\.md'
+stated_regex = '(?i)health\.md|report.{0,20}nam'
+topic_regex = '(?i)what should.{0,30}(call|name)|file ?name'
+
+[[fact]]
+id = "F02"
+statement = 'No table in a report is wider than four columns'
+tier = 1
+established_in = "T01"
+census_regex = '(?i)(four|4) columns'
+stated_regex = '(?i)(four|4) column'
+topic_regex = '(?i)how many columns|table width'
+
+[[fact]]
+id = "F03"
+statement = 'The project is called Build Health, never CI Health'
+tier = 3
+established_in = "T01"
+census_regex = '(?i)build health'
+stated_regex = '(?i)build health'
+topic_regex = '(?i)what.{0,20}(call|name).{0,20}project|project name'
+
+[[fact]]
+id = "F04"
+statement = 'Every timestamp is Europe/Oslo'
+tier = 3
+established_in = "T01"
+census_regex = '(?i)Europe/Oslo|Oslo time|CES?T'
+stated_regex = '(?i)oslo|timezone'
+topic_regex = '(?i)which time ?zone|what time ?zone|utc or local'
+
+[[fact]]
+id = "F05"
+statement = 'A failure rate is a percentage with one decimal, never a fraction'
+tier = 3
+established_in = "T01"
+census_regex = '(?i)one decimal|\d+\.\d ?%'
+stated_regex = '(?i)one decimal|percentage'
+topic_regex = '(?i)percentage or fraction|how.{0,20}express.{0,20}rate'
+
+[[fact]]
+id = "F06"
+statement = 'Eight BuildObserved events, three failed, so 37.5 percent'
+tier = 2
+established_in = "T02"
+census_regex = '37\.5 ?%'
+stated_regex = '37\.5|eight builds|8 builds'
+topic_regex = '(?i)how many builds|what.{0,20}failure rate'
+
+[[fact]]
+id = "F07"
+statement = 'The alert threshold is 25 percent'
+tier = 3
+established_in = "T02"
+census_regex = '25(\.0)? ?%'
+stated_regex = '25(\.0)? ?%|threshold'
+topic_regex = '(?i)what threshold|when should.{0,20}alert'
+
+[[fact]]
+id = "F08"
+statement = 'The first report is artifacts/build-health/2026-01-05-health.md'
+tier = 1
+established_in = "T02"
+census_regex = '2026-01-05-health\.md'
+stated_regex = '2026-01-05-health\.md'
+topic_regex = '(?i)which report|where.{0,20}report'
+
+[[fact]]
+id = "F09"
+statement = 'The app id is build-health, never build-watch'
+tier = 3
+established_in = "T03"
+census_regex = 'build-health'
+stated_regex = 'build-health'
+topic_regex = '(?i)what.{0,20}app id|call the app'
+
+[[fact]]
+id = "F10"
+statement = 'No external font import, and colour comes from the SDK theme tokens'
+tier = 3
+established_in = "T03"
+census_regex = '(?i)var\(--(bg|text|accent|border|font|radius|shadow)|theme token|no.{0,20}font import'
+stated_regex = '(?i)theme token|sdk token|font import'
+topic_regex = '(?i)which font|what colou?rs?|styling'
+
+[[fact]]
+id = "F11"
+statement = 'The app source lives at apps/build-health'
+tier = 1
+established_in = "T03"
+census_regex = 'apps/build-health'
+stated_regex = 'apps/build-health'
+topic_regex = '(?i)where.{0,20}app.{0,20}live|app path'
+
+[[fact]]
+id = "F12"
+statement = 'collect.sh fails without BUILD_TOKEN, so local runs use collect.py --offline'
+tier = 4
+established_in = "T04"
+established_by = "work"
+census_regex = 'collect\.py --offline'
+stated_regex = 'collect\.py|BUILD_TOKEN|offline'
+topic_regex = '(?i)how.{0,20}collect|which script'
+
+[[fact]]
+id = "F13"
+statement = 'The second project, example-org/api, was collected and is on the record'
+tier = 2
+established_in = "T04"
+established_by = "work"
+# The old regex was the literal event name `CollectionCompleted`, which no
+# prompt, no script and no seeded file ever states. Passing it meant inventing
+# that exact string, so both arms failed P12.F13 identically on 2026-08-21:
+# a naming coincidence, not retention. Match the fact the task actually
+# establishes, which is that the second project got collected.
+census_regex = '(?i)example-org/api'
+stated_regex = '(?i)example-org/api'
+topic_regex = '(?i)which event|event id|second project'
+
+[[fact]]
+id = "F14"
+statement = 'The collection procedure lives in a knowhow file, not in the trigger intent'
+tier = 1
+established_in = "T05"
+established_by = "work"
+# The old regex demanded the exact id `build-health-collection`, a string the
+# fixture never supplies: the agent chooses its own filename. That made
+# P12.F14 unpassable by construction, and both arms failed it identically on
+# 2026-08-21. What the fact is actually about is the split: the recipe written
+# to knowhow rather than inlined. Match on the recipe's own content, which is
+# what P05.4 and P06.1 already read.
+census_regex = '(?i)knowhow'
+stated_regex = '(?i)knowhow'
+topic_regex = '(?i)which knowhow|knowhow id|where.{0,20}procedure'
+
+[[fact]]
+id = "F15"
+# The slug is the agent's own choice: no prompt, script or seeded file supplies
+# one, so a literal slug is unpassable by construction. What the handover must
+# carry is that a daily Build Health trigger exists, under whatever name it got.
+statement = 'A daily Build Health trigger exists, under whatever name it got'
+tier = 1
+established_in = "T05"
+census_regex = '(?i)build-health-[a-z-]*(morning|daily|report)|(?i)trigger.{0,40}build health|(?i)build health.{0,40}trigger'
+stated_regex = '(?i)build-health-[a-z-]*(morning|daily|report)|(?i)daily.{0,20}trigger'
+topic_regex = '(?i)which trigger|trigger name'
+
+[[fact]]
+id = "F16"
+statement = 'The cron is 0 0 6 * * *, because the user is up at six'
+tier = 3
+established_in = "T01"
+# 06:00 is the fact. The cron literal is one way to write it and the only way
+# the old regex accepted, so a handover that said "runs at 06:00" was scored a
+# loss in both arms on 2026-08-22. 06:00 appears nowhere else in this domain
+# (the quiet window is 22:00-07:00), so a bare match is safe.
+census_regex = '0 (0 )?6 \* \* \*|\b06:00\b|(?i)\b(six|6)(:00)? ?(am)?\b.{0,20}(each|every) morning'
+stated_regex = '(?i)cron|up at six|06:00'
+topic_regex = '(?i)what time.{0,20}run|when should.{0,20}(run|fire)|schedule'
+
+[[fact]]
+id = "F17"
+statement = 'The weekly summary ends with the line the child thread was given'
+tier = 2
+established_in = "T07"
+# T07 hands the child a line and the child writes it; no seeded file states the
+# literal, so an exact-string match scores the child's wording, not retention.
+census_regex = '(?i)prepared[- ]by|(?i)sub-?thread.{0,40}(line|footer|ends)|(?i)(ends|closing line).{0,40}sub-?thread'
+stated_regex = '(?i)prepared[- ]by|(?i)sub-?thread.{0,30}line'
+topic_regex = '(?i)what.{0,20}sub-?thread|weekly summary'
+
+[[fact]]
+id = "F18"
+statement = 'The breakdown is grouped by project, not by day'
+tier = 4
+established_in = "T09"
+established_by = "answer"
+census_regex = '(?i)(group\w*|broken down|breakdown|split|organis\w*|organiz\w*|one row|per)[ -](by[ -])?project|(?i)by project, not by day|(?i)per-project'
+stated_regex = '(?i)(by|per)[ -]project'
+topic_regex = '(?i)how.{0,20}group|by project or by day'
+
+[[fact]]
+id = "F19"
+statement = 'The changelog lives at artifacts/build-health/CHANGELOG.md'
+tier = 1
+established_in = "T10"
+census_regex = 'build-health/CHANGELOG\.md'
+stated_regex = 'CHANGELOG\.md'
+topic_regex = '(?i)where.{0,20}changelog'
+
+[[fact]]
+id = "F20"
+statement = 'No notification is sent between 22:00 and 07:00'
+tier = 3
+established_in = "T02"
+census_regex = '22:00'
+stated_regex = '22:00|quiet hours'
+topic_regex = '(?i)quiet hours|when.{0,20}not.{0,20}notify|notify.{0,20}at night'
+
+# The last three sit in the ledger-migration corpus, the only seeded material
+# large enough to fill a context window. Each is written in exactly one
+# document, so a probe that passes says the agent still had THAT document's
+# contents rather than the corpus in general.
+#
+# All three are tier 1, which reads oddly for the two tasks about losing things
+# and is the honest tier. The document stays on disk the whole run, so the fact
+# is always one read away. That is the ceiling's whole question: an agent CAN go
+# back, and what differs is whether it knows it has to.
+
+[[fact]]
+id = "F21"
+statement = 'A replay session may reach back at most 26 hours'
+tier = 1
+established_in = "T13"
+established_by = "seed"
+census_regex = '(?i)26 ?hours?'
+stated_regex = '(?i)26 ?hours?'
+topic_regex = '(?i)replay window|how far back'
+
+[[fact]]
+id = "F22"
+statement = 'A replay batch is capped at 480 records'
+tier = 1
+established_in = "T13"
+established_by = "seed"
+census_regex = '\b480\b'
+stated_regex = '\b480\b'
+topic_regex = '(?i)batch (size|cap)|how many records'
+
+[[fact]]
+id = "F23"
+statement = 'The cutover holds writes for 45 minutes after the last replay'
+tier = 1
+established_in = "T14"
+established_by = "seed"
+census_regex = '(?i)45 ?minutes?'
+stated_regex = '(?i)45 ?min'
+topic_regex = '(?i)how long.{0,30}(hold|held)|write hold'

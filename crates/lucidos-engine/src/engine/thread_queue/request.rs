@@ -105,13 +105,26 @@ pub enum ThreadQueueRequest {
         app_id: Option<String>,
         #[serde(default = "default_coding_agent")]
         coding_agent: CodingAgent,
+        /// Backend model the session runs on, already validated against that
+        /// backend's picker at the tool boundary. `None` inherits the backend
+        /// default (for Claude Code, the `model` in `cc-settings.json`).
+        ///
+        /// Persisted with the request so a spawn that queues across a restart
+        /// re-fires on the model the caller asked for. Absent on rows written
+        /// before the field existed, which is exactly the old behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Thinking budget for the session, validated with `model` above.
+        /// `None` inherits the backend default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
         /// Who launched this thread. Same split as `SubThread::origin`:
         /// attribution for the popover, independent of the callback linkage
         /// above, and Agent-mode for the same reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
     },
-    /// Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread —
+    /// Agent/Engine-mode `POST /api/v1/chat/stream` that starts a NEW thread:
     /// cross-workspace task POSTs and `lucidos spawn-thread` CLI calls.
     /// Executed through `process_message_with_steps` with the captured
     /// `origin`; counts as `sub-thread` or `coding-agent` depending on
@@ -331,6 +344,8 @@ mod tests {
             title: None,
             app_id: None,
             coding_agent: CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
             origin: origin.clone(),
         };
         let back: ThreadQueueRequest =
@@ -343,6 +358,67 @@ mod tests {
             } => {
                 assert_eq!(o, origin);
                 assert_eq!(parent_thread_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A queued spawn that crosses a restart must re-fire on the model the
+    /// caller asked for. The request is persisted verbatim in `ThreadQueued`
+    /// and in `thread_queue.request`, so a pin that does not survive this
+    /// round-trip becomes a spawn that quietly runs on the backend default
+    /// after a restart, which is the original bug wearing a different hat.
+    #[test]
+    fn the_model_and_effort_pins_survive_the_persistence_round_trip() {
+        let cc = ThreadQueueRequest::CodingAgent {
+            prompt: "run it".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: CodingAgent::ClaudeCode,
+            model: Some("claude-sonnet-5".into()),
+            reasoning_effort: Some("low".into()),
+            origin: None,
+        };
+        let back: ThreadQueueRequest =
+            serde_json::from_value(serde_json::to_value(&cc).unwrap()).unwrap();
+        match back {
+            ThreadQueueRequest::CodingAgent {
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
+                assert_eq!(reasoning_effort.as_deref(), Some("low"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A row queued before the fields existed must still deserialize, and must
+    /// come back UNPINNED rather than failing the requeue. Same back-compat
+    /// rule the `origin` field follows below.
+    #[test]
+    fn a_coding_agent_row_without_the_pin_fields_still_deserializes() {
+        let json = serde_json::json!({
+            "type": "coding-agent",
+            "prompt": "queued before the fields existed",
+            "cc_thread_id": Uuid::new_v4(),
+        });
+        let back: ThreadQueueRequest = serde_json::from_value(json).unwrap();
+        match back {
+            ThreadQueueRequest::CodingAgent {
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(model, None);
+                assert_eq!(reasoning_effort, None);
             }
             other => panic!("wrong variant: {other:?}"),
         }

@@ -96,6 +96,31 @@ fn command_definitions_include_reasoning_effort_options() {
     );
 }
 
+/// Claude Code's JSON declares no per-model effort restriction, so the
+/// transpose must offer every model every tier. The picker then reads one rule
+/// on both backends rather than special-casing the absent matrix.
+#[test]
+fn every_claude_code_model_offers_every_tier() {
+    let defs = cc_command_definitions();
+    let all: Vec<&str> = cc_reasoning_effort_options()
+        .iter()
+        .map(|e| e.value.as_str())
+        .collect();
+    let options = defs.as_array().expect("array")[0]["params"][0]["options"]
+        .as_array()
+        .expect("options")
+        .clone();
+    for option in &options {
+        let offered: Vec<&str> = option["reasoning_efforts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{} must declare its tiers", option["value"]))
+            .iter()
+            .map(|e| e.as_str().expect("tier"))
+            .collect();
+        assert_eq!(offered, all, "{} must offer every tier", option["value"]);
+    }
+}
+
 #[test]
 fn control_request_deserializes_all_variants() {
     let cases = vec![

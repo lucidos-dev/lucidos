@@ -363,6 +363,44 @@ test_frontend_build_fresh_dist_reused() {
     fi
 }
 
+# ── report_webkit_excluded ────────────────────────────────────────────
+# A --no-webkit run is missing the most expensive project in the suite. It must
+# not read like a complete one, and the per-project table cannot say so, because
+# an excluded project is dropped from it rather than given a fake rc.
+test_webkit_exclusion_is_announced() {
+    echo "test: report_webkit_excluded names the gap and the recovery command"
+    local out="$SANDBOX/webkit-excluded.out"
+    report_webkit_excluded 1 >"$out" 2>&1
+
+    if grep -q "did NOT run" "$out"; then
+        pass "says mobile-webkit did not run"
+    else
+        fail "an excluded project was not announced"; cat "$out"
+    fi
+    if grep -q "Coverage is incomplete" "$out"; then
+        pass "says coverage is incomplete"
+    else
+        fail "did not say the run has a hole in it"; cat "$out"
+    fi
+    if grep -q -- "e2e-browser.sh --webkit" "$out"; then
+        pass "names the command that closes the gap"
+    else
+        fail "left the reader with no recovery command"; cat "$out"
+    fi
+}
+
+test_webkit_exclusion_is_silent_when_it_ran() {
+    echo "test: report_webkit_excluded says nothing on an ordinary full run"
+    local out="$SANDBOX/webkit-included.out"
+    report_webkit_excluded "" >"$out" 2>&1
+
+    if [ -s "$out" ]; then
+        fail "warned about an exclusion on a run that included mobile-webkit"; cat "$out"
+    else
+        pass "silent when the project was not excluded"
+    fi
+}
+
 # ── report_project_exit_codes ─────────────────────────────────────────
 # The nightly's per-project table printed a blank rc for the last project on a
 # run where that project had two real failures. Two halves are covered here: the
@@ -588,6 +626,8 @@ test_frontend_build_stale_via_root_lockfile
 test_frontend_build_staleness_check_fails_open
 test_frontend_build_fresh_dist_reused
 test_report_prints_every_exit_code
+test_webkit_exclusion_is_announced
+test_webkit_exclusion_is_silent_when_it_ran
 test_report_blank_rc_is_unknown_and_fails
 test_report_non_numeric_rc_is_unknown
 test_report_non_numeric_overall_forced_nonzero

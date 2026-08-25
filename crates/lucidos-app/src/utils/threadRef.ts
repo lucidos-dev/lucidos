@@ -1,4 +1,5 @@
-import { workspaceName, showToast } from '../store/store';
+import { workspaceName } from '../store/store';
+import { copyToClipboard } from './clipboard';
 
 /** Refs are always workspace-qualified so they keep meaning when pasted across
  *  workspaces. The link's visible text is the thread title; the title-prompt
@@ -11,17 +12,14 @@ function buildThreadRef(threadId: string, title: string): string {
     return `[${safeTitle}](thread:${ws}/${threadId})`;
 }
 
+/** Both copies go through `utils/clipboard`, the one guard against a missing
+ *  `navigator.clipboard`. A non-secure origin exposes none, so an unguarded
+ *  `writeText` threw before a promise existed. Neither arm of the `then` pair
+ *  ran, and the tap did nothing and said nothing. */
 export function copyThreadRef(threadId: string, title: string): void {
-    const ref = buildThreadRef(threadId, title);
-    navigator.clipboard.writeText(ref).then(
-        () => showToast('Thread reference copied', 'success'),
-        () => showToast('Failed to copy reference', 'error'),
-    );
+    copyToClipboard(buildThreadRef(threadId, title), 'Thread reference copied');
 }
 
 export function copyThreadTitle(title: string): void {
-    navigator.clipboard.writeText(title || 'Untitled Thread').then(
-        () => showToast('Thread title copied', 'success'),
-        () => showToast('Failed to copy title', 'error'),
-    );
+    copyToClipboard(title || 'Untitled Thread', 'Thread title copied');
 }

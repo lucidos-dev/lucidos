@@ -446,8 +446,14 @@ html, html[data-theme="dark"] {
     /* Header bar — a muted, deeper blue in dark mode: clearly reads as brand-blue
        chrome but calmer than the vivid light-mode blue (which glows as a bright
        slab against the near-black app), without sinking into murky navy. Light
-       foreground stays legible on it. */
-    --header-gradient: linear-gradient(180deg, #15549e 0%, #0b3868 100%);
+       foreground stays legible on it.
+       The two STOPS are named, in every theme that sets the gradient, because
+       things drawn ON the bar have to match it. `--titlebar-strip-bg` takes the
+       top one; `--header-badge-ring` (panels/shell.css) mixes both.
+       A literal copied into either would drift the first time a stop moves. */
+    --header-bar-top: #15549e;
+    --header-bar-bottom: #0b3868;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
     /* Active-pane cue — the mobile active pane dot (.mobile-dot.active) wears
        this fill + layered neon bloom on the header bar. The body is a soft cool
        BLUE — landing between the prior brand blue and near-white (a midpoint of
@@ -468,7 +474,7 @@ html, html[data-theme="dark"] {
     --focus-header-tint: rgba(169, 197, 232, 0.12);
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
        TOP stop above, so the strip is seamless with the header's top edge. */
-    --titlebar-strip-bg: #15549e;
+    --titlebar-strip-bg: var(--header-bar-top);
 }
 
 /* iOS PWA dark-mode brand-blue correction (iPhone OLED).
@@ -485,8 +491,10 @@ html, html[data-theme="dark"] {
    (the --focus-ring band and the info-toast border) off the app's standard blue.
    Higher specificity than the `html, html[data-theme="dark"]` block above. */
 html.ios-pwa[data-theme="dark"] {
-    --header-gradient: linear-gradient(180deg, #15579c 0%, #0b3a66 100%);
-    --titlebar-strip-bg: #15579c;
+    --header-bar-top: #15579c;
+    --header-bar-bottom: #0b3a66;
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
+    --titlebar-strip-bg: var(--header-bar-top);
 }
 
 /* Light theme */
@@ -546,7 +554,9 @@ html[data-theme="light"] {
     --syntax-function: #8250df;
     /* Header bar — vivid brand blue on the white app (deep-navy dark-mode
        variant is in the dark theme block above). */
-    --header-gradient: linear-gradient(180deg, var(--brand-blue) 0%, var(--brand-blue-deep) 100%);
+    --header-bar-top: var(--brand-blue);
+    --header-bar-bottom: var(--brand-blue-deep);
+    --header-gradient: linear-gradient(180deg, var(--header-bar-top) 0%, var(--header-bar-bottom) 100%);
     /* Active-pane cue — a touch lighter/more opaque than the dark-theme value so
        the soft-blue dot stays crisp on the brighter light bar (see the dark block
        for the intent). */
@@ -557,8 +567,8 @@ html[data-theme="light"] {
        so it stays visible on the brighter light bar (see the dark block). */
     --focus-header-tint: rgba(191, 213, 243, 0.16);
     /* Reclaimed macOS title-bar band (.titlebar-strip) — solid = the gradient's
-       TOP stop above (--brand-blue), so the strip is seamless with the header. */
-    --titlebar-strip-bg: var(--brand-blue);
+       TOP stop above, so the strip is seamless with the header. */
+    --titlebar-strip-bg: var(--header-bar-top);
 }
 
 button,
@@ -653,111 +663,8 @@ samp,
     font-feature-settings: var(--font-features-code, normal);
 }
 
-/* Global tooltip (JS-positioned, appended to body) */
-#tooltip {
-    position: fixed;
-    z-index: var(--z-tooltip);
-    max-width: 30rem;
-    padding: 0.5rem 0.75rem;
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.625rem;
-    font-family: var(--font-ui);
-    font-size: var(--font-size-xs);
-    font-weight: 400;
-    font-style: normal;
-    line-height: 1.4;
-    text-align: left;
-    text-transform: none;
-    letter-spacing: normal;
-    white-space: normal;
-    word-wrap: break-word;
-    pointer-events: none;
-    opacity: 0;
-    display: none;
-    transition: opacity var(--duration-fast);
-    box-shadow: var(--shadow-sm);
-}
-
-#tooltip-arrow {
-    position: absolute;
-    top: -0.3125rem;
-    width: 0.625rem;
-    height: 0.625rem;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-right: none;
-    border-bottom: none;
-    transform: translateX(-0.3125rem) rotate(45deg);
-}
-
-#tooltip.above #tooltip-arrow {
-    top: auto;
-    bottom: -0.3125rem;
-    border: 1px solid var(--border-color);
-    border-left: none;
-    border-top: none;
-}
-
-#tooltip-title {
-    font-weight: 600;
-    font-size: var(--font-size-sm);
-    color: var(--text-primary);
-    margin-bottom: 0.5rem;
-}
-
-#tooltip-title:empty {
-    display: none;
-}
-
-#tooltip-text {
-    position: relative;
-    white-space: pre-line;
-}
-
-/* Structured two-column label/value tooltip (e.g. thread drawer rows). The dim
-   label sits in the left column, the bright value right-aligned in the right —
-   `display: contents` lets each .tt-row's children join the parent grid so the
-   columns stay aligned across every row. */
-#tooltip-text.tooltip-rows {
-    display: grid;
-    grid-template-columns: auto auto;
-    column-gap: 1.5rem;
-    row-gap: 0.25rem;
-    white-space: nowrap;
-}
-
-#tooltip-text.tooltip-rows .tt-row {
-    display: contents;
-}
-
-#tooltip-text.tooltip-rows .tt-label {
-    color: var(--text-muted);
-}
-
-#tooltip-text.tooltip-rows .tt-value {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.375rem;
-    justify-self: end;
-    color: var(--text-primary);
-    font-weight: 500;
-}
-
-#tooltip-text.tooltip-rows .tt-dot {
-    flex: none;
-    width: 0.4rem;
-    height: 0.4rem;
-    border-radius: 50%;
-    background: var(--text-muted);
-}
-
-#tooltip-text.tooltip-rows .tt-dot-running { background: var(--accent); }
-#tooltip-text.tooltip-rows .tt-dot-changes { background: var(--accent-green); }
-/* Neutral state, not a caution — mirrors .thread-info-dot-waiting. */
-#tooltip-text.tooltip-rows .tt-dot-waiting { background: var(--accent-notable); }
-#tooltip-text.tooltip-rows .tt-dot-failed { background: var(--accent-red); }
+/* The #tooltip rules moved to styles/global/shared-components.css, so one copy
+   styles the host shell and every app iframe. Do not add a copy back here. */
 
 body {
     font-family: var(--font-ui);

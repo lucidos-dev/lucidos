@@ -302,9 +302,8 @@
    compose icon paints 12.5 of 18, a fifth more ink in a nominally equal box,
    and was reported oversized: the same 21% mismatch the trash correction below
    exists to remove, in the other direction. At the medium step it lands within
-   a few percent of that icon's ink. Both of this class's callers are the
-   heading's own pair, so the step is the default here rather than a
-   per-caller retune. */
+   a few percent of that icon's ink. So the step is the band's default rather
+   than a per-caller retune. */
 .icon-btn.row-icon {
     --icon-glyph: var(--icon-size-md);
 }
@@ -656,6 +655,26 @@ html[data-theme="dark"] .split-button.open::before {
 
 .dropdown-sizer > :first-child {
     visibility: visible;
+}
+
+/* A model selection reads as a whole pair, `Opus 5 (1M) · X-High`, so its
+   trigger is far wider than an ordinary dropdown's and a long registry id would
+   push its row past the pane. `.dropdown`'s blanket `flex-shrink: 0` is right
+   for a short control and wrong for this one, so this variant shrinks and
+   ellipsizes. It carries no `.dropdown-sizer`: the field renders one label
+   rather than every option stacked, so there is nothing to size against. */
+.dropdown.model-selection-field {
+    flex-shrink: 1;
+    min-width: 0;
+}
+
+/* `min-width: 0` is what lets it ellipsize: the trigger is a flex row, and a
+   flex item defends its min-content width until told otherwise. */
+.model-selection-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .dropdown-chevron {
@@ -1309,4 +1328,133 @@ html[data-theme="dark"] .split-button.open::before {
     justify-content: flex-end;
     margin-top: 1.25rem;
     flex-shrink: 0;
+}
+
+/* Control-menu lists. Host chrome, shared across panes: the prompt bar's two
+   control menus render these, and so does the model-selection field in
+   Settings and the trigger form, through `ModelSelectionPicker`. The panel BOX
+   each opens in is its own host's business (`.control-dropdown` in the prompt
+   bar, `.dropdown-menu` for the field); what lives here is the list inside. */
+.control-list {
+    display: flex;
+    flex-direction: column;
+    padding: 0.25rem;
+}
+
+/* The list opens scrolled to the model in force, which on a long registry is
+   far down. A filter that scrolled away with it would be out of reach exactly
+   when it earns its place. Sticky keeps it on the panel's top edge. */
+.control-filter-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    padding: 0.25rem;
+    background: var(--bg-secondary);
+}
+
+.control-filter {
+    display: block;
+    width: 100%;
+}
+
+.control-input {
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+}
+
+.control-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.control-empty {
+    padding: 0.5rem 0.625rem;
+    font-size: var(--font-size-md);
+    color: var(--text-secondary);
+}
+
+.control-section-label {
+    padding: 0.25rem 0.625rem;
+    font-size: var(--font-size-xs);
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.control-item {
+    display: block;
+    width: 100%;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    cursor: pointer;
+}
+
+.control-item:hover,
+.control-item-active {
+    background: var(--bg-hover);
+}
+
+/* The way back to the list this one was opened from. Muted, because it is an
+   exit rather than one of the choices on offer. */
+.control-back {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
+}
+
+.control-back-glyph {
+    font-size: var(--font-size-md);
+    line-height: 1;
+}
+
+.control-option {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+}
+
+.control-option-label {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* Picking this row opens another list rather than committing, so it sits at
+   the trailing edge where a disclosure belongs. */
+.control-option-more {
+    margin-left: auto;
+    color: var(--text-muted);
+}
+
+.control-checkmark {
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 700;
+}
+
+.control-current-value {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.control-option-current {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.control-option-desc {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
 }

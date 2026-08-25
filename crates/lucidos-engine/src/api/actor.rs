@@ -67,6 +67,12 @@ use uuid::Uuid;
 /// Header carrying the originating browser/device id on mutating endpoints
 /// that don't accept a request body (apply/discard/revert, pin/unpin, etc.).
 /// Frontend's `json()` helper sets this from `getDeviceId()`.
+///
+/// How much it is worth depends on who is asking. Through the *workspace
+/// gateway* it is the gateway's own value: `enforce` strips the client's copy
+/// and re-injects the device it authenticated. Straight to the engine's
+/// loopback port it is whatever the caller typed. That second case is the
+/// ADR 0050 posture, and the reason nothing here reads it as authorization.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
 /// Header forwarded by the `lucidos` CLI carrying the thread-bound origin

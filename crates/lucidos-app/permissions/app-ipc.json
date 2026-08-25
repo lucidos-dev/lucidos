@@ -21,6 +21,7 @@
           "quit_lucidos",
           "uninstall_lucidos",
           "open_url_external",
+          "save_to_downloads",
           "show_native_notification",
           "dismiss_native_notification",
           "nudge_dock_badge",
@@ -40,7 +41,10 @@
           "tailscale_up",
           "tailscale_serve",
           "cancel_tailscale_serve",
-          "get_or_create_device_id"
+          "get_or_create_device_id",
+          "previous_device_id",
+          "remember_device_id",
+          "mint_pairing_code"
         ]
       }
     },

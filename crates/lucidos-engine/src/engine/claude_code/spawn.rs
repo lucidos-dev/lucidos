@@ -302,6 +302,8 @@ impl LucidosEngine {
             caller_title,
             app_id,
             coding_agent,
+            model,
+            reasoning_effort,
             origin,
         } = params;
 
@@ -356,16 +358,8 @@ impl LucidosEngine {
             // extractor's default model.
             if !has_explicit_title {
                 if let Some(ref extractor) = engine.extractor {
-                    let title_model = crate::core::PreferenceStore::get(
-                        &engine.pool,
-                        crate::core::PREF_MODEL_TITLE,
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                    match extractor.provider_for_model(&title_model) {
-                        Ok(provider) => {
+                    match crate::engine::title_call(&engine.pool, extractor).await {
+                        Ok(call) => {
                             let bus = engine.event_bus.clone();
                             let msg = prompt_owned.clone();
                             tokio::spawn(async move {
@@ -375,7 +369,7 @@ impl LucidosEngine {
                                 // prompt carried images.
                                 crate::engine::chat::emit_generated_title(
                                     &bus,
-                                    provider.as_ref(),
+                                    &call,
                                     cc_thread_id,
                                     &msg,
                                     None,
@@ -424,7 +418,11 @@ impl LucidosEngine {
                     None,
                     None,
                     None,
-                    None,
+                    // `reasoning_effort` — the caller's pin, or None to inherit
+                    // the backend default. `resolve_route_overrides` passes a
+                    // coding-agent effort straight through: the tier belongs to
+                    // CC / Codex, not to the chat registry.
+                    reasoning_effort.as_deref(),
                     images_owned.as_deref(),
                     device_id_owned.as_deref(),
                     Some(true),
@@ -436,7 +434,13 @@ impl LucidosEngine {
                     parent_thread_id,
                     spawning_event_id,
                     ActorMode::Agent,
-                    None,
+                    // `cc_model` — the caller's pin, validated against this
+                    // backend's picker at the tool boundary. It reaches
+                    // `run_direct_agent`'s explicit-param slot, which wins over
+                    // the session and thread-event fallbacks, so a spawn runs on
+                    // the model the caller named rather than on the durable
+                    // default in `cc-settings.json`.
+                    model.as_deref(),
                     Some(coding_agent),
                     None, // pre_emitted_origin — router emits MR itself
                     None, // title — already emitted placeholder above

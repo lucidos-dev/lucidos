@@ -1,13 +1,10 @@
 use super::*;
 
 use crate::core::environment_variables::validate_name;
+use crate::core::grants::{self, GrantFile};
 use crate::core::{
     AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore, ModelStore,
     OAuthStore, PinnedAppStore, PreferenceStore,
-};
-use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
-use crate::engine::command_permission::{
-    read_agent_allowed_commands_file, write_agent_allowed_commands_file,
 };
 use crate::llm::{supported_efforts, ProviderKind};
 
@@ -29,16 +26,13 @@ pub(super) struct AllowlistRequest {
 }
 
 /// GET /api/v1/cc-allowed-tools — return the raw contents of
-/// `~/.lucidos/cc-allowed-tools` so the settings UI can display them. Missing
-/// file returns the seeded header (mirrors `cc_allowed_tools` semantics).
+/// `<workspace>/.lucidos/cc-allowed-tools` so the settings UI can display them.
+/// A missing file returns the seeded header (mirrors `cc_allowed_tools`).
 pub(super) async fn get_cc_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
-    let dir = state.engine.user_dir().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "User directory not configured".to_string(),
-    ))?;
-    let contents = read_allowed_tools_file(dir).map_err(|e| {
+    let dir = state.engine.grants_dir();
+    let contents = grants::read_raw(&dir, GrantFile::CodingAgentTools).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to read cc-allowed-tools: {}", e),
@@ -47,38 +41,74 @@ pub(super) async fn get_cc_allowed_tools(
     Ok(Json(AllowlistResponse { contents }))
 }
 
+/// Overwrite one grant file, and announce what the permission became.
+///
+/// **The write and the emit are one operation.** Each of the three editors
+/// widens what an agent may run without a permission card. All three were a
+/// bare `fs::write` leaving no trace, so `PUT /api/v1/cc-allowed-tools` with
+/// `{"contents":"Bash(*)"}` was invisible in the events table.
+///
+/// One helper, rather than the pair copied into three handlers. Three copies
+/// is how the emit came to be missing from all of them.
+///
+/// The patterns come from the body we just wrote, not from a read-back, so a
+/// concurrent edit cannot make the event describe somebody else's write.
+pub(super) async fn write_grant_file(
+    state: &AppState,
+    headers: &HeaderMap,
+    file: GrantFile,
+    contents: &str,
+) -> Result<StatusCode, (StatusCode, String)> {
+    grants::write_raw(&state.engine.grants_dir(), file, contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write {}: {}", file.file_name(), e),
+        )
+    })?;
+    let patterns = grants::parse_patterns(contents);
+    state
+        .engine
+        .event_bus
+        .emit_user_system(
+            headers,
+            &state.pool,
+            "[Settings] PermissionGrantsChanged",
+            |actor| crate::engine::event_bus::SystemEvent::PermissionGrantsChanged {
+                grant_file: file,
+                patterns,
+                actor,
+            },
+        )
+        .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// PUT /api/v1/cc-allowed-tools — overwrite the file with the provided contents
 /// (atomic). Newly spawned Claude Code subprocesses pick this up immediately; in-flight
 /// subprocesses keep their frozen `--allowedTools` flag until they restart.
 pub(super) async fn put_cc_allowed_tools(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<AllowlistRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let dir = state.engine.user_dir().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "User directory not configured".to_string(),
-    ))?;
-    write_allowed_tools_file(dir, &body.contents).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write cc-allowed-tools: {}", e),
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    write_grant_file(
+        &state,
+        &headers,
+        GrantFile::CodingAgentTools,
+        &body.contents,
+    )
+    .await
 }
 
 /// GET /api/v1/agent-allowed-commands — return the raw contents of
-/// `~/.lucidos/agent-allowed-commands`, the Lucidos Agent command-guard
+/// `<workspace>/.lucidos/agent-allowed-commands`, the Lucidos Agent command-guard
 /// allowlist (ADR 0002). Missing file returns the seeded header. The chat
 /// counterpart of `get_cc_allowed_tools`.
 pub(super) async fn get_agent_allowed_commands(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
-    let dir = state.engine.user_dir().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "User directory not configured".to_string(),
-    ))?;
-    let contents = read_agent_allowed_commands_file(dir).map_err(|e| {
+    let dir = state.engine.grants_dir();
+    let contents = grants::read_raw(&dir, GrantFile::AgentCommands).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to read agent-allowed-commands: {}", e),
@@ -92,19 +122,10 @@ pub(super) async fn get_agent_allowed_commands(
 /// gated command — no restart.
 pub(super) async fn put_agent_allowed_commands(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<AllowlistRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let dir = state.engine.user_dir().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "User directory not configured".to_string(),
-    ))?;
-    write_agent_allowed_commands_file(dir, &body.contents).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write agent-allowed-commands: {}", e),
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    write_grant_file(&state, &headers, GrantFile::AgentCommands, &body.contents).await
 }
 
 // ===== Credential Endpoints =====
@@ -307,27 +328,6 @@ pub(super) async fn get_email_account(
     }
 }
 
-/// Get a credential's auth value (for copying client ID/secret)
-pub(super) async fn get_credential_value(
-    State(state): State<AppState>,
-    Query(query): Query<CredentialIdQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // By id, not name: `CredentialStore::get` is deliberately blind to
-    // `oauth_client` rows, so a name-keyed copy-value could never reach the
-    // client ID / secret the OAuth Client row's own Copy buttons ask for.
-    match CredentialStore::get_by_id(&state.pool, query.id).await {
-        Ok(Some(cred)) => Ok(Json(serde_json::json!({
-            "auth_type": cred.auth_type.to_string(),
-            "auth_value": cred.auth_value,
-        }))),
-        Ok(None) => Err((StatusCode::NOT_FOUND, "Credential not found".to_string())),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get credential: {}", e),
-        )),
-    }
-}
-
 /// Delete a credential
 pub(super) async fn delete_credential(
     State(state): State<AppState>,
@@ -468,12 +468,12 @@ pub(super) async fn delete_env_var(
 fn valid_provider(p: &str) -> bool {
     matches!(
         p,
-        "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "local"
+        "vertex" | "anthropic" | "openai" | "openrouter" | "xai" | "opencode-free" | "local"
     )
 }
 
 const PROVIDER_ERR: &str =
-    "Provider must be one of: vertex, anthropic, openai, openrouter, xai, local";
+    "Provider must be one of: vertex, anthropic, openai, openrouter, xai, opencode-free, local";
 
 const CONTEXT_WINDOW_ERR: &str =
     "context_window must be a positive number of tokens (omit it to infer from the model id)";
@@ -1260,6 +1260,76 @@ pub(super) async fn register_device(
     }
 }
 
+/// Why this caller may not move a row onto `target`, or `None` when it may.
+///
+/// The rule is that a caller may only hand a row over to ITSELF. Behind the
+/// *workspace gateway* the `x-lucidos-device-id` header is gateway-asserted
+/// (ADR 0094's amendment), so requiring the body's target to match it is free.
+/// Unchecked, a paired caller could move another device's row onto an id nobody
+/// will ever present, taking its push subscription and preferences with it.
+///
+/// A missing or blank header is the loopback case and is not refused, matching
+/// every other endpoint here.
+///
+/// The client asserts the id it is ADOPTING, which is what makes the rule
+/// satisfiable at all: it still stores the old one when it asks. See
+/// `handOverDevice` in `api/client/settings.ts`.
+fn foreign_hand_over(headers: &HeaderMap, target: &str) -> Option<String> {
+    let asserted = headers
+        .get(super::actor::HEADER_DEVICE_ID)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    if asserted == target {
+        return None;
+    }
+    Some(format!(
+        "this caller is device {asserted} and cannot hand a row over to {target}"
+    ))
+}
+
+/// Move a device's row to the id it now reports as.
+///
+/// Called once, early in boot, by a client whose id has changed under it. The
+/// three OUTCOMES are all 200: `already-done` and `no-such-device` mean "stop
+/// asking", and neither is a failure the user should see.
+///
+/// **A failed transaction is a 500, not a 200 carrying `success: false`.** The
+/// client throws away its memory of the old id once this returns, so a failure
+/// it cannot see is a row abandoned forever. The frontend's `json()` only
+/// rejects on a non-2xx status, so the status IS the signal.
+///
+/// Who may ask is [`foreign_hand_over`]'s rule.
+pub(super) async fn hand_over_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceHandOverRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if let Some(reason) = foreign_hand_over(&headers, &request.device_id) {
+        return Err(ApiError::bad_request(reason));
+    }
+    let actor =
+        super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id)).await;
+    let outcome = crate::core::DeviceStore::hand_over(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.old_device_id,
+        &request.device_id,
+        actor,
+    )
+    .await
+    .map_err(|e| {
+        log!("[Settings] Device hand-over failed: {}", e);
+        ApiError::internal(format!(
+            "could not hand device {} over to {}: {e}",
+            request.old_device_id, request.device_id
+        ))
+    })?;
+    Ok(Json(
+        serde_json::json!({ "success": true, "outcome": outcome }),
+    ))
+}
+
 pub(super) async fn list_devices(
     State(state): State<AppState>,
 ) -> Result<Json<DevicesListResponse>, (StatusCode, Json<serde_json::Value>)> {
@@ -1564,7 +1634,6 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_credential)
                 .delete(delete_credential),
         )
-        .route("/credential-value", get(get_credential_value))
         .route("/email-account", get(get_email_account))
         // User-managed non-secret environment variables
         // (Settings → System → Environment variables).
@@ -1614,18 +1683,20 @@ pub(super) fn router() -> Router<AppState> {
                 .put(set_preference)
                 .delete(delete_preference),
         )
-        // CC tool-permission allowlist (~/.lucidos/cc-allowed-tools)
+        // CC tool-permission allowlist (<workspace>/.lucidos/cc-allowed-tools)
         .route(
             "/cc-allowed-tools",
             get(get_cc_allowed_tools).put(put_cc_allowed_tools),
         )
-        // Lucidos Agent command-guard allowlist (~/.lucidos/agent-allowed-commands, ADR 0002)
+        // Lucidos Agent command-guard allowlist
+        // (<workspace>/.lucidos/agent-allowed-commands, ADR 0002)
         .route(
             "/agent-allowed-commands",
             get(get_agent_allowed_commands).put(put_agent_allowed_commands),
         )
         // Device endpoints
         .route("/devices/register", post(register_device))
+        .route("/devices/hand-over", post(hand_over_device))
         .route("/devices", get(list_devices))
         .route("/devices/:device_id/name", put(rename_device))
         .route("/devices/:device_id/push", put(set_device_push))
@@ -1845,6 +1916,7 @@ mod provider_validation_tests {
             ProviderKind::OpenAi,
             ProviderKind::OpenRouter,
             ProviderKind::XAi,
+            ProviderKind::OpenCodeFree,
             ProviderKind::Local,
         ] {
             let ok = kind.as_str();
@@ -1857,5 +1929,59 @@ mod provider_validation_tests {
         for bad in ["", "Vertex", "openai ", "ollama", "bogus"] {
             assert!(!valid_provider(bad), "{bad:?} must be rejected");
         }
+    }
+}
+
+#[cfg(test)]
+mod hand_over_guard_tests {
+    use super::*;
+
+    fn headers_with(device_id: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(id) = device_id {
+            h.insert(super::super::actor::HEADER_DEVICE_ID, id.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn a_caller_may_move_its_own_row() {
+        assert_eq!(
+            foreign_hand_over(&headers_with(Some("dev-a")), "dev-a"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_caller_may_not_move_someone_elses_row() {
+        // The reason names both, so the client's own log says which two ids
+        // disagreed rather than only that something was refused.
+        let reason = foreign_hand_over(&headers_with(Some("dev-a")), "dev-b")
+            .expect("a caller that is not the target must be refused");
+        assert!(reason.contains("dev-a"), "{reason}");
+        assert!(reason.contains("dev-b"), "{reason}");
+    }
+
+    #[test]
+    fn the_client_asserting_the_id_it_adopts_is_the_case_that_must_pass() {
+        // What `handOverDevice` sends. Asserting the id it still STORES is the
+        // shape that stranded the migration, so pin both directions.
+        assert_eq!(
+            foreign_hand_over(&headers_with(Some("paired-device")), "paired-device"),
+            None
+        );
+        assert!(
+            foreign_hand_over(&headers_with(Some("minted-locally")), "paired-device").is_some()
+        );
+    }
+
+    #[test]
+    fn no_header_is_the_loopback_case_and_is_allowed() {
+        assert_eq!(foreign_hand_over(&headers_with(None), "dev-a"), None);
+    }
+
+    #[test]
+    fn a_blank_header_asserts_nothing_and_is_allowed() {
+        assert_eq!(foreign_hand_over(&headers_with(Some("   ")), "dev-a"), None);
     }
 }

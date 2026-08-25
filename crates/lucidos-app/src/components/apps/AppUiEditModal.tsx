@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
-import { activeInlineForm, appsList, showToast } from '../../store/store';
+import { useEffect, useRef } from 'preact/hooks';
+import { activeInlineForm, appsList, appSourceEpoch, showToast } from '../../store/store';
 import { closeAppForm, saveAppMetadata, refreshAppUI } from '../../store/actions/apps';
 // Preact lint flags signal writes from a render body as a side-effect-in-render
 // bug; the missing-app close is moved into a useEffect via MissingAppCloser
@@ -13,6 +13,7 @@ import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useServerBackedField } from '../../hooks/useServerBackedField';
 
 export function AppUiEditModal() {
   const form = activeInlineForm.value;
@@ -57,14 +58,37 @@ function MissingAppCloser() {
 }
 
 function AppUiEditModalInner({ app }: { app: App }) {
-  const [name, setName] = useState(app.name);
-  const [description, setDescription] = useState(app.description);
+  // Server-backed: an `AppUpdated` frame repaints an untouched field, and a
+  // touched one keeps the user's draft (ADR 0118).
+  const [name, setName] = useServerBackedField(app.name);
+  const [description, setDescription] = useServerBackedField(app.description);
+
+  // The file bodies obey the same rule at editor granularity. `appSourceEpoch`
+  // moves when the engine says this app's files changed on disk, and that
+  // re-reads them. The first keystroke stops both halves of that: the epoch
+  // freezes, so no NEW read starts, and `stillWanted` drops the reply of one
+  // already in flight. Without the second half a read begun a moment before
+  // the keystroke still lands and discards it.
+  //
+  // A ref, not state: the reply arrives between renders, so a state read would
+  // be a render behind. `updateFileContent` re-renders anyway through
+  // `setFilesLoadable`, which is what the epoch freeze needs.
+  const edited = useRef(false);
+  const epoch = useRef(appSourceEpoch.value);
+  if (!edited.current) epoch.current = appSourceEpoch.value;
   const { loadable: filesLoadable, setLoadable: setFilesLoadable, showLoading } = useLoadableFetch<UiSourceFile[]>(
     () => readAppSourceApi(app.id).then((res) => res.files),
-    [app.id],
+    [app.id, epoch.current],
+    {
+      // The epoch dep is a re-read of the SAME files, so the editors stay on
+      // screen and their contents swap when the fresh bytes land.
+      keepLoadedWhileRefetching: true,
+      stillWanted: () => !edited.current,
+    },
   );
 
   function updateFileContent(index: number, content: string) {
+    edited.current = true;
     setFilesLoadable((prev) => {
       if (prev.status !== 'loaded') return prev;
       return { status: 'loaded', data: prev.data.map((f, i) => i === index ? { ...f, content } : f) };

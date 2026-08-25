@@ -5,6 +5,7 @@ import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
 import { checkConnection } from '../../store/actions/connection';
 import { gatewayPickerHref } from '../../utils/basePath';
+import { replaceDocument } from '../../utils/documentNavigation';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
@@ -180,7 +181,7 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
                     <p>Can't reach this workspace</p>
                     <button class="action-btn" onClick={() => { void checkConnection(); forceRetryThreadEvents(reason.threadId); }}>Retry</button>
                     {pickerHref && (
-                        <button class="thread-empty-reload" onClick={() => { window.location.href = pickerHref; }}>
+                        <button class="thread-empty-reload" onClick={() => replaceDocument(pickerHref)}>
                             Back to workspaces
                         </button>
                     )}

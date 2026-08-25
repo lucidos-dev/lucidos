@@ -65,10 +65,19 @@ fn stub_driver(jsonl_body: &str, resume: Option<&str>, continuation: bool) -> St
     }
 }
 
+/// How long a driver test waits for the app-server to say anything.
+///
+/// A liveness ceiling, not a claim about speed. The child is a node process
+/// plus a native binary, and the full suite runs thousands of tests at once.
+/// Ten seconds passed in isolation and timed out three of these under load,
+/// which reads as breakage in the diff and never is. A slow spawn is not the
+/// bug these tests look for, so the ceiling only has to clear a real one.
+const EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn next_event(agent: &mut RunningAgent) -> AgentEvent {
-    tokio::time::timeout(std::time::Duration::from_secs(10), agent.events_rx.recv())
+    tokio::time::timeout(EVENT_TIMEOUT, agent.events_rx.recv())
         .await
-        .expect("event within 10s")
+        .expect("an event before the liveness ceiling")
         .expect("events channel open")
 }
 
@@ -128,9 +137,9 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
     } = s.agent;
     drop(input_tx);
     drop(control_tx);
-    let exited = tokio::time::timeout(std::time::Duration::from_secs(10), events_rx.recv())
+    let exited = tokio::time::timeout(EVENT_TIMEOUT, events_rx.recv())
         .await
-        .expect("Exited within 10s")
+        .expect("Exited before the liveness ceiling")
         .expect("events channel open");
     assert!(matches!(exited, AgentEvent::Exited { .. }));
     assert!(
@@ -352,9 +361,9 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         })
         .unwrap();
     async fn recv(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> AgentEvent {
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
             .await
-            .expect("event within 10s")
+            .expect("an event before the liveness ceiling")
             .expect("channel open")
     }
     assert!(matches!(

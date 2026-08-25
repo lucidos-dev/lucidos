@@ -19,17 +19,14 @@ pub(super) async fn install_from_source_with_bus(
 ) -> Result<String, String> {
     let source = detect_source(source_str)?;
     let (_scratch, plugin_root, source_type) = fetch_source(workspace_path, &source)?;
-    let (summary, _files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         workspace_path,
         bus,
         &plugin_root,
-        source_type,
-        overwrite,
-        None,
-        None,
+        InstallContext::plain(source_type, overwrite),
     )
     .await?;
-    Ok(summary)
+    Ok(write.summary)
 }
 
 pub(super) const FIXTURE_MANIFEST: &str = r#"
@@ -113,5 +110,3 @@ pub(super) async fn read_events(
     .expect("query events");
     rows.into_iter().map(|(p,)| p).collect()
 }
-
-// ---- e2e test 1 -------------------------------------------------------

@@ -56,6 +56,20 @@ describe('todoListIndicatorBody', () => {
     expect(todoListIndicatorBody({ items: [], onClick: NOOP })).toBeNull();
   });
 
+  // *Todo notes* can outlive their items. Under ADR 0085's context mode an
+  // agent that finished its plan still writes `todos: []` with a pointer worth
+  // keeping. Hiding the indicator there would make the block the whole mode
+  // rests on the one thing the user cannot see.
+  it('still shows the indicator for a cleared list that kept notes', () => {
+    const text = vnodeToText(
+      todoListIndicatorBody({ items: [], notes: 'the report is at artifacts/week.md', onClick: NOOP }),
+    );
+    expect(text).toContain('data-role="todo-indicator"');
+    expect(text).toContain('data-state="idle"');
+    expect(text).toContain('data-tooltip="Notes kept"');
+    expect(text).toContain('aria-label="Todo list: no items, notes kept. Click to expand."');
+  });
+
   it('renders the in-progress state when an item is mid-flight, with the active form in the tooltip', () => {
     const items: TodoItem[] = [
       { content: 'a', active_form: 'doing a', status: 'completed' },
@@ -273,5 +287,39 @@ describe('todoListPanelBody', () => {
     ];
     const text = vnodeToText(todoListPanelBody({ items, onClose: NOOP }));
     expect(text).not.toContain('todo-panel-status-tag');
+  });
+
+  // ADR 0085 decision 1: the notes render beside the items, and only when
+  // there are any. The mode is off by default, so a list without notes has to
+  // be exactly the panel it was before the field existed.
+  it('renders the notes above the list when the agent kept some', () => {
+    const items: TodoItem[] = [
+      { content: 'Run tests', active_form: 'Running tests', status: 'pending' },
+    ];
+    const text = vnodeToText(
+      todoListPanelBody({ items, notes: 'collect.sh needs bash 5', onClose: NOOP }),
+    );
+    expect(text).toContain('data-role="todo-notes"');
+    expect(text).toContain('collect.sh needs bash 5');
+    expect(text.indexOf('todo-panel-notes')).toBeLessThan(text.indexOf('todo-panel-list'));
+  });
+
+  it('renders no notes region for a list that carries none', () => {
+    const items: TodoItem[] = [
+      { content: 'Run tests', active_form: 'Running tests', status: 'pending' },
+    ];
+    for (const notes of [undefined, null, '']) {
+      const text = vnodeToText(todoListPanelBody({ items, notes, onClose: NOOP }));
+      expect(text).not.toContain('todo-panel-notes');
+      expect(text).toContain('todo-panel-list');
+    }
+  });
+
+  it('renders the notes for a cleared list, with an empty item list', () => {
+    const text = vnodeToText(
+      todoListPanelBody({ items: [], notes: 'the report is at artifacts/week.md', onClose: NOOP }),
+    );
+    expect(text).toContain('the report is at artifacts/week.md');
+    expect(text).not.toContain('todo-panel-row');
   });
 });

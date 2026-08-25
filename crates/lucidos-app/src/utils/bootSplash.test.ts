@@ -59,6 +59,7 @@ function installFakeSplash(present: boolean, initialClasses: string[] = []) {
   return {
     statusEl,
     statusShown: () => statusClasses.has('boot-splash-status-shown'),
+    statusIsReport: () => statusClasses.has('boot-splash-status-report'),
     hasLeaving: () => classes.has('boot-splash-leaving'),
     isRemoved: () => removed,
     fireAnimationEnd: () => splashEl.fire('animationend', splashEl),
@@ -97,6 +98,26 @@ describe('bootSplash controller', () => {
     expect(fake.statusShown()).toBe(true);
     c.setBootStatus('');
     expect(fake.statusShown()).toBe(false);
+  });
+
+  it('a multi-line label switches the status into the wrapping report state', async () => {
+    // The packaged desktop sends a crash-loop report (desktop.rs
+    // `crash_loop_label`) as several lines. The one-line rules in index.html
+    // would clip it to its first ellipsized line, taking the reason and the log
+    // path with it.
+    fake = installFakeSplash(true);
+    const c = await freshController();
+    c.setBootStatus(
+      'The background service is not starting. It has started 3 times without coming up.\n' +
+        'LUCIDOS_ENGINE_BIN does not exist: /R/lucidos-engine\n' +
+        'Lucidos keeps trying. Log: /L/engine-service.err.log',
+    );
+    expect(fake.statusIsReport()).toBe(true);
+    expect(fake.statusShown()).toBe(true);
+
+    // And back: a service that came up leaves an ordinary one-line status.
+    c.setBootStatus('Waiting for the background service… (42s)');
+    expect(fake.statusIsReport()).toBe(false);
   });
 
   it('dismiss adds the leaving class and removes the node on animationend', async () => {

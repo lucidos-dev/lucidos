@@ -149,7 +149,7 @@ pub struct ThreadSummary {
     /// (ADR 0049). Its own thread's waits only, never a descendant roll-up.
     pub live_event_wait_count: i64,
     /// The same waits the count counts, spelled out: one entry per unresolved
-    /// wait, oldest first. This is what the subscription indicator renders, so
+    /// wait, oldest first. This is what the waiting indicator renders, so
     /// the count says how many and this says which.
     ///
     /// Carried on the summary for one reason: the client used to build this
@@ -172,7 +172,10 @@ pub struct ThreadSummary {
     /// Consumed by `display_section` via `count > 0` to bubble Current to the
     /// ancestor chain even when sibling descendants are still running.
     pub attention_descendant_count: i64,
-    /// Thread status: "idle", "running", or "waiting". Computed by the backend.
+    /// Thread status, computed by the backend. One of the six
+    /// [`ThreadStatus`] values as written by `as_str`: `idle`, `running`,
+    /// `waiting`, `waiting_for_user_answer`, `paused`, `failed`. Nothing
+    /// writes `waiting` any more; it survives on historical rows.
     pub status: String,
     /// Whether the coding-agent branch has any diff against main on disk — pure git
     /// truth. Set by the projection on `ChangeProposed`, cleared on

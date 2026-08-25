@@ -231,8 +231,10 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting', true, false, false)).toBe('waiting');
   });
 
-  it('waiting + active children + codingAgentProposed → changes (own changes win)', () => {
-    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
+  // Waiting outranks changes: a running child wakes this thread through the
+  // fan-in, so its change is not final and Apply is withheld to match.
+  it('waiting + active children + codingAgentProposed → waiting (not done yet)', () => {
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('waiting');
   });
 
   it('failed → failed (red triangle)', () => {
@@ -251,8 +253,8 @@ describe('visual status resolution', () => {
     expect(resolveVisualStatus('waiting_for_user_answer', true, false, false)).toBe('question');
   });
 
-  it('idle + active children + codingAgentProposed → changes (own changes win)', () => {
-    expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
+  it('idle + active children + codingAgentProposed → waiting (not done yet)', () => {
+    expect(resolveVisualStatus('idle', true, true, false)).toBe('waiting');
   });
 });
 
@@ -300,8 +302,10 @@ describe('thread title status icon', () => {
     expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
-  it('changes win over children — thread title shows static changes dot', () => {
-    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
+  // With a child still running the title pulses instead: the change is real,
+  // but it cannot be resolved until the thread stops being woken.
+  it('children outrank changes, so the thread title pulses', () => {
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('waiting');
   });
 
   it('pulsing waiting dot only when own state has nothing else to show', () => {

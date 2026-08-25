@@ -48,9 +48,11 @@ impl LucidosEngine {
         Option<crate::engine::event_bus::EmitResult>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let depth = crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
-            .try_with(|d| *d)
-            .unwrap_or(0);
+        // In the write path so no caller can skip it. The HTTP route checked
+        // the name; the LLM `emit_event` tool did not, and a reserved name from
+        // either writes the same permanent row.
+        crate::core::event_subscription::validate_emittable_event_type(event_type)?;
+        let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
         self.event_bus
             .emit(crate::engine::event_bus::BusEvent::System(
                 crate::engine::event_bus::SystemEvent::DomainEvent {

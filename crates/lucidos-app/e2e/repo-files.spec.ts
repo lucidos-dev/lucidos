@@ -253,9 +253,11 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await assertHealthy(page);
     repoId = await registerRepo(page, repoName);
     // Two columns are offered only where they fit, so the diff pane has to
-    // clear the threshold. Narrowing the Conversation side gives the content
-    // pane the width without depending on the project's viewport. The side-by-side
-    // preference is pinned off so each test starts from the unified view.
+    // clear the `SIDE_BY_SIDE_MIN_REM` threshold. Narrowing the Conversation
+    // side is most of the way there, though a bare 0.15 is not honoured: the
+    // pane clamps to its own minimum (`minThreadPanePx`). The desktop tests
+    // widen the window on top of this, see `roomForTwoColumns`. The
+    // side-by-side preference is pinned off so each test starts unified.
     await page.addInitScript(() => {
       localStorage.setItem('lucidos-split-ratio', '0.15');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
@@ -291,11 +293,24 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await expect(page.locator('.diff-view:visible')).toBeVisible({ timeout: 10_000 });
   }
 
+  /** Give the diff pane room for two columns.
+   *
+   *  The chromium project runs at 1280, and that is NOT enough: the Files panel
+   *  spends part of the content pane on its tree, and the Conversation pane
+   *  will not go below `minThreadPanePx`. The diff lands ~20px short of the
+   *  threshold, so the product correctly withholds the toggle. Widening the
+   *  window is the honest way in, and it is what a desktop reader with two
+   *  columns open actually has. */
+  async function roomForTwoColumns(page: Page): Promise<void> {
+    await page.setViewportSize({ width: 1600, height: 900 });
+  }
+
   test('toggles between the unified hunks and two aligned columns', async ({ page }, testInfo) => {
     test.skip(
       testInfo.project.name !== 'chromium',
       'a phone has no room for two columns, so the toggle is deliberately absent there',
     );
+    await roomForTwoColumns(page);
     await openHunks(page);
 
     // Unified to begin with: one column carrying both files' line numbers.
@@ -339,6 +354,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
   // can do: side by side is a rendering of the HUNKS.
   test('does not offer the toggle over the whole merged file', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'chromium', 'the narrow case is covered separately');
+    await roomForTwoColumns(page);
     await openHunks(page);
     // Offered, not "has a header button": a diff contributes enough context
     // actions that the header folds the whole set into its `⋯` menu, and a

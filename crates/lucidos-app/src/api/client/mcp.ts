@@ -133,7 +133,7 @@ export async function setMcpDisabledTools(id: string, disabledTools: string[]): 
   await throwIfNotOk(resp);
 }
 
-// --- Chat MCP permission allowlist (~/.lucidos/mcp-allowed-tools) ---
+// --- Chat MCP permission allowlist (<workspace>/.lucidos/mcp-allowed-tools) ---
 export async function getMcpAllowedTools(): Promise<string> {
   const body = await json<{ contents: string }>(`${API}/mcp-allowed-tools`);
   return body.contents;

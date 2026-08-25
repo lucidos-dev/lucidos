@@ -4,6 +4,8 @@ import { signal } from '@preact/signals-core';
 const backupProgress = signal<{ phase: string; progress: number; total: number } | null>(null);
 const backupStatusVersion = signal(0);
 const showToast = vi.fn();
+const dismissToast = vi.fn();
+const openBackupSettings = vi.fn();
 
 vi.mock('../store', () => ({
   threadMap: signal(new Map()),
@@ -24,7 +26,7 @@ vi.mock('../store', () => ({
   panelOverlay: signal(null),
   showConfirm: vi.fn(),
   showToast,
-  dismissToast: vi.fn(),
+  dismissToast,
   repoSource: signal(null),
 }));
 
@@ -53,6 +55,7 @@ vi.mock('./menu', () => ({
   setActiveMenu: vi.fn(),
   switchMenuItem: vi.fn(),
   openSettingsSubview: vi.fn(),
+  openBackupSettings,
 }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
@@ -99,6 +102,7 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup failed: Token refresh failed (invalid_grant)',
       'error',
+      expect.objectContaining({ key: 'backup-failed', onClick: expect.any(Function) }),
     );
   });
 
@@ -108,6 +112,18 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       'Backup failed: Unknown error',
       'error',
+      expect.objectContaining({ key: 'backup-failed' }),
     );
+  });
+
+  // The toast names a problem the Backup page fixes, so the tap goes there.
+  it('tapping the BackupFailed toast dismisses it and opens the Backup page', () => {
+    handleGlobalEvent('BackupFailed', { error: 'Google Drive is full' });
+
+    const opts = showToast.mock.calls[0][2] as { onClick: () => void };
+    opts.onClick();
+
+    expect(dismissToast).toHaveBeenCalledExactlyOnceWith('backup-failed');
+    expect(openBackupSettings).toHaveBeenCalledOnce();
   });
 });

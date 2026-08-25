@@ -9,7 +9,7 @@
 //! and the LLM calls `install_plugin` with that path.
 
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{delete, get, post},
     Json, Router,
@@ -26,8 +26,9 @@ use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
 use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
 use crate::engine::tools::plugins::{
     cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
-    confirm_pending_uninstall, installed_plugin_summaries, stage_install_request,
-    stage_uninstall_request, PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
+    confirm_pending_uninstall, installed_plugin_summaries, propose_local_patch_upstream,
+    stage_install_request, stage_uninstall_request, LocalChangeReport,
+    PLUGIN_INSTALL_REQUEST_PREFIX, PLUGIN_UNINSTALL_REQUEST_PREFIX,
 };
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
@@ -88,6 +89,20 @@ pub(super) struct StageInstallRequest {
 #[derive(Debug, Deserialize)]
 pub(super) struct StageUninstallRequest {
     pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ProposeUpstreamRequest {
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ProposeUpstreamResponse {
+    /// `data/`-relative path of the generated patch.
+    pub patch_path: String,
+    /// The thread that will take the patch to the plugin's author. The
+    /// frontend navigates the user into it.
+    pub thread_id: Uuid,
 }
 
 pub(super) async fn list_marketplaces(
@@ -416,6 +431,48 @@ pub(super) struct ConfirmInstallResponse {
     /// frontend navigates the user to this thread after a successful install.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_thread_id: Option<uuid::Uuid>,
+    /// What the install did to files the user had locally edited. Absent when
+    /// it met none, which is every fresh install.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_changes: Option<LocalChangesResponse>,
+}
+
+/// The wire shape of [`LocalChangeReport`], so the receipt panel can say which
+/// edits were kept, which were lost, and where the lost ones went.
+#[derive(Debug, Serialize)]
+pub(super) struct LocalChangesResponse {
+    pub merged: Vec<String>,
+    pub conflicted: Vec<String>,
+    pub replaced: Vec<String>,
+    pub restored: Vec<String>,
+    pub saved_paths: Vec<String>,
+}
+
+impl From<LocalChangeReport> for LocalChangesResponse {
+    fn from(r: LocalChangeReport) -> Self {
+        Self {
+            merged: r.merged,
+            conflicted: r.conflicted,
+            replaced: r.replaced,
+            restored: r.restored,
+            saved_paths: r.saved_paths,
+        }
+    }
+}
+
+/// Whether the confirm keeps the user's local edits by default.
+///
+/// The panel's keep control sends `keep_local_changes=false` to take a clean
+/// upstream copy instead. Absent means keep, so an LLM-driven or scripted
+/// confirm gets the safe answer rather than silently discarding a patch.
+#[derive(Debug, Deserialize)]
+pub(super) struct ConfirmInstallQuery {
+    #[serde(default = "keep_local_changes_default")]
+    pub keep_local_changes: bool,
+}
+
+fn keep_local_changes_default() -> bool {
+    true
 }
 
 /// 404 when the pending entry is gone (already consumed, expired, or wrong
@@ -438,13 +495,16 @@ pub(super) async fn confirm_install(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(install_id): Path<String>,
+    Query(query): Query<ConfirmInstallQuery>,
 ) -> Result<Json<ConfirmInstallResponse>, (StatusCode, Json<JsonValue>)> {
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match confirm_pending_install(&state.engine, &install_id, actor).await {
+    match confirm_pending_install(&state.engine, &install_id, query.keep_local_changes, actor).await
+    {
         Ok(outcome) => Ok(Json(ConfirmInstallResponse {
             summary: outcome.summary,
             installed_files: outcome.installed_files,
             setup_thread_id: outcome.setup_thread_id,
+            local_changes: outcome.local_changes.map(Into::into),
         })),
         Err(e) => Err(err(pending_status(&e), &e)),
     }
@@ -510,6 +570,32 @@ pub(super) async fn cancel_uninstall(
     }
 }
 
+/// `POST /api/v1/plugins/propose-upstream`: offer the caller's local patch to
+/// the plugin's author. Derives the diff, writes it under `data/artifacts/`,
+/// and spawns a thread to take it from there. The engine performs no GitHub
+/// operation itself.
+///
+/// 400 when the plugin is unknown, has no recorded baseline, or has no local
+/// changes to propose. All three are things the user can act on.
+pub(super) async fn propose_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ProposeUpstreamRequest>,
+) -> Result<Json<ProposeUpstreamResponse>, (StatusCode, Json<JsonValue>)> {
+    let id = body.id.trim();
+    if id.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "id is required"));
+    }
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match propose_local_patch_upstream(&state.engine, id, actor).await {
+        Ok(outcome) => Ok(Json(ProposeUpstreamResponse {
+            patch_path: outcome.patch_path,
+            thread_id: outcome.thread_id,
+        })),
+        Err(e) => Err(err(StatusCode::BAD_REQUEST, &e)),
+    }
+}
+
 /// Routes for the `/plugins/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -525,6 +611,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/plugins/installed", get(installed))
         .route("/plugins/install-request", post(stage_install))
         .route("/plugins/uninstall-request", post(stage_uninstall))
+        .route("/plugins/propose-upstream", post(propose_upstream))
         .route(
             "/plugins/upload-archive",
             post(upload_archive).layer(DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)),

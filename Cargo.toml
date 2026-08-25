@@ -7,6 +7,8 @@ members = [
     "crates/lucidos-app",
     "crates/lucidos-cli",
     "crates/lucidos-e2e",
+    "crates/lucidos-eval",
+    "crates/lucidos-local-token",
     "crates/lucidos-tailscale",
 ]
 

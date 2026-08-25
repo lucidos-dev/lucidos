@@ -20,7 +20,7 @@ import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loadin
 import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/push';
 import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
-import { startAppUpdateChecks, stopAppUpdateChecks, recheckAppUpdateOnResume } from '../store/actions/app-update';
+import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck } from '../store/actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from '../store/actions/engine-update';
 import {
   loadEmbeddingModelStatus,
@@ -33,6 +33,7 @@ import { refreshChangesState, restoreRestartState } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
+import { clipboardOrReport } from '../utils/clipboard';
 import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from './sw-update';
@@ -218,7 +219,12 @@ export function useStartup(): void {
           text = wrapper?.querySelector('pre code')?.textContent ?? null;
         }
         if (text == null) return;
-        navigator.clipboard.writeText(text).then(() => {
+        // Guarded rather than called bare: a non-secure origin exposes no
+        // `navigator.clipboard`, so the unguarded call threw before a promise
+        // existed and the `.catch` below never ran. See utils/clipboard.ts.
+        const clipboard = clipboardOrReport();
+        if (!clipboard) return;
+        clipboard.writeText(text).then(() => {
           copyBtn.innerHTML = CHECK_ICON;
           copyBtn.classList.add('copy-btn-copied');
           setTimeout(() => {
@@ -596,12 +602,12 @@ export function useStartup(): void {
       // isn't replayed on reconnect), so re-poll authoritatively on resume — shows
       // 'ready' if the build finished while away, never a stale spin.
       void checkEngineVersion();
-      // Same reconciliation for the PACKAGED app release, which this handler used
-      // to be the only update surface to skip: a desktop client is long-resident
-      // and rarely remounts, so without a resume check it kept reporting itself
-      // current for the whole poll interval after a release. Throttled inside
-      // (window focus fires constantly); a no-op outside the Tauri client.
-      void recheckAppUpdateOnResume();
+      // Same reconciliation for the published RELEASE. A client is long-resident
+      // and rarely remounts, so without this it kept reporting itself current
+      // for the whole interval after a release. This is a loopback read of the
+      // gateway, which owns the check (ADR 0108). It re-polls the origin only
+      // when its own answer is stale, so constant window focus costs nothing.
+      void refreshReleaseCheck();
       // And the embedding model, for the same reason as the engine build: a
       // suspended PWA missed every transient status frame, so re-read the
       // snapshot rather than trusting the last one seen before backgrounding.
@@ -704,10 +710,14 @@ export function useStartup(): void {
       ? setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000)
       : null;
 
-    // Packaged build: surface "update available" INSIDE the workspace (in-app
-    // toast), checking on startup + on an interval so a long-resident client still
-    // notices. Tauri-only; a no-op in a browser/PWA/dev. See store/actions/app-update.ts.
-    startAppUpdateChecks();
+    // Narration for an app update the user starts. Tauri-only, and no timer:
+    // the CHECK belongs to the gateway (ADR 0108), which is what stops N open
+    // windows making N polls an hour. See store/actions/app-update.ts.
+    startAppUpdateProgress();
+
+    // Read the machine's release answer on mount, so opening the app after a
+    // gap shows a fresh one rather than waiting out the gateway's backstop.
+    void refreshReleaseCheck();
 
     // Dev: poll the engine version-status so a background rebuild (kicked off by
     // Apply) surfaces "New version available → Switch to new version" once ready.
@@ -723,7 +733,7 @@ export function useStartup(): void {
       swProbe.stop();
       crossWorkspaceBadge.stop();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
-      stopAppUpdateChecks();
+      stopAppUpdateProgress();
       unsubscribeFromTailscaleServeProgress();
       stopEngineUpdateChecks();
       clearTimeout(initialHealthCheck);

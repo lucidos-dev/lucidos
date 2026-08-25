@@ -56,6 +56,9 @@ export function TriggerItem({ trigger }: Partial<Props>) {
   return (
     <div
       class={`list-row trigger-row${sk ? '' : ' clickable'}${trigger?.paused ? ' trigger-disabled' : ''}`}
+      // The anchor a trigger deep link scrolls to, mirroring `data-plugin-id`
+      // on a plugin row. Absent on the skeleton, which names no trigger.
+      data-trigger-id={trigger?.id}
       onClick={sk ? undefined : () => { if (trigger) openEditTrigger(trigger.id); }}
     >
       <div class="list-row-info">

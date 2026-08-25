@@ -13,6 +13,8 @@
 #      and is the exact failure that started this work;
 #   2. the wait loop returns as soon as the origin flips, and times out rather
 #      than hanging a release;
+#   2b. an arm needs BOTH vantages to agree (the plain edge read and the
+#      cache-defeating origin read), so one fresh read is never a verdict;
 #   3. arming is idempotent — an origin already serving this version costs no
 #      deploy, which is what makes `--push-rc` retries cheap;
 #   4. every failure path is NON-FATAL and returns non-zero, so a slow publisher
@@ -146,6 +148,112 @@ else
   else
     fail "timeout took ${elapsed}s, expected ~10s"
   fi
+fi
+
+echo "== 2b. an arm needs BOTH vantages to agree =="
+
+# Called with no `url` in the caller's scope, which is where a same-line
+# `local fetch_url="$url/install.sh"` silently reads the CALLER's variable
+# under bash's dynamic scoping. Every other case here goes through
+# rc_front_door_serves_version, which happens to HAVE a local named `url`, so
+# the bug hid behind a passing suite.
+write_installer "0.78.0"
+if _rc_front_door_read "$ORIGIN" edge && [ "$RC_FRONT_DOOR_SERVED_VERSION" = "0.78.0" ]; then
+  pass "the single read builds its URL from its own parameter, not the caller's scope"
+else
+  fail "a direct read failed: the fetch URL is leaking from the caller's scope"
+fi
+
+
+# The v0.18.3 shape: one read, taken as a verdict. `rc_front_door_confirms_version`
+# is what refuses that. Against a file:// fixture both vantages read the same
+# bytes, so these cases drive the AGREEMENT logic and the disagreement is
+# injected by stubbing the single-read primitive.
+
+write_installer "0.78.0"
+if rc_front_door_confirms_version "0.78.0" "$ORIGIN"; then
+  pass "confirms when both vantages serve the candidate"
+else
+  fail "refused an origin serving the candidate from both vantages"
+fi
+
+if rc_front_door_confirms_version "0.77.0" "$ORIGIN"; then
+  fail "confirmed 0.77.0 while the origin serves 0.78.0"
+else
+  pass "refuses a version neither vantage serves"
+fi
+
+# A fresh origin behind a lagging edge. This is the state the wait must NOT arm
+# on: the deploy landed, propagation is still running, and other POPs are the
+# ones about to red. Injected by shadowing `_rc_front_door_read` per vantage.
+if (
+  _rc_front_door_read() {
+    RC_FRONT_DOOR_SERVED_VERSION=""
+    case "$2" in
+      edge)   RC_FRONT_DOOR_SERVED_VERSION="0.77.0" ;;
+      origin) RC_FRONT_DOOR_SERVED_VERSION="0.78.0" ;;
+    esac
+    [ -n "$RC_FRONT_DOOR_SERVED_VERSION" ]
+  }
+  rc_front_door_confirms_version "0.78.0" "$ORIGIN"
+); then
+  fail "armed on a fresh ORIGIN while this POP still served the previous candidate"
+else
+  pass "refuses a fresh origin behind a lagging edge (the v0.18.3 shape)"
+fi
+
+# The mirror image: this POP happens to be fresh while the origin still holds
+# the previous copy. Nothing has been published, so nothing may be armed.
+if (
+  _rc_front_door_read() {
+    RC_FRONT_DOOR_SERVED_VERSION=""
+    case "$2" in
+      edge)   RC_FRONT_DOOR_SERVED_VERSION="0.78.0" ;;
+      origin) RC_FRONT_DOOR_SERVED_VERSION="0.77.0" ;;
+    esac
+    [ -n "$RC_FRONT_DOOR_SERVED_VERSION" ]
+  }
+  rc_front_door_confirms_version "0.78.0" "$ORIGIN"
+); then
+  fail "armed while the ORIGIN still held the previous candidate"
+else
+  pass "refuses a stale origin behind a fresh edge"
+fi
+
+# An unreadable vantage is not a matching one. Fail closed, same posture as the
+# sniff itself.
+if (
+  _rc_front_door_read() {
+    RC_FRONT_DOOR_SERVED_VERSION=""
+    [ "$2" = edge ] && RC_FRONT_DOOR_SERVED_VERSION="0.78.0"
+    [ -n "$RC_FRONT_DOOR_SERVED_VERSION" ]
+  }
+  rc_front_door_confirms_version "0.78.0" "$ORIGIN"
+); then
+  fail "armed with one vantage unreadable"
+else
+  pass "fails closed when a vantage cannot be read at all"
+fi
+
+# The reading is what every premature-arm message quotes, so it has to name both
+# vantages rather than collapse them into one number.
+write_installer "0.77.0"
+rc_front_door_confirms_version "0.78.0" "$ORIGIN" || true
+reading="$(rc_front_door_reading)"
+if [[ "$reading" == *"edge=0.77.0"* && "$reading" == *"origin=0.77.0"* ]]; then
+  pass "the reading names what each vantage served ($reading)"
+else
+  fail "the reading does not name both vantages: $reading"
+fi
+
+# The wait's success line has to say the arm was two-sided. A line that reads
+# like the old single-read one would put the v0.18.3 misreading straight back.
+write_installer "0.78.0"
+out="$(rc_front_door_wait "0.78.0" 30 "$ORIGIN" 2>&1)"
+if [[ "$out" == *"at the edge and at the origin"* ]]; then
+  pass "the wait reports which vantages agreed"
+else
+  fail "the wait's success line does not say the arm was two-sided: $out"
 fi
 
 echo "== 3. arming is idempotent and never fatal =="

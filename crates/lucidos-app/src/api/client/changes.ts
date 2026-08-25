@@ -30,7 +30,7 @@ export interface Change {
    * or WaitingForUserAnswer). Applying then races the session's next proposal,
    * so the changes view disables Apply and drops it from Apply All. Defaults to
    * false (absent on non-pending changes and older payloads). */
-  thread_active?: boolean;
+  thread_unsettled?: boolean;
 }
 
 /** One thread's contribution to the current restart-required toast: derived

@@ -4,6 +4,7 @@ import {
   resolveDeepLink,
   parseDeepLinkFromUrl,
   parseDeepLinkFromSwMessage,
+  parseDeepLinkFromInboxRow,
   hasDeepLinkParams,
   stripDeepLinkFromUrl,
 } from './notification-deeplink';
@@ -371,5 +372,106 @@ describe('stripDeepLinkFromUrl', () => {
     const url = new URL('https://localhost:5174/?app=stale');
     const cleaned = stripDeepLinkFromUrl(url);
     expect(cleaned.search).toBe('?app=stale');
+  });
+});
+
+
+describe('validateTap refuses a scripted navigate url', () => {
+  // `to.url` is the one attacker-reachable field here: `parseDeepLinkFromUrl`
+  // reads `tap=` off the page's own hash, and `handleNavigationRequest` hands
+  // the value to `openUrl` and then to `window.open`.
+  const tapWith = (url: string) =>
+    new URL(
+      `https://localhost:5174/#notification=n-1&tap=${encodeURIComponent(
+        JSON.stringify({ kind: 'navigate', to: { target: 'url', url } }),
+      )}`,
+    );
+
+  it('accepts an ordinary http url', () => {
+    const parsed = parseDeepLinkFromUrl(tapWith('https://example.com/a'));
+    expect(parsed.tap).toEqual({
+      kind: 'navigate',
+      to: { target: 'url', url: 'https://example.com/a' },
+    });
+  });
+
+  it('accepts the non-http schemes openExternalUrl documents', () => {
+    for (const url of ['mailto:me@example.com', 'tel:+1234', 'file:///tmp/x']) {
+      expect(parseDeepLinkFromUrl(tapWith(url)).tap).not.toBeNull();
+    }
+  });
+
+  it.each([
+    ['bare', 'javascript:alert(1)'],
+    ['upper case', 'JavaScript:alert(1)'],
+    ['vbscript', 'vbscript:msgbox(1)'],
+    ['leading space', ' javascript:alert(1)'],
+    ['inner tab', 'java\tscript:alert(1)'],
+    ['inner newline', 'java\nscript:alert(1)'],
+  ])('refuses a %s scripted url', (_label, url) => {
+    expect(parseDeepLinkFromUrl(tapWith(url)).tap).toBeNull();
+  });
+
+  // The URL parser strips every leading C0 control, not just whitespace.
+  // JavaScript's `\s` covers none of the codes below, so a guard built on it
+  // let them through. `new URL(...).href` then handed the sink a bare
+  // `javascript:` URL. Written as codes, so no control character sits
+  // literally in this file.
+  it.each([[0x00], [0x01], [0x08], [0x0e], [0x1f]])(
+    'refuses a scripted url hidden behind C0 control %#',
+    (code) => {
+      const url = `${String.fromCharCode(code)}javascript:alert(1)`;
+      // The premise: the sink really does normalize this back to a bare scheme.
+      expect(new URL(url).protocol).toBe('javascript:');
+      expect(parseDeepLinkFromUrl(tapWith(url)).tap).toBeNull();
+    },
+  );
+});
+
+// The inbox row used to ignore `tap` and always open the detail. It now routes
+// through the same dispatcher the toast and the push tap use, so the surfaces
+// cannot disagree about where one notification goes.
+describe('parseDeepLinkFromInboxRow', () => {
+  const row = {
+    id: 'n-1',
+    thread_id: 't-1',
+    event_id: 'e-1',
+    tap: { kind: 'navigate', to: { target: 'thread', id: 't-1', event_id: 'e-1' } } as Tap,
+  };
+
+  it('carries the row id, its source thread and event, and its tap', () => {
+    expect(parseDeepLinkFromInboxRow(row)).toEqual({
+      notification: 'n-1',
+      thread: 't-1',
+      event: 'e-1',
+      tap: row.tap,
+    });
+  });
+
+  it('normalizes absent fields to null, as the URL and SW parsers do', () => {
+    expect(parseDeepLinkFromInboxRow({ id: 'n-2' })).toEqual({
+      notification: 'n-2',
+      thread: null,
+      event: null,
+      tap: null,
+    });
+  });
+
+  it('resolves a navigate row to its destination, so one tap lands there', () => {
+    expect(resolveDeepLink(parseDeepLinkFromInboxRow(row))).toEqual({
+      type: 'navigate',
+      to: { target: 'thread', id: 't-1', event_id: 'e-1' },
+      notification: 'n-1',
+    });
+  });
+
+  it.each<[string, Tap | undefined]>([
+    ['a modal tap', { kind: 'modal' }],
+    ['no tap at all', undefined],
+  ])('resolves %s to the detail, exactly as the whole list did before', (_label, tap) => {
+    expect(resolveDeepLink(parseDeepLinkFromInboxRow({ id: 'n-3', tap }))).toEqual({
+      type: 'view-notification',
+      id: 'n-3',
+    });
   });
 });

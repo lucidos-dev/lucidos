@@ -16,6 +16,92 @@ fn admin_url() -> String {
         .unwrap_or_else(|_| "postgres://lucidos:lucidos@localhost:5432/postgres".into())
 }
 
+/// An `LlmProvider` that hands out one scripted reply per call and reports a
+/// fixed token usage. Lets a test drive a retry or resample loop, and assert
+/// on the `ContextCaptured` rows each round trip leaves behind.
+pub struct ScriptedProvider {
+    replies: std::sync::Mutex<std::vec::IntoIter<String>>,
+    model: String,
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+impl ScriptedProvider {
+    /// One reply per expected call, in order. Running out is an error, which
+    /// is what catches a loop calling more times than the test expects.
+    pub fn new(model: &str, replies: Vec<&str>) -> Self {
+        Self {
+            replies: std::sync::Mutex::new(
+                replies
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            ),
+            model: model.to_string(),
+            input_tokens: 210,
+            output_tokens: 4,
+        }
+    }
+
+    pub fn reporting(mut self, input_tokens: u32, output_tokens: u32) -> Self {
+        self.input_tokens = input_tokens;
+        self.output_tokens = output_tokens;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::llm::provider::LlmProvider for ScriptedProvider {
+    async fn chat(
+        &self,
+        _messages: Vec<crate::llm::provider::Message>,
+        _tools: Vec<crate::llm::provider::ToolDefinition>,
+        _model_override: Option<&str>,
+        _system_prompt: Option<&str>,
+        _on_token: Option<crate::llm::provider::TokenCallback>,
+        _reasoning_effort: Option<&str>,
+    ) -> Result<crate::llm::provider::LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let next = self
+            .replies
+            .lock()
+            .expect("scripted replies")
+            .next()
+            .ok_or("scripted provider ran out of replies")?;
+        Ok(crate::llm::provider::LlmResponse {
+            content: Some(next),
+            tool_calls: vec![],
+            stop_reason: Some("end_turn".to_string()),
+            output_tokens: Some(self.output_tokens),
+            input_tokens: Some(self.input_tokens),
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            thinking_chars: None,
+            unknown_sse_dropped: 0,
+            model_only_text: None,
+        })
+    }
+
+    fn default_model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Every auxiliary capture of one purpose on one thread, oldest first.
+pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<serde_json::Value> {
+    sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM events \
+         WHERE thread_id = $1 AND event_type = 'ContextCaptured' \
+           AND payload->>'purpose' = $2 \
+         ORDER BY sequence ASC",
+    )
+    .bind(thread_id)
+    .bind(purpose)
+    .fetch_all(pool)
+    .await
+    .expect("read auxiliary captures")
+}
+
 /// Connection URL for a throwaway database created by `setup_test_db`. Lets a
 /// test open its own dedicated connection to the same DB (e.g. the startup-lease
 /// tests, which contend a Postgres advisory lock across independent connections).

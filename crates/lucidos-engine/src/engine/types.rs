@@ -39,8 +39,8 @@ pub struct ProcessResult {
 /// thread appears active but nobody reads the injection channel.
 pub type OrphanedInjection = super::InjectedPrompt;
 
-/// `content` is `Option` so the modal can render section *shape* (name +
-/// `char_count`) without persisting the body when the `capture_context`
+/// `content` is `Option` so the modal can render section *shape* (name + the
+/// two sizes) without persisting the body when the `capture_context`
 /// preference is off. Old DB rows always have content and deserialize as
 /// `Some(_)`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,7 +48,28 @@ pub struct ContextSection {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    pub char_count: usize,
+    /// Chars this section ADDS to the request, beyond what other sections
+    /// already count. Sum it over a capture and you get the budget the
+    /// request spent.
+    ///
+    /// On most sections nothing else counts their bytes, so the delta happens
+    /// to equal `content_chars`. `Conversation` is where the two part: every
+    /// other section is already concatenated into `messages[0]`, so its delta
+    /// is what the tool loop added on top.
+    ///
+    /// The alias is honest. The stored value always was the delta, and only
+    /// the name lied. Two read paths serve `sections` verbatim rather than
+    /// through serde, so they rename the stored key themselves: see
+    /// `api::threads::events_snapshot::rename_legacy_section_size`.
+    #[serde(alias = "char_count")]
+    pub budget_delta_chars: usize,
+    /// True `chars().count()` of this section's own content, whatever the
+    /// persisted `content` shows. A dropped body (`capture_context` off) and a
+    /// head-and-tail truncation both leave it untouched.
+    ///
+    /// `None` means the row predates this field, never a zero-size section.
+    #[serde(default)]
+    pub content_chars: Option<usize>,
     /// API role this section is sent under. Defaults to "user" for backward
     /// compat with persisted ContextCaptured events from before this change —
     /// every previous section was actually part of either the system prompt
@@ -91,10 +112,43 @@ mod tests {
         let section: ContextSection =
             serde_json::from_str(json).expect("legacy payload must deserialize");
         assert_eq!(section.name, "X");
-        assert_eq!(section.char_count, 42);
+        assert_eq!(section.budget_delta_chars, 42);
         assert!(section.content.is_none());
         assert_eq!(section.role, ContextRole::User);
         assert!(section.group.is_none());
+    }
+
+    /// Months of stored rows spell the delta `char_count`. They must land in
+    /// the field that holds a delta, and they must not claim a content size
+    /// nobody measured.
+    #[test]
+    fn a_stored_char_count_is_the_budget_delta_and_leaves_the_content_size_unknown() {
+        let json = r#"{"name":"Conversation","char_count":418291}"#;
+        let section: ContextSection =
+            serde_json::from_str(json).expect("legacy payload must deserialize");
+        assert_eq!(section.budget_delta_chars, 418_291);
+        assert_eq!(
+            section.content_chars, None,
+            "absent means unmeasured, not zero"
+        );
+    }
+
+    /// The rename has no shim, so nothing writes the old key. A reader summing
+    /// `char_count` off a fresh row must find nothing there.
+    #[test]
+    fn a_written_section_spells_both_sizes_and_never_the_old_name() {
+        let section = ContextSection {
+            name: "System Instructions".to_string(),
+            content: None,
+            budget_delta_chars: 90,
+            content_chars: Some(90),
+            role: ContextRole::System,
+            group: None,
+        };
+        let json = serde_json::to_value(&section).expect("serializes");
+        assert_eq!(json["budget_delta_chars"], 90);
+        assert_eq!(json["content_chars"], 90);
+        assert!(json.get("char_count").is_none());
     }
 
     /// A session whose run loop still owns `msg_rx` is live.
@@ -158,6 +212,13 @@ pub enum ContextProducer {
     MainLlm,
     ClaudeCode,
     Codex,
+    /// An *auxiliary model call*: one the engine makes for itself rather than
+    /// as an agent's turn (a thread title, an image description, a memory
+    /// call, an image generation). It has its own producer so a cost
+    /// breakdown keyed on `producer` does not file background spend under the
+    /// agent that happened to be running. Like the coding-agent producers it
+    /// carries no section breakdown body, only the call's cost.
+    Auxiliary,
 }
 
 impl ContextProducer {
@@ -170,8 +231,77 @@ impl ContextProducer {
     }
 }
 
-/// `cache_*_tokens` are Anthropic-only (zero elsewhere). `output_tokens`
-/// may be zero on a snapshot emitted mid-stream before the final delta.
+/// Which model call a `ContextCaptured` records.
+///
+/// `Turn` is an agent's own round trip and is the only value the two agentic
+/// loops emit. Every other variant is an *auxiliary model call*, and always
+/// pairs with [`ContextProducer::Auxiliary`]: `AuxCapture` is the single
+/// constructor for both fields, so the pair cannot diverge.
+///
+/// Serialized only when it is not `Turn`, so a turn row keeps the wire shape
+/// it had before this field existed. A stored row without the key reads back
+/// as `Turn`, which is what the 600k rows written before it rely on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPurpose {
+    #[default]
+    Turn,
+    Title,
+    ImageDescribe,
+    Memory,
+    /// History summarisation, which used to be stamped [`Self::Memory`] along
+    /// with fact extraction and query classification. One purpose over three
+    /// jobs left a 94,903-char summariser call and a 6,800-char extraction
+    /// indistinguishable on the wire. Diagnosing the summariser then meant
+    /// inferring it from payload size.
+    ///
+    /// Standing invariant: **one purpose per auxiliary model preference**. This
+    /// one owns `model_conversation_summary`; `Memory` keeps the other two
+    /// jobs, which still share `model_memory`.
+    ConversationSummary,
+    ImageGen,
+}
+
+impl ContextPurpose {
+    /// Skip-serializing predicate: a turn capture writes no `purpose` key.
+    pub(crate) fn is_turn(&self) -> bool {
+        matches!(self, Self::Turn)
+    }
+
+    /// Section name for the one body-less section an auxiliary capture
+    /// carries. Names the request so a reader of the raw payload can tell
+    /// which call the estimate belongs to.
+    pub(crate) fn section_name(&self) -> &'static str {
+        match self {
+            Self::Turn => "Request",
+            Self::Title => "Title Request",
+            Self::ImageDescribe => "Image Description Request",
+            Self::Memory => "Memory Request",
+            Self::ConversationSummary => "Conversation Summary Request",
+            Self::ImageGen => "Image Generation Request",
+        }
+    }
+}
+
+/// Tokens one API call reported.
+///
+/// **`input_tokens` is a TOTAL and it CONTAINS the two cache counts.** It is
+/// everything the model processed, which is the number a reader wants for
+/// context size. Both providers are normalised to that convention: Anthropic
+/// reports three disjoint counts and `anthropic_wire` sums them, and OpenAI's
+/// `prompt_tokens` already covers `prompt_tokens_details.cached_tokens`.
+///
+/// So the three input fields are a total and two of its parts, never three
+/// classes to add up. Anything applying a per-class rate must first derive
+/// fresh input as `input_tokens - cache_read_tokens - cache_creation_tokens`,
+/// saturating. Read as classes, every cached token is billed twice, once at
+/// the full input rate. That mistake overstated the eval's dollar figures
+/// fourfold, and `lucidos-eval`'s `InputSplit` is the type that now prevents it.
+///
+/// `cache_creation_tokens` is Anthropic-only, since OpenAI charges nothing for
+/// a cache write and reports no count for one. `cache_read_tokens` is set by
+/// both. `output_tokens` may be zero on a snapshot emitted mid-stream, before
+/// the final delta.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ApiUsage {
     pub input_tokens: u32,

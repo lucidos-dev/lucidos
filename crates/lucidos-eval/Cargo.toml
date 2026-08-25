@@ -1,0 +1,44 @@
+[package]
+name = "lucidos-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Bin only, deliberately. ADR 0087 decision 15: the eval is a binary and never a
+# test, because `make test` would pick a test up and spend four figures. There is
+# no [lib], no [[test]] and no tests/ directory, and
+# `scripts/check-eval-not-a-test.sh` fails `make lint` if any of them appears.
+[[bin]]
+name = "lucidos-eval"
+path = "src/main.rs"
+
+[features]
+# One-shot generator for the 40 seeded memory rows. Off by default so the crate
+# every contributor builds stays light: the feature pulls in the ONNX embedder.
+# Run it only when the fixture changes, and commit its output.
+fixture-gen = ["dep:fastembed"]
+
+[dependencies]
+# The gateway's control plane authenticates a local caller by a token in a mode
+# 0600 file. This crate owns that path and that header name for every sender, so
+# the harness takes it rather than hand-copying the pair a fifth time.
+lucidos-local-token = { path = "../lucidos-local-token" }
+# The judge calls a model through the engine's provider layer, so it reaches
+# every provider the engine reaches. This does not make the eval a test: the
+# lint above forbids test TARGETS, and says nothing about a dependency.
+# `scripts/eval-context-mode.sh` already builds the engine in the same cargo
+# invocation, so the cost here is a link step.
+lucidos-engine = { path = "../lucidos-engine" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+regex = "1"
+fastembed = { version = "4", optional = true }

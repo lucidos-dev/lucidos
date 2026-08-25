@@ -227,6 +227,16 @@ EOF
 
 # ── env contract (single source of truth, shared with the foreground launcher) ─
 
+# service_runtime_program <runtime-root>: the binary the service RUNS. The
+# gateway is the program itself rather than an env var, so it is the one staged
+# resource service_runtime_env_pairs cannot name. Both launch paths (the
+# foreground exec and the unit's gateway_bin) go through here, which is what
+# lets scripts/lib/resource_contract.sh derive the launcher's whole resource
+# surface instead of restating any of it.
+service_runtime_program() {
+    printf '%s/lucidos-gateway\n' "${1%/}"
+}
+
 # service_runtime_env_pairs <runtime-root> <data> <port> — the canonical
 # NAME=VALUE env the gateway runs with, identical to
 # crates/lucidos-app/src/desktop.rs::spawn_gateway but resolved against the SHARED

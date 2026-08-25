@@ -104,8 +104,8 @@ describe('CC thread follow-up: channel detection', () => {
     expect(exchanges[0].steps.some(s => s.event.type === 'SessionStarted')).toBe(true);
   });
 
-  it('follow-up to running CC thread must route via CC channel, not /api/v1/chat', () => {
-    // Regression: sending a follow-up via /api/v1/chat calls register_thread()
+  it('follow-up to running CC thread must route via CC channel, not /api/v1/chat/stream', () => {
+    // Regression: sending a follow-up via /api/v1/chat/stream calls register_thread()
     // which cancels the old token, killing the active Claude Code session.
     // The frontend should detect running CC threads and route via CC message channel.
     const { map, id } = makeThread();
@@ -130,7 +130,7 @@ describe('CC thread follow-up: channel detection', () => {
     expect(hasLiveCCSession).toBe(true);
   });
 
-  it('follow-up to ended CC thread spawns new Claude Code session via /api/v1/chat', () => {
+  it('follow-up to ended CC thread spawns new Claude Code session via /api/v1/chat/stream', () => {
     const { map, id } = makeThread();
 
     // Claude Code session that has ended
@@ -146,7 +146,7 @@ describe('CC thread follow-up: channel detection', () => {
     const status = map.get(id)!.meta.status;
     expect(status).toBe('idle');
 
-    // Ended CC thread — should spawn new session via /api/v1/chat, not CC channel
+    // Ended CC thread: spawns a new session via /api/v1/chat/stream, not the CC channel
     const thread = map.get(id)!;
     const isCCThread = thread.meta.channel === 'claude_code';
     const hasLiveCCSession = isCCThread && (status === 'running' || status === 'waiting');

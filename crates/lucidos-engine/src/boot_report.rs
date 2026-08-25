@@ -44,10 +44,8 @@ pub fn report(phase: &str) {
         // Loopback call to the co-located gateway; accept its self-signed dev
         // cert and bypass any ambient proxy — the same posture as the
         // Apply-restart callback (`api/history.rs::restart_via_gateway`).
-        let client = match reqwest::Client::builder()
+        let client = match crate::gateway_auth::client_builder()
             .timeout(Duration::from_secs(2))
-            .no_proxy()
-            .danger_accept_invalid_certs(true)
             .build()
         {
             Ok(c) => c,

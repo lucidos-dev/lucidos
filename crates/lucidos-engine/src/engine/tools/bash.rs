@@ -8,8 +8,241 @@ use crate::engine::types::AgentUserInput;
 use crate::llm::tools::{
     BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
 };
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 const MAX_OUTPUT_BYTES: usize = 100 * 1024; // 100 KB
+
+/// How long the pipe readers may go with no bytes and no EOF before we call
+/// the pipes detached.
+///
+/// A flat deadline cannot express this. The readers can still be draining a
+/// backlog after the shell exits. On a loaded host they can also be starved
+/// for longer than any figure small enough to be worth waiting. So the window
+/// measures QUIET, and a reader making progress keeps extending it.
+const DETACHED_QUIET_WINDOW: Duration = Duration::from_millis(500);
+
+/// Hard cap on the whole post-exit drain, so a detached process that writes
+/// continuously cannot hold the tool open. Reached only by a process that is
+/// both detached and chatty; a plain detached one goes quiet immediately.
+const DETACHED_MAX_WAIT: Duration = Duration::from_secs(5);
+
+/// The outcome of waiting on a `run_bash` shell.
+///
+/// `wait_with_output()` could not express the middle variant, and that is the
+/// bug this type exists to make impossible. It returns on pipe EOF rather than
+/// on shell exit. So a shell that detached something holding those pipes looked
+/// identical to a shell still running. `run_bash` then reported `command timed
+/// out` for a launch that had already succeeded (ADR 0100).
+#[derive(Debug)]
+enum ShellWait {
+    /// The shell exited and both pipes closed.
+    Completed {
+        outcome: TaskOutcome,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// The shell exited, but a process it detached still holds the pipes.
+    /// Carries whatever drained before the grace expired.
+    Detached {
+        outcome: TaskOutcome,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// The shell itself never exited within the budget.
+    TimedOut,
+}
+
+/// Where a pipe reader puts what it reads, and whether anyone still wants it.
+///
+/// A shared buffer rather than a `Vec` the task owns, because the caller stops
+/// waiting before the reader stops reading. A task that owns its buffer takes
+/// every collected byte with it, and those bytes are what the caller needs.
+struct PipeSink {
+    buf: Mutex<Vec<u8>>,
+    /// Bytes this reader has taken off the pipe, ever. Read by the post-exit
+    /// wait to tell a reader draining a backlog from one sitting on an idle
+    /// pipe. Monotonic, so a stale read can only under-report progress.
+    read_bytes: AtomicU64,
+    /// Set once the caller has taken its snapshot. The reader keeps reading
+    /// and throws the bytes away, which is what holds the read end open.
+    discard: AtomicBool,
+}
+
+impl PipeSink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            buf: Mutex::new(Vec::new()),
+            read_bytes: AtomicU64::new(0),
+            discard: AtomicBool::new(false),
+        })
+    }
+
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.buf.lock().expect("drain buffer"))
+    }
+
+    fn progress(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// Read `pipe` to exhaustion, appending into `sink` until it says stop.
+///
+/// It reads to EOF even after the caller has gone, and that is the point. The
+/// reader owns the pipe handle, so dropping the task closes the read end. The
+/// next write by a process we deliberately did not kill would then take
+/// `EPIPE` or `SIGPIPE`, killing it by the back door (ADR 0100).
+async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<PipeSink>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => return,
+            Ok(n) => {
+                sink.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                if !sink.discard.load(Ordering::Relaxed) {
+                    sink.buf
+                        .lock()
+                        .expect("drain buffer")
+                        .extend_from_slice(&buf[..n]);
+                }
+            }
+            Err(e) => {
+                // The write end is gone in a way that is not a clean EOF.
+                // Nothing more can arrive, so stop and keep what we have.
+                log!("[Bash] pipe read ended with an error: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Wait for both readers to reach EOF after the shell has exited. `true` means
+/// they got there, so the output is complete.
+///
+/// `false` means the pipes went quiet while still open, which is a process the
+/// shell detached holding the write ends. Quiet has to clear two bars, because
+/// discarding a live pipe throws away a successful command's output:
+///
+/// - No bytes arrived. Progress resets the window, so a reader working through
+///   a backlog is never mistaken for an idle one.
+/// - A canary task finished, proving the runtime serviced the readers. Without
+///   it a starved reader reads as an idle pipe under load.
+///
+/// Each reader is taken out of its slot the moment it completes. A window can
+/// expire with one pipe closed and the other still live, and a `JoinHandle`
+/// that has returned `Ready` must never be polled again.
+async fn drain_until_quiet(
+    readers: &mut [Option<tokio::task::JoinHandle<()>>],
+    out_sink: &Arc<PipeSink>,
+    err_sink: &Arc<PipeSink>,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + DETACHED_MAX_WAIT;
+    loop {
+        let before = out_sink.progress() + err_sink.progress();
+        let window = DETACHED_QUIET_WINDOW.min(deadline - tokio::time::Instant::now());
+        // Spawned alongside the window, so it competes for the same scheduler.
+        // A trivial task that does not finish in half a second means the
+        // runtime never got to the readers either.
+        let canary = tokio::spawn(async {});
+        let finished = tokio::time::timeout(window, async {
+            for slot in readers.iter_mut() {
+                if let Some(reader) = slot.as_mut() {
+                    // `drain_pipe` maps every read error to a clean stop, and
+                    // nothing aborts these tasks, so a JoinError is
+                    // unreachable.
+                    let _ = reader.await;
+                    // Only reached when the await resolved. A window expiring
+                    // mid-await leaves the slot filled, which is correct: that
+                    // handle is merely pending and may be polled again.
+                    *slot = None;
+                }
+            }
+        })
+        .await
+        .is_ok();
+
+        if finished {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        if out_sink.progress() + err_sink.progress() != before {
+            continue;
+        }
+        // No bytes this window. That is only evidence of an idle pipe if the
+        // readers actually ran. A starved reader looks identical, and calling
+        // it detached discards output the OS had already buffered.
+        if !canary.is_finished() {
+            continue;
+        }
+        return false;
+    }
+}
+
+/// Wait for `child` to exit while draining both pipes concurrently.
+///
+/// Concurrent draining is load-bearing, not tidiness: `child.wait()` alone
+/// deadlocks against a child that fills a pipe buffer, which is the trap
+/// `wait_with_output()` used to cover for us.
+async fn wait_for_shell(
+    mut child: tokio::process::Child,
+    timeout: Duration,
+) -> Result<ShellWait, Box<dyn std::error::Error + Send + Sync>> {
+    let out_sink = PipeSink::new();
+    let err_sink = PipeSink::new();
+    let mut readers: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::with_capacity(2);
+    if let Some(pipe) = child.stdout.take() {
+        readers.push(Some(tokio::spawn(drain_pipe(pipe, Arc::clone(&out_sink)))));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        readers.push(Some(tokio::spawn(drain_pipe(pipe, Arc::clone(&err_sink)))));
+    }
+
+    // Hand the readers over to whoever still holds the write ends, on every
+    // exit path. They stop by themselves at EOF, which for an ordinary command
+    // is immediate. Aborting instead would close the read ends.
+    let release = |out: &Arc<PipeSink>, err: &Arc<PipeSink>| {
+        out.discard.store(true, Ordering::Relaxed);
+        err.discard.store(true, Ordering::Relaxed);
+    };
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status.map_err(|e| format!("executing command: {}", e))?,
+        Err(_) => {
+            release(&out_sink, &err_sink);
+            // Dropping `child` here fires the `kill_on_drop` the caller set,
+            // so the shell is SIGKILLed before this function returns.
+            return Ok(ShellWait::TimedOut);
+        }
+    };
+
+    let drained = drain_until_quiet(&mut readers, &out_sink, &err_sink).await;
+
+    // Typed, so a signal death can't be flattened into a bare number. The old
+    // `status.code().unwrap_or(-1)` reported a SIGSEGV as `-1`, which reads
+    // like an ordinary exit code.
+    let outcome = TaskOutcome::from_status(status);
+    let stdout = out_sink.take();
+    let stderr = err_sink.take();
+    release(&out_sink, &err_sink);
+    Ok(if drained {
+        ShellWait::Completed {
+            outcome,
+            stdout,
+            stderr,
+        }
+    } else {
+        ShellWait::Detached {
+            outcome,
+            stdout,
+            stderr,
+        }
+    })
+}
 
 /// Sanitize raw subprocess bytes for storage in a jsonb event payload and
 /// truncate to the LLM-facing cap. Centralized so the sync `run_bash` and
@@ -83,29 +316,30 @@ impl LucidosEngine {
             .spawn()
             .map_err(|e| format!("Failed to spawn command: {}", e))?;
 
-        let output = match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        {
-            Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(format!("executing command: {}", e).into()),
-            Err(_) => {
-                // Timeout — wait_with_output() is dropped here, taking the
-                // owned Child with it; kill_on_drop on the Command above
-                // means the OS sends SIGKILL. The shell child exits before
-                // this function returns.
+        // Wait on the SHELL, not on pipe EOF. A command that detaches a
+        // process keeps the pipes open after the shell is gone. Waiting on EOF
+        // reported that as a timeout (ADR 0100).
+        let waited = wait_for_shell(child, Duration::from_secs(timeout_secs)).await?;
+        let (raw_stdout, raw_stderr, detached, outcome) = match waited {
+            ShellWait::TimedOut => {
+                // The shell itself never exited. `wait_for_shell` has already
+                // dropped it, so the OS has SIGKILLed it by now.
                 return Err(format!("command timed out after {}s", timeout_secs).into());
             }
+            ShellWait::Completed {
+                outcome,
+                stdout,
+                stderr,
+            } => (stdout, stderr, false, outcome),
+            ShellWait::Detached {
+                outcome,
+                stdout,
+                stderr,
+            } => (stdout, stderr, true, outcome),
         };
 
-        let stdout = finalize_stream(&output.stdout);
-        let stderr = finalize_stream(&output.stderr);
-        // Typed, so a signal death can't be flattened into a bare number. The
-        // old `status.code().unwrap_or(-1)` reported a SIGSEGV as `-1`, which
-        // reads like an ordinary exit code.
-        let outcome = TaskOutcome::from_status(output.status);
+        let stdout = finalize_stream(&raw_stdout);
+        let stderr = finalize_stream(&raw_stderr);
 
         let mut response = String::new();
 
@@ -129,6 +363,18 @@ impl LucidosEngine {
 
         if response.is_empty() {
             response = format!("[{}]", outcome.describe());
+        }
+
+        if detached {
+            // Say plainly that the launch worked. The old behaviour reported a
+            // timeout here. An agent that believes its command failed retries
+            // it, or goes hunting a bug that is not there.
+            response.push_str(&format!(
+                "\n\n[the shell exited ({}), but a process it detached still holds this \
+                 command's output pipes. Output above is only what arrived before they \
+                 went quiet. Use run_bash_background for work that must outlive the call.]",
+                outcome.describe(),
+            ));
         }
 
         Ok(response)
@@ -619,6 +865,234 @@ fn format_bash_wake_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,
+    /// so these exercise the real fd topology rather than a simplified one.
+    fn spawn_like_the_tool(command: &str) -> tokio::process::Child {
+        command_shell()
+            .command(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn")
+    }
+
+    /// Output and status for the ordinary case, and promptly.
+    ///
+    /// It deliberately does NOT assert `Completed` over `Detached`. Two
+    /// concurrent spawns can cross-inherit a pipe write end through the
+    /// parent's `dup2` window. A sibling test's shell then holds this one's
+    /// pipe open and delays EOF. The bytes and the status are exact either
+    /// way, and those are what the caller reads.
+    #[tokio::test]
+    async fn an_ordinary_command_reports_its_output_and_exit_status() {
+        let started = std::time::Instant::now();
+        let child = spawn_like_the_tool("echo out; echo err >&2; exit 3");
+        let (outcome, stdout, stderr) = match wait_for_shell(child, Duration::from_secs(10))
+            .await
+            .unwrap()
+        {
+            ShellWait::Completed {
+                outcome,
+                stdout,
+                stderr,
+            }
+            | ShellWait::Detached {
+                outcome,
+                stdout,
+                stderr,
+            } => (outcome, stdout, stderr),
+            other => panic!("expected the shell to exit, got {other:?}"),
+        };
+
+        assert_eq!(outcome, TaskOutcome::Exited(3));
+        assert_eq!(String::from_utf8_lossy(&stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&stderr), "err\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(9),
+            "a command that exits must not wait out its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The incident shape. `&` binds looser than `&&`, so the whole chain runs
+    /// in one backgrounded subshell that keeps both pipe write ends open.
+    /// `wait_with_output()` waits for pipe EOF, so it blocked the full timeout
+    /// and reported a failure for a launch that had already succeeded.
+    #[tokio::test]
+    async fn a_detached_subshell_holding_the_pipes_does_not_look_like_a_timeout() {
+        let started = std::time::Instant::now();
+        let child = spawn_like_the_tool("echo launched && sleep 30 >/dev/null 2>&1 & echo queued");
+        // A 30s budget the detached `sleep` would blow through if we waited on
+        // pipe EOF. Reaching Detached quickly is the whole point.
+        let waited = wait_for_shell(child, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must not wait for the detached child: took {:?}",
+            started.elapsed()
+        );
+        match waited {
+            ShellWait::Detached {
+                outcome, stdout, ..
+            } => {
+                assert_eq!(
+                    outcome,
+                    TaskOutcome::Exited(0),
+                    "the shell itself succeeded"
+                );
+                assert!(
+                    String::from_utf8_lossy(&stdout).contains("queued"),
+                    "output drained before the grace expired: {:?}",
+                    String::from_utf8_lossy(&stdout)
+                );
+            }
+            other => panic!("expected Detached, got {other:?}"),
+        }
+    }
+
+    /// Returning must not kill what we chose not to kill. The reader task owns
+    /// the pipe handle, so aborting it closes the read end, and the detached
+    /// process takes `SIGPIPE` on its next write. `run_bash` would then report
+    /// a survivor it had just killed. Reading on, and discarding, is the fix.
+    ///
+    /// The chain writes to the inherited pipe a second after the grace has
+    /// expired, then touches the marker. A closed read end kills it before it
+    /// gets there.
+    #[tokio::test]
+    async fn a_detached_process_is_not_killed_by_the_pipes_closing() {
+        let marker =
+            std::env::temp_dir().join(format!("lucidos-detached-live-{}", std::process::id()));
+        // Unrecoverable cleanup: a leftover from an earlier aborted run.
+        let _ = std::fs::remove_file(&marker);
+
+        let child = spawn_like_the_tool(&format!(
+            "echo queued && sleep 1 && echo late && touch '{}' & echo done",
+            marker.display()
+        ));
+        let waited = wait_for_shell(child, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(
+            matches!(waited, ShellWait::Detached { .. }),
+            "expected Detached, got {waited:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert!(
+            marker.exists(),
+            "the detached chain died, most likely on SIGPIPE from a closed read end"
+        );
+        // Unrecoverable cleanup: the marker has served its purpose.
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// One pipe closes while the other stays live and keeps producing, so the
+    /// quiet window expires and the wait loops.
+    ///
+    /// That is the only path where a reader completes but its partner does
+    /// not. A `JoinHandle` that has returned `Ready` must never be polled
+    /// again. The detached group redirects its stdout away, so the stdout
+    /// reader reaches EOF while the stderr reader is still going.
+    #[tokio::test]
+    async fn a_pipe_closing_while_the_other_keeps_producing_does_not_repoll_it() {
+        let child = spawn_like_the_tool(
+            "echo out; { exec >/dev/null; i=0; while [ $i -lt 6 ]; do echo tick >&2; \
+             sleep 0.3; i=$((i+1)); done; } & echo done",
+        );
+        let (outcome, stdout, stderr) = match wait_for_shell(child, Duration::from_secs(30))
+            .await
+            .unwrap()
+        {
+            ShellWait::Completed {
+                outcome,
+                stdout,
+                stderr,
+            }
+            | ShellWait::Detached {
+                outcome,
+                stdout,
+                stderr,
+            } => (outcome, stdout, stderr),
+            other => panic!("expected the shell to exit, got {other:?}"),
+        };
+
+        assert_eq!(outcome, TaskOutcome::Exited(0));
+        assert!(
+            String::from_utf8_lossy(&stdout).contains("done"),
+            "stdout: {:?}",
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&stderr).contains("tick"),
+            "the live pipe kept draining across windows: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    /// The distinction the fix rests on: a shell that never exits is still a
+    /// real timeout, and must not be softened into a success.
+    ///
+    /// It must also STOP the work, not just stop waiting for it.
+    /// `wait_for_shell` drops the child, and the caller's `kill_on_drop` turns
+    /// that into a SIGKILL. The marker file is the proof: a surviving shell
+    /// would create it a second later.
+    #[tokio::test]
+    async fn a_timeout_reports_a_timeout_and_kills_the_shell() {
+        let marker =
+            std::env::temp_dir().join(format!("lucidos-timeout-kill-{}", std::process::id()));
+        // Unrecoverable cleanup: a leftover from an earlier aborted run.
+        let _ = std::fs::remove_file(&marker);
+
+        let child = spawn_like_the_tool(&format!("sleep 1; touch '{}'", marker.display()));
+        let waited = wait_for_shell(child, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(
+            matches!(waited, ShellWait::TimedOut),
+            "expected TimedOut, got {waited:?}"
+        );
+
+        // Outlive the `sleep` the shell was running when we gave up on it.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(
+            !marker.exists(),
+            "the shell survived the timeout and kept working"
+        );
+    }
+
+    /// Dropping `wait_with_output()` for `child.wait()` reopens the classic
+    /// deadlock: a child that fills the pipe buffer blocks forever unless
+    /// something drains it concurrently. 328 KB is several times any pipe
+    /// buffer, so this hangs to the timeout if the readers are not concurrent.
+    ///
+    /// Like the test above it accepts either exited variant, for the same
+    /// spawn-race reason. Every byte surviving is the assertion that matters.
+    #[tokio::test]
+    async fn a_chatty_command_does_not_deadlock_on_a_full_pipe() {
+        let child = spawn_like_the_tool(
+            r#"awk 'BEGIN{ for (i = 0; i < 8000; i++) print "0123456789012345678901234567890123456789" }'"#,
+        );
+        let (outcome, stdout) = match wait_for_shell(child, Duration::from_secs(20))
+            .await
+            .unwrap()
+        {
+            ShellWait::Completed {
+                outcome, stdout, ..
+            }
+            | ShellWait::Detached {
+                outcome, stdout, ..
+            } => (outcome, stdout),
+            other => panic!("expected the shell to exit, got {other:?}"),
+        };
+
+        assert_eq!(outcome, TaskOutcome::Exited(0));
+        assert_eq!(stdout.len(), 8000 * 41, "every byte must survive");
+    }
 
     #[test]
     fn truncate_output_short_string() {

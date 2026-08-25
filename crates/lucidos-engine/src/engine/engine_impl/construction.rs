@@ -53,6 +53,7 @@ impl LucidosEngine {
                             cb.parent_thread_id,
                             cb.child_thread_id,
                             cb.child_completed_event_id,
+                            cb.child_terminal_event_id,
                             cb.parent_is_coding_agent,
                         )
                         .await
@@ -63,6 +64,32 @@ impl LucidosEngine {
                             cb.child_thread_id,
                             e
                         );
+                        // The card already marked the parent awake, so a
+                        // failure here would leave it reading "Requesting"
+                        // with no turn behind it until the next boot. Report
+                        // the failure instead: `ResponseFailed` settles the
+                        // status and puts the error on the timeline.
+                        //
+                        // A terminal is right HERE and wrong in the fan-in's
+                        // own rollback paths. This wake WAS delivered and
+                        // consumed, so the next boot's
+                        // `refire_unprocessed_child_completions` should skip
+                        // this parent rather than re-drive a failed turn.
+                        //
+                        // Unlike this call's sibling turn-spawning sites, the
+                        // wake can also fail BEFORE the turn starts, so the
+                        // emit stays. It is anchored on the completion event,
+                        // which is the turn's pre-emitted origin, so the gate
+                        // drops it when the turn already settled itself.
+                        crate::engine::agentic_loop::ensure_failure_terminator_emitted(
+                            &engine.event_bus,
+                            engine.pool(),
+                            cb.parent_thread_id,
+                            cb.child_completed_event_id,
+                            None,
+                            &e.to_string(),
+                        )
+                        .await;
                     }
                 });
             }
@@ -432,7 +459,8 @@ impl LucidosEngine {
     ///
     /// A duty that exists but can no longer be carried (no worktree anywhere)
     /// is closed loudly here rather than dropped — see
-    /// `close_stranded_conflict_duty`.
+    /// `close_stranded_conflict_duty`. "No worktree anywhere" means git said
+    /// so. A lookup that could not run leaves the duty parked instead.
     async fn resolve_continue_conflict_duty(
         &self,
         thread_id: Uuid,
@@ -475,12 +503,30 @@ impl LucidosEngine {
         };
         let worktree = match recorded {
             Some(pair) => Some(pair),
-            None => crate::engine::git_ops::find_worktree_for_branch(
+            None => match crate::engine::git_ops::find_worktree_for_branch(
                 std::path::Path::new(&change.repo_root),
                 &change.branch_name,
             )
             .await
-            .map(|p| (p, change.branch_name.clone())),
+            {
+                crate::engine::git_ops::WorktreeLookup::Found(p) => {
+                    Some((p, change.branch_name.clone()))
+                }
+                crate::engine::git_ops::WorktreeLookup::NotFound => None,
+                // Closing the duty runs `merge --abort`, `worktree remove
+                // --force` and `branch -D` on the recorded temp pair, then
+                // writes MergeResolutionCleared and ChangeApplyFailed. None of
+                // that may ride on a probe that never ran. The duty stays
+                // parked for the next boot instead.
+                crate::engine::git_ops::WorktreeLookup::Unknown => {
+                    crate::log!(
+                        "[SpawnConsumer] Continue thread={} could not locate the worktree for branch {} (git worktree list gave no answer); leaving the conflict duty parked",
+                        thread_id,
+                        change.branch_name
+                    );
+                    return None;
+                }
+            },
         };
         match worktree {
             Some(pair) => {
@@ -1104,6 +1150,12 @@ impl LucidosEngine {
             crate::core::user_dir::ensure_git_init(ud);
         }
 
+        // Permission grants used to be machine-global. Seed every workspace
+        // that existed when they stopped being so, once per machine (ADR 0095).
+        // Writes no table, so there is no event: `core/announced_surfaces.rs`
+        // states that migrations sit outside the announcement rule.
+        crate::core::grants::migration::run(user_dir.as_deref(), &workspace_path);
+
         // Wrap the active provider in the swappable handle BEFORE the struct is
         // assembled, so the credential subscriber below shares the very handle
         // stored on `Self.llm` and its writes are seen by every read site.
@@ -1140,12 +1192,12 @@ impl LucidosEngine {
         spawn_vertex_region_subscriber(event_bus.subscribe(), vertex_location.clone());
         spawn_models_registry_subscriber(event_bus.subscribe(), model_registry, pool.clone());
 
-        // Hot-swap the active LLM provider when a provider credential is added or
-        // removed at runtime — the whole point of booting unconfigured. NOT
-        // spawned under LUCIDOS_MODEL=mock, so the mock is never swapped to/from
-        // (mock isolation).
+        // Hot-swap the active LLM provider when a provider credential or a
+        // provider preference changes at runtime, which is the whole point of
+        // booting unconfigured. NOT spawned under LUCIDOS_MODEL=mock, so the
+        // mock is never swapped to or from (mock isolation).
         if !provider_build_ctx.model_is_mock {
-            spawn_provider_credential_subscriber(
+            spawn_provider_config_subscriber(
                 event_bus.subscribe(),
                 llm_handle.clone(),
                 web_search_handle.clone(),

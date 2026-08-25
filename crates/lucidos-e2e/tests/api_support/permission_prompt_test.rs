@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-/// Serialize tests that snapshot/modify the global `~/.lucidos/cc-allowed-tools`
+/// Serialize tests that snapshot/modify this workspace's `cc-allowed-tools`
 /// file. Cargo runs integration tests in parallel within a binary, so without
 /// this lock concurrent snapshot+restore cycles would race and clobber each
 /// other's restore. Acquire at the top of any test that calls
@@ -216,7 +216,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
 }
 
 /// `persist_scope: "narrow"` on a Skill prompt → engine appends
-/// `Skill(<plugin>:*)` to ~/.lucidos/cc-allowed-tools and a second identical
+/// `Skill(<plugin>:*)` to the workspace's cc-allowed-tools and a second identical
 /// click is a no-op (no duplicate line).
 #[tokio::test]
 async fn permission_prompt_persists_narrow_skill_pattern() {
@@ -413,7 +413,7 @@ async fn permission_prompt_without_persist_scope_does_not_write_file() {
     );
 }
 
-/// Read the current ~/.lucidos/cc-allowed-tools via the settings endpoint.
+/// Read the workspace's current cc-allowed-tools via the settings endpoint.
 async fn read_cc_allowed_tools(client: &reqwest::Client) -> String {
     let resp = client
         .get(format!("{}/api/v1/cc-allowed-tools", base_url()))
@@ -439,7 +439,7 @@ async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
     );
 }
 
-/// GET/PUT round-trip of `~/.lucidos/agent-allowed-commands` via the settings
+/// GET/PUT round-trip of the workspace's `agent-allowed-commands` via the settings
 /// endpoints that back the Settings → Permissions → Lucidos Agent permissions
 /// list editor. Mirrors the `cc-allowed-tools` settings API.
 #[tokio::test]
@@ -476,7 +476,7 @@ async fn agent_allowed_commands_settings_roundtrip() {
     assert!(restore.status().is_success(), "restore PUT must succeed");
 }
 
-/// Read the current ~/.lucidos/agent-allowed-commands via the settings endpoint.
+/// Read the workspace's agent-allowed-commands via the settings endpoint.
 async fn read_agent_allowed_commands(client: &reqwest::Client) -> String {
     let resp = client
         .get(format!("{}/api/v1/agent-allowed-commands", base_url()))
@@ -585,4 +585,133 @@ async fn wait_for_permission_request(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Regression: each allowlist editor records WHAT the permission became.
+///
+/// All three were a bare write plus rename, emitting nothing and resolving no
+/// actor, while every other mutation in the same router stamped both. A
+/// `PUT /api/v1/cc-allowed-tools` with `{"contents":"Bash(*)"}` left no row at
+/// all, so a widened grant could not be audited after the fact.
+///
+/// One test over all three lanes. Two of them were fixed once and the third was
+/// missed, which is the failure this covers.
+#[tokio::test]
+async fn every_allowlist_put_records_the_resulting_grants() {
+    let client = http_client();
+    let _lock = lock_cc_allowed_tools().await;
+    let pool = PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to database");
+    let device = format!("e2e-grants-{}", Uuid::new_v4().simple());
+
+    for (route, grant_file, header, sentinel_pattern) in [
+        (
+            "cc-allowed-tools",
+            "cc-allowed-tools",
+            "# One pattern per line.",
+            "Bash(e2e-cc-{}:*)",
+        ),
+        (
+            "agent-allowed-commands",
+            "agent-allowed-commands",
+            "# Lucidos Agent command allowlist: one pattern per line.",
+            "Bash(e2e-agent-{}:*)",
+        ),
+        (
+            "mcp-allowed-tools",
+            "mcp-allowed-tools",
+            "# Lucidos Agent MCP allowlist: one pattern per line.",
+            "Mcp(e2e-mcp-{}:*)",
+        ),
+    ] {
+        let snapshot = read_allowlist(&client, route).await;
+        let sentinel = sentinel_pattern.replace("{}", &Uuid::new_v4().simple().to_string());
+        let body = format!("{header}\n{sentinel}\n");
+
+        let put = client
+            .put(format!("{}/api/v1/{route}", base_url()))
+            .header("x-lucidos-device-id", &device)
+            .json(&json!({ "contents": body }))
+            .send()
+            .await
+            .expect("PUT failed");
+        assert!(put.status().is_success(), "PUT /{route} must succeed");
+
+        let row: Option<(String, serde_json::Value)> = sqlx::query_as(
+            "SELECT aggregate, payload FROM events \
+             WHERE event_type = 'PermissionGrantsChanged' \
+               AND payload->'data'->>'grant_file' = $1 \
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(grant_file)
+        .fetch_optional(&pool)
+        .await
+        .expect("query failed");
+        let (aggregate, payload) =
+            row.unwrap_or_else(|| panic!("PUT /{route} must persist a PermissionGrantsChanged"));
+
+        assert_eq!(aggregate, "permission_grant");
+        let data = &payload["data"];
+        assert_eq!(
+            data["patterns"],
+            json!([sentinel]),
+            "the row must state what the permission BECAME, in full: {payload}"
+        );
+        assert!(
+            !data["actor"].is_null(),
+            "the row must name the device that widened the grant: {payload}"
+        );
+
+        restore_allowlist(&client, route, &snapshot).await;
+    }
+
+    pool.close().await;
+}
+
+/// Regression: the auto-approve toggle names the device that flipped it.
+///
+/// It already emitted `McpServerUpdated` carrying the resulting value. What it
+/// did not do was resolve an actor: `McpManager::set_auto_approve` passed a
+/// hardcoded `None`, so every row was unattributed.
+///
+/// Runs against a server id that does not exist. The handler resolves the actor
+/// before the store looks the row up. No row means no event, so this pins the
+/// one thing a missing server still proves: the call is well-formed, and it
+/// answers rather than 500ing.
+#[tokio::test]
+async fn auto_approve_on_an_unknown_server_still_answers() {
+    let client = http_client();
+    let resp = client
+        .put(format!("{}/api/v1/mcp/auto-approve", base_url()))
+        .header("x-lucidos-device-id", "e2e-auto-approve")
+        .json(&json!({ "server_id": "no-such-server", "auto_approve": true }))
+        .send()
+        .await
+        .expect("PUT mcp/auto-approve failed");
+    assert_eq!(resp.status().as_u16(), 200, "the toggle must answer 200");
+}
+
+async fn read_allowlist(client: &reqwest::Client, route: &str) -> String {
+    let resp = client
+        .get(format!("{}/api/v1/{route}", base_url()))
+        .send()
+        .await
+        .expect("GET failed");
+    assert_eq!(resp.status().as_u16(), 200, "GET /{route} must 200");
+    let body: serde_json::Value = resp.json().await.expect("invalid JSON");
+    body["contents"].as_str().unwrap_or("").to_string()
+}
+
+async fn restore_allowlist(client: &reqwest::Client, route: &str, contents: &str) {
+    let resp = client
+        .put(format!("{}/api/v1/{route}", base_url()))
+        .json(&json!({ "contents": contents }))
+        .send()
+        .await
+        .expect("restore PUT failed");
+    assert!(
+        resp.status().is_success(),
+        "restore PUT /{route} must succeed"
+    );
 }

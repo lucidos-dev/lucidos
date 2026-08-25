@@ -131,31 +131,20 @@ pub(super) fn validate_codex_effort<'a>(
 /// switch — approvals are per-request cards under the app-server driver and
 /// absent entirely under the exec escape hatch (sandbox is the guard).
 pub fn codex_command_definitions() -> serde_json::Value {
-    fn options_to_json(opts: &[CcMenuOption]) -> Vec<serde_json::Value> {
-        opts.iter()
-            .map(|m| {
-                let mut option = serde_json::json!({
-                    "value": m.value,
-                    "label": m.label,
-                    "description": m.description,
-                });
-                if let Some(models) = &m.supported_models {
-                    option["supported_models"] = serde_json::json!(models);
-                }
-                option
-            })
-            .collect()
-    }
+    let (model_options, effort_options) = super::claude_code::model_and_effort_options(
+        codex_model_options(),
+        codex_reasoning_effort_options(),
+    );
     serde_json::json!([
         {
             "subtype": "set_model",
             "label": "Model",
-            "params": [{ "key": "model", "label": "Model", "options": options_to_json(codex_model_options()) }]
+            "params": [{ "key": "model", "label": "Model", "options": model_options }]
         },
         {
             "subtype": "set_reasoning_effort",
             "label": "Reasoning Effort",
-            "params": [{ "key": "effort", "label": "Reasoning Effort", "options": options_to_json(codex_reasoning_effort_options()) }]
+            "params": [{ "key": "effort", "label": "Reasoning Effort", "options": effort_options }]
         }
     ])
 }

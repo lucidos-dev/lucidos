@@ -12,6 +12,62 @@ use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
+/// The `reasoning_effort` values `run_coding_agent` advertises: the union of
+/// what the two backends offer, in ladder order.
+///
+/// A union rather than one backend's list, because the tool serves both and the
+/// two vocabularies can drift apart at any time. Advertising the union keeps a
+/// value that IS valid somewhere out of the schema's way, and per-backend
+/// validation at the spawn boundary rejects it by name for the backend that
+/// does not take it. That is the same split the `model` argument uses: the
+/// schema describes the surface, the spawn enforces the backend.
+fn coding_agent_effort_vocabulary() -> Vec<&'static str> {
+    let offered = |agent| {
+        crate::runtime::coding_agent_reasoning_effort_options(agent)
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect::<Vec<_>>()
+    };
+    let claude = offered(crate::runtime::CodingAgent::ClaudeCode);
+    let codex = offered(crate::runtime::CodingAgent::Codex);
+    crate::llm::EFFORT_LADDER
+        .iter()
+        .copied()
+        .filter(|tier| claude.contains(tier) || codex.contains(tier))
+        .collect()
+}
+
+/// The `model` values `run_coding_agent` advertises: the union of what the two
+/// backends offer, each backend's own picker order, Claude Code first then
+/// Codex.
+///
+/// Models are not a scale, so unlike [`coding_agent_effort_vocabulary`] this
+/// does not sort. It preserves picker order and drops any value both backends
+/// offer, `default` today: it means "that backend's own default" in each, so
+/// it is one entry, not two identical ones. A future overlap dedupes the same
+/// way, with no new special case to remember.
+///
+/// The union is deliberately loose: it says nothing about which id belongs to
+/// which backend, so the schema still admits a Codex id paired with
+/// `coding_agent: "claude-code"`. `validate_coding_agent_model` refuses that
+/// at the spawn, which is correct and unchanged. The enum's job is narrower:
+/// kill the id that exists in NO backend picker, the whole class of mistake a
+/// chat-picker id used here is.
+fn coding_agent_model_vocabulary() -> Vec<&'static str> {
+    let mut seen = std::collections::HashSet::new();
+    [
+        crate::runtime::CodingAgent::ClaudeCode,
+        crate::runtime::CodingAgent::Codex,
+    ]
+    .into_iter()
+    .flat_map(crate::runtime::coding_agent_model_options)
+    .filter_map(|option| {
+        let value = option.value.as_str();
+        seen.insert(value).then_some(value)
+    })
+    .collect()
+}
+
 pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -48,18 +104,18 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::RUN_CODING_AGENT.to_string(),
-            description: "Run a coding agent to edit source code: Lucidos itself, an installed app, or a registered repo. ONLY when the user explicitly asks to modify code, never for workspace work the native tools cover. Spawning returns immediately and the ack is NOT a result: read the child's final response text for pass/fail before acting on it or reporting.\n\nPick `folder` first, asking which one if it is ambiguous. Omitting it means Lucidos itself, AVAILABLE ONLY on an install whose engine was launched from a Lucidos source checkout: the system prompt's \"WHAT A CODING AGENT CAN EDIT ON THIS INSTALL\" section says which install this is. load_knowhow('system-knowhow/coding-agent-events') for the folder table and cross-workspace.".to_string(),
+            description: "Run a coding agent to edit source code: Lucidos itself, an installed app, or a registered repo. ONLY when the user explicitly asks to modify code, never for workspace work the native tools cover. Spawning returns immediately and the ack is NOT a result: read the child's final response text for pass/fail before acting on it or reporting.\n\nPick `folder` first, asking which one if it is ambiguous. Omitting it means Lucidos itself, AVAILABLE ONLY on an install whose engine was launched from a Lucidos source checkout: the system prompt's \"WHAT A CODING AGENT CAN EDIT ON THIS INSTALL\" section says which. load_knowhow('system-knowhow/coding-agent-events') for the folder table and cross-workspace.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The coding task. Be specific about the files and the outcome."
+                        "description": "The coding task. Name the files and the outcome."
                     },
                     "coding_agent": {
                         "type": "string",
                         "enum": ["claude-code", "codex"],
-                        "description": "Use \"codex\" whenever the user asks for Codex; omit for Claude Code."
+                        "description": "Use \"codex\" when the user asks for Codex; omit for Claude Code."
                     },
                     "folder": {
                         "type": "string",
@@ -69,32 +125,39 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     // § "`repo` → `folder` deprecated alias on `run_coding_agent`".
                     "repo": {
                         "type": "string",
-                        "description": "DEPRECATED, use `folder`. Passing both is an error."
+                        "description": "DEPRECATED alias of `folder`; both is an error"
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Target workspace basename. Omit for this one. Another requires `relation=\"top\"` and resolves `folder` there."
+                        "description": "Target workspace basename. Omit for this one. Another needs `relation=\"top\"` and resolves `folder` there."
                     },
-                    "allowed_tools": {
-                        "type": "string",
-                        "description": "Tools to auto-approve, comma-separated. Default Bash,Read,Edit,Write,Glob,Grep."
-                    },
+                    // No `allowed_tools` and no `append_system_prompt` here, on
+                    // purpose. Both were declared for a year and neither ever
+                    // reached the spawn: `run_session` overwrites the allowlist
+                    // from the user's `cc-allowed-tools` file and composes the
+                    // system prompt itself. Wiring them was the wrong repair.
+                    // The allowlist is the USER'S permission surface, so a caller
+                    // that could widen its own child's allowlist would be a
+                    // boundary hole, and the system prompt is engine-owned.
+                    // Declaring neither is what makes the schema honest.
                     "model": {
                         "type": "string",
-                        "description": "Model override. Omit for the backend default."
+                        "enum": coding_agent_model_vocabulary(),
+                        "description": "An id the chosen backend does not offer is REFUSED, never swapped for the default. Omit to inherit. A one-file edit wants Sonnet, not Opus."
                     },
-                    "append_system_prompt": {
+                    "reasoning_effort": {
                         "type": "string",
-                        "description": "Appended to the agent's system prompt."
+                        "enum": coding_agent_effort_vocabulary(),
+                        "description": "Thinking budget. Omit for the backend default."
                     },
                     "images": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Conversation images to forward, e.g. [\"thread:1\"], 1-based. Omit for the current message's; `[]` forwards none."
+                        "description": "Conversation images to forward, e.g. [\"thread:1\"], 1-based. Omit for the current message's; `[]` none."
                     },
                     "title": {
                         "type": "string",
-                        "description": "3-6 words, and this is how you will refer to this child later in your prose. Auto-generated if omitted."
+                        "description": "3-6 words, and how you will refer to this child later in your prose. Auto-generated if omitted."
                     },
                     "relation": {
                         "type": "string",
@@ -352,6 +415,101 @@ mod tests {
             folder.contains("only on an install launched from a Lucidos source checkout"),
             "the `folder` param must state the precondition too — it is what the \
              model reads when deciding to omit it:\n{folder}"
+        );
+    }
+
+    /// The schema may only advertise an argument the spawn path actually reads.
+    ///
+    /// `model`, `allowed_tools` and `append_system_prompt` were declared here
+    /// and read by nothing: `ThreadQueueRequest::CodingAgent` had no field for
+    /// any of them, so every session ran on the `cc-settings.json` default while
+    /// the tool result came back a plain success. An agent told to match model
+    /// to task obeyed, reported "I picked Sonnet", and ran Opus every time.
+    ///
+    /// So the rule this test pins is not "declare these three": it is that the
+    /// declared set and the honoured set are the SAME set. `model` and
+    /// `reasoning_effort` are now honoured, so they are declared. The other two
+    /// are owned elsewhere and refused at the boundary, so they are not.
+    #[test]
+    fn the_coding_agent_schema_declares_only_arguments_the_spawn_honours() {
+        let tools = spawn_tools();
+        let run_coding_agent = tools
+            .iter()
+            .find(|tool| tool.name == tn::RUN_CODING_AGENT)
+            .expect("run_coding_agent tool must be registered");
+        let props = run_coding_agent.parameters["properties"]
+            .as_object()
+            .expect("properties object");
+
+        for honoured in ["model", "reasoning_effort"] {
+            assert!(
+                props.contains_key(honoured),
+                "`{honoured}` reaches the spawn, so the model must be told it exists"
+            );
+        }
+        for owned_elsewhere in ["allowed_tools", "append_system_prompt"] {
+            assert!(
+                !props.contains_key(owned_elsewhere),
+                "`{owned_elsewhere}` is overwritten by run_session and can never take \
+                 effect; declaring it invites a caller to pass it and be silently ignored"
+            );
+        }
+    }
+
+    /// The effort enum is built from the backends' own pickers, so a tier added
+    /// to either `cc_menu_options.json` or `codex_menu_options.json` shows up
+    /// here without anyone remembering to edit this file. A hand-copied list is
+    /// how the CC alias tables went stale before (three `wontfix` rows in the
+    /// tracker say so).
+    #[test]
+    fn the_effort_enum_is_the_union_of_what_the_backends_offer() {
+        let vocabulary = coding_agent_effort_vocabulary();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for option in crate::runtime::coding_agent_reasoning_effort_options(agent) {
+                assert!(
+                    vocabulary.contains(&option.value.as_str()),
+                    "{} offers '{}' but the schema does not advertise it",
+                    agent.as_str(),
+                    option.value
+                );
+            }
+        }
+        // Ladder order, not insertion order: the model reads this as a scale.
+        let ladder: Vec<&str> = crate::llm::EFFORT_LADDER
+            .iter()
+            .copied()
+            .filter(|t| vocabulary.contains(t))
+            .collect();
+        assert_eq!(vocabulary, ladder, "the enum must read low-to-high");
+    }
+
+    /// The model enum is built from the backends' own pickers. An id added to
+    /// either `cc_menu_options.json` or `codex_menu_options.json` shows up
+    /// here without anyone remembering to edit this file. Mirrors
+    /// `the_effort_enum_is_the_union_of_what_the_backends_offer` above.
+    #[test]
+    fn the_model_enum_is_the_union_of_what_the_backends_offer() {
+        let vocabulary = coding_agent_model_vocabulary();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for option in crate::runtime::coding_agent_model_options(agent) {
+                assert!(
+                    vocabulary.contains(&option.value.as_str()),
+                    "{} offers '{}' but the schema does not advertise it",
+                    agent.as_str(),
+                    option.value
+                );
+            }
+        }
+        assert_eq!(
+            vocabulary.iter().filter(|v| **v == "default").count(),
+            1,
+            "both backends offer 'default'; the enum must list it once"
         );
     }
 }

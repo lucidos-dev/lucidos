@@ -11,8 +11,8 @@ use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
 use super::super::{InjectedPrompt, InjectedPromptKind};
 use super::{
     append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
-    emit_user_prompt_injected_event, ensure_terminator_emitted, filter_removed_queued_prompts,
-    round_backstop_message, tool_call_cap_message,
+    emit_user_prompt_injected_event, ensure_failure_terminator_emitted, ensure_terminator_emitted,
+    filter_removed_queued_prompts, round_backstop_message, tool_call_cap_message,
 };
 use crate::core::DEFAULT_MAX_TOOL_CALLS;
 use crate::llm::{Message, MessageContent};
@@ -551,6 +551,168 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
     teardown_test_db(&db_name).await;
 }
 
+// ---------------------------------------------------------------------------
+// Failure terminator: one per exchange
+// ---------------------------------------------------------------------------
+
+/// Count every `ResponseFailed` row on a thread.
+async fn failed_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseFailed'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("query")
+}
+
+/// Count the `ResponseFailed` rows anchored to one exchange. Counting by
+/// anchor is the whole point: an unanchored row belongs to no exchange, and
+/// that is what the gate could not see.
+async fn failed_count_for(pool: &sqlx::PgPool, thread_id: Uuid, anchor: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseFailed' \
+           AND payload->>'request_event_id' = $2",
+    )
+    .bind(thread_id.to_string())
+    .bind(anchor.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("query")
+}
+
+/// A turn that dies BEFORE the agentic loop leaves the exchange open, and
+/// the UI stuck on "running". The engine settles it, anchored, so the
+/// callers no longer need a terminator of their own.
+#[tokio::test]
+async fn a_pre_loop_failure_is_settled_with_an_anchored_terminator() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    anchor_request(&bus, thread_id, origin_id, "do work").await;
+
+    ensure_failure_terminator_emitted(&bus, &pool, thread_id, origin_id, None, "setup blew up")
+        .await;
+
+    assert_eq!(
+        failed_count(&pool, thread_id).await,
+        1,
+        "a pre-loop failure must settle the exchange"
+    );
+    assert_eq!(
+        failed_count_for(&pool, thread_id, origin_id).await,
+        1,
+        "the terminator must carry the anchor, or the gate cannot dedup it"
+    );
+
+    let error: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'error' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseFailed'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("query");
+    assert_eq!(error.as_deref(), Some("setup blew up"));
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The reported bug. A stream error inside the loop emits an ANCHORED
+/// `ResponseFailed`, and the caller used to stack an unanchored copy on
+/// top milliseconds later. Two rows meant every subscribed trigger fired
+/// twice. One exchange gets one terminator.
+#[tokio::test]
+async fn an_in_loop_failure_is_not_terminated_twice() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let origin_id = Uuid::new_v4();
+    let meta = anchor_request(&bus, thread_id, origin_id, "do work").await;
+
+    // What the agentic loop emits when the provider stream errors.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseFailed {
+            error: "OpenAI streaming error [502]: Provider returned error".into(),
+        },
+        meta,
+    })
+    .await
+    .expect("loop terminator emit ok");
+
+    ensure_failure_terminator_emitted(
+        &bus,
+        &pool,
+        thread_id,
+        origin_id,
+        None,
+        "OpenAI streaming error [502]: Provider returned error",
+    )
+    .await;
+
+    assert_eq!(
+        failed_count(&pool, thread_id).await,
+        1,
+        "the loop already settled this exchange"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The gate keys on `request_event_id`, so an earlier exchange's failure
+/// must not swallow this one. Otherwise a thread that failed once would
+/// never settle again, and every later turn would hang on "running".
+#[tokio::test]
+async fn an_earlier_failure_does_not_settle_the_current_exchange() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+
+    let earlier_origin = Uuid::new_v4();
+    let earlier_meta = anchor_request(&bus, thread_id, earlier_origin, "first turn").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseFailed {
+            error: "first failure".into(),
+        },
+        meta: earlier_meta,
+    })
+    .await
+    .expect("earlier terminator");
+
+    let current_origin = Uuid::new_v4();
+    anchor_request(&bus, thread_id, current_origin, "second turn").await;
+    ensure_failure_terminator_emitted(
+        &bus,
+        &pool,
+        thread_id,
+        current_origin,
+        None,
+        "second failure",
+    )
+    .await;
+
+    assert_eq!(
+        failed_count(&pool, thread_id).await,
+        2,
+        "the current exchange needs its own terminator"
+    );
+    assert_eq!(
+        failed_count_for(&pool, thread_id, current_origin).await,
+        1,
+        "exactly one terminator must belong to the current exchange"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
 /// Regression: `/api/v1/restart` pre-emits `ResponseAborted{actor: device}` for
 /// the in-flight chat thread, then `force_evict_chat_thread` cancels its
 /// token. The agentic loop's cancel branches fire moments later. Without
@@ -706,6 +868,228 @@ async fn filter_removed_queued_prompts_binds_thread_aggregate_id_as_text() {
         vec!["keep"],
         "removed queued prompts must be filtered before ingestion"
     );
+
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// The working understanding survives a cancelled round
+// ---------------------------------------------------------------------------
+
+/// A stopped round used to lose the document and flush the raw markup instead.
+/// The cancel arm returned before the parse block that persists and splices.
+/// Twenty rounds of notes went with one Stop, and the user read the machinery.
+///
+/// This drives the helper both terminal paths share.
+#[tokio::test]
+async fn a_cancelled_round_persists_the_document_it_wrote() {
+    use super::super::chat::process::working_understanding as wu;
+    use super::read_working_understanding;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let partial = "Reading the file now.\n\
+                   [WORKING UNDERSTANDING]\nthe file is 400 lines\n[/WORKING UNDERSTANDING]\n\
+                   Next I will";
+    let mut document = wu::WorkingUnderstanding::default();
+    let mut todo = vec![];
+    let (parsed, _) = read_working_understanding(
+        &bus,
+        thread_id,
+        partial,
+        wu::ReplyEnd::Truncated,
+        &mut document,
+        &mut todo,
+        &None,
+    )
+    .await;
+
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'document' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'WorkingUnderstandingWritten'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_optional(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        stored.as_deref(),
+        Some("the file is 400 lines"),
+        "a cancelled round still wrote what it wrote"
+    );
+
+    let flushed = wu::strip_faulted_markup(&wu::splice_spans_out(partial, &parsed.spans));
+    assert!(
+        !flushed.contains(wu::MARKER_PREFIX),
+        "and the transcript gets prose, not markup: {flushed}"
+    );
+    assert_eq!(flushed, "Reading the file now.\n\nNext I will");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The checklist rides along, so a cancel does not strand the prompt bar on a
+/// list the model had already moved past.
+#[tokio::test]
+async fn a_cancelled_round_persists_the_checklist_it_wrote() {
+    use super::super::chat::process::working_understanding as wu;
+    use super::read_working_understanding;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let mut document = wu::WorkingUnderstanding::default();
+    let mut todo = vec![];
+    read_working_understanding(
+        &bus,
+        thread_id,
+        "[WORKING UNDERSTANDING]\nbody\n[TODO]\n- [x] read the file\n- [ ] fix it\n\
+         [/WORKING UNDERSTANDING]",
+        wu::ReplyEnd::Truncated,
+        &mut document,
+        &mut todo,
+        &None,
+    )
+    .await;
+
+    assert_eq!(todo.len(), 2, "the loop's own snapshot moved with the emit");
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'TodoListWritten'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(written, 1);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A Stop landing mid-block keeps the document that was already there.
+///
+/// The parse takes an unclosed block to the end of the text, so the fragment
+/// would arrive as a whole-document REPLACE and overwrite everything. The Stop
+/// is what cut it, not the model, so the block is dropped and the old notes
+/// stand. The user still reads prose: the markup goes with it.
+#[tokio::test]
+async fn a_stop_inside_the_block_leaves_the_old_document_standing() {
+    use super::super::chat::process::working_understanding as wu;
+    use super::read_working_understanding;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let partial = "On it.\n[WORKING UNDERSTANDING]\nthe fi";
+    let mut document = wu::WorkingUnderstanding {
+        body: "twenty rounds of notes".into(),
+        constraints: "never touch the migrations".into(),
+    };
+    let mut todo = vec![];
+    let (parsed, _) = read_working_understanding(
+        &bus,
+        thread_id,
+        partial,
+        wu::ReplyEnd::Truncated,
+        &mut document,
+        &mut todo,
+        &None,
+    )
+    .await;
+
+    assert_eq!(document.body, "twenty rounds of notes");
+    assert_eq!(document.constraints, "never touch the migrations");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+         AND event_type = 'WorkingUnderstandingWritten'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(rows, 0, "nothing was finished, so nothing is recorded");
+
+    let flushed = wu::strip_faulted_markup(&wu::splice_spans_out(partial, &parsed.spans));
+    assert_eq!(flushed, "On it.");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The same reply, ended by the model rather than by a Stop, still lands. An
+/// opening it never closed is its own mistake, and the fault says so.
+#[tokio::test]
+async fn a_model_that_forgot_the_closing_marker_still_writes_its_document() {
+    use super::super::chat::process::working_understanding as wu;
+    use super::read_working_understanding;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let mut document = wu::WorkingUnderstanding::default();
+    let mut todo = vec![];
+    let (parsed, _) = read_working_understanding(
+        &bus,
+        thread_id,
+        "On it.\n[WORKING UNDERSTANDING]\nthe file is 400 lines",
+        wu::ReplyEnd::Complete,
+        &mut document,
+        &mut todo,
+        &None,
+    )
+    .await;
+
+    assert_eq!(document.body, "the file is 400 lines");
+    assert!(
+        parsed.faults.iter().any(|f| f.contains(wu::CLOSE)),
+        "and it is told what it left out: {:?}",
+        parsed.faults
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A round that wrote nothing emits nothing. Otherwise every cancel would
+/// append an identical document row, and the mode's own history would be noise.
+#[tokio::test]
+async fn a_cancelled_round_that_wrote_nothing_emits_nothing() {
+    use super::super::chat::process::working_understanding as wu;
+    use super::read_working_understanding;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _cb_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    let mut document = wu::WorkingUnderstanding {
+        body: "notes from earlier".into(),
+        constraints: String::new(),
+    };
+    let mut todo = vec![];
+    read_working_understanding(
+        &bus,
+        thread_id,
+        "Just thinking out loud here.",
+        wu::ReplyEnd::Truncated,
+        &mut document,
+        &mut todo,
+        &None,
+    )
+    .await;
+
+    assert_eq!(document.body, "notes from earlier");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+         AND event_type IN ('WorkingUnderstandingWritten', 'TodoListWritten')",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(rows, 0);
 
     teardown_test_db(&db_name).await;
 }

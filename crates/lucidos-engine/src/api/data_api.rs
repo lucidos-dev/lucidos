@@ -89,6 +89,61 @@ fn validate_data_path_mutate(path: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+/// The workspace-relative file this `/data` mount request names, or `None` when
+/// the mount must not serve it.
+///
+/// `uri_path` is the nest-stripped path, so `/data/artifacts/a.md` arrives as
+/// `/artifacts/a.md`. Percent-decoded first: the allowlist reads a filesystem
+/// path, and `%2e%2e` is `..` by the time anything opens a file.
+///
+/// A trailing slash is trimmed rather than refused. `/data/apps/todo/` is how a
+/// directory link reaches the mount, and `ServeDir` answers it with that
+/// directory's `index.html`.
+fn data_mount_target(uri_path: &str) -> Option<String> {
+    let decoded = urlencoding::decode(uri_path).ok()?;
+    let rel = decoded.trim_start_matches('/').trim_end_matches('/');
+    validate_data_path_read(rel).ok()?;
+    Some(rel.to_string())
+}
+
+/// The `/data` static mount, as `api::mod` nests it.
+///
+/// **It runs the same allowlist as `GET /api/v1/data/*path`.** Without that the
+/// two siblings disagreed about one tree. The API route refused anything
+/// outside the prefixes. This mount handed out `data/postgres/postgresql.conf`
+/// and every content-addressed blob to any caller that could name the path, an
+/// app iframe included.
+///
+/// One constructor, so a test exercises the real wiring rather than a
+/// restatement of it.
+pub(super) fn static_mount(data_dir: std::path::PathBuf) -> axum::routing::MethodRouter {
+    get(move |req: axum::extract::Request| serve_workspace_data(data_dir.clone(), req))
+}
+
+/// Serve one file from the mount, or 404.
+///
+/// A refused path answers 404, which is what a static mount says about a file
+/// it does not serve. It is also the smaller disclosure: 403 would confirm the
+/// file exists.
+async fn serve_workspace_data(
+    data_dir: std::path::PathBuf,
+    req: axum::extract::Request,
+) -> Response {
+    let Some(_rel) = data_mount_target(req.uri().path()) else {
+        // Logged because `request_logger` skips `/data`, so a refusal is
+        // otherwise invisible to whoever has to explain the 404.
+        log!("[data] refused {} on the /data mount", req.uri().path());
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match ServeDir::new(&data_dir).oneshot(req).await {
+        Ok(resp) => resp.map(axum::body::Body::new),
+        Err(e) => {
+            log!("[data] ServeDir failed: {}", e);
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
 fn make_artifact_manager(
     workspace_path: &std::path::Path,
 ) -> Result<ArtifactManager, Box<Response>> {
@@ -188,7 +243,14 @@ fn walkdir(root: &std::path::Path, dir: &std::path::Path) -> Result<Vec<String>,
 }
 
 /// GET /api/v1/data/*path — read a data file
-pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+///
+/// The response shape (validators, ranges, streaming) belongs to
+/// [`super::file_response::serve_file`]; this handler owns only path resolution.
+pub(super) async fn read_data(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if let Err((code, msg)) = validate_data_path_read(&path) {
         return (code, msg).into_response();
     }
@@ -205,17 +267,7 @@ pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<St
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let content_type = content_type_for_ext(&ext);
 
-    match std::fs::read(&file_path) {
-        Ok(content) => ([(header::CONTENT_TYPE, content_type)], content).into_response(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "File not found").into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error reading file: {}", e),
-        )
-            .into_response(),
-    }
+    super::file_response::serve_file(&file_path, content_type, &headers).await
 }
 
 /// The `artifacts/` arm of [`write_data`]: store the file, commit it, announce
@@ -521,15 +573,19 @@ pub(super) async fn edit_data(
     for op in &body.operations {
         if let Err(e) = state
             .engine
-            .edit_file_at_path(
-                &body.path,
-                op.json_path.as_deref(),
-                op.json_value.clone(),
-                op.find.as_deref(),
-                op.replace.as_deref(),
-                false,
-                None,
-            )
+            .edit_file_at_path(crate::engine::tools::files::EditFileArgs {
+                raw_path: &body.path,
+                // The HTTP data surface is `data/`-only, so it never names a
+                // repo and always takes the committing default.
+                repo: None,
+                json_path: op.json_path.as_deref(),
+                new_value: op.json_value.clone(),
+                old_string: op.find.as_deref(),
+                new_string: op.replace.as_deref(),
+                replace_all: false,
+                commit: None,
+                message: None,
+            })
             .await
         {
             let status = if e.starts_with("Failed to") {
@@ -600,6 +656,91 @@ mod tests {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, "x").unwrap();
+    }
+
+    /// Regression: the `/data` static mount is gated by the same allowlist the
+    /// API route runs.
+    ///
+    /// It had none. `GET /data/postgres/postgresql.conf` and every blob under
+    /// `data/blobs/` were served verbatim to anything that could name the path,
+    /// while the sibling `GET /api/v1/data/*path` refused both.
+    #[test]
+    fn the_data_mount_serves_only_the_read_allowlist() {
+        for allowed in [
+            "/artifacts/report.pdf",
+            "/apps/habit-tracker/index.html",
+            "/apps/habit-tracker/",
+            "/knowhow/how-to.md",
+            "/triggers/nightly/trigger.toml",
+            "/config/apis.json",
+            "/auth-modules/binance-hmac.wasm",
+            "/scripts/auth/login.py",
+        ] {
+            assert!(
+                data_mount_target(allowed).is_some(),
+                "{allowed} must still be served"
+            );
+        }
+        for refused in [
+            "/postgres/postgresql.conf",
+            "/blobs/ab/abcdef.png",
+            "/data/artifacts/nested.md",
+            "/.backupignore",
+            "/.lucidos/tmp/x",
+            "/",
+            "",
+        ] {
+            assert!(
+                data_mount_target(refused).is_none(),
+                "{refused:?} must not be served"
+            );
+        }
+    }
+
+    /// A percent-encoded `..` is `..` by the time a file is opened, so the
+    /// allowlist has to see the decoded path.
+    #[test]
+    fn the_data_mount_decodes_before_it_validates() {
+        assert!(data_mount_target("/artifacts/%2e%2e/postgres/x.conf").is_none());
+        assert_eq!(
+            data_mount_target("/artifacts/my%20report.pdf").as_deref(),
+            Some("artifacts/my report.pdf"),
+        );
+    }
+
+    /// The predicate above decides; this proves it is wired in front of
+    /// `ServeDir`. A file that exists on disk under a refused prefix must not
+    /// come back, which is the whole defect.
+    #[tokio::test]
+    async fn the_mount_gates_serve_dir_and_not_just_the_predicate() {
+        use tower::ServiceExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "artifacts/ok.md");
+        touch(tmp.path(), "blobs/ab/secret.png");
+        let app = Router::new().nest_service("/data", static_mount(tmp.path().to_path_buf()));
+
+        let get_status = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(get_status("/data/artifacts/ok.md").await, StatusCode::OK);
+        assert_eq!(
+            get_status("/data/blobs/ab/secret.png").await,
+            StatusCode::NOT_FOUND,
+            "a blob that exists on disk must not be served by the mount"
+        );
     }
 
     #[test]

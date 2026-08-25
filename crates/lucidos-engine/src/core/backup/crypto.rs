@@ -120,6 +120,19 @@ fn decrypt_chunked(
             break;
         }
 
+        // `encrypt` never writes a chunk larger than CHUNK_SIZE, so a bigger
+        // length means a corrupt or hostile archive. The length is four bytes
+        // read straight out of a downloaded file. Unchecked, the allocation
+        // below zeroes up to 4 GiB before the short read can fail, which
+        // OOM-kills the engine instead of failing the restore.
+        if chunk_len > CHUNK_SIZE {
+            return Err(format!(
+                "corrupt archive: chunk {chunk_index} declares {chunk_len} bytes, \
+                 above the {CHUNK_SIZE}-byte maximum"
+            )
+            .into());
+        }
+
         // Ciphertext is chunk_len + 16 bytes (GCM tag)
         let ct_len = chunk_len + 16;
         let mut ciphertext = vec![0u8; ct_len];
@@ -168,11 +181,19 @@ pub fn load_key_file(path: &Path) -> Result<Option<Vec<u8>>, BoxError> {
 }
 
 /// Save a key to a file as base64.
+///
+/// Owner-only on Unix. This one file decrypts every cloud backup the workspace
+/// has ever uploaded, and a default umask would leave it world-readable.
 pub fn save_key_file(path: &Path, key: &[u8]) -> Result<(), BoxError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, key_to_base64(key))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 

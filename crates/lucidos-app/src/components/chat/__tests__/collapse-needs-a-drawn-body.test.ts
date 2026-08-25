@@ -66,6 +66,38 @@ describe('a turn is collapsible only while its body draws something', () => {
 });
 
 /**
+ * **A change turn and a user message carry no fold.**
+ *
+ * Both were dropped on request, and for the same reason. A change turn's body
+ * is a summary, a description and a file list. A user message is the reader's
+ * own text, already as short as they made it. The control cost a row of chrome
+ * on every one of them to fold a few lines.
+ *
+ * What keeps a fold is an initiator turn whose body can run long and is not
+ * yours: a forwarded agent message, a question, a permission prompt.
+ *
+ * The same expression also decides `isInitiatorCollapsed`, so a turn a reader
+ * folded before this cannot render as a stuck `⋯` stub.
+ */
+describe('the initiator fold skips a change turn and a user message', () => {
+  it('gates it on both predicates, beside the body test', () => {
+    expect(source).toMatch(
+      /const canCollapseInitiator = !isChangePanel && !isUserMessageBubble\s*\n?\s*&& \(!!initiator\.summary \|\| !!initiator\.details\)/,
+    );
+  });
+
+  for (const predicate of ['isChangePanel', 'isUserMessageBubble']) {
+    it(`reads ${predicate} from above, so the gate cannot see it undefined`, () => {
+      // Each is a `const`, so using one a line early is a temporal dead zone
+      // throw rather than a quiet `undefined`. Order is the whole guard.
+      expect(source.indexOf(`const ${predicate} =`)).toBeLessThan(
+        source.indexOf('const canCollapseInitiator ='),
+      );
+    });
+  }
+});
+
+/**
  * **A reveal clicked on a folded turn unfolds that turn.**
  *
  * A folded turn draws no body, so "Show steps" / "Show the full response"

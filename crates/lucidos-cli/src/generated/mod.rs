@@ -141,7 +141,7 @@ pub enum TriggersCmd {
         /// 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
         #[arg(long)]
         cron_expressions: Option<String>,
-        /// Event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
+        /// Event subscriptions, e.g. [{"event_type":"X","condition":{"a.b":"c"}}].
         #[arg(long)]
         on: Option<String>,
         /// Owning app directory name; deep-links notifications to that app.
@@ -182,7 +182,7 @@ pub enum TriggersCmd {
         /// 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
         #[arg(long)]
         cron_expressions: Option<String>,
-        /// Event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
+        /// Event subscriptions, e.g. [{"event_type":"X","condition":{"a.b":"c"}}].
         #[arg(long)]
         on: Option<String>,
         /// Pause (true) or resume (false) the trigger.
@@ -953,6 +953,145 @@ pub fn dispatch_mcp(ws: &Workspace, cmd: McpCmd) -> Result<(), BoxError> {
         }
         McpCmd::Remove { id } => {
             let url = format!("{}/api/v1/mcp/servers/{}", ws.base_url(), id);
+            let req = client()?.delete(&url).json(&serde_json::json!({}));
+            send_and_print("DELETE", &url, req)
+        }
+    }
+}
+
+/// Inbound webhooks: endpoints a third party posts to, each emitting one pinned domain event.
+#[derive(clap::Subcommand)]
+pub enum WebhooksCmd {
+    /// Every webhook: id, name, pinned event type, whether it is signed and enabled, and the path a sender posts to.
+    List,
+    /// Create a webhook. An unsigned one prints its token ONCE, since only the digest is stored. A SIGNED one gets no token: a sender like GitHub cannot present one.
+    Create {
+        /// What to call this webhook in the list.
+        #[arg(long)]
+        name: String,
+        /// The domain event every delivery emits, PascalCase past tense (e.g. 'DeployFinished'). Pinned: a caller cannot change it.
+        #[arg(long)]
+        event_type: String,
+        /// Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here.
+        #[arg(long)]
+        hmac: Option<String>,
+        /// Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.
+        #[arg(long)]
+        dedupe: Option<String>,
+        /// Header names to copy into the event payload under `headers`, as a JSON array (e.g. ["X-GitHub-Event"]). A condition then reads `headers.X-GitHub-Event`. An allow-list: `Authorization` and the hook's own signature header are refused, because the events table is append-only.
+        #[arg(long)]
+        headers: Option<String>,
+    },
+    /// Rename a webhook, repin its event type, or switch it off. Omitted fields keep their stored value.
+    Update {
+        /// Webhook UUID, as shown by `list`.
+        #[arg(long)]
+        id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New pinned event type.
+        #[arg(long)]
+        event_type: Option<String>,
+        /// false stops the endpoint accepting deliveries, without deleting it.
+        #[arg(long)]
+        enabled: Option<bool>,
+        /// Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.
+        #[arg(long)]
+        dedupe: Option<String>,
+        /// Header names to copy into the event payload under `headers`, as a JSON array (e.g. ["X-GitHub-Event"]). A condition then reads `headers.X-GitHub-Event`. An allow-list: `Authorization` and the hook's own signature header are refused, because the events table is append-only.
+        #[arg(long)]
+        headers: Option<String>,
+    },
+    /// Delete a webhook. Its URL answers nothing from then on.
+    Delete {
+        /// Webhook UUID, as shown by `list`.
+        #[arg(long)]
+        id: String,
+    },
+}
+
+/// Execute a `lucidos webhooks <op>` command against the parent workspace.
+pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxError> {
+    match cmd {
+        WebhooksCmd::List => {
+            let url = format!("{}/api/v1/webhooks", ws.base_url());
+            let req = client()?.get(&url);
+            send_and_print("GET", &url, req)
+        }
+        WebhooksCmd::Create {
+            name,
+            event_type,
+            hmac,
+            dedupe,
+            headers,
+        } => {
+            let url = format!("{}/api/v1/webhooks", ws.base_url());
+            let mut body = serde_json::Map::new();
+            body.insert("name".into(), serde_json::json!(name));
+            body.insert("event_type".into(), serde_json::json!(event_type));
+            if let Some(v) = hmac {
+                body.insert(
+                    "hmac".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--hmac must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = dedupe {
+                body.insert(
+                    "dedupe".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--dedupe must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = headers {
+                body.insert(
+                    "headers".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--headers must be valid JSON: {}", e))?,
+                );
+            }
+            let req = client()?.post(&url).json(&serde_json::Value::Object(body));
+            send_and_print("POST", &url, req)
+        }
+        WebhooksCmd::Update {
+            id,
+            name,
+            event_type,
+            enabled,
+            dedupe,
+            headers,
+        } => {
+            let url = format!("{}/api/v1/webhooks/{}", ws.base_url(), id);
+            let mut body = serde_json::Map::new();
+            if let Some(v) = name {
+                body.insert("name".into(), serde_json::json!(v));
+            }
+            if let Some(v) = event_type {
+                body.insert("event_type".into(), serde_json::json!(v));
+            }
+            if let Some(v) = enabled {
+                body.insert("enabled".into(), serde_json::json!(v));
+            }
+            if let Some(v) = dedupe {
+                body.insert(
+                    "dedupe".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--dedupe must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = headers {
+                body.insert(
+                    "headers".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--headers must be valid JSON: {}", e))?,
+                );
+            }
+            let req = client()?.put(&url).json(&serde_json::Value::Object(body));
+            send_and_print("PUT", &url, req)
+        }
+        WebhooksCmd::Delete { id } => {
+            let url = format!("{}/api/v1/webhooks/{}", ws.base_url(), id);
             let req = client()?.delete(&url).json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }

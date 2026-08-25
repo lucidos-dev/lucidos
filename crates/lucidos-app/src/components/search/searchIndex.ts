@@ -4,6 +4,7 @@ import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 import { isMobile } from '../../utils/viewport';
 import { isTauri } from '../../utils/platform';
+import { WORKSPACE_ID } from '../../utils/basePath';
 // The one definition of "this client can actually act on the external-link
 // target", shared with the Settings row and its nav entry so search can never
 // offer a result that lands on nothing.
@@ -43,6 +44,11 @@ interface SettingsSearchEntry {
   /** Only surfaced under Tauri, for the same reason again: the in-app browser
    *  opens a desktop webview, so its toggle renders nowhere else. */
   tauriOnly?: boolean;
+  /** Only surfaced on a page the workspace gateway served, once more for the
+   *  same reason: Paired devices reads the gateway's own auth surface and
+   *  renders nothing when there is no gateway to ask. A page on a direct
+   *  engine port resolves that path against the engine and gets a 404. */
+  gatewayOnly?: boolean;
 }
 
 /**
@@ -60,8 +66,13 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'locale', label: 'Locale', subview: 'locale', path: 'Settings', keywords: 'language timezone region locale time zone' },
   { id: 'marketplaces', label: 'Marketplaces', subview: 'marketplaces', path: 'Settings', keywords: 'marketplace plugin catalog install source registry' },
-  { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan' },
-  { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
+  { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan pairing code add device' },
+  { id: 'webhooks', label: 'Webhooks', subview: 'webhooks', path: 'Settings', keywords: 'webhook inbound hook endpoint github stripe slack signature hmac token funnel event' },
+  { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings', keywords: 'device phone laptop push notifications rename remove last seen' },
+  // Pairing lives on the same row as push now, so Revoke is found on the
+  // Devices page rather than under Access. Still gateway-gated: with none, no
+  // row carries a Revoke button and the word would land on nothing.
+  { id: 'devices:paired', label: 'Paired devices', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:list', keywords: 'paired pairing device revoke unpair sign out cut off network access', gatewayOnly: true },
   { id: 'system', label: 'System', subview: 'system', path: 'Settings', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
@@ -98,6 +109,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // tailnet rows from two plain-HTTP reads. Gating it hid the address the
   // browser user came looking for, from behind the section showing it.
   { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet magicdns address phone open elsewhere' },
+  { id: 'access:add-device', label: 'Add a device', subview: 'access', path: 'Settings → Access', anchor: 'access:add-device', keywords: 'pair pairing code qr scan phone new device enrol add' },
   { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
   { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
 
@@ -106,12 +118,13 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:image-generation', label: 'Image generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
   { id: 'models:background-tasks', label: 'Background tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
   { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:vertex-ai', keywords: 'vertex gcloud gcp google adc region' },
-  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter xai grok local gcloud gcp google api key direct credential gpt claude' },
-  { id: 'models:reasoning', label: 'Reasoning', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:reasoning' },
+  { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter xai grok opencode free keyless local gcloud gcp google api key direct credential gpt claude' },
+  { id: 'models:chat-model', label: 'Model', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:chat-model', keywords: 'model reasoning effort thinking tier opus sonnet haiku gpt' },
   { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
   { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
-  { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-context' },
+  { id: 'models:memory-extraction', label: 'Memory extraction', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-extraction' },
+  { id: 'models:conversation-summary', label: 'Conversation summary', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:conversation-summary' },
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:region' },
 
   // Appearance & Behavior subview (Links absorbed the retired Links and
@@ -190,7 +203,8 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
     (!e.mobileOnly || isMobile())
     && (!e.packagedOnly || enginePackaged.value)
     && (!e.iosPwaOnly || externalLinkTargetConfigurable())
-    && (!e.tauriOnly || isTauri());
+    && (!e.tauriOnly || isTauri())
+    && (!e.gatewayOnly || WORKSPACE_ID !== null);
   const matches = q
     ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
     : SETTINGS_SEARCH_INDEX.filter(visible);

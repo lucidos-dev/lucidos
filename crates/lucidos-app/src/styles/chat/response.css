@@ -74,127 +74,6 @@
     flex-shrink: 0;
 }
 
-/* The turn's three controls (`turnControls`), sitting immediately right of the
-   executor label: the full response, the step log, and the turn's fold.
-
-   One gap for all three, the collapse control included. It used to carry an
-   extra 0.3125rem so its narrower scope read as a group break. The break is
-   gone: its label and its turning glyph carry that scope on their own, and two
-   different gaps inside a run of three icons are a claim the eye reads before
-   it reads any tooltip, which landed as "two things and a stray" rather than
-   as a scope split. The class stays, since the brightness rule below still
-   singles the control out by it. */
-.response-controls {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.125rem;
-    flex-shrink: 0;
-    /* One row unit tall, so the header can align its fields at flex-start
-       without the icons riding up off the label's line. The buttons are the
-       tallest thing on the row at 0.875rem plus their 0.25rem of padding, which
-       is under the unit, so this reserves the difference rather than adding
-       any: the run keeps the height it already had inside the header's
-       min-height. */
-    min-height: var(--turn-header-line);
-    /* Pulled back out of the header's 0.5rem gap, because that gap is measured
-       between BOXES and the eye measures ink. The button adds its 0.125rem
-       padding and the glyph its own inset (the chevron starts 5/24 of the way
-       in), so the flex gap alone left ~10px of white between the label's last
-       letter and the first stroke: the controls read as adrift rather than as
-       the label's. At 0.25rem it is ~8px.
-
-       Bounded on both sides, and the floor is now the binding one. With the
-       group break gone this is the ONE gap in the run that differs, so it is
-       the only thing keeping the label out of the run: a 0.375rem pull leaves
-       0.125rem between the boxes, exactly the gap the icons hold between
-       themselves, and the label reads as a fourth item in the row. 0.25rem is
-       double the intra-run gap, which is enough to group.
-
-       The ceiling: the executor button carries 0.375rem of trailing padding
-       cancelled by an equal negative margin (input-messages.css), so its hit
-       area and its hover chip both run that much past the text with only the
-       header's 0.125rem of real gap after them. This pull laps 2px of that
-       padding, where 0.375rem lapped 4px; the label's own text is still
-       exclusively the executor's, but going further starts eating a target
-       the user can feel and only sees on hover. */
-    margin-left: -0.25rem;
-}
-
-/* Tighter than the base .icon-btn's 0.25rem, deliberately: at 0.125rem the
-   button is the 0.875rem glyph plus 0.25rem, which fits inside the header's
-   existing 1.2rem min-height, so adding the controls grows no row anywhere in
-   the transcript. The base padding would push a control-bearing header ~3px
-   past a control-less one, and a row height that varies by turn TYPE reads
-   worse than a uniformly compact one. Everything here is rem, so the button is
-   ~20px on the 18px mobile root and ~27px at 150% ui-scale; the 18px is the
-   plain-desktop floor, not the common case.
-
-   What it costs, at a 16px root with the widest state ("Lucidos Agent" plus
-   "Requesting" plus the timestamp): the header's one-line width goes from
-   251px bare to 293px with two controls and 313px with three, and a thread
-   pane dragged to its 300px floor gives the header less than that. So at the
-   floor an in-flight turn's header runs to two rows, settling back to one when
-   the status shrinks to "Done" (269px with all three). Accepted rather than
-   fixed: wrapping is what that degradation is for, it keeps every field
-   readable where truncating the executor name would not, and a finished turn,
-   which is the whole transcript bar one row, still fits at the floor. Where
-   the break lands is `.response-meta`'s job, not this row's: the meta gives up
-   its width first and stacks the timestamp under the status, so the second row
-   costs the pair its own line rather than costing the whole header one.
-
-   Those two figures are arithmetic off the measured bare one, not fresh
-   measurements: the run costs 22px for its first control (an 18px box after
-   the 8px header gap less the 4px pull) and 20px for each one after it (the
-   box plus the run's 2px gap), which is 42px and 62px. They therefore move
-   whenever either gap above does, so keep them in step rather than reading
-   them as fixed. */
-.response-controls .icon-btn {
-    padding: 0.125rem;
-    color: var(--text-muted);
-}
-
-/* Hover lifts an OFF control one step, to secondary rather than all the way to
-   the primary the ON state uses. Going the whole way made the two states
-   identical under the cursor (both a bright glyph on a hover chip), so the one
-   control the pointer is on was the one you could not read. The chip is the
-   hover cue; the colour stays the state cue.
-
-   Out-specifies the muted default above (2 classes + a pseudo-class), so this
-   holds whichever file the cascade sees last, and the ON rule below both
-   out-specifies this one (its `:not()` argument counts, making it 2 classes +
-   an attribute + a class) and comes later, so a pressed control keeps its
-   brightness while hovered. The collapse control has no ON rule to lose, so
-   hover is the only thing that moves it, which is the whole point. */
-@media (hover: hover) {
-    .response-controls .icon-btn:hover {
-        color: var(--text-secondary);
-    }
-}
-
-/* On: the glyph brightens to full-contrast text and that is the whole state,
-   deliberately NOT the accent-on-a-chip the header's active icons wear
-   (.icon-btn.filter-active in host-components.css). Those sit alone on the app
-   bar; these repeat on every turn, and a column of filled accent chips down a
-   long thread reads as a column of alerts. Muted to bright is enough contrast
-   to answer "is it on" at a glance, and it leaves the hover background as the
-   one thing that fills, in both states, so hover still reads as hover.
-
-   The collapse control is excluded, and the scope split is why. For the pair
-   it belongs to, bright means "on, and you are seeing MORE": their off state
-   looks like nothing at all, so a turn with no steps drawn is indistinguishable
-   from a turn whose steps are hidden unless the control says which. Bright on
-   the collapse control would mean the turn is FOLDED, which is the same cue
-   inverted, sitting 0.125rem from the two it contradicts, with nothing in the
-   spacing left to hint that it answers a different question. And it reports a
-   state nothing else is hiding: the turn underneath it has become a `⋯` stub,
-   which is unmissable and is the affordance for unfolding. So it stays muted
-   in both states, hover is its only change, and `aria-pressed` carries the
-   state for a screen reader. Pinned by
-   styles/__tests__/turn-control-brightness.test.ts. */
-.response-controls .icon-btn[aria-pressed="true"]:not(.response-control-turn) {
-    color: var(--text-primary);
-}
-
 /* Status + timestamp pair: visually grouped on the right since they describe
    the same thing, the current state of the response and when it last updated.
    Same shape as `.initiator-meta` (input-messages.css); the two headers sit one
@@ -770,15 +649,19 @@
     margin: 0;
 }
 
+/* The dashed underline is what tells an in-app link from an external one, so
+   every class the click router claims wears it. */
 .response-content a.artifact-link,
-.response-content a.app-link {
+.response-content a.app-link,
+.response-content a.trigger-link {
     text-decoration: underline dashed;
     cursor: pointer;
 }
 
 @media (hover: hover) {
     .response-content a.artifact-link:hover,
-    .response-content a.app-link:hover {
+    .response-content a.app-link:hover,
+    .response-content a.trigger-link:hover {
         text-decoration: underline solid;
     }
 }

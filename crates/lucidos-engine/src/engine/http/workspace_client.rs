@@ -125,10 +125,10 @@ pub async fn workspace_post<B: serde::Serialize>(
 }
 
 /// The user-facing parameters for spawning a coding-agent thread in another
-/// workspace: the prompt plus the optional title / target folder / backend.
-/// Grouped because these five always travel together from the caller down to
-/// the request-body builder; passing them as a unit keeps the spawn helper
-/// under clippy's argument-count limit without an artificial wrapper.
+/// workspace: the prompt plus the optional title / target folder / backend /
+/// model / effort. Grouped because they always travel together from the caller
+/// down to the request-body builder; passing them as a unit keeps the spawn
+/// helper under clippy's argument-count limit without an artificial wrapper.
 pub struct CrossWorkspaceSpawn<'a> {
     /// The instruction sent to the spawned coding-agent thread.
     pub prompt: &'a str,
@@ -140,6 +140,13 @@ pub struct CrossWorkspaceSpawn<'a> {
     pub folder: Option<&'a str>,
     /// Which backend drives the thread; receiver defaults to Claude Code.
     pub coding_agent: Option<crate::runtime::CodingAgent>,
+    /// Model pin, already validated against `coding_agent`'s picker by the
+    /// caller. Sent as `cc_model`, the field the receiving engine's
+    /// `ChatRequest` reads for a coding-agent thread. Omitted when `None`, so
+    /// the receiver applies its own default.
+    pub model: Option<&'a str>,
+    /// Thinking-budget pin, sent as `reasoning_effort`. Omitted when `None`.
+    pub reasoning_effort: Option<&'a str>,
 }
 
 /// Build the `/api/v1/chat/stream` body for a cross-workspace coding-agent spawn.
@@ -151,28 +158,30 @@ pub struct CrossWorkspaceSpawn<'a> {
 /// threads in the receiving engine.
 pub(crate) fn build_cross_workspace_coding_agent_body(
     cc_thread_id: Uuid,
-    prompt: &str,
-    title: Option<&str>,
-    repo: Option<&str>,
-    folder: Option<&str>,
-    coding_agent: Option<crate::runtime::CodingAgent>,
+    spawn: &CrossWorkspaceSpawn<'_>,
 ) -> Value {
     let mut body = serde_json::json!({
-        "message": prompt,
+        "message": spawn.prompt,
         "thread_id": cc_thread_id.to_string(),
         "use_coding_agent": true,
     });
     let obj = body.as_object_mut().expect("json! built an object");
-    if let Some(t) = title.filter(|s| !s.is_empty()) {
-        obj.insert("title".into(), Value::String(t.to_string()));
+    // `cc_model` rather than `model`: on the receiving `ChatRequest`, `model` is
+    // the CHAT model and `cc_model` is the coding-agent one. Sending the wrong
+    // key would set a chat model on a thread that never runs a chat turn, and
+    // the session would take the backend default with nothing to show for it.
+    for (key, value) in [
+        ("title", spawn.title),
+        ("repo_id", spawn.repo),
+        ("folder", spawn.folder),
+        ("cc_model", spawn.model),
+        ("reasoning_effort", spawn.reasoning_effort),
+    ] {
+        if let Some(v) = value.filter(|s| !s.is_empty()) {
+            obj.insert(key.into(), Value::String(v.to_string()));
+        }
     }
-    if let Some(r) = repo.filter(|s| !s.is_empty()) {
-        obj.insert("repo_id".into(), Value::String(r.to_string()));
-    }
-    if let Some(f) = folder.filter(|s| !s.is_empty()) {
-        obj.insert("folder".into(), Value::String(f.to_string()));
-    }
-    if let Some(agent) = coding_agent {
+    if let Some(agent) = spawn.coding_agent {
         obj.insert(
             "coding_agent".into(),
             Value::String(agent.as_str().to_string()),
@@ -202,14 +211,7 @@ pub async fn spawn_coding_agent_in_workspace(
     scheme: &str,
 ) -> Result<Uuid, String> {
     let cc_thread_id = Uuid::new_v4();
-    let body = build_cross_workspace_coding_agent_body(
-        cc_thread_id,
-        spawn.prompt,
-        spawn.title,
-        spawn.repo,
-        spawn.folder,
-        spawn.coding_agent,
-    );
+    let body = build_cross_workspace_coding_agent_body(cc_thread_id, spawn);
     let url = format!(
         "{}://localhost:{}/api/v1/chat/stream",
         scheme, target.api_port
@@ -367,13 +369,25 @@ mod tests {
         let tid = Uuid::new_v4();
         let body = build_cross_workspace_coding_agent_body(
             tid,
-            "do the thing",
-            Some("My title"),
-            Some("Lucidos"),
-            None,
-            Some(crate::runtime::CodingAgent::Codex),
+            &CrossWorkspaceSpawn {
+                prompt: "do the thing",
+                title: Some("My title"),
+                repo: Some("Lucidos"),
+                folder: None,
+                coding_agent: Some(crate::runtime::CodingAgent::Codex),
+                model: Some("gpt-5.6-luna"),
+                reasoning_effort: Some("low"),
+            },
         );
         assert_eq!(body["message"], "do the thing");
+        // `cc_model`, never `model`: the receiver reads the latter as the CHAT
+        // model, which a coding-agent thread never uses.
+        assert_eq!(body["cc_model"], "gpt-5.6-luna");
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(
+            body.get("model").is_none(),
+            "a coding-agent spawn must not set the chat model key: {body}"
+        );
         assert_eq!(body["thread_id"], tid.to_string());
         assert_eq!(body["use_coding_agent"], true);
         assert_eq!(body["title"], "My title");
@@ -386,11 +400,20 @@ mod tests {
         let tid = Uuid::new_v4();
         let body = build_cross_workspace_coding_agent_body(
             tid,
-            "do the thing",
-            None,
-            None,
-            Some("data/apps/habit-tracker"),
-            Some(crate::runtime::CodingAgent::Codex),
+            &CrossWorkspaceSpawn {
+                prompt: "do the thing",
+                title: None,
+                repo: None,
+                folder: Some("data/apps/habit-tracker"),
+                coding_agent: Some(crate::runtime::CodingAgent::Codex),
+                model: None,
+                reasoning_effort: None,
+            },
+        );
+        assert!(
+            body.get("cc_model").is_none() && body.get("reasoning_effort").is_none(),
+            "an unpinned spawn must omit both, so the receiver applies its own \
+             default rather than being handed an empty string: {body}"
         );
         assert_eq!(body["folder"], "data/apps/habit-tracker");
         assert_eq!(body["coding_agent"], "codex");
@@ -404,7 +427,18 @@ mod tests {
     #[test]
     fn build_coding_agent_body_omits_title_and_repo_when_unset_or_empty() {
         let tid = Uuid::new_v4();
-        let body = build_cross_workspace_coding_agent_body(tid, "x", None, None, None, None);
+        let body = build_cross_workspace_coding_agent_body(
+            tid,
+            &CrossWorkspaceSpawn {
+                prompt: "x",
+                title: None,
+                repo: None,
+                folder: None,
+                coding_agent: None,
+                model: None,
+                reasoning_effort: None,
+            },
+        );
         assert!(
             body.get("title").is_none(),
             "title must be omitted: {:?}",
@@ -426,8 +460,18 @@ mod tests {
             body
         );
         // Empty strings are treated as absent so the receiver doesn't see "".
-        let body =
-            build_cross_workspace_coding_agent_body(tid, "x", Some(""), Some(""), Some(""), None);
+        let body = build_cross_workspace_coding_agent_body(
+            tid,
+            &CrossWorkspaceSpawn {
+                prompt: "x",
+                title: Some(""),
+                repo: Some(""),
+                folder: Some(""),
+                coding_agent: None,
+                model: None,
+                reasoning_effort: None,
+            },
+        );
         assert!(
             body.get("title").is_none(),
             "empty title must be omitted: {:?}",
@@ -494,6 +538,8 @@ mod tests {
                 repo: None,
                 folder: Some("data/apps/habit-tracker"),
                 coding_agent: Some(crate::runtime::CodingAgent::Codex),
+                model: None,
+                reasoning_effort: None,
             },
             &ctx,
             "http",
@@ -574,6 +620,8 @@ mod tests {
                 repo: None,
                 folder: None,
                 coding_agent: None,
+                model: None,
+                reasoning_effort: None,
             },
             &ctx,
             "http",
@@ -622,6 +670,8 @@ mod tests {
                 repo: None,
                 folder: None,
                 coding_agent: None,
+                model: None,
+                reasoning_effort: None,
             },
             &ctx(),
             "http",

@@ -125,6 +125,12 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
     }
 }
 
+/// The registry row wrapping [`get_navigate_ui_tool`], so the chat tail is a
+/// gated table rather than a push.
+pub(super) fn navigate_ui_tools() -> Vec<ToolDefinition> {
+    vec![get_navigate_ui_tool()]
+}
+
 // `manage_repositories` and `manage_models` are now manifest-built grouped tools
 // (see `crate::capability_manifest`, domains `repositories` / `models`). Their
 // schemas come from the manifest (SSOT); `execute_tool` keeps routing the
@@ -393,7 +399,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a backup finishing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a delivery.\n\nMATCHING IS WORKSPACE-WIDE, so any thread's `ChildThreadCompleted` is a real wait whoever spawned it: name it with a `child_thread_id` condition. NOT YOUR OWN CHILD'S: that already re-opens this thread, so a wait duplicates it.\n\nTHE SUBSCRIPTION IS SPENT once it delivers, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -406,11 +412,11 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                             "properties": {
                                 "event_type": {
                                     "type": "string",
-                                    "description": "PascalCase past tense: a thread event (`ChangeProposed`, `CodingAgentIdled`, `ChildThreadCompleted`, …) or a domain event this workspace emits. Streaming events and the `EventWait*` family are refused."
+                                    "description": "PascalCase past tense: a thread event (`ChangeProposed`, `CodingAgentIdled`, `ChildThreadCompleted`, …), a persisted system event (`BackupCompleted`, `TriggerCompleted`, …), or a domain event this workspace emits. Refused: streaming events, the `EventWait*` family, and transient frames that write no event row (`BackupProgress`)."
                                 },
                                 "condition": {
                                     "type": "object",
-                                    "description": "Optional filter on THIS entry. A value for equality, or an operator object (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`). The event's OWN payload fields, plus `thread_id`, which scopes ANY thread event to one thread: `CodingAgentIdled` with `{\"thread_id\": \"<uuid>\"}` is one session finishing."
+                                    "description": "Optional filter on THIS entry. A key is a FIELD PATH, so dots read one level down (`workflow_run.event`) and a missing path is null. A value for equality, or an operator object (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`, `$nin`, `$regex`). `$or` takes a list of conditions. The event's OWN payload fields, plus `thread_id`, which scopes ANY thread event to one thread: `CodingAgentIdled` with `{\"thread_id\": \"<uuid>\"}` is one session finishing."
                                 }
                             },
                             "required": ["event_type"]
@@ -424,7 +430,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                     },
                     "reason": {
                         "type": "string",
-                        "description": "REQUIRED. One short line in the user's language saying what you await; it shows in the subscription indicator."
+                        "description": "REQUIRED. One short line in the user's language saying what you await; it shows in the waiting indicator."
                     }
                 },
                 "required": ["on", "timeout_secs", "reason"]
@@ -475,42 +481,52 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: tn::TODO_WRITE.to_string(),
-            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you call this again.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "todos": {
-                        "type": "array",
-                        "description": "The whole new list. `[]` clears.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "content": {
-                                    "type": "string",
-                                    "description": "Imperative form (\"Run tests\")."
-                                },
-                                "active_form": {
-                                    "type": "string",
-                                    "description": "Present-continuous form, shown while in_progress (\"Running tests\")."
-                                },
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
-                                    "description": "At most ONE item may be `in_progress`."
-                                }
-                            },
-                            "required": ["content", "active_form", "status"]
+/// The todo list, everywhere the *self-curated context mode* is off.
+///
+/// Under the mode the checklist lives in the working understanding, under a
+/// `[TODO]` heading in the model's own reply. Offering this schema as well
+/// would be two write surfaces for one list, which is the cost bug twice over.
+/// So the mode-on array is a strict subset of the mode-off one, and the mode
+/// adds no tool at all.
+pub(super) fn todo_write_tools(caps: &crate::llm::ToolCapabilities) -> Vec<ToolDefinition> {
+    if caps.context_mode {
+        return Vec::new();
+    }
+    let parameters = json!({
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "description": "The whole new list. `[]` clears.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Imperative form (\"Run tests\")."
+                        },
+                        "active_form": {
+                            "type": "string",
+                            "description": "Present-continuous form, shown while in_progress (\"Running tests\")."
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                            "description": "At most ONE item may be `in_progress`."
                         }
-                    }
-                },
-                "required": ["todos"]
-            }),
+                    },
+                    "required": ["content", "active_form", "status"]
+                }
+            }
         },
-    ]
+        "required": ["todos"]
+    });
+
+    vec![ToolDefinition {
+        name: tn::TODO_WRITE.to_string(),
+        description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. AT RESPONSE END the engine settles every unfinished item: `waiting` if you still hold an event wait, else `abandoned` (you walked away). Work you finish after a settle still shows `abandoned` until you call this again.".to_string(),
+        parameters,
+    }]
 }
 
 /// Contract codegen for the `navigate_ui` `target` + `settings_view` enums.

@@ -81,10 +81,26 @@ new_inputs() {
     printf '%s' "$dir"
 }
 
+# The named-resource arguments for a new_inputs tree, into the ARGS array. One
+# helper, so a case that wants to break ONE resource breaks it in the inputs
+# rather than by hand-editing a long argument list.
+set_args() {
+    local dir="$1"
+    ARGS=(
+        "lucidos-engine=$dir/engine"
+        "lucidos-gateway=$dir/gateway"
+        "lucidos=$dir/cli"
+        "frontend=$dir/frontend"
+        "postgres=$dir/pg"
+        "sdk=$dir/sdk"
+        "system-knowhow=$dir/system-knowhow"
+    )
+}
+
 echo ""
 echo "test: stage_runtime_assemble lays down exactly the 7 RESOURCE_NAMES"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
-OUT="$(stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow")"; rc=$?
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
+OUT="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}")"; rc=$?
 if [ $rc -eq 0 ] && [ "$OUT" = "$STAGE" ]; then pass "assemble exits 0 and prints the stage dir"; else fail "assemble failed (rc=$rc, out=$OUT)"; fi
 for n in lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow; do
     if [ -e "$STAGE/$n" ]; then pass "staged $n"; else fail "missing $n in stage"; fi
@@ -102,35 +118,63 @@ if [ "$count" = "7" ]; then pass "stage has exactly 7 top-level entries"; else f
 echo ""
 echo "test: stage_runtime_assemble re-stages cleanly (removes stale entries)"
 printf 'stale\n' > "$STAGE/stale-file"
-stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 if [ -e "$STAGE/stale-file" ]; then fail "stale file survived a re-stage"; else pass "stale file removed on re-stage"; fi
-rm -rf "$IN" "$STAGE"
+
+echo ""
+echo "test: the argument ORDER carries nothing"
+# The whole point of naming them. The old signature took eight ordered paths, so
+# two inputs of the same kind could be swapped and the stage still looked fine.
+STAGE2="$(mktemp -d)/stage"
+stage_runtime_assemble "$STAGE2" \
+    "system-knowhow=$IN/system-knowhow" "sdk=$IN/sdk" "postgres=$IN/pg" \
+    "frontend=$IN/frontend" "lucidos=$IN/cli" "lucidos-gateway=$IN/gateway" \
+    "lucidos-engine=$IN/engine" >/dev/null
+if diff -r "$STAGE" "$STAGE2" >/dev/null 2>&1; then pass "a reordered call stages an identical tree"; else fail "argument order changed the tree"; fi
+rm -rf "$STAGE2" "$IN" "$STAGE"
 
 echo ""
 echo "test: stage_runtime_assemble refuses a missing input"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 rm -rf "$IN/sdk"
-out="$(stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && echo "$out" | grep -qi "sdk dist not found"; then pass "missing sdk input refused"; else fail "expected missing-sdk refusal (rc=$rc): $out"; fi
+out="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "resource 'sdk' not found"; then pass "missing sdk input refused"; else fail "expected missing-sdk refusal (rc=$rc): $out"; fi
 if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on refusal"; fi
 rm -rf "$IN"
 
 echo ""
 echo "test: stage_runtime_assemble refuses a missing lucidos CLI binary"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 rm -f "$IN/cli"
-out="$(stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && echo "$out" | grep -qi "lucidos CLI binary not found"; then pass "missing lucidos CLI refused"; else fail "expected missing-cli refusal (rc=$rc): $out"; fi
+out="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "resource 'lucidos' not found"; then pass "missing lucidos CLI refused"; else fail "expected missing-cli refusal (rc=$rc): $out"; fi
 if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on refusal"; fi
 rm -rf "$IN"
 
 echo ""
 echo "test: stage_runtime_assemble refuses a missing system-knowhow dir"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
 rm -rf "$IN/system-knowhow"
-out="$(stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" 2>&1)"; rc=$?
-if [ $rc -ne 0 ] && echo "$out" | grep -qi "system-knowhow dir not found"; then pass "missing system-knowhow refused"; else fail "expected missing-system-knowhow refusal (rc=$rc): $out"; fi
+out="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "resource 'system-knowhow' not found"; then pass "missing system-knowhow refused"; else fail "expected missing-system-knowhow refusal (rc=$rc): $out"; fi
 if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on refusal"; fi
+rm -rf "$IN"
+
+echo ""
+echo "test: stage_runtime_assemble refuses a malformed or repeated resource"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
+out="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}" "$IN/engine" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "expects <name>=<path>"; then pass "a bare path is refused"; else fail "expected a <name>=<path> refusal (rc=$rc): $out"; fi
+out="$(stage_runtime_assemble "$STAGE" "${ARGS[@]}" "sdk=$IN/sdk" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "given twice"; then pass "a repeated resource is refused"; else fail "expected a duplicate refusal (rc=$rc): $out"; fi
+out="$(stage_runtime_assemble "$STAGE" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "at least one"; then pass "no resources at all is refused"; else fail "expected an empty-list refusal (rc=$rc): $out"; fi
+# A plain, non-executable file is neither a staged dir nor a staged binary, so it
+# is named rather than copied into a bundle that would fail to launch it.
+printf 'not executable\n' > "$IN/plain"
+out="$(stage_runtime_assemble "$STAGE" "lucidos-engine=$IN/plain" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "neither a directory nor an executable"; then pass "a non-executable file is refused"; else fail "expected a non-executable refusal (rc=$rc): $out"; fi
+if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on any refusal"; fi
 rm -rf "$IN"
 
 # ── staged-knowhow freshness (the hand-run-build guard) ──────────────────────
@@ -153,8 +197,8 @@ rm -rf "$IN" "$STAGE"
 
 echo ""
 echo "test: stage_runtime_staged_knowhow_fresh accepts a stage assemble just wrote"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
-stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
+stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "freshly staged copy is clean"; else fail "a copy assemble just made must be clean"; fi
 
 echo ""
@@ -163,18 +207,18 @@ printf '# glossary v2\n' > "$IN/system-knowhow/glossary.md"
 out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "drifted from the live tree"; then pass "changed file caught"; else fail "expected changed-file drift (rc=$rc): $out"; fi
 if echo "$out" | grep -q "rm -rf"; then pass "drift message says how to fix it"; else fail "drift message must name the remedy: $out"; fi
-stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 printf '# new doc\n' > "$IN/system-knowhow/triggers.md"
 if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc added since staging should be drift"; else pass "added file caught"; fi
-stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 rm -f "$IN/system-knowhow/triggers.md"
 if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc deleted since staging should be drift"; else pass "removed file caught"; fi
 rm -rf "$IN" "$STAGE"
 
 echo ""
 echo "test: stage_runtime_staged_knowhow_fresh refuses a missing live tree"
-IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
-stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"; set_args "$IN"
+stage_runtime_assemble "$STAGE" "${ARGS[@]}" >/dev/null
 rm -rf "$IN/system-knowhow"
 out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "system-knowhow dir not found"; then pass "missing live tree refused, never read as clean"; else fail "expected missing-live-tree refusal (rc=$rc): $out"; fi

@@ -68,32 +68,79 @@ pub(crate) fn supports_extended_thinking(model: &str) -> bool {
         || model.contains("claude-fable-5")
 }
 
+/// Adaptive-thinking Claude models, each paired with the ceiling the API
+/// accepts for its `max_tokens`.
+///
+/// One list answers both questions on purpose. `max_tokens` bounds thinking AND
+/// response text together. Too low a value cuts a deep turn wherever it had
+/// reached, including mid tool-call
+/// (`docs/plans/2026-08-18-a-truncated-tool-argument-stream.md`). Too high is
+/// worse: the API rejects the request, so every turn on that model fails rather
+/// than one long one. Pairing each fragment with its ceiling means a new arm
+/// cannot be added without naming one.
+///
+/// 128_000 is the exact ceiling, not a decimal reading of "128k". Vertex
+/// rejects anything above it with `max_tokens: N > 128000, which is the maximum
+/// allowed number of output tokens`. Opus 4.7, Opus 4.8, Opus 5 and Sonnet 5
+/// each report that same number.
+const ADAPTIVE_THINKING_MODELS: &[(&str, u32)] = &[
+    ("claude-opus-4-7", 128_000),
+    ("claude-opus-4-8", 128_000),
+    ("claude-opus-5", 128_000),
+    ("claude-sonnet-5", 128_000),
+    ("claude-fable-5", 128_000),
+];
+
+/// The `max_tokens` ceiling for an adaptive-thinking model, or `None` when the
+/// model is not one. See [`ADAPTIVE_THINKING_MODELS`].
+fn adaptive_max_output_tokens(model: &str) -> Option<u32> {
+    ADAPTIVE_THINKING_MODELS
+        .iter()
+        .find(|(fragment, _)| model.contains(fragment))
+        .map(|&(_, max_tokens)| max_tokens)
+}
+
 /// Models that only support adaptive thinking (no `budget_tokens`, no
 /// `temperature`/`top_p`/`top_k`). Effort is controlled via
 /// `output_config.effort`. Covers Opus 4.7+ (incl. Opus 5), Sonnet 5, and
 /// Fable 5. Sonnet 4.6 and older stay on the `budget_tokens` path.
 pub(crate) fn requires_adaptive_thinking(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
-        || model.contains("claude-opus-4-8")
-        || model.contains("claude-opus-5")
-        || model.contains("claude-sonnet-5")
-        || model.contains("claude-fable-5")
+    adaptive_max_output_tokens(model).is_some()
 }
 
 /// Convert MessageContent to the serde_json::Value format Claude expects.
 /// Text → JSON string, Blocks → JSON array of content block objects.
-fn message_content_to_claude_value(content: &MessageContent) -> serde_json::Value {
+///
+/// Also reports where this message's cache marker belongs: the index of the
+/// last block that is not an engine tail block, or `None` for string content.
+/// The anchor is computed here because this is where the emitted array is
+/// built. The filter below drops blocks, so an emitted index is not a source
+/// index.
+fn message_content_to_claude_value(content: &MessageContent) -> (serde_json::Value, Option<usize>) {
     match content {
-        MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+        MessageContent::Text(s) => (serde_json::Value::String(s.clone()), None),
         MessageContent::Blocks(blocks) => {
-            let json_blocks: Vec<serde_json::Value> = blocks
-                .iter()
-                .filter(|block| !matches!(block, ContentBlock::Text { text } if text.is_empty()))
-                .map(|block| match block {
-                    ContentBlock::Text { text } => serde_json::json!({
-                        "type": "text",
-                        "text": text,
-                    }),
+            let mut json_blocks: Vec<serde_json::Value> = Vec::with_capacity(blocks.len());
+            let mut anchor: Option<usize> = None;
+            // Both text forms are filtered. They emit the same `type: "text"`
+            // below, and the API rejects an empty one.
+            for block in blocks.iter().filter(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Text { text } | ContentBlock::EngineTail { text }
+                        if text.is_empty()
+                )
+            }) {
+                if !matches!(block, ContentBlock::EngineTail { .. }) {
+                    anchor = Some(json_blocks.len());
+                }
+                json_blocks.push(match block {
+                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
+                        serde_json::json!({
+                            "type": "text",
+                            "text": text,
+                        })
+                    }
                     ContentBlock::ToolUse {
                         id,
                         name,
@@ -129,9 +176,9 @@ fn message_content_to_claude_value(content: &MessageContent) -> serde_json::Valu
                             "data": data,
                         },
                     }),
-                })
-                .collect();
-            serde_json::Value::Array(json_blocks)
+                });
+            }
+            (serde_json::Value::Array(json_blocks), anchor)
         }
     }
 }
@@ -150,7 +197,9 @@ fn thinking_config(
     let effort = reasoning_effort.unwrap_or("high");
     if effort == "none" {
         (None, None, 8192)
-    } else if requires_adaptive_thinking(base_model) {
+    } else if let Some(max_tokens) = adaptive_max_output_tokens(base_model) {
+        // The model's own ceiling, so `end_turn` ends the turn rather than a
+        // budget we invented. See [`ADAPTIVE_THINKING_MODELS`].
         (
             Some(ClaudeThinking {
                 thinking_type: "adaptive".to_string(),
@@ -159,7 +208,7 @@ fn thinking_config(
             Some(ClaudeOutputConfig {
                 effort: effort.to_string(),
             }),
-            32768,
+            max_tokens,
         )
     } else {
         let budget = crate::llm::thinking_budget_for_effort(effort);
@@ -220,9 +269,13 @@ pub(crate) fn build_claude_request(
 
     let mut claude_messages: Vec<ClaudeMessage> = messages
         .iter()
-        .map(|m| ClaudeMessage {
-            role: m.role.clone(),
-            content: message_content_to_claude_value(&m.content),
+        .map(|m| {
+            let (content, cache_anchor) = message_content_to_claude_value(&m.content);
+            ClaudeMessage {
+                role: m.role.clone(),
+                content,
+                cache_anchor,
+            }
         })
         .collect();
 
@@ -243,6 +296,7 @@ pub(crate) fn build_claude_request(
     };
 
     apply_cache_control_to_last_message(&mut claude_messages);
+    apply_cache_control_to_penultimate_message(&mut claude_messages);
 
     let (thinking, output_config, max_tokens) = thinking_config(base_model, reasoning_effort);
 
@@ -289,6 +343,8 @@ pub(crate) async fn parse_claude_stream(
 ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
+    // Bytes of a character the transport split across two chunks.
+    let mut carry: Vec<u8> = Vec::new();
 
     // Accumulated content blocks by index
     let mut blocks: Vec<AccumulatedBlock> = Vec::new();
@@ -310,7 +366,7 @@ pub(crate) async fn parse_claude_stream(
             }
         };
 
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        crate::llm::push_utf8_chunk(&mut carry, &chunk, &mut buffer);
 
         // Process complete lines
         while let Some(newline_pos) = buffer.find('\n') {
@@ -343,6 +399,15 @@ pub(crate) async fn parse_claude_stream(
                             if let AccumulatedBlock::Text(t) = block {
                                 let raw_start = t.len() - (new_text_len - prev_text_len);
                                 let delta_start = t.floor_char_boundary(raw_start);
+                                // `delta_start == 0` with earlier text already
+                                // streamed means this chunk is a new text
+                                // block's first content. Mirror the storage
+                                // side's newline join here too, or a replayed
+                                // history reads differently from what the
+                                // user watched stream by.
+                                if delta_start == 0 && prev_text_len > 0 {
+                                    cb("\n");
+                                }
                                 cb(&t[delta_start..]);
                                 break;
                             }
@@ -356,6 +421,29 @@ pub(crate) async fn parse_claude_stream(
 
     crate::llm::cache_probe::log_response(&turn_meta, provider_tag);
 
+    // A whole Anthropic stream always ends with `message_delta`, which carries
+    // the stop reason. Without one the provider hung up early, so a parse that
+    // salvaged nothing is a truncation rather than a turn the model chose to
+    // end. Fail here to reach the caller's retry loop, which only sees `Err`.
+    // Returning Ok would hand the agentic loop an unrecognised stop and cost
+    // the whole turn (ADR 0089).
+    if turn_meta.stop_reason.is_none() && !blocks.iter().any(carries_output) {
+        return Err(format!(
+            "Claude stream truncated: {} closed the stream before message_delta, with nothing to show for {} input tokens",
+            provider_tag,
+            turn_meta.input_tokens.unwrap_or(0),
+        )
+        .into());
+    }
+
+    // A retry re-runs the whole request, so text the callback already pushed
+    // would render a second time (ADR 0089). Only the callback can have pushed
+    // it, so a caller without one is still safe to retry.
+    let already_rendered_text = on_token.is_some()
+        && blocks
+            .iter()
+            .any(|b| matches!(b, AccumulatedBlock::Text(t) if !t.is_empty()));
+
     // Build LlmResponse from accumulated blocks
     let mut content = None;
     let mut tool_calls = Vec::new();
@@ -363,8 +451,20 @@ pub(crate) async fn parse_claude_stream(
 
     for block in blocks {
         match block {
+            // A turn can carry more than one text block (Anthropic interleaves
+            // thinking and text). They are separate blocks in the wire format,
+            // not a pre-split string, so join on a newline rather than
+            // concatenate: a bare join could weld two sentences together. An
+            // empty block (a placeholder that never got a delta) contributes
+            // nothing, rather than a bare newline.
             AccumulatedBlock::Text(text) => {
-                content = Some(text);
+                if text.is_empty() {
+                    continue;
+                }
+                content = Some(match content {
+                    Some(existing) => format!("{existing}\n{text}"),
+                    None => text,
+                });
             }
             AccumulatedBlock::ToolUse {
                 id,
@@ -375,9 +475,13 @@ pub(crate) async fn parse_claude_stream(
                     serde_json::json!({})
                 } else {
                     serde_json::from_str(&json_parts).map_err(|e| {
-                        format!(
-                            "Failed to parse tool arguments: {} (json: {})",
-                            e, json_parts
+                        tool_argument_parse_error(
+                            e,
+                            &name,
+                            &json_parts,
+                            &turn_meta,
+                            provider_tag,
+                            already_rendered_text,
                         )
                     })?
                 };
@@ -405,7 +509,102 @@ pub(crate) async fn parse_claude_stream(
         cache_read_tokens: turn_meta.cache_read_tokens,
         thinking_chars: Some(thinking_chars),
         unknown_sse_dropped: turn_meta.unknown_sse_dropped,
+        // Claude's pre-tool narration is a printable answer fragment and
+        // already rides in `content`, so nothing here is model-only.
+        model_only_text: None,
     })
+}
+
+/// The error for a `tool_use` block whose accumulated arguments do not parse.
+/// Which error depends on why the stream stopped, because that is what decides
+/// whether retrying can help (ADR 0091).
+///
+/// No stop reason means the connection ended mid-arguments. That is ADR 0089's
+/// truncation, one block later. Nothing of a tool call reaches the frontend and
+/// the tool never ran, so a retry duplicates nothing. The wording carries
+/// "stream truncated" because `is_transient_error` matches on it.
+///
+/// Unless the same turn already streamed text, which the tool call's own
+/// emptiness says nothing about. Retrying there renders that text twice, the
+/// case ADR 0089 rejected outright, so it reports and stops instead.
+///
+/// `max_tokens` means the model exhausted its output budget mid-call. An
+/// identical retry is cut identically, so this arm is deliberately NOT
+/// retryable.
+///
+/// Any other stop reason is the model emitting malformed JSON under a stop it
+/// chose. Not a transport problem, so it keeps the original wording.
+fn tool_argument_parse_error(
+    err: serde_json::Error,
+    tool_name: &str,
+    json_parts: &str,
+    meta: &TurnMeta,
+    provider_tag: &str,
+    already_rendered_text: bool,
+) -> String {
+    match meta.stop_reason.as_deref() {
+        None if already_rendered_text => stays_non_retryable(
+            format!(
+                "Claude ended the stream partway through the arguments for '{}', after already \
+                 sending text. Retrying would render that text twice, so the turn stops here.",
+                tool_name,
+            ),
+            "Claude ended the stream partway through a tool call, after already sending text. \
+             Retrying would render that text twice, so the turn stops here.",
+        ),
+        None => format!(
+            "Claude stream truncated: {} closed the stream {} bytes into the arguments for '{}', before message_delta",
+            provider_tag,
+            json_parts.len(),
+            tool_name,
+        ),
+        Some("max_tokens") => stays_non_retryable(
+            format!(
+                "Claude hit the model's output token limit while streaming the arguments for \
+                 '{}'. The call was cut off, so the tool never ran. Ask for the work in smaller \
+                 steps.",
+                tool_name,
+            ),
+            "Claude hit the model's output token limit while streaming a tool call's arguments. \
+             The call was cut off, so the tool never ran. Ask for the work in smaller steps.",
+        ),
+        Some(_) => stays_non_retryable(
+            format!("Failed to parse tool arguments: {} (json: {})", err, json_parts),
+            "Failed to parse tool arguments, and the arguments are withheld here because they \
+             read as a transient transport error.",
+        ),
+    }
+}
+
+/// Guarantee an error that must not retry does not read as one that should.
+///
+/// `is_retryable_error` decides by sniffing the text, and all three of the
+/// non-retryable arms above interpolate model-supplied content. A tool name may
+/// legally be `502` (`^[a-zA-Z0-9_-]{1,128}$`), raw arguments may contain one,
+/// and a serde message ends in a column number. Any of those reads as a
+/// transient HTTP status.
+///
+/// So the detailed message is used only when it classifies correctly, and a
+/// fixed fallback carrying no model text is used when it does not. Losing the
+/// detail in that case is the cheap side of the trade: the alternative is a
+/// budget cut that retries forever, or a rendered turn that renders twice.
+fn stays_non_retryable(detailed: String, fallback: &str) -> String {
+    if crate::llm::is_retryable_error(&detailed) {
+        fallback.to_string()
+    } else {
+        detailed
+    }
+}
+
+/// Whether a block holds something a retry would duplicate or throw away.
+/// Thinking counts as nothing: it never reaches the frontend, and the engine
+/// keeps only its length.
+fn carries_output(block: &AccumulatedBlock) -> bool {
+    match block {
+        AccumulatedBlock::Text(text) => !text.is_empty(),
+        AccumulatedBlock::ToolUse { .. } => true,
+        AccumulatedBlock::Thinking(_) => false,
+    }
 }
 
 fn process_sse_data(
@@ -561,7 +760,15 @@ fn process_sse_data(
 /// write premium and everything beyond is pure savings. Render order is
 /// `tools` → `system` → `messages` — a marker on the last block of each tier
 /// caches everything before it. We place markers on tools[-1], the system
-/// block, and the last message's last content block (3 of the 4 allowed).
+/// block, the last message's last content block, and the one before it. That
+/// is all 4 of the allowed breakpoints.
+///
+/// **All 4 are spent, so a fifth marker is a turn-killing change.** The request
+/// carries no top-level `cache_control`, so nothing asks for an automatic
+/// breakpoint, and an automatic one alongside 4 explicit ones is a 400. To add
+/// a marker somewhere new, one of the four has to go, and
+/// `docs/investigations/2026-08-23-context-mode-cache-breakpoint-diagnosis.md`
+/// measures what each is worth.
 fn ephemeral_cache_marker() -> serde_json::Value {
     serde_json::json!({"type": "ephemeral"})
 }
@@ -598,29 +805,73 @@ fn apply_cache_control_to_last_tool(tools: &mut [ClaudeTool]) {
     }
 }
 
-/// Mark the final message so the entire prior conversation prefix becomes a
-/// cache breakpoint on the next turn. Bare-string content is rewritten into the
-/// array form (the only shape that accepts `cache_control`); existing arrays get
-/// the marker on their final block. Empty strings are left alone — they have
-/// nothing worth caching and round-tripping them through the array form would
-/// produce an empty text block, which the API rejects.
-fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) {
-    let Some(last) = messages.last_mut() else {
-        return;
-    };
-    match &mut last.content {
+/// Mark one message's last non-tail content block, so the prefix ending there
+/// becomes a cache breakpoint.
+///
+/// The panel and the working understanding ride on the message holding the
+/// round's tool results. Both are rewritten at the top of the next round, so a
+/// mark on the final block re-sends those results at write price every round.
+/// Under the sweep a result stays whole for 6 to 15 rounds, so that is
+/// thousands of tokens rather than a hundred.
+///
+/// Bare-string content is rewritten into the array form, the only shape that
+/// accepts `cache_control`. An array is marked at `cache_anchor`, which
+/// [`message_content_to_claude_value`] set from the typed blocks. Nothing is
+/// given up by stopping short: the blocks after the mark are collapsed next
+/// round anyway, so no request could ever have read them. We skip an empty
+/// string. It has nothing worth caching, and the array form would turn it into
+/// an empty text block, which the API rejects.
+fn mark_message_for_cache(message: &mut ClaudeMessage) {
+    let anchor = message.cache_anchor;
+    match &mut message.content {
         serde_json::Value::String(s) if !s.is_empty() => {
             let text = std::mem::take(s);
-            last.content = serde_json::Value::Array(vec![text_block_with_cache_control(text)]);
+            message.content = serde_json::Value::Array(vec![text_block_with_cache_control(text)]);
+            message.cache_anchor = Some(0);
         }
         serde_json::Value::Array(arr) => {
-            let Some(last_block) = arr.last_mut().and_then(|b| b.as_object_mut()) else {
+            // A message of nothing but tail blocks falls back to its final one.
+            // Still exactly one mark, so the count of four holds.
+            let at = anchor.unwrap_or(arr.len().saturating_sub(1));
+            let Some(block) = arr.get_mut(at).and_then(|b| b.as_object_mut()) else {
                 return;
             };
-            last_block.insert("cache_control".to_string(), ephemeral_cache_marker());
+            block.insert("cache_control".to_string(), ephemeral_cache_marker());
         }
         _ => {}
     }
+}
+
+/// Mark the final message so the entire prior conversation prefix becomes a
+/// cache breakpoint on the next turn.
+fn apply_cache_control_to_last_message(messages: &mut [ClaudeMessage]) {
+    if let Some(last) = messages.last_mut() {
+        mark_message_for_cache(last);
+    }
+}
+
+/// Mark the message in front of the tail, so a round that rewrites the tail can
+/// still read everything before it.
+///
+/// A read needs a breakpoint some earlier request wrote. Anthropic's ~20-block
+/// lookback finds only such an entry. Behind the tail marker there is nothing
+/// but the system block, so touching the last message drops the whole array
+/// back to full price.
+///
+/// Two things touch it. The context mode rewrites one message at the top of
+/// every round, always the one that was last in the previous round: see
+/// `chat::process::context_panel::collapse_tail_blocks`. And in either mode, a
+/// round can put more than ~20 blocks between consecutive tail markers, which
+/// puts the previous entry out of lookback range.
+///
+/// The penultimate message is the newest position neither case disturbs. The
+/// measurements are in
+/// `docs/investigations/2026-08-23-context-mode-cache-breakpoint-diagnosis.md`.
+fn apply_cache_control_to_penultimate_message(messages: &mut [ClaudeMessage]) {
+    let Some(index) = messages.len().checked_sub(2) else {
+        return;
+    };
+    mark_message_for_cache(&mut messages[index]);
 }
 
 // ===== Claude/Anthropic request/response types =====
@@ -670,6 +921,14 @@ pub(crate) struct ClaudeOutputConfig {
 pub(crate) struct ClaudeMessage {
     pub role: String,
     pub content: serde_json::Value,
+    /// Where a cache marker on this message belongs: the index in `content` of
+    /// the last block the engine did not append at the tail. `None` for string
+    /// content, and for an array of nothing but tail blocks.
+    ///
+    /// Carried rather than re-derived, because by this point the array is
+    /// untyped JSON and a tail block is indistinguishable from any other text.
+    #[serde(skip)]
+    pub cache_anchor: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -678,8 +937,8 @@ pub(crate) struct ClaudeTool {
     pub description: String,
     pub input_schema: serde_json::Value,
     /// Set on the last tool to make tools+system a cached prefix. The cap is 4
-    /// cache_control breakpoints per request; we use 3 (this + system + the last
-    /// message), so the budget is comfortably under.
+    /// cache_control breakpoints per request. This one, system, the last
+    /// message and the one before it are all 4, so there is no spare.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<serde_json::Value>,
 }
@@ -827,7 +1086,7 @@ mod tests {
         assert_eq!(thinking.thinking_type, "adaptive");
         assert!(thinking.budget_tokens.is_none());
         assert_eq!(output_config.expect("effort present").effort, "xhigh");
-        assert_eq!(max_tokens, 32768);
+        assert_eq!(max_tokens, 128_000);
     }
 
     #[test]
@@ -841,7 +1100,55 @@ mod tests {
         assert_eq!(thinking.thinking_type, "adaptive");
         assert!(thinking.budget_tokens.is_none());
         assert_eq!(output_config.expect("effort present").effort, "high");
-        assert_eq!(max_tokens, 32768);
+        assert_eq!(max_tokens, 128_000);
+    }
+
+    /// `max_tokens` covers thinking as well as the reply, so every effort level
+    /// gets the model's full ceiling. A lower number is a budget we did not
+    /// mean to set, and it cut a real turn mid `write_file`
+    /// (`docs/plans/2026-08-18-a-truncated-tool-argument-stream.md`).
+    #[test]
+    fn every_adaptive_model_gets_its_full_output_ceiling_at_every_effort() {
+        for (fragment, ceiling) in ADAPTIVE_THINKING_MODELS {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let (_, _, max_tokens) = thinking_config(fragment, Some(effort));
+                assert_eq!(
+                    max_tokens, *ceiling,
+                    "{fragment} at {effort} effort must get its full ceiling"
+                );
+            }
+        }
+    }
+
+    /// The registry ids carry an `@default` alias and a `[1m]` suffix, and the
+    /// ceiling lookup is the same substring match the adaptive gate uses. Both
+    /// have to survive those decorations or the model silently falls to the
+    /// 8192-token no-thinking path.
+    #[test]
+    fn the_output_ceiling_survives_the_alias_and_context_suffixes() {
+        for id in [
+            "claude-opus-5",
+            "claude-opus-5@default",
+            "claude-opus-5@default[1m]",
+            "claude-sonnet-5[1m]",
+        ] {
+            assert_eq!(adaptive_max_output_tokens(id), Some(128_000), "{id}");
+        }
+    }
+
+    /// The `budget_tokens` path is deliberately untouched: those models are a
+    /// separate generation with their own limits, and nothing reported points
+    /// at them. Sonnet 4.6 is the closest neighbour, so it pins the boundary.
+    #[test]
+    fn the_budget_tokens_path_keeps_its_own_max_tokens() {
+        assert_eq!(adaptive_max_output_tokens("claude-sonnet-4-6"), None);
+        let (thinking, output_config, max_tokens) =
+            thinking_config("claude-sonnet-4-6", Some("xhigh"));
+        let thinking = thinking.expect("extended thinking present");
+        assert_eq!(thinking.thinking_type, "enabled");
+        let budget = thinking.budget_tokens.expect("budget present");
+        assert!(output_config.is_none());
+        assert_eq!(max_tokens, budget + 16384);
     }
 
     #[test]
@@ -858,7 +1165,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let value = message_content_to_claude_value(&content);
+        let (value, _) = message_content_to_claude_value(&content);
         let arr = value.as_array().unwrap();
         // Empty text block should be filtered out, leaving only the image
         assert_eq!(arr.len(), 1);
@@ -877,7 +1184,7 @@ mod tests {
                 data: "AAAA".to_string(),
             },
         ]);
-        let value = message_content_to_claude_value(&content);
+        let (value, _) = message_content_to_claude_value(&content);
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], "text");
@@ -982,6 +1289,7 @@ mod tests {
         let mut messages = vec![ClaudeMessage {
             role: "user".into(),
             content: serde_json::Value::String("hello there".into()),
+            cache_anchor: None,
         }];
         apply_cache_control_to_last_message(&mut messages);
         let arr = messages[0].content.as_array().unwrap();
@@ -999,11 +1307,144 @@ mod tests {
                 {"type": "text", "text": "first block"},
                 {"type": "text", "text": "second block"},
             ]),
+            cache_anchor: None,
         }];
         apply_cache_control_to_last_message(&mut messages);
         let arr = messages[0].content.as_array().unwrap();
         assert!(arr[0].get("cache_control").is_none());
         assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// A message built the way `build_claude_request` builds one, so the anchor
+    /// is derived from the block types rather than asserted into place.
+    fn from_blocks(role: &str, blocks: Vec<ContentBlock>) -> ClaudeMessage {
+        let (content, cache_anchor) =
+            message_content_to_claude_value(&MessageContent::Blocks(blocks));
+        ClaudeMessage {
+            role: role.into(),
+            content,
+            cache_anchor,
+        }
+    }
+
+    /// Invariant 41. The panel and the document ride on the message holding the
+    /// round's tool results. Both are rewritten at the top of the next round,
+    /// so a mark on the final block re-sends the results at write price.
+    #[test]
+    fn the_last_message_mark_clears_the_engines_tail_blocks() {
+        let mut messages = vec![from_blocks(
+            "user",
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "a big result".into(),
+                },
+                ContentBlock::Text {
+                    text: "Results above.".into(),
+                },
+                ContentBlock::EngineTail {
+                    text: "[CONTEXT PANEL]\nYou are holding …".into(),
+                },
+                ContentBlock::EngineTail {
+                    text: "[WORKING UNDERSTANDING]\nwhat I know\n".into(),
+                },
+            ],
+        )];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert_eq!(
+            arr[1]["cache_control"]["type"], "ephemeral",
+            "the mark belongs on the instruction, in front of the tail blocks"
+        );
+        assert_eq!(
+            arr.iter()
+                .filter(|b| b.get("cache_control").is_some())
+                .count(),
+            1,
+            "still exactly one mark on this message, so the count of four holds"
+        );
+    }
+
+    /// A message of nothing but tail blocks still gets its one mark, on the
+    /// last of them. Skipping it would spend a breakpoint on nothing.
+    #[test]
+    fn a_message_of_only_tail_blocks_falls_back_to_its_last() {
+        let mut messages = vec![from_blocks(
+            "user",
+            vec![
+                ContentBlock::EngineTail {
+                    text: "[CONTEXT PANEL]\nx".into(),
+                },
+                ContentBlock::EngineTail {
+                    text: "[WORKING UNDERSTANDING]\ny".into(),
+                },
+            ],
+        )];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert!(arr[0].get("cache_control").is_none());
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// Both text forms are dropped when empty. They emit the same `type:
+    /// "text"`, and the API answers an empty one with a 400.
+    #[test]
+    fn an_empty_tail_block_never_reaches_the_wire() {
+        let message = from_blocks(
+            "user",
+            vec![
+                ContentBlock::Text { text: "".into() },
+                ContentBlock::EngineTail { text: "".into() },
+                ContentBlock::Text {
+                    text: "the only survivor".into(),
+                },
+            ],
+        );
+        let arr = message.content.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["text"], "the only survivor");
+    }
+
+    /// Invariant 1. With the mode off no block in the array is a tail block,
+    /// so the mark lands where it always did.
+    #[test]
+    fn a_control_arm_message_is_marked_on_its_final_block() {
+        let mut messages = vec![from_blocks(
+            "user",
+            vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "a result".into(),
+                },
+                ContentBlock::Text {
+                    text: "Results above.".into(),
+                },
+            ],
+        )];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// The anchor asks the block type, never the text.
+    ///
+    /// A user who pastes a panel back in writes a [`ContentBlock::Text`] whose
+    /// first characters are the panel's heading. Anchoring in front of it would
+    /// hand the round's real tail block the breakpoint.
+    #[test]
+    fn a_user_message_opening_with_the_panel_heading_still_anchors_on_itself() {
+        let mut messages = vec![from_blocks(
+            "user",
+            vec![ContentBlock::Text {
+                text: "[CONTEXT PANEL] is what you sent me. What is it?".into(),
+            }],
+        )];
+        apply_cache_control_to_last_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert_eq!(
+            arr[0]["cache_control"]["type"], "ephemeral",
+            "the user's own text is not a tail block, whatever it opens with"
+        );
     }
 
     #[test]
@@ -1012,10 +1453,12 @@ mod tests {
             ClaudeMessage {
                 role: "user".into(),
                 content: serde_json::Value::String("first turn".into()),
+                cache_anchor: None,
             },
             ClaudeMessage {
                 role: "assistant".into(),
                 content: serde_json::Value::String("second turn".into()),
+                cache_anchor: None,
             },
         ];
         apply_cache_control_to_last_message(&mut messages);
@@ -1033,12 +1476,100 @@ mod tests {
     }
 
     #[test]
+    fn apply_cache_control_to_penultimate_message_string_content_becomes_block() {
+        let mut messages = vec![
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("first turn".into()),
+                cache_anchor: None,
+            },
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("second turn".into()),
+                cache_anchor: None,
+            },
+        ];
+        apply_cache_control_to_penultimate_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert_eq!(arr[0]["text"], "first turn");
+        assert_eq!(arr[0]["cache_control"]["type"], "ephemeral");
+        // The tail is left for `apply_cache_control_to_last_message`.
+        assert!(messages[1].content.is_string());
+    }
+
+    #[test]
+    fn apply_cache_control_to_penultimate_message_marks_last_block_only() {
+        let mut messages = vec![
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "first block"},
+                    {"type": "text", "text": "second block"},
+                ]),
+                cache_anchor: None,
+            },
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("tail".into()),
+                cache_anchor: None,
+            },
+        ];
+        apply_cache_control_to_penultimate_message(&mut messages);
+        let arr = messages[0].content.as_array().unwrap();
+        assert!(arr[0].get("cache_control").is_none());
+        assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn apply_cache_control_to_penultimate_message_picks_the_second_from_last() {
+        let mut messages = vec![
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("oldest".into()),
+                cache_anchor: None,
+            },
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::Value::String("middle".into()),
+                cache_anchor: None,
+            },
+            ClaudeMessage {
+                role: "user".into(),
+                content: serde_json::Value::String("newest".into()),
+                cache_anchor: None,
+            },
+        ];
+        apply_cache_control_to_penultimate_message(&mut messages);
+        assert!(messages[0].content.is_string());
+        assert!(messages[1].content.is_array());
+        assert!(messages[2].content.is_string());
+    }
+
+    #[test]
+    fn apply_cache_control_to_penultimate_message_needs_two_messages() {
+        // With one message the anchor would land on the tail, doubling a marker
+        // and caching nothing new.
+        let mut messages = vec![ClaudeMessage {
+            role: "user".into(),
+            content: serde_json::Value::String("only turn".into()),
+            cache_anchor: None,
+        }];
+        apply_cache_control_to_penultimate_message(&mut messages);
+        assert!(messages[0].content.is_string());
+
+        let mut empty: Vec<ClaudeMessage> = Vec::new();
+        apply_cache_control_to_penultimate_message(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn apply_cache_control_to_last_message_skips_empty_string() {
         // An empty string would round-trip into an empty text block, which
         // Anthropic rejects. Cache_control on nothing is meaningless anyway.
         let mut messages = vec![ClaudeMessage {
             role: "user".into(),
             content: serde_json::Value::String(String::new()),
+            cache_anchor: None,
         }];
         apply_cache_control_to_last_message(&mut messages);
         // Untouched
@@ -1104,7 +1635,8 @@ mod tests {
     fn cache_control_serializes_into_wire_format() {
         // End-to-end: build a request the way build_claude_request does,
         // serialize it, and check cache_control lands on tools[-1], the system
-        // block, and messages[-1]'s last content block.
+        // block, messages[-1]'s last content block and messages[-2]'s. That is
+        // all four Anthropic allows, so the count is asserted too.
         let mut tools = vec![
             ClaudeTool {
                 name: "search".into(),
@@ -1125,17 +1657,21 @@ mod tests {
             ClaudeMessage {
                 role: "user".into(),
                 content: serde_json::Value::String("first turn".into()),
+                cache_anchor: None,
             },
             ClaudeMessage {
                 role: "assistant".into(),
                 content: serde_json::Value::String("response".into()),
+                cache_anchor: None,
             },
             ClaudeMessage {
                 role: "user".into(),
                 content: serde_json::Value::String("follow-up".into()),
+                cache_anchor: None,
             },
         ];
         apply_cache_control_to_last_message(&mut messages);
+        apply_cache_control_to_penultimate_message(&mut messages);
 
         let req = ClaudeRequest {
             anthropic_version: Some("vertex-2023-10-16".into()),
@@ -1161,15 +1697,20 @@ mod tests {
         let system_arr = json["system"].as_array().unwrap();
         assert_eq!(system_arr[0]["cache_control"]["type"], "ephemeral");
 
-        // Messages: only the final message's last block carries cache_control
+        // Messages: the last two carry a marker, and nothing older does.
         let msgs = json["messages"].as_array().unwrap();
         assert!(msgs[0]["content"].is_string());
-        assert!(msgs[1]["content"].is_string());
-        let last_blocks = msgs[2]["content"].as_array().unwrap();
-        assert_eq!(
-            last_blocks.last().unwrap()["cache_control"]["type"],
-            "ephemeral"
-        );
+        for index in [1, 2] {
+            let blocks = msgs[index]["content"].as_array().unwrap();
+            assert_eq!(
+                blocks.last().unwrap()["cache_control"]["type"],
+                "ephemeral",
+                "message {index} should anchor a cache prefix"
+            );
+        }
+
+        // Four is the cap, and a fifth is a 400 rather than a slower request.
+        assert_eq!(breakpoints(&req), 4);
     }
 
     #[test]
@@ -1312,5 +1853,518 @@ mod tests {
         );
         assert_eq!(args["action"], "create");
         assert_eq!(meta.unknown_sse_dropped, 0);
+    }
+
+    /// The opening frame of a real Vertex turn: input cost, nothing produced yet.
+    const MESSAGE_START: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"id":"msg_x","type":"message","#,
+        r#""role":"assistant","content":[],"model":"claude-opus-5","stop_reason":null,"#,
+        r#""stop_sequence":null,"usage":{"input_tokens":2,"cache_creation_input_tokens":2369,"#,
+        r#""cache_read_input_tokens":117174,"output_tokens":1}}}"#,
+        "\n\n"
+    );
+
+    /// Wrap a canned SSE body as the response the parser consumes.
+    fn sse_response(body: impl Into<reqwest::Body>) -> reqwest::Response {
+        reqwest::Response::from(axum::http::Response::new(body.into()))
+    }
+
+    /// The failing shape: a `write_file` call whose arguments stop where the
+    /// document body would have begun. The bytes are identical across the three
+    /// cases below. Only the stop reason differs, and that is what the parser
+    /// has to classify on.
+    fn truncated_tool_args_sse(stop_reason: Option<&str>) -> String {
+        truncated_tool_args_named("write_file", stop_reason)
+    }
+
+    /// The same shape with the tool name as a parameter, so a test can prove a
+    /// hostile-but-legal name cannot change how the error classifies.
+    fn truncated_tool_args_named(tool_name: &str, stop_reason: Option<&str>) -> String {
+        let mut body = format!(
+            concat!(
+                r#"data: {{"type":"message_start","message":{{"usage":{{"input_tokens":112000}}}}}}"#,
+                "\n\n",
+                r#"data: {{"type":"content_block_start","index":0,"#,
+                r#""content_block":{{"type":"tool_use","id":"tu_1","name":"{}"}}}}"#,
+                "\n\n",
+                r#"data: {{"type":"content_block_delta","index":0,"#,
+                r#""delta":{{"type":"input_json_delta","#,
+                r#""partial_json":"{{\"path\": \"artifacts/research/architecture.md\""}}}}"#,
+                "\n\n"
+            ),
+            tool_name
+        );
+        if let Some(reason) = stop_reason {
+            body.push_str(&format!(
+                r#"data: {{"type":"message_delta","delta":{{"stop_reason":"{reason}"}},"#
+            ));
+            body.push_str(r#""usage":{"output_tokens":128000}}"#);
+            body.push_str("\n\n");
+        }
+        body
+    }
+
+    /// The same cut, but the turn said something first. Index 0 is the text the
+    /// callback has already pushed to the frontend; index 1 is the tool call
+    /// that never finishes.
+    fn text_then_truncated_tool_args_sse() -> String {
+        String::from(concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":112000}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"text_delta","text":"Writing that now."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"#,
+            r#""content_block":{"type":"tool_use","id":"tu_1","name":"write_file"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"#,
+            r#""delta":{"type":"input_json_delta","#,
+            r#""partial_json":"{\"path\": \"artifacts/research/architecture.md\""}}"#,
+            "\n\n"
+        ))
+    }
+
+    /// Collect everything the token callback pushes, so a test can assert on
+    /// what the frontend would already have rendered.
+    fn recording_callback() -> (TokenCallback, std::sync::Arc<std::sync::Mutex<String>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        let cb: TokenCallback = Box::new(move |t: &str| {
+            sink.lock().expect("callback mutex").push_str(t);
+        });
+        (cb, seen)
+    }
+
+    /// A provider that hangs up after `message_start` has produced nothing, and
+    /// has not said why it stopped. Reporting that as a successful empty parse
+    /// costs the whole turn: the caller's retry loop only fires on `Err`, so the
+    /// agentic loop reads the silence as an unrecognised stop and emits
+    /// ResponseFailed. Vertex does this on a dropped stream.
+    #[tokio::test]
+    async fn a_stream_closed_before_message_delta_is_a_retryable_truncation() {
+        let err = parse_claude_stream(sse_response(MESSAGE_START), &None, "Test")
+            .await
+            .expect_err("a stream that ended before message_delta is not a completed turn");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stream truncated"),
+            "the error must name the truncation, got: {msg}"
+        );
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "the truncation must reach the retry path, got: {msg}"
+        );
+    }
+
+    /// The counterpart: a model that ends its turn without text is intentional
+    /// silence, and the stop reason proves the stream arrived whole.
+    #[tokio::test]
+    async fn a_clean_empty_turn_still_parses_as_a_completed_response() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"#,
+            r#""usage":{"output_tokens":3}}"#,
+            "\n\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n"
+        );
+
+        let response = parse_claude_stream(sse_response(BODY), &None, "Test")
+            .await
+            .expect("a stream carrying a stop reason is a completed turn");
+
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(response.content, None);
+        assert!(response.tool_calls.is_empty());
+    }
+
+    /// Truncation after the model started speaking keeps what arrived. Retrying
+    /// would re-stream text the frontend already rendered, so the partial turn
+    /// stays a success and the caller decides what to do with it.
+    #[tokio::test]
+    async fn a_truncated_stream_that_already_carried_text_keeps_its_content() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"text_delta","text":"Checking"}}"#,
+            "\n\n"
+        );
+
+        let response = parse_claude_stream(sse_response(BODY), &None, "Test")
+            .await
+            .expect("partial text is still a parse, not a truncation");
+
+        assert_eq!(response.content.as_deref(), Some("Checking"));
+        assert_eq!(response.stop_reason, None);
+    }
+
+    /// Anthropic interleaves thinking and text, so a turn's visible answer can
+    /// arrive as more than one text block. Every block must survive into
+    /// `LlmResponse.content`, joined on a newline rather than overwritten, and
+    /// the live callback must stream that same newline: a replayed history
+    /// must read exactly like what the user watched stream by.
+    #[tokio::test]
+    async fn two_text_blocks_are_accumulated_not_overwritten() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"text_delta","text":"First sentence."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"#,
+            r#""delta":{"type":"text_delta","text":"Second sentence."}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"#,
+            r#""usage":{"output_tokens":6}}"#,
+            "\n\n"
+        );
+
+        let (cb, seen) = recording_callback();
+        let response = parse_claude_stream(sse_response(BODY), &Some(cb), "Test")
+            .await
+            .expect("a two-text-block turn parses");
+
+        assert_eq!(
+            response.content.as_deref(),
+            Some("First sentence.\nSecond sentence.")
+        );
+        assert_eq!(
+            *seen.lock().expect("callback mutex"),
+            response.content.unwrap()
+        );
+    }
+
+    /// Three text blocks, with a thinking block between the second and third:
+    /// the shape that motivated the fix. Only the text blocks reach `content`,
+    /// still in order and still every one of them.
+    #[tokio::test]
+    async fn three_text_blocks_across_a_thinking_block_are_all_kept() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":0,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"#,
+            r#""delta":{"type":"text_delta","text":"One."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":1,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":1,"#,
+            r#""delta":{"type":"text_delta","text":"Two."}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":2,"#,
+            r#""content_block":{"type":"thinking","thinking":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":2,"#,
+            r#""delta":{"type":"thinking_delta","thinking":"weighing it"}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_start","index":3,"#,
+            r#""content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":3,"#,
+            r#""delta":{"type":"text_delta","text":"Three."}}"#,
+            "\n\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"#,
+            r#""usage":{"output_tokens":9}}"#,
+            "\n\n"
+        );
+
+        let (cb, seen) = recording_callback();
+        let response = parse_claude_stream(sse_response(BODY), &Some(cb), "Test")
+            .await
+            .expect("a three-text-block turn parses");
+
+        assert_eq!(response.content.as_deref(), Some("One.\nTwo.\nThree."));
+        assert_eq!(
+            *seen.lock().expect("callback mutex"),
+            response.content.unwrap()
+        );
+    }
+
+    /// Tool arguments are the case ADR 0089's `carries_output` guard excludes,
+    /// and the reason it gives does not apply to them. Nothing of a tool call
+    /// reaches the frontend and the tool never ran, so a retry duplicates
+    /// nothing. Without this the turn died on a dropped connection that one
+    /// retry would have survived.
+    #[tokio::test]
+    async fn tool_arguments_cut_by_a_dropped_connection_retry() {
+        // A live callback with no text through it: the common shape, where the
+        // model calls a tool with no preamble. Nothing rendered, so retry.
+        let (on_token, seen) = recording_callback();
+        let err = parse_claude_stream(
+            sse_response(truncated_tool_args_sse(None)),
+            &Some(on_token),
+            "Test",
+        )
+        .await
+        .expect_err("a tool call cut before message_delta is not a completed turn");
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "no text should have gone out"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stream truncated") && msg.contains("write_file"),
+            "the error must name the truncation and the tool, got: {msg}"
+        );
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "a dropped connection must reach the retry path, got: {msg}"
+        );
+    }
+
+    /// ADR 0089's guarantee is about the TURN, not the tool call. A turn that
+    /// streamed text before the cut has already rendered it, so retrying shows
+    /// it twice. The tool call being invisible says nothing about the text
+    /// beside it, which is the trap this closes.
+    #[tokio::test]
+    async fn a_cut_tool_call_after_streamed_text_reports_instead_of_retrying() {
+        let (on_token, seen) = recording_callback();
+        let err = parse_claude_stream(
+            sse_response(text_then_truncated_tool_args_sse()),
+            &Some(on_token),
+            "Test",
+        )
+        .await
+        .expect_err("a cut tool call is still an error");
+
+        assert_eq!(
+            seen.lock().unwrap().as_str(),
+            "Writing that now.",
+            "the callback must have rendered the text already"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already sending text"),
+            "the error must say why it will not retry, got: {msg}"
+        );
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "retrying would render the streamed text twice, got: {msg}"
+        );
+    }
+
+    /// Codex review caught this one. A tool name is `^[a-zA-Z0-9_-]{1,128}$`,
+    /// so `502` is legal. Interpolated into a message that must not retry, it
+    /// makes `is_retryable_error` see a transient HTTP status. A budget cut
+    /// would then retry identically until the attempts ran out.
+    #[tokio::test]
+    async fn a_tool_named_like_an_http_status_cannot_flip_the_classification() {
+        for name in ["502", "503", "529"] {
+            for stop in ["max_tokens", "tool_use"] {
+                let err = parse_claude_stream(
+                    sse_response(truncated_tool_args_named(name, Some(stop))),
+                    &None,
+                    "Test",
+                )
+                .await
+                .expect_err("unparseable arguments are still an error");
+
+                let msg = err.to_string();
+                assert!(
+                    !crate::llm::is_retryable_error(&msg),
+                    "tool '{name}' at stop '{stop}' must stay non-retryable, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// The same stream with no callback attached is safe to retry: nothing
+    /// reached a frontend, so the text only exists in the response the retry
+    /// discards.
+    #[tokio::test]
+    async fn the_same_cut_retries_when_no_callback_was_rendering() {
+        let err = parse_claude_stream(
+            sse_response(text_then_truncated_tool_args_sse()),
+            &None,
+            "Test",
+        )
+        .await
+        .expect_err("a cut tool call is still an error");
+
+        let msg = err.to_string();
+        assert!(
+            crate::llm::is_retryable_error(&msg),
+            "with nothing rendered the truncation is retryable, got: {msg}"
+        );
+    }
+
+    /// The budget cut is the opposite: the model said why it stopped, and an
+    /// identical retry is cut identically. So it must not retry. The message
+    /// also has to say what happened, rather than show the user a serde error
+    /// about a JSON blob they never wrote.
+    #[tokio::test]
+    async fn tool_arguments_cut_by_the_token_budget_name_the_budget_and_do_not_retry() {
+        let err = parse_claude_stream(
+            sse_response(truncated_tool_args_sse(Some("max_tokens"))),
+            &None,
+            "Test",
+        )
+        .await
+        .expect_err("a tool call cut at the token budget is not a completed turn");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("output token limit") && msg.contains("write_file"),
+            "the error must name the budget and the tool, got: {msg}"
+        );
+        assert!(
+            !msg.contains("EOF while parsing"),
+            "the serde wording is what this arm replaces, got: {msg}"
+        );
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "an identical retry is cut identically, got: {msg}"
+        );
+    }
+
+    /// A stop reason the model chose, with arguments that still do not parse,
+    /// is malformed model output rather than a transport problem. It keeps the
+    /// original wording, raw JSON included, because there the blob is the
+    /// diagnostic.
+    #[tokio::test]
+    async fn malformed_tool_arguments_under_a_clean_stop_keep_the_parse_error() {
+        let err = parse_claude_stream(
+            sse_response(truncated_tool_args_sse(Some("tool_use"))),
+            &None,
+            "Test",
+        )
+        .await
+        .expect_err("unparseable arguments are still an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failed to parse tool arguments"),
+            "a model bug keeps its own wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("artifacts/research/architecture.md"),
+            "the raw arguments are the diagnostic here, got: {msg}"
+        );
+        assert!(
+            !crate::llm::is_retryable_error(&msg),
+            "malformed output is not a transport error, got: {msg}"
+        );
+    }
+
+    /// Every `cache_control` marker in the serialized request, wherever it sits.
+    ///
+    /// Anthropic allows 4 and rejects a 5th, so the count is the invariant, not
+    /// the placement. Counted off the wire body rather than off our own types,
+    /// because the body is what the API reads.
+    fn breakpoints(req: &ClaudeRequest) -> usize {
+        serde_json::to_string(req)
+            .expect("the request serializes")
+            .matches("\"cache_control\"")
+            .count()
+    }
+
+    fn one_tool() -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "read_file".into(),
+            description: "read a file".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    fn request_for(messages: Vec<Message>) -> ClaudeRequest {
+        build_claude_request(
+            messages,
+            one_tool(),
+            "claude-opus-5",
+            Some("system prompt body"),
+            Some("high"),
+            WireTarget::Vertex {
+                url: VERTEX_TEST_URL,
+            },
+            "Vertex",
+        )
+        .0
+    }
+
+    fn image_block() -> ContentBlock {
+        ContentBlock::Image {
+            source_type: "base64".into(),
+            media_type: "image/png".into(),
+            data: "AAAA".into(),
+        }
+    }
+
+    /// Round 1 of a turn has one message, so there is no message in front of
+    /// the tail and the anchor has nowhere to go. Three markers, not four.
+    #[test]
+    fn a_single_message_turn_carries_three_breakpoints() {
+        let req = request_for(vec![Message {
+            role: "user".into(),
+            content: MessageContent::Text("the whole payload".into()),
+        }]);
+        assert_eq!(breakpoints(&req), 3);
+    }
+
+    /// Several blocks in one message are still one message. A turn with both
+    /// history images and attached images puts a separator block between the
+    /// groups, and that is not somewhere to anchor.
+    #[test]
+    fn several_blocks_in_one_message_still_anchor_nothing() {
+        let req = request_for(vec![Message {
+            role: "user".into(),
+            content: MessageContent::Blocks(vec![
+                ContentBlock::Text {
+                    text: "the whole payload".into(),
+                },
+                image_block(),
+                ContentBlock::Text {
+                    text: "[Below: image attached to current message]".into(),
+                },
+                image_block(),
+            ]),
+        }]);
+        assert_eq!(
+            breakpoints(&req),
+            3,
+            "one message cannot carry both the tail marker and the anchor"
+        );
+    }
+
+    /// From round 2 on, the anchor has a home and the request spends all four.
+    /// It is the same count in either context mode. The wire places the anchor
+    /// structurally, and the mode only decides whether the tail is rewritten
+    /// underneath it.
+    #[test]
+    fn a_turn_past_its_first_round_carries_four_breakpoints() {
+        let req = request_for(vec![
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("the whole payload".into()),
+            },
+            Message {
+                role: "assistant".into(),
+                content: MessageContent::Text("reading the file now".into()),
+            },
+            Message {
+                role: "user".into(),
+                content: MessageContent::Text("[tool result]".into()),
+            },
+        ]);
+        assert_eq!(breakpoints(&req), 4);
     }
 }

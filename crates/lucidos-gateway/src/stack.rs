@@ -57,16 +57,38 @@ pub enum Health {
     Unhealthy,
 }
 
+/// Who keeps a workspace's engine running, and so who may replace it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EngineKeeper {
+    /// The gateway, because somebody asked it to run this workspace: the
+    /// auto-start flag, a restore record, an open, a Retry. It spawns a
+    /// replacement when the engine exits, including for an engine it re-adopted
+    /// while answering one of those asks.
+    Gateway,
+    /// Somebody else, whose engine the gateway found answering on the registered
+    /// port. Nobody asked it to start anything, so it reports and proxies that
+    /// engine but never replaces it. It cannot reproduce the environment,
+    /// database and model configuration the engine was launched with. A
+    /// replacement would be a different engine wearing the same address. The
+    /// stack is released when the engine exits, and the workspace reads as
+    /// stopped until somebody starts it again.
+    External,
+}
+
 /// Mutable runtime state for one workspace stack. Held behind a `Mutex` in the
 /// gateway's stack map; the supervisor loop locks each in turn.
 pub struct StackRuntime {
     pub ws: Workspace,
     pub resolved_dir: PathBuf,
     pub pg: PgHandle,
-    /// The engine process this gateway spawned. `None` when the engine was
-    /// re-adopted (gateway restart) — supervision is health-based, so a missing
+    /// The engine process this gateway spawned. `None` when it holds no handle:
+    /// an engine re-adopted across a gateway restart, or an
+    /// [`EngineKeeper::External`] one. Supervision is health-based, so a missing
     /// `Child` only means "we can't `try_wait` it", not "it's down".
     pub engine: Option<Child>,
+    /// Whether this gateway may spawn a replacement engine here. Independent of
+    /// `engine`, which says only whether we hold a handle.
+    pub keeper: EngineKeeper,
     pub health: Health,
     /// Respawn attempts since the stack was last healthy. Caps auto-respawn.
     pub restart_attempts: u32,
@@ -424,6 +446,49 @@ pub async fn probe_health(client: &reqwest::Client, scheme: &str, port: u16) -> 
     }
 }
 
+/// An engine found answering on a registered port, and when it says it started.
+///
+/// `started_at` is `None` when the payload carries no timestamp. The gateway
+/// then cannot tell this engine from one it has just stopped, so a stopped
+/// workspace keeps its stop. See `GatewayState::adopt_running_engines`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiveEngine {
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Ask whatever is on `port` whether it is an engine, and when it started.
+///
+/// `None` means nothing answered, so there is nothing to adopt. This is
+/// [`probe_health`] plus the one field that tells a fresh engine from one a stop
+/// is still draining. The two stay separate because the supervisor's 2s probe of
+/// a stack it already holds has no use for the body.
+pub async fn probe_live_engine(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+) -> Option<LiveEngine> {
+    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/health");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    Some(LiveEngine {
+        started_at: started_at_in(&body),
+    })
+}
+
+/// The `started_at` an engine's health payload reports, as an instant.
+///
+/// Every failure collapses to `None`: an unparseable body, a missing field, a
+/// timestamp in some other format. A caller reading `None` treats the engine as
+/// one it cannot identify, never as a fresh one.
+fn started_at_in(body: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let stamp = json.get("started_at")?.as_str()?;
+    Some(chrono::DateTime::parse_from_rfc3339(stamp).ok()?.into())
+}
+
 /// A short-timeout client for health probes (distinct from the proxy client,
 /// which has no global timeout so SSE can stream).
 ///
@@ -754,6 +819,7 @@ mod tests {
             resolved_dir: PathBuf::from("/ws/dev"),
             pg: PgHandle::External,
             engine: None,
+            keeper: EngineKeeper::Gateway,
             health: Health::Healthy,
             restart_attempts: 0,
             health_misses: 0,
@@ -905,6 +971,7 @@ mod tests {
             resolved_dir: PathBuf::from("/ws/dev"),
             pg: PgHandle::External,
             engine: None,
+            keeper: EngineKeeper::Gateway,
             health: Health::Healthy,
             restart_attempts: 0,
             health_misses: 0,
@@ -914,6 +981,52 @@ mod tests {
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["unread_count"], serde_json::json!(4));
+    }
+
+    // ── Finding an engine somebody else started ──────────────────────────────
+
+    /// The field the discovery pass reads to tell a fresh engine from the one a
+    /// stop is still draining.
+    #[test]
+    fn a_health_payload_names_when_the_engine_started() {
+        let body = r#"{"status":"ok","started_at":"2026-08-22T09:34:40.135361+00:00"}"#;
+        let started = started_at_in(body).expect("an engine reports its start time");
+        assert_eq!(started.to_rfc3339(), "2026-08-22T09:34:40.135361+00:00");
+    }
+
+    /// Anything unreadable names no start time, and the caller then treats the
+    /// engine as one it cannot identify rather than as a fresh one.
+    #[test]
+    fn an_unreadable_payload_names_no_start_time() {
+        for body in [
+            "",
+            "not json",
+            r#"{"status":"ok"}"#,
+            r#"{"started_at":42}"#,
+            r#"{"started_at":"yesterday"}"#,
+        ] {
+            assert!(started_at_in(body).is_none(), "must not parse: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_port_nothing_listens_on_holds_no_engine() {
+        let port = dead_port().await;
+        assert_eq!(
+            probe_live_engine(&build_health_client(), "http", port).await,
+            None
+        );
+    }
+
+    /// An engine that answers is adoptable even when it names no start time.
+    /// The stand-in's 204 carries no body, which is that case exactly.
+    #[tokio::test]
+    async fn an_engine_that_answers_is_live_even_with_no_start_time() {
+        let (port, _saw) = capturing_engine().await;
+        assert_eq!(
+            probe_live_engine(&build_health_client(), "http", port).await,
+            Some(LiveEngine { started_at: None })
+        );
     }
 
     /// A spawned engine must INHERIT its model cache location rather than be

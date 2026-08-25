@@ -76,7 +76,12 @@ function renderedAnchors(): Set<string> {
       if (entry.isDirectory()) { walk(path); continue; }
       if (!entry.name.endsWith('.tsx')) continue;
       const src = readFileSync(path, 'utf8');
-      for (const m of src.matchAll(/(?:data-search-)?anchor="([^"]+)"/g)) anchors.add(m[1]);
+      // Any prop whose name ends in `anchor`, so a component that renders the
+      // attribute on the caller's behalf still counts. `ModelSelectionRow` is
+      // one, taking the anchor for the row it draws. Over-matching an unrelated
+      // `*Anchor` prop only adds a name to the set, and the set is read with
+      // `.has`.
+      for (const m of src.matchAll(/\b[\w-]*[Aa]nchor="([^"]+)"/g)) anchors.add(m[1]);
     }
   };
   walk(COMPONENTS_DIR);

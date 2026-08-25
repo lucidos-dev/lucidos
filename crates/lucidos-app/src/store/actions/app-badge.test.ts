@@ -36,8 +36,13 @@ vi.mock('../../utils/basePath', async (importActual) => {
   };
 });
 
-const { applyAppBadge, syncWorkspaceAppBadge, refreshOtherWorkspacesUnread } =
-  await import('./app-badge');
+const {
+  applyAppBadge,
+  syncWorkspaceAppBadge,
+  refreshOtherWorkspacesUnread,
+  crossWorkspaceUnreadTotal,
+  peerWorkspaces,
+} = await import('./app-badge');
 const { isTauri } = await import('../../utils/platform');
 
 let setAppBadge: ReturnType<typeof vi.fn>;
@@ -87,6 +92,9 @@ beforeEach(() => {
   mocks.workspaceId = null;
   mocks.isPicker = false;
   unreadNotifications.value = { status: 'not-loaded' };
+  // Module-level, so a listing left by one case would otherwise be the starting
+  // total of the next.
+  peerWorkspaces.value = [];
 });
 
 afterEach(() => {
@@ -233,11 +241,18 @@ describe('behind the gateway the icon badges EVERY workspace', () => {
     expect(setAppBadge).toHaveBeenLastCalledWith(1);
   });
 
-  it('does not reach for the control plane under Tauri (the native tray owns the total)', async () => {
+  it('under Tauri still reads the peers, but writes no icon badge', async () => {
+    // Two concerns that used to share one gate. The native tray and dock own
+    // the ICON on desktop, so the page must not write it. The page still draws
+    // the brand badge and the menu's notifications group, and both need these
+    // rows, so the fetch has to run.
     (isTauri as ReturnType<typeof vi.fn>).mockReturnValue(true);
+    mocks.listWorkspaces.mockResolvedValueOnce([workspace('other', 4)]);
+    unreadNotifications.value = { status: 'loaded', data: [] };
     await refreshOtherWorkspacesUnread();
-    expect(mocks.listWorkspaces).not.toHaveBeenCalled();
+    expect(mocks.listWorkspaces).toHaveBeenCalled();
     expect(setAppBadge).not.toHaveBeenCalled();
+    expect(crossWorkspaceUnreadTotal.value).toBe(4);
   });
 
   it('does not reach for the control plane in the picker (it sums its own listing)', async () => {

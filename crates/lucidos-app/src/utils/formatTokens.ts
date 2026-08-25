@@ -33,9 +33,15 @@ export function formatContextWindow(tokens: number | null): string {
   return `context window: ${formatTokens(tokens)}`;
 }
 
-/** Percent of the context window consumed, clamped 0..100. Returns 0 when
- *  `window` is 0 to avoid NaN; the modal hides the bar in that case. */
+/** Percent of the context window consumed. Returns 0 when `window` is 0 to
+ *  avoid NaN; the modal hides the bar in that case.
+ *
+ *  Deliberately NOT clamped at 100. A capture over its window means the WINDOW
+ *  is wrong. Rounding that off to "exactly full" is how a real 240k Claude Code
+ *  prompt read as `203k / 200k (100%)`. A caller drawing a bar clamps its own
+ *  fill width. The number stays honest, being the only thing that can report
+ *  the error at all. */
 export function contextPercent(used: number, window: number): number {
   if (window <= 0) return 0;
-  return Math.min(100, Math.round((used / window) * 100));
+  return Math.round((used / window) * 100);
 }

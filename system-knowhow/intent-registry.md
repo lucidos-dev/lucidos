@@ -29,6 +29,12 @@ A trigger has two dimensions: *when to fire* (schedule, lives in the `TriggerCre
 
 This is also why an audit that walks only `apps/<app>/intents/` will report trigger-derived IDs as "phantom" intents. They are real; they just live next door under `triggers/`.
 
+## An empty registry means no `execute_intent` tool at all
+
+The tool is **capability-gated** (ADR 0088): a workspace whose registry is empty is not offered `execute_intent`, because there is no id it could be passed. So "the tool is missing" and "the registry found nothing" are one fact. The fix for both is a `.md` file under one of the three sources above.
+
+The gate is a function of the workspace, never of the thread, so every thread in a workspace agrees about it. It also opens by itself: the registry is recomputed per turn, so the first intent file makes the tool appear on the next thread with nothing to restart.
+
 ## Invalidation
 
 None needed. The list is recomputed every time `process_chat_message` builds the system prompt. Add, remove, or rename a `.md` file under any of the three sources and the next thread sees the change. There is nothing to purge, regenerate, or clear.

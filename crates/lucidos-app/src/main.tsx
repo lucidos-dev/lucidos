@@ -1,7 +1,7 @@
 // MUST be first: installs per-workspace localStorage namespacing before any
 // module-init localStorage read (for example store/store.ts).
 import './utils/workspaceStorage.install';
-import { render } from 'preact';
+import { render, type ComponentChildren } from 'preact';
 import { App } from './App';
 import { lazyComponent } from './utils/lazyComponent';
 import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
@@ -16,10 +16,11 @@ import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke, windowReadyToShow } from './utils/tauri';
-import { setBootStatus } from './utils/bootSplash';
+import { handOverBootOwnership, setBootStatus } from './utils/bootSplash';
 import { startStartupStatusPolling } from './utils/startupStatus';
-import { reconcileDesktopDeviceId } from './store/actions/devices';
+import { adoptGatewayDeviceId, reconcileDesktopDeviceId } from './store/actions/devices';
 import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
+import { takePairingCodeFromUrl } from './utils/pairingCodeSeed';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
 import './styles/global.css';
@@ -39,20 +40,11 @@ import './styles/drawer.css';
 import './store/effects';
 import './store/actions/wipPreview';
 
-// The inline pre-hydration watchdog owns the case where this module graph never
-// evaluates, for example a stale hashed entry bundle. Handing over tells it the
-// graph is live: it clears the 15s stall timer, the entry-script error listener
-// and the guarded retry state. From here on, a boot that dies is the
-// application's to recover.
-function handOverBootOwnership(): void {
-  (window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
-}
-
 // The app path hands over here: reaching this line means its whole root is in
-// memory. The PICKER path must NOT, since its root arrives in a second chunk
-// (see WorkspacePicker below). Handing over here would disarm the watchdog
-// while the thing it guards is still in flight, and that watchdog is the
-// picker's only recovery.
+// memory. The PICKER path must NOT, since its root arrives in later chunks
+// (see PairingGate and WorkspacePicker below). Handing over here would disarm
+// the watchdog while the thing it guards is still in flight, and that watchdog
+// is the picker's only recovery.
 //
 // The gateway escape link is offered to direct-port documents alone
 // (revealGatewayEscape in index.html), and `lazyComponent`'s stale-chunk reload
@@ -114,6 +106,20 @@ const appRoot = document.getElementById('app')!;
 // 404 that would otherwise strand it. `<App/>` deliberately stays static: it IS
 // the eager graph, so splitting it would move bytes into a second chunk without
 // shortening the critical path.
+//
+// The gate splits for the same reason: it renders only under `IS_PICKER`, so a
+// workspace document carried a screen it could never mount. The picker now
+// fetches two chunks in series, because the gate holds its children back until
+// the session probe answers. Both land under the boot splash.
+//
+// The gate must NOT hand boot ownership over when its chunk resolves, the way
+// the picker below does. The watchdog stays armed across the session probe.
+// `PairingGate` hands over itself once it finds this device unpaired, and the
+// picker chunk hands over on resolve. Both are after the probe.
+const PairingGate = lazyComponent<{ children: ComponentChildren }>(() =>
+  import('./components/picker/PairingGate').then((m) => m.PairingGate),
+);
+
 const WorkspacePicker = lazyComponent(() =>
   import('./components/picker/WorkspacePicker').then((m) => {
     // The picker path proves its graph is live here, not at the eager
@@ -178,6 +184,11 @@ async function boot() {
   // is a no-op everywhere else.
   adoptDeviceIdFromUrl();
 
+  // A scanned pairing QR arrives as `?pair=<code>`. Read and strip it here, so
+  // the code never survives into a reload, a bookmark or an installed PWA's
+  // start URL. `PairingGate` asks the same memoized function for the value.
+  takePairingCodeFromUrl();
+
   // Packaged desktop: the shell keeps the launch window hidden until a page says
   // it has something to paint (lib.rs `window_ready_to_show`). Signal here
   // rather than from `applyTheme`, because EVERY boot path reaches this line
@@ -196,12 +207,25 @@ async function boot() {
     return;
   }
 
-  // Desktop only: reconcile the per-workspace device id with the native store
-  // BEFORE the first API call, so it survives a DMG reinstall. The id rides
-  // every request as `x-lucidos-device-id`. Browser and PWA skip this, their
-  // localStorage id being durable already. An async function runs synchronously
-  // up to its first await, so the non-Tauri render below is unchanged in timing.
-  if (isTauri() && !IS_PICKER && WORKSPACE_ID) {
+  // Behind the gateway, the device id is the one it authenticated us as, not
+  // one we minted. Adopt it BEFORE the first API call and before registration,
+  // so the row this workspace keeps belongs to the device that paired. Also
+  // hands the old row over, in the one window where both ids are known.
+  //
+  // This is the FIRST await on the boot path, and unlike the reconcile below it
+  // is not desktop-only: browser and PWA pay it too. It is bounded for exactly
+  // that reason. A gateway that accepts the connection and then stalls would
+  // otherwise hold the boot splash with no ceiling. Adopting late costs only a
+  // page load.
+  const namedByGateway = IS_PICKER
+    ? false
+    : await adoptGatewayDeviceId(WORKSPACE_ID ?? null);
+
+  // Desktop with no gateway answering: reconcile the per-workspace device id
+  // with the native store instead, so it survives a DMG reinstall. Skipped when
+  // the gateway named us, because that call would put the stored id back and
+  // undo the adoption above.
+  if (isTauri() && !IS_PICKER && WORKSPACE_ID && !namedByGateway) {
     await reconcileDesktopDeviceId(WORKSPACE_ID);
   }
 
@@ -212,7 +236,18 @@ async function boot() {
     // Permanent, not dev-only, and quiet until something crosses a threshold
     // (utils/perfProbe.ts).
     if (!IS_PICKER) startPerfProbe();
-    render(IS_PICKER ? <WorkspacePicker /> : <App />, appRoot);
+    render(
+      IS_PICKER ? (
+        // The picker shell is the one surface the gateway serves without a
+        // credential, so it is where an unpaired device lands and pairs.
+        <PairingGate>
+          <WorkspacePicker />
+        </PairingGate>
+      ) : (
+        <App />
+      ),
+      appRoot,
+    );
   }
 }
 void boot();

@@ -477,18 +477,20 @@ async fn repo_with_agent_branch(tracked: &str) -> (tempfile::TempDir, std::path:
     (tmp, repo, sha)
 }
 
-/// Record the thread's last known commit the way a real idle does. The
-/// `MessageReceived` first is what makes this a coding-agent thread, without
-/// which the lifecycle rejects `CodingAgentIdled` as CC-only.
-async fn seed_idle_with_head_sha(
-    bus: &crate::engine::event_bus::EventBus,
-    thread_id: Uuid,
-    head_sha: &str,
-) {
-    let cc_meta = crate::engine::thread_events::EventMeta {
+fn cc_meta() -> crate::engine::thread_events::EventMeta {
+    crate::engine::thread_events::EventMeta {
         channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
         ..crate::engine::thread_events::EventMeta::NONE
-    };
+    }
+}
+
+/// Open a coding-agent thread the way a real first turn does: the user's
+/// message, then the spawn's `SessionStarted`. Both are load-bearing. The
+/// lifecycle rejects `CodingAgentIdled` on a thread it has not classified as
+/// CC, and `SessionStarted` is the only event that sets
+/// `thread_summaries.is_coding_agent`, which
+/// `thread_owns_a_coding_agent_worktree` reads.
+async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uuid) {
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
@@ -504,10 +506,35 @@ async fn seed_idle_with_head_sha(
             reasoning_effort: None,
             origin: None,
         },
-        meta: cc_meta.clone(),
+        meta: cc_meta(),
     })
     .await
     .unwrap();
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: crate::engine::thread_events::ThreadEvent::SessionStarted {
+            session_id: String::new(),
+            branch: "lucidos-claude-code-repo-example-repo-implement-the-ticket".into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .unwrap();
+}
+
+/// Record a turn boundary the way a real idle does.
+async fn seed_idle(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    head_sha: Option<&str>,
+    worktree_path: Option<&str>,
+) {
+    seed_cc_thread(bus, thread_id).await;
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
@@ -517,11 +544,11 @@ async fn seed_idle_with_head_sha(
             cc_session_id: Some("sess-1".into()),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             reason: None,
-            worktree_path: None,
-            worktree_head_sha: Some(head_sha.to_string()),
+            worktree_path: worktree_path.map(str::to_string),
+            worktree_head_sha: head_sha.map(str::to_string),
             bg_bash_pending: false,
         },
-        meta: cc_meta,
+        meta: cc_meta(),
     })
     .await
     .unwrap();
@@ -537,7 +564,7 @@ async fn resolve_recorded_branch_follows_a_rename_once_the_worktree_is_gone() {
     let thread_id = Uuid::new_v4();
     let tracked = "lucidos-claude-code-repo-example-repo-implement-the-ticket";
     let (_tmp, repo, work_sha) = repo_with_agent_branch(tracked).await;
-    seed_idle_with_head_sha(&bus, thread_id, &work_sha).await;
+    seed_idle(&bus, thread_id, Some(&work_sha), None).await;
     let _ = crate::engine::git_ops::git_cmd(
         &["branch", "-m", tracked, "ticket-1234-drop-unused-tables"],
         &repo,
@@ -580,7 +607,7 @@ async fn resolve_recorded_branch_reports_a_deleted_branch_by_name() {
     let thread_id = Uuid::new_v4();
     let tracked = "lucidos-claude-code-repo-example-repo-implement-the-ticket";
     let (_tmp, repo, work_sha) = repo_with_agent_branch(tracked).await;
-    seed_idle_with_head_sha(&bus, thread_id, &work_sha).await;
+    seed_idle(&bus, thread_id, Some(&work_sha), None).await;
     let _ = crate::engine::git_ops::git_cmd(&["branch", "-D", tracked], &repo).await;
 
     let (status, message) =
@@ -591,6 +618,130 @@ async fn resolve_recorded_branch_reports_a_deleted_branch_by_name() {
     assert!(
         message.contains(tracked),
         "the error must name the branch it looked for: {message}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+// -------------------- resolve_diff_worktree --------------------
+
+/// A conflict-resolution session works in the merge worktree, on a temp branch
+/// that is not the thread's. Diffing it would answer the Diff button with the
+/// merge in progress instead of the thread's own work.
+#[test]
+fn live_thread_worktree_skips_a_conflict_merge_tree() {
+    let own = std::path::PathBuf::from("/tmp/lucidos-test/thread-worktree");
+    let merge = std::path::PathBuf::from("/tmp/lucidos-test/merge-worktree");
+    let (mut session, _rx) = crate::engine::types::AgentSession::for_test();
+
+    session.worktree_path = Some(own.clone());
+    assert_eq!(super::live_thread_worktree(Some(&session)), Some(own));
+
+    session.conflict_change_id = Some(Uuid::new_v4());
+    session.worktree_path = Some(merge);
+    assert_eq!(
+        super::live_thread_worktree(Some(&session)),
+        None,
+        "the merge worktree belongs to the merge, not to the thread"
+    );
+
+    assert_eq!(super::live_thread_worktree(None), None);
+}
+
+/// The reported bug: an app coding-agent thread commits mid-turn, the Diff
+/// button lights up, and the click answers 404. No `CodingAgentIdled` has been
+/// emitted yet on a first turn, and an app thread records no
+/// `SessionStarted.repo_id` for the branch-ref fallback to use. The worktree is
+/// sitting at its deterministic path the whole time.
+#[tokio::test]
+async fn resolve_diff_worktree_finds_the_deterministic_path_before_the_first_idle() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    let ws = tempfile::tempdir().unwrap();
+    let expected =
+        crate::engine::agent_session::resume::deterministic_worktree_path(ws.path(), thread_id);
+
+    // Nothing on disk yet: the caller must fall through to the branch ref.
+    assert_eq!(
+        super::resolve_diff_worktree(&pool, thread_id, None, ws.path()).await,
+        None,
+        "a path that does not exist is not a worktree to diff"
+    );
+
+    tokio::fs::create_dir_all(&expected).await.unwrap();
+    assert_eq!(
+        super::resolve_diff_worktree(&pool, thread_id, None, ws.path()).await,
+        Some(expected),
+        "the first turn's worktree is findable from the thread id alone"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The deterministic path reads the thread id's first 8 hex characters and
+/// nothing else. An id naming no thread must not reach the worktree of a real
+/// thread sharing that prefix. Nothing would scope that answer, so it would
+/// carry the real thread's whole diff.
+#[tokio::test]
+async fn resolve_diff_worktree_refuses_a_thread_id_it_does_not_know() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let real = Uuid::new_v4();
+    seed_cc_thread(&bus, real).await;
+    let ws = tempfile::tempdir().unwrap();
+    let worktree =
+        crate::engine::agent_session::resume::deterministic_worktree_path(ws.path(), real);
+    tokio::fs::create_dir_all(&worktree).await.unwrap();
+
+    // Same 8-char prefix, different uuid, no thread of its own.
+    let mut bytes = real.into_bytes();
+    bytes[15] ^= 0xff;
+    let colliding = Uuid::from_bytes(bytes);
+    assert_eq!(
+        crate::engine::agent_session::resume::deterministic_worktree_path(ws.path(), colliding),
+        worktree,
+        "test setup: the two ids must share a deterministic path"
+    );
+
+    assert_eq!(
+        super::resolve_diff_worktree(&pool, colliding, None, ws.path()).await,
+        None,
+        "an unknown thread id must not reach a real thread's worktree"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A running turn owns the answer. The last idle describes where the PREVIOUS
+/// turn worked, so the live session's own worktree wins whenever both are on
+/// disk.
+#[tokio::test]
+async fn resolve_diff_worktree_prefers_the_running_session_over_the_last_idle() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let ws = tempfile::tempdir().unwrap();
+
+    let idled = ws.path().join("idled-worktree");
+    let running = ws.path().join("running-worktree");
+    tokio::fs::create_dir_all(&idled).await.unwrap();
+    tokio::fs::create_dir_all(&running).await.unwrap();
+    seed_idle(&bus, thread_id, None, idled.to_str()).await;
+
+    assert_eq!(
+        super::resolve_diff_worktree(&pool, thread_id, Some(running.clone()), ws.path()).await,
+        Some(running),
+        "the live session's worktree is the tree the agent is writing to"
+    );
+    assert_eq!(
+        super::resolve_diff_worktree(&pool, thread_id, None, ws.path()).await,
+        Some(idled),
+        "with no session running, the last idle's recorded worktree stands"
     );
 
     pool.close().await;

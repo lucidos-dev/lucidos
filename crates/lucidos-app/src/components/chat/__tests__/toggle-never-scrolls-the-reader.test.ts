@@ -183,8 +183,8 @@ describe('no transcript toggle scrolls the reader', () => {
     expect(
       offenders,
       'withScrollAnchor call(s) whose handler also moves the transcript. withScrollAnchor '
-      + 'already holds the reader on the turn ROOT across the growth; a scroll beside it '
-      + `undoes exactly that:\n${offenders.join('\n')}`,
+      + 'already holds the reader on their own topmost line across the growth; a scroll '
+      + `beside it undoes exactly that:\n${offenders.join('\n')}`,
     ).toEqual([]);
   });
 });

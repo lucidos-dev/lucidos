@@ -1,3 +1,59 @@
+/// Everything a title call runs under: the provider, the effort resolved
+/// beside it, and the purpose's deadline.
+///
+/// One type, because the first two are a *model selection*. A site that builds
+/// the provider and forgets the effort silently ignores what the user set, and
+/// one that forgets the deadline runs unbounded. Owned rather than borrowed:
+/// three of the five title sites move it into a spawned task.
+pub(crate) struct TitleCall {
+    provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>,
+    effort: Option<String>,
+    /// The purpose's whole-call deadline. Carried because titling resamples: a
+    /// response that fails validation earns a second request, and each request
+    /// carries the provider's own retries. Bounding one attempt is therefore
+    /// not the same as bounding the call.
+    deadline: std::time::Duration,
+}
+
+impl TitleCall {
+    pub(crate) fn provider(&self) -> &dyn crate::llm::provider::LlmProvider {
+        self.provider.as_ref()
+    }
+
+    /// A call over an already-built provider, at the purpose's declared
+    /// defaults. Tests only: production resolves the pair from preferences.
+    #[cfg(test)]
+    pub(crate) fn over(provider: std::sync::Arc<dyn crate::llm::provider::LlmProvider>) -> Self {
+        let call =
+            crate::engine::aux_purpose::AuxCall::defaults(crate::engine::ContextPurpose::Title);
+        Self {
+            provider,
+            effort: call.reasoning().map(str::to_string),
+            deadline: call.deadline(),
+        }
+    }
+}
+
+/// Resolve the title *model selection* and build its provider.
+///
+/// One helper because five sites need the same two things: the follow-up
+/// titler, the chat and coding-agent spawns, the engine's own thread titler,
+/// and the API's title suggestion. Each used to read the model preference
+/// itself.
+pub(crate) async fn title_call(
+    pool: &sqlx::PgPool,
+    extractor: &crate::memory::MemoryExtractor,
+) -> Result<TitleCall, Box<dyn std::error::Error + Send + Sync>> {
+    let call =
+        crate::engine::aux_purpose::AuxCall::resolve(pool, crate::engine::ContextPurpose::Title)
+            .await;
+    Ok(TitleCall {
+        provider: extractor.provider_for_model(call.model(), call.attempt_timeout())?,
+        effort: call.reasoning().map(str::to_string),
+        deadline: call.deadline(),
+    })
+}
+
 /// Replace markdown thread references — `[Title text](thread:UUID)` or
 /// `[Title text](thread:workspace/UUID)` — with a neutral placeholder before
 /// titling. The link's visible text is the *referenced* thread's title; left
@@ -152,14 +208,44 @@ fn build_title_user_content(message: &str, image_description: Option<&str>) -> S
 
 /// Generate a short title (3-6 words) for a new thread using Flash.
 /// Standalone function so it can be spawned into a background task.
+///
+/// `capture` records each round trip for token accounting. It is recorded per
+/// attempt, not once per title: a resample is a second API call that cost a
+/// second set of tokens, whatever the validator then did with the answer.
 pub(crate) async fn generate_thread_title(
-    provider: &dyn crate::llm::provider::LlmProvider,
+    call: &TitleCall,
     message: &str,
     image_description: Option<&str>,
+    capture: Option<&crate::engine::AuxCapture>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    // The deadline lives HERE, not at the call sites, because titling
+    // resamples: two requests, each carrying the provider's own retries. Two
+    // of the five sites had already skipped a caller-side timeout.
+    match tokio::time::timeout(
+        call.deadline,
+        title_attempts(call, message, image_description, capture),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("title generation timed out after {:?}", call.deadline).into()),
+    }
+}
+
+/// The resample loop `generate_thread_title` bounds.
+async fn title_attempts(
+    call: &TitleCall,
+    message: &str,
+    image_description: Option<&str>,
+    capture: Option<&crate::engine::AuxCapture>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use crate::llm::provider::{Message, MessageContent};
 
+    let provider = call.provider();
+    let reasoning_effort = call.effort.as_deref();
+
     let user_content = build_title_user_content(message, image_description);
+    let request_chars = TITLE_SYSTEM_PROMPT.chars().count() + user_content.chars().count();
 
     // Smaller/faster title models intermittently answer the message (a
     // clarifying question, refusal, or explanation) instead of titling it;
@@ -184,9 +270,14 @@ pub(crate) async fn generate_thread_title(
                 None,
                 Some(TITLE_SYSTEM_PROMPT),
                 None,
-                Some("none"),
+                reasoning_effort,
             )
             .await?;
+        if let Some(capture) = capture {
+            capture
+                .record(provider.default_model(), request_chars, &response)
+                .await;
+        }
         let title = response
             .content
             .ok_or("No title returned")?
@@ -207,13 +298,14 @@ pub(crate) async fn generate_thread_title(
 /// used to short-circuit the LLM for image-only messages (see [`decide_title_path`]).
 pub(crate) async fn emit_generated_title(
     bus: &crate::engine::event_bus::EventBus,
-    provider: &dyn crate::llm::provider::LlmProvider,
+    call: &TitleCall,
     thread_id: uuid::Uuid,
     message: &str,
     image_description: Option<&str>,
     fallback_title: Option<String>,
     image_count: usize,
 ) {
+    let provider = call.provider();
     let title = match decide_title_path(message, image_description, image_count) {
         TitleDecision::Skip => return,
         TitleDecision::Image => "Image".to_string(),
@@ -223,7 +315,13 @@ pub(crate) async fn emit_generated_title(
             // (success path emits no other line) is triageable.
             let started = std::time::Instant::now();
             let model = provider.default_model().to_string();
-            let result = generate_thread_title(provider, message, image_description).await;
+            let capture = crate::engine::AuxCapture::new(
+                bus,
+                thread_id,
+                crate::engine::ContextPurpose::Title,
+            );
+            let result =
+                generate_thread_title(call, message, image_description, Some(&capture)).await;
             let outcome = match &result {
                 Ok(_) => "generated".to_string(),
                 Err(e) if fallback_title.is_some() => format!("failed ({}), using fallback", e),
@@ -254,6 +352,115 @@ pub(crate) async fn emit_generated_title(
         .await
     {
         log!("[Thread] Failed to emit title: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+    use uuid::Uuid;
+
+    const TITLE_MODEL: &str = "gemini-3-flash-preview";
+
+    /// A resample is a second API call that spent a second set of tokens.
+    /// Counting only the winning attempt would under-report the real spend,
+    /// which is the whole point of capturing these.
+    #[tokio::test]
+    async fn a_resampled_title_records_both_attempts() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture =
+            crate::engine::AuxCapture::new(&bus, thread_id, crate::engine::ContextPurpose::Title);
+
+        // First reply is an echo of the instruction, which `validate_title`
+        // rejects; the second is a real title.
+        let provider = ScriptedProvider::new(
+            TITLE_MODEL,
+            vec!["Generate conversation title", "Fix the auth bug"],
+        );
+        let title = generate_thread_title(
+            &TitleCall::over(std::sync::Arc::new(provider)),
+            "the auth handshake breaks",
+            None,
+            Some(&capture),
+        )
+        .await
+        .expect("second attempt yields a title");
+        assert_eq!(title, "Fix the auth bug");
+
+        let captures = aux_captures(&pool, thread_id, "title").await;
+        assert_eq!(
+            captures.len(),
+            2,
+            "both attempts cost tokens, so both are captured: {captures:?}"
+        );
+        for payload in &captures {
+            assert_eq!(payload["producer"], "auxiliary");
+            assert_eq!(payload["model"], TITLE_MODEL);
+            assert_eq!(payload["usage"]["input_tokens"], 210);
+            assert_eq!(payload["usage"]["output_tokens"], 4);
+            assert!(
+                payload.get("reconstructed").is_none(),
+                "a live capture is measured, not reconstructed"
+            );
+        }
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A title that never validates still spent its tokens twice over.
+    #[tokio::test]
+    async fn a_title_that_never_validates_still_records_its_attempts() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture =
+            crate::engine::AuxCapture::new(&bus, thread_id, crate::engine::ContextPurpose::Title);
+
+        let provider =
+            ScriptedProvider::new(TITLE_MODEL, vec!["conversation title", "Generate a title"]);
+        assert!(
+            generate_thread_title(
+                &TitleCall::over(std::sync::Arc::new(provider)),
+                "anything",
+                None,
+                Some(&capture)
+            )
+            .await
+            .is_err(),
+            "both attempts are rejected by the validator"
+        );
+        assert_eq!(aux_captures(&pool, thread_id, "title").await.len(), 2);
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Titling without a capture must still work. The suggestion endpoint
+    /// takes this path when the thread id will not parse.
+    #[tokio::test]
+    async fn titling_without_a_capture_emits_nothing_and_still_titles() {
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+
+        let provider = ScriptedProvider::new(TITLE_MODEL, vec!["Fix the auth bug"]);
+        let title = generate_thread_title(
+            &TitleCall::over(std::sync::Arc::new(provider)),
+            "the auth handshake breaks",
+            None,
+            None,
+        )
+        .await
+        .expect("titles fine with no capture");
+        assert_eq!(title, "Fix the auth bug");
+        assert!(aux_captures(&pool, thread_id, "title").await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 }
 

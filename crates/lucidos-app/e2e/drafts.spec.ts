@@ -565,9 +565,18 @@ test.describe('Per-thread drafts', () => {
 
     // No ThreadView header rendered at all (drafts have no editable title).
     await expect(page.locator('.thread-view-header')).toHaveCount(0);
-    // No "Untitled Thread" fallback anywhere.
-    await expect(page.getByText('Untitled Thread')).toHaveCount(0);
-    // Body must not surface the "No messages in this thread" copy.
+    // Scoped to the PANE, which is what the claim is about. The drawer this
+    // test opened lists every thread in the workspace. A titleless one with no
+    // message to derive from legitimately reads "Untitled Thread" there (see
+    // `threadTitle.ts`). Page-wide, a row a sibling spec left behind failed
+    // this on the first attempt of all three projects.
+    await expect(pane.getByText('Untitled Thread')).toHaveCount(0);
+    // Body must not surface the "No messages in this thread" copy. PAGE-wide,
+    // unlike the line above, and the asymmetry is load-bearing. Only
+    // `ThreadView` renders that copy, and `ThreadPane` renders `ThreadView`
+    // and `compose-empty` on opposite branches. Scoped to the pane the check
+    // could never match, so it would assert nothing. Page-wide it still
+    // catches a `ThreadView` in the other pane of the mobile layout.
     await expect(page.getByText('No messages in this thread')).toHaveCount(0);
 
     // The textarea still carries the typed draft.

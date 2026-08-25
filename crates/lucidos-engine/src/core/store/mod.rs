@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 pub use messages::format_child_thread_completed_block;
 pub(crate) use messages::{
     build_resume_tool_blocks_with_skip_ids, build_session_messages,
-    collect_tool_pairs_chronological, find_orphan_tool_called_ids, RESUME_VERBATIM_TOOL_TAIL,
+    collect_tool_pairs_chronological, find_orphan_tool_called_ids, newest_conversation_summary,
+    parse_event_address, synthesize_tool_use_id, with_event_address, CachedSummary,
+    RESUME_VERBATIM_TOOL_TAIL,
 };
 use sqlx::PgPool;
 pub use threads::{
@@ -121,6 +123,11 @@ pub struct EventQueryFilters<'a> {
     /// Restrict to one thread. `None` is every thread, which is what every
     /// caller predating this field passes, so the filter can only narrow.
     pub thread_id: Option<Uuid>,
+    /// Resolve one event by primary key: the dereference half of a pointer the
+    /// agent noted earlier (ADR 0085). Distinct from the two cursors above,
+    /// which position a window rather than name a row. AND-ed with every other
+    /// filter, so a contradicting `event_type` yields nothing.
+    pub event_id: Option<Uuid>,
 }
 
 /// Outcome of [`EventStore::query_events_paged`]. Kept separate from
@@ -252,6 +259,38 @@ impl EventStore {
         self.fetch_events(filters, None, None, limit).await
     }
 
+    /// The `ToolResult` a `ToolCalled` produced, or `None` for an orphan.
+    ///
+    /// The pairing lives in the result's `tool_called_event_id`. Every live
+    /// emit stamps it, and so does the recovery sweep's synthetic backfill, so
+    /// this is exact rather than positional. Scoped to the call's own thread,
+    /// which keeps it a short range scan under
+    /// `idx_events_thread_id_created_seq`. Unscoped it would walk every
+    /// `ToolResult` in the workspace.
+    ///
+    /// Exists because the address an agent notes names the CALL: that is the
+    /// form resumed blocks carry, and the form the retired
+    /// `dismiss_from_context` took (ADR 0109). The half it actually lost is the
+    /// result, so a read of the call has to be able to reach it (ADR 0085,
+    /// Decision 5).
+    pub async fn tool_result_for_call(
+        &self,
+        tool_called_event_id: Uuid,
+        thread_id: Option<Uuid>,
+    ) -> Result<Option<EventRow>, sqlx::Error> {
+        sqlx::query_as::<_, EventRow>(
+            "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
+             WHERE event_type = 'ToolResult' \
+             AND payload->>'tool_called_event_id' = $1 \
+             AND ($2::uuid IS NULL OR thread_id = $2) \
+             ORDER BY sequence ASC LIMIT 1",
+        )
+        .bind(tool_called_event_id.to_string())
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Cursor-paged variant of [`Self::query_events`]. Pass `before_event_id`
     /// to walk backward (strictly older than the cursor under
     /// `(created, id)` lexicographic order) or `after_event_id` to
@@ -305,6 +344,7 @@ impl EventStore {
         // matters: every existing caller (the CLI, triggers, the SDK) passes
         // `None`, and a filter that narrowed by default would silently change
         // all of them. It rides the `idx_events_thread_id_created_seq` index.
+        // `event_id` follows the same rule and hits the primary key.
         sqlx::query_as::<_, EventRow>(
             "SELECT id, event_type, payload, created, thread_id, sequence FROM events \
              WHERE ($1::text IS NULL OR event_type = $1) \
@@ -313,6 +353,7 @@ impl EventStore {
              AND ($5::timestamptz IS NULL OR created < $5 OR (created = $5 AND id < $6)) \
              AND ($7::timestamptz IS NULL OR created > $7 OR (created = $7 AND id > $8)) \
              AND ($9::uuid IS NULL OR thread_id = $9) \
+             AND ($10::uuid IS NULL OR id = $10) \
              ORDER BY created DESC, id DESC LIMIT $4",
         )
         .bind(filters.event_type)
@@ -324,6 +365,7 @@ impl EventStore {
         .bind(after_cursor.map(|(c, _)| c))
         .bind(after_cursor.map(|(_, i)| i))
         .bind(filters.thread_id)
+        .bind(filters.event_id)
         .fetch_all(&self.pool)
         .await
     }
@@ -388,11 +430,32 @@ impl EventStore {
     }
 
     /// Return all distinct event_type values, ordered alphabetically.
+    ///
+    /// A loose index scan, NOT `SELECT DISTINCT`, and the difference is the
+    /// point. Postgres has no skip scan, so `SELECT DISTINCT` reads every row.
+    /// On a 3.3M-event workspace that took 480ms and 177k buffers for 209
+    /// names, and it grows with the table. This walks
+    /// `idx_events_type_created` one descent per distinct value: 8ms and 972
+    /// buffers for the same names. Cost now tracks the number of event types,
+    /// not the number of events.
+    ///
+    /// The recursive term yields NULL when no greater value exists. That is a
+    /// safe terminator only because `events.event_type` is NOT NULL, so no
+    /// real row can produce it.
     pub async fn distinct_event_types(&self) -> Result<Vec<String>, sqlx::Error> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT DISTINCT event_type FROM events ORDER BY event_type")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "WITH RECURSIVE t AS ( \
+                 (SELECT event_type FROM events ORDER BY event_type LIMIT 1) \
+                 UNION ALL \
+                 SELECT (SELECT e.event_type FROM events e \
+                         WHERE e.event_type > t.event_type \
+                         ORDER BY e.event_type LIMIT 1) \
+                 FROM t WHERE t.event_type IS NOT NULL \
+             ) \
+             SELECT event_type FROM t WHERE event_type IS NOT NULL ORDER BY event_type",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 

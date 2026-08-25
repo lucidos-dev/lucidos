@@ -11,14 +11,41 @@
 mod tool_result_split_tests {
     use super::super::{
         build_tool_result_blocks, holds_explicitly_requested_image, parse_app_capture_marker,
-        split_tool_result, strip_app_capture_marker,
+        split_tool_result, strip_app_capture_marker, ToolOutput,
     };
+    use crate::core::store::synthesize_tool_use_id;
     use crate::engine::tools::files::{parse_image_content_marker, EXPLICIT_IMAGE_RESULT_TEXT};
     use crate::llm::ContentBlock;
 
     /// A 1x1 transparent PNG. Small enough that `fit_for_llm` passes it through
     /// untouched, real enough that the mime sniffer recognises it.
     const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// Fixed `ToolCalled` event id, so a test can assert on the exact address
+    /// the model is handed.
+    fn event_id() -> uuid::Uuid {
+        uuid::Uuid::parse_str("090b688b-f0dd-4fed-9047-0ad54d76b2a4").unwrap()
+    }
+
+    /// One tool output with its `ToolCalled` address, the shape every live call
+    /// has. Tests use it so the whole suite runs the marker path.
+    fn out(tool_use_id: &str, text: String) -> ToolOutput {
+        ToolOutput {
+            tool_use_id: tool_use_id.to_string(),
+            text,
+            event_id: Some(event_id()),
+        }
+    }
+
+    fn tool_result_contents(blocks: &[ContentBlock]) -> Vec<&str> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     fn image_content_sentinel() -> String {
         format!("[IMAGE_CONTENT:image/png]\n{}", PNG_1X1)
@@ -189,8 +216,7 @@ mod tool_result_split_tests {
     #[test]
     fn explicit_image_output_builds_a_vision_block() {
         let split = split_tool_result(&image_content_sentinel());
-        let blocks =
-            build_tool_result_blocks(&[("call_1".to_string(), split.llm_text)], "Results.");
+        let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
 
         assert_eq!(
             images_in(&blocks),
@@ -200,7 +226,8 @@ mod tool_result_split_tests {
         );
         assert!(blocks.iter().any(|b| matches!(
             b,
-            ContentBlock::ToolResult { content, .. } if content == EXPLICIT_IMAGE_RESULT_TEXT
+            ContentBlock::ToolResult { content, .. }
+                if content.starts_with(EXPLICIT_IMAGE_RESULT_TEXT)
         )));
     }
 
@@ -210,8 +237,7 @@ mod tool_result_split_tests {
     #[test]
     fn explicit_image_output_is_pinned() {
         let split = split_tool_result(&image_content_sentinel());
-        let blocks =
-            build_tool_result_blocks(&[("call_1".to_string(), split.llm_text)], "Results.");
+        let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
 
         assert!(
             holds_explicitly_requested_image(&blocks),
@@ -225,8 +251,7 @@ mod tool_result_split_tests {
     #[test]
     fn app_capture_output_reaches_vision_but_is_not_pinned() {
         let split = split_tool_result(&app_capture_sentinel());
-        let blocks =
-            build_tool_result_blocks(&[("call_1".to_string(), split.llm_text)], "Results.");
+        let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
 
         assert_eq!(images_in(&blocks), 1, "the capture must reach vision");
         assert!(blocks.iter().any(|b| matches!(
@@ -247,8 +272,7 @@ mod tool_result_split_tests {
     fn failed_screenshot_capture_produces_no_image_block() {
         let raw = super::super::format_capture_result("", "html2canvas failed on oklab()");
         let split = split_tool_result(&raw);
-        let blocks =
-            build_tool_result_blocks(&[("call_1".to_string(), split.llm_text)], "Results.");
+        let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
 
         assert_eq!(
             images_in(&blocks),
@@ -272,9 +296,9 @@ mod tool_result_split_tests {
         let capture = split_tool_result(&app_capture_sentinel()).llm_text;
         let blocks = build_tool_result_blocks(
             &[
-                ("call_1".to_string(), explicit),
-                ("call_2".to_string(), "plain output".to_string()),
-                ("call_3".to_string(), capture),
+                out("call_1", explicit),
+                out("call_2", "plain output".to_string()),
+                out("call_3", capture),
             ],
             "Results.",
         );
@@ -307,5 +331,109 @@ mod tool_result_split_tests {
 
         assert_eq!(blocks.len(), 1);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Results."));
+    }
+
+    // -----------------------------------------------------------------------
+    // The event address (ADR 0085 Decision 9)
+    // -----------------------------------------------------------------------
+
+    /// A live result states its own `ToolCalled` event id, so the model can
+    /// note the address of something the turn boundary is about to drop. The
+    /// provider's `tool_use_id` cannot serve: it means nothing after the turn.
+    #[test]
+    fn a_live_tool_result_states_its_own_event_id() {
+        let blocks = build_tool_result_blocks(&[out("call_1", "done".to_string())], "Results.");
+
+        assert_eq!(
+            tool_result_contents(&blocks),
+            vec!["done\n[evt-090b688bf0dd4fed90470ad54d76b2a4]"],
+        );
+    }
+
+    /// The address is rendered by the SAME function the resume path uses for
+    /// its synthetic `tool_use_id`. Two renderers would drift, and the model
+    /// would then hold two spellings of one id with no way to tell them apart.
+    #[test]
+    fn the_address_is_the_form_every_reader_already_accepts() {
+        let blocks = build_tool_result_blocks(&[out("call_1", "done".to_string())], "Results.");
+        let content = tool_result_contents(&blocks)[0];
+
+        let rendered = synthesize_tool_use_id(&event_id());
+        assert!(
+            content.ends_with(&format!("\n[{rendered}]")),
+            "got: {content}"
+        );
+        // The bracketed body must parse back to the originating event id, which
+        // is what makes it a pointer rather than a decoration.
+        let inner = rendered.strip_prefix("evt-").expect("evt- prefix");
+        assert_eq!(uuid::Uuid::parse_str(inner).unwrap(), event_id());
+    }
+
+    /// Nothing is retained. The address is appended when the wire blocks are
+    /// built, downstream of the `ToolResult` emit. So the event payload holds
+    /// what it always held, and the pair still vanishes at the boundary.
+    #[test]
+    fn the_address_never_reaches_the_persisted_event() {
+        let split = split_tool_result("total 4\ndrwxr-xr-x  2 u  staff");
+
+        assert!(
+            !split.event_text().contains("evt-"),
+            "the event text must carry no address, got: {}",
+            split.event_text()
+        );
+    }
+
+    /// A `ToolCalled` whose emit failed has no address to state. The result
+    /// goes out unmarked, rather than carrying a placeholder the model would
+    /// dereference into a "not found".
+    #[test]
+    fn a_result_with_no_event_id_is_left_unmarked() {
+        let blocks = build_tool_result_blocks(
+            &[ToolOutput {
+                tool_use_id: "call_1".to_string(),
+                text: "done".to_string(),
+                event_id: None,
+            }],
+            "Results.",
+        );
+
+        assert_eq!(tool_result_contents(&blocks), vec!["done"]);
+    }
+
+    /// Every branch of the builder states the address, not just the plain one.
+    /// The two sentinel branches replace the content wholesale, so each needed
+    /// the append wiring separately.
+    #[test]
+    fn both_image_branches_state_the_address_too() {
+        let explicit = split_tool_result(&image_content_sentinel()).llm_text;
+        let capture = split_tool_result(&app_capture_sentinel()).llm_text;
+        let blocks = build_tool_result_blocks(
+            &[out("call_1", explicit), out("call_2", capture)],
+            "Results.",
+        );
+
+        let suffix = format!("\n[{}]", synthesize_tool_use_id(&event_id()));
+        for content in tool_result_contents(&blocks) {
+            assert!(content.ends_with(&suffix), "unmarked branch: {content}");
+        }
+    }
+
+    /// The pin survives the append. `holds_explicitly_requested_image` matched
+    /// `EXPLICIT_IMAGE_RESULT_TEXT` for equality. Appending the address would
+    /// then have unpinned every explicitly viewed image, blinding the model on
+    /// its very next tool call.
+    #[test]
+    fn an_explicitly_viewed_image_still_pins_once_the_address_is_appended() {
+        let split = split_tool_result(&image_content_sentinel());
+        let blocks = build_tool_result_blocks(&[out("call_1", split.llm_text)], "Results.");
+
+        assert!(
+            tool_result_contents(&blocks)[0].contains("evt-"),
+            "this test is only meaningful with the address present"
+        );
+        assert!(
+            holds_explicitly_requested_image(&blocks),
+            "the pin must survive the appended address"
+        );
     }
 }

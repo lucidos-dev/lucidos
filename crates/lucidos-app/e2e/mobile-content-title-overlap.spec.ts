@@ -1,13 +1,14 @@
 /**
  * The mobile content header's two structural promises, at ui-scale 100 / 125 / 150.
  *
- * 1. **The trailing cluster is a constant.** Every context action collapses
- *    into the `⋯` overflow menu whatever the view carries and whatever the
- *    width, so the cluster is `⋯` + bell, or the bell alone for a view with no
- *    context actions at all. A bare context action in the header is the
- *    regression. Not a cosmetic rule: a trailing cluster whose width tracked
- *    the action count moved the centred nav cluster with it, so the chevrons
- *    sat somewhere different on every content view.
+ * 1. **The trailing cluster is bounded at two icon boxes.** Context actions
+ *    collapse into the `⋯` overflow menu whatever the width, so the cluster is
+ *    one control plus the bell. Three views, three shapes: `⋯` when two or more
+ *    actions fold, the action's own icon when exactly one would, and the bell
+ *    alone when the view carries none. A second bare context action in the
+ *    header is the regression. Not a cosmetic rule: a trailing cluster whose
+ *    width tracked the action count moved the centred nav cluster with it. The
+ *    chevrons then sat somewhere different on every content view.
  * 2. **The title never paints under either cluster.** It is the one shrinkable
  *    member of a fixed-width centred box, so it ellipsises at the span between
  *    the chevrons rather than crossing an icon.
@@ -20,13 +21,13 @@
  * here for exactly that reason: the CSS clamp that replaced the measurement has
  * to hold across them too.
  *
- * Two fixtures, and they are the two shapes: an app (three context actions and
- * a ~13-char title, the exact repro from the demo closeup) and a settings
- * subview (no context actions, the longest label in the nav).
+ * Three fixtures, one per shape. An app carries three context actions under a
+ * ~13-char title, the exact repro from the demo closeup. The Files view carries
+ * one. A settings subview carries none, under the longest label in the nav.
  */
 import { test, expect, Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
-import { assertHealthy, gotoWithRetry, ensureMobileView, navigateToApp, clickVisibleElement } from './helpers';
+import { assertHealthy, gotoWithRetry, ensureMobileView, navigateToApp, clickVisibleElement, openFilesPanel } from './helpers';
 
 const APP_ID = 'e2e-mobile-title-overlap';
 const APP_NAME = 'Half Marathon'; // the demo's ~13-char name, the exact repro
@@ -161,6 +162,29 @@ test.describe('Mobile content header collapses to one icon and never overlaps', 
       expect(m.trailingIcons, `ui-scale ${scale}: the trailing cluster should be exactly the overflow trigger + bell`).toBe(2);
       expectClearAndCentred(m, scale);
     }
+  });
+
+  test('a view with ONE context action shows that action, not the overflow trigger', async ({ page }) => {
+    // Files carries a single action, Search files. Folding it would cost a tap
+    // and save nothing: the ⋯ trigger stands in the same box.
+    await navigateToApp(page);
+    await openFilesPanel(page);
+    await ensureMobileView(page, 'content');
+    await expect(page.locator('.mobile-content-header .mobile-content-title'))
+      .toHaveText('Files', { timeout: 15_000 });
+
+    for (const scale of [100, 125, 150]) {
+      const m = await setScaleAndSettle(page, scale);
+      expect(m.hasOverflow, `ui-scale ${scale}: a lone action needs no overflow trigger`).toBe(false);
+      expect(m.bareActions, `ui-scale ${scale}: the one action should ride the row`).toBe(1);
+      // The bound the centred cluster's edge reserve is sized against: the same
+      // two boxes the overflow shape costs, so the chevrons do not move.
+      expect(m.trailingIcons, `ui-scale ${scale}: the trailing cluster should be the action + bell`).toBe(2);
+      expectClearAndCentred(m, scale);
+    }
+
+    // ...and it is the search action, reachable without opening anything.
+    await expect(page.locator('.mobile-content-header .file-search-btn.icon-btn')).toBeVisible();
   });
 
   test('a view with NO context actions shows the bell alone', async ({ page }) => {

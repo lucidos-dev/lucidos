@@ -2,7 +2,11 @@ import {
   chatModels, configuredProviders, currentModel, reasoningEffort, showToast, showConfirm,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import { MODELS, REASONING_LEVELS, availableReasoningLevels, clampReasoningEffort } from '../models';
+import { MODELS, REASONING_LEVELS } from '../models';
+import {
+  clampToOffered, lucidosTiers, tierOptions, type ModelChoice, type TierChoice,
+} from '../modelSelection';
+import { displayModelName } from '../thread-events';
 import { listModels, createModel, updateModel, deleteModelApi } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -45,19 +49,48 @@ export function modelReasoningEfforts(modelId: string): string[] | undefined {
   return loadable.data.find((m) => m.id === modelId)?.reasoning_efforts;
 }
 
-/** The reasoning options to OFFER for a model. Every Lucidos Agent effort
- *  picker goes through this rather than `availableReasoningLevels` directly, so
- *  the registry's answer is used wherever it exists. */
-export function reasoningLevelsFor(modelId: string): typeof REASONING_LEVELS {
-  return availableReasoningLevels(modelId, modelReasoningEfforts(modelId));
-}
+/** The Lucidos Agent's tier vocabulary, for `useModelSelection`. */
+export const LUCIDOS_TIER_VOCABULARY: readonly TierChoice[] = REASONING_LEVELS;
 
 /** Snap an effort onto the closest tier a model supports. Call this on EVERY
  *  model change: an effort left over from the previous model is exactly what
  *  the engine has to clamp at the chokepoint, and a picker showing one value
- *  while the request carries another is the confusion this pairing removes. */
+ *  while the request carries another is the confusion this pairing removes.
+ *
+ *  Pickers get this through `useModelSelection`, which clamps as part of a
+ *  pick. The two remaining direct callers are not pickers: saving the account
+ *  model, and re-clamping the displayed effort once the registry lands. */
 export function clampEffortFor(effort: string, modelId: string): string {
-  return clampReasoningEffort(effort, modelId, modelReasoningEfforts(modelId));
+  const offered = tierOptions(
+    lucidosTiers(modelId, modelReasoningEfforts(modelId)),
+    LUCIDOS_TIER_VOCABULARY,
+  );
+  return clampToOffered(effort, offered) ?? effort;
+}
+
+/** The Lucidos Agent's model rows, each carrying the tiers it offers.
+ *
+ *  This is the adapter half of the *model selection* unit: it turns the
+ *  registry (or the static fallback) into the shape `useModelSelection` reads,
+ *  which is the same shape the coding-agent menu gets off the wire.
+ *
+ *  `current` is appended when the registry does not list it. A saved
+ *  `chat_model` naming a deleted or disabled model then still renders as
+ *  selected, rather than the picker silently showing something else. */
+export function lucidosModelChoices(current?: string | null): ModelChoice[] {
+  const choices = chatModelOptions().map((o) => ({
+    value: o.value,
+    label: o.label,
+    reasoningEfforts: lucidosTiers(o.value, modelReasoningEfforts(o.value)),
+  }));
+  if (current && !choices.some((c) => c.value === current)) {
+    choices.push({
+      value: current,
+      label: displayModelName(current),
+      reasoningEfforts: lucidosTiers(current, modelReasoningEfforts(current)),
+    });
+  }
+  return choices;
 }
 
 /** Options for the chat model `<Dropdown>` — enabled models from the loaded

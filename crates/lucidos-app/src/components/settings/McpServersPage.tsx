@@ -13,10 +13,11 @@ import {
   type McpServersResponse,
   type McpToolStatus,
 } from '../../api/client';
-import { showConfirm, showToast } from '../../store/store';
+import { mcpServersVersion, showConfirm, showToast } from '../../store/store';
 import { toFailed, type Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { Explainer } from '../shared/Explainer';
 import { ChevronDownIcon, ChevronRightIcon } from '../shared/icons';
 import { LoadableError } from '../shared/LoadableError';
@@ -144,7 +145,7 @@ export function mcpServerRow(props: McpServerRowProps): VNode {
             <SkBlock w="6rem" h="1.25rem" round>
               <button
                 type="button"
-                class="mcp-tools-toggle"
+                class="settings-disclosure-toggle"
                 aria-expanded={expanded}
                 onClick={() => props.onToggleExpanded?.()}
               >
@@ -347,6 +348,11 @@ export function McpServersPage() {
    *  whole set, so two in flight can settle backwards and re-enable a tool the
    *  user just switched off. */
   const writes = useRef(new Map<string, Promise<void>>());
+  /** Bumped by every local write, before it goes out. A reload that started
+   *  earlier is older than the write and must drop its reply rather than
+   *  apply it. `writes` cannot answer this: its entries are per server and are
+   *  never removed, so it says nothing about what is outstanding NOW. */
+  const localWrites = useRef(0);
 
   function showData(data: McpServersResponse) {
     shown.current = data;
@@ -377,7 +383,28 @@ export function McpServersPage() {
     }
   }
 
+  // A server the agent registers, or a tool switched off on another device,
+  // repaints this page with no reload (ADR 0118). Two guards, for two races.
+  //
+  // `paused` skips it while a row verb runs, which can take seconds: that verb
+  // refreshes when it settles. Held, not dropped, so the frame still lands.
+  //
+  // `stillWanted` covers the race `paused` cannot see. A tool switch is
+  // optimistic and queues its write outside `pending`, and its own event bumps
+  // this counter. A reload fired by that event would land on top of the NEXT
+  // flip and bounce the switch back. That is the bug `18874e1da` fixed, and
+  // this is the same seam taken from the SSE side.
+  useVersionedRefresh(
+    mcpServersVersion.value,
+    Object.keys(pending).length > 0,
+    () => {
+      const startedAt = localWrites.current;
+      void refresh(() => localWrites.current === startedAt);
+    },
+  );
+
   async function runVerb(server: McpServerStatus, verb: McpRowVerb, call: () => Promise<void>) {
+    localWrites.current++;
     setPending((prev) => ({ ...prev, [server.id]: verb }));
     setErrors((prev) => withoutKey(prev, server.id));
     try {
@@ -442,6 +469,7 @@ export function McpServersPage() {
   function setToolDisabled(server: McpServerStatus, wireName: string, disabled: boolean) {
     const base = shown.current;
     if (!base) return;
+    localWrites.current++;
     showData(patchToolDisabled(base, server.id, wireName, disabled));
 
     const isLast = () => writes.current.get(server.id) === mine;

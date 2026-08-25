@@ -222,6 +222,7 @@ These all look reasonable in isolation; they fail the same way every time and wa
 5. **Polling `bash_output` after `finished: true`**. Nothing new can arrive. For the next few minutes each call returns an empty window, and after that each one replays the full final stdout/stderr from the event store, which is exactly the context bloat the drain semantics exist to avoid.
 6. **Draining a long task to the end of the turn rather than ending the turn.** A build with forty minutes left costs twenty 120-second drains and twenty turns of context, and the last one still might not reach the end. End the turn instead: the engine subscribes you to the completion and re-opens the thread when it lands. See "You do not have to sit through it" above.
 7. **Spawning a shell loop to watch something** (`for i in $(seq 1 200); do … sleep 60; done`). It cannot re-open a thread when it finds what it was looking for, so nobody ever reads it, and it dies with your turn anyway.
+8. **Detaching with `&` or `nohup` from `run_bash`.** `&` binds looser than `&&`. So `cd x && thing & echo ok` backgrounds the whole chain as one subshell, which keeps holding the tool's output pipes. You get the shell's real exit status and a note that a detached process survived, then nothing more. The process runs on with no task id, no watchdog and no completion event. Use `run_bash_background` instead, and drain it with `bash_output(task_id, wait_secs=N)`.
 
 ## Errors
 

@@ -1,13 +1,20 @@
 //! Pure search helpers for `glob_files` and `grep_files` tools.
 //!
-//! Both tools operate on the workspace's `data/` directory and scope themselves
-//! to the same subdirectories that `list_files` walks (artifacts, apps, knowhow,
-//! triggers). Patterns are written relative to `data/` so the LLM can use the
-//! same paths it sees in `list_files` output (e.g. `apps/**/index.html`).
+//! Each tool comes in two forms. `glob_files` / `grep_files` walk the
+//! workspace's `data/` directory, scoped to the subdirectories `list_files`
+//! walks (artifacts, apps, knowhow, triggers). Patterns are relative to `data/`,
+//! so the LLM can use the paths it sees in `list_files` output (e.g.
+//! `apps/**/index.html`).
+//!
+//! `glob_entries` / `grep_entries` take the file list instead, which is how a
+//! registered repository is searched (`engine::tools::repo_files`). Everything
+//! that matters lives below that split: the brace expansion, the match caps,
+//! the binary sniff and the context window are shared, and only the source of
+//! the paths differs.
 
 use super::ClampBounds;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default + clamp bounds for `glob_files`'s `limit` arg. An absent arg
 /// resolves to the default (200); any supplied value is clamped into
@@ -45,9 +52,22 @@ pub const GREP_MAX_LINE_CHARS: usize = 300;
 /// model's context budget for a single tool result.
 pub const GREP_MAX_TOTAL_BYTES: usize = 50 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Cap on the patterns one brace expansion may produce. Nesting multiplies, so
+/// nine two-way groups already reach 512, and each alternative costs a compile
+/// plus one comparison per file walked. The widest pattern a month of workspace
+/// traffic produced listed five directories. 256 sits far above that and low
+/// enough to keep the walk cheap.
+const MAX_BRACE_ALTERNATIVES: usize = 256;
 /// Skip files larger than this when grepping — keeps a single pathological log
 /// file from OOM-ing the engine. Glob walk is metadata-only so doesn't need it.
 const GREP_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The `data/` file list both tools walk, in the `(relative, absolute)` shape
+/// the entries-taking bodies consume.
+fn data_entries(workspace_path: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    crate::core::list_searchable_data_files(workspace_path)
+        .map_err(|e| format!("Failed to list workspace files: {}", e))
+}
 
 #[derive(Debug, Serialize)]
 pub struct GlobResult {
@@ -87,6 +107,150 @@ fn validate_pattern(label: &str, pattern: &str) -> Result<(), String> {
     }
 }
 
+/// End index of the `[...]` class opening at `start`, or `None` when no `]`
+/// closes it. `glob::Pattern` rejects an unterminated class, so we scan past
+/// the `[` and leave the compile to report it. A `]` in the first position is
+/// a class member, which is what the matcher does too.
+fn class_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if chars.get(i) == Some(&'!') {
+        i += 1;
+    }
+    // The first member, even when it is `]`.
+    i += 1;
+    chars[i.min(chars.len())..]
+        .iter()
+        .position(|c| *c == ']')
+        .map(|offset| i + offset)
+}
+
+/// Read the brace group opening at `open` into its top-level alternatives,
+/// with the index of the closing `}`. `None` means the group is not one:
+/// either nothing closes it, or it holds no top-level comma.
+fn parse_group(chars: &[char], open: usize) -> Option<(Vec<String>, usize)> {
+    let mut alternatives: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 1usize;
+    let mut saw_comma = false;
+    let mut i = open + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '[' => {
+                let end = class_end(chars, i).unwrap_or(i);
+                current.extend(&chars[i..=end]);
+                i = end + 1;
+                continue;
+            }
+            '{' => {
+                depth += 1;
+                current.push('{');
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    alternatives.push(current);
+                    return saw_comma.then_some((alternatives, i));
+                }
+                current.push('}');
+            }
+            ',' if depth == 1 => {
+                saw_comma = true;
+                alternatives.push(std::mem::take(&mut current));
+            }
+            c => current.push(c),
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a pattern at its first brace group, into the text before it, its
+/// alternatives, and the text after it. `None` means the pattern holds no
+/// group left to expand.
+fn split_first_group(pattern: &str) -> Option<(String, Vec<String>, String)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '[' => i = class_end(&chars, i).map_or(i + 1, |end| end + 1),
+            '{' => {
+                if let Some((alternatives, close)) = parse_group(&chars, i) {
+                    return Some((
+                        chars[..i].iter().collect(),
+                        alternatives,
+                        chars[close + 1..].iter().collect(),
+                    ));
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Expand brace alternation into one plain pattern per alternative, so
+/// `a/{b,c}/d` becomes `a/b/d` and `a/c/d`.
+///
+/// `glob::Pattern` has no braces and matches `{` as a literal character. An
+/// unexpanded brace pattern therefore returns an empty list, which reads
+/// exactly like "no such file". The first four rules are bash's, the dialect
+/// every other glob the model writes for implements:
+///
+/// - Nesting expands too: `a/{b,{c,d}}` gives `a/b`, `a/c` and `a/d`.
+/// - A group with no top-level comma stays literal: `a/{b}` matches `a/{b}`.
+/// - An unbalanced `{` or `}` stays literal.
+/// - An empty alternative contributes nothing: `x{,.md}` gives `x` and `x.md`.
+///
+/// The fifth rule leaves bash on purpose: braces inside a `[...]` class stay
+/// literal, so `[{]` matches a single `{`. Bash expands the text before any
+/// class exists, turning `[{]a,b[}]` into `[]a]` and `b[]`. It escapes a brace
+/// by quoting instead, and one pattern string has no quoting, so the class is
+/// the only escape we can offer.
+fn expand_braces(pattern: &str) -> Result<Vec<String>, String> {
+    let mut expanded = Vec::new();
+    let mut pending = std::collections::VecDeque::from([pattern.to_string()]);
+    while let Some(candidate) = pending.pop_front() {
+        match split_first_group(&candidate) {
+            None => expanded.push(candidate),
+            Some((prefix, alternatives, suffix)) => {
+                for alternative in alternatives {
+                    pending.push_back(format!("{}{}{}", prefix, alternative, suffix));
+                }
+            }
+        }
+        // Each pending entry yields at least one pattern, so this sum is a
+        // floor on the final count. Testing it every round stops a nested
+        // pattern here rather than once the queue holds thousands of strings.
+        if expanded.len() + pending.len() > MAX_BRACE_ALTERNATIVES {
+            return Err(format!(
+                "expands past {} alternatives: narrow the braces, or search in more than one call",
+                MAX_BRACE_ALTERNATIVES
+            ));
+        }
+    }
+    Ok(expanded)
+}
+
+/// Compile a `data/`-relative pattern into one matcher per brace alternative.
+/// A path matches when ANY of them matches. Both tools compile through here,
+/// so a pattern cannot come to mean one thing to `glob_files` and another to
+/// `grep_files`'s `path_glob`.
+fn compile_pattern(label: &str, pattern: &str) -> Result<Vec<glob::Pattern>, String> {
+    validate_pattern(label, pattern)?;
+    let expanded = expand_braces(pattern).map_err(|e| format!("{} '{}' {}", label, pattern, e))?;
+    expanded
+        .iter()
+        .map(|alternative| {
+            // An alternative can carry an escape its unexpanded form hid, as
+            // `{/etc,artifacts}/**` does, so validate what we really compile.
+            validate_pattern(label, alternative)?;
+            glob::Pattern::new(alternative)
+                .map_err(|e| format!("Invalid {} '{}': {}", label, alternative, e))
+        })
+        .collect()
+}
+
 /// Match files under `data/` against a glob pattern (relative to `data/`).
 ///
 /// `limit` is `None` when the caller omitted the arg (→ [`GLOB_LIMIT`]'s
@@ -97,22 +261,29 @@ pub fn glob_files(
     pattern: &str,
     limit: Option<usize>,
 ) -> Result<GlobResult, String> {
+    glob_entries(data_entries(workspace_path)?, pattern, limit)
+}
+
+/// [`glob_files`] over a caller-supplied file list. A walk of something other
+/// than `data/` reuses the matching, the brace expansion and the limit rather
+/// than reimplementing them. `engine::tools::repo_files` supplies a registered
+/// repository's entries.
+pub fn glob_entries(
+    entries: Vec<(String, PathBuf)>,
+    pattern: &str,
+    limit: Option<usize>,
+) -> Result<GlobResult, String> {
     let limit = GLOB_LIMIT.apply(limit);
     let pattern = pattern.trim();
     if pattern.is_empty() {
         return Err("pattern is required".to_string());
     }
-    validate_pattern("pattern", pattern)?;
-    let compiled = glob::Pattern::new(pattern)
-        .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?;
-
-    let entries = crate::core::list_searchable_data_files(workspace_path)
-        .map_err(|e| format!("Failed to list workspace files: {}", e))?;
+    let compiled = compile_pattern("glob pattern", pattern)?;
 
     let mut matches = Vec::new();
     let mut truncated = false;
     for (rel, _) in entries {
-        if compiled.matches(&rel) {
+        if compiled.iter().any(|p| p.matches(&rel)) {
             if matches.len() >= limit {
                 truncated = true;
                 break;
@@ -159,6 +330,27 @@ pub fn grep_files(
     max_matches: Option<usize>,
     context_lines: Option<usize>,
 ) -> Result<GrepResult, String> {
+    grep_entries(
+        data_entries(workspace_path)?,
+        pattern,
+        path_glob,
+        case_insensitive,
+        max_matches,
+        context_lines,
+    )
+}
+
+/// [`grep_files`] over a caller-supplied file list. Same reason as
+/// [`glob_entries`]: the caps, the binary sniff and the context window are the
+/// valuable part and must not be reimplemented per file source.
+pub fn grep_entries(
+    entries: Vec<(String, PathBuf)>,
+    pattern: &str,
+    path_glob: Option<&str>,
+    case_insensitive: bool,
+    max_matches: Option<usize>,
+    context_lines: Option<usize>,
+) -> Result<GrepResult, String> {
     let max_matches = GREP_MAX_MATCHES.apply(max_matches);
     let context_lines = GREP_CONTEXT_LINES.apply(context_lines);
     let pattern = pattern.trim();
@@ -174,22 +366,16 @@ pub fn grep_files(
     let path_filter = path_glob
         .map(str::trim)
         .filter(|g| !g.is_empty())
-        .map(|g| {
-            validate_pattern("path_glob", g)?;
-            glob::Pattern::new(g).map_err(|e| format!("Invalid path_glob '{}': {}", g, e))
-        })
+        .map(|g| compile_pattern("path_glob", g))
         .transpose()?;
-
-    let entries = crate::core::list_searchable_data_files(workspace_path)
-        .map_err(|e| format!("Failed to list workspace files: {}", e))?;
 
     let mut matches = Vec::new();
     let mut truncated = false;
     let mut total_bytes: usize = 0;
 
     'outer: for (rel, abs) in entries {
-        if let Some(ref pat) = path_filter {
-            if !pat.matches(&rel) {
+        if let Some(ref patterns) = path_filter {
+            if !patterns.iter().any(|p| p.matches(&rel)) {
                 continue;
             }
         }
@@ -440,6 +626,131 @@ mod tests {
         );
     }
 
+    // -------- brace alternation --------
+    // `glob::Pattern` matches `{` literally, so before expansion every one of
+    // these returned an empty list that reads exactly like "no such file".
+
+    #[test]
+    fn glob_expands_braces_to_the_union_of_the_arms() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/data-analysis/report.md", "x");
+        write(ws.path(), "artifacts/data-analysis/sub/notes.md", "y");
+        write(ws.path(), "artifacts/ticket-workflow/queue.md", "z");
+        write(ws.path(), "artifacts/backoffice/ledger.md", "w");
+
+        let braced = glob_files(
+            ws.path(),
+            "artifacts/{data-analysis,ticket-workflow}/**",
+            Some(200),
+        )
+        .unwrap();
+        let first = glob_files(ws.path(), "artifacts/data-analysis/**", Some(200)).unwrap();
+        let second = glob_files(ws.path(), "artifacts/ticket-workflow/**", Some(200)).unwrap();
+
+        assert_eq!(braced.paths, [first.paths, second.paths].concat());
+        assert_eq!(braced.paths.len(), 3);
+        assert!(!braced
+            .paths
+            .contains(&"artifacts/backoffice/ledger.md".to_string()));
+    }
+
+    #[test]
+    fn glob_expands_nested_braces() {
+        let ws = make_workspace();
+        for dir in ["one", "two", "three", "four"] {
+            write(ws.path(), &format!("artifacts/{}/x.md", dir), "x");
+        }
+        let r = glob_files(ws.path(), "artifacts/{one,{two,three}}/x.md", Some(200)).unwrap();
+        assert_eq!(
+            r.paths,
+            vec![
+                "artifacts/one/x.md".to_string(),
+                "artifacts/three/x.md".to_string(),
+                "artifacts/two/x.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_brace_empty_alternative_matches_the_bare_prefix() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/notes", "x");
+        write(ws.path(), "artifacts/notes.md", "y");
+        write(ws.path(), "artifacts/notes.txt", "z");
+        let r = glob_files(ws.path(), "artifacts/notes{,.md}", Some(200)).unwrap();
+        assert_eq!(
+            r.paths,
+            vec![
+                "artifacts/notes".to_string(),
+                "artifacts/notes.md".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_brace_group_without_a_comma_stays_literal() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/{one}.md", "x");
+        write(ws.path(), "artifacts/one.md", "y");
+        // Bash reads `{one}` as three literal characters, and so do we.
+        let r = glob_files(ws.path(), "artifacts/{one}.md", Some(200)).unwrap();
+        assert_eq!(r.paths, vec!["artifacts/{one}.md".to_string()]);
+    }
+
+    #[test]
+    fn glob_unbalanced_brace_stays_literal() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/{unclosed.md", "x");
+        write(ws.path(), "artifacts/close}.md", "y");
+        write(ws.path(), "artifacts/unclosed.md", "z");
+
+        let opened = glob_files(ws.path(), "artifacts/{unclosed.md", Some(200)).unwrap();
+        assert_eq!(opened.paths, vec!["artifacts/{unclosed.md".to_string()]);
+
+        let closed = glob_files(ws.path(), "artifacts/close}.md", Some(200)).unwrap();
+        assert_eq!(closed.paths, vec!["artifacts/close}.md".to_string()]);
+    }
+
+    #[test]
+    fn glob_character_class_hides_braces_and_commas() {
+        let ws = make_workspace();
+        write(ws.path(), "artifacts/{a,b}.md", "x");
+        write(ws.path(), "artifacts/a,b.md", "y");
+        write(ws.path(), "artifacts/c.md", "z");
+
+        // `[{]` is the matcher's own escape for a literal brace.
+        let escaped = glob_files(ws.path(), "artifacts/[{]a,b[}].md", Some(200)).unwrap();
+        assert_eq!(escaped.paths, vec!["artifacts/{a,b}.md".to_string()]);
+
+        // A comma inside a class belongs to the class, not to the alternation.
+        let inside = glob_files(ws.path(), "artifacts/{a[,]b,c}.md", Some(200)).unwrap();
+        assert_eq!(
+            inside.paths,
+            vec!["artifacts/a,b.md".to_string(), "artifacts/c.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn glob_rejects_expansion_past_the_alternative_cap() {
+        let ws = make_workspace();
+        // Nine two-way groups multiply out to 512, past MAX_BRACE_ALTERNATIVES.
+        let pattern = format!("artifacts/{}.md", "{a,b}".repeat(9));
+        let err = glob_files(ws.path(), &pattern, Some(200)).unwrap_err();
+        assert!(
+            err.contains("alternatives"),
+            "expected an alternative-cap error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn glob_brace_alternative_cannot_escape_data() {
+        let ws = make_workspace();
+        // The raw pattern passes the traversal guard; one expansion does not.
+        let err = glob_files(ws.path(), "{/etc,artifacts}/**", Some(200)).unwrap_err();
+        assert!(err.contains("rejected"), "got: {}", err);
+    }
+
     // -------- grep_files --------
 
     #[test]
@@ -503,6 +814,26 @@ mod tests {
         .unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "apps/foo/index.html");
+    }
+
+    #[test]
+    fn grep_path_glob_expands_braces() {
+        let ws = make_workspace();
+        write(ws.path(), "apps/one/x.md", "Hello");
+        write(ws.path(), "knowhow/two/y.md", "Hello");
+        write(ws.path(), "artifacts/three/z.md", "Hello");
+
+        let r = grep_files(
+            ws.path(),
+            "Hello",
+            Some("{apps,knowhow}/**/*.md"),
+            false,
+            Some(100),
+            Some(0),
+        )
+        .unwrap();
+        let paths: Vec<&str> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, vec!["apps/one/x.md", "knowhow/two/y.md"]);
     }
 
     #[test]

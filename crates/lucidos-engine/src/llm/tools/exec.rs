@@ -68,7 +68,9 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
             description: format!(
                 "Run system commands (curl, wget, git, jq, system tools). NOT for creating or editing files in data/: use run_python, and git add plus git commit to commit what bash changed. \
                 Stdout and stderr come back truncated to 100KB. Timeout {DEFAULT_TIMEOUT_SECS}s by default, {MAX_TIMEOUT_SECS}s max: bump `timeout_secs` to the max for a build, a full-repo grep, or anything over 30s, or the default kills it mid-stream. \
-                The repeated-call guard buckets consecutive calls by the FIRST WHITESPACE TOKEN of `command`, so `sleep 60 && check` buckets under `sleep`. To WAIT on a background task use `bash_output(task_id, wait_secs=N)`. Same env-var injection as run_python."
+                The repeated-call guard buckets consecutive calls by the FIRST WHITESPACE TOKEN of `command`, so `sleep 60 && check` buckets under `sleep`. To WAIT on a background task use `bash_output(task_id, wait_secs=N)`. \
+                Never detach with `&` or `nohup`: the chain backgrounds as one subshell still holding this call's pipes, so you get a detached-process note and nothing after it. Use run_bash_background. \
+                Same env-var injection as run_python."
             ),
             parameters: json!({
                 "type": "object",

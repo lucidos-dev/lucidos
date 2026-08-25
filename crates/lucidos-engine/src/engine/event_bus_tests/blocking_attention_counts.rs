@@ -804,3 +804,252 @@ async fn rebuild_recomputes_blocking_descendant_count() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// -----------------------------------------------------------------------
+// Recursive-CTE termination and dedup.
+//
+// Every ancestor / descendant walk in
+// `event_bus_projection_propagation.rs` uses plain UNION. The two tests
+// below hold the pair of properties that swap rests on: a cycle
+// terminates, and an acyclic tree still counts every descendant once.
+// -----------------------------------------------------------------------
+
+/// Await `fut`, failing rather than hanging when a recursive CTE loops.
+///
+/// The regression this guards is not a wrong answer. The query never returns,
+/// so an unbounded await would wedge the whole test binary instead of
+/// reporting a failure.
+///
+/// Dropping the future abandons the query, it does not stop it. So the timeout
+/// arm kills this database's other backends first. Otherwise the loop burns a
+/// core until the test container dies, and `teardown_test_db` cannot drop a
+/// database somebody is still connected to.
+async fn within_ten_seconds<F: std::future::Future>(
+    pool: &PgPool,
+    what: &str,
+    fut: F,
+) -> F::Output {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), fut).await {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = sqlx::query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid <> pg_backend_pid()",
+            )
+            .execute(pool)
+            .await;
+            panic!("{what} did not finish in 10s: its recursive CTE looped");
+        }
+    }
+}
+
+/// Insert a `thread_summaries` row straight, bypassing the projection.
+///
+/// The cycle test needs a `parent_thread_id` that no emit path will write.
+/// The tree test needs a shape whose expected counts read off one place.
+async fn insert_summary_row(
+    pool: &PgPool,
+    thread_id: Uuid,
+    parent: Option<Uuid>,
+    status: &str,
+    is_coding_agent: bool,
+) {
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, last_activity, has_response, \
+              state, status, archive_state, is_coding_agent, parent_thread_id) \
+         VALUES ($1, 'T', $5, 1, NOW(), TRUE, 'active', $2, 'inbox', $3, $4)",
+    )
+    .bind(thread_id)
+    .bind(status)
+    .bind(is_coding_agent)
+    .bind(parent)
+    .bind(if is_coding_agent {
+        "claude_code"
+    } else {
+        "chat"
+    })
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Set both descendant counters on every row to a wrong value.
+///
+/// A later assertion then proves the recompute ran, rather than reading a
+/// number that was already right.
+async fn poison_descendant_counts(pool: &PgPool) {
+    sqlx::query(
+        "UPDATE thread_summaries \
+         SET blocking_descendant_count = 99, attention_descendant_count = 99",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Discard a proposal on `thread_id`, which is what drives the ancestor
+/// reconcile. The `change_id` is deliberately not a uuid, so the `changes`
+/// projection short-circuits and needs no aggregate row.
+async fn emit_change_discarded(bus: &EventBus, thread_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ChangeDiscarded {
+            change_id: format!("test-cid-{thread_id}"),
+            actor: None,
+            path: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// Parent cycle (data corruption, or a poison row written before the API
+/// boundary refused one): A→B→A. Every recursive CTE in the propagation
+/// module uses UNION, so each walk terminates on the dedup. Mirrors
+/// `fetch_family_extension_terminates_on_cycle`, which pins the same
+/// property on the read path.
+///
+/// The boot path awaits `rebuild_blocking_descendant_count`. So under UNION
+/// ALL one cyclic row hung engine startup on every future boot, with no way
+/// out from the UI.
+#[tokio::test]
+async fn propagation_walks_terminate_on_a_parent_cycle() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    insert_summary_row(&pool, a, Some(b), "running", true).await;
+    insert_summary_row(&pool, b, Some(a), "running", true).await;
+
+    // The boot-path rebuild.
+    within_ten_seconds(
+        &pool,
+        "rebuild_blocking_descendant_count",
+        EventBus::rebuild_blocking_descendant_count(&pool),
+    )
+    .await
+    .unwrap();
+
+    // The live delta walk, reached through the projection's function-boundary
+    // sampler: idling A flips its `is_blocking` and propagates to ancestors.
+    within_ten_seconds(
+        &pool,
+        "propagate_blocking_change",
+        emit_cc_idle(&bus, a, false, None),
+    )
+    .await;
+
+    // The Apply/Discard reconcile, which walks ancestors AND then every
+    // descendant of each one.
+    within_ten_seconds(
+        &pool,
+        "reconcile_proposal_lifecycle_end",
+        emit_change_discarded(&bus, a),
+    )
+    .await;
+
+    // A self-parent is the one-node case of the same corruption, and the one
+    // the API boundary now refuses. It must terminate too.
+    let solo = Uuid::new_v4();
+    insert_summary_row(&pool, solo, None, "running", true).await;
+    sqlx::query("UPDATE thread_summaries SET parent_thread_id = $1 WHERE thread_id = $1")
+        .bind(solo)
+        .execute(&pool)
+        .await
+        .unwrap();
+    within_ten_seconds(
+        &pool,
+        "rebuild_blocking_descendant_count on a self-parented row",
+        EventBus::rebuild_blocking_descendant_count(&pool),
+    )
+    .await
+    .unwrap();
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The UNION swap changes no count on ordinary acyclic data. Postgres dedups
+/// on the whole selected tuple, and each walk already selects one unique per
+/// (root, node). A thread has one parent, so exactly one path reaches it from
+/// any ancestor.
+///
+/// This tree catches a narrower tuple. `leaf_a` and `leaf_b` differ only by
+/// `thread_id`, and every descendant of `mid` is also a descendant of `root`.
+/// Drop `thread_id` or `root_id` from a selection and the counts below
+/// collapse.
+///
+/// - `root` (chat, idle)
+///   - `mid` (chat, idle)
+///     - `leaf_a` (coding agent, running)
+///     - `leaf_b` (coding agent, running)
+///   - `leaf_c` (coding agent, waiting_for_user_answer)
+#[tokio::test]
+async fn dedup_still_counts_every_descendant_of_an_acyclic_tree() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let root = Uuid::new_v4();
+    let mid = Uuid::new_v4();
+    let leaf_a = Uuid::new_v4();
+    let leaf_b = Uuid::new_v4();
+    let leaf_c = Uuid::new_v4();
+    insert_summary_row(&pool, root, None, "idle", false).await;
+    insert_summary_row(&pool, mid, Some(root), "idle", false).await;
+    insert_summary_row(&pool, leaf_a, Some(mid), "running", true).await;
+    insert_summary_row(&pool, leaf_b, Some(mid), "running", true).await;
+    insert_summary_row(&pool, leaf_c, Some(root), "waiting_for_user_answer", true).await;
+    poison_descendant_counts(&pool).await;
+
+    EventBus::rebuild_blocking_descendant_count(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_blocking_descendant_count(&pool, root).await,
+        3,
+        "root blocks on leaf_a, leaf_b and leaf_c; mid is idle"
+    );
+    assert_eq!(
+        read_attention_descendant_count(&pool, root).await,
+        1,
+        "only leaf_c waits on the user; running is not attention"
+    );
+    assert_eq!(
+        read_blocking_descendant_count(&pool, mid).await,
+        2,
+        "mid blocks on its two running children, counted once each"
+    );
+    assert_eq!(read_attention_descendant_count(&pool, mid).await, 0);
+    for leaf in [leaf_a, leaf_b, leaf_c] {
+        assert_eq!(read_blocking_descendant_count(&pool, leaf).await, 0);
+        assert_eq!(read_attention_descendant_count(&pool, leaf).await, 0);
+    }
+
+    // Same arithmetic through the in-transaction reconcile, a separate pair
+    // of CTEs. Discarding leaf_a's proposal idles it, then recomputes every
+    // ancestor from ground truth.
+    emit_change_discarded(&bus, leaf_a).await;
+
+    assert_eq!(
+        read_blocking_descendant_count(&pool, mid).await,
+        1,
+        "reconcile drops the idled leaf_a, keeps leaf_b"
+    );
+    assert_eq!(
+        read_blocking_descendant_count(&pool, root).await,
+        2,
+        "reconcile reaches the grandparent, counting leaf_b and leaf_c"
+    );
+    assert_eq!(
+        read_attention_descendant_count(&pool, root).await,
+        1,
+        "leaf_c still waits on the user"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

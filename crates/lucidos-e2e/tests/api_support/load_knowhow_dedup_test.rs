@@ -173,7 +173,17 @@ async fn poll_event_payload_contains(
 }
 
 /// Poll the events table for the most recent `ContextCaptured` row on the
-/// given thread, returning its parsed payload. Times out after `max_secs`.
+/// given thread that came from the MAIN LLM call, returning its parsed payload.
+/// Times out after `max_secs`.
+///
+/// The producer filter is load-bearing. A turn also runs *auxiliary model
+/// calls*, and each captures its own context on the same thread. Query
+/// classification lands during setup, before the turn's own row; fact
+/// extraction lands after it, off the EventBus. Either can be the newest, and
+/// its single "Memory Request" section carries no knowhow and never will.
+///
+/// Filtered on `producer` rather than `purpose`: `ContextPurpose::Turn` is
+/// skip-serialized, so a turn row has no `purpose` key to match on at all.
 async fn poll_latest_context_captured(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -184,6 +194,7 @@ async fn poll_latest_context_captured(
         let row: Option<(Value,)> = sqlx::query_as(
             "SELECT payload FROM events \
              WHERE event_type = 'ContextCaptured' AND aggregate_id = $1 \
+               AND payload->>'producer' = 'main_llm' \
              ORDER BY created DESC LIMIT 1",
         )
         .bind(thread_id.to_string())
@@ -195,7 +206,7 @@ async fn poll_latest_context_captured(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "ContextCaptured for thread {thread_id} did not appear within {max_secs}s",
+            "a main_llm ContextCaptured for thread {thread_id} did not appear within {max_secs}s",
         );
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }

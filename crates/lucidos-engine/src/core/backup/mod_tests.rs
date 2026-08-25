@@ -889,6 +889,24 @@ fn backupignore_missing_file_means_only_hardcoded() {
     ));
 }
 
+/// Permission grants are deliberately NOT backed up (ADR 0095). They live in
+/// `.lucidos/`, so a restore lands a workspace with no grants and the user is
+/// asked once. That is fail-closed and correct: restoring onto another machine
+/// must not silently reinstate a yes.
+#[test]
+fn permission_grants_are_excluded_from_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let ignore = BackupIgnore::load(dir.path());
+    for file in crate::core::GrantFile::ALL {
+        let rel = std::path::PathBuf::from(".lucidos").join(file.file_name());
+        assert!(
+            is_excluded_workspace_path(&rel, &ignore),
+            "{} must not travel in a backup archive",
+            rel.display()
+        );
+    }
+}
+
 /// A loaded `.backupignore` excludes its patterns IN ADDITION to the hardcoded
 /// `.lucidos` / `data/postgres` exclusions — neither overrides the other.
 #[test]

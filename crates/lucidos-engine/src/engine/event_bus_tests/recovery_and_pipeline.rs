@@ -227,7 +227,7 @@ async fn emit_user_system_resolves_actor_and_emits_system_event() {
 //
 //   1. `emit_pipeline_has_five_named_phases_in_order` — a source-level check
 //      that the five `// === Phase: <Name> ===` banners exist inside
-//      `event_bus.rs` in the documented order. Catches the case where someone
+//      `event_bus/mod.rs` in the documented order. Catches the case where someone
 //      adds a chunk of code outside a declared phase, or reorders the phases.
 //
 //   2. `subscriber_observes_event_with_committed_projection` — a behavioural

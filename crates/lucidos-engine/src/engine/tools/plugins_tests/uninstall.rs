@@ -140,18 +140,15 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
     let bus = MockEventBus::new();
 
     // 1. Fresh install lands files and emits PluginInstalled.
-    let (msg, _files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         &workspace,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install should succeed on empty workspace");
-    assert_eq!(msg, "Installed Fixture Plugin v0.1.0 (2 files).");
+    assert_eq!(write.summary, "Installed Fixture Plugin v0.1.0 (2 files).");
 
     let kn_path = workspace.join("data/knowhow/fixture.md");
     let trig_path = workspace.join("data/triggers/fixture/fixture.md");
@@ -208,10 +205,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         &workspace,
         &bus,
         &unpacked_v2,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect_err("second install must hit conflict");
@@ -234,18 +228,15 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
     assert_eq!(std::fs::read_to_string(&kn_path).unwrap(), "v1");
 
     // 3. Re-install with overwrite=true succeeds and the file content updates.
-    let (msg2, _files2) = install_from_unpacked_with_bus(
+    let write2 = install_from_unpacked_with_bus(
         &workspace,
         &bus,
         &unpacked_v2,
-        SourceType::Archive,
-        true,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, true),
     )
     .await
     .expect("overwrite install should succeed");
-    assert_eq!(msg2, "Installed Fixture Plugin v0.1.0 (2 files).");
+    assert_eq!(write2.summary, "Installed Fixture Plugin v0.1.0 (2 files).");
     assert_eq!(
         std::fs::read_to_string(&kn_path).unwrap(),
         "v2",
@@ -260,7 +251,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
     // 4. Uninstall via the new confirm flow: build a PendingUninstall directly
     //    from the recorded files and run uninstall_with_bus. Asserts that
     //    files now actually disappear (the v2 behavior — v1 was guide-only).
-    let installed_files = match &bus.emitted_events()[1] {
+    let recorded_files = match &bus.emitted_events()[1] {
         BusEvent::System(SystemEvent::PluginInstalled { files, .. }) => files.clone(),
         other => panic!("expected PluginInstalled at index 1, got {:?}", other),
     };
@@ -268,7 +259,7 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         plugin_id: "fixture-plugin".to_string(),
         plugin_version: "0.1.0".to_string(),
         plugin_name: "Fixture Plugin".to_string(),
-        files_present: installed_files.clone(),
+        files_present: recorded_files.clone(),
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
@@ -356,14 +347,11 @@ source = "https://github.com/x/uninstall-track"
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (_msg, installed_files) = install_from_unpacked_with_bus(
+    let write = install_from_unpacked_with_bus(
         &scratch,
         &bus,
         &unpacked,
-        SourceType::Archive,
-        false,
-        None,
-        None,
+        InstallContext::plain(SourceType::Archive, false),
     )
     .await
     .expect("install");
@@ -371,7 +359,7 @@ source = "https://github.com/x/uninstall-track"
     // Sanity: install committed the files (covered in depth by the install
     // regression test) — so the uninstall has a tracked deletion to make.
     let repo = git2::Repository::open(&scratch).unwrap();
-    for rel in &installed_files {
+    for rel in &write.installed_files {
         assert!(
             repo.status_file(std::path::Path::new(&format!("data/{}", rel)))
                 .unwrap()
@@ -385,17 +373,17 @@ source = "https://github.com/x/uninstall-track"
         plugin_id: "uninstall-track-plugin".to_string(),
         plugin_version: "1.2.0".to_string(),
         plugin_name: "Uninstall Track Plugin".to_string(),
-        files_present: installed_files.clone(),
+        files_present: write.installed_files.clone(),
         files_missing: Vec::new(),
         created_at: chrono::Utc::now(),
     };
     let outcome = uninstall_with_bus(&scratch, &bus, &pending, None)
         .await
         .expect("uninstall");
-    assert_eq!(outcome.files_deleted.len(), installed_files.len());
+    assert_eq!(outcome.files_deleted.len(), write.installed_files.len());
 
     // Files gone from disk.
-    for rel in &installed_files {
+    for rel in &write.installed_files {
         assert!(
             !scratch.join("data").join(rel).exists(),
             "uninstall must delete {}",
@@ -412,7 +400,7 @@ source = "https://github.com/x/uninstall-track"
         "uninstall commit must name the plugin and version"
     );
     let tree = head.tree().unwrap();
-    for rel in &installed_files {
+    for rel in &write.installed_files {
         assert!(
             tree.get_path(std::path::Path::new(&format!("data/{}", rel)))
                 .is_err(),

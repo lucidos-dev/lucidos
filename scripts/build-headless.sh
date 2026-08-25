@@ -5,14 +5,17 @@
 # (step 2 of docs/plans/2026-06-30-installer-step2-linux-tarball.md) and also
 # runs on macOS as the local smoke for the shared staging recipe.
 #
-# It assembles the SAME 6-resource self-contained tree as the DMG —
+# It assembles the SAME 7-resource self-contained tree as the DMG, and from the
+# same list: both read RESOURCE_NAMES out of scripts/lib/resource_contract.sh,
+# which is also where --check gets its notion of what the runtime requires.
 #   • lucidos-engine        (target/release/lucidos-engine)
 #   • lucidos-gateway       (target/release/lucidos-gateway)
-#   • lucidos               (target/release/lucidos — the CLI)
+#   • lucidos               (target/release/lucidos, the CLI)
 #   • frontend              (crates/lucidos-app/dist)
 #   • postgres              (relocatable PostgreSQL 18 + compiled pgvector)
 #   • sdk                   (packages/lucidos-sdk/dist)
-# — via the shared scripts/lib/stage_runtime.sh, then reuses
+#   • system-knowhow        (system-knowhow/)
+# Staging runs through the shared scripts/lib/stage_runtime.sh, then reuses
 # scripts/lib/headless_tarball.sh to emit lucidos-<version>-<triple>.tar.gz plus a
 # `shasum -a 256 -c`-compatible .sha256 sidecar. No Tauri, no .app, no DMG.
 #
@@ -54,7 +57,13 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/crates/lucidos-app"
-RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
+
+# The staged-resource contract, shared with build-dmg.sh. Sourced first, because
+# the array below reads from it.
+# shellcheck source=scripts/lib/resource_contract.sh
+source "$SCRIPT_DIR/lib/resource_contract.sh"
+# shellcheck disable=SC2207  # resource names are single words by construction
+RESOURCE_NAMES=($(resource_contract_names))
 
 PG_VERSION="${PG_VERSION:-18.4.0}"          # match build-dmg.sh / the dev/docker stack
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
@@ -124,7 +133,12 @@ if [ -z "$TRIPLE" ]; then
 fi
 
 # --check: validate the resource contract offline and exit (no build, no network).
+# This used to be a printf and an exit 0, which could not fail, so a reader who
+# trusted it as the contract validator got no signal at all. It now runs the same
+# check build-dmg.sh does, against the two runtime launchers.
 if [ "$DO_CHECK" = "1" ]; then
+    resource_contract_check "$APP_DIR/src/desktop.rs" \
+        || die "the staged resource contract does not hold (see the errors above)"
     printf 'OK: headless bundle for %s includes %s\n' "$TRIPLE" "${RESOURCE_NAMES[*]}"
     exit 0
 fi
@@ -174,9 +188,19 @@ PG_PREFIX="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$TR
 # ── 4. assemble the runtime tree ─────────────────────────────────────────────
 STAGE="$REPO_ROOT/.lucidos/headless-build/$TRIPLE/stage"
 step "Staging runtime tree → $STAGE"
-stage_runtime_assemble "$STAGE" "$ENGINE_BIN" "$GATEWAY_BIN" "$CLI_BIN" "$APP_DIR/dist" \
-    "$PG_PREFIX" "$REPO_ROOT/packages/lucidos-sdk/dist" "$REPO_ROOT/system-knowhow" >/dev/null \
+stage_runtime_assemble "$STAGE" \
+    "lucidos-engine=$ENGINE_BIN" \
+    "lucidos-gateway=$GATEWAY_BIN" \
+    "lucidos=$CLI_BIN" \
+    "frontend=$APP_DIR/dist" \
+    "postgres=$PG_PREFIX" \
+    "sdk=$REPO_ROOT/packages/lucidos-sdk/dist" \
+    "system-knowhow=$REPO_ROOT/system-knowhow" >/dev/null \
     || die "failed to stage the runtime tree into $STAGE"
+# The tarball is built from this tree, so assert it against the contract before
+# it is sealed. An omitted resource is invisible in a .tar.gz nobody unpacks.
+resource_contract_assert_staged "$STAGE" \
+    || die "the staged tree does not match the resource contract (see the errors above)"
 
 # ── 5. emit the headless tarball + .sha256 ───────────────────────────────────
 step "Emitting headless tarball + .sha256 → $OUT_DIR"

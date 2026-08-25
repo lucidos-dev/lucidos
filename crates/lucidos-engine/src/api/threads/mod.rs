@@ -52,6 +52,8 @@ struct ThreadActionFacts {
     archive_state: String,
     coding_agent_proposed: bool,
     blocking_descendant_count: i32,
+    live_event_wait_count: i32,
+    active_children_count: i32,
     is_saved: bool,
     compose_text: Option<String>,
     compose_images: Option<serde_json::Value>,
@@ -72,7 +74,8 @@ pub(in crate::api) async fn available_thread_actions_for(
     };
     let facts: Option<ThreadActionFacts> = sqlx::query_as(
         "SELECT is_coding_agent, status, archive_state, coding_agent_proposed,
-                blocking_descendant_count, is_saved, compose_text, compose_images
+                blocking_descendant_count, live_event_wait_count, active_children_count,
+                is_saved, compose_text, compose_images
          FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -97,6 +100,8 @@ pub(in crate::api) async fn available_thread_actions_for(
         ArchiveState::parse(&f.archive_state),
         f.coding_agent_proposed,
         f.blocking_descendant_count > 0,
+        f.live_event_wait_count > 0,
+        f.active_children_count > 0,
         has_unsent_draft,
         f.is_saved,
     ))

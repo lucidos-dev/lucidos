@@ -19,7 +19,10 @@ function threadNavItem(index: number, id: string): NavHistoryItem {
   return {
     key: `${index}:${id}`,
     label: thread ? threadDisplayTitle(thread) : 'Untitled Thread',
-    icon: <ThreadTypeIcon channel={thread?.meta.channel ?? 'chat'} codingAgent={thread?.meta.codingAgent} />,
+    // `'unknown'`, not a plausible `'chat'`: a row whose thread has left the
+    // map has no known channel. `ThreadTypeIcon` draws the Lucidos mark for
+    // both, so the honest value costs nothing.
+    icon: <ThreadTypeIcon channel={thread?.meta.channel ?? 'unknown'} codingAgent={thread?.meta.codingAgent} />,
     onSelect: () => threadNavGoTo(index),
   };
 }

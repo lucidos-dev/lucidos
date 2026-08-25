@@ -41,6 +41,16 @@ pub(crate) use recovery::switch_was_user_initiated;
 // production SQL rather than a hand-copied paraphrase of it.
 #[cfg(test)]
 pub(crate) use recovery::BRANCH_CLASSIFICATION_SQL;
+// The stale settle's two worktree actions, so the app-shape tests drive the
+// production pair rather than a hand-copied replay of it. Which of the two runs
+// is the whole property: a Discard removes the tree, everything else rescues it
+// and leaves it to the cleanup worker (ADR 0035).
+// `settle_stale_worktree` joins them because it holds the third answer: git
+// could not say which tree has the branch, so neither action may run.
+#[cfg(test)]
+pub(crate) use recovery::{
+    remove_discarded_stale_worktree, rescue_stale_worktree, settle_stale_worktree,
+};
 // "Does this branch still owe the user a recovery?", for the same reason: the
 // scenario mirror calls it instead of re-spelling its `&&`, which is how a
 // retired input sat in the mirror being asserted as correct.

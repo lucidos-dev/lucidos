@@ -1,7 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
-import { isNavigationScroll, isHeaderPinnedForScroll } from '../components/chat/scrollState';
+import { isAnchorScroll, isNavigationScroll, isHeaderPinnedForScroll, onAnchorScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 import { isRepaintNudging } from '../utils/iosRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
@@ -69,6 +69,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let currentContainerPane: Element | null = null;
     let currentViewKey: string | null = null;
     let mutationRafId: number | null = null;
+    /** The pending next-frame re-base after an anchor write (`onAnchorScroll`). */
+    let anchorSettleRaf: number | null = null;
     let keyboardOpen = false; // true while a prompt input is focused
     let disabled = false;
     // Per-pane scroll state so each pane has independent header position
@@ -236,6 +238,13 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       updateHeaderVar();
     }
 
+    /** The container's offset, with iOS elastic bounce at either end clamped
+     *  away so it cannot move the header. */
+    function clampedScrollTop(container: Element): number {
+      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+      return Math.min(Math.max(0, container.scrollTop), maxScroll);
+    }
+
     function onScroll() {
       const header = headerRef.current;
       if (!header || cachedHeight === 0 || !currentContainer || disabled) return;
@@ -276,9 +285,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // own motion and far cheaper than dropping real scroll deltas.
       if (isRepaintNudging() && !isUserScrolling()) return;
 
-      const rawScrollTop = currentContainer.scrollTop;
-      const maxScroll = Math.max(0, currentContainer.scrollHeight - currentContainer.clientHeight);
-      const scrollTop = Math.min(Math.max(0, rawScrollTop), maxScroll);
+      const scrollTop = clampedScrollTop(currentContainer);
 
       // One of OUR OWN navigations is writing scrollTop frame by frame (a
       // chevron tap, turn-nav, a deep-link glide). Those scroll events are not
@@ -287,9 +294,15 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // (isHeaderPinnedForScroll): .chat-exchange's scroll-margin-top is sized
       // for the visible-header case, so a half-hidden header would leave the
       // landed event partly covered.
+      // An ANCHOR write is the exception, and it is the opposite request: the
+      // app moved the container precisely so the reader's line would NOT move.
+      // Revealing the chrome there covers that line with the header they had
+      // scrolled away, by up to a header plus a thread title. So the offset is
+      // kept and only the baseline re-taken, which is what makes the correction
+      // invisible instead of a jump. See `markAnchorScroll`.
       if (isNavigationScroll() || isHeaderPinnedForScroll()) {
         prevScrollTop = scrollTop;
-        headerOffset = 0;
+        if (!isAnchorScroll()) headerOffset = 0;
         applyTransform();
         return;
       }
@@ -548,6 +561,27 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     }
     recomputeDisabled();
 
+    // The app re-based this container's offset to hold the reader on the
+    // content they were reading. Re-take the baseline HERE, not on the scroll
+    // event: on WebKit that event can arrive after the navigation window has
+    // closed, handing the header the whole jump. See `onAnchorScroll`. The
+    // offset is untouched, because nobody moved.
+    //
+    // And AGAIN on the next frame, because the write is not the end of it. A
+    // reveal that shrinks the transcript is still settling, and the browser's
+    // own clamp lands after. That clamp is a scroll nobody asked for, and the
+    // header spent it as a reveal of the full title and bar.
+    const unsubAnchor = onAnchorScroll((el) => {
+      if (el !== currentContainer) return;
+      prevScrollTop = clampedScrollTop(el);
+      if (anchorSettleRaf !== null) cancelAnimationFrame(anchorSettleRaf);
+      anchorSettleRaf = requestAnimationFrame(() => {
+        anchorSettleRaf = null;
+        if (el !== currentContainer) return;
+        prevScrollTop = clampedScrollTop(el);
+      });
+    });
+
     const unsub = mobileView.subscribe(() => {
       attachListener();
       refreshHeight();
@@ -568,9 +602,11 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       window.visualViewport?.removeEventListener('resize', refreshHeight);
       if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
       if (mutationRafId !== null) cancelAnimationFrame(mutationRafId);
+      if (anchorSettleRaf !== null) cancelAnimationFrame(anchorSettleRaf);
       observer.disconnect();
       headerResizeObserver.disconnect();
       if (titleBarResizeObserver) titleBarResizeObserver.disconnect();
+      unsubAnchor();
       unsub();
       unsubOverlay();
       unsubPrefs();

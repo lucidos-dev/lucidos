@@ -61,21 +61,24 @@ pub enum DisplaySection {
 pub enum ThreadStatus {
     Idle,
     Running,
-    /// Written by exactly ONE site: `AbortCause::status_sql()`
-    /// (`thread_events/cause.rs`), whose non-`StaleSettle` arms map to
-    /// `CASE WHEN coding_agent_proposed THEN 'waiting' ELSE <verdict> END`.
-    /// That fragment is interpolated into the `ResponseAborted` projection
-    /// arm, so an abort landing on a CC thread that already proposed a change
-    /// settles here rather than at `Paused` / `Failed`: a change ready to
-    /// review outranks both the interruption and the failure.
+    /// **Nothing writes this any more.** It survives so historical rows keep
+    /// their meaning. `ThreadStatus::parse` deserializes `waiting` here rather
+    /// than falling through to Idle. The variant also stays in `ALL`, in the
+    /// CLI's status filter, and in the generated TS union.
     ///
-    /// Every OTHER settle path uses `STATUS_FROM_PROPOSED_CHANGE`, which is the
-    /// literal `'idle'`: a proposed change is an artifact for the user to
-    /// review, not a parked loop, so it surfaces via `coding_agent_proposed`
-    /// (and `is_blocking` clause 3) instead. Historical CC rows may also still
-    /// carry `waiting`, and `ThreadStatus::parse` deserializes them here rather
-    /// than falling through its catch-all to Idle. For "loop is parked waiting
-    /// for human input" see `WaitingForUserAnswer`.
+    /// `AbortCause::status_sql()` was the last writer. Its verdict arms opened
+    /// `CASE WHEN coding_agent_proposed THEN 'waiting'`, so an abort landing on
+    /// a CC thread with a pending change settled here instead of at `Paused` /
+    /// `Failed`. That ordering (a change to review outranks the interruption)
+    /// is kept, and now lives only in the frontend's `resolveVisualStatus`. See
+    /// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`
+    /// for why saying it twice cost the verdict.
+    ///
+    /// Every settle path writes `STATUS_FROM_PROPOSED_CHANGE`, the literal
+    /// `'idle'`: a proposed change is an artifact for the user to review, not a
+    /// parked loop, so it surfaces via `coding_agent_proposed` (and
+    /// `is_blocking` clause 3) instead. For "loop is parked waiting for human
+    /// input" see `WaitingForUserAnswer`.
     Waiting,
     /// CC paused on an `AskUserQuestion` tool call. The subprocess was killed
     /// after emitting `UserQuestionAsked`; resuming requires the user to
@@ -85,7 +88,8 @@ pub enum ThreadStatus {
     /// The user's own *Switch to new version* interrupted this turn, and the
     /// engine has promised to resume it. Set by `AbortCause::status_sql()` for
     /// exactly one shape, `AbortCause::promises_auto_resume()`: an
-    /// `EngineShutdown` abort stamped with the device that clicked Switch.    ///
+    /// `EngineShutdown` abort stamped with the device that clicked Switch.
+    ///
     /// Nothing failed here, which is the whole point of the variant: before it
     /// existed the switch teardown landed on `Failed`, so switching versions
     /// painted every in-flight thread with the red error dot for work the engine
@@ -93,19 +97,24 @@ pub enum ThreadStatus {
     /// why the condition is this narrow: an interruption NOBODY is coming back
     /// for (a crash, a bare shutdown, or a boot that could not keep the resume
     /// promise) is `Failed`, so it keeps the red dot, its needs-attention slot,
-    /// and its Continue button. Distinct from `WaitingForUserAnswer` (the loop is
-    /// parked on a question the user must answer) and from `Waiting` (a change is
-    /// sitting in review): a paused turn is simply on its way back.
+    /// and its Continue button. Distinct from `WaitingForUserAnswer`, where the
+    /// loop is parked on a question the user must answer: a paused turn is
+    /// simply on its way back.
+    ///
+    /// **Written whether or not the thread has a pending change.** The change
+    /// rides `coding_agent_proposed`, and the frontend's `resolveVisualStatus`
+    /// ranks the two. This arm used to defer to a pending change and write
+    /// `Waiting`, which is how the verdict got lost; see that variant.
     ///
     /// A verdict, not a resting state: like `Failed`, it must survive the trailing
     /// events of the dying turn (see `preserving_verdict`), or recovery's own
     /// `CodingAgentIdled` walks it straight back to `Idle`.
     Paused,
     /// Last response failed (model error, quota exceeded, etc.). Distinct from
-    /// `Waiting` so the UI can show an error indicator instead of the changes
-    /// dot, and from `Paused` so an interruption the engine expects to resume
-    /// isn't reported as an error. Cleared when the user sends another message
-    /// (→ `Running`).
+    /// `Paused`, so an interruption the engine expects to resume isn't reported
+    /// as an error. Cleared when the user sends another message (→ `Running`).
+    /// Written whether or not a change is pending, for the reason `Paused`
+    /// gives.
     Failed,
 }
 
@@ -313,15 +322,24 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // of THIS exchange — same shape as a user-message exchange.
         // See docs/plans/2026-05-12-child-completion-card-design.md.
         "ChildThreadCompleted" => EventClass::Start,
-        // Resume-helper input from the `dismiss_from_context` tool. Pure
-        // bookkeeping — no UI surface, no activity bump.
-        "ContextDismissed" => EventClass::Metadata,
+        // Resume-helper input from the retired `dismiss_from_context` tool,
+        // and the record of a keep. Pure bookkeeping, no UI surface and no
+        // activity bump.
+        "ContextDismissed" | "ContextKeptOpen" => EventClass::Metadata,
+        // The model's picture of the job, written in its own reply. The
+        // round that carried it already bumped activity, so this is
+        // bookkeeping the next turn reads back.
+        "WorkingUnderstandingWritten" => EventClass::Metadata,
         // Engine-internal Flash enrichment of a prior MessageReceived's
         // attached images. The originating MessageReceived already moved
         // the thread into Running; this event arrives one or more
         // iterations later as a derived past-tense fact and must NOT
         // disturb the section/status machinery.
         "ImageDescribed" => EventClass::Metadata,
+        // The cached older-turn summary (ADR 0102). Written during turn setup,
+        // before the starter event on some paths, so it must not touch the
+        // section or status machinery. It is derived content, not a decision.
+        "ConversationSummarized" => EventClass::Metadata,
         // Event-wait lifecycle. Registration is Activity, not ActionRequired:
         // the thread subscribed to something the SYSTEM will deliver, so it must
         // never read as needing the user. The three resolutions are Activity for
@@ -354,6 +372,7 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "ToolCalled",
         "ToolResult",
         "TodoListWritten",
+        "WorkingUnderstandingWritten",
         "ResponseGenerated",
         "ResponseCanceled",
         "ResponseAborted",
@@ -405,11 +424,15 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Phase 4 fan-in / resume bookkeeping.
         "ChildThreadCompleted",
         "ContextDismissed",
+        "ContextKeptOpen",
         // Background-bash lifecycle (run_bash_background trio).
         "BackgroundBashStarted",
         "BackgroundBashCompleted",
         // Engine-internal Flash enrichment for MessageReceived images.
         "ImageDescribed",
+        // The cached older-turn summary. Persisted because the event IS the
+        // cache: there is no table, and a later turn rebuilds it from here.
+        "ConversationSummarized",
         // Command-guard checkpoint lifecycle (ADR 0002, Phase 4).
         "CommandCheckpointed",
         "CommandCheckpointReverted",
@@ -600,6 +623,9 @@ pub fn resolve_transition(
         // surface emits it. No section transition (the paired ToolCalled
         // already bumped activity for the wrapping turn).
         | "TodoListWritten"
+        // The model's working understanding, same shape as the todo list
+        // and legal on the same threads.
+        | "WorkingUnderstandingWritten"
         // ContinuationStarted opens the resume exchange after engine restart for
         // both chat (via /api/v1/threads/<id>/continue → chat/rerun.rs) and CC
         // (via the spawn-dispatcher's --resume path). Pure boundary marker —
@@ -633,14 +659,26 @@ pub fn resolve_transition(
         // running on long-idle threads.
         | "WorktreeCleaned"
         // Phase 4 fan-in events — typed callback emitted onto the parent
-        // when a child thread completes, and the dismissal record the
-        // `dismiss_from_context` tool produces. Both are pure resume-helper
-        // input: no section transition (parent's section was already moved
-        // by the child completion's other side effects), no status change.
-        // Without this entry, the bus rejects the typed emit and the
-        // wake-text path becomes a phantom-event reference (the C2 bug).
+        // when a child thread completes, plus the two curation records: the
+        // retired `dismiss_from_context` tool's, and the one a `[KEEP OPEN]`
+        // heading in the working understanding produces. No
+        // section transition here:
+        // the parent's section was already moved by the child completion's
+        // other side effects. Without this entry, the bus rejects the typed
+        // emit and the wake-text path becomes a phantom-event reference (the
+        // C2 bug).
+        //
+        // A completion that wakes its parent DOES move the status to
+        // `running`. The parent's exchange then opens the way a user
+        // message's does, rather than reading "Done" through the turn setup.
+        // That write is `update_parent_after_child_terminal` in
+        // `event_bus/parent_callback.rs`, under the same `should_callback`
+        // gate that decides a card is owed. It is absent from
+        // `status_transitions()` on purpose: that table mirrors
+        // `update_thread_projection`, and this write is not in it.
         | "ChildThreadCompleted"
         | "ContextDismissed"
+        | "ContextKeptOpen"
         // Background bash lifecycle — pure audit / fallback storage for
         // the run_bash_background tools. Legal on both thread types
         // (chat is the primary caller; CC could plausibly use them too).
@@ -654,6 +692,10 @@ pub fn resolve_transition(
         // originating MessageReceived (which already moved the section);
         // a transition here would re-open a thread the user just settled.
         | "ImageDescribed"
+        // The cached older-turn summary, written while the prompt is being
+        // assembled. A transition here would flip a thread to running before
+        // its own starter event says so.
+        | "ConversationSummarized"
         // Command-guard checkpoint lifecycle (ADR 0002, Phase 4). Both are
         // mid-turn bookkeeping over an Undo card: the checkpoint is taken while
         // the turn is already running, and the revert is a button on that card.
@@ -825,9 +867,16 @@ pub fn is_blocking(
 /// the attention badge and its drawer filter, both fed by this count.
 ///
 /// A thread merely holding an *event wait* is absent from this and from
-/// `is_blocking` alike: a subscription does not hold its thread's turn, and it
-/// asks nothing of the user, so such a thread is plain idle. Its subscriptions
-/// surface in the per-thread subscription indicator instead.
+/// `is_blocking` alike: a subscription does not hold its thread's turn, so such
+/// a thread is plain idle. Its subscriptions surface in the per-thread waiting
+/// indicator instead.
+///
+/// `available_thread_actions` DOES read the wait (ADR 0106), and the asymmetry
+/// is deliberate. Relaxing `is_blocking` would let an ancestor cascade-archive
+/// the thread, and that cascade emits `ChangeApplied` per pending change. So it
+/// would reach the outcome the action gate exists to prevent. The cost is a
+/// parked thread wearing an attention badge with no action to take, which is
+/// premature rather than wrong: it will need the user once it wakes.
 ///
 /// Relationship: `is_blocking = is_attention_needing OR status == Running`.
 /// `Archive`-button gating still uses `is_blocking` so a Running descendant
@@ -880,25 +929,45 @@ pub fn is_attention_needing(
 ///   `composeDrafts` signal so the cascade doesn't lag the 250 ms compose
 ///   debounce.
 /// - `is_saved` — `thread_summaries.is_saved`.
+/// - `has_live_event_waits` / `has_active_children`: projection facts
+///   (`live_event_wait_count > 0`, `active_children_count > 0`). Either one
+///   means the thread is *parked*, so something will wake it.
 ///
 /// `descendants_block_archive` is true when any descendant is currently in a
 /// state that prevents archive (Running, WaitingForUserAnswer, or
 /// has_pending_changes && CodingAgent — see `is_blocking`).
+// Six of the nine parameters are `bool`, so the argument swap this lint guards
+// against is a live hazard rather than an impossible one. Two things carry it
+// instead of a facts struct, which would have to be mirrored through the TS
+// emitter and the fixture to buy anything. The cross-validation fixture
+// exhausts the cross product and compares Rust against TS case by case, so a
+// swap between the two languages cannot survive it. And each side has exactly
+// ONE production caller, both covered: `available_thread_actions_for` and
+// `resolveThreadActions`.
+#[allow(clippy::too_many_arguments)]
 pub fn available_thread_actions(
     thread_type: ThreadType,
     status: ThreadStatus,
     stored_section: ArchiveState,
     has_pending_changes: bool,
     descendants_block_archive: bool,
+    has_live_event_waits: bool,
+    has_active_children: bool,
     has_unsent_draft: bool,
     is_saved: bool,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     // A thread holding an *event wait* is NOT live: the subscription does not
-    // hold its turn, so Archive stays offered. Archiving is not a way to strand
-    // one either, since the archive cancels every live wait on the thread
-    // (`EventWaitCancelCause::ThreadArchived`).
+    // hold its turn, so it settles at `idle` and keeps Archive (ADR 0049).
     let live = status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
+    // Parked: the turn ended, but something will wake this thread and it may
+    // commit again on the same branch. Its change is therefore not final.
+    //
+    // A gap survives between the delivery clearing the fact and the wake
+    // reaching `running`, so Apply reappears for it. ADR 0106 records why that
+    // is accepted: the flag needed to close it strands TRUE on a wake lost to a
+    // restart, and withholds Apply for good.
+    let will_resume = has_live_event_waits || has_active_children;
     let coding_agent_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
 
     // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be
@@ -909,10 +978,20 @@ pub fn available_thread_actions(
     // Layers 2 & 3 — change resolution then archive. Both are suppressed while
     // the thread is live (mid-turn). A pending change outranks archive: the
     // user must Apply or Discard before the thread can be archived.
+    //
+    // A parked thread loses Apply and Discard too, because both resolve a change
+    // the thread has not finished producing: it wakes on its delivery and commits
+    // on to the same branch. That leaves it exactly what a Running thread offers.
+    // Archive is unaffected, because a pending change already outranked it here.
+    // Archiving a parked thread with no change still cancels its waits rather than
+    // stranding them (`EventWaitCancelCause::ThreadArchived`). The way out before
+    // the 24 h ceiling is Stop waiting, which clears the wait and restores both.
     if !live {
         if coding_agent_pending {
-            actions.push(Action::Discard);
-            actions.push(Action::Apply);
+            if !will_resume {
+                actions.push(Action::Discard);
+                actions.push(Action::Apply);
+            }
         } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
             actions.push(Action::Archive);
         }
@@ -928,8 +1007,9 @@ pub fn available_thread_actions(
 
 // ── TypeScript Codegen ──────────────────────────────────────────────
 
-/// Event types whose projection sets `last_activity = NOW()` in event_bus.rs.
-/// Must match exactly the match arms in EventBus::update_thread_projection().
+/// Event types whose projection sets `last_activity = NOW()` in
+/// `event_bus_projection_thread.rs`. Must match exactly the match arms in
+/// `EventBus::update_thread_projection()`.
 /// The frontend uses this to keep thread.meta.updatedAt in sync with the backend.
 pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     // Thread start events (upsert INSERT with last_activity = NOW())
@@ -973,7 +1053,8 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
 ];
 
 /// Event types that increment message_count in the thread_summaries projection.
-/// Must match the events that do `message_count + 1` in event_bus.rs.
+/// Must match the events that do `message_count + 1` in
+/// `event_bus_projection_thread.rs`.
 pub const MESSAGE_COUNT_EVENTS: &[&str] = &[
     "MessageReceived",
     "TriggerStarted",
@@ -1014,7 +1095,8 @@ pub struct StatusTransition {
     pub cc_flags: CcFlagRule,
 }
 
-/// Status transitions for each event type, mirroring event_bus.rs update_thread_projection().
+/// Status transitions for each event type, mirroring
+/// `event_bus_projection_thread.rs`'s `update_thread_projection()`.
 /// Events not listed here have no status or CC flag effect.
 pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
     vec![
@@ -1047,7 +1129,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // Projection skips empty-text payloads — see event_bus.rs.
+        // Projection skips empty-text payloads: see event_bus_projection_thread.rs.
         (
             "CodingAgentPromptSent",
             StatusTransition {
@@ -1082,8 +1164,8 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         // Exception: reason=StaleResume skips this transition (handled imperatively
-        // in event_bus.rs and thread-events.ts) because the user's message is still
-        // being processed in a fresh session.
+        // in event_bus_projection_thread.rs and thread-events.ts) because the
+        // user's message is still being processed in a fresh session.
         (
             "SessionEnded",
             StatusTransition {
@@ -1099,13 +1181,16 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // than 'failed', because the engine resumes that turn itself. The row
         // below states the remaining case, which is every interruption nobody
         // promised to undo and IS genuinely failed; the split lives next to the
-        // cause enum, on `AbortCause::promises_auto_resume()`. Pending changes
-        // override every arm to 'waiting': reviewing the changes is more
-        // actionable than acknowledging the interrupt.
+        // cause enum, on `AbortCause::promises_auto_resume()`.
+        //
+        // A pending change no longer enters into it, which is why this is
+        // `Set` rather than the `ConditionalCc(Waiting, Failed)` it was. The
+        // change surfaces through `coding_agent_proposed`, and the frontend
+        // ranks it against the verdict.
         (
             "ResponseAborted",
             StatusTransition {
-                status: StatusRule::ConditionalCc(ThreadStatus::Waiting, ThreadStatus::Failed),
+                status: StatusRule::Set(ThreadStatus::Failed),
                 cc_flags: CcFlagRule::None,
             },
         ),
@@ -1279,7 +1364,8 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // into one Result haven't actually finished) must re-bump status to
         // Running. This is a no-op on the common streaming path where status
         // is already Running. Must list exactly the same events as the
-        // activity-event arm in `event_bus.rs::update_thread_projection`.
+        // activity-event arm in
+        // `event_bus_projection_thread.rs::update_thread_projection`.
         //
         // Caveat: the projection skips this Running-bump when the event
         // carries `meta.actor = MessageOrigin::System`. Live LLM-loop
@@ -1290,7 +1376,7 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
         // wrote, so resurrecting them to Running parks the row in the
         // Active section forever. The contract here describes the
         // typical live-event path; the System-actor exception lives in
-        // `event_bus_projection.rs` and is covered by
+        // `event_bus_projection_thread.rs` and is covered by
         // `system_actor_activity_event_does_not_resurrect_terminated_thread`.
         (
             "TextStreamed",

@@ -35,8 +35,8 @@ describe('mergeContextCaptureSections', () => {
   it('attaches fetched sections + tools and clears the stripped flag', () => {
     const stripped = baseSnap({ sections_stripped: true, event_id: 'eid' });
     const sections: ContextSection[] = [
-      { name: 'system', char_count: 100, role: 'system' },
-      { name: 'history', char_count: 50, role: 'prior_message' },
+      { name: 'system', budget_delta_chars: 100, role: 'system' },
+      { name: 'history', budget_delta_chars: 50, role: 'prior_message' },
     ];
     const merged = mergeContextCaptureSections(stripped, { sections, tools: ['edit', 'search'] });
     expect(merged.sections).toEqual(sections);
@@ -52,7 +52,7 @@ describe('mergeContextCaptureSections', () => {
   it('does not mutate the input snapshot', () => {
     const stripped = baseSnap({ sections_stripped: true, event_id: 'eid' });
     const original = JSON.parse(JSON.stringify(stripped));
-    mergeContextCaptureSections(stripped, { sections: [{ name: 'x', char_count: 1 }], tools: [] });
+    mergeContextCaptureSections(stripped, { sections: [{ name: 'x', budget_delta_chars: 1 }], tools: [] });
     expect(stripped).toEqual(original);
   });
 });

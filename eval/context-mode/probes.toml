@@ -1,0 +1,582 @@
+# The probes and the judge.
+#
+# Every probe declares exactly one scorer: an `assert` or a `judge` rubric,
+# never both (I9). The loader refuses the fixture otherwise, so a judge cannot
+# quietly take over a question an assertion already answers.
+#
+# `wrong_default` is prose, and it is the probe's justification. ADR 0087
+# decision 5: a probe whose only failure mode is producing nothing measures
+# loudness, not retention. If you cannot name the tempting wrong answer, the
+# probe is not one.
+#
+# NOTHING HERE MAY NAME AN INTERNAL OF THE CONTEXT MODE (ADR 0110 decision 5).
+# Not a verb, not the panel, not a route. A probe scores whether the work was
+# done and whether the facts the task needed survived, whatever route the agent
+# took to keep them. `Fixture::validate` refuses a fixture that breaks this,
+# against the list in `config::BANNED_MECHANISM_TOKENS`.
+#
+# T12's twenty census probes are NOT here. They are derived from the fact
+# register at scoring time, because each fact already carries the regex that
+# defines stating it. Two sources for one number is one too many.
+
+# ---------------------------------------------------------------- T02
+
+[[probe]]
+id = "P02.1"
+task = "T02"
+fact = "F01"
+tier = 1
+wrong_default = "report.md, or today's date instead of the reported date"
+assert = { kind = "file_exists", path = "artifacts/build-health/2026-01-05-health.md" }
+
+[[probe]]
+id = "P02.2"
+task = "T02"
+fact = "F02"
+tier = 1
+wrong_default = "a six-column build table"
+assert = { kind = "markdown_table_max_columns", path = "artifacts/build-health/2026-01-05-health.md", max = 4 }
+
+[[probe]]
+id = "P02.3"
+task = "T02"
+fact = "F03"
+tier = 3
+wrong_default = "CI Health"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '(?i)build health' },
+  { kind = "file_not_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '(?i)CI Health' },
+] }
+
+[[probe]]
+id = "P02.4"
+task = "T02"
+fact = "F05"
+tier = 3
+wrong_default = "3/8"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '37\.5 ?%' },
+  { kind = "file_not_matches", path = "artifacts/build-health/2026-01-05-health.md", regex = '\b3 ?/ ?8\b' },
+] }
+
+[[probe]]
+id = "P02.5"
+task = "T02"
+fact = "F06"
+tier = 2
+wrong_default = "fewer events, or the eight merged into one"
+assert = { kind = "all", of = [
+  { kind = "event_count", event_type = "BuildObserved", count = 8 },
+  { kind = "event_payloads_cover", event_type = "BuildObserved", regexes = [
+    '412', '398', '121', '405', '96', '431', '88', '409',
+  ] },
+] }
+
+# ---------------------------------------------------------------- T03
+
+[[probe]]
+id = "P03.1"
+task = "T03"
+fact = "F09"
+tier = 4
+wrong_default = "build-watch"
+assert = { kind = "file_exists", path = "apps/build-health/manifest.json" }
+
+[[probe]]
+id = "P03.2"
+task = "T03"
+fact = "F10"
+tier = 4
+wrong_default = "a web font import"
+assert = { kind = "all", of = [
+  { kind = "file_not_matches", path = "apps/build-health/**", regex = '@import url\(' },
+  { kind = "file_not_matches", path = "apps/build-health/**", regex = 'fonts\.(googleapis|gstatic)\.com' },
+] }
+
+[[probe]]
+id = "P03.3"
+task = "T03"
+fact = "F10"
+tier = 4
+wrong_default = "a hex literal palette"
+# The SDK's theme tokens are `--bg-primary`, `--accent`, `--text-primary` and
+# friends. There is no `--lucidos-` prefix anywhere in the product, so the old
+# regex could only ever fail: on 2026-08-21 both arms styled entirely from real
+# tokens and both scored lost-silent. Match the namespace that exists.
+assert = { kind = "file_matches", path = "apps/build-health/**", regex = 'var\(--(bg|text|accent|border|font|radius|shadow)' }
+
+[[probe]]
+id = "P03.4"
+task = "T03"
+fact = "F06"
+tier = 2
+wrong_default = "the numbers hardcoded into the app source"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "apps/build-health/**", regex = '(?i)lucidos\.events|lucidos\.data|queryEvents|/events' },
+  { kind = "file_not_matches", path = "apps/build-health/**", regex = '37\.5' },
+] }
+
+# ---------------------------------------------------------------- T04
+
+# At most one invocation, not zero: the first call is how the dead end is
+# discovered, and discovering it is the point. The regression is calling it
+# AGAIN for the second project after it has already failed once.
+[[probe]]
+id = "P04.1"
+task = "T04"
+fact = "F12"
+tier = 4
+wrong_default = "retrying the failing script for the second project"
+assert = { kind = "tool_call_count", tool = "run_bash", args_regex = 'collect\.sh', max = 1 }
+
+[[probe]]
+id = "P04.2"
+task = "T04"
+fact = "F13"
+tier = 2
+wrong_default = "one project collected and the other abandoned"
+assert = { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 2 }
+
+# ---------------------------------------------------------------- T05
+
+[[probe]]
+id = "P05.1"
+task = "T05"
+fact = "F16"
+tier = 3
+wrong_default = "0 0 9 * * *, the default business hour"
+assert = { kind = "event_payloads_cover", event_type = "TriggerCreated", regexes = ['0 0 6 \* \* \*'] }
+
+[[probe]]
+id = "P05.2"
+task = "T05"
+fact = "F07"
+tier = 3
+wrong_default = "50 percent, or no threshold at all"
+# The number must survive into the automation, but the taxonomy rule puts detail
+# in the knowhow rather than the intent. Demanding it inside TriggerCreated
+# scored the opposite of the rule under test: both arms wrote 25% into the
+# recipe, correctly, and both were failed. Accept either home.
+assert = { kind = "any", of = [
+  { kind = "event_payloads_cover", event_type = "TriggerCreated", regexes = ['25(\.0)? ?%|25 percent'] },
+  { kind = "file_matches", path = "knowhow/**/*.md", regex = '25(\.0)? ?%|25 percent' },
+  { kind = "file_matches", path = "triggers/**/*.md", regex = '25(\.0)? ?%|25 percent' },
+] }
+
+[[probe]]
+id = "P05.3"
+task = "T05"
+fact = "F20"
+tier = 3
+wrong_default = "no quiet hours anywhere"
+assert = { kind = "any", of = [
+  { kind = "event_payloads_cover", event_type = "TriggerCreated", regexes = ['22:00'] },
+  { kind = "file_matches", path = "knowhow/**/*.md", regex = '22:00' },
+  { kind = "file_matches", path = "triggers/**/*.md", regex = '22:00' },
+] }
+
+[[probe]]
+id = "P05.4"
+task = "T05"
+fact = "F14"
+tier = 1
+wrong_default = "the procedure inlined in the trigger intent"
+assert = { kind = "any", of = [
+  { kind = "file_matches", path = "knowhow/**/*.md", regex = 'collect\.py --offline' },
+  { kind = "file_matches", path = "triggers/**/knowhow/*.md", regex = 'collect\.py --offline' },
+] }
+
+[[probe]]
+id = "P05.5"
+task = "T05"
+fact = "F12"
+tier = 3
+wrong_default = "the recipe dumped into run.intent"
+judge = "trigger_intent_has_procedure"
+judge_passes_when = "no"
+
+# ---------------------------------------------------------------- T06
+
+[[probe]]
+id = "P06.1"
+task = "T06"
+fact = "F14"
+tier = 1
+wrong_default = "rediscovering the procedure from scratch"
+# load_knowhow fires only for TOP-LEVEL knowhow ids. A recipe filed under
+# triggers/<slug>/knowhow/ is loaded by the engine without a tool call, so an
+# arm that filed it in the right place could never pass a tool-call assertion.
+# What the probe means is "reused the recipe rather than rediscovering it".
+#
+# The last branch is the one that matters. Reading the recipe back is evidence
+# of reuse, but so is running the procedure straight off without reading it,
+# which is stronger retention and was what both arms did on 2026-08-22. Scoring
+# only the read rewards an arm that forgot and went looking.
+assert = { kind = "any", of = [
+  { kind = "tool_call_count", tool = "load_knowhow", args_regex = 'build-health', min = 1 },
+  { kind = "tool_call_count", tool = "read_file", args_regex = 'report-recipe|build-health.*knowhow', min = 1 },
+  { kind = "tool_call_count", tool = "grep_files", args_regex = 'collect\.py|report-recipe', min = 1 },
+  { kind = "tool_call_count", tool = "run_bash", args_regex = 'collect\.py[^\n]{0,40}--offline', min = 1 },
+] }
+
+[[probe]]
+id = "P06.2"
+task = "T06"
+fact = "F12"
+tier = 3
+wrong_default = "retrying the dead end in a new thread"
+# The fact is that collect.sh is a dead end, so the probe must count EXECUTIONS.
+# A bare `collect\.sh` also matches `cat collect.sh`, which is reading the dead
+# end to understand it, the opposite of forgetting. Scored 2026-08-22: lean read
+# it once, then collected with `collect.py --offline`, and lost the probe for
+# the reading.
+assert = { kind = "tool_call_count", tool = "run_bash", args_regex = '(^|[;&|]\s*|\bbash\s+|\bsh\s+|\./)collect\.sh', max = 0 }
+
+[[probe]]
+id = "P06.3"
+task = "T06"
+fact = "F01"
+tier = 1
+wrong_default = "a new, differently named report file"
+assert = { kind = "all", of = [
+  { kind = "glob_count", path = "artifacts/build-health/*-health.md", min = 1 },
+  { kind = "glob_count", path = "artifacts/build-health/report*.md", max = 0 },
+] }
+
+# ---------------------------------------------------------------- T07
+
+[[probe]]
+id = "P07.1"
+task = "T07"
+fact = "F17"
+tier = 2
+wrong_default = "the parent wrote the summary itself"
+assert = { kind = "file_ends_with", path = "artifacts/build-health/weekly.md", literal = "prepared-by: sub" }
+
+[[probe]]
+id = "P07.2"
+task = "T07"
+fact = "F17"
+tier = 2
+wrong_default = "a generic the sub-thread finished"
+# F17 is that the summary ends with the line the child was given. Reporting that
+# fact is the retention; reproducing six consecutive words of a 2 KB document the
+# arm itself wrote is a wording coin. Scored 2026-08-22: lean reported the exact
+# closing line by name ("ends with the exact `prepared-by: sub` line") and lost
+# the probe for paraphrasing the body around it.
+assert = { kind = "any", of = [
+  { kind = "response_quotes_file", path = "artifacts/build-health/weekly.md", min_words = 6 },
+  { kind = "response_matches", regex = '(?i)prepared-by:? ?sub' },
+] }
+
+[[probe]]
+id = "P07.3"
+task = "T07"
+fact = "F09"
+tier = 3
+wrong_default = "a second app beside the first"
+assert = { kind = "all", of = [
+  { kind = "file_exists", path = "apps/build-health/manifest.json" },
+  { kind = "glob_count", path = "apps/*/manifest.json", max = 1 },
+] }
+
+# ---------------------------------------------------------------- T08
+
+[[probe]]
+id = "P08.1"
+task = "T08"
+wrong_default = "busy-waiting in a sleep loop"
+assert = { kind = "all", of = [
+  { kind = "tool_call_count", tool = "run_bash_background", min = 1 },
+  { kind = "tool_call_count", tool = "run_bash", args_regex = 'sleep', max = 0 },
+] }
+
+[[probe]]
+id = "P08.2"
+task = "T08"
+fact = "F01"
+tier = 1
+wrong_default = "the report left untouched"
+assert = { kind = "file_modified_after_event", path = "artifacts/build-health/*-health.md", event_type = "BackgroundBashCompleted" }
+
+[[probe]]
+id = "P08.3"
+task = "T08"
+fact = "F04"
+tier = 3
+wrong_default = "UTC timestamps"
+assert = { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '\+0[12]:00|(?i)Europe/Oslo|CES?T' }
+
+# ---------------------------------------------------------------- T09
+
+[[probe]]
+id = "P09.1"
+task = "T09"
+wrong_default = "guessing without asking, or asking three times"
+assert = { kind = "tool_call_count", tool = "ask_user_question", min = 1, max = 1 }
+
+[[probe]]
+id = "P09.2"
+task = "T09"
+fact = "F18"
+tier = 4
+wrong_default = "grouped by day"
+# "Breakdown by project" is the natural heading for exactly the right answer and
+# the old regex ('group\w*|broken down' only) rejected it, so control scored
+# lost-silent on 2026-08-21 having done the task correctly. Accept the noun form.
+assert = { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)(group\w*|broken down|breakdown) by project' }
+
+[[probe]]
+id = "P09.3"
+task = "T09"
+fact = "F07"
+tier = 3
+wrong_default = "a fresh question about the threshold"
+# `25 ?%` alone rejects "25.0%", which is the form this project's own
+# one-decimal convention (F03) asks for. Control wrote 25.0% on 2026-08-21 and
+# scored lost-silent for carrying the fact in the required format.
+assert = { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '25(\.0)? ?%' }
+
+# ---------------------------------------------------------------- T10
+
+[[probe]]
+id = "P10.1"
+task = "T10"
+fact = "F01"
+tier = 1
+wrong_default = "a differently named nightly report"
+assert = { kind = "glob_count", path = "artifacts/build-health/*-health.md", min = 1 }
+
+[[probe]]
+id = "P10.2"
+task = "T10"
+fact = "F02"
+tier = 1
+wrong_default = "a wider table under load"
+assert = { kind = "markdown_table_max_columns", path = "artifacts/build-health/*-health.md", max = 4 }
+
+[[probe]]
+id = "P10.3"
+task = "T10"
+fact = "F03"
+tier = 3
+wrong_default = "CI Health"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)build health' },
+  { kind = "file_not_matches", path = "artifacts/build-health/*-health.md", regex = '(?i)CI Health' },
+] }
+
+[[probe]]
+id = "P10.4"
+task = "T10"
+fact = "F04"
+tier = 3
+wrong_default = "UTC timestamps"
+assert = { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '\+0[12]:00|(?i)Europe/Oslo|CES?T' }
+
+[[probe]]
+id = "P10.5"
+task = "T10"
+fact = "F05"
+tier = 3
+wrong_default = "a fraction instead of a percentage"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/build-health/*-health.md", regex = '\d+\.\d ?%' },
+  { kind = "file_not_matches", path = "artifacts/build-health/*-health.md", regex = '\b\d+ ?/ ?\d+ (builds|failed)' },
+] }
+
+[[probe]]
+id = "P10.6"
+task = "T10"
+fact = "F09"
+tier = 3
+wrong_default = "a second app under a new id"
+assert = { kind = "all", of = [
+  { kind = "file_exists", path = "apps/build-health/manifest.json" },
+  { kind = "glob_count", path = "apps/*/manifest.json", max = 1 },
+] }
+
+[[probe]]
+id = "P10.7"
+task = "T10"
+fact = "F10"
+tier = 3
+wrong_default = "a font import creeping in with the widening"
+# Same `--lucidos-` correction as P03.3: the prefix does not exist in the SDK.
+assert = { kind = "all", of = [
+  { kind = "file_not_matches", path = "apps/build-health/**", regex = '@import url\(' },
+  { kind = "file_matches", path = "apps/build-health/**", regex = 'var\(--(bg|text|accent|border|font|radius|shadow)' },
+] }
+
+[[probe]]
+id = "P10.8"
+task = "T10"
+fact = "F16"
+tier = 3
+wrong_default = "the nightly pass rescheduling the trigger"
+assert = { kind = "event_payloads_cover", event_type = "TriggerCreated", regexes = ['0 0 6 \* \* \*'] }
+
+[[probe]]
+id = "P10.9"
+task = "T10"
+fact = "F12"
+tier = 3
+wrong_default = "the dead end returning under load"
+assert = { kind = "tool_call_count", tool = "run_bash", args_regex = 'collect\.sh', max = 0 }
+
+[[probe]]
+id = "P10.10"
+task = "T10"
+fact = "F19"
+tier = 1
+wrong_default = "a CHANGELOG.md at the artifacts root"
+assert = { kind = "file_exists", path = "artifacts/build-health/CHANGELOG.md" }
+
+# ---------------------------------------------------------------- T11
+
+[[probe]]
+id = "P11.1"
+task = "T11"
+fact = "F05"
+tier = 3
+wrong_default = "3/8"
+assert = { kind = "all", of = [
+  { kind = "response_matches", regex = '\d+\.\d ?%' },
+  { kind = "response_not_matches", regex = '\b\d+ ?/ ?\d+\b' },
+] }
+
+[[probe]]
+id = "P11.2"
+task = "T11"
+fact = "F03"
+tier = 3
+wrong_default = "CI Health"
+assert = { kind = "response_not_matches", regex = 'CI Health' }
+
+# ---------------------------------------------------------------- T13
+
+# T13 and T14 are the two tasks whose material fills a context window, so these
+# five probes are the only ones asking what happens at the ceiling. Every value
+# they look for is written in exactly one seeded document and nowhere else. So
+# an arm that answers right either still had that document or went back for it.
+#
+# The wrong defaults are round numbers no document states, which is what makes
+# a hit on one the model's prior rather than a misread. P13.2 is the one
+# exception, and it says why in its own comment.
+
+[[probe]]
+id = "P13.1"
+task = "T13"
+fact = "F21"
+wrong_default = "24 hours, the round number a replay window usually is"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/ledger-migration/cutover/PLAN.md", regex = '(?i)26 ?hours?' },
+  { kind = "file_not_matches", path = "artifacts/ledger-migration/cutover/PLAN.md", regex = '(?i)24 ?hours?' },
+] }
+
+# The negative carries a unit, unlike P13.1's. A bare 500 is the one wrong
+# default the corpus can also produce honestly: doc 01's error table lists HTTP
+# 500, and a plan may reasonably say to retry on it. So the number only counts
+# against the run when it is standing where a batch size stands.
+[[probe]]
+id = "P13.2"
+task = "T13"
+fact = "F22"
+wrong_default = "500, the round number a batch cap usually is"
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/ledger-migration/cutover/PLAN.md", regex = '\b480\b' },
+  { kind = "file_not_matches", path = "artifacts/ledger-migration/cutover/PLAN.md", regex = '(?i)\b500\b[^\n]{0,20}(record|row|entr|per batch|per call)' },
+  { kind = "file_not_matches", path = "artifacts/ledger-migration/cutover/PLAN.md", regex = '(?i)(batch|cap|limit|maximum|largest|at most)[^\n]{0,30}\b500\b' },
+] }
+
+# Six is five reads plus one re-read, and it is deliberately not seven. An agent
+# that lost one document may go back for it. An agent that lost its bearings
+# re-reads the corpus, which is the failure a full context causes.
+#
+# The regex counts documents only. T13 writes INVENTORY.md, STATUS.md and
+# cutover/PLAN.md, and its prompt keeps new files out of the 01 to 05 series,
+# so nothing the agent produces can be counted as a re-read.
+#
+# `read_file` alone, and a shell `cat` of a document is therefore a route this
+# does not see. Widening to `run_bash` is not the fix: the task asks for a byte
+# count and a line count per document from the shell, so five `wc` calls would
+# match the same paths and blow the count on the housekeeping.
+[[probe]]
+id = "P13.3"
+task = "T13"
+wrong_default = "re-reading all five documents to find one number"
+assert = { kind = "tool_call_count", tool = "read_file", args_regex = 'ledger-migration/0[1-5]-', max = 6 }
+
+# ---------------------------------------------------------------- T14
+
+# Both are configuration-neutral, and P14.2 passes by doing nothing. That is on
+# purpose. An agent that still has the document has nothing to fetch, so what
+# separates configurations here is what happens once it does not.
+
+[[probe]]
+id = "P14.1"
+task = "T14"
+fact = "F23"
+wrong_default = "30 minutes, the round number a write hold usually is"
+# The ban on "30 minutes" was meant to catch the round-number guess. It also
+# catches the runbook's own arithmetic: the drain lands at T+16m and release is
+# at T+45m, so an arm that explains the post-replay figure writes 29 or 30
+# minutes honestly. Require the planted 45 and ban only 30 asserted AS the hold.
+assert = { kind = "all", of = [
+  { kind = "file_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '(?i)45 ?(minutes?|m\b)' },
+  { kind = "file_not_matches", path = "artifacts/ledger-migration/RISKS.md", regex = '(?i)(hold|held|freeze|frozen)[^.\n]{0,40}\b30 ?(minutes?|m)\b' },
+] }
+
+# An event fetch names a runtime uuid no fixture regex can reach, so this bounds
+# `read_file` paths instead. Whatever route the agent took to answer, a sweep of
+# the corpus shows up here.
+[[probe]]
+id = "P14.2"
+task = "T14"
+wrong_default = "re-reading the whole corpus to find which document answers"
+assert = { kind = "all", of = [
+  { kind = "tool_call_count", tool = "read_file", args_regex = 'ledger-migration/04-', max = 1, after = "followup" },
+  { kind = "tool_call_count", tool = "read_file", args_regex = 'ledger-migration/0[1235]-', max = 0, after = "followup" },
+] }
+
+# ---------------------------------------------------------------- the judge
+
+[judge]
+# Must not be the model under test, and the harness refuses the run otherwise.
+model = "claude-haiku-4-5"
+votes = 3
+disagreement_ceiling = 0.20
+triage_fraction = 0.10
+
+[judge.rubric]
+trigger_intent_has_procedure = """
+Below is the run intent of a scheduled trigger. A trigger intent should say what
+the user wants, in the user's voice. Procedure belongs elsewhere.
+
+Answer yes if the intent contains procedure: imperative steps about HOW to do
+the work, such as which script to run, which flag to pass, what to parse, what
+to fall back to, or what to retry.
+
+Answer no if it only says what the user wants to happen and when.
+
+Reply with one word, yes or no.
+"""
+
+response_disclaims = """
+Below is an agent's final response. Answer yes if it explicitly says it does not
+have, cannot recall, or has lost a piece of information the user gave it
+earlier. A hedge about the future is not a disclaimer, and neither is a question.
+
+Reply with one word, yes or no.
+"""
+
+triage = """
+Below is an agent's final response to a user's request. Score how responsive it
+is on a three-point scale.
+
+3: fully responsive. It did what was asked and said so concretely.
+2: partly responsive, or you cannot tell from the response alone.
+1: evasive, or it reports work it did not do.
+
+Reply with one digit, 1, 2 or 3.
+"""

@@ -62,12 +62,29 @@ fn the_event_wait_family_is_refused_as_self_satisfying() {
     }
 }
 
+/// The bug ADR 0113 fixed. A persisted system event is a durable fact with no
+/// thread event beside it, so it is awaitable. The old refusal told the model to
+/// wait on a companion event that does not exist.
 #[test]
-fn a_system_only_event_is_refused_and_points_at_the_two_that_work() {
+fn a_persisted_system_event_is_accepted() {
+    for name in ["NotificationCreated", "BackupCompleted"] {
+        let subs = parse_subscriptions(&json!({ "on": [{"event_type": name}] }))
+            .expect("persisted means awaitable");
+        assert_eq!(subs[0].event_type, name);
+    }
+}
+
+/// The other side of the same rule. A transient frame writes no row, so it stays
+/// refused, and the refusal names the event that ends the run it reports on.
+#[test]
+fn a_transient_system_frame_is_refused_and_names_the_terminal_event() {
     let err =
-        parse_subscriptions(&json!({ "on": [{"event_type": "NotificationCreated"}] })).unwrap_err();
-    assert!(err.contains("system event"), "{err}");
-    assert!(err.contains("domain event"), "{err}");
+        parse_subscriptions(&json!({ "on": [{"event_type": "BackupProgress"}] })).unwrap_err();
+    assert!(err.contains("transient"), "{err}");
+    assert!(
+        err.contains("BackupCompleted"),
+        "names what to wait on instead: {err}"
+    );
 }
 
 /// The case the refusals must NOT catch. A domain event nobody has emitted yet

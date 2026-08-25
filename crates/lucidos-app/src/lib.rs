@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -13,6 +14,7 @@ mod desktop;
 mod device_id_store;
 mod mobile;
 mod notifications;
+mod pairing;
 /// Login-shell environment hydration for a GUI launch. macOS-only: it exists
 /// because launchd hands a packaged process an environment the user's profile
 /// never touched, which is a macOS packaging fact.
@@ -923,6 +925,131 @@ fn open_url_external(url: String) -> Result<(), String> {
     open_in_default_browser(&url)
 }
 
+/// Where a saved download landed: the folder to open, and the file in it.
+#[derive(Serialize)]
+struct SavedDownload {
+    dir: String,
+    path: String,
+}
+
+/// Write `contents` into the OS downloads folder as `filename`, and report
+/// where it landed.
+///
+/// The page cannot use the webview's own download machinery. wry attaches a
+/// `WKDownloadDelegate` only when the app registers a download handler, and
+/// this app registers none, so an `<a download>` click is silently abandoned.
+/// Registering one would mean building the `main` window here rather than
+/// declaring it in `tauri.conf.json`. Saving through a command keeps that
+/// config untouched, and hands the caller the exact destination, which is what
+/// lets the toast open the folder.
+///
+/// `filename` must be a leaf name, so this can only write inside the downloads
+/// folder. An existing file is never overwritten: the name takes a ` (1)`
+/// counter, matching what a real download would have done.
+///
+/// macOS gates that folder behind TCC, so the first save raises a system
+/// prompt. A denial comes back as `Operation not permitted` inside the write
+/// error, which the caller toasts rather than swallowing.
+///
+/// That prompt is also why the command is `async` while the body is not. Tauri
+/// runs a plain sync command on the MAIN thread, so the open would hold the UI
+/// up for as long as the dialog. `async` moves the whole body onto the async
+/// runtime, where a blocking wait costs nothing on screen.
+#[tauri::command(async)]
+fn save_to_downloads(
+    app: tauri::AppHandle,
+    filename: String,
+    contents: String,
+) -> Result<SavedDownload, String> {
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("could not resolve the downloads folder: {e}"))?;
+    let leaf = leaf_filename(&filename)
+        .ok_or_else(|| format!("{filename:?} is not a usable file name"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let path = write_new_download(&dir, &leaf, &contents)
+        .map_err(|e| format!("could not write {leaf} to {}: {e}", dir.display()))?;
+    Ok(SavedDownload {
+        dir: dir.display().to_string(),
+        path: path.display().to_string(),
+    })
+}
+
+/// `name` as a single file name, or None when it is anything else.
+///
+/// Refused rather than repaired, because a repaired name is not the one the
+/// caller asked for. The component walk is what makes this platform-correct: it
+/// rejects a separator, a `..`, an absolute path, and a Windows drive prefix,
+/// each of which would let `Path::join` escape the folder. A leading dot goes
+/// too, so a download cannot land hidden.
+///
+/// The backslash is checked by hand because the walk cannot: Unix takes it as
+/// an ordinary character, so `sub\dir.json` is one component there and a
+/// traversal on Windows. One rule on every platform is worth more than the
+/// literal file name it costs.
+fn leaf_filename(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.starts_with('.') || trimmed.contains('\\') {
+        return None;
+    }
+    let mut components = std::path::Path::new(trimmed).components();
+    let leaf = match components.next() {
+        Some(std::path::Component::Normal(leaf)) => leaf.to_str()?,
+        _ => return None,
+    };
+    components.next().is_none().then(|| leaf.to_string())
+}
+
+/// Write `contents` into `dir` as `name`, or as the first free `name (1)`,
+/// `name (2)` variant, and report the path taken. The counter sits before the
+/// extension, where a browser download puts it.
+///
+/// Creation is atomic (`create_new`) rather than an existence check followed by
+/// a write. Two exports of one thread racing would both find the same name
+/// free, and the second write would truncate the first. Here the loser is told
+/// `AlreadyExists` and moves to the next counter.
+fn write_new_download(
+    dir: &std::path::Path,
+    name: &str,
+    contents: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let mut counter = 0u32;
+    loop {
+        let path = match counter {
+            0 => dir.join(name),
+            n => dir.join(format!("{stem} ({n}){ext}")),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(contents.as_bytes()) {
+                    // `create_new` just made this path, so nothing that existed
+                    // before is at risk. Leaving it would put a TRUNCATED file
+                    // under the very name the export was asked for, and the
+                    // retry would land beside it as ` (1)`. This export exists
+                    // to be attached to a bug report, so the wrong one being
+                    // the obvious one to grab is the whole cost.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Restart the always-on gateway service via launchd. The supervisor catches
 /// the SIGTERM, tears the bundled gateway and its spawned workspace engines
 /// down gracefully, and launchd respawns the service.
@@ -1205,7 +1332,8 @@ fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
     let _ = state.0.lock().unwrap().send(());
 }
 
-/// Report whether the main app window is ACTIVE: focused and on-screen.
+/// Report whether the CALLING page's own window is ACTIVE: focused and
+/// on-screen.
 ///
 /// The frontend pulls this at startup to SEED its `native-window-active` cache
 /// before registering the event listener. Tauri does not replay the transition
@@ -1214,18 +1342,21 @@ fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
 /// keeps that default and pongs the device as active. The engine then suppresses
 /// the OS push into an invisible in-app toast.
 ///
+/// **It reads `window`, never `main`.** Each app window can sit on its own
+/// workspace, and the transitions it seeds ahead of are `emit_to` one label. A
+/// seed off another window therefore answers about a page that is not this one.
+/// Reading `main` is how a backgrounded second window seeded itself active from
+/// a focused first one. It then pongs `is_active: true` and its workspace's push
+/// is suppressed, the `Any`-listener symptom reached one route further back.
+///
 /// Any state read that fails resolves to the SAFE direction, inactive, so an
 /// uncertain seed surfaces the banner rather than suppressing it.
 #[tauri::command]
-fn get_native_window_active(app: tauri::AppHandle) -> bool {
-    get_main_window(&app)
-        .map(|w| {
-            let focused = w.is_focused().unwrap_or(false);
-            let visible = w.is_visible().unwrap_or(false);
-            let minimized = w.is_minimized().unwrap_or(false);
-            focused && visible && !minimized
-        })
-        .unwrap_or(false)
+fn get_native_window_active(window: tauri::Window) -> bool {
+    let focused = window.is_focused().unwrap_or(false);
+    let visible = window.is_visible().unwrap_or(false);
+    let minimized = window.is_minimized().unwrap_or(false);
+    focused && visible && !minimized
 }
 
 /// Drain the deep links from native-banner taps the page may not have been
@@ -1267,6 +1398,25 @@ static LAST_UNREAD: AtomicU64 = AtomicU64::new(0);
 
 /// The client should be menu-bar-only exactly when no app window is visible.
 fn should_be_menu_bar_only(visible_app_windows: usize) -> bool {
+    visible_app_windows == 0
+}
+
+/// Should a macOS *reopen* put a window back on screen? Only when the user can
+/// see none, which is the one thing
+/// `applicationShouldHandleReopen:hasVisibleWindows:` exists to answer.
+///
+/// **With a window already up, a reopen must change nothing**, and that is a fix
+/// rather than a tidy-up. macOS raises the event for a Dock-icon click, a Finder
+/// re-open, and an activation driven by a notification tap. The Dock activates
+/// the app by itself either way. Answering any of them by fronting `main` raises
+/// whatever workspace `main` is pointed at, over the window the user was on.
+/// That is the rule [`focus_calling_window`] already states, and a native banner
+/// tap is where it bit: `route_native_tap` picks the window on the workspace
+/// that raised the banner, and the reopen then overruled it.
+///
+/// Compiled off macOS only for its test: `RunEvent::Reopen` is macOS-only.
+#[cfg(any(target_os = "macos", test))]
+fn reopen_shows_a_window(visible_app_windows: usize) -> bool {
     visible_app_windows == 0
 }
 
@@ -1439,21 +1589,26 @@ fn set_menu_bar_only(app: &tauri::AppHandle, menu_bar_only: bool) {
     apply_unread_indicator(app, LAST_UNREAD.load(std::sync::atomic::Ordering::SeqCst));
 }
 
-/// Drop the client to menu-bar-only IFF no app window is left visible. Closing
-/// the LAST window removes the app from the Dock and Cmd+Tab, while closing one
-/// of several leaves it a normal Dock app. `excluding` skips a window that is on
-/// its way out but might still be listed.
-fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excluding: Option<&str>) {
-    let visible = app
-        .webview_windows()
+/// How many top-level app windows the user can actually see. `excluding` skips a
+/// window that is on its way out but might still be listed. An unreadable
+/// visibility counts as hidden: that keeps the tray and the reopen path from
+/// leaving the client with nothing on screen.
+fn visible_app_windows(app: &tauri::AppHandle, excluding: Option<&str>) -> usize {
+    app.webview_windows()
         .iter()
         .filter(|(label, w)| {
             is_app_window(label.as_str())
                 && Some(label.as_str()) != excluding
                 && w.is_visible().unwrap_or(false)
         })
-        .count();
-    if should_be_menu_bar_only(visible) {
+        .count()
+}
+
+/// Drop the client to menu-bar-only IFF no app window is left visible. Closing
+/// the LAST window removes the app from the Dock and Cmd+Tab, while closing one
+/// of several leaves it a normal Dock app.
+fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excluding: Option<&str>) {
+    if should_be_menu_bar_only(visible_app_windows(app, excluding)) {
         set_menu_bar_only(app, true);
     }
 }
@@ -1721,6 +1876,7 @@ pub fn run() {
             quit_lucidos,
             uninstall_lucidos,
             open_url_external,
+            save_to_downloads,
             show_native_notification,
             dismiss_native_notification,
             focus_calling_window,
@@ -1741,6 +1897,9 @@ pub fn run() {
             mobile::tailscale_serve,
             mobile::cancel_tailscale_serve,
             device_id_store::get_or_create_device_id,
+            device_id_store::previous_device_id,
+            device_id_store::remember_device_id,
+            pairing::mint_pairing_code,
         ])
         .on_window_event(|window, event| {
             let app = window.app_handle();
@@ -1995,17 +2154,28 @@ pub fn run() {
             // The engine and Postgres run as a launchd service, independent of
             // the client. Packaged: keep the client process alive when the last
             // window is dismissed, so it can host the menu-bar item. A Dock
-            // click re-shows the window. `quit_lucidos` sets `QUITTING` so its
-            // own exit passes the guard.
+            // click on the windowless client re-shows one. `quit_lucidos` sets
+            // `QUITTING` so its own exit passes the guard.
             match event {
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
                     }
                 }
+                // A reopen brings the client back only when nothing is on
+                // screen. See `reopen_shows_a_window` for why a window already
+                // up is left exactly where the user put it.
+                //
+                // The event's own `has_visible_windows` is deliberately unused:
+                // it is AppKit's count over every `NSWindow` this process owns,
+                // and the menu-bar status item owns one. Trusting it would read
+                // a trayed client as "has windows" and never reopen. We count
+                // APP windows instead, the same way the tray path does.
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
-                    if !tauri::is_dev() {
+                    if !tauri::is_dev()
+                        && reopen_shows_a_window(visible_app_windows(app_handle, None))
+                    {
                         show_main_window(app_handle);
                     }
                 }
@@ -2219,6 +2389,19 @@ mod tests {
         // main-hidden-but-a-secondary-still-open case.
         assert!(!should_be_menu_bar_only(1));
         assert!(!should_be_menu_bar_only(3));
+    }
+
+    #[test]
+    fn a_reopen_only_shows_a_window_when_none_is_on_screen() {
+        // Trayed / windowless: a Dock click is the way back, so show one.
+        assert!(reopen_shows_a_window(0));
+        // The bug: with a window up, fronting `main` raised whatever workspace
+        // it was on over the one the user was looking at. A native banner tap
+        // reaches here through the reopen macOS raises when it activates the
+        // app, right after `route_native_tap` chose the raising workspace's
+        // window. Leave the order alone.
+        assert!(!reopen_shows_a_window(1));
+        assert!(!reopen_shows_a_window(2));
     }
 
     #[test]
@@ -2566,6 +2749,67 @@ mod tests {
         assert!(!flags.contains(StateFlags::VISIBLE));
         assert!(!flags.contains(StateFlags::DECORATIONS));
     }
+
+    #[test]
+    fn a_plain_file_name_is_kept() {
+        assert_eq!(
+            leaf_filename("thread-1a2b3c4d-my-thread.json").as_deref(),
+            Some("thread-1a2b3c4d-my-thread.json"),
+        );
+        assert_eq!(
+            leaf_filename("  spaced.json  ").as_deref(),
+            Some("spaced.json")
+        );
+    }
+
+    /// The security boundary: every one of these would let `Path::join` write
+    /// somewhere the caller never named.
+    #[test]
+    fn a_name_that_is_not_a_leaf_is_refused() {
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../escape.json",
+            "sub/dir.json",
+            "sub\\dir.json",
+            "/absolute.json",
+            ".hidden.json",
+        ] {
+            assert_eq!(leaf_filename(name), None, "{name:?} must be refused");
+        }
+    }
+
+    /// A repeat export must not eat the previous one. The counter goes before
+    /// the extension so the file stays a readable `.json`.
+    #[test]
+    fn a_taken_name_gains_a_counter_before_its_extension() {
+        let dir = std::env::temp_dir().join(format!("lucidos-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |name: &str, body: &str| write_new_download(&dir, name, body).unwrap();
+        assert_eq!(write("t.json", "first"), dir.join("t.json"));
+        assert_eq!(write("t.json", "second"), dir.join("t (1).json"));
+        assert_eq!(write("t.json", "third"), dir.join("t (2).json"));
+
+        // An extensionless name takes the counter at the end instead.
+        assert_eq!(write("bare", "x"), dir.join("bare"));
+        assert_eq!(write("bare", "y"), dir.join("bare (1)"));
+
+        // Each write landed where it said, and none clobbered an earlier one.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("t.json")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("t (1).json")).unwrap(),
+            "second"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Regression coverage for the Tauri ACL, which stands between the packaged
@@ -2845,6 +3089,8 @@ mod acl_tests {
             "open_url_external",
             "show_native_notification",
             "get_or_create_device_id",
+            "previous_device_id",
+            "remember_device_id",
             "plugin:event|listen",
         ] {
             assert!(

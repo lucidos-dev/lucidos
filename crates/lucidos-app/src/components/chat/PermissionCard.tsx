@@ -177,8 +177,11 @@ export function narrowPattern(toolName: string, input: Record<string, unknown>):
   if (toolName === 'Bash') {
     const command = typeof input.command === 'string' ? input.command : null;
     if (!command) return null;
-    const first = command.trim().split(/\s+/)[0];
-    return first ? `Bash(${first}:*)` : null;
+    // `commandHead`, not the raw first token. The engine derives the stored
+    // pattern from the unwrapped inner script. A raw-token label therefore
+    // names a different grant from the one the click persists.
+    const head = commandHead(command);
+    return head ? `Bash(${head}:*)` : null;
   }
   return null;
 }
@@ -236,8 +239,10 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
   if (toolName === 'Bash' || toolName === 'command_execution') {
     const command = typeof input.command === 'string' ? input.command : null;
     if (!command) return null;
-    const first = command.trim().split(/\s+/)[0];
-    return first ? `${first} …` : null;
+    // Same reason as `narrowPattern`. Codex wraps every command it runs, so
+    // the raw first token labelled every one of them with the same shell.
+    const head = commandHead(command);
+    return head ? `${head} …` : null;
   }
   if (toolName === 'Skill') {
     const skill = typeof input.skill === 'string' ? input.skill : null;
@@ -567,16 +572,152 @@ interface CommandPermissionBodyProps {
 
 const BASH_TOOLS: ReadonlySet<string> = new Set(['run_bash', 'run_bash_background']);
 
+const GUARD_SHELLS: ReadonlySet<string> = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash']);
+
+/** Basename of a head token, with grouping and quote characters stripped.
+ *  Mirror of the engine's `normalized_head`. */
+function normalizedHead(head: string): string {
+  const unquoted = head.replace(/^[({\\]+/, '').replace(/^["']+|["']+$/g, '');
+  return unquoted.split('/').pop() || unquoted;
+}
+
+/** A single-dash cluster of ASCII letters containing `c`. Mirror of the
+ *  engine's `is_shell_c_flag`. */
+function isShellCFlag(tok: string): boolean {
+  if (tok.length < 2 || !tok.startsWith('-') || tok.startsWith('--')) return false;
+  const letters = tok.slice(1);
+  return letters.includes('c') && /^[A-Za-z]+$/.test(letters);
+}
+
+/** Whether the tail after a `-c` script operand can run something of its own.
+ *  Mirror of the engine's `tail_runs_more_commands` plus
+ *  `has_command_substitution`. */
+function tailRunsMoreCommands(tail: string): boolean {
+  return /[;|&\n><]/.test(tail) || tail.includes('$(') || tail.includes('`')
+    || tail.includes('<(') || tail.includes('>(');
+}
+
+/** Unwrap one shell `-c` wrapper so the head comes from the inner script.
+ *
+ *  Mirror of the engine's `unwrap_shell_command`, and it has to stay one. The
+ *  engine derives the pattern it STORES from the unwrapped text. A card reading
+ *  the raw text therefore names a different grant from the one the click
+ *  persists. Codex sends every command pre-wrapped, so that is the ordinary
+ *  path rather than an edge case.
+ *
+ *  Returns the original command whenever the wrapper is not a plain one, which
+ *  is the same conservative direction the engine takes. */
+function unwrapShellCommand(command: string): string {
+  const trimmed = command.trimStart();
+  const first = trimmed.split(/\s+/).filter(Boolean)[0];
+  if (!first || !GUARD_SHELLS.has(normalizedHead(first))) return command;
+
+  // Walk EVERY whitespace-delimited token for the `-c` cluster, as the engine
+  // does. Testing only the first dash token gave up on `bash -o pipefail -c
+  // '…'`, so the card read `bash` while the click stored the inner head.
+  const token = /\S+/g;
+  let m: RegExpExecArray | null;
+  while ((m = token.exec(trimmed)) !== null) {
+    if (!isShellCFlag(m[0])) continue;
+    const operand = trimmed.slice(m.index + m[0].length).trim();
+    // The script is ONE word. Anything after it sets `$0` and the positional
+    // parameters. A control operator there belongs to the OUTER shell and
+    // unwrapping would hide it, so fall back to the whole command.
+    const [script, tail] = splitShellScriptOperand(operand);
+    if (tailRunsMoreCommands(tail)) return command;
+    return script;
+  }
+  return command;
+}
+
+/** Characters that end an UNQUOTED shell word. */
+const ENDS_SHELL_WORD = /[\s;|&<>()]/;
+
+/** Take the `-c` script operand as POSIX builds it, and the tail after it.
+ *
+ *  A word JOINS adjacent quoted and unquoted runs, so the first close quote is
+ *  not where it ends. `'rm -rf '\''/'\'''` is one word reading `rm -rf '/'`,
+ *  which is exactly the idiom Codex emits. One quoting layer is decoded, since
+ *  `-c` makes the inner shell re-parse the operand.
+ *
+ *  An operand not starting with a quote is returned whole, tail included, the
+ *  same conservative direction the engine takes. */
+function splitShellScriptOperand(s: string): [string, string] {
+  if (s === '' || (s[0] !== "'" && s[0] !== '"')) return [s, ''];
+  let word = '';
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "'") {
+      const end = s.indexOf("'", i + 1);
+      const stop = end === -1 ? s.length : end;
+      word += s.slice(i + 1, stop);
+      i = Math.min(stop + 1, s.length);
+    } else if (c === '"') {
+      i++;
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === '\\' && i + 1 < s.length && '"\\$`'.includes(s[i + 1])) {
+          word += s[i + 1];
+          i += 2;
+          continue;
+        }
+        word += s[i];
+        i++;
+      }
+      i = Math.min(i + 1, s.length);
+    } else if (c === '\\') {
+      i++;
+      if (i < s.length) {
+        word += s[i];
+        i++;
+      }
+    } else if (opensSubstitution(s, i) || ENDS_SHELL_WORD.test(c)) {
+      // A substitution glued to the word ends it HERE, so the opener lands in
+      // the tail where `tailRunsMoreCommands` sees it. Otherwise the `$` joins
+      // the script and the tail starts at `(`, which nothing recognises.
+      break;
+    } else {
+      word += c;
+      i++;
+    }
+  }
+  return [word, s.slice(i)];
+}
+
+/** True when a substitution opener starts at `i`: `$(`, `<(`, `>(`, or a
+ *  backtick. Mirror of the engine's `opens_substitution`. */
+function opensSubstitution(s: string, i: number): boolean {
+  return s[i] === '`' || ('$<>'.includes(s[i]) && s[i + 1] === '(');
+}
+
+/** If `tok` is an I/O redirection operator, whether its target is the NEXT
+ *  token rather than glued onto this one. `null` when it is not a redirect.
+ *  Mirror of the engine's `redirect_token_needs_target`: bash allows a
+ *  redirect BEFORE the command, and reading it as the command word labels the
+ *  card with a grant the engine never stores. */
+function redirectTokenNeedsTarget(tok: string): boolean | null {
+  const rest = tok.replace(/^[0-9&]+/, '');
+  const op = /^(>>|>|<)/.exec(rest);
+  if (!op) return null;
+  return rest.length === op[1].length;
+}
+
 /** The command head shown on the Bash narrow / session buttons — mirror of the
- *  engine's `first_command_token`: skip privilege/wrapper prefixes and
- *  `VAR=value` assignments, take the basename. Display-only (the engine derives
- *  the actually-stored pattern). `null` for an empty command. */
+ *  engine's `first_command_token`: unwrap a shell wrapper, skip privilege
+ *  prefixes and `VAR=value` assignments, take the basename. `null` for an empty
+ *  command. Pinned by `__tests__/permission-card-command-head.test.ts`. */
 export function commandHead(command: string): string | null {
   const benign = new Set(['sudo', 'env', 'command', 'time', 'nice', 'builtin', 'exec']);
-  const toks = command.trim().split(/\s+/).filter(Boolean);
+  const toks = unwrapShellCommand(command).trim().split(/\s+/).filter(Boolean);
   let i = 0;
-  while (i < toks.length && (benign.has(toks[i]) || (!toks[i].startsWith('-') && toks[i].includes('=')))) {
-    i++;
+  while (i < toks.length) {
+    if (benign.has(toks[i]) || (!toks[i].startsWith('-') && toks[i].includes('='))) {
+      i++;
+      continue;
+    }
+    const needsTarget = redirectTokenNeedsTarget(toks[i]);
+    if (needsTarget === null) break;
+    i += needsTarget ? 2 : 1;
   }
   const head = toks[i];
   if (!head) return null;
@@ -668,7 +809,7 @@ export function renderCommandQuestion(command: string, summary: string) {
 // Different event shape (a server + tool identity and an args summary, not a
 // command or a structured tool input) and a different consent endpoint, but the
 // same buttons + answered-state machinery. The "Always allow" scopes persist to
-// ~/.lucidos/mcp-allowed-tools: narrow → Mcp(server:tool), broad → Mcp(server:*).
+// the workspace's mcp-allowed-tools: narrow → Mcp(server:tool), broad → Mcp(server:*).
 // ---------------------------------------------------------------------------
 
 interface McpPermissionEvent {

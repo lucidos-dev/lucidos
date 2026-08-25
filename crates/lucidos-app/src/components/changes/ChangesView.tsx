@@ -28,15 +28,15 @@ function ChangeDescription({ description }: { description: string }) {
 interface ChangeRowProps {
   change: Change;
   busy: boolean;
-  threadActive: boolean;
+  threadUnsettled: boolean;
   onOpen: () => void;
   onDiff: () => void;
   onDiscard: () => void;
   onApply: () => void;
 }
 
-export const THREAD_ACTIVE_TIP =
-  'The coding agent is still working on this thread — wait for it to finish';
+export const THREAD_UNSETTLED_TIP =
+  'The coding agent has not finished with this thread. It is working, or waiting for something that will wake it, so wait for it to settle';
 
 /** Why Apply is unavailable for this change, or `null` when it can be applied.
  *
@@ -47,7 +47,7 @@ export const THREAD_ACTIVE_TIP =
  *  reject. Discard is deliberately NOT gated on the empty case: discarding is
  *  how the user resolves a change whose branch commits cancelled out. */
 export function applyBlockedReason(change: Change): string | null {
-  if (change.thread_active) return THREAD_ACTIVE_TIP;
+  if (change.thread_unsettled) return THREAD_UNSETTLED_TIP;
   if (change.file_count === 0) return 'This change has no file changes left — discard it';
   return null;
 }
@@ -56,7 +56,7 @@ export function applyBlockedReason(change: Change): string | null {
  *  SkeletonProvider (`<ChangeRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. Props are optional
  *  only to support the skeleton call; real call sites pass them all. */
-function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onApply }: Partial<ChangeRowProps>) {
+function ChangeRow({ change, busy, threadUnsettled, onOpen, onDiff, onDiscard, onApply }: Partial<ChangeRowProps>) {
   const sk = useSkeleton();
   const applyBlocked = change ? applyBlockedReason(change) : null;
   const applyTip = applyBlocked
@@ -93,7 +93,7 @@ function ChangeRow({ change, busy, threadActive, onOpen, onDiff, onDiscard, onAp
           <button class="action-btn" onClick={(e) => { e.stopPropagation(); onDiff?.(); }}>Diff</button>
         </SkBlock>
         <SkBlock w="4.25rem" h="2rem" round>
-          <button class="action-btn action-btn-danger" disabled={busy || threadActive} data-tooltip={threadActive ? THREAD_ACTIVE_TIP : undefined} onClick={(e) => { e.stopPropagation(); onDiscard?.(); }}>Discard</button>
+          <button class="action-btn action-btn-danger" disabled={busy || threadUnsettled} data-tooltip={threadUnsettled ? THREAD_UNSETTLED_TIP : undefined} onClick={(e) => { e.stopPropagation(); onDiscard?.(); }}>Discard</button>
         </SkBlock>
         <SkBlock w="3.75rem" h="2rem" round>
           <button class="action-btn action-btn-confirm" disabled={busy || !!applyBlocked} data-tooltip={applyTip} onClick={(e) => { e.stopPropagation(); onApply?.(); }}>
@@ -188,7 +188,7 @@ export function ChangesView() {
             <div class="changes-bulk-actions">
               {/* Apply/Discard All skip changes whose thread is still working
                   (server-side too); disable the buttons when none are eligible. */}
-              <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_active)} onClick={() => void discardAllChanges()}>Discard All</button>
+              <button class="action-btn action-btn-danger" disabled={applyAllInProgress.value || !pending.some(c => !c.thread_unsettled)} onClick={() => void discardAllChanges()}>Discard All</button>
               {/* Enablement reads the same rule the per-row button and the
                   server use, so Apply All can never light up for a batch the
                   server would reject. Discard All keeps every pending change:
@@ -203,13 +203,13 @@ export function ChangesView() {
             // A change whose thread is mid-turn can't be applied/discarded —
             // doing so races (or yanks the worktree from) the live coding-agent
             // session. The server refuses it too (guard_change_action).
-            const threadActive = !!change.thread_active;
+            const threadUnsettled = !!change.thread_unsettled;
             return (
               <ChangeRow
                 key={change.id}
                 change={change}
                 busy={busy}
-                threadActive={threadActive}
+                threadUnsettled={threadUnsettled}
                 onOpen={() => openChangeThread(change)}
                 onDiff={() => void viewChangeDiff(change)}
                 onDiscard={() => guardedAction(change.id, discardSingleChange)}

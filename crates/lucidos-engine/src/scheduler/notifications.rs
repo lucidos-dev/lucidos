@@ -159,6 +159,32 @@ pub enum NavigateTarget {
     Url,
 }
 
+/// The tap a producer gets when it supplied none.
+///
+/// `Navigate` to the source event when the notification names one, `Modal`
+/// otherwise. An `event_id` is the producer saying there is a specific thing to
+/// look at: a question, a permission request, a failure card. Landing on it is
+/// what the reader wanted, and the card in between was a second tap for nothing.
+///
+/// A `thread_id` alone is NOT enough, and deliberately so. The engine stamps it
+/// on every `send_notification` from the origin thread, so it is provenance
+/// rather than intent. Navigating on it would drop a daily-summary notification
+/// into the middle of that trigger's agent transcript. That is worse than the
+/// card the summary was written for.
+pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
+    match (link_thread, link_event) {
+        (Some(thread), Some(event)) => Tap::Navigate {
+            to: NavigateUi {
+                target: NavigateTarget::Thread,
+                id: Some(thread.to_string()),
+                event_id: Some(event.to_string()),
+                ..Default::default()
+            },
+        },
+        _ => Tap::Modal,
+    }
+}
+
 /// A notification sent to the user
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Notification {
@@ -695,5 +721,30 @@ mod tests {
     #[test]
     fn tap_default_is_modal() {
         assert_eq!(Tap::default(), Tap::Modal);
+    }
+
+    #[test]
+    fn default_tap_navigates_to_the_named_source_event() {
+        let thread = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        match default_tap(Some(thread), Some(event)) {
+            Tap::Navigate { to } => {
+                assert_eq!(to.target, NavigateTarget::Thread);
+                assert_eq!(to.id.as_deref(), Some(thread.to_string().as_str()));
+                assert_eq!(to.event_id.as_deref(), Some(event.to_string().as_str()));
+            }
+            other => panic!("expected a navigate tap, got {:?}", other),
+        }
+    }
+
+    /// A thread alone is provenance, not intent: the engine stamps it on every
+    /// `send_notification`. Navigating on it would send a summary notification
+    /// into the middle of its own trigger's transcript.
+    #[test]
+    fn default_tap_needs_both_a_thread_and_an_event() {
+        let id = Uuid::new_v4();
+        assert_eq!(default_tap(Some(id), None), Tap::Modal);
+        assert_eq!(default_tap(None, Some(id)), Tap::Modal);
+        assert_eq!(default_tap(None, None), Tap::Modal);
     }
 }

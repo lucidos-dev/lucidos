@@ -42,22 +42,27 @@ The security model is **unchanged and load-bearing**: the engine has no inbound 
 
 ## Dev runtime topology (normative)
 
-This section is **load-bearing and normative** — it exists because an
-implementation pass conflated the *packaged* posture (§1: "engines are
-loopback-only, the gateway is the sole network-facing surface") with the *dev*
-layout and made the dev engine loopback-only, which silently broke §4's
-"a direct hit on the engine's own port". **Dev ≠ packaged. Loopback-only is a
-packaged concern only.** Implement the two layouts from this table, not from the
-repeated security line:
+**The engine rows are superseded by ADR 0096.** They said dev binds all
+interfaces, and that stopped being safe once the gateway began authenticating
+every network caller (ADR 0094): a network-bound engine port served a whole
+workspace with no credential. Engines bind loopback in dev too now, and the
+gateway is the only network path. The table below is updated to match.
+
+The original reason this section is normative still holds. An implementation
+pass once conflated the *packaged* posture with the *dev* layout and broke §4's
+"a direct hit on the engine's own port". That direct hit still works, ON the
+machine, which is what §4 needs. What ADR 0096 removed is reaching it from
+ANOTHER device, which was the bypass. Implement the two layouts from this table:
 
 | | **Packaged** | **Dev (`web-dev.sh`)** |
 |---|---|---|
 | Gateway binds | the stable port (5252), all interfaces | a **fixed** port (**5251**; override `LUCIDOS_DEV_GATEWAY_PORT`), all interfaces — **ONE shared gateway per machine**, NOT one per workspace. Dev uses **5251** so it coexists with a packaged `Lucidos.app` on 5252 |
-| Engine binds | **loopback only** (`LUCIDOS_BIND_LOOPBACK=1`) — unreachable except via the gateway | **all interfaces** on the user-facing port (`VITE_PORT`, 5173+offset) — still per-workspace so engines coexist |
-| Engine TLS | none (plain http; the gateway terminates TLS) | its own cert (serves https directly) when certs exist |
-| Direct app URL | — (engine not network-reachable) | **`https://localhost:5173/`** → engine, base `/` (works exactly as the pre-gateway engine did) |
+| Engine binds | **loopback only** (`LUCIDOS_BIND_LOOPBACK=1`), unreachable except via the gateway | **loopback only**, as packaged (ADR 0096). Still per-workspace on `VITE_PORT` (5173+offset) so engines coexist |
+| Engine TLS | none (plain http; the gateway terminates TLS) | none, as packaged. The cert is stripped on the loopback branch |
+| Direct app URL | the engine is not network-reachable | **`http://localhost:5173/`** → engine, base `/`, from THIS machine only |
 | Workspace via gateway | `https://<stable>/<slug>/` | `https://localhost:5251/<slug>/` → gateway proxies to the engine |
 | Picker | `https://<stable>/~/` | `https://localhost:5251/~/` (or `https://localhost:5251/` — smart root) |
+| Hook socket | loopback, 5262 | loopback, 5261 (ADR 0097). One route, webhook deliveries only |
 
 **One shared gateway, durable registry, per-workspace auto-start** (refines §10;
 corrects an implementation that scoped the dev gateway per-workspace — each
@@ -124,10 +129,10 @@ Both dev URLs are live **simultaneously** — this is §4's "one engine serves b
 gateway-fronted and legacy-direct access correctly, per request" made concrete.
 The engine stamps `<base href="/<slug>/">` when it sees `X-Forwarded-Prefix`
 (gateway path) and `/` when it doesn't (direct hit), so the *same* running engine
-serves both. The gateway, spawning a non-loopback dev engine that serves https on
-its own port, proxies + health-probes it over **https** (accepting its
-self-signed cert). The knobs: the gateway reads `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`
-(default `1`; dev sets `0`) to pick the engine's bind + TLS handling;
+serves both. Since ADR 0096 the dev engine is loopback and plain http, so the gateway proxies
+and health-probes it over **http**, as it always has packaged. The knobs: the
+gateway reads `LUCIDOS_GATEWAY_ENGINE_LOOPBACK` (default `1`, and nothing sets
+it) to pick the engine's bind + TLS handling;
 `scripts/lib/workspace.sh::swap_ports` assigns `ENGINE_PORT=VITE_PORT` (direct)
 and `GATEWAY_PORT=API_PORT` (gateway). `LUCIDOS_NO_GATEWAY` is a third, separate
 mode (engine only, no gateway at all) — not the same as the dev engine's direct

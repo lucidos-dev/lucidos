@@ -44,9 +44,9 @@ What each piece does — include only what you need:
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body is set to `--font-size-md`, the type scale's body step, and inputs and buttons are set to `--font-ui` at the same step, so text and controls you do not size yourself land where the host shell's body text lands. Note that the body step is NOT the root font-size: the root is the user's UI scale, and `1rem` is `--font-size-xl`, a section heading. Text that names no size at all therefore comes out a step and a half larger than body, which is why the defaults above exist. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs iframe-only side effects, none of which needs a call from you: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`); a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host); per-app scroll memory (the app returns to where the user left it after an app switch or a reload); and the Lucidos **tooltip** on any `data-tooltip` element (see § Tooltips, under lucidos.ui). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
-| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and — under a `system` preference — when the OS light/dark appearance flips (a `prefers-color-scheme` listener, off iOS, matching the host shell) | Static apps that have opted out of Lucidos theming |
+| `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and, under a `system` preference, when the OS light/dark appearance flips. The OS half watches `prefers-color-scheme` and the frame's own resume, on every platform, matching the host shell | Static apps that have opted out of Lucidos theming |
 
 **Inherit the theme by default.** A normal app includes the theme assets, calls `applyPreferences()` + `watchPreferences()`, and styles with the theme variables (below) — so it follows the user's light/dark (OS) appearance just like the rest of Lucidos. Theme integration is *technically* opt-in: the engine never auto-injects these tags, so an app that omits both `<script src="/api/v1/sdk-prefs.js">` and `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` gets no `data-theme` attribute, no CSS variables, and no Lucidos default styling. Opt out only for an app that ships its own complete visual identity (charts, games, embedded third-party UIs) — otherwise inheriting is the default, and **hardcoding colors is a bug** (a light-mode workspace gets a dark-only app, or vice versa).
 
@@ -63,6 +63,7 @@ What each piece does — include only what you need:
 | Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
 | Layout (theme-independent) | `--font-ui`, `--font-mono`, `--font-features-text`, `--font-features-code`, `--transition`, `--user-ui-scale`, plus the spacing / radius / motion scales below |
+| Stacking | `--z-tooltip` (`10000`), the layer the built-in tooltip paints on. Keep your own overlays under it, so a tooltip is never covered. |
 
 The user's UI font is **`--font-ui`** — that's the canonical token, set live to the
 user's font choice. You rarely need to apply it yourself: `sdk-iframe.css` already
@@ -204,6 +205,7 @@ file). The class names are the contract:
 | `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
+| `data-tooltip` (an attribute, plus the `#tooltip` rules that paint it) | A themed Lucidos tooltip on any element. You write the attribute and nothing else: `sdk.js` builds, positions and paints the box. Full contract in § Tooltips, under lucidos.ui. |
 
 Prefer these over hand-rolling buttons and rows — a plain unclassed `<button>`
 gets a neutral default that does **not** match Lucidos's primary blue button.
@@ -374,6 +376,7 @@ interface EventQuery {
   before_event_id?: string;   // walk backward from this event, exclusive
   after_event_id?: string;    // tail-follow forward from this event, exclusive
   thread_id?: string;         // restrict to one thread
+  event_id?: string;          // resolve ONE event by id; uuid or 'evt-<32 hex>'
 }
 
 interface LucidosEvent {
@@ -1069,8 +1072,9 @@ interface ThreadsListOptions {
   /** The UNION of 'running' and 'waiting_for_user_answer'. true selects it,
    *  false inverts it, omitting it filters nothing. For "is the workspace
    *  busy?" pass status: 'running' instead: a thread awaiting a user answer is
-   *  blocked on the human, not working. 'waiting' is in neither, and means the
-   *  coding agent stopped and proposed changes the user must act on.
+   *  blocked on the human, not working. 'waiting' is in neither. Nothing
+   *  writes it now, so it only appears on older rows; a thread carrying
+   *  changes to review is 'idle', or the verdict its turn ended on.
    *  Mutually exclusive with status. */
   active?: boolean;
   /** Comma-separated status filter naming exactly the statuses to keep, in the
@@ -1193,6 +1197,7 @@ lucidos.ui.dismissToast(key: string): void
 lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
+lucidos.ui.disableTooltips(): void
 ```
 
 `applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors. For each setting it prefers the server value, then the value the synchronous `sdk-prefs.js` script already applied from the parent shell's `localStorage`, and only then a default — so a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
@@ -1208,6 +1213,8 @@ be able to inject a declaration or fetch from another origin. Nothing is
 required of an app beyond calling `applyPreferences()`.
 
 `watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts without a reload: when the user toggles light/dark, when the OS appearance changes under a `system` preference, or when a value is retuned from the Style Remote.
+
+Under a `system` preference the OS appearance is watched two ways, because neither alone is enough on every client. The `prefers-color-scheme` media query covers a flip while the app is on screen. The frame's resume (`visibilitychange`, `focus`, `pageshow`) covers one announced while it was not. That is the normal case in an installed iOS PWA, which is resumed rather than reloaded. Both are sampled a moment after the event and only re-apply when the resolved theme actually moved, so a wake that changed nothing costs nothing. Your app needs to do none of this: it is inside `watchPreferences()`.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
 and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against the
@@ -1576,6 +1583,65 @@ const name = await lucidos.ui.prompt({
 if (name === null) return; // user cancelled
 // proceed with `name`
 ```
+
+### Tooltips
+
+Any element with `data-tooltip` gets a themed Lucidos tooltip. There is nothing
+to call and nothing to build: `sdk.js` installs one delegated listener on the
+document, so an element you add later is covered too. Never hand-roll a tooltip
+in an app.
+
+```html
+<button class="icon-btn" data-tooltip="Delete this row">🗑</button>
+```
+
+| Attribute | Effect |
+|---|---|
+| `data-tooltip` | The tooltip text. For the normal case this is the whole contract. |
+| `data-tooltip-title` | A bold heading above the text. |
+| `data-tooltip-rows` | A JSON array of `{label, value, tone?}`, rendered as a two-column grid. Use it for a small property list. `tone` paints a leading dot and takes `running`, `changes`, `waiting` or `failed`. |
+| `data-tooltip-below` | Always place the tooltip below the element, never above. |
+| `data-tooltip-follow-cursor` | Anchor on the pointer instead of the element's border. Worth it only on a very tall element, where the border is far from the hand. |
+| `data-tooltip-tap` | On a touch device, reveal on a single tap as well as on a long press. |
+
+Placement: above the element by default, flipped below when there is no room
+above. Horizontally centred on the element and clamped inside the viewport, with
+the arrow kept on the anchor. It hides on mouseout, on a mousedown, on a scroll,
+and when the frame loses focus.
+
+**A pointer waits 300ms before the tooltip appears**, so crossing a toolbar does
+not trail one behind the cursor.
+
+**Touch: press and hold for 450ms.** The tooltip appears under the finger and
+clears itself two seconds after you lift. Moving the finger cancels it, so a
+scroll or a swipe never reveals one. The tap that ends the long press is
+swallowed, so revealing a tooltip never also activates what sits under it.
+
+**A redundant tooltip is dropped.** When the text repeats the element's own
+visible text, and that text is not truncated, nothing shows. A truncated label
+keeps its tooltip, which is what makes a clipped file name readable.
+
+#### Turning it off
+
+The layer stands down on its own whenever your page owns a `#tooltip` element.
+So an app that hand-rolled a tooltip before this existed never shows two, and
+neither opt-out below is needed for that case.
+
+To turn it off deliberately, set the attribute in markup:
+
+```html
+<html data-lucidos-tooltips="off">
+```
+
+or call this once at startup:
+
+```js
+lucidos.ui.disableTooltips();
+```
+
+The attribute is read on `<html>` or `<body>`, and it applies before any script
+runs. `disableTooltips()` sets the same attribute and drops the tooltip node.
+Both last for the life of the page.
 
 ### lucidos.ui.Select — themed dropdown
 

@@ -19,7 +19,7 @@ pub(super) struct McpPermissionConsentRequest {
     /// When `Some(_)` and `allowed`, the engine records the derived
     /// `Mcp(server:tool)` / `Mcp(server:*)` pattern so future matching calls
     /// skip the prompt: `session` into the in-memory per-thread allow set;
-    /// `narrow` / `broad` into `~/.lucidos/mcp-allowed-tools`. Absent
+    /// `narrow` / `broad` into `<workspace>/.lucidos/mcp-allowed-tools`. Absent
     /// (Allow-once) records nothing. Unknown wire values 4xx via serde — match
     /// the engine's typed enum exactly.
     #[serde(default)]

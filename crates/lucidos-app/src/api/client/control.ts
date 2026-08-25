@@ -11,6 +11,8 @@
  */
 
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
+import { replaceDocument } from '../../utils/documentNavigation';
+import { gatewayErrorReason } from './gatewayError';
 
 const CONTROL = '/~/api/v1/control';
 
@@ -33,14 +35,7 @@ export interface WorkspaceStatus {
 
 async function controlJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${CONTROL}${path}`, init);
-  if (!res.ok) {
-    let reason = res.statusText;
-    try {
-      const body = await res.json();
-      if (body?.error) reason = body.error;
-    } catch { /* non-JSON body */ }
-    throw new Error(reason || `HTTP ${res.status}`);
-  }
+  if (!res.ok) throw new Error(await gatewayErrorReason(res));
   // 204 (rename / autostart / delete) and 202 (restart / stop — "accepted,
   // async") are bodyless; calling res.json() on an empty body throws a
   // SyntaxError, which would surface a spurious error and skip the refresh.
@@ -119,9 +114,27 @@ export async function deleteWorkspace(id: string, confirm: string): Promise<void
   });
 }
 
-/** Navigate the browser to a workspace (`/<slug>/`, ADR 0014). */
+/** Navigate the browser to a workspace (`/<slug>/`, ADR 0014).
+ *
+ *  REPLACES the current history entry rather than pushing one, so the workspace
+ *  you leave does not stay on the back stack. See `utils/documentNavigation.ts`
+ *  for why a flat history is what keeps a stray back gesture harmless. */
 export function openWorkspace(id: string): void {
-  window.location.href = `/${encodeURIComponent(id)}/`;
+  replaceDocument(`/${encodeURIComponent(id)}/`);
+}
+
+/** Navigate to a workspace and land on its notifications view.
+ *
+ *  A SAME-WINDOW replacing navigation, exactly like {@link openWorkspace}. A
+ *  named `window.open` target is what `openThreadInWorkspace` uses, and it is
+ *  wrong here: an installed PWA has origin-wide scope, so `/<slug>/` stays
+ *  inside the app while a new window drops the user into the browser.
+ *
+ *  The bare `#notifications` hash is the landing channel the target page reads
+ *  in `store/actions/hash-deeplink-router.ts`. It carries no id, so the target
+ *  needs nothing fetched before it can honour it. */
+export function openWorkspaceNotifications(id: string): void {
+  replaceDocument(`/${encodeURIComponent(id)}/#notifications`);
 }
 
 // ── Gateway self-update (picker reload control) ────────────────────────────
@@ -136,12 +149,80 @@ export interface GatewayStatus {
    *  updater + a full service restart, not a gateway re-exec). Absent on an older
    *  gateway → treated as dev (control shown). */
   packaged?: boolean;
+  /** The machine's release check (ADR 0108). Absent on an older gateway, which
+   *  the frontend reads as "no offer" rather than as "up to date". */
+  release_check?: ReleaseCheck;
+}
+
+/** How this install takes an update, from the gateway's read of its own
+ *  executable path. `desktop-app` installs in the client; `installer-rerun`
+ *  means re-running `install.sh`, and carries the command to copy. */
+export type InstallShape = 'desktop-app' | 'installer-rerun';
+
+/** A published release newer than the one running. */
+export interface ReleaseOffer {
+  version: string;
+  /** Raw markdown for the offered release, when the origin carries it. Optional
+   *  in the contract: absent means the offer shows no "What's new" link, and
+   *  the release still appears in the panel once the changelog is fetched. */
+  notes: string | null;
+  install: InstallShape | null;
+  /** The `install.sh` re-run for this instance, or `null` when the client
+   *  installs instead. Composed by the gateway from the live slug and prefix. */
+  command: string | null;
+}
+
+/** The gateway's release check. Mirrors `release_check::ReleaseCheck::snapshot`. */
+export interface ReleaseCheck {
+  /** The machine-global preference. False stops the check entirely. */
+  enabled: boolean;
+  /** Whether the first-run notice has been seen. No poll happens before it. */
+  notice_acknowledged: boolean;
+  /** Whether this deployment may poll at all: installed, on a published target.
+   *  False for a dev gateway, which must never appear in the numbers. */
+  supported: boolean;
+  current_version: string;
+  /** When an answer last arrived, or `null` when none has. */
+  checked_at: string | null;
+  /** Why the last poll failed, cleared by the next success. Without it the
+   *  caller reads the unchanged snapshot as "you are up to date". */
+  last_error: string | null;
+  latest: ReleaseOffer | null;
 }
 
 /** Build id of the running gateway + whether a newer binary is on disk (the dev
- *  picker's "new gateway available" badge). */
+ *  picker's "new gateway available" badge), plus the release check's last known
+ *  answer. Never waits on the origin: the picker polls this every 2s. */
 export async function getGatewayStatus(): Promise<GatewayStatus> {
   return controlJson<GatewayStatus>('/gateway/status');
+}
+
+/** Ask the gateway to poll lucidos.dev if its answer is stale, and return the
+ *  result. Concurrent callers coalesce inside the gateway, so N open windows
+ *  still make one outbound request.
+ *
+ *  `force` is the Settings button, which asks for a poll now. It is still
+ *  floored at one a minute on the gateway side. */
+export async function requestUpdateCheck(force = false): Promise<ReleaseCheck> {
+  return controlJson<ReleaseCheck>('/gateway/check-updates', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ force }),
+  });
+}
+
+/** Write the machine-global release-check preference and return the result.
+ *  Each field is optional, so the first-run notice can acknowledge without also
+ *  restating `enabled`. Takes effect on the next tick, with no restart. */
+export async function setReleaseCheckConfig(body: {
+  enabled?: boolean;
+  notice_acknowledged?: boolean;
+}): Promise<ReleaseCheck> {
+  return controlJson<ReleaseCheck>('/release-check', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 /** Adopt the rebuilt gateway binary: the gateway re-execs itself (same PID). The
@@ -217,6 +298,78 @@ export async function getRestoreStatus(): Promise<GwRestoreStatus> {
 /** Dismiss a terminal (completed/failed) restore result. Refused while running. */
 export async function clearRestoreStatus(): Promise<void> {
   await controlJson<void>('/restore-status', { method: 'DELETE' });
+}
+
+// ── Paired devices (ADR 0094) ─────────────────────────────────────────────
+//
+// Under `/~/api/v1/auth/`, a sibling of the control plane rather than part of
+// it, so these do not go through `controlJson`. Same reasoning for the absolute
+// path: the gateway owns `/~/`, and the calls work from the picker and from
+// inside a workspace alike. In legacy no-gateway mode they do not exist, and a
+// caller reads the failure as "no gateway, so nothing is paired".
+
+const AUTH = '/~/api/v1/auth';
+
+/** One device that has paired with this machine's gateway.
+ *
+ *  `last_seen_at` is absent for a device paired before the gateway recorded it,
+ *  and fills in on that device's next request. It moves at most once a day, so
+ *  it says which rows are live without being an access log. */
+export interface PairedDevice {
+  id: string;
+  label: string;
+  paired_at: string;
+  last_seen_at?: string;
+}
+
+/** A gateway call that failed, carrying the status so a caller can tell a
+ *  MISSING gateway from a broken one.
+ *
+ *  A page served off a direct engine port resolves `/~/` against the engine and
+ *  gets a 404, which is not an error to report: there is no pairing surface on
+ *  that deployment. Any other status is a real failure and must look like one.
+ *  `status` is 0 when the request never got an answer at all. */
+export class GatewayError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = 'GatewayError';
+  }
+
+  /** Is this "no gateway serves this page", rather than "the gateway broke"? */
+  get isAbsent(): boolean {
+    return this.status === 404;
+  }
+}
+
+async function authJson<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${AUTH}${path}`, init);
+  } catch (e) {
+    throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
+  }
+  if (!res.ok) {
+    let reason = res.statusText;
+    try {
+      const body = await res.json();
+      if (body?.error) reason = body.error;
+    } catch { /* non-JSON body */ }
+    throw new GatewayError(reason || `HTTP ${res.status}`, res.status);
+  }
+  return res.status === 204 ? (undefined as T) : res.json();
+}
+
+export function listPairedDevices(): Promise<PairedDevice[]> {
+  return authJson<PairedDevice[]>('/devices');
+}
+
+/** Forget a paired device, so its credential resolves to nobody.
+ *
+ *  Revoking the device you are ON is allowed and is sometimes the point (a
+ *  phone you no longer hold). The gateway clears the cookie in the same
+ *  response, so this browser lands back on the pairing screen. */
+export async function revokePairedDevice(id: string): Promise<void> {
+  await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
 /** Slug a workspace name the way the gateway registry does. Re-exported from the

@@ -62,7 +62,12 @@ export function ConfirmDialog() {
         {state.title && <h2 class="confirm-title">{state.title}</h2>}
         <DialogMessage message={state.message} />
         {state.details && (
-          <div class="confirm-details">
+          // `tabIndex={-1}`, so Chrome leaves the list out of the Tab order. A
+          // long one overflows, and Chrome promotes an overflowing scroller
+          // with no focusable child to a Tab stop. `trapDialogTab` cycles the
+          // two buttons and never names it, so the promotion only ever painted
+          // the browser's ring around the list. See `.confirm-details:focus`.
+          <div class="confirm-details" tabIndex={-1}>
             {state.details.intro && <p class="confirm-details-intro">{state.details.intro}</p>}
             {state.details.groups.map((g, gi) => (
               <div class="confirm-details-group" key={gi}>

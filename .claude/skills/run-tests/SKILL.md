@@ -13,12 +13,21 @@ comment out a failing test.
 
 Run both phases. If either fails, the whole skill FAILED.
 
-1. **Rust engine.** Two steps:
+1. **Rust engine.** Three steps:
    1. **Build:** `cargo build -p lucidos-engine --release` — verifies the engine
       compiles in the profile it ships in (a separate compilation from the test
       build below, which is debug + `cfg(test)`).
-   2. **Test:** `./scripts/test-engine.sh --full` (equivalently `make test-full`).
-      Runs the whole crate — lib + integration + doctests.
+   2. **Eval crate:** `cargo test --locked -p lucidos-eval`, run before the
+      engine suite because it needs no Postgres and takes under a second.
+      **`./scripts/test-engine.sh --full` is NOT equivalent to `make
+      test-full`**: only the make target carries the `test-eval` prerequisite,
+      so the script alone drops this phase and its ~115 tests silently.
+      The crate is bin-only, so this runs the binary's own unit tests.
+      `scripts/check-eval-not-a-test.sh` (in `make lint`) keeps those tests
+      unable to reach anything that spends money or boots a workspace
+      (ADR 0087).
+   3. **Test:** `./scripts/test-engine.sh --full`.
+      Runs the whole crate: lib + integration + doctests.
       **Do NOT run bare `cargo test -p lucidos-engine`.** The engine's
       integration tests (`setup_test_db` in `src/test_support.rs`) need a real
       Postgres: each `CREATE`s a throwaway `lucidos_test_*` database, migrates,
@@ -78,11 +87,11 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`7 ignored` in the lib run and `1 ignored` in the doctest run**,
+Expect **`8 ignored` in the lib run and `1 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The seven are two different things: **five
-codegen writers** and **two diagnostic printers**.
+no `#[ignore]` at all.) The eight are two different things: **five
+codegen writers** and **three diagnostic printers**.
 
 ### The five codegen writers
 
@@ -110,17 +119,21 @@ When a guard fails it prints the exact regeneration command; run that,
 then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
 prints the live list if you need to re-check the set.
 
-### The two diagnostic printers
+### The three diagnostic printers
 
-Both live in `engine::chat::process::system_prompt::tests` and arrived
-with the 2026-08-07 prompt-budget trim. Neither asserts anything, so
-neither has a pass/fail to skip: they are on-demand dumps, shaped as
-tests only because `cargo test` is how you run a thing in a Rust crate.
-The `#[ignore]` keeps their output out of every ordinary suite run.
+All three live in `engine::chat::process::system_prompt::tests`. The
+first two arrived with the 2026-08-07 prompt-budget trim, the third with
+capability-gated tool families
+(`docs/plans/2026-08-18-capability-gated-tool-families-and-two-volatile-values.md`).
+None asserts anything, so
+none has a pass/fail to skip: they are on-demand dumps, shaped as tests
+only because `cargo test` is how you run a thing in a Rust crate. The
+`#[ignore]` keeps their output out of every ordinary suite run.
 
 | `#[ignore]` printer | What asserts over the same data |
 |---|---|
 | `print_full_tool_schema_ranking` | `no_single_tool_schema_dominates_the_always_loaded_budget` (per-tool ceiling) and `always_loaded_context_stays_under_budget` (total budget) |
+| `print_gated_array_sizes` | the same two budget guards. They measure the gate-blind engine-authored surface, so they bound every gate setting this printer dumps |
 | `print_frozen_tool_contract` | nothing automated: it exists for a manual before/after diff across a prose-only trim |
 
 So `print_frozen_tool_contract` is the one entry that does not satisfy
@@ -169,6 +182,7 @@ Only stop if the failure is genuinely unfixable from this session
 Final status: PASSED or FAILED (FAILED if either phase failed).
 Include exact counts per phase:
 
-- **Rust:** library / integration / doc-test passes, failures, ignored.
+- **Rust engine:** library / integration / doc-test passes, failures, ignored.
+- **Eval crate:** passes, failures, ignored.
 - **Frontend:** test files run, tests passed, tests failed, tests skipped,
   plus the `tsc --noEmit` exit status.

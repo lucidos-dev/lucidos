@@ -60,7 +60,7 @@ export function DropZone() {
       applyHighlight(zone);
     }
 
-    function onDragLeave(_e: DragEvent) {
+    function onDragLeave() {
       // Don't gate on dragCarriesFiles: some browsers strip dataTransfer.types
       // on dragleave, which would desync the counter and strand the highlight.
       // If we incremented in dragenter, we must decrement here unconditionally.

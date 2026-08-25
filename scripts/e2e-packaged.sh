@@ -178,7 +178,21 @@ SVC_PID=$!
 log "launched service PID $SVC_PID (logs: $SVC_LOG)"
 
 # Small helpers. JSON parsing uses python3 (already required by build-dmg.sh).
-http_status() { curl -s -o /dev/null -w '%{http_code}' "$1"; }
+#
+# `gateway_curl` carries the machine-local credential the gateway's control
+# plane requires. Deliberately a second copy of the one in `lib/workspace.sh`:
+# this script sources no library, and pulling the whole workspace lib in for one
+# function would drag its launch side effects into a packaged smoke test. Keep
+# the two in step; `lucidos-local-token` owns the header name and the path.
+gateway_curl() {
+    local token_file="$HOME/.lucidos/local-token"
+    if [ -r "$token_file" ]; then
+        curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"
+    else
+        curl "$@"
+    fi
+}
+http_status() { gateway_curl -s -o /dev/null -w '%{http_code}' "$1"; }
 alive() { kill -0 "$SVC_PID" 2>/dev/null; }
 dump_log() { echo "----- service log (tail) -----"; tail -40 "$SVC_LOG" 2>/dev/null; echo "------------------------------"; }
 
@@ -198,12 +212,12 @@ log "PASS: gateway healthy ($HJSON)"
 
 # ── 2. Picker shell ───────────────────────────────────────────────────────────
 [ "$(http_status "$BASE/~/")" = "200" ] || fail "picker (/~/) did not return 200"
-curl -s -D - -o /dev/null "$BASE/~/" | grep -iq '^content-type:[[:space:]]*text/html' \
+gateway_curl -s -D - -o /dev/null "$BASE/~/" | grep -iq '^content-type:[[:space:]]*text/html' \
     || fail "picker (/~/) is not text/html"
 log "PASS: picker served"
 
 # ── 3. Create a workspace (triggers embedded PG provision + engine spawn) ─────
-CREATE="$(curl -s -X POST "$BASE/~/api/v1/control/workspaces" \
+CREATE="$(gateway_curl -s -X POST "$BASE/~/api/v1/control/workspaces" \
     -H 'Content-Type: application/json' -d '{"name":"smoke"}')"
 SLUG="$(printf '%s' "$CREATE" | python3 -c \
     'import sys,json; print(json.load(sys.stdin)["workspace"]["id"])' 2>/dev/null)"
@@ -217,7 +231,7 @@ log "waiting for workspace '$SLUG' to become healthy …"
 ok=0
 for _ in $(seq 1 120); do                   # up to 240s
     alive || { dump_log; fail "service process died while the workspace was booting"; }
-    LIST="$(curl -s "$BASE/~/api/v1/control/workspaces")"
+    LIST="$(gateway_curl -s "$BASE/~/api/v1/control/workspaces")"
     H="$(printf '%s' "$LIST" | SLUG="$SLUG" python3 -c \
         'import sys,json,os; s=os.environ["SLUG"]; d=json.load(sys.stdin); print(next((w.get("health","") for w in d.get("workspaces",[]) if w.get("id")==s), ""))' \
         2>/dev/null)"

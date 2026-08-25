@@ -27,6 +27,164 @@ pub use claude_code::{
 pub use codex::{CodexRuntime, CODEX_ASK_USER_QUESTION_TOOL};
 pub use python::PythonRuntime;
 
+/// The `/model` picker entries for one backend. Same data the frontend picker
+/// renders, reached without the caller having to know which module owns it.
+pub fn coding_agent_model_options(agent: CodingAgent) -> &'static [claude_code::CcMenuOption] {
+    match agent {
+        CodingAgent::ClaudeCode => claude_code::cc_model_options(),
+        CodingAgent::Codex => codex::codex_model_options(),
+    }
+}
+
+/// The context window a coding-agent session runs `model` under, when the
+/// backend's own window differs from what the model registry infers.
+///
+/// `None` means nothing is declared, and the caller falls back to
+/// `context_window_for`. That fallback is right for the engine's own calls and
+/// wrong for these: it answers 200k for a bare `claude-` id, because LUCIDOS
+/// gates 1M mode on its own `[1m]` suffix. Claude Code does not. A Sonnet 5
+/// session runs 1M whatever we spell, so a capture rendered a real 240k prompt
+/// as "203k / 200k (100%)" before this existed.
+///
+/// The lookup ignores a `@default` version pin, which the picker writes on two
+/// rows (`claude-opus-5@default`) and the agent strips when it echoes the model
+/// back. It deliberately does NOT ignore `[1m]`: that suffix is what keeps a 1M
+/// row distinct from its bare sibling, the same rule [`likely_intended_model`]
+/// documents.
+pub fn coding_agent_context_window(agent: CodingAgent, model: &str) -> Option<usize> {
+    let target = strip_version_pin(model);
+    coding_agent_model_options(agent)
+        .iter()
+        .find(|o| strip_version_pin(&o.value) == target)
+        .and_then(|o| o.context_window)
+}
+
+/// The `/effort` picker entries for one backend.
+pub fn coding_agent_reasoning_effort_options(
+    agent: CodingAgent,
+) -> &'static [claude_code::CcMenuOption] {
+    match agent {
+        CodingAgent::ClaudeCode => claude_code::cc_reasoning_effort_options(),
+        CodingAgent::Codex => codex::codex_reasoning_effort_options(),
+    }
+}
+
+/// Validate a caller-supplied model id against the backend that will run it.
+///
+/// REFUSES an unknown id rather than falling back to the default, and that is
+/// the whole point of the function. A silent fallback is what shipped before:
+/// `run_coding_agent` advertised a `model` argument, no layer read it, and every
+/// session ran on the settings default while the tool result said success. The
+/// caller then reported a model choice it had not made. An id the backend does
+/// not offer is a caller mistake, and a mistake the caller can SEE is worth more
+/// than a session that quietly runs on the wrong model.
+///
+/// The vocabulary is the backend's own picker list, so this cannot drift from
+/// what the user can pick in the UI.
+///
+/// When the rejected id is not offered but is a close spelling of one that
+/// is, `likely_intended_model` names it before the full list. A caller can
+/// paste the LUCIDOS CHAT id `claude-opus-5@default[1m]` by mistake. Claude
+/// Code spells that same model `claude-opus-5[1m]`.
+pub fn validate_coding_agent_model(
+    agent: CodingAgent,
+    model: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(None);
+    };
+    let options = coding_agent_model_options(agent);
+    if options.iter().any(|o| o.value == model) {
+        return Ok(Some(model.to_string()));
+    }
+    let offered = options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hint = likely_intended_model(model, options)
+        .map(|likely| format!(", which spells that model '{likely}'"))
+        .unwrap_or_default();
+    Err(format!(
+        "model '{model}' is not offered by {}{hint}. Choose one of: {offered}",
+        agent.as_str(),
+    ))
+}
+
+/// The single offered id that is a close misspelling of a rejected `model`,
+/// or `None` when no exactly-one candidate is close enough to name.
+///
+/// Checked two ways, one at a time. First with a `@default` version pin
+/// removed, the LUCIDOS CHAT picker's own decoration. Then with a trailing
+/// `[1m]` context-window suffix removed.
+///
+/// Never both at once. Claude Code's own list pins `@default` on one row,
+/// `claude-opus-5@default`. It pins `[1m]` on a different row for the same
+/// model, `claude-opus-5[1m]`. Stripping both would collapse those two ids
+/// into one stem and turn a clean match into a guess.
+fn likely_intended_model<'a>(
+    model: &str,
+    options: &'a [claude_code::CcMenuOption],
+) -> Option<&'a str> {
+    unique_match_after(model, options, strip_version_pin).or_else(|| {
+        unique_match_after(model, options, |id| {
+            id.strip_suffix("[1m]").unwrap_or(id).to_string()
+        })
+    })
+}
+
+/// A model id without the `@default` version pin the Claude Code picker writes
+/// on some rows. Shared by the two callers that must see through it, so they
+/// cannot disagree about what the decoration means.
+fn strip_version_pin(id: &str) -> String {
+    id.replace("@default", "")
+}
+
+/// The one offered id whose value equals `strip(model)` once `strip` is
+/// applied to it too. `None` when zero or more than one candidate ties.
+fn unique_match_after<'a>(
+    model: &str,
+    options: &'a [claude_code::CcMenuOption],
+    strip: impl Fn(&str) -> String,
+) -> Option<&'a str> {
+    let target = strip(model);
+    let mut matches = options.iter().filter(|o| strip(&o.value) == target);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first.value.as_str())
+}
+
+/// Validate a caller-supplied reasoning effort against the backend that will
+/// run it. Refuses an out-of-vocabulary tier for the same reason
+/// [`validate_coding_agent_model`] refuses an unknown model.
+///
+/// Codex adds a second constraint its own driver already enforces
+/// (`validate_codex_effort`): some tiers are model-specific. That check stays
+/// where it is, because it needs the RESOLVED model; this one only rejects a
+/// tier the backend does not know at all.
+pub fn validate_coding_agent_effort(
+    agent: CodingAgent,
+    effort: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(effort) = effort.map(str::trim).filter(|e| !e.is_empty()) else {
+        return Ok(None);
+    };
+    let options = coding_agent_reasoning_effort_options(agent);
+    if options.iter().any(|o| o.value == effort) {
+        return Ok(Some(effort.to_string()));
+    }
+    let offered = options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "reasoning_effort '{}' is not offered by {}. Choose one of: {}",
+        effort,
+        agent.as_str(),
+        offered
+    ))
+}
+
 /// True for every wire tool name that raises a Lucidos QuestionCard.
 ///
 /// ONE list, because two separate gates key on it and a name missing from
@@ -184,9 +342,24 @@ pub async fn detect_agent_binary_with_version(
     agent: CodingAgent,
     override_path: Option<&str>,
 ) -> AgentBinaryStatus {
+    detect_agent_binary_within(agent, override_path, VERSION_PROBE_TIMEOUT).await
+}
+
+/// The enrichment above, with the probe's ceiling supplied by the caller.
+///
+/// Only the test names its own ceiling, and it needs to. The production five
+/// seconds is a user-facing request budget, not a claim about how long a fork
+/// takes. The full suite runs thousands of tests at once, and a spawn there
+/// really can miss that budget. This failed as a flake rather than a defect.
+/// The sibling probe tests already take a timeout for the same reason.
+async fn detect_agent_binary_within(
+    agent: CodingAgent,
+    override_path: Option<&str>,
+    timeout: std::time::Duration,
+) -> AgentBinaryStatus {
     let mut status = detect_agent_binary(agent, override_path);
     if let Some(binary) = version_probe_target(&status).map(std::path::PathBuf::from) {
-        status.version = probe_agent_version(agent, &binary, VERSION_PROBE_TIMEOUT).await;
+        status.version = probe_agent_version(agent, &binary, timeout).await;
     }
     status
 }
@@ -494,13 +667,23 @@ mod tests {
         path
     }
 
+    /// Headroom for the tests below, where the deadline is scaffolding rather
+    /// than the thing under test. Each spawns a shell script that returns in
+    /// milliseconds. Any deadline they reach means the host is loaded, not
+    /// that the probe is wrong. The production `VERSION_PROBE_TIMEOUT` of 5s
+    /// was reachable: the full suite saturated one and `--version` timed out.
+    ///
+    /// `probe_gives_up_at_the_timeout` owns deadline behaviour and keeps its
+    /// own short value, so widening here costs no coverage.
+    const UNREACHABLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
     #[cfg(unix)]
     #[tokio::test]
     async fn probe_reports_the_version_a_healthy_binary_prints() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let bin = fake_binary(tmp.path(), "agent", "echo '4.5.6 (Fake Agent)'");
         assert_eq!(
-            probe_agent_version(CodingAgent::Codex, &bin, std::time::Duration::from_secs(5))
+            probe_agent_version(CodingAgent::Codex, &bin, UNREACHABLE_DEADLINE)
                 .await
                 .as_deref(),
             Some("4.5.6")
@@ -514,7 +697,9 @@ mod tests {
         let exits_nonzero = fake_binary(tmp.path(), "broken", "echo boom >&2; exit 1");
         let says_nothing_useful = fake_binary(tmp.path(), "quiet", "echo 'usage: quiet [opts]'");
         let missing = tmp.path().join("does-not-exist");
-        let timeout = std::time::Duration::from_secs(5);
+        // Generous on purpose: a deadline hit here would make the test pass for
+        // the wrong reason, since a timeout also yields `None`.
+        let timeout = UNREACHABLE_DEADLINE;
         for bin in [&exits_nonzero, &says_nothing_useful, &missing] {
             assert_eq!(
                 probe_agent_version(CodingAgent::ClaudeCode, bin, timeout).await,
@@ -552,7 +737,7 @@ mod tests {
             "echo '5.6.7 (Chatty)'\nhead -c 262144 /dev/zero | tr '\\0' 'x'",
         );
         assert_eq!(
-            probe_agent_version(CodingAgent::Codex, &bin, std::time::Duration::from_secs(10))
+            probe_agent_version(CodingAgent::Codex, &bin, UNREACHABLE_DEADLINE)
                 .await
                 .as_deref(),
             Some("5.6.7"),
@@ -592,8 +777,14 @@ mod tests {
         let configured = bin.to_string_lossy().into_owned();
 
         let sync = detect_agent_binary(CodingAgent::ClaudeCode, Some(&configured));
-        let enriched =
-            detect_agent_binary_with_version(CodingAgent::ClaudeCode, Some(&configured)).await;
+        // A ceiling of its own, so a loaded host forking a shell cannot fail
+        // this. The production budget is asserted by the probe tests above.
+        let enriched = detect_agent_binary_within(
+            CodingAgent::ClaudeCode,
+            Some(&configured),
+            std::time::Duration::from_secs(120),
+        )
+        .await;
 
         assert_eq!(enriched.path, sync.path);
         assert_eq!(enriched.source, sync.source);
@@ -618,5 +809,235 @@ mod tests {
             "the spawn-failure message naming the preference must survive"
         );
         assert_eq!(status.version, None);
+    }
+
+    // ── Spawn pin validation ───────────────────────────────────────────────
+    // Both validators REFUSE rather than fall back. That is the whole contract:
+    // `run_coding_agent` advertised a `model` argument that no layer read, so
+    // every session silently ran on the `cc-settings.json` default while the
+    // spawn reported success. Falling back to the default on a bad id would
+    // rebuild exactly that failure, one layer higher up.
+
+    #[test]
+    fn a_model_the_backend_offers_is_accepted_unchanged() {
+        assert_eq!(
+            validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-sonnet-5")),
+            Ok(Some("claude-sonnet-5".to_string()))
+        );
+        assert_eq!(
+            validate_coding_agent_model(CodingAgent::Codex, Some("gpt-5.6-luna")),
+            Ok(Some("gpt-5.6-luna".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_absent_or_blank_model_inherits_the_backend_default() {
+        for input in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                validate_coding_agent_model(CodingAgent::ClaudeCode, input),
+                Ok(None),
+                "{input:?} means 'unpinned', which is not an error"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_model_is_refused_and_never_swapped_for_the_default() {
+        let err = validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-sonnet-9"))
+            .expect_err("an id the backend does not offer must fail the spawn");
+        assert!(
+            err.contains("claude-sonnet-9"),
+            "name the rejected id: {err}"
+        );
+        assert!(
+            err.contains("claude-opus-5@default"),
+            "list what IS offered, so the caller can fix it in one step: {err}"
+        );
+    }
+
+    /// The real mistake this guards against: a caller pastes the LUCIDOS CHAT
+    /// id for Opus 5's 1M variant, which carries CHAT's own `@default`
+    /// version pin. Claude Code spells the same model without that pin.
+    #[test]
+    fn a_near_miss_id_names_the_likely_intended_one_before_the_list() {
+        let err =
+            validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-opus-5@default[1m]"))
+                .expect_err("an id no backend offers must fail the spawn");
+        assert!(
+            err.contains("which spells that model 'claude-opus-5[1m]'"),
+            "name the near miss before the full list: {err}"
+        );
+        assert!(
+            err.contains("Choose one of:"),
+            "the full list must still follow the hint: {err}"
+        );
+    }
+
+    /// `claude-sonnet-9` collapses to no other offered id under either strip,
+    /// so the refusal carries no guess, only the plain list.
+    #[test]
+    fn an_id_with_no_near_match_gets_the_plain_list() {
+        let err = validate_coding_agent_model(CodingAgent::ClaudeCode, Some("claude-sonnet-9"))
+            .expect_err("an id the backend does not offer must fail the spawn");
+        assert!(
+            !err.contains("which spells that model"),
+            "no candidate is close, so no hint must be guessed: {err}"
+        );
+    }
+
+    /// The two backends have disjoint model vocabularies, and picking the wrong
+    /// one is the likeliest caller mistake: a Codex spawn carrying a Claude id
+    /// looks entirely reasonable at the call site.
+    #[test]
+    fn a_model_from_the_other_backend_is_refused() {
+        assert!(validate_coding_agent_model(CodingAgent::Codex, Some("claude-sonnet-5")).is_err());
+        assert!(
+            validate_coding_agent_model(CodingAgent::ClaudeCode, Some("gpt-5.6-luna")).is_err()
+        );
+    }
+
+    #[test]
+    fn effort_validation_mirrors_the_model_rules() {
+        assert_eq!(
+            validate_coding_agent_effort(CodingAgent::ClaudeCode, Some("low")),
+            Ok(Some("low".to_string()))
+        );
+        assert_eq!(
+            validate_coding_agent_effort(CodingAgent::Codex, None),
+            Ok(None)
+        );
+        let err = validate_coding_agent_effort(CodingAgent::ClaudeCode, Some("xxhigh"))
+            .expect_err("an unknown tier must fail rather than silently drop");
+        assert!(err.contains("xxhigh"), "{err}");
+    }
+
+    /// `none` is on the CHAT effort ladder and on neither coding-agent picker.
+    /// A caller reading the chat vocabulary would reach for it, and it must not
+    /// resolve to the backend default in silence.
+    #[test]
+    fn a_chat_only_effort_tier_is_not_accepted_for_a_coding_agent() {
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            assert!(
+                validate_coding_agent_effort(agent, Some("none")).is_err(),
+                "{} does not offer 'none'",
+                agent.as_str()
+            );
+        }
+    }
+
+    // ── The backend's own context window ───────────────────────────────────
+
+    /// The bug this resolver exists for. A Sonnet 5 session runs 1M under
+    /// Claude Code, while the registry answers 200k for the same id. So the
+    /// viewer rendered a real 240k prompt as "203k / 200k (100%)".
+    #[test]
+    fn a_declared_window_answers_for_the_backend() {
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-sonnet-5"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5"),
+            Some(1_000_000)
+        );
+    }
+
+    /// The picker pins a version on two rows and the agent echoes the model
+    /// without it, so an exact-value lookup would miss both.
+    #[test]
+    fn the_echoed_id_matches_a_row_spelled_with_a_version_pin() {
+        for echoed in ["claude-opus-5", "claude-opus-4-8"] {
+            assert_eq!(
+                coding_agent_context_window(CodingAgent::ClaudeCode, echoed),
+                Some(1_000_000),
+                "{echoed} must match its '@default' row"
+            );
+        }
+    }
+
+    /// `[1m]` is NOT stripped when matching. It is what tells a 1M row from its
+    /// bare sibling, so collapsing the two would make one inherit the other's
+    /// window. Those rows declare nothing: the id-shape rule answers 1M.
+    #[test]
+    fn a_1m_row_does_not_inherit_from_its_bare_sibling() {
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-opus-4-8[1m]"),
+            None
+        );
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::ClaudeCode, "claude-fable-5[1m]"),
+            None
+        );
+    }
+
+    /// Undeclared means "the registry answers", which is the behaviour every
+    /// one of these had before the field existed.
+    #[test]
+    fn an_undeclared_model_leaves_the_registry_to_answer() {
+        for model in ["haiku", "claude-opus-4-1", "default", "not-a-model"] {
+            assert_eq!(
+                coding_agent_context_window(CodingAgent::ClaudeCode, model),
+                None,
+                "{model} must not declare a window"
+            );
+        }
+        assert_eq!(
+            coding_agent_context_window(CodingAgent::Codex, "gpt-5.6-sol"),
+            None
+        );
+    }
+
+    /// The trap that makes this table subtle. `normalize_cc_model_id` folds an
+    /// old dated id onto an alias, so `sonnet` is what a Sonnet 4.6 session
+    /// records. A window declared there would describe the wrong model.
+    #[test]
+    fn no_alias_row_declares_a_window() {
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            for alias in ["default", "sonnet", "opus", "opus[1m]", "haiku"] {
+                assert_eq!(
+                    coding_agent_context_window(agent, alias),
+                    None,
+                    "{alias} moves between models and must stay undeclared"
+                );
+            }
+        }
+    }
+
+    /// The lookup takes the FIRST row matching the stripped id, where
+    /// `unique_match_after` refuses an ambiguous one. That is safe only while
+    /// no two rows collapse to the same key, so pin it: adding a bare
+    /// `claude-opus-5` beside `claude-opus-5@default` would otherwise let
+    /// whichever comes first answer.
+    #[test]
+    fn no_two_rows_collapse_to_the_same_lookup_key() {
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            let mut seen = std::collections::HashSet::new();
+            for option in coding_agent_model_options(agent) {
+                let key = strip_version_pin(&option.value);
+                assert!(
+                    seen.insert(key.clone()),
+                    "{} strips to '{key}', which another row already claims",
+                    option.value
+                );
+            }
+        }
+    }
+
+    /// A declared window is a real token count. Guards a slipped digit in the
+    /// JSON, which would otherwise read as a tiny window and pin every step at
+    /// hundreds of percent.
+    #[test]
+    fn a_declared_window_is_a_plausible_token_count() {
+        for agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            for option in coding_agent_model_options(agent) {
+                if let Some(window) = option.context_window {
+                    assert!(
+                        window >= 200_000,
+                        "{} declares an implausible {window}-token window",
+                        option.value
+                    );
+                }
+            }
+        }
     }
 }

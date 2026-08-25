@@ -290,7 +290,12 @@ describe('the badge rides the mark rather than sitting beside it', () => {
     // wider target floats the badge clear of the mark's ink. Half the
     // difference between the host's box and the glyph IS the glyph's corner at
     // any tuning, so the offset must reference --header-mark-size.
-    expect(decl(badge, '--brand-badge-corner'))
+    //
+    // Declared on the SLOT, so both badges inherit one arithmetic: the state
+    // badge takes the top corner and the unread count takes the bottom.
+    // Newline-anchored: `.header-nav-cluster > .brand-mark-slot {` carries the
+    // same substring and is the earlier match.
+    expect(decl(block(markCss, '\n.brand-mark-slot {'), '--brand-badge-corner'))
       .toBe('calc((100% - var(--header-mark-size)) / 2)');
     for (const side of ['top', 'right']) {
       expect(decl(badge, side), `${side} must derive the corner, not sit at 0`)
@@ -298,6 +303,23 @@ describe('the badge rides the mark rather than sitting beside it', () => {
     }
     // The nudge stays a nudge: on the corner by default.
     expect(decl(block(markCss, ':root {'), '--header-mark-badge-offset')).toBe('0rem');
+  });
+
+  it('leaves the mark\'s sparkle alone: the unread count takes the OTHER corner', () => {
+    // LucidosMarkIcon puts its sparkle at the TOP-right. The state badge covers
+    // it, but only while a build runs or an update waits. An unread count is
+    // resident, so parking it there would leave the brand as three plain
+    // squares for as long as anything is unread.
+    const count = block(markCss, '.brand-mark-slot .badge.brand-unread-badge {');
+    expect(decl(count, 'bottom'), 'the count must ride the bottom corner')
+      .toBe('calc(var(--brand-badge-corner) + var(--header-mark-badge-offset))');
+    // Required, not tidiness: the base `.badge` sets `top`, and a box given both
+    // `top` and `bottom` stretches between them into a tall pill.
+    expect(decl(count, 'top'), 'the base badge top must be released').toBe('auto');
+    expect(decl(badge, 'bottom'), 'the state badge must stay on the top corner').toBeNull();
+    // The tap belongs to the mark underneath, which opens the menu. This is a
+    // positioned span over a SIBLING button, so its own taps would die.
+    expect(decl(count, 'pointer-events')).toBe('none');
   });
 
   it('stays inside the host box, so no clip can shave it and no measure sees it', () => {
@@ -370,6 +392,23 @@ describe('the nav chevrons are pinned to one shared span', () => {
     for (const token of ['--header-nav-min-span', '--header-nav-edge-reserve', '--header-nav-span']) {
       expect(span, 'the span must clamp, or it overlaps the edge clusters at high ui-scale').toContain(token);
     }
+  });
+
+  it('the cluster SPANS the row vertically, so its own height cannot place it', () => {
+    // `top: 50%` plus a `translateY(-50%)` positions the box by half its OWN
+    // height, and the three rows fill their clusters differently: the thread
+    // row's is as tall as the mark (2.1rem), the content row's as tall as a
+    // chevron (1.75rem). Each then rounds its own half. WebKit landed the two
+    // 0.14px apart at the 18px mobile root, enough to move the anti-aliasing
+    // of a hairline chevron on a phone. Spanning the row removes the term:
+    // flexbox centres the members against one identical box.
+    expect(decl(cluster, 'top')).toBe('0');
+    expect(decl(cluster, 'bottom')).toBe('0');
+    expect(decl(cluster, 'height'), 'the inset pair is what spans it; a height re-opens the rounding')
+      .toBeNull();
+    expect(decl(cluster, 'transform'), 'the horizontal centring only')
+      .toBe('translateX(-50%)');
+    expect(decl(cluster, 'align-items'), 'flexbox owns the vertical placement now').toBe('center');
   });
 
   it('the threads pane hangs its mark off the same span, at the trailing edge', () => {

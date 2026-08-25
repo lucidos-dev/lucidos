@@ -10,6 +10,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { toFailed } from '../../store/types';
 import { formatTimeAgo, formatDateTime } from '../../utils/formatTime';
 import { errorDetail } from '../../utils/errorDetail';
+import { copyToClipboard } from '../../utils/clipboard';
 import type { Loadable } from '../../store/types';
 import type {
   MemoryStatsResponse,
@@ -147,10 +148,7 @@ function MemoryEntryRow({ entry }: { entry?: MemoryEntryInfo }) {
                 data-tooltip="Copy id"
                 onClick={(e) => {
                   e.stopPropagation();
-                  navigator.clipboard?.writeText(entry.id).then(
-                    () => showToast('Memory id copied', 'success'),
-                    () => showToast('Could not copy memory id', 'error'),
-                  );
+                  copyToClipboard(entry.id, 'Memory id copied');
                 }}
               >
                 {entry.id}

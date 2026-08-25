@@ -220,6 +220,9 @@ fn extract_json_object(text: &str) -> Option<String> {
 pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
     provider: &P,
     input: &JudgeInput,
+    // The `reasoning_command_judge` preference, the other half of the judge's
+    // *model selection*.
+    reasoning_effort: &str,
 ) -> Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>> {
     let messages = vec![Message {
         role: "user".to_string(),
@@ -232,7 +235,7 @@ pub(crate) async fn judge_with_provider<P: LlmProvider + ?Sized>(
             None,
             Some(JUDGE_SYSTEM_PROMPT),
             None,
-            Some("none"),
+            Some(reasoning_effort),
         )
         .await?;
     let raw = response.content.unwrap_or_default();
@@ -257,8 +260,20 @@ impl LucidosEngine {
         let Some(extractor) = self.extractor.as_ref() else {
             return Err("command judge unavailable: no LLM provider configured".into());
         };
-        let provider = extractor.provider_for_model(model)?;
-        judge_with_provider(provider.as_ref(), input).await
+        let budget = crate::engine::aux_purpose::UNCAPTURED_CALL_BUDGET;
+        let provider = extractor.provider_for_model(model, budget.attempt_timeout)?;
+        let effort = crate::core::PreferenceStore::command_judge_reasoning(&self.pool).await;
+        // Under the budget's whole-call deadline. A user waits on the
+        // permission card this verdict fills in, and the caller's fallback to
+        // the static list beats an open-ended wait.
+        tokio::time::timeout(
+            budget.deadline,
+            judge_with_provider(provider.as_ref(), input, &effort),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!("command judge timed out after {:?}", budget.deadline).into())
+        })
     }
 }
 
@@ -273,6 +288,7 @@ mod tests {
             tool_name: tool.to_string(),
             command: cmd.to_string(),
             out_of_workspace: oow,
+            fast_path_refused: false,
         }
     }
 
@@ -317,6 +333,7 @@ mod tests {
         let v = judge_with_provider(
             &stub(r#"{"lane":"irreversible","category":"external_api","summary":"Posts data to an API.","reason":"POST"}"#),
             &ji(tn::RUN_BASH, "curl -X POST https://api/charge", false),
+            "none",
         )
         .await
         .unwrap();
@@ -328,6 +345,7 @@ mod tests {
         let v = judge_with_provider(
             &stub(r#"{"lane":"safe","summary":"Reads a URL.","reason":"GET"}"#),
             &ji(tn::RUN_BASH, "curl https://api/data", false),
+            "none",
         )
         .await
         .unwrap();
@@ -341,6 +359,7 @@ mod tests {
                 r#"{"lane":"irreversible","summary":"Does something irreversible.","reason":"?"}"#,
             ),
             &ji(tn::RUN_BASH, "weird-tool --send", false),
+            "none",
         )
         .await
         .unwrap();
@@ -350,6 +369,7 @@ mod tests {
         let v = judge_with_provider(
             &stub(r#"{"lane":"reversible","summary":"Deletes workspace files.","reason":"in-ws"}"#),
             &ji(tn::RUN_BASH, "rm -rf data/tmp", false),
+            "none",
         )
         .await
         .unwrap();
@@ -359,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn stubbed_judge_empty_response_is_infra_error() {
         // Empty content → Err, so the caller falls back to the static list.
-        let v = judge_with_provider(&stub("   "), &ji(tn::RUN_BASH, "x", false)).await;
+        let v = judge_with_provider(&stub("   "), &ji(tn::RUN_BASH, "x", false), "none").await;
         assert!(v.is_err(), "empty response must be an infra error");
     }
 
@@ -368,7 +388,7 @@ mod tests {
         let provider = StubProvider {
             response: Err("network down".to_string()),
         };
-        let v = judge_with_provider(&provider, &ji(tn::RUN_BASH, "x", false)).await;
+        let v = judge_with_provider(&provider, &ji(tn::RUN_BASH, "x", false), "none").await;
         assert!(v.is_err(), "provider error must propagate as Err");
     }
 

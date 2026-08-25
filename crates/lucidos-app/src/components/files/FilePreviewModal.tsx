@@ -160,7 +160,19 @@ export function FilePreviewModal() {
           </button>
         </div>
       </div>
-      <div class="file-preview-modal-body">
+      {/* A declared scroll region, mirroring `.content-pane-body`. Nothing
+          traps Tab in this modal, so a keyboard user genuinely reaches the body
+          and scrolls a long preview with it. Chrome gave that for free by
+          promoting an overflowing scroller, but only while the preview holds no
+          link, and it arrived unnamed wearing the browser's own ring. Declaring
+          the stop makes it every browser's and names it, and components.css
+          gives it our inset ring in place of the browser's. */}
+      <div
+        class="file-preview-modal-body"
+        tabIndex={0}
+        role="region"
+        aria-label="File preview"
+      >
         {filePreviewModalBody(state.path, layout)}
       </div>
     </Overlay>

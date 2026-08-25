@@ -19,6 +19,9 @@
  * 5. The dot's first-line offset is derived from the two quantities that decide
  *    it, both of them the ones actually in force, or it drifts off the line the
  *    moment either is retuned. Same derivation as the Lucidos menu's notice.
+ * 6. On mobile the bar spans the window. It is a child of the fixed header
+ *    there, so it is full-bleed only while that header keeps its inline inset
+ *    on its rows. A column-level inset reaches the bar too.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -28,7 +31,7 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { block, cssRules, decl, rulesTargeting } from './css-rule-helpers';
+import { block, cssRules, decl, rulesTargeting, selectorList } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
@@ -36,7 +39,37 @@ const styles = (rel: string): string => readFileSync(resolve(stylesDir, rel), 'u
 
 const shellCss = styles('panels/shell.css');
 const baseCss = styles('global/base.css');
+const mobileCss = styles('mobile.css');
 const rootTokens = block(baseCss, ':root');
+
+/** The three sections the mobile header swaps between, one per pane. */
+const MOBILE_HEADER_SECTIONS = [
+  '.mobile-threads-header',
+  '.mobile-thread-header',
+  '.mobile-content-header',
+];
+
+/** Every property that can inset a box horizontally. The scan reads all of
+ *  them, so a shorthand or a single side cannot walk around a guard written
+ *  for `padding-inline` alone. */
+const INLINE_PADDING_PROPS = [
+  'padding',
+  'padding-inline',
+  'padding-inline-start',
+  'padding-inline-end',
+  'padding-left',
+  'padding-right',
+];
+
+/** How the mobile breakpoint insets the element carrying `className`, as
+ *  `prop: value` pairs in source order. Empty when nothing there pads it. */
+function mobileInlinePadding(className: string): string[] {
+  return rulesTargeting(mobileCss, className)
+    .filter(rule => rule.atRules.includes('max-width: 768px'))
+    .flatMap(rule => INLINE_PADDING_PROPS
+      .filter(prop => rule.props.has(prop))
+      .map(prop => `${prop}: ${rule.props.get(prop)}`));
+}
 
 /** Every rule the bar is made of, its inner parts included. `rulesTargeting`
  *  answers "which rules style THIS element", which deliberately drops
@@ -148,5 +181,34 @@ describe('neither bar reaches for a banned or unguarded device', () => {
     for (const rule of barRules) {
       expect(rule.body, `${rule.selector} animates`).not.toMatch(/animation\s*:|transition\s*:/);
     }
+  });
+});
+
+describe('the mobile header hands its inline inset to its rows', () => {
+  // Both bars mount inside that header on this viewport, so the inset the
+  // desktop bar's controls want reaches them too. It left each bar floating a
+  // glyph's width inside both screen edges, its border stopping short of each.
+  it('leaves the column itself unpadded, so a bar spans the window', () => {
+    expect(mobileInlinePadding('app-header'), 'the mobile header pads its own column')
+      .toEqual(['padding-inline: 0']);
+  });
+
+  it('pads each pane section instead, which is the row the inset was for', () => {
+    for (const section of MOBILE_HEADER_SECTIONS) {
+      expect(mobileInlinePadding(section.slice(1)), `${section} takes the wrong inset`)
+        .toEqual(['padding-inline: var(--header-padding-x)']);
+    }
+    // One grouped rule, so the three cannot drift apart.
+    const grouped = rulesTargeting(mobileCss, 'mobile-thread-header')
+      .find(rule => rule.props.has('padding-inline'));
+    expect(selectorList(grouped!.selector)).toEqual(MOBILE_HEADER_SECTIONS);
+  });
+
+  it('leaves the row itself unpadded, so every centred cluster keeps its box', () => {
+    // The clusters are absolutely positioned against the row, and their
+    // non-overlap reserves are derived from its width. An inset moved onto the
+    // row would change both.
+    expect(mobileInlinePadding('mobile-header-row'), 'the row now pads itself too')
+      .toEqual([]);
   });
 });

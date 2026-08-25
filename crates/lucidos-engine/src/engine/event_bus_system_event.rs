@@ -291,6 +291,15 @@ pub enum SystemEvent {
         served_dir: String,
         /// Whether that path lies inside a coding-agent worktree.
         served_in_worktree: bool,
+        /// What the build-watch last said went wrong, when it said anything.
+        ///
+        /// Read from its `.build-watch/status.json`. A failing build is the
+        /// other way an Apply strands, and until this field existed the message
+        /// could only guess at "is the build-watch running?" while the answer
+        /// sat in a log file. `None` when the status is missing, unreadable, or
+        /// reports a healthy build.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_error: Option<String>,
         sent_at_ms: i64,
     },
     /// A dev engine advanced its boot-pinned served-frontend snapshot to the
@@ -521,6 +530,43 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// An install met files the user had locally edited, and says what it did
+    /// with each. `merged` kept their edit alongside upstream's. `conflicted`
+    /// could not. `replaced` was never mergeable: a trigger projection, a
+    /// binary, or the panel's keep control switched off. `restored` is a file
+    /// the user had deleted that upstream still ships, so it came back.
+    ///
+    /// Everything in `merged` survives in the file. Everything in `conflicted`
+    /// and `replaced` has a copy in `saved_paths`. Nothing in `restored` does,
+    /// because a deletion has no content to save.
+    ///
+    /// Emitted right after the `PluginInstalled` it belongs to, and only when
+    /// the install met at least one edited file. It exists because the outcome
+    /// is otherwise unrecoverable. The Modified badge is derived from git plus
+    /// disk on each read. Once the commits are written, nothing on disk records
+    /// which files merged and which lost.
+    ///
+    /// `saved_paths` are `data/`-relative copies of every discarded edit,
+    /// written under `data/artifacts/` before the overwrite. `commit` is the
+    /// commit holding the merged working tree plus those copies.
+    PluginLocalChangesMerged {
+        id: String,
+        version: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merged: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflicted: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        replaced: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restored: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        saved_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A pending plugin install (raised by `install_plugin` / `update_plugin`)
     /// was canceled by the user from the install panel. Audit trail only —
     /// no file writes happen on cancel; the staged temp dir is dropped.
@@ -617,6 +663,15 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// One device's whole row moved to a new id, keeping its push subscription
+    /// and its preferences. Emitted when a browser stops minting its own id and
+    /// takes the *workspace gateway*'s instead. `device_id` is where it landed.
+    DeviceHandedOver {
+        device_id: String,
+        old_device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     RepositoryAdded {
         repo_id: String,
         name: String,
@@ -648,6 +703,23 @@ pub enum SystemEvent {
     /// A credential entry was removed.
     CredentialDeleted {
         service_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A credential's plaintext was handed to a caller, through the Settings
+    /// copy buttons or the edit form's prefill.
+    ///
+    /// Same secrecy contract as its siblings: the service and its type, never
+    /// the value. What it adds is that a read is now on the record. The origin
+    /// check in front of it is defense in depth, not a boundary (ADR 0117). So
+    /// a reveal that should not have happened leaves a row somebody can find.
+    ///
+    /// `auth_type` is a plain `String` here, unlike `CredentialCreated`'s typed
+    /// field. The reveal route reads it off the stored row as its wire
+    /// spelling, and never parses it back.
+    CredentialRevealed {
+        service_name: String,
+        auth_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -691,6 +763,35 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A webhook was created. It opens a publicly reachable endpoint that emits
+    /// a pinned domain event, so its birth belongs on the timeline. The payload
+    /// carries the pinned `event_type` and whether a signature is configured,
+    /// never the token and never a secret.
+    WebhookCreated {
+        webhook_id: String,
+        name: String,
+        event_type: String,
+        signed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A webhook's configuration changed. `enabled` is carried because turning
+    /// one off is the thing a reader most often wants to date.
+    WebhookUpdated {
+        webhook_id: String,
+        name: String,
+        event_type: String,
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A webhook was deleted, so its URL answers nothing from now on.
+    WebhookDeleted {
+        webhook_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// An MCP server was registered, or an existing one re-registered with a
     /// new command / args / env. The `mcp_servers` table drives which external
     /// tools the agent can call, so a registration changes the agent's own tool
@@ -727,6 +828,28 @@ pub enum SystemEvent {
     /// An MCP server was unregistered and its tools left the agent's surface.
     McpServerRemoved {
         server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// One of the three permission allowlists was rewritten wholesale, through
+    /// its Settings editor.
+    ///
+    /// `patterns` is the resulting set in full, never a delta, on the model of
+    /// `McpServerDisabledToolsChanged`. The point of the event is auditing a
+    /// WIDENED grant after the fact, so the row has to say what the permission
+    /// became. "It changed" answers nothing a month later.
+    ///
+    /// One variant with a typed `grant_file`, not three near-identical ones.
+    /// `GrantFile` is already this codebase's single identity for the three
+    /// lanes. Three variants would be one event written three times, drifting
+    /// apart the way the three handlers just did. A subscriber that wants one
+    /// lane scopes it with a `condition` on `grant_file`.
+    ///
+    /// Comments and blank lines are dropped: this records the grants, not the
+    /// file's formatting.
+    PermissionGrantsChanged {
+        grant_file: crate::core::GrantFile,
+        patterns: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -986,79 +1109,109 @@ impl SystemEvent {
         }
     }
 
+    /// Wire-format `type` names the engine writes an `events` row for. One
+    /// list, two entry points: [`Self::is_persisted`] answers for a constructed
+    /// event, [`Self::is_persisted_type_name`] for a bare name.
+    ///
+    /// A persisted event is a durable fact, so it is also what an event wait
+    /// and a trigger may subscribe to (ADR 0113). That is why the name-keyed
+    /// form exists: validation holds a name, not an event.
+    ///
+    /// `DomainEvent` is deliberately absent. It is a transport variant, and its
+    /// row is stored under the inner event type, never that literal name.
+    pub const PERSISTED_TYPE_NAMES: &'static [&'static str] = &[
+        "NotificationCreated",
+        "PreferencesChanged",
+        "ArtifactImported",
+        "ArtifactCreated",
+        "ArtifactUpdated",
+        "ArtifactDeleted",
+        "RepositoryImported",
+        "TriggerCreated",
+        "TriggerUpdated",
+        "TriggerDeleted",
+        "TriggerEnabled",
+        "TriggerDisabled",
+        "TriggerExecuted",
+        "TriggerGroupCreated",
+        "TriggerGroupRenamed",
+        "TriggerGroupReordered",
+        "TriggerGroupDeleted",
+        "TriggerCompleted",
+        "LanguageSet",
+        "TimezoneSet",
+        "ChangeDiscarded",
+        "PluginInstalled",
+        "PluginLocalChangesMerged",
+        "PluginUninstalled",
+        "PluginInstallCanceled",
+        "PluginUninstallCanceled",
+        "PluginMarketplaceRegistered",
+        "PluginMarketplaceRemoved",
+        "PinnedAppPinned",
+        "PinnedAppUnpinned",
+        "DeviceRegistered",
+        "DeviceRenamed",
+        "DevicePushChanged",
+        "DeviceDeleted",
+        "DeviceHandedOver",
+        "RepositoryAdded",
+        "RepositoryRemoved",
+        "CredentialCreated",
+        "CredentialUpdated",
+        "CredentialDeleted",
+        "CredentialRevealed",
+        "EnvironmentVariableSet",
+        "EnvironmentVariableDeleted",
+        "ModelCreated",
+        "ModelUpdated",
+        "ModelDeleted",
+        "WebhookCreated",
+        "WebhookUpdated",
+        "WebhookDeleted",
+        "McpServerRegistered",
+        "McpServerUpdated",
+        "McpServerDisabledToolsChanged",
+        "McpServerRemoved",
+        "PermissionGrantsChanged",
+        "OAuthAccountConnected",
+        "OAuthAccountDeleted",
+        "DataFileWritten",
+        "DataFileDeleted",
+        "DataFileEdited",
+        "ApplyAllBatchStarted",
+        "ApplyAllBatchCompleted",
+        "EngineSupervisorRespawned",
+        "EmailSent",
+        "ProxyModulesReloaded",
+        "ThreadQueued",
+        "ThreadQueueAdmitted",
+        "ThreadQueueDropped",
+        "ThreadQueueCompleted",
+        "CapacityPolicyChanged",
+        "BackupCompleted",
+        "BackupFailed",
+    ];
+
+    /// Whether this event writes a row to the `events` table.
+    ///
+    /// `DomainEvent` is the one variant whose answer depends on a field. Every
+    /// other one is decided by its name, so both forms read one list.
     pub fn is_persisted(&self) -> bool {
-        matches!(
-            self,
-            |Self::NotificationCreated { .. }| Self::PreferencesChanged { .. }
-                | Self::ArtifactImported { .. }
-                | Self::ArtifactCreated { .. }
-                | Self::ArtifactUpdated { .. }
-                | Self::ArtifactDeleted { .. }
-                | Self::RepositoryImported { .. }
-                | Self::TriggerCreated { .. }
-                | Self::TriggerUpdated { .. }
-                | Self::TriggerDeleted { .. }
-                | Self::TriggerEnabled { .. }
-                | Self::TriggerDisabled { .. }
-                | Self::TriggerExecuted { .. }
-                | Self::TriggerGroupCreated { .. }
-                | Self::TriggerGroupRenamed { .. }
-                | Self::TriggerGroupReordered { .. }
-                | Self::TriggerGroupDeleted { .. }
-                | Self::TriggerCompleted { .. }
-                | Self::LanguageSet { .. }
-                | Self::TimezoneSet { .. }
-                | Self::ChangeDiscarded { .. }
-                | Self::DomainEvent {
-                    transient: false,
-                    ..
-                }
-                | Self::PluginInstalled { .. }
-                | Self::PluginUninstalled { .. }
-                | Self::PluginInstallCanceled { .. }
-                | Self::PluginUninstallCanceled { .. }
-                | Self::PluginMarketplaceRegistered { .. }
-                | Self::PluginMarketplaceRemoved { .. }
-                | Self::PinnedAppPinned { .. }
-                | Self::PinnedAppUnpinned { .. }
-                | Self::DeviceRegistered { .. }
-                | Self::DeviceRenamed { .. }
-                | Self::DevicePushChanged { .. }
-                | Self::DeviceDeleted { .. }
-                | Self::RepositoryAdded { .. }
-                | Self::RepositoryRemoved { .. }
-                | Self::CredentialCreated { .. }
-                | Self::CredentialUpdated { .. }
-                | Self::CredentialDeleted { .. }
-                | Self::EnvironmentVariableSet { .. }
-                | Self::EnvironmentVariableDeleted { .. }
-                | Self::ModelCreated { .. }
-                | Self::ModelUpdated { .. }
-                | Self::ModelDeleted { .. }
-                | Self::McpServerRegistered { .. }
-                | Self::McpServerUpdated { .. }
-                | Self::McpServerDisabledToolsChanged { .. }
-                | Self::McpServerRemoved { .. }
-                | Self::OAuthAccountConnected { .. }
-                | Self::OAuthAccountDeleted { .. }
-                | Self::DataFileWritten { .. }
-                | Self::DataFileDeleted { .. }
-                | Self::DataFileEdited { .. }
-                | Self::ApplyAllBatchStarted { .. }
-                | Self::ApplyAllBatchCompleted { .. }
-                | Self::EngineSupervisorRespawned { .. }
-                | Self::EmailSent { .. }
-                | Self::ProxyModulesReloaded { .. }
-                | Self::ThreadQueued { .. }
-                | Self::ThreadQueueAdmitted { .. }
-                | Self::ThreadQueueDropped { .. }
-                | Self::ThreadQueueCompleted { .. }
-                | Self::CapacityPolicyChanged { .. }
-                // Terminal backup events are the durable run history (start /
-                // finish / size). BackupProgress stays transient (no row per tick).
-                | Self::BackupCompleted { .. }
-                | Self::BackupFailed { .. }
-        )
+        match self {
+            Self::DomainEvent { transient, .. } => !transient,
+            _ => Self::is_persisted_type_name(self.event_type()),
+        }
+    }
+
+    /// [`Self::is_persisted`] for a bare wire name, which is all a validator or
+    /// a stored row has in hand.
+    ///
+    /// This is NOT the emit guard. Waiting on a name and being allowed to POST
+    /// it are separate permissions: [`Self::is_reserved_type_name`] answers the
+    /// second and stays as strict as it is.
+    pub fn is_persisted_type_name(name: &str) -> bool {
+        Self::PERSISTED_TYPE_NAMES.contains(&name)
     }
 
     pub fn event_type(&self) -> &'static str {
@@ -1112,6 +1265,7 @@ impl SystemEvent {
             Self::NativePushRequested { .. } => "NativePushRequested",
             Self::NativePushDismissRequested { .. } => "NativePushDismissRequested",
             Self::PluginInstalled { .. } => "PluginInstalled",
+            Self::PluginLocalChangesMerged { .. } => "PluginLocalChangesMerged",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
             Self::PluginInstallCanceled { .. } => "PluginInstallCanceled",
             Self::PluginUninstallCanceled { .. } => "PluginUninstallCanceled",
@@ -1124,20 +1278,26 @@ impl SystemEvent {
             Self::DeviceRenamed { .. } => "DeviceRenamed",
             Self::DevicePushChanged { .. } => "DevicePushChanged",
             Self::DeviceDeleted { .. } => "DeviceDeleted",
+            Self::DeviceHandedOver { .. } => "DeviceHandedOver",
             Self::RepositoryAdded { .. } => "RepositoryAdded",
             Self::RepositoryRemoved { .. } => "RepositoryRemoved",
             Self::CredentialCreated { .. } => "CredentialCreated",
             Self::CredentialUpdated { .. } => "CredentialUpdated",
             Self::CredentialDeleted { .. } => "CredentialDeleted",
+            Self::CredentialRevealed { .. } => "CredentialRevealed",
             Self::EnvironmentVariableSet { .. } => "EnvironmentVariableSet",
             Self::EnvironmentVariableDeleted { .. } => "EnvironmentVariableDeleted",
             Self::ModelCreated { .. } => "ModelCreated",
             Self::ModelUpdated { .. } => "ModelUpdated",
             Self::ModelDeleted { .. } => "ModelDeleted",
+            Self::WebhookCreated { .. } => "WebhookCreated",
+            Self::WebhookUpdated { .. } => "WebhookUpdated",
+            Self::WebhookDeleted { .. } => "WebhookDeleted",
             Self::McpServerRegistered { .. } => "McpServerRegistered",
             Self::McpServerUpdated { .. } => "McpServerUpdated",
             Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
             Self::McpServerRemoved { .. } => "McpServerRemoved",
+            Self::PermissionGrantsChanged { .. } => "PermissionGrantsChanged",
             Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
             Self::DataFileWritten { .. } => "DataFileWritten",
@@ -1154,6 +1314,22 @@ impl SystemEvent {
             Self::ThreadQueueCompleted { .. } => "ThreadQueueCompleted",
             Self::ThreadQueueChanged {} => "ThreadQueueChanged",
             Self::CapacityPolicyChanged { .. } => "CapacityPolicyChanged",
+        }
+    }
+
+    /// The name this event is filed under: its `events.event_type` column, and
+    /// the name a subscriber writes in an `on:` entry.
+    ///
+    /// Identical to [`Self::event_type`] for every variant but `DomainEvent`,
+    /// which is a transport wrapper. A domain event is stored and matched under
+    /// the inner name the workspace chose, never the literal `"DomainEvent"`.
+    ///
+    /// Use this wherever a name is compared against a row or a subscription.
+    /// Reserve [`Self::event_type`] for the Rust variant's own name.
+    pub fn stored_event_type(&self) -> &str {
+        match self {
+            Self::DomainEvent { event_type, .. } => event_type.as_str(),
+            _ => self.event_type(),
         }
     }
 
@@ -1213,6 +1389,7 @@ impl SystemEvent {
         "NativePushRequested",
         "NativePushDismissRequested",
         "PluginInstalled",
+        "PluginLocalChangesMerged",
         "PluginUninstalled",
         "PluginInstallCanceled",
         "PluginUninstallCanceled",
@@ -1225,20 +1402,26 @@ impl SystemEvent {
         "DeviceRenamed",
         "DevicePushChanged",
         "DeviceDeleted",
+        "DeviceHandedOver",
         "RepositoryAdded",
         "RepositoryRemoved",
         "CredentialCreated",
         "CredentialUpdated",
         "CredentialDeleted",
+        "CredentialRevealed",
         "EnvironmentVariableSet",
         "EnvironmentVariableDeleted",
         "ModelCreated",
         "ModelUpdated",
         "ModelDeleted",
+        "WebhookCreated",
+        "WebhookUpdated",
+        "WebhookDeleted",
         "McpServerRegistered",
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
         "McpServerRemoved",
+        "PermissionGrantsChanged",
         "OAuthAccountConnected",
         "OAuthAccountDeleted",
         "DataFileWritten",
@@ -1305,6 +1488,7 @@ impl SystemEvent {
             Self::DeviceVisible { .. } | Self::DeviceHidden { .. } => "device_presence",
             Self::PresenceCheck { .. } => "presence",
             Self::PluginInstalled { .. }
+            | Self::PluginLocalChangesMerged { .. }
             | Self::PluginUninstalled { .. }
             | Self::PluginInstallCanceled { .. }
             | Self::PluginUninstallCanceled { .. } => "plugin",
@@ -1319,21 +1503,27 @@ impl SystemEvent {
             Self::DeviceRegistered { .. }
             | Self::DeviceRenamed { .. }
             | Self::DevicePushChanged { .. }
-            | Self::DeviceDeleted { .. } => "device",
+            | Self::DeviceDeleted { .. }
+            | Self::DeviceHandedOver { .. } => "device",
             Self::RepositoryAdded { .. } | Self::RepositoryRemoved { .. } => "repository",
             Self::CredentialCreated { .. }
             | Self::CredentialUpdated { .. }
-            | Self::CredentialDeleted { .. } => "credential",
+            | Self::CredentialDeleted { .. }
+            | Self::CredentialRevealed { .. } => "credential",
             Self::EnvironmentVariableSet { .. } | Self::EnvironmentVariableDeleted { .. } => {
                 "environment_variable"
             }
             Self::ModelCreated { .. } | Self::ModelUpdated { .. } | Self::ModelDeleted { .. } => {
                 "model"
             }
+            Self::WebhookCreated { .. }
+            | Self::WebhookUpdated { .. }
+            | Self::WebhookDeleted { .. } => "webhook",
             Self::McpServerRegistered { .. }
             | Self::McpServerUpdated { .. }
             | Self::McpServerDisabledToolsChanged { .. }
             | Self::McpServerRemoved { .. } => "mcp_server",
+            Self::PermissionGrantsChanged { .. } => "permission_grant",
             Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
                 "oauth_account"
             }
@@ -1411,6 +1601,7 @@ impl SystemEvent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            Self::PluginLocalChangesMerged { id, .. } => id.clone(),
             Self::PluginUninstalled { id, .. } => id.clone(),
             Self::PluginInstallCanceled { id, .. } => id.clone(),
             Self::PluginUninstallCanceled { id, .. } => id.clone(),
@@ -1431,22 +1622,28 @@ impl SystemEvent {
             Self::DeviceRegistered { device_id, .. }
             | Self::DeviceRenamed { device_id, .. }
             | Self::DevicePushChanged { device_id, .. }
-            | Self::DeviceDeleted { device_id, .. } => device_id.clone(),
+            | Self::DeviceDeleted { device_id, .. }
+            | Self::DeviceHandedOver { device_id, .. } => device_id.clone(),
             Self::RepositoryAdded { repo_id, .. } | Self::RepositoryRemoved { repo_id, .. } => {
                 repo_id.clone()
             }
             Self::CredentialCreated { service_name, .. }
             | Self::CredentialUpdated { service_name, .. }
-            | Self::CredentialDeleted { service_name, .. } => service_name.clone(),
+            | Self::CredentialDeleted { service_name, .. }
+            | Self::CredentialRevealed { service_name, .. } => service_name.clone(),
             Self::EnvironmentVariableSet { name, .. }
             | Self::EnvironmentVariableDeleted { name, .. } => name.clone(),
             Self::ModelCreated { id, .. }
             | Self::ModelUpdated { id, .. }
             | Self::ModelDeleted { id, .. } => id.clone(),
+            Self::WebhookCreated { webhook_id, .. }
+            | Self::WebhookUpdated { webhook_id, .. }
+            | Self::WebhookDeleted { webhook_id, .. } => webhook_id.clone(),
             Self::McpServerRegistered { server_id, .. }
             | Self::McpServerUpdated { server_id, .. }
             | Self::McpServerDisabledToolsChanged { server_id, .. }
             | Self::McpServerRemoved { server_id, .. } => server_id.clone(),
+            Self::PermissionGrantsChanged { grant_file, .. } => grant_file.file_name().to_string(),
             Self::OAuthAccountConnected { account_id, .. }
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
             Self::DataFileWritten { path, .. }

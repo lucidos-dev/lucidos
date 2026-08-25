@@ -12,6 +12,16 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 lucidos-build-slot = { path = "../lucidos-build-slot" }
+lucidos-local-token = { path = "../lucidos-local-token" }
+# `lucidos pair --qr` draws the code in the terminal, and needs a hostname a
+# phone can reach to put in it. Tailscale answers that from the interface list
+# with no subprocess. It picks a name to print and never touches the auth
+# decision (ADR 0094).
+lucidos-tailscale = { path = "../lucidos-tailscale" }
+# The same encoder the gateway uses, so the two QRs cannot differ. No default
+# features: `image` is the crate's only dependency and it is gated off, and the
+# unicode renderer this needs is behind no feature at all.
+qrcode = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

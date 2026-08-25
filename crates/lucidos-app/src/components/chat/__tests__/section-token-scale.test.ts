@@ -11,7 +11,7 @@ import type { ContextCapture, ContextSection } from '../../../store/types';
  *  headline, so the tree sums to the header by construction. */
 
 function section(name: string, chars: number, role: ContextSection['role'] = 'user'): ContextSection {
-  return { name, char_count: chars, role };
+  return { name, budget_delta_chars: chars, content_chars: chars, role };
 }
 
 /** The reported capture, to scale: 540.1K chars of sections against a real
@@ -39,7 +39,7 @@ function capture(over: Partial<ContextCapture> = {}): ContextCapture {
 function renderedRoleTotals(snap: ContextCapture): number {
   const tokens = sectionTokenScale(snap);
   return groupSections(snap.sections)
-    .map(role => role.innerGroups.flatMap(ig => ig.sections).reduce((a, s) => a + s.char_count, 0))
+    .map(role => role.innerGroups.flatMap(ig => ig.sections).reduce((a, s) => a + s.budget_delta_chars, 0))
     .reduce((a, chars) => a + tokens(chars), 0);
 }
 
@@ -102,5 +102,31 @@ describe('sectionTokenScale', () => {
       capture({ sections: [], sections_stripped: true, event_id: 'e1' }),
     );
     expect(tokens(147_800)).toBe(0);
+  });
+
+  /** The Conversation row is the one section whose two sizes disagree. Its
+   *  content_chars counts the bundle a second time, so a tree that divided by
+   *  it would not sum to the header. */
+  it('divides by the budget delta, so a delta section does not break the sum', () => {
+    const snap = capture({
+      sections: [
+        section('System Instructions', 147_800, 'system'),
+        section('Prior turn', 17_400, 'prior_message'),
+        // 374,900 added on top of a 165,200-char bundle already in message 0.
+        { name: 'Conversation', budget_delta_chars: 374_900, content_chars: 540_100, role: 'user' },
+      ],
+      usage: { input_tokens: 205_000, output_tokens: 196, cache_read_tokens: 203_000, cache_creation_tokens: 2_000 },
+    });
+    expect(renderedRoleTotals(snap)).toBeCloseTo(205_000, -1);
+  });
+
+  /** A row written before the split carries no content_chars at all. Nothing
+   *  the viewer reads may go undefined on it. */
+  it('renders a pre-split row, which measured no region', () => {
+    const snap = capture({
+      sections: [{ name: 'Conversation', budget_delta_chars: 500, role: 'user' }],
+      usage: { input_tokens: 1_000, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    });
+    expect(renderedRoleTotals(snap)).toBeCloseTo(1_000, -1);
   });
 });

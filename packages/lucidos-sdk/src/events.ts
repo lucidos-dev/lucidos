@@ -28,6 +28,13 @@ export interface EventQuery {
    * predating this field passes, so the filter can only narrow.
    */
   thread_id?: string;
+  /**
+   * Resolve ONE event by primary key, rather than positioning a window the way
+   * the two cursors above do. Takes a bare uuid, or the `evt-<32 hex>` address
+   * the agent sees on a tool result. A malformed value is a 400, never a
+   * silently unfiltered page.
+   */
+  event_id?: string;
 }
 
 /**
@@ -46,6 +53,7 @@ export function buildEventQueryString(params: EventQuery): string {
   if (params.before_event_id) qs.set('before_event_id', params.before_event_id);
   if (params.after_event_id) qs.set('after_event_id', params.after_event_id);
   if (params.thread_id) qs.set('thread_id', params.thread_id);
+  if (params.event_id) qs.set('event_id', params.event_id);
   return qs.toString();
 }
 

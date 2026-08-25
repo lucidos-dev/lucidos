@@ -4,15 +4,19 @@
 //! A workspace slug can never start with the sigil (slugs are `[a-z0-9-]`), so
 //! the first path segment is unambiguous with no reserved-word list.
 
+use crate::auth;
 use crate::boot_failure::BootFailure;
 use crate::boot_phase::{self, BootPhase};
 use crate::error::ApiError;
+use crate::hook_socket;
 use crate::net_config;
 use crate::next_boot;
+use crate::pairing_qr;
 use crate::postgres::{self, PgBackend, PgHandle, ProvisionError, ProvisionErrorKind};
 use crate::proxy;
 use crate::registry::{self, Registry, Workspace, REGISTRY_VERSION, SIGIL};
-use crate::stack::{self, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
+use crate::release_check;
+use crate::stack::{self, EngineKeeper, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
 use crate::BoxError;
 use axum::body::Body;
 use axum::extract::State;
@@ -86,6 +90,11 @@ const RESTART_CAP: u32 = 5;
 /// EXITED. An engine that is still ALIVE is never culled, whatever the probe
 /// says (see [`respawn_decision`]), so there is no separate "slow" threshold.
 const DEAD_MISS_THRESHOLD: u32 = 2;
+/// Consecutive missed probes before releasing an [`EngineKeeper::External`]
+/// stack. Deliberately more patient than [`DEAD_MISS_THRESHOLD`]: nothing
+/// improves by dropping a stack quickly. An external launcher that writes no
+/// pidfile also leaves a merely BUSY engine looking exactly like an exited one.
+const EXTERNAL_RELEASE_MISSES: u32 = 5;
 /// How long a workspace may sit in the boot window before the splash escapes to
 /// the manual "Back to workspaces" page (see [`proxy::stalled_page`]). Must
 /// exceed a legitimate slow first-run boot: [`BOOT_GRACE`] plus migrations and
@@ -127,6 +136,28 @@ struct GatewayInner {
     app_data: PathBuf,
     registry_path: PathBuf,
     gateway_port: u16,
+    /// The machine-local token proving a caller is a process on this machine
+    /// (`crate::auth`). Minted at startup, never logged, never sent anywhere.
+    local_token: String,
+    /// Where the paired-device store lives, so tests can point it elsewhere.
+    paired_devices_path: PathBuf,
+    /// Paired devices, the source of truth for who may reach this gateway over
+    /// the network. Held in memory and written through on every change.
+    ///
+    /// `authorize` takes this lock on EVERY request, so nothing may hold it
+    /// across a file write. [`GatewayState::persist_paired_devices`] is the only
+    /// writer, and it holds it just long enough to clone.
+    paired_devices: Mutex<auth::PairedDevices>,
+    /// Serializes writers of the store, so two of them cannot interleave and
+    /// publish out of order. Separate from the data lock above precisely so the
+    /// file write happens with that one released.
+    paired_devices_writing: Mutex<()>,
+    /// Pairing codes minted and not yet redeemed. Never persisted: a code lives
+    /// five minutes, so surviving a restart would buy nothing.
+    pending_pairings: Mutex<auth::PendingPairings>,
+    /// Whether this process terminates TLS on its own socket. Decides only
+    /// whether a credential cookie is marked `Secure`.
+    serves_tls: bool,
     /// The engine binary to spawn per workspace. Must be explicit
     /// (`LUCIDOS_ENGINE_BIN`): the gateway's own `current_exe` is the gateway,
     /// not the engine (ADR 0014 §1).
@@ -134,14 +165,15 @@ struct GatewayInner {
     /// The built frontend dir (`dist/`) the gateway serves the picker from, and
     /// passes to engines via the inherited env so they serve it too.
     static_dir: Option<PathBuf>,
-    /// Whether spawned engines bind loopback-only (packaged) or all interfaces
-    /// (dev, so the workspace app is also reachable directly on its port). See
-    /// `LUCIDOS_GATEWAY_ENGINE_LOOPBACK` and ADR 0014 "Dev runtime topology".
+    /// Whether spawned engines bind loopback only. Yes in every build since
+    /// ADR 0096, because the gateway authenticates every network caller and an
+    /// engine port facing the network walks past that. Only
+    /// `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` turns it off.
     engine_loopback: bool,
-    /// Whether the spawned engine serves TLS on its port. A dev engine is the
-    /// direct front and keeps its cert, so the gateway must proxy and
-    /// health-probe it over https. A packaged engine serves plain HTTP on
-    /// loopback and the gateway terminates TLS.
+    /// Whether the spawned engine serves TLS on its port. A loopback engine
+    /// serves plain http and the gateway terminates TLS, so this is false
+    /// wherever `engine_loopback` holds. An engine put back on the network
+    /// keeps the inherited cert and is proxied over https.
     engine_tls: bool,
     pg_backend: PgBackend,
     /// True under the packaged desktop runtime. Reported in
@@ -165,6 +197,12 @@ struct GatewayInner {
     /// workspace). Guards against a burst of concurrent requests each spawning a
     /// duplicate engine before the stack lands in `stacks`.
     starting: AsyncMutex<HashSet<String>>,
+    /// When the gateway last stopped each workspace's engine, for the ids it has
+    /// not installed a stack for since. Read by
+    /// [`GatewayState::adopt_running_engines`], which must not re-adopt the
+    /// engine a stop is still draining. Never persisted: a stop the gateway did
+    /// not live to see through has no engine left to guard against.
+    stopped_at: RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     /// Hot-path id to engine-port map for the proxy, so proxying never contends
     /// with a stack mutex held during a multi-second respawn.
     routes: RwLock<HashMap<String, u16>>,
@@ -196,22 +234,294 @@ struct GatewayInner {
     /// control to re-exec onto the rebuilt binary and to stat for the
     /// "new gateway available" check.
     exe_path: Option<PathBuf>,
-    /// Cached update check, re-run only when the binary's mtime moves, so the
-    /// picker's 2s poll does not fork `current_exe --build-id` every tick.
-    update_check: Mutex<UpdateCheck>,
+    /// Cached gateway-binary check, re-run only when the binary's mtime moves,
+    /// so the picker's 2s poll does not fork `current_exe --build-id` every tick.
+    binary_check: Mutex<GatewayBinaryCheck>,
+    /// The machine's one release check: is a newer Lucidos PUBLISHED (ADR 0108)?
+    /// A different question from `binary_check`, which asks whether a newer
+    /// gateway binary sits on disk in a dev checkout.
+    release_check: release_check::ReleaseCheck,
 }
 
 /// Memoized "is a newer gateway binary on disk?" verdict, keyed by the binary's
 /// last-seen mtime. A `None` mtime means not yet checked.
 #[derive(Default)]
-struct UpdateCheck {
+struct GatewayBinaryCheck {
     last_mtime: Option<std::time::SystemTime>,
     update_available: bool,
 }
 
 impl GatewayState {
+    /// A state with an empty registry and nothing running, for a test that
+    /// needs to drive a `Router` rather than a live gateway.
+    ///
+    /// Every path here is under the OS temp dir and nothing is written unless a
+    /// test asks for it, so this touches no real workspace.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self::for_tests_with_static_dir(None)
+    }
+
+    /// [`Self::for_tests`], with a frontend dir, for a test that needs a real
+    /// shell served rather than "no frontend configured".
+    ///
+    /// A supplied dir also roots the paired-device store, in a subdirectory of
+    /// its own. The default scratch path is keyed by pid, so it is shared by
+    /// every test in the binary, and tests run in parallel: two of them saving
+    /// the store at once race on the atomic rename and one fails. A test that
+    /// owns a directory gets its own store with it.
+    #[cfg(test)]
+    pub fn for_tests_with_static_dir(static_dir: Option<PathBuf>) -> Self {
+        let scratch = match static_dir.as_ref() {
+            Some(dir) => dir.join("state"),
+            None => std::env::temp_dir().join(format!("lucidos-gw-state-{}", std::process::id())),
+        };
+        GatewayState {
+            inner: Arc::new(GatewayInner {
+                app_data: scratch.clone(),
+                registry_path: scratch.join("workspaces.json"),
+                gateway_port: 5251,
+                local_token: "test-local-token".to_string(),
+                paired_devices_path: scratch.join("paired-devices.json"),
+                paired_devices: Mutex::new(auth::PairedDevices::default()),
+                paired_devices_writing: Mutex::new(()),
+                pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                serves_tls: false,
+                engine_bin: scratch.join("lucidos-engine"),
+                static_dir,
+                engine_loopback: true,
+                engine_tls: false,
+                pg_backend: PgBackend::Docker,
+                packaged: false,
+                pg_lock: AsyncMutex::new(()),
+                proxy_client: proxy::build_client(),
+                health_client: stack::build_health_client(),
+                registry: Mutex::new(Registry::default()),
+                stacks: AsyncMutex::new(HashMap::new()),
+                starting: AsyncMutex::new(HashSet::new()),
+                stopped_at: RwLock::new(HashMap::new()),
+                routes: RwLock::new(HashMap::new()),
+                boot_phases: RwLock::new(HashMap::new()),
+                boot_failures: RwLock::new(HashMap::new()),
+                restore: RwLock::new(RestoreStatus::default()),
+                pending_binds: RwLock::new(BTreeSet::new()),
+                exe_path: None,
+                binary_check: Mutex::new(GatewayBinaryCheck::default()),
+                // Not packaged and no executable path, so the gate is shut and
+                // no test can reach the network through this.
+                release_check: release_check::ReleaseCheck::new(&release_check::Deployment {
+                    packaged: false,
+                    exe: None,
+                    app_data: scratch,
+                    default_prefix: None,
+                    config_path: None,
+                }),
+            }),
+        }
+    }
+
     fn app_data(&self) -> &PathBuf {
         &self.inner.app_data
+    }
+
+    /// What this request proved about itself (`crate::auth`).
+    ///
+    /// A poisoned paired-device lock resolves to `Unauthorized`. Failing closed
+    /// is right here: the alternative is admitting an unauthenticated caller
+    /// because an unrelated thread panicked.
+    pub fn authorize(&self, headers: &axum::http::HeaderMap) -> auth::Authorization {
+        match self.inner.paired_devices.lock() {
+            Ok(paired) => auth::authorize(headers, &self.inner.local_token, &paired),
+            Err(_) => auth::Authorization::Unauthorized,
+        }
+    }
+
+    /// Does this process terminate TLS on its own socket?
+    ///
+    /// Resolved once at boot through `net_config::serves_tls_from_env`, then
+    /// carried. Both consumers read it here: `serve` picks the listener, and
+    /// `auth::request_is_secure` decides the session cookie's `Secure` flag.
+    pub fn serves_tls(&self) -> bool {
+        self.inner.serves_tls
+    }
+
+    /// A snapshot of the paired devices, for the management list.
+    pub fn paired_devices(&self) -> auth::PairedDevices {
+        self.inner
+            .paired_devices
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default()
+    }
+
+    /// Mint a one-time pairing code, carrying the name the minter suggested.
+    pub fn mint_pairing_code(&self, label: Option<String>) -> Result<String, String> {
+        self.inner
+            .pending_pairings
+            .lock()
+            .map_err(|_| "pairing state is unavailable".to_string())?
+            .mint(label)
+            .map_err(|e| format!("could not mint a pairing code: {e}"))
+    }
+
+    /// Redeem `code` and enrol a device called `label`.
+    ///
+    /// `Ok(None)` means the code was wrong or expired, which is a caller error
+    /// rather than a failure. The code is consumed before the credential is
+    /// minted, so a failure to persist cannot leave a code redeemable twice.
+    pub fn redeem_pairing_code(
+        &self,
+        code: &str,
+        requested_label: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        // The name the device typed wins when it gave one, because that person
+        // is being more specific than whoever minted the code. Otherwise the
+        // `lucidos pair --label` name applies, and only then the fallback.
+        let minted_label = {
+            let mut pending = self
+                .inner
+                .pending_pairings
+                .lock()
+                .map_err(|_| "pairing state is unavailable".to_string())?;
+            match pending.redeem(code) {
+                Some(label) => label,
+                None => return Ok(None),
+            }
+        };
+        let label = requested_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(minted_label)
+            .unwrap_or_else(|| "Paired device".to_string());
+        let credential =
+            auth::mint_credential().map_err(|e| format!("could not mint a credential: {e}"))?;
+        let device = auth::PairedDevice {
+            id: auth::mint_device_id().map_err(|e| format!("could not mint a device id: {e}"))?,
+            label: label.to_string(),
+            credential_digest: auth::digest(&credential),
+            paired_at: chrono::Utc::now().to_rfc3339(),
+            // Seeded, not left `None`: this device is reaching us right now, and
+            // an empty last-seen on a device that just paired reads as stale.
+            last_seen_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        self.write_paired_devices(|paired| {
+            paired.devices.push(device.clone());
+        })?;
+        crate::log!("[Gateway] paired a new device: {}", device.label);
+        Ok(Some(credential))
+    }
+
+    /// Forget a paired device. `false` when no device had that id.
+    pub fn revoke_device(&self, id: &str) -> Result<bool, String> {
+        let mut removed = false;
+        self.write_paired_devices(|paired| {
+            let before = paired.devices.len();
+            paired.devices.retain(|d| d.id != id);
+            removed = paired.devices.len() != before;
+        })?;
+        if removed {
+            crate::log!("[Gateway] revoked a paired device");
+        }
+        Ok(removed)
+    }
+
+    /// Record that `id` reached us, if it is a day since the last time.
+    ///
+    /// `true` when it stamped, which is the caller's cue to refresh that
+    /// device's cookie on the same beat. `false` covers both "seen recently"
+    /// and "no such device", because neither is worth a write.
+    ///
+    /// # This runs on every authorized request
+    ///
+    /// So the check and the stamp share one lock acquisition. Reading first and
+    /// writing after would let two concurrent requests both decide a stamp is
+    /// due and save twice. The throttle is what keeps a whole-file save off the
+    /// hot path: the store is rewritten once a day per device, not per request.
+    ///
+    /// The stamp is in memory before this returns; the disk write is handed to
+    /// a blocking thread and not waited on. Losing one to a crash costs a
+    /// restamp tomorrow, which is not worth making a request wait for a write.
+    ///
+    /// It does not go through [`Self::write_paired_devices`], which always
+    /// saves. Skipping the save is the entire throttle.
+    pub fn touch_device(&self, id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let stamped = match self.inner.paired_devices.lock() {
+            Ok(mut paired) => match paired.devices.iter_mut().find(|d| d.id == id) {
+                Some(device) if auth::last_seen_is_due(device.last_seen_at.as_deref(), now) => {
+                    device.last_seen_at = Some(now.to_rfc3339());
+                    true
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        };
+        if stamped {
+            let state = self.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = state.persist_paired_devices() {
+                    crate::log!("[Gateway] could not record a device's last-seen time: {e}");
+                }
+            });
+        }
+        stamped
+    }
+
+    /// Write what the store says NOW, with the data lock released.
+    ///
+    /// Two properties, and the second is the subtle one. The data lock is held
+    /// only to clone: `authorize` takes it on every request, and a file write
+    /// is far longer than the digest compare it usually guards.
+    ///
+    /// And every writer publishes CURRENT memory, never a snapshot taken
+    /// earlier. A last-seen write holding a pre-revoke snapshot would otherwise
+    /// put the revoked device back in the file. The next boot would load it as
+    /// paired.
+    fn persist_paired_devices(&self) -> Result<(), String> {
+        let _writing = self
+            .inner
+            .paired_devices_writing
+            .lock()
+            .map_err(|_| "paired device store is unavailable".to_string())?;
+        let snapshot = self
+            .inner
+            .paired_devices
+            .lock()
+            .map_err(|_| "paired device store is unavailable".to_string())?
+            .clone();
+        snapshot
+            .save(&self.inner.paired_devices_path)
+            .map_err(|e| format!("could not save the paired device store: {e}"))
+    }
+
+    /// [`Self::write_paired_devices`], for a test that needs a seeded store.
+    #[cfg(test)]
+    pub fn write_paired_devices_for_test(
+        &self,
+        mutate: impl FnOnce(&mut auth::PairedDevices),
+    ) -> Result<(), String> {
+        self.write_paired_devices(mutate)
+    }
+
+    /// Mutate the paired-device store, then publish it.
+    ///
+    /// The mutation is atomic under the data lock, so a concurrent pair and
+    /// revoke cannot both read, both mutate, and have the loser's change lost.
+    /// The write is [`Self::persist_paired_devices`], which publishes whatever
+    /// memory holds once both mutations have landed.
+    fn write_paired_devices(
+        &self,
+        mutate: impl FnOnce(&mut auth::PairedDevices),
+    ) -> Result<(), String> {
+        {
+            let mut paired = self
+                .inner
+                .paired_devices
+                .lock()
+                .map_err(|_| "paired device store is unavailable".to_string())?;
+            mutate(&mut paired);
+        }
+        self.persist_paired_devices()
     }
 
     /// Loopback port for `id`, if registered. Hot path, so no async locks.
@@ -219,10 +529,26 @@ impl GatewayState {
         self.inner.routes.read().ok()?.get(id).copied()
     }
 
+    /// Loopback port serving workspace `slug`, if one is running. `None` covers
+    /// both an unregistered slug and a stopped workspace, which the hook socket
+    /// deliberately answers alike.
+    pub fn engine_port(&self, slug: &str) -> Option<u16> {
+        self.route(slug)
+    }
+
+    /// The pooled client for a hop to a workspace engine.
+    ///
+    /// Shared with the proxy on purpose: same destination, same TLS posture,
+    /// same connection pool. A second client would double the idle connections
+    /// for no difference in behaviour.
+    pub fn engine_client(&self) -> &reqwest::Client {
+        &self.inner.proxy_client
+    }
+
     /// The scheme the spawned engine serves on its port. The literals come from
     /// `net_config` rather than being spelled here, so this side of the hop
     /// cannot drift from the rule that decided `engine_tls`.
-    fn engine_scheme(&self) -> &'static str {
+    pub fn engine_scheme(&self) -> &'static str {
         if self.inner.engine_tls {
             net_config::SCHEME_HTTPS
         } else {
@@ -262,6 +588,44 @@ impl GatewayState {
         if let Ok(mut r) = self.inner.routes.write() {
             r.remove(id);
         }
+    }
+
+    /// Drop the route and the boot-window state for a workspace that no longer
+    /// has a running engine. What every teardown owes, whether a person asked
+    /// for it ([`Self::stop_workspace`]) or an external engine simply exited
+    /// ([`SuperviseAction::Release`]).
+    fn clear_runtime_state(&self, id: &str) {
+        self.clear_route(id);
+        // No live route means the next open lazy-starts fresh. Drop any stale
+        // boot phase, so that open begins from the default splash label. Drop
+        // any terminal failure too, so the retry is judged on its own merits.
+        self.clear_boot_phase(id);
+        self.clear_boot_failure(id);
+    }
+
+    /// Remember that the gateway has just stopped `id`'s engine.
+    ///
+    /// Only the paths that actually SIGNAL an engine record one. A stop of a
+    /// workspace the gateway holds no stack for signals nothing, so there is no
+    /// draining engine for [`adoptable_after_stop`] to guard against.
+    fn record_stop(&self, id: &str) {
+        if let Ok(mut stops) = self.inner.stopped_at.write() {
+            stops.insert(id.to_string(), chrono::Utc::now());
+        }
+    }
+
+    /// Forget `id`'s stop: it has a stack again, or it is gone from the
+    /// registry. Either way the record no longer describes anything.
+    fn clear_stop(&self, id: &str) {
+        if let Ok(mut stops) = self.inner.stopped_at.write() {
+            stops.remove(id);
+        }
+    }
+
+    /// When the gateway last stopped `id`'s engine, if it has not started one
+    /// since.
+    fn stop_record(&self, id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.inner.stopped_at.read().ok()?.get(id).copied()
     }
 
     /// Record the current cold-boot phase for `id`. Hot path, so no async locks.
@@ -355,6 +719,11 @@ impl GatewayState {
     // ── Status ───────────────────────────────────────────────────────────────
 
     /// Per-workspace status in registry order (stable for the picker).
+    ///
+    /// An entry with no stack reports as stopped, and that is a real answer
+    /// rather than a default: an engine answering on the registered port is
+    /// adopted within one supervise tick, so it HAS a stack by the time anyone
+    /// reads this. See [`Self::adopt_running_engines`].
     pub async fn list_status(&self) -> Vec<WorkspaceStatus> {
         let order: Vec<Workspace> = {
             let reg = self.inner.registry.lock().unwrap();
@@ -447,7 +816,7 @@ impl GatewayState {
         let mtime = std::fs::metadata(&exe).and_then(|m| m.modified()).ok();
         // Fast path: mtime unchanged since the last check → reuse the verdict.
         {
-            let cache = self.inner.update_check.lock().unwrap();
+            let cache = self.inner.binary_check.lock().unwrap();
             if cache.last_mtime == mtime {
                 return cache.update_available;
             }
@@ -467,10 +836,16 @@ impl GatewayState {
         };
         let update_available =
             crate::build_id::disk_id_is_upgrade(&exe, &disk_id, GATEWAY_BUILD_ID).await;
-        let mut cache = self.inner.update_check.lock().unwrap();
+        let mut cache = self.inner.binary_check.lock().unwrap();
         cache.last_mtime = mtime;
         cache.update_available = update_available;
         update_available
+    }
+
+    /// The machine's release check (ADR 0108), for the control plane and the
+    /// backstop timer.
+    pub fn release_check(&self) -> &release_check::ReleaseCheck {
+        &self.inner.release_check
     }
 
     /// Re-exec this process onto the on-disk binary, keeping the PID so the
@@ -552,10 +927,12 @@ impl GatewayState {
                 let running =
                     stack::probe_health(&me.inner.health_client, me.engine_scheme(), ws.port).await
                         == ProbeOutcome::Healthy;
-                if should_bring_up(&ws, running, &restore) {
-                    // bring_up itself re-adopts a healthy engine and only spawns
-                    // when none is running, so this is correct for both cases.
-                    me.bring_up(ws).await;
+                match boot_action(&ws, running, &restore) {
+                    // `bring_up` re-adopts a healthy engine and only spawns when
+                    // none is running, so it is right for both cases.
+                    BootAction::Start => me.bring_up(ws).await,
+                    BootAction::Adopt => me.adopt_running_engine(ws).await,
+                    BootAction::Leave => {}
                 }
             }
         });
@@ -595,6 +972,124 @@ impl GatewayState {
         self.inner.starting.lock().await.remove(id);
     }
 
+    /// Adopt every registered workspace that has no runtime stack and whose
+    /// engine is already answering. Run on each supervise tick.
+    ///
+    /// This is what makes an ADOPTED workspace a real one
+    /// ([`Self::adopt_workspace`]). Its caller boots an engine on the port the
+    /// registry handed back, and this pass picks that engine up on the next
+    /// tick. Without it the entry reports [`Self::list_status`]'s "not started"
+    /// for as long as the gateway lives, has no route to proxy over, and cannot
+    /// be stopped: every one of those reads the stack map.
+    ///
+    /// It STARTS nothing. [`Self::bring_up`] is the path that provisions a
+    /// database and spawns an engine, and it runs only when somebody asked for
+    /// this workspace to be running. Nobody asked here, so what it finds is an
+    /// [`EngineKeeper::External`] engine.
+    async fn adopt_running_engines(&self) {
+        let registered: Vec<Workspace> = {
+            let reg = self.inner.registry.lock().unwrap();
+            reg.workspaces.clone()
+        };
+        // A workspace being brought up is not stackless for long, and adopting
+        // it from under `bring_up` would displace the engine it just spawned.
+        let candidates: Vec<Workspace> = {
+            let stacks = self.inner.stacks.lock().await;
+            let starting = self.inner.starting.lock().await;
+            registered
+                .into_iter()
+                .filter(|ws| !stacks.contains_key(&ws.id) && !starting.contains(&ws.id))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        // Concurrently, and with no lock held, for the reason the supervisor's
+        // own probe phase spells out: one slow engine must not serialize a pass.
+        let scheme = self.engine_scheme();
+        let client = &self.inner.health_client;
+        let found = futures::future::join_all(
+            candidates
+                .iter()
+                .map(|ws| stack::probe_live_engine(client, scheme, ws.port)),
+        )
+        .await;
+
+        for (ws, live) in candidates.into_iter().zip(found) {
+            let Some(live) = live else { continue };
+            if !adoptable_after_stop(self.stop_record(&ws.id), live.started_at) {
+                continue;
+            }
+            self.adopt_running_engine(ws).await;
+        }
+    }
+
+    /// Install a stack for a workspace whose engine is ALREADY running.
+    ///
+    /// The shape a gateway restart leaves behind for an engine it reclaims: no
+    /// `Child` to wait on, no database provisioned by us, and healthy because it
+    /// just answered.
+    ///
+    /// Guarded by [`GatewayInner::starting`], the guard [`Self::lazy_start`]
+    /// takes, so the two can never both install a stack for one id. That matters
+    /// more here than there: [`Self::install_stack`] STOPS a displaced engine,
+    /// and the engine it would displace is the one just adopted.
+    ///
+    /// The registry is re-read here, because the caller's probe ran with no lock
+    /// held. A delete landing during that probe has already trashed the
+    /// directory. A stack and a route for a workspace that no longer exists
+    /// would point traffic at whatever is still on the port.
+    async fn adopt_running_engine(&self, ws: Workspace) {
+        if self.inner.stacks.lock().await.contains_key(&ws.id) {
+            return;
+        }
+        {
+            let mut starting = self.inner.starting.lock().await;
+            if !starting.insert(ws.id.clone()) {
+                return; // a lazy-start is already bringing this one up
+            }
+        }
+        let still_registered = self
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .get(&ws.id)
+            .is_some_and(|current| current.port == ws.port);
+        if !still_registered {
+            self.inner.starting.lock().await.remove(&ws.id);
+            return;
+        }
+        let stack = StackRuntime {
+            resolved_dir: ws.resolve_dir(self.app_data()),
+            ws: ws.clone(),
+            // Not ours: whoever started this engine gave it its database.
+            pg: PgHandle::External,
+            engine: None,
+            keeper: EngineKeeper::External,
+            health: Health::Healthy,
+            restart_attempts: 0,
+            health_misses: 0,
+            // Nothing was spawned, so there is no attempt to date. The
+            // supervisor reads this only to pace a respawn, which an external
+            // engine never gets.
+            last_spawn: None,
+            last_error: None,
+            last_unread: None,
+        };
+        self.set_route(&ws.id, ws.port);
+        self.install_stack(&ws.id, stack).await;
+        // Already up, so there is no boot window to narrate and nothing failed.
+        self.clear_boot_phase(&ws.id);
+        self.clear_boot_failure(&ws.id);
+        crate::log!(
+            "[Gateway] adopted the engine already running for '{}' on :{}",
+            ws.id,
+            ws.port
+        );
+        self.inner.starting.lock().await.remove(&ws.id);
+    }
+
     /// Provision Postgres + adopt-or-spawn the engine for one workspace, then
     /// register its runtime stack + route. Never panics.
     ///
@@ -616,6 +1111,10 @@ impl GatewayState {
                 resolved_dir,
                 pg,
                 engine,
+                // Somebody asked for this workspace to be running, so the
+                // gateway owns keeping it that way. That holds for an engine it
+                // re-adopted here too: those are its own children.
+                keeper: EngineKeeper::Gateway,
                 health,
                 restart_attempts: 0,
                 health_misses: 0,
@@ -634,6 +1133,7 @@ impl GatewayState {
                     resolved_dir,
                     pg: PgHandle::External,
                     engine: None,
+                    keeper: EngineKeeper::Gateway,
                     // A retryable failure must stay OUT of `Unhealthy`: the
                     // supervisor skips an unhealthy stack entirely, so that state
                     // is the latch, not merely a label.
@@ -670,6 +1170,8 @@ impl GatewayState {
     /// The map lock is released before the stack lock, the ordering every other
     /// map-then-stack site uses (the supervisor holds stack then map).
     async fn install_stack(&self, id: &str, stack: StackRuntime) {
+        // An engine is running here again, so any stop on record is spent.
+        self.clear_stop(id);
         let displaced = self
             .inner
             .stacks
@@ -820,6 +1322,148 @@ impl GatewayState {
             },
         };
         Ok(status)
+    }
+
+    /// Register a workspace directory that ALREADY EXISTS, without provisioning
+    /// anything and without starting an engine.
+    ///
+    /// The sibling of [`Self::create_workspace`], for a directory somebody else
+    /// owns: the context-mode eval's arms, or a tree copied off another machine.
+    /// `create` provisions a NEW directory under app-data and slugs a display
+    /// name. This one takes the directory as given and slugs its basename, the
+    /// name a caller already addresses it by.
+    ///
+    /// **Registration only.** No engine spawned, no Postgres provisioned, no
+    /// byte written inside `dir`. The caller boots on the returned port, and
+    /// [`Self::adopt_running_engines`] picks that engine up on the next
+    /// supervise tick: from then on the workspace is healthy in the picker,
+    /// proxied, stoppable and restartable like any other. A caller that boots
+    /// nothing leaves a listed, stopped workspace that lazy-starts on open.
+    ///
+    /// Idempotent for the same path, and never a silent repoint. See
+    /// [`address_points_elsewhere_message`] for what a mismatch means.
+    pub async fn adopt_workspace(
+        &self,
+        dir: &Path,
+        name: Option<&str>,
+        autostart: Option<bool>,
+    ) -> Result<Workspace, ApiError> {
+        if !dir.is_absolute() {
+            return Err(ApiError::bad_request(format!(
+                "'{}' is not an absolute path. Adoption registers a directory as it is, so \
+                 there is no base to resolve a relative one against.",
+                dir.display()
+            )));
+        }
+        let meta = std::fs::metadata(dir)
+            .map_err(|e| ApiError::bad_request(format!("cannot read '{}': {e}", dir.display())))?;
+        if !meta.is_dir() {
+            return Err(ApiError::bad_request(format!(
+                "'{}' is not a directory",
+                dir.display()
+            )));
+        }
+        // The registry stores `dir` as a `String`, so a path that is not UTF-8
+        // has no faithful representation. Refuse rather than store the lossy
+        // form, which resolves somewhere else and has `bring_up` create that
+        // somewhere else. Today's only caller hands over a path parsed from a
+        // JSON string, so this cannot fire through the endpoint. It is here
+        // because the signature takes a `&Path` and a later caller may not.
+        let dir_text = dir.to_str().ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "'{}' is not valid UTF-8, and the registry can only store a path it can \
+                 write as text",
+                dir.display()
+            ))
+        })?;
+        let basename = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| ApiError::bad_request("the path has no final component to name it"))?;
+        let id = registry::slugify(basename);
+        if !registry::is_valid_id(&id) {
+            return Err(ApiError::bad_request(format!(
+                "'{basename}' does not name a workspace address: it slugifies to '{id}', which \
+                 is not a valid one"
+            )));
+        }
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+
+        let ws = {
+            let mut reg = self.inner.registry.lock().unwrap();
+            // The name first, new entry or not, so the refusal is the sentence
+            // create gives. `except_id` lets a re-adopt pass its own name back.
+            if let Some(name) = name {
+                if let Some(existing) = reg.find_by_display_name(name, Some(&id)) {
+                    return Err(ApiError::conflict(name_taken_message(&existing.name)));
+                }
+                if names_match(&self.restore_reserved_name(), name) {
+                    return Err(ApiError::conflict(name_being_restored_message(name)));
+                }
+            }
+            let entry = match reg.get(&id) {
+                Some(existing) => {
+                    let registered = existing.resolve_dir(self.app_data());
+                    if !same_path(&registered, dir) {
+                        return Err(ApiError::conflict(address_points_elsewhere_message(
+                            &id,
+                            &registered,
+                            dir,
+                        )));
+                    }
+                    // Same place, so update in place. The port stays: moving it
+                    // would strand an engine already running on it. `dir` stays
+                    // too, since what is stored already resolves here.
+                    let entry = reg.get_mut(&id).expect("just found");
+                    if let Some(name) = name {
+                        entry.name = name.to_string();
+                    }
+                    if let Some(autostart) = autostart {
+                        entry.autostart = autostart;
+                    }
+                    entry.clone()
+                }
+                None => {
+                    let port = reg
+                        .allocate_port()
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                    let entry = Workspace {
+                        id: id.clone(),
+                        name: name.unwrap_or(basename).to_string(),
+                        dir: dir_text.to_string(),
+                        port,
+                        database_url: None,
+                        autostart: autostart.unwrap_or(false),
+                    };
+                    reg.add(entry.clone())
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                    entry
+                }
+            };
+            // Saved while the lock is still held, as create, rename and
+            // autostart all do. Release it first and a concurrent delete lands
+            // between the two. This call would then persist a registry without
+            // the entry it is about to report as adopted.
+            reg.save(&self.inner.registry_path)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            entry
+        };
+        // Keep a running stack's copy in sync, the way rename and autostart do.
+        // A no-op unless the caller adopted a workspace already running here.
+        let stack = self.inner.stacks.lock().await.get(&ws.id).cloned();
+        if let Some(stack) = stack {
+            let mut s = stack.lock().await;
+            s.ws.name = ws.name.clone();
+            s.ws.autostart = ws.autostart;
+        }
+        crate::log!(
+            "[Gateway] adopted '{}' at {} on port {} (autostart {}, no engine started)",
+            ws.id,
+            dir.display(),
+            ws.port,
+            ws.autostart
+        );
+        Ok(ws)
     }
 
     /// Current restore-flow state, for the picker's poll.
@@ -1051,6 +1695,7 @@ impl GatewayState {
                     resolved_dir,
                     pg: prov.handle,
                     engine: Some(child),
+                    keeper: EngineKeeper::Gateway,
                     health: Health::Booting,
                     restart_attempts: 0,
                     health_misses: 0,
@@ -1267,13 +1912,12 @@ impl GatewayState {
             let mut s = stack.lock().await;
             self.notify_restart_intent(&s, requested_by).await;
             stop_engine_process(&mut s);
+            // A signalled engine keeps answering for its whole graceful drain,
+            // so record the stop: without it the next discovery pass re-adopts
+            // the engine this call is tearing down.
+            self.record_stop(id);
         }
-        self.clear_route(id);
-        // No live route means the next open lazy-starts fresh. Drop any stale
-        // boot phase so that open begins from the default splash label, and any
-        // terminal failure so the retry is judged on its own merits.
-        self.clear_boot_phase(id);
-        self.clear_boot_failure(id);
+        self.clear_runtime_state(id);
         crate::log!("[Gateway] stopped '{}' (kept in registry)", id);
         Ok(())
     }
@@ -1331,6 +1975,8 @@ impl GatewayState {
             crate::log!("[Gateway] '{}' database teardown failed: {}", id, e);
         }
         self.clear_route(id);
+        // Nothing left to guard: the entry is about to leave the registry.
+        self.clear_stop(id);
 
         // Unregister, then move the dir to trash.
         {
@@ -1404,6 +2050,10 @@ impl GatewayState {
         ) {
             Ok(child) => {
                 s.engine = Some(child);
+                // This engine is the gateway's, whoever started the one it
+                // replaced. A Restart or a Retry on an external engine is a
+                // person asking the gateway to take the workspace over.
+                s.keeper = EngineKeeper::Gateway;
                 s.health = Health::Booting;
                 s.last_error = None;
                 self.set_boot_phase(&s.ws.id, BootPhase::StartingEngine);
@@ -1525,6 +2175,7 @@ impl GatewayState {
                 // gateway narrating its own backoff; treating it as terminal
                 // would latch exactly the workspace it exists to keep alive.
                 boot_failure.as_ref().is_some_and(BootFailure::is_terminal),
+                s.keeper,
             ) {
                 // Healthy is handled above; treat defensively as a no-op.
                 SuperviseAction::Healthy => {}
@@ -1584,6 +2235,20 @@ impl GatewayState {
                     );
                     self.respawn_stack(&mut s).await;
                 }
+                SuperviseAction::Release => {
+                    // Somebody else's engine has exited, and replacing it is not
+                    // the gateway's call. Drop the stack exactly as a Stop does,
+                    // so the workspace reads as stopped and the next open starts
+                    // an engine the gateway owns. Stack lock then map lock, the
+                    // order this loop already uses above.
+                    self.inner.stacks.lock().await.remove(&t.id);
+                    self.clear_runtime_state(&t.id);
+                    crate::log!(
+                        "[Gateway] released '{}': the engine it was adopted with is gone, \
+                         and the gateway does not replace one it did not start",
+                        t.id
+                    );
+                }
             }
         }
     }
@@ -1634,6 +2299,27 @@ enum SuperviseAction {
     Respawn,
     /// Hit the restart cap: mark Unhealthy and stop auto-respawning.
     MarkUnhealthy,
+    /// An [`EngineKeeper::External`] engine has exited. Drop the stack rather
+    /// than spawn a replacement the gateway was never asked for.
+    Release,
+}
+
+/// Whether an engine answering on a registered port may be adopted, given when
+/// the gateway last stopped that workspace (`None` for never).
+///
+/// A stop must stick. The engine answers `/api/v1/health` for the whole of its
+/// graceful drain, so an unguarded discovery pass would re-adopt the very engine
+/// a person just stopped. Only an engine that STARTED after the stop is a
+/// different engine. One that reports no start time cannot prove it is, so the
+/// stop stands.
+fn adoptable_after_stop(
+    stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match stopped_at {
+        None => true,
+        Some(stopped) => started_at.is_some_and(|started| started > stopped),
+    }
 }
 
 /// Pure cull-or-keep decision for one stack. `misses` is the consecutive-miss
@@ -1646,6 +2332,11 @@ enum SuperviseAction {
 /// the supervisor respawns ONLY a process that has actually exited, which still
 /// preserves crash recovery and lazy-start. A deadlocked-but-alive engine is
 /// the rare accepted cost, and waits for a manual restart. See ADR 0014.
+///
+/// **And it respawns only its OWN.** An [`EngineKeeper::External`] engine that
+/// exits is released rather than replaced (ADR 0101). The never-cull rule above
+/// covers both kinds alike, so being external never costs a live engine
+/// anything.
 fn respawn_decision(
     outcome: ProbeOutcome,
     alive: bool,
@@ -1653,6 +2344,7 @@ fn respawn_decision(
     misses: u32,
     restart_attempts: u32,
     terminal_boot_failure: bool,
+    keeper: EngineKeeper,
 ) -> SuperviseAction {
     if outcome == ProbeOutcome::Healthy {
         return SuperviseAction::Healthy;
@@ -1671,6 +2363,17 @@ fn respawn_decision(
     if alive {
         return if since_spawn < BOOT_GRACE {
             SuperviseAction::Booting
+        } else {
+            SuperviseAction::Wait
+        };
+    }
+    // The process is not visibly alive, and this engine is not the gateway's to
+    // start again: it holds none of the environment, database or model
+    // configuration that one ran with. Let the stack go instead, once the
+    // silence has run long enough to mean more than a busy engine.
+    if keeper == EngineKeeper::External {
+        return if misses >= EXTERNAL_RELEASE_MISSES {
+            SuperviseAction::Release
         } else {
             SuperviseAction::Wait
         };
@@ -1919,14 +2622,10 @@ pub async fn run() -> Result<(), BoxError> {
         std::env::var_os("LUCIDOS_STATIC_DIR").map(PathBuf::from),
         packaged,
     )?;
-    // Engines bind loopback-only by default (packaged security posture); dev sets
-    // `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` so the engine is reachable directly on
-    // its user-facing port too (ADR 0014 "Dev runtime topology").
-    let engine_loopback = !matches!(
+    let engine_loopback = engine_loopback_from_env(
         std::env::var("LUCIDOS_GATEWAY_ENGINE_LOOPBACK")
-            .unwrap_or_default()
-            .trim(),
-        "0" | "false" | "no" | "off"
+            .ok()
+            .as_deref(),
     );
     // A dev engine keeps the inherited TLS cert and serves https on its own
     // port (ADR 0014 §4). The gateway must proxy and probe it over https. A
@@ -1995,32 +2694,68 @@ pub async fn run() -> Result<(), BoxError> {
             }
         }
     }
-    let state = GatewayState {
-        inner: Arc::new(GatewayInner {
-            app_data,
-            registry_path,
-            gateway_port,
-            engine_bin,
-            static_dir,
-            engine_loopback,
-            engine_tls,
-            pg_backend,
-            packaged,
-            pg_lock: AsyncMutex::new(()),
-            proxy_client: proxy::build_client(),
-            health_client: stack::build_health_client(),
-            registry: Mutex::new(registry),
-            stacks: AsyncMutex::new(HashMap::new()),
-            starting: AsyncMutex::new(HashSet::new()),
-            routes: RwLock::new(HashMap::new()),
-            boot_phases: RwLock::new(HashMap::new()),
-            boot_failures: RwLock::new(HashMap::new()),
-            restore: RwLock::new(RestoreStatus::default()),
-            pending_binds: RwLock::new(BTreeSet::new()),
-            exe_path: std::env::current_exe().ok(),
-            update_check: Mutex::new(UpdateCheck::default()),
-        }),
-    };
+    // Mint before serving, and treat a failure as fatal. A gateway with no
+    // local token can authenticate no local caller once enforcement lands. The
+    // CLI, the dev scripts and both e2e suites would then fail one request at a
+    // time. Failing here says why, once.
+    let local_token = auth::ensure_local_token()?;
+    let paired_devices_path = auth::paired_devices_path()
+        .ok_or_else(|| -> BoxError { "HOME is not set, so there is nowhere to pair to".into() })?;
+    let paired_devices = auth::PairedDevices::load(&paired_devices_path)?;
+    crate::log!(
+        "[Gateway] inbound auth ready: {} paired device(s), local token at {}",
+        paired_devices.devices.len(),
+        auth::local_token_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unknown>".into())
+    );
+    // Whether this gateway's OWN port is https, which decides whether a session
+    // cookie carries `Secure`. Resolved through the one rule: bare presence
+    // called a set-but-empty value TLS. A `Secure` cookie on a plain-http
+    // origin is dropped by the browser, so inbound auth failed with nothing to
+    // see. The listener in `serve` reads the same call.
+    let serves_tls = net_config::serves_tls_from_env();
+    // The release check needs both, and `app_data` moves into the struct below.
+    let exe_path = std::env::current_exe().ok();
+    let release_app_data = app_data.clone();
+
+    let state =
+        GatewayState {
+            inner: Arc::new(GatewayInner {
+                app_data,
+                registry_path,
+                gateway_port,
+                local_token,
+                paired_devices_path,
+                paired_devices: Mutex::new(paired_devices),
+                paired_devices_writing: Mutex::new(()),
+                pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                serves_tls,
+                engine_bin,
+                static_dir,
+                engine_loopback,
+                engine_tls,
+                pg_backend,
+                packaged,
+                pg_lock: AsyncMutex::new(()),
+                proxy_client: proxy::build_client(),
+                health_client: stack::build_health_client(),
+                registry: Mutex::new(registry),
+                stacks: AsyncMutex::new(HashMap::new()),
+                starting: AsyncMutex::new(HashSet::new()),
+                stopped_at: RwLock::new(HashMap::new()),
+                routes: RwLock::new(HashMap::new()),
+                boot_phases: RwLock::new(HashMap::new()),
+                boot_failures: RwLock::new(HashMap::new()),
+                restore: RwLock::new(RestoreStatus::default()),
+                pending_binds: RwLock::new(BTreeSet::new()),
+                exe_path: exe_path.clone(),
+                binary_check: Mutex::new(GatewayBinaryCheck::default()),
+                release_check: release_check::ReleaseCheck::new(
+                    &release_check::Deployment::from_env(packaged, exe_path, release_app_data),
+                ),
+            }),
+        };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
 
     // Re-adopt running engines and spawn the auto-start workspaces (ADR 0014).
@@ -2034,7 +2769,27 @@ pub async fn run() -> Result<(), BoxError> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(SUPERVISE_INTERVAL).await;
+                // Adopt before supervising. A workspace picked up on this tick
+                // then gets its first health read and unread count in the same
+                // pass.
+                sup.adopt_running_engines().await;
                 sup.supervise_once().await;
+            }
+        });
+    }
+
+    // Release-check backstop (ADR 0108). A window asking for a refresh is the
+    // usual trigger. Both paths share one staleness gate, so this fires only
+    // for a gateway nobody is looking at. The first tick waits out a
+    // pid-derived offset, which spreads the fleet without a randomness source.
+    {
+        let checker = state.clone();
+        let offset = Duration::from_secs(u64::from(std::process::id() % 300));
+        tokio::spawn(async move {
+            tokio::time::sleep(offset).await;
+            loop {
+                checker.release_check().refresh(false).await;
+                tokio::time::sleep(release_check::POLL_INTERVAL).await;
             }
         });
     }
@@ -2053,7 +2808,17 @@ async fn serve(
     let router = Router::new()
         .route("/~/api/v1/health", get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
+        .nest("/~/api/v1/auth", crate::auth_api::router())
         .fallback(fallback)
+        // Authorization sits in front of EVERYTHING: the proxy into each
+        // workspace, the control plane and the picker's own API. Layered after
+        // every route is registered, because `Router::layer` covers only what
+        // came before it, and a route this misses is a route with no auth.
+        // `auth_api::is_public_path` is the entire exemption list.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth_api::enforce,
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
@@ -2075,18 +2840,23 @@ async fn serve(
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
-    let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
-    let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
-    let tls = match (tls_cert, tls_key) {
-        (Some(cert), Some(key)) => {
-            Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?)
-        }
-        _ => None,
+    // Whether to serve TLS was decided ONCE, in `run`, and carried here on the
+    // state. This branch only loads the paths that decision implies, so the
+    // listener and the cookie's `Secure` flag cannot disagree. Matching on bare
+    // `Some` took the TLS arm for a set-but-empty value, which is how a launch
+    // script spells "unset". `from_pem_file("", "")` then errored and the
+    // gateway never served, leaving the picker on its boot splash.
+    let tls = if state.serves_tls() {
+        let cert = std::env::var("LUCIDOS_TLS_CERT").unwrap_or_default();
+        let key = std::env::var("LUCIDOS_TLS_KEY").unwrap_or_default();
+        Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?)
+    } else {
+        None
     };
 
     // The required addresses, bound BEFORE anything is served so a failure is
     // fatal and reported as one.
-    let mut serving = Vec::with_capacity(plan.required.len());
+    let mut serving = Vec::with_capacity(plan.required.len() + 1);
     for addr in plan.required {
         let listener = bind_and_log(addr, tls.is_some())?;
         serving.push(serve_listener(
@@ -2095,6 +2865,45 @@ async fn serve(
             handle.clone(),
             tls.clone(),
         ));
+    }
+
+    // The hook socket, on its own port and its own router (`crate::hook_socket`).
+    // Plain http and loopback: this is what `tailscale funnel` maps, and funnel
+    // proxies from this machine. It shares the shutdown handle, so SIGUSR1
+    // stops both listeners together.
+    //
+    // Nothing about it is fatal, at bind time or later. The gateway's job is
+    // serving workspaces, so refusing to start (or dying mid-flight) over a
+    // webhook surface nobody may be using is the wrong trade. Its failures are
+    // logged and it stops answering, while every workspace keeps serving.
+    if let Some(hook) =
+        hook_socket::hook_port(std::env::var("LUCIDOS_HOOK_PORT").ok().as_deref(), port)
+    {
+        let addr = hook_socket::bind_addr(hook);
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                crate::log!("[Gateway] hook socket listening on http://{addr}");
+                let hook_serving = serve_listener(
+                    listener,
+                    hook_socket::router(state.clone()),
+                    handle.clone(),
+                    None,
+                );
+                serving.push(Box::pin(async move {
+                    if let Err(e) = hook_serving.await {
+                        crate::log!(
+                            "[Gateway] the hook socket stopped serving ({e}); \
+                             workspaces are unaffected"
+                        );
+                    }
+                    Ok(())
+                }));
+            }
+            Err(e) => crate::log!(
+                "[Gateway] could not bind the hook socket on {addr} ({e}); \
+                 webhook deliveries will not be accepted"
+            ),
+        }
     }
 
     // The optional ones, each retried in its own task until the address exists.
@@ -2243,6 +3052,19 @@ fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("1" | "true" | "yes" | "on"))
 }
 
+/// Do the engines this gateway spawns bind loopback only?
+///
+/// Yes unless something explicitly says otherwise, in dev as well as packaged.
+/// The gateway authenticates every network caller (ADR 0094), so an engine port
+/// facing the network is a way straight past pairing. Dev used to set this to
+/// `0` and no longer does.
+fn engine_loopback_from_env(value: Option<&str>) -> bool {
+    !matches!(
+        value.unwrap_or_default().trim(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 /// Gateway-own health (`/~/api/v1/health`). The launcher polls this.
 ///
 /// `status` stays `ok` while an address is pending: the gateway IS serving, and
@@ -2278,7 +3100,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
         if let Some(slug) = state.sole_workspace() {
             return redirect(&format!("/{slug}/"));
         }
-        return serve_picker_shell(&state);
+        return serve_picker_shell(&state, None);
     }
 
     if path == format!("/{SIGIL}") {
@@ -2425,15 +3247,66 @@ fn address_taken_message(slug: &str, existing_name: &str) -> String {
     )
 }
 
-/// Should [`GatewayState::boot_all`] bring this workspace up?
+/// The refusal when an adopt's slug is already registered against a DIFFERENT
+/// directory.
 ///
-/// The three yeses are different questions. `healthy` is an engine that
-/// outlived the gateway and needs re-adopting. `restore` is one the last
+/// Adoption derives the slug from the directory basename, so two trees of the
+/// same name in different parents collide here. Repointing would silently
+/// orphan whichever workspace was registered first, and its data with it. So
+/// the answer names both paths and leaves the choice with the caller: rename a
+/// directory, or delete the entry that is wrong.
+fn address_points_elsewhere_message(slug: &str, registered: &Path, requested: &Path) -> String {
+    format!(
+        "The address /{slug}/ is already registered at {}, not {}. \
+         Rename one of the directories, or delete that workspace first.",
+        registered.display(),
+        requested.display()
+    )
+}
+
+/// Do these two paths name the same place on disk?
+///
+/// Canonicalized where possible, because macOS resolves `/tmp` to `/private/tmp`
+/// and a plain comparison would read a correct re-adopt as a repoint. The
+/// registered dir may not exist, and a path that cannot be canonicalized falls
+/// back to itself. The comparison then degrades to a literal one, rather than
+/// answering yes.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let resolve = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    resolve(a) == resolve(b)
+}
+
+/// What [`GatewayState::boot_all`] does with one registered workspace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BootAction {
+    /// Somebody asked for this workspace to be running, so provision it, start
+    /// it, and keep it running.
+    Start,
+    /// Nobody asked, and an engine is answering anyway. Adopt it.
+    Adopt,
+    /// Leave it stopped. It stays listed, and lazy-starts on an open.
+    Leave,
+}
+
+/// Which of the three [`GatewayState::boot_all`] owes this workspace.
+///
+/// The two asks are different questions. `restore` is a workspace the last
 /// teardown stopped (see [`crate::next_boot`]), and `autostart` is the user's
 /// boot posture. A restore does NOT consult `autostart`: a restart must return
 /// what it took, whatever the flag says.
-fn should_bring_up(ws: &Workspace, healthy: bool, restore: &HashSet<String>) -> bool {
-    healthy || restore.contains(&ws.id) || ws.autostart
+///
+/// `healthy` is neither. It is an engine that outlived the gateway, and nobody
+/// asked for it, so it is adopted rather than taken over. Marking one as ours
+/// would hand every eval arm and every e2e engine a gateway-spawned replacement
+/// on the next gateway restart (ADR 0101).
+fn boot_action(ws: &Workspace, healthy: bool, restore: &HashSet<String>) -> BootAction {
+    if restore.contains(&ws.id) || ws.autostart {
+        BootAction::Start
+    } else if healthy {
+        BootAction::Adopt
+    } else {
+        BootAction::Leave
+    }
 }
 
 /// True for a browser document navigation that should wake a stopped workspace.
@@ -2477,16 +3350,22 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     let Some(dir) = state.inner.static_dir.clone() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
+    // A scanned QR lands here as `/~/?pair=<code>`. The code rides into the
+    // shell's manifest link and out again in `start_url`, so an iOS home-screen
+    // install pairs itself on first launch. Owned rather than borrowed, because
+    // the asset branch below consumes `req`.
+    let pair_code = pairing_qr::pairing_code_in_query(req.uri().query()).map(str::to_string);
+
     // Serving the raw `dist/index.html` here would carry no base tag, so the
     // bundle would render the app rather than the picker. Mirrors the engine's
     // own `serve_frontend` index special-case.
     if rest.is_empty() || rest == "index.html" {
-        return serve_picker_shell(state);
+        return serve_picker_shell(state, pair_code.as_deref());
     }
     // The PWA manifest needs a picker-specific re-stamp (see
     // `serve_picker_manifest`), so it must NOT be served verbatim.
     if rest == "manifest.json" {
-        return serve_picker_manifest(state);
+        return serve_picker_manifest(state, pair_code.as_deref());
     }
     // Reconstruct the request with the sigil stripped so `ServeDir` resolves
     // the asset against `static_dir`.
@@ -2506,14 +3385,27 @@ async fn serve_sigil(state: &GatewayState, rest: &str, req: axum::extract::Reque
     match service.oneshot(asset_req).await {
         Ok(resp) if resp.status() != StatusCode::NOT_FOUND => resp.map(Body::new),
         // No such asset. The picker is a SPA, so serve its shell.
-        _ => serve_picker_shell(state),
+        _ => serve_picker_shell(state, pair_code.as_deref()),
     }
 }
 
 /// Serve the picker shell: `index.html` from `static_dir` with `<base
 /// href="/~/">` stamped in, so the bundle's relative asset refs resolve under
 /// the sigil namespace (and `main.tsx` recognises the picker context).
-fn serve_picker_shell(state: &GatewayState) -> Response {
+fn serve_picker_shell(state: &GatewayState, pair_code: Option<&str>) -> Response {
+    serve_stamped_picker_shell(state, false, pair_code)
+}
+
+/// The picker shell, optionally stamped as the pairing screen.
+///
+/// One reader for one file, because the pairing screen IS the picker document
+/// plus a marker. Splitting them would leave two places to keep the base href
+/// and the error handling in step.
+fn serve_stamped_picker_shell(
+    state: &GatewayState,
+    pairing: bool,
+    pair_code: Option<&str>,
+) -> Response {
     let Some(dir) = state.inner.static_dir.as_ref() else {
         return (StatusCode::NOT_FOUND, "no frontend configured").into_response();
     };
@@ -2529,12 +3421,195 @@ fn serve_picker_shell(state: &GatewayState) -> Response {
             return (StatusCode::INTERNAL_SERVER_ERROR, "picker unavailable").into_response();
         }
     };
-    let stamped = inject_base_href(&html, &format!("/{SIGIL}/"));
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        stamped,
+        stamp_picker_shell(&html, pairing, pair_code),
     )
         .into_response()
+}
+
+/// Stamp the head tags the picker context needs. Pure, so the rules below are
+/// unit-tested against the real `index.html`.
+///
+/// # A stamped code leaves exactly one manifest link
+///
+/// A manifest is "the first link element in tree order whose rel contains
+/// manifest", and `inject_head_tags` puts ours at the top of `<head>`. Winning
+/// on the letter of that would still stake the auto-pair on the reader
+/// agreeing, on the one platform the feature exists for. So the bundle's link
+/// goes when a code is stamped, and the document has one manifest rather than a
+/// favourite.
+///
+/// The ordinary no-code load, which is every other request, removes nothing.
+/// That document is byte-identical to the bundle's.
+///
+/// Our href is absolute rather than relative to the stamped base. The base
+/// resolves it either way, and an absolute one owes nothing to tag ordering.
+fn stamp_picker_shell(html: &str, pairing: bool, pair_code: Option<&str>) -> String {
+    let mut tags = format!("<base href=\"/{SIGIL}/\">");
+    if pairing {
+        tags.push_str(&format!(
+            "<meta name=\"{PAIRING_SHELL_META_NAME}\" content=\"1\">"
+        ));
+    }
+    let Some(code) = pair_code else {
+        return inject_head_tags(html, &tags);
+    };
+    let param = pairing_qr::PAIR_PARAM;
+    tags.push_str(&format!(
+        "<link rel=\"manifest\" href=\"/{SIGIL}/manifest.json?{param}={code}\">"
+    ));
+    inject_head_tags(&strip_manifest_links(html), &tags)
+}
+
+/// `html` with every `<link rel="manifest">` element removed.
+///
+/// This shares byte offsets with a lowercased copy, which holds because
+/// `to_ascii_lowercase` rewrites ASCII bytes in place and leaves every
+/// multi-byte sequence alone. `find_head_open_end` below leans on the same
+/// fact.
+fn strip_manifest_links(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(open) = lower[cursor..].find("<link").map(|i| i + cursor) {
+        let Some(end) = tag_end(&lower[open..]).map(|i| i + open) else {
+            break;
+        };
+        out.push_str(&html[cursor..open]);
+        if !declares_manifest_rel(&lower[open..end]) {
+            out.push_str(&html[open..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&html[cursor..]);
+    out
+}
+
+/// Byte offset just past the `>` closing the tag `tag` opens with.
+///
+/// Quote-aware, so a `>` inside an attribute value does not end the tag early.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, &b) in tag.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(i + 1),
+            None => {}
+        }
+    }
+    None
+}
+
+/// Does this lowercased tag carry `rel` with a `manifest` token?
+///
+/// `rel` is a space-separated token list, so the value has to MATCH a token
+/// rather than merely contain the word.
+fn declares_manifest_rel(tag: &str) -> bool {
+    attr_value(tag, "rel").is_some_and(|v| v.split_ascii_whitespace().any(|t| t == "manifest"))
+}
+
+/// The value of `name` in this lowercased tag, unquoted, or `None`.
+///
+/// Walks the attributes rather than searching for the name, because a search
+/// finds it inside another attribute's VALUE as readily as at an attribute
+/// boundary. Here that decides whether an element is deleted.
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    // Past `<link`, at the first attribute.
+    let mut rest = tag.strip_prefix('<')?.split_once(char::is_whitespace)?.1;
+    loop {
+        rest = rest.trim_start();
+        // The tag is out of attributes. Also the loop's termination: without it
+        // a leading `>` splits into an empty name and no progress.
+        if rest.starts_with('>') {
+            return None;
+        }
+        let split = rest.find(|c: char| c.is_ascii_whitespace() || c == '=' || c == '>')?;
+        let (attr, after) = rest.split_at(split);
+        let after = after.trim_start();
+        let (value, tail) = match after.strip_prefix('=') {
+            Some(v) => attr_tail(v.trim_start()),
+            None => ("", after),
+        };
+        if attr == name {
+            return Some(value);
+        }
+        rest = tail;
+    }
+}
+
+/// An attribute value, and the tag text after it.
+///
+/// Quoted runs to the closing quote; bare runs to the next whitespace or `>`.
+fn attr_tail(raw: &str) -> (&str, &str) {
+    for quote in ['"', '\''] {
+        if let Some(inner) = raw.strip_prefix(quote) {
+            return inner.split_once(quote).unwrap_or((inner, ""));
+        }
+    }
+    let end = raw
+        .find(|c: char| c.is_ascii_whitespace() || c == '>')
+        .unwrap_or(raw.len());
+    raw.split_at(end)
+}
+
+/// Marks a response as the pairing screen rather than the app shell, so a
+/// service worker shows it and caches nothing. Mirrors the boot splash's
+/// `X-Lucidos-Boot-Splash`.
+pub(crate) const PAIRING_SHELL_HEADER: &str = "x-lucidos-pairing";
+
+/// Marks the DOCUMENT as the pairing screen, for script that runs before the
+/// bundle. The header above marks the RESPONSE, which only the service worker
+/// can read.
+///
+/// The cold-start fast path in `index.html` is exactly such a script. It
+/// redirects to the remembered workspace on any document whose base href is the
+/// sigil, which is every picker document. This screen is served in place at the
+/// url asked for, so without the marker that redirect lands right back here.
+/// Measured at ~320 navigations per second before this existed.
+///
+/// Stamped beside the base href, hence ahead of every inline script in `<head>`.
+/// The readers are `index.html` and `utils/pairingShell.ts`, which match on this
+/// name. A test below pins the document's copy to this one.
+pub(crate) const PAIRING_SHELL_META_NAME: &str = "lucidos-pairing";
+
+/// The pairing screen, served AT the URL an unpaired caller asked for.
+///
+/// # Why in place, rather than a redirect to `/~/`
+///
+/// An unpaired PWA cannot update its service worker: `/<slug>/sw.js` is not
+/// public, so the check gets 401 and the worker on the device keeps running.
+/// This has to work against the worker already out there.
+///
+/// `networkFirstShell` keeps a response only when `response.ok &&
+/// !response.redirected`, and serves its cached workspace shell otherwise. A
+/// 307 fails both halves, which is how an unpaired PWA boots a stale app that
+/// 401s every call. A 200 passes, so today's worker renders this instead.
+///
+/// No new public path is needed: the shell's `<base href="/~/">` keeps its
+/// assets under the sigil namespace. Rest:
+/// `docs/plans/2026-08-19-nobody-is-stranded-by-the-pairing-update.md`.
+/// `pair_code` is whatever the refused request's own query carried, validated
+/// by the same reader `serve_sigil` uses. A scan lands on the public
+/// `/~/?pair=`, so the ordinary path never gets here. The picker's cold-start
+/// fast path is why one still can: it redirects a remembered workspace and
+/// takes the query with it, landing a real code on a gated path. Drop the code
+/// there and the install this screen feeds gets a manifest without it, so the
+/// app opens asking to pair.
+pub(crate) fn serve_pairing_shell(state: &GatewayState, pair_code: Option<&str>) -> Response {
+    let mut response = serve_stamped_picker_shell(state, true, pair_code);
+    // Only a real shell wears the marker. A missing frontend answers 404 here,
+    // and an unreadable index answers 500. A worker told either is the pairing
+    // screen shows the error text, rather than falling back as it would for any
+    // other failure.
+    if response.status().is_success() {
+        response
+            .headers_mut()
+            .insert(PAIRING_SHELL_HEADER, HeaderValue::from_static("1"));
+    }
+    response
 }
 
 /// Serve the picker's PWA manifest, re-stamped from the bundled one so the
@@ -2543,8 +3618,32 @@ fn serve_picker_shell(state: &GatewayState) -> Response {
 /// The bundled manifest declares `start_url` and `scope` as `"."`. Here that
 /// would scope the installed PWA to `/~/` alone, so tapping a workspace would
 /// navigate out of scope and open a browser.
-fn serve_picker_manifest(state: &GatewayState) -> Response {
-    serve_gateway_manifest(state, &format!("/{SIGIL}/"), &format!("/{SIGIL}/"))
+///
+/// # `pair_code` is how an iOS home-screen app pairs itself
+///
+/// iOS gives a home-screen app its own storage container, so pairing in Safari
+/// never reaches it. `start_url` is one of the two channels that do cross:
+/// install from a page carrying a code and the app launches at
+/// `/~/?pair=<code>`, which `PairingGate` already seeds itself from.
+///
+/// `id` is deliberately NOT varied by the code. It is the installation's
+/// identity, so a per-code `id` would read as a different app and could install
+/// a second icon. Only the launch URL moves.
+///
+/// This answers the same body for a code that was never minted, so it is no
+/// oracle for whether one is live. It is a public path, and the caller is
+/// handed back only what the caller sent.
+fn serve_picker_manifest(state: &GatewayState, pair_code: Option<&str>) -> Response {
+    serve_gateway_manifest(state, &picker_start_url(pair_code), &format!("/{SIGIL}/"))
+}
+
+/// Pure: the picker's launch URL, carrying a pairing code when there is one.
+fn picker_start_url(pair_code: Option<&str>) -> String {
+    let picker = format!("/{SIGIL}/");
+    match pair_code {
+        Some(code) => format!("{picker}?{}={code}", pairing_qr::PAIR_PARAM),
+        None => picker,
+    }
 }
 
 /// Serve a gateway-fronted workspace's PWA manifest. Direct engine access keeps
@@ -2604,19 +3703,23 @@ fn redirect(location: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// Insert `<base href="…">` as the first child of `<head>` so every relative
-/// ref in the document resolves against it. Falls back to prepending when there
-/// is no `<head>`. Deliberately duplicates the engine's stamping (ADR 0014 §1).
-pub fn inject_base_href(html: &str, href: &str) -> String {
-    let tag = format!("<base href=\"{href}\">");
+/// Insert `tags` as the first children of `<head>`. Falls back to prepending
+/// when there is no `<head>`. Deliberately duplicates the engine's stamping
+/// (ADR 0014 §1).
+///
+/// Two things ride on that position. A `<base>` there governs every relative
+/// ref in the document. And every inline script in the head is parsed after
+/// these tags, which is what lets one of them stand a script down.
+/// `PAIRING_SHELL_META` is exactly that.
+fn inject_head_tags(html: &str, tags: &str) -> String {
     if let Some(pos) = find_head_open_end(html) {
-        let mut out = String::with_capacity(html.len() + tag.len());
+        let mut out = String::with_capacity(html.len() + tags.len());
         out.push_str(&html[..pos]);
-        out.push_str(&tag);
+        out.push_str(tags);
         out.push_str(&html[pos..]);
         out
     } else {
-        format!("{tag}{html}")
+        format!("{tags}{html}")
     }
 }
 
@@ -2704,6 +3807,69 @@ fn raise_fd_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+
+    // ── The paired-device store publishes memory, never a stale snapshot ─────
+
+    #[test]
+    fn a_late_write_cannot_bring_a_revoked_device_back() {
+        // The hazard in taking the file write off the data lock. A last-seen
+        // write is spawned, a revoke lands first, and the write then arrives
+        // holding what it read before. Publishing that would re-pair a device
+        // the user revoked, on the next boot, with nothing saying why.
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        let path = state.inner.paired_devices_path.clone();
+
+        state
+            .write_paired_devices_for_test(|paired| {
+                paired.devices.push(auth::PairedDevice {
+                    id: "device-1".into(),
+                    label: "My iPhone".into(),
+                    credential_digest: auth::digest("cred-abc"),
+                    paired_at: "2020-01-01T00:00:00Z".into(),
+                    last_seen_at: None,
+                });
+            })
+            .unwrap();
+        assert_eq!(auth::PairedDevices::load(&path).unwrap().devices.len(), 1);
+
+        state.revoke_device("device-1").unwrap();
+        assert!(auth::PairedDevices::load(&path).unwrap().devices.is_empty());
+
+        // The late write, arriving after the revoke. It reads memory afresh, so
+        // it publishes the revoked state rather than resurrecting the device.
+        state.persist_paired_devices().unwrap();
+        assert!(
+            auth::PairedDevices::load(&path).unwrap().devices.is_empty(),
+            "a revoked device must not come back through a later write"
+        );
+    }
+
+    // That the data lock is released before the file write is structural: the
+    // clone ends its scope in `persist_paired_devices` before `save` runs. A
+    // test cannot observe it without instrumenting the write, and one that
+    // merely ran a read alongside a write would pass either way.
+
+    // ── The engines this gateway spawns stay off the network ─────────────────
+
+    #[test]
+    fn a_spawned_engine_binds_loopback_unless_something_says_otherwise() {
+        // Unset is the case that matters. Dev used to set this to `0`. Every
+        // workspace was then reachable on its engine port with no credential,
+        // straight past the pairing the gateway enforces (ADR 0094).
+        assert!(engine_loopback_from_env(None));
+        assert!(engine_loopback_from_env(Some("")));
+        assert!(engine_loopback_from_env(Some("1")));
+        assert!(engine_loopback_from_env(Some("anything else")));
+    }
+
+    #[test]
+    fn the_old_topology_is_still_reachable_on_purpose() {
+        for value in ["0", "false", "no", "off", " 0 "] {
+            assert!(!engine_loopback_from_env(Some(value)), "value: {value:?}");
+        }
+    }
 
     // ── Reaping a stopped engine ─────────────────────────────────────────────
     //
@@ -2769,6 +3935,7 @@ mod tests {
             resolved_dir: dir,
             pg: PgHandle::External,
             engine,
+            keeper: EngineKeeper::Gateway,
             health: Health::Booting,
             restart_attempts: 0,
             health_misses: 0,
@@ -2916,17 +4083,36 @@ mod tests {
     #[test]
     fn a_workspace_the_last_teardown_stopped_comes_back_without_autostart() {
         let restore: HashSet<String> = ["myws".to_string()].into_iter().collect();
-        assert!(should_bring_up(&workspace("myws", false), false, &restore));
+        assert_eq!(
+            boot_action(&workspace("myws", false), false, &restore),
+            BootAction::Start
+        );
     }
 
     #[test]
-    fn a_healthy_or_autostart_workspace_comes_up_with_no_restore_record() {
+    fn an_autostart_workspace_comes_up_with_no_restore_record() {
         let empty = HashSet::new();
-        assert!(
-            should_bring_up(&workspace("adopted", false), true, &empty),
-            "a surviving engine is re-adopted whatever the flag says",
+        assert_eq!(
+            boot_action(&workspace("always", true), false, &empty),
+            BootAction::Start
         );
-        assert!(should_bring_up(&workspace("always", true), false, &empty));
+        assert_eq!(
+            boot_action(&workspace("always", true), true, &empty),
+            BootAction::Start,
+            "its engine survived, and the gateway still owns keeping it up",
+        );
+    }
+
+    /// An engine that outlived the gateway, for a workspace nobody asked to run,
+    /// is adopted rather than taken over. Marking one as ours would give every
+    /// eval arm a gateway-spawned replacement on the next restart (ADR 0101).
+    #[test]
+    fn a_surviving_engine_nobody_asked_for_is_adopted_not_taken_over() {
+        let empty = HashSet::new();
+        assert_eq!(
+            boot_action(&workspace("adopted", false), true, &empty),
+            BootAction::Adopt
+        );
     }
 
     // ── Refusing a restore whose address is taken ────────────────────────────
@@ -2988,16 +4174,14 @@ mod tests {
     #[test]
     fn a_stopped_workspace_stays_stopped() {
         let restore: HashSet<String> = ["other".to_string()].into_iter().collect();
-        assert!(!should_bring_up(
-            &workspace("stopped", false),
-            false,
-            &restore
-        ));
-        assert!(!should_bring_up(
-            &workspace("stopped", false),
-            false,
-            &HashSet::new()
-        ));
+        assert_eq!(
+            boot_action(&workspace("stopped", false), false, &restore),
+            BootAction::Leave
+        );
+        assert_eq!(
+            boot_action(&workspace("stopped", false), false, &HashSet::new()),
+            BootAction::Leave
+        );
     }
 
     /// A worktree-rooted engine binary is refused at boot with the corrective
@@ -3102,24 +4286,159 @@ mod tests {
     }
 
     #[test]
-    fn inject_base_href_inserts_after_head() {
+    fn head_tags_are_inserted_after_head() {
         let html =
             "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>x</body></html>";
-        let out = inject_base_href(html, "/~/");
+        let out = inject_head_tags(html, "<base href=\"/~/\">");
         assert!(out.contains("<head><base href=\"/~/\"><meta charset=\"utf-8\">"));
     }
 
     #[test]
-    fn inject_base_href_handles_attributes_on_head() {
+    fn head_tags_survive_attributes_on_head() {
         let html = "<head data-x=\"1\"><title>t</title></head>";
-        let out = inject_base_href(html, "/dev/");
+        let out = inject_head_tags(html, "<base href=\"/dev/\">");
         assert!(out.contains("<head data-x=\"1\"><base href=\"/dev/\"><title>"));
     }
 
+    /// The app's real shell, so the ordering test below measures the document
+    /// the gateway actually serves rather than a fixture that can drift from it.
+    const APP_INDEX_HTML: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lucidos-app/index.html"
+    ));
+
+    /// The stamped marker tag, as the document carries it.
+    fn marker_tag() -> String {
+        format!("<meta name=\"{PAIRING_SHELL_META_NAME}\" content=\"1\">")
+    }
+
     #[test]
-    fn inject_base_href_prepends_when_no_head() {
+    fn only_the_pairing_shell_marks_the_document() {
+        let picker = stamp_picker_shell(APP_INDEX_HTML, false, None);
+        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, None);
+        assert!(
+            !picker.contains(&marker_tag()),
+            "the ordinary picker must not wear the marker, or auto-open dies for everyone"
+        );
+        assert!(pairing.contains(&marker_tag()));
+        assert!(
+            pairing.contains(&format!("<base href=\"/{SIGIL}/\">")),
+            "the pairing screen still needs the sigil base for its assets"
+        );
+    }
+
+    /// The stamped manifest link, as the document carries it.
+    fn manifest_link(code: &str) -> String {
+        let param = pairing_qr::PAIR_PARAM;
+        format!("<link rel=\"manifest\" href=\"/{SIGIL}/manifest.json?{param}={code}\">")
+    }
+
+    #[test]
+    fn a_scanned_shell_points_its_manifest_link_at_the_code() {
+        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
+        assert!(scanned.contains(&manifest_link("01234567")), "{scanned}");
+    }
+
+    #[test]
+    fn a_shell_with_no_code_grows_no_manifest_link() {
+        // Every ordinary picker load takes this path, and a second manifest
+        // link on it would override the bundle's for no reason.
+        let plain = stamp_picker_shell(APP_INDEX_HTML, false, None);
+        assert_eq!(
+            plain.matches("rel=\"manifest\"").count(),
+            APP_INDEX_HTML.matches("rel=\"manifest\"").count(),
+            "an unscanned shell must carry exactly the bundle's manifest links"
+        );
+    }
+
+    /// Two manifest links would make the auto-pair rest on the reader picking
+    /// the first in tree order. Ours is the only one instead.
+    #[test]
+    fn a_scanned_shell_carries_exactly_one_manifest_link() {
+        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
+        assert_eq!(
+            scanned.matches("rel=\"manifest\"").count(),
+            1,
+            "the bundle's own link must be gone: {scanned}"
+        );
+        assert!(scanned.contains(&manifest_link("01234567")));
+    }
+
+    /// The shell is mostly `<link>` elements, and every one of them but the
+    /// manifest has to survive the strip.
+    #[test]
+    fn stripping_the_manifest_link_leaves_every_other_link_alone() {
+        let scanned = stamp_picker_shell(APP_INDEX_HTML, false, Some("01234567"));
+        for rel in [
+            "icon",
+            "apple-touch-icon",
+            "apple-touch-startup-image",
+            "preconnect",
+        ] {
+            assert_eq!(
+                scanned.matches(&format!("rel=\"{rel}\"")).count(),
+                APP_INDEX_HTML.matches(&format!("rel=\"{rel}\"")).count(),
+                "the strip ate a {rel} link"
+            );
+        }
+    }
+
+    #[test]
+    fn the_strip_reads_rel_rather_than_the_tag_text() {
+        // Case, quoting and a multi-token rel are all the document's choice,
+        // and Vite rewrites the href on the way to `dist/`.
+        for tag in [
+            "<link rel=\"manifest\" href=\"./manifest.json\">",
+            "<LINK REL='MANIFEST' HREF='/x.json'>",
+            "<link href=\"m.json\" rel=\"alternate manifest\">",
+        ] {
+            let html = format!("<head>{tag}</head>");
+            assert_eq!(strip_manifest_links(&html), "<head></head>", "{tag}");
+        }
+        // And a rel that merely contains the word, or names it in a value, is
+        // a different element and stays.
+        for tag in [
+            "<link rel=\"manifestish\" href=\"x\">",
+            "<link rel=\"icon\" href=\"rel=manifest.png\">",
+            "<link rel=\"icon\" href=\"a>b\" sizes=\"1x1\">",
+        ] {
+            let html = format!("<head>{tag}</head>");
+            assert_eq!(strip_manifest_links(&html), html, "{tag}");
+        }
+    }
+
+    /// The marker only works if the cold-start fast path can see it, and that
+    /// script runs in `<head>` the moment it is parsed.
+    #[test]
+    fn the_pairing_marker_precedes_the_cold_start_fast_path() {
+        let pairing = stamp_picker_shell(APP_INDEX_HTML, true, None);
+        let marker = pairing
+            .find(&marker_tag())
+            .expect("the pairing shell carries the marker");
+        let fast_path = pairing
+            .find("lucidos-last-workspace")
+            .expect("index.html still has the cold-start fast path");
+        assert!(
+            marker < fast_path,
+            "the marker must be parsed before the redirect it stands down"
+        );
+    }
+
+    /// The document's readers match on a name this crate chooses, and neither
+    /// side compiles against the other. So a rename here goes silent: the
+    /// gateway stamps a tag nothing looks for, and the loop comes back.
+    #[test]
+    fn the_documents_own_guard_reads_the_name_this_crate_stamps() {
+        assert!(
+            APP_INDEX_HTML.contains(&format!("meta[name=\"{PAIRING_SHELL_META_NAME}\"]")),
+            "index.html's cold-start fast path must query the name stamped above"
+        );
+    }
+
+    #[test]
+    fn head_tags_are_prepended_when_there_is_no_head() {
         let html = "<p>no head here</p>";
-        let out = inject_base_href(html, "/~/");
+        let out = inject_head_tags(html, "<base href=\"/~/\">");
         assert!(out.starts_with("<base href=\"/~/\"><p>"));
     }
 
@@ -3216,6 +4535,73 @@ mod tests {
         assert_eq!(out["icons"][0]["src"], "icons/icon-192.png");
     }
 
+    /// The bundled manifest, so this measures what the gateway really re-stamps.
+    const APP_MANIFEST_JSON: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lucidos-app/public/manifest.json"
+    ));
+
+    #[test]
+    fn a_scanned_manifest_launches_at_the_code_and_keeps_one_identity() {
+        let out: serde_json::Value = serde_json::from_str(&gateway_manifest_json(
+            APP_MANIFEST_JSON,
+            &picker_start_url(Some("01234567")),
+            &format!("/{SIGIL}/"),
+        ))
+        .expect("valid JSON");
+
+        // The launch URL carries the code, so a fresh install pairs itself.
+        assert_eq!(out["start_url"], "/~/?pair=01234567");
+        // The identity does NOT move with it. A per-code id reads as a
+        // different app, and installs a second icon.
+        assert_eq!(out["id"], "/~/");
+        assert_eq!(out["scope"], "/");
+    }
+
+    #[test]
+    fn a_manifest_asked_for_no_code_is_the_one_every_installed_client_already_has() {
+        // Every installed PWA refetches this. A diff here can re-scope or
+        // re-prompt an install that was working.
+        let picker = format!("/{SIGIL}/");
+        assert_eq!(picker_start_url(None), picker);
+        assert_eq!(
+            gateway_manifest_json(APP_MANIFEST_JSON, &picker_start_url(None), &picker),
+            gateway_manifest_json(APP_MANIFEST_JSON, &picker, &picker),
+        );
+    }
+
+    /// The end-to-end grammar check: a query the caller controls, all the way
+    /// to the string inside the served JSON.
+    #[test]
+    fn nothing_but_eight_digits_reaches_a_stamped_start_url() {
+        for query in [
+            "pair=abc",
+            "pair=0123456",
+            "pair=012345678",
+            "pair=0123456\"",
+            "pair=01234567\"}",
+            "pair=../../etc",
+            "pair=",
+        ] {
+            let code = pairing_qr::pairing_code_in_query(Some(query));
+            assert_eq!(code, None, "{query} was accepted");
+            assert_eq!(picker_start_url(code), format!("/{SIGIL}/"));
+        }
+
+        let code = pairing_qr::pairing_code_in_query(Some("pair=01234567"));
+        let out: serde_json::Value = serde_json::from_str(&gateway_manifest_json(
+            APP_MANIFEST_JSON,
+            &picker_start_url(code),
+            &format!("/{SIGIL}/"),
+        ))
+        .expect("valid JSON");
+        let start_url = out["start_url"].as_str().expect("a string start_url");
+        let tail = start_url
+            .strip_prefix(&format!("/{SIGIL}/?pair="))
+            .expect("the code sits in the query");
+        assert!(tail.bytes().all(|b| b.is_ascii_digit()), "{tail}");
+    }
+
     #[test]
     fn boot_window_stalled_only_past_budget() {
         // No boot window (healthy / stopped) is never stalled.
@@ -3297,7 +4683,33 @@ mod tests {
         misses: u32,
         restart_attempts: u32,
     ) -> SuperviseAction {
-        respawn_decision(outcome, alive, since_spawn, misses, restart_attempts, false)
+        respawn_decision(
+            outcome,
+            alive,
+            since_spawn,
+            misses,
+            restart_attempts,
+            false,
+            EngineKeeper::Gateway,
+        )
+    }
+
+    /// [`decide`] for an engine the gateway did not start.
+    fn decide_external(
+        outcome: ProbeOutcome,
+        alive: bool,
+        since_spawn: Duration,
+        misses: u32,
+    ) -> SuperviseAction {
+        respawn_decision(
+            outcome,
+            alive,
+            since_spawn,
+            misses,
+            0,
+            false,
+            EngineKeeper::External,
+        )
     }
 
     /// A reported terminal boot failure short-circuits to Unhealthy on the
@@ -3312,7 +4724,15 @@ mod tests {
         ] {
             for alive in [true, false] {
                 assert_eq!(
-                    respawn_decision(outcome, alive, Duration::ZERO, 0, 0, true),
+                    respawn_decision(
+                        outcome,
+                        alive,
+                        Duration::ZERO,
+                        0,
+                        0,
+                        true,
+                        EngineKeeper::Gateway,
+                    ),
                     SuperviseAction::MarkUnhealthy,
                     "outcome={outcome:?} alive={alive} must not be retried",
                 );
@@ -3325,7 +4745,15 @@ mod tests {
     #[test]
     fn terminal_boot_failure_never_overrides_a_healthy_probe() {
         assert_eq!(
-            respawn_decision(ProbeOutcome::Healthy, true, established(), 0, 0, true),
+            respawn_decision(
+                ProbeOutcome::Healthy,
+                true,
+                established(),
+                0,
+                0,
+                true,
+                EngineKeeper::Gateway,
+            ),
             SuperviseAction::Healthy
         );
     }
@@ -3445,6 +4873,66 @@ mod tests {
             ),
             SuperviseAction::Respawn
         );
+    }
+
+    /// The gateway replaces its own engines and nobody else's. An eval arm runs
+    /// an engine it cannot reproduce, so a replacement would be a different
+    /// engine wearing the same address (ADR 0101).
+    #[test]
+    fn a_dead_external_engine_is_released_where_our_own_is_respawned() {
+        assert_eq!(
+            decide_external(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                EXTERNAL_RELEASE_MISSES
+            ),
+            SuperviseAction::Release
+        );
+        assert_eq!(
+            decide(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD,
+                0
+            ),
+            SuperviseAction::Respawn,
+            "our own engine still comes back"
+        );
+    }
+
+    /// Releasing waits longer than a respawn does. An external launcher that
+    /// writes no pidfile leaves a busy engine looking exited, and dropping the
+    /// stack takes its route with it.
+    #[test]
+    fn a_short_silence_does_not_release_an_external_engine() {
+        for misses in [1, DEAD_MISS_THRESHOLD, EXTERNAL_RELEASE_MISSES - 1] {
+            assert_eq!(
+                decide_external(ProbeOutcome::Unreachable, false, established(), misses),
+                SuperviseAction::Wait,
+                "misses={misses} is not yet evidence the engine is gone"
+            );
+        }
+    }
+
+    /// The never-cull rule covers both kinds alike. An external engine that is
+    /// alive is left alone, however it is answering.
+    #[test]
+    fn an_alive_external_engine_is_never_released() {
+        for outcome in [
+            ProbeOutcome::Slow,
+            ProbeOutcome::Unreachable,
+            ProbeOutcome::Other,
+        ] {
+            for misses in [1, 5, 9999] {
+                assert_eq!(
+                    decide_external(outcome, true, established(), misses),
+                    SuperviseAction::Wait,
+                    "outcome={outcome:?} misses={misses}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3590,6 +5078,7 @@ mod tests {
                 DEAD_MISS_THRESHOLD,
                 2,
                 retrying.is_terminal(),
+                EngineKeeper::Gateway,
             ),
             SuperviseAction::Respawn
         );
@@ -3694,5 +5183,443 @@ mod tests {
         // leaves Booting.
         assert!(!probe_result_is_stale(true, None, None, Health::Booting));
         assert!(!probe_result_is_stale(true, None, None, Health::Healthy));
+    }
+
+    // ── Adopting a directory that already exists ─────────────────────────────
+    //
+    // Driven through the real control router, so the route, the body shape and
+    // the status code are all part of what is asserted. Each test owns its
+    // tempdir, because the default scratch path is keyed by pid and shared by
+    // every test in the binary. Two of these would race on the registry write.
+
+    /// A state and a scratch root, both owned by one test.
+    fn adopting_state() -> (GatewayState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+        (state, dir)
+    }
+
+    /// An existing workspace directory named `name`, under `root`.
+    fn a_directory(root: &Path, name: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn registered(state: &GatewayState) -> Vec<Workspace> {
+        state.inner.registry.lock().unwrap().workspaces.clone()
+    }
+
+    /// POST the adopt endpoint, answering with its status and parsed body.
+    async fn adopt(state: &GatewayState, body: Value) -> (StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let router = crate::control::router().with_state(state.clone());
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/workspaces/adopt")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The adopted entry, or a panic naming the refusal.
+    async fn adopted(state: &GatewayState, body: Value) -> Workspace {
+        let (status, body) = adopt(state, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_value(body["workspace"].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn adopting_a_directory_registers_it_and_starts_nothing() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+
+        assert_eq!(ws.id, "eval-lean-1", "the basename is the address");
+        assert_eq!(ws.name, "eval-lean-1", "no name given, so the directory's");
+        assert_eq!(ws.dir, arm.to_string_lossy());
+        assert!(ws.port > 0, "the caller boots on this port");
+        assert!(ws.database_url.is_none(), "the shared cluster derives it");
+        // Registration only. An engine would have landed here, and spawning one
+        // writes `.lucidos/engine.pid` into the adopted directory.
+        assert!(state.inner.stacks.lock().await.is_empty());
+        assert!(!arm.join(".lucidos").exists());
+    }
+
+    #[tokio::test]
+    async fn an_adopted_workspace_does_not_run_in_the_background() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        assert!(
+            !ws.autostart,
+            "an adopted directory is somebody else's, so the gateway does not \
+             spawn an engine for it on every boot",
+        );
+
+        let other = a_directory(root.path(), "eval-control-1");
+        let ws = adopted(&state, json!({ "dir": other, "autostart": true })).await;
+        assert!(ws.autostart, "and an explicit true is honoured");
+    }
+
+    #[tokio::test]
+    async fn the_entry_is_listed_by_the_running_gateway_and_survives_a_reload() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+
+        // In memory, which is what makes it routable with no gateway restart.
+        // Writing `workspaces.json` behind a running gateway does not, because
+        // the registry it serves from is the one held here.
+        let listed = state.list_status().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "eval-lean-1");
+        assert_eq!(listed[0].port, ws.port);
+
+        // And on disk, so a later gateway boot finds it too.
+        let saved = Registry::load(&state.inner.registry_path).unwrap();
+        assert_eq!(saved.get("eval-lean-1"), Some(&ws));
+    }
+
+    #[tokio::test]
+    async fn re_adopting_the_same_path_keeps_the_port_and_the_user_set_name() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let first = adopted(&state, json!({ "dir": arm })).await;
+
+        // The picker's two controls, both user-set.
+        state
+            .rename_workspace("eval-lean-1", "Lean arm, repeat 1")
+            .await
+            .unwrap();
+        state.set_autostart("eval-lean-1", true).await.unwrap();
+
+        let again = adopted(&state, json!({ "dir": arm })).await;
+        assert_eq!(again.port, first.port, "a moved port strands the engine");
+        assert_eq!(again.name, "Lean arm, repeat 1");
+        assert!(
+            again.autostart,
+            "the picker toggle is not undone by a re-seed"
+        );
+        assert_eq!(registered(&state).len(), 1, "updated, never duplicated");
+    }
+
+    #[tokio::test]
+    async fn re_adopting_with_a_name_sets_it() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        adopted(&state, json!({ "dir": arm })).await;
+
+        let named = json!({ "dir": arm, "name": "Lean arm, repeat 1" });
+        assert_eq!(
+            adopted(&state, named.clone()).await.name,
+            "Lean arm, repeat 1"
+        );
+        // Its own name is not a collision with itself.
+        assert_eq!(adopted(&state, named).await.name, "Lean arm, repeat 1");
+    }
+
+    #[tokio::test]
+    async fn a_same_slug_adopt_of_another_directory_is_refused() {
+        let (state, root) = adopting_state();
+        let here = a_directory(&a_directory(root.path(), "here"), "eval-lean-1");
+        let elsewhere = a_directory(&a_directory(root.path(), "elsewhere"), "eval-lean-1");
+        let first = adopted(&state, json!({ "dir": here })).await;
+
+        let (status, body) = adopt(&state, json!({ "dir": elsewhere })).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Both paths, because the caller cannot fix this without knowing which
+        // other tree holds the address.
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains(&here.display().to_string()), "{message}");
+        assert!(
+            message.contains(&elsewhere.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(
+            registered(&state),
+            vec![first],
+            "a repoint would orphan the first workspace's data",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_that_cannot_be_adopted_is_refused_before_anything_is_written() {
+        let (state, root) = adopting_state();
+        let file = root.path().join("eval-lean-1");
+        std::fs::write(&file, b"not a directory").unwrap();
+        // 65 characters, one past the id length limit. This is the only way
+        // `slugify` produces something `is_valid_id` rejects: it lowercases,
+        // collapses punctuation and trims dashes, but it never truncates.
+        let too_long = a_directory(root.path(), &"e".repeat(65));
+
+        for (path, expected) in [
+            (PathBuf::from("eval-lean-1"), "not an absolute path"),
+            (root.path().join("eval-nothing-here"), "cannot read"),
+            (file, "not a directory"),
+            (too_long, "does not name a workspace address"),
+        ] {
+            let (status, body) = adopt(&state, json!({ "dir": path })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path:?}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains(expected),
+                "{path:?}: {body}"
+            );
+        }
+        assert!(registered(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_display_name_another_workspace_carries_is_refused() {
+        let (state, root) = adopting_state();
+        let first = a_directory(root.path(), "eval-lean-1");
+        adopted(&state, json!({ "dir": first, "name": "Lean arm" })).await;
+
+        let second = a_directory(root.path(), "eval-control-1");
+        let (status, body) = adopt(&state, json!({ "dir": second, "name": "  LEAN ARM  " })).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"].as_str().unwrap(),
+            name_taken_message("Lean arm"),
+            "the same sentence create gives, quoting the name as stored",
+        );
+        assert_eq!(registered(&state).len(), 1);
+    }
+
+    // ── Adopting an engine the gateway did not start ─────────────────────────
+    //
+    // What makes an adopted workspace a real one. Its caller boots an engine on
+    // the port the registry handed back, and the supervise tick picks that
+    // engine up. Before this, the entry read "not started" for the whole life of
+    // the gateway, because only a restart or a document navigation installed a
+    // stack.
+
+    fn minutes_ago(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() - chrono::Duration::minutes(minutes)
+    }
+
+    /// A stand-in engine on `port`, answering `/api/v1/health` until the test
+    /// drops it. It reports a start time, which is how the gateway tells a fresh
+    /// engine from one a stop is still draining.
+    struct StubEngine {
+        started_at: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl StubEngine {
+        async fn on(port: u16, started_at: chrono::DateTime<chrono::Utc>) -> StubEngine {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .expect("the port the registry just allocated is free");
+            let started_at = Arc::new(Mutex::new(started_at));
+            let reported = Arc::clone(&started_at);
+            let task = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let body = format!(
+                        r#"{{"status":"ok","started_at":"{}"}}"#,
+                        reported.lock().unwrap().to_rfc3339()
+                    );
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(head.as_bytes()).await;
+                        let _ = sock.write_all(body.as_bytes()).await;
+                        let _ = sock.flush().await;
+                    });
+                }
+            });
+            StubEngine { started_at, task }
+        }
+
+        /// A DIFFERENT engine takes the port over, which is what the eval
+        /// harness does after it releases an arm.
+        fn relaunched(&self) {
+            *self.started_at.lock().unwrap() = chrono::Utc::now() + chrono::Duration::seconds(1);
+        }
+    }
+
+    impl Drop for StubEngine {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn one_status(state: &GatewayState) -> WorkspaceStatus {
+        let mut all = state.list_status().await;
+        assert_eq!(all.len(), 1, "these tests register exactly one workspace");
+        all.remove(0)
+    }
+
+    /// The reported defect, end to end: adopt a directory, boot an engine on the
+    /// port that came back, and the picker must stop calling it "not started".
+    #[tokio::test]
+    async fn an_adopted_workspace_whose_engine_answers_is_healthy_without_being_opened() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+
+        state.adopt_running_engines().await;
+
+        let status = one_status(&state).await;
+        assert_eq!(
+            status.health,
+            Health::Healthy,
+            "its engine is answering on the port the registry handed out"
+        );
+        assert_eq!(status.last_error, None, "nothing failed here");
+        assert_eq!(
+            state.route("eval-lean-1"),
+            Some(ws.port),
+            "and it is proxied, not merely badged"
+        );
+    }
+
+    /// The pass reports; it never starts. A registered workspace with no engine
+    /// stays stopped, with nothing spawned and no database provisioned.
+    #[tokio::test]
+    async fn a_workspace_with_no_engine_is_left_stopped() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        adopted(&state, json!({ "dir": arm })).await;
+
+        state.adopt_running_engines().await;
+
+        assert!(
+            state.inner.stacks.lock().await.is_empty(),
+            "nobody asked for this workspace to be running"
+        );
+        let status = one_status(&state).await;
+        assert_eq!(status.health, Health::Unhealthy);
+        assert_eq!(status.last_error.as_deref(), Some("not started"));
+    }
+
+    /// A Stop must stick. The engine answers for the whole of its graceful
+    /// drain, and reading that as a fresh start would resurrect what the user
+    /// just stopped.
+    #[tokio::test]
+    async fn a_stop_is_not_undone_by_the_engine_it_is_draining() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        state.adopt_running_engines().await;
+        assert_eq!(one_status(&state).await.health, Health::Healthy);
+
+        state.stop_workspace("eval-lean-1", None).await.unwrap();
+        state.adopt_running_engines().await;
+
+        assert!(
+            state.inner.stacks.lock().await.is_empty(),
+            "the draining engine must not be read as somebody starting it"
+        );
+        assert_eq!(
+            one_status(&state).await.last_error.as_deref(),
+            Some("not started")
+        );
+        assert_eq!(state.route("eval-lean-1"), None);
+    }
+
+    /// The other half of the same guard, and the shape the eval harness runs:
+    /// it releases the arm, then boots its own engine on that port.
+    #[tokio::test]
+    async fn an_engine_started_after_the_stop_is_adopted() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+        state.adopt_running_engines().await;
+        state.stop_workspace("eval-lean-1", None).await.unwrap();
+
+        engine.relaunched();
+        state.adopt_running_engines().await;
+
+        assert_eq!(
+            one_status(&state).await.health,
+            Health::Healthy,
+            "a later engine is a different engine, and the stop is spent"
+        );
+    }
+
+    /// A delete can land while a probe is in flight. Installing a stack then
+    /// would point a route at whatever is still on the port, for a workspace
+    /// whose directory is already in the trash.
+    #[tokio::test]
+    async fn a_workspace_that_left_the_registry_is_not_adopted() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        let ws = adopted(&state, json!({ "dir": arm })).await;
+        let _engine = StubEngine::on(ws.port, minutes_ago(5)).await;
+
+        // What a delete landing mid-probe leaves behind.
+        state
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .remove("eval-lean-1")
+            .unwrap();
+        state.adopt_running_engine(ws).await;
+
+        assert!(state.inner.stacks.lock().await.is_empty());
+        assert_eq!(state.route("eval-lean-1"), None);
+        assert!(
+            state.inner.starting.lock().await.is_empty(),
+            "the guard must be released on the way out, or nothing can start \
+             this address again"
+        );
+    }
+
+    #[test]
+    fn only_an_engine_that_outlived_the_stop_is_adoptable() {
+        let stop = chrono::Utc::now();
+        let second = chrono::Duration::seconds(1);
+        assert!(
+            adoptable_after_stop(None, None),
+            "never stopped, so there is nothing to guard"
+        );
+        assert!(adoptable_after_stop(None, Some(minutes_ago(5))));
+        assert!(adoptable_after_stop(Some(stop), Some(stop + second)));
+        assert!(!adoptable_after_stop(Some(stop), Some(stop - second)));
+        assert!(
+            !adoptable_after_stop(Some(stop), Some(stop)),
+            "started at the stop, so it is the engine being torn down"
+        );
+        assert!(
+            !adoptable_after_stop(Some(stop), None),
+            "an engine that names no start time cannot prove it is a new one"
+        );
+    }
+
+    #[test]
+    fn same_path_sees_through_a_symlinked_prefix() {
+        // The macOS case this exists for: `/tmp` is a symlink to `/private/tmp`,
+        // so a literal comparison reads a correct re-adopt as a repoint.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_path(&real, &link));
+        assert!(!same_path(&real, &root.path().join("other")));
+        // Neither side exists, so it degrades to a literal comparison rather
+        // than answering yes.
+        let missing = root.path().join("gone");
+        assert!(same_path(&missing, &missing));
+        assert!(!same_path(&missing, &root.path().join("also-gone")));
     }
 }

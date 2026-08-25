@@ -91,7 +91,7 @@ pub fn migrate_image_payload(
         // user-supplied and intentionally ignored.
         match write_blob(workspace, &bytes) {
             Ok(blob) => result.hashes.push(blob.hash),
-            Err(BlobError::UnsupportedMime) => result.failed_decode += 1,
+            Err(BlobError::UnsupportedMime(_)) => result.failed_decode += 1,
             Err(e @ BlobError::Io(_)) => return Err(e),
             // write_blob never returns BadEncoding — that variant fires
             // only through write_blob_from_base64. We've already decoded.

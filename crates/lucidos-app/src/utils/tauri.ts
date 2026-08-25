@@ -267,6 +267,26 @@ export function getOrCreateDeviceId(workspace: string, candidate: string): Promi
   return invoke<string>('get_or_create_device_id', { workspace, candidate });
 }
 
+/**
+ * What id this window last used for `workspace`, or `null` if it has none.
+ *
+ * A reinstall re-buckets the webview's `localStorage` AND its cookie jar. The
+ * window pairs again under a new name, and this native file is the only memory
+ * of the old one. Reads only, so a caller can learn the old id, migrate the
+ * engine's row, and commit the new one afterwards. Tauri only. */
+export function previousDeviceId(workspace: string): Promise<string | null> {
+  return invoke<string | null>('previous_device_id', { workspace });
+}
+
+/**
+ * Record the id the gateway now names this window.
+ *
+ * Call only once the engine's row has actually moved. Writing before that would
+ * discard the one memory a retry depends on. Tauri only. */
+export function rememberDeviceId(workspace: string, id: string): Promise<void> {
+  return invoke<void>('remember_device_id', { workspace, id });
+}
+
 // --- App auto-update (packaged desktop app) ---
 
 /** A newer signed packaged build, and what is in it. */
@@ -421,6 +441,30 @@ export interface ConnectInfo {
  *  Only call when isTauri() is true. */
 export function openExternal(url: string): Promise<void> {
   return invoke('open_url_external', { url });
+}
+
+/** Where a saved download landed (mirror of the Rust `SavedDownload`). `dir` is
+ *  the folder to open; `path` is the file inside it, which may carry a ` (1)`
+ *  counter the caller did not ask for. */
+export interface SavedDownload {
+  dir: string;
+  path: string;
+}
+
+/** Write `contents` into the OS downloads folder as `filename` (lib.rs
+ *  `save_to_downloads`), and report where it landed.
+ *
+ *  The desktop client cannot download through the webview: wry attaches a
+ *  download delegate only when the app registers a download handler, and this
+ *  app registers none, so an `<a download>` click is silently dropped. Saving
+ *  through the command is what makes the file exist, and its answer is what
+ *  lets a toast name and open the folder.
+ *
+ *  Rejects with a string when the folder cannot be resolved, the name is not a
+ *  leaf name, or the write fails. Callers owe the user a toast. Only call when
+ *  isTauri() is true. */
+export function saveToDownloads(filename: string, contents: string): Promise<SavedDownload> {
+  return invoke<SavedDownload>('save_to_downloads', { filename, contents });
 }
 
 /** Open a workspace in a NEW top-level app window (lib.rs

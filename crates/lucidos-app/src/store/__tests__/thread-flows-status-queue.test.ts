@@ -26,6 +26,60 @@ describe('Timestamps', () => {
     expect(exchangeTimestamp(exchanges[0])).not.toBe(exchangeResponseTimestamp(exchanges[0]));
   });
 
+  // The reported shape: a 42-second reply archived an hour and three quarters
+  // later, whose header read the archive time and so claimed a two-hour turn.
+  it('archiving later does not move the response timestamp', () => {
+    const { map, id } = makeThread();
+    const userTime = '2026-08-07T07:09:02.000Z';
+    const responseTime = '2026-08-07T07:09:44.000Z';
+    const archiveTime = '2026-08-07T08:53:37.000Z';
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'cut the space a little', created: userTime } as any,
+      { type: 'TextStreamed', text: 'Took roughly 32px out.', created: responseTime } as any,
+      { type: 'ResponseGenerated', created: responseTime } as any,
+      { type: 'ThreadArchived', created: archiveTime } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    // The premise, so the assertion below cannot pass vacuously: the archive
+    // really is folded in as the turn's last step.
+    expect(exchanges[0].steps.some(s => s.event.type === 'ThreadArchived')).toBe(true);
+    expect(exchangeResponseTimestamp(exchanges[0])).toBe(responseTime);
+  });
+
+  // Same class, a different clock: the session ends at the next engine
+  // shutdown, which can be days after the turn it closes.
+  it('a later SessionEnded does not move the response timestamp', () => {
+    const { map, id } = makeThread();
+    const responseTime = '2026-08-07T07:09:44.000Z';
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'go', created: '2026-08-07T07:09:02.000Z' } as any,
+      { type: 'CodingAgentTextStreamed', text: 'done.', created: responseTime } as any,
+      { type: 'CodingAgentIdled', created: responseTime } as any,
+      { type: 'SessionEnded', reason: 'shutdown', created: '2026-08-09T18:00:00.000Z' } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchangeResponseTimestamp(exchanges[0])).toBe(responseTime);
+  });
+
+  // The skip must not invent a timestamp. An exchange whose only steps are
+  // bookkeeping has produced no response, and the header falls back to the
+  // user message's own time.
+  it('bookkeeping-only steps leave the response timestamp undefined', () => {
+    const { map, id } = makeThread();
+
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'go', created: '2026-08-07T07:09:02.000Z' } as any,
+      { type: 'ThreadArchived', created: '2026-08-07T08:53:37.000Z' } as any,
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    expect(exchangeResponseTimestamp(exchanges[0])).toBeUndefined();
+  });
+
   it('handleEvent stores server-provided created timestamp, not client time', () => {
     const { map, id } = makeThread();
     const serverTime = '2026-03-15T20:54:09.000Z';

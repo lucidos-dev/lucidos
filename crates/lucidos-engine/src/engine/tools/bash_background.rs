@@ -880,8 +880,13 @@ mod tests {
         );
         assert!(!first.finished);
 
-        // Wait for finish, then drain again — only "b" should remain.
-        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
+        // Wait for finish, then drain again: only "b" should remain. The
+        // budget is deliberately far past the script's own 0.3s. It returns as
+        // soon as the task ends, so a wide one costs nothing and only a real
+        // hang pays it. At 3s suite load reached it and failed the assert.
+        // Widening is safe here because the script exits on its own, so this
+        // deadline never stands in for the spawn ceiling firing.
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(60)).await;
         assert!(finished);
         let second = reg
             .read_output_in_memory_wait(&task_id, Duration::ZERO)

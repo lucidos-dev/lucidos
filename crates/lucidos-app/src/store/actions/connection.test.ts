@@ -39,9 +39,13 @@ vi.mock('./chat-changes', () => ({
 vi.mock('./notifications', () => ({
   loadUnreadNotifications: vi.fn(),
 }));
+vi.mock('./preferences', () => ({
+  loadPreferences: vi.fn(),
+}));
 
 // Import after mocks are set up
 const { handleResume } = await import('./connection');
+const { loadPreferences } = await import('./preferences');
 
 const emailConfirmForm = {
   type: 'email-confirm' as const,
@@ -119,6 +123,20 @@ describe('handleResume preserves credential request form', () => {
       expect(form.request?.prompt).toContain('1. Go to https://dev.helius.xyz/dashboard');
       expect(form.request?.prompt).toContain('2. Copy API Key');
     }
+  });
+});
+
+/**
+ * Preferences have no SSE re-trigger of their own beyond `PreferencesChanged`
+ * / `LanguageSet` / `TimezoneSet`, and nothing else re-runs the loader once it
+ * fails. A resume must reload them, or a fetch cancelled at startup leaves
+ * Settings showing every value at its default for the whole page load.
+ */
+describe('handleResume reloads preferences', () => {
+  it('calls loadPreferences on every resume', async () => {
+    await handleResume();
+
+    expect(loadPreferences).toHaveBeenCalled();
   });
 });
 

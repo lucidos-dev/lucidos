@@ -25,13 +25,13 @@
 //! [`recover_orphan_mcp_permission_requests`].
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::core::grants::{self, GrantFile};
 use crate::engine::cc_permission::{DedupKey, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -46,18 +46,6 @@ pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 /// Reason on a resolution the engine emits because the chat turn was canceled
 /// (Stop button) while the card was on screen.
 pub const CANCELED_REASON: &str = "Canceled by user";
-
-/// Persisted allowlist file under `~/.lucidos/` — the MCP counterpart of
-/// `cc-allowed-tools` (CC) and `agent-allowed-commands` (chat command guard).
-/// Separate file because MCP patterns (`Mcp(<server>:<tool>)`) are neither CC
-/// `--allowedTools` patterns nor bash/python command patterns.
-const MCP_ALLOWED_TOOLS_FILE: &str = "mcp-allowed-tools";
-const MCP_ALLOWED_TOOLS_HEADER: &str = "# Lucidos Agent MCP allowlist — one pattern per line. Lines starting with '#' are ignored.\n# Patterns: Mcp(<server>:<tool>) e.g. Mcp(slack:channels_list) · Mcp(<server>:*) (any tool on the server).\n# <server> is the MCP server's registry id. Delete a line to revoke that grant.\n";
-
-/// Compiled-in default allowlist — empty so the feature ships dark; users build
-/// their list via the per-prompt "Always allow" buttons (which append to the
-/// file) or by editing `mcp-allowed-tools` directly.
-pub const DEFAULT_MCP_ALLOWED_TOOLS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Allow-pattern derivation (reuses `AllowScope`)
@@ -100,112 +88,10 @@ pub fn mcp_is_allowed(server_id: &str, tool: &str, allowed: impl Fn(&str) -> boo
 // Persisted allowlist file (`mcp-allowed-tools`)
 // ---------------------------------------------------------------------------
 
-/// Patterns from `<user_dir>/mcp-allowed-tools` (one per line, blanks and `#`
-/// comments ignored). Empty on a missing file, a `None` user_dir, or an IO
-/// error — a read failure must never auto-allow, so it degrades to "no
-/// patterns" (the user re-approves once rather than the gate silently opening).
-pub fn mcp_allowed_tools_patterns(user_dir: Option<&Path>) -> Vec<String> {
-    let Some(dir) = user_dir else {
-        return DEFAULT_MCP_ALLOWED_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    };
-    let path = dir.join(MCP_ALLOWED_TOOLS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.to_string())
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_MCP_ALLOWED_TOOLS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        Err(e) => {
-            crate::log!(
-                "[McpPermission] Failed to read {}: {} — treating as no allowlist",
-                path.display(),
-                e
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Append `pattern` to `<user_dir>/mcp-allowed-tools` if not already present.
-/// Creates the file (with the header comment) if it doesn't exist. Atomic write
-/// via tmp + rename. No-op when `user_dir` is `None`.
-pub fn append_mcp_allowed_tool(
-    user_dir: Option<&Path>,
-    pattern: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(dir) = user_dir else {
-        return Ok(());
-    };
-    let path = dir.join(MCP_ALLOWED_TOOLS_FILE);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => MCP_ALLOWED_TOOLS_HEADER.to_string(),
-        Err(e) => return Err(e.into()),
-    };
-    if existing
-        .lines()
-        .map(str::trim)
-        .any(|l| !l.is_empty() && !l.starts_with('#') && l == pattern)
-    {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(pattern);
-    next.push('\n');
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &next)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
-/// Read the raw contents of `<user_dir>/mcp-allowed-tools` for a settings UI. A
-/// missing file returns the seeded header (mirrors the command-guard allowlist),
-/// so the editor always opens with the instructional comment even before the
-/// first "Always allow" grant.
-pub fn read_mcp_allowed_tools_file(
-    user_dir: &Path,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let path = user_dir.join(MCP_ALLOWED_TOOLS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(MCP_ALLOWED_TOOLS_HEADER.to_string())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Atomically overwrite `<user_dir>/mcp-allowed-tools` with `contents`. The gate
-/// reads the file fresh on each prompt (see [`mcp_allowed_tools_patterns`]), so
-/// an edit takes effect on the next gated MCP call — no restart.
-pub fn write_mcp_allowed_tools_file(
-    user_dir: &Path,
-    contents: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::create_dir_all(user_dir)?;
-    let path = user_dir.join(MCP_ALLOWED_TOOLS_FILE);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// Record a granted "Always allow" by scope: `Session` into the in-memory
-/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file.
-/// No-op for scopes whose pattern doesn't derive. Mirrors
-/// `command_permission::record_command_allow_grant`.
+/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file
+/// ([`GrantFile::McpTools`]). No-op for scopes whose pattern doesn't derive.
+/// Mirrors `command_permission::record_command_allow_grant`.
 pub fn record_mcp_allow_grant(
     engine: &LucidosEngine,
     thread_id: Uuid,
@@ -222,7 +108,7 @@ pub fn record_mcp_allow_grant(
             pending.allow_session(thread_id, pattern);
         }
         AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = append_mcp_allowed_tool(engine.user_dir(), &pattern) {
+            if let Err(e) = grants::append(&engine.grants_dir(), GrantFile::McpTools, &pattern) {
                 crate::log!(
                     "[McpPermission] Failed to persist allow pattern {:?}: {}",
                     pattern,
@@ -489,7 +375,7 @@ impl LucidosEngine {
                 .cloned()
                 .unwrap_or_default()
         };
-        let persisted = mcp_allowed_tools_patterns(self.user_dir());
+        let persisted = grants::patterns(&self.grants_dir(), GrantFile::McpTools);
         if mcp_is_allowed(server_id, tool, |p| {
             session_patterns.contains(p) || persisted.iter().any(|x| x == p)
         }) {
@@ -646,59 +532,21 @@ mod tests {
         assert_eq!(mcp_gate(false, Some(EventChannel::Chat)), McpGate::Ask);
     }
 
+    /// The file and the gate agree: a broad grant persisted through
+    /// `core::grants` auto-allows a tool nobody has seen before. The file
+    /// mechanics themselves are covered in `core::grants`.
     #[test]
-    fn allowlist_roundtrip_append_then_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = Some(dir.path());
-        assert!(mcp_allowed_tools_patterns(p).is_empty());
-        append_mcp_allowed_tool(p, "Mcp(slack:channels_list)").unwrap();
-        append_mcp_allowed_tool(p, "Mcp(github:*)").unwrap();
-        // Duplicate append is a no-op.
-        append_mcp_allowed_tool(p, "Mcp(slack:channels_list)").unwrap();
-        let patterns = mcp_allowed_tools_patterns(p);
-        assert!(patterns.contains(&"Mcp(slack:channels_list)".to_string()));
-        assert!(patterns.contains(&"Mcp(github:*)".to_string()));
-        assert_eq!(
-            patterns
-                .iter()
-                .filter(|p| *p == "Mcp(slack:channels_list)")
-                .count(),
-            1,
-            "duplicate must not be appended twice"
-        );
-        // A persisted broad grant auto-allows a fresh tool on that server.
+    fn a_persisted_broad_grant_auto_allows_a_fresh_tool_on_that_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = grants::grants_dir(tmp.path());
+        grants::append(&dir, GrantFile::McpTools, "Mcp(github:*)").unwrap();
+
+        let patterns = grants::patterns(&dir, GrantFile::McpTools);
         assert!(mcp_is_allowed("github", "create_issue", |pat| patterns
             .iter()
             .any(|x| x == pat)));
-    }
-
-    #[test]
-    fn allowlist_missing_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(mcp_allowed_tools_patterns(Some(dir.path())).is_empty());
-        assert!(mcp_allowed_tools_patterns(None).is_empty());
-    }
-
-    #[test]
-    fn whole_file_read_missing_returns_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let contents = read_mcp_allowed_tools_file(dir.path()).unwrap();
-        assert_eq!(contents, MCP_ALLOWED_TOOLS_HEADER);
-    }
-
-    #[test]
-    fn whole_file_write_then_read_and_parse() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = format!("{MCP_ALLOWED_TOOLS_HEADER}Mcp(slack:channels_list)\nMcp(github:*)\n");
-        write_mcp_allowed_tools_file(dir.path(), &body).unwrap();
-        assert_eq!(read_mcp_allowed_tools_file(dir.path()).unwrap(), body);
-        let patterns = mcp_allowed_tools_patterns(Some(dir.path()));
-        assert_eq!(
-            patterns,
-            vec![
-                "Mcp(slack:channels_list)".to_string(),
-                "Mcp(github:*)".to_string()
-            ]
-        );
+        assert!(!mcp_is_allowed("slack", "post_message", |pat| patterns
+            .iter()
+            .any(|x| x == pat)));
     }
 }

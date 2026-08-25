@@ -72,23 +72,34 @@ test.describe('File preview inline editing', () => {
     await expect(textarea).toBeVisible({ timeout: 5_000 });
     await expect(textarea).toHaveValue(/original body/);
 
-    // Save is the neutral (blue) `.action-btn`, and it is inert until the draft
-    // actually differs from the content loaded at mount.
-    const saveBtn = page.locator('.file-editor-toolbar button:visible').filter({ hasText: 'Save' }).first();
-    await expect(saveBtn).toBeDisabled();
+    // With no unsaved changes the toolbar offers only Close. Save and Cancel
+    // arrive once the draft differs from the last-saved content. So a Save
+    // button here at all would mean the dirty gate is broken.
+    const toolbarBtn = (text: string) =>
+      page.locator('.file-editor-toolbar button:visible').filter({ hasText: text }).first();
+    await expect(toolbarBtn('Close')).toBeVisible();
+    await expect(page.locator('.file-editor-toolbar button:visible').filter({ hasText: 'Save' }))
+      .toHaveCount(0);
 
     // Replace the content and save.
     const marker = `edited-${Date.now()}`;
     await textarea.fill(`# E2E heading\n\n${marker}\n`);
-    await expect(saveBtn).toBeEnabled();
-    await saveBtn.click();
+    await expect(toolbarBtn('Save')).toBeEnabled();
+    await toolbarBtn('Save').click();
 
-    // Editor closes and the rendered preview reflects the new content.
+    // The editor STAYS OPEN after a save, and the toolbar falls back to Close
+    // as the draft becomes the new baseline. Leaving on save was the old
+    // behaviour, and it lost the thread of a multi-save edit.
+    await expect(toolbarBtn('Close')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.file-editor-textarea:visible').first()).toBeVisible();
+
+    // The write is persisted server-side, before anything re-reads it.
+    expect(await readMdFile(page, filePath)).toContain(marker);
+
+    // Close hands back to the rendered preview, which re-fetches.
+    await toolbarBtn('Close').click();
     await expect(page.locator('.file-editor-textarea')).toHaveCount(0, { timeout: 10_000 });
     await expect(page.locator('.file-preview-content:visible').first()).toContainText(marker, { timeout: 10_000 });
-
-    // The write is persisted server-side.
-    expect(await readMdFile(page, filePath)).toContain(marker);
   });
 
   test('cancel discards the draft', async ({ page }) => {

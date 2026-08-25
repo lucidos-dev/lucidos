@@ -18,13 +18,13 @@
 //! [`recover_orphan_command_permission_requests`].
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::core::grants::{self, GrantFile};
 use crate::engine::cc_permission::{DedupKey, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::command_guard::{
@@ -45,17 +45,6 @@ pub const SUPERSEDED_REASON: &str = "Superseded by a new message";
 /// Reason on a resolution the engine emits because the chat turn was canceled
 /// (Stop button) while the card was on screen.
 pub const CANCELED_REASON: &str = "Canceled by user";
-
-/// Persisted allowlist file under `~/.lucidos/` — the command-guard counterpart
-/// of `cc-allowed-tools`. Separate file because chat command patterns
-/// (`Bash(git:*)`, `Python`) are not CC `--allowedTools` patterns.
-const AGENT_ALLOWED_COMMANDS_FILE: &str = "agent-allowed-commands";
-const AGENT_ALLOWED_COMMANDS_HEADER: &str = "# Lucidos Agent command allowlist: one pattern per line. Lines starting with '#' are ignored.\n# Patterns: Bash(<head>:*) e.g. Bash(git:*) · Bash (any bash) · Python (any python).\n# A chained command (&&, |, ;) auto-allows only when EVERY segment's head is covered.\n";
-
-/// Compiled-in default allowlist — empty so the feature ships dark; users build
-/// their list via the per-prompt "Always allow" buttons (which append to the
-/// file) or by editing `agent-allowed-commands` directly.
-pub const DEFAULT_AGENT_ALLOWED_COMMANDS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Allow-pattern derivation (reuses `AllowScope`)
@@ -87,35 +76,17 @@ pub fn derive_command_allow_pattern(
     }
 }
 
-/// Whether the granted pattern set fully covers `command` — the auto-allow
+/// Whether the granted pattern set fully covers `command`, the auto-allow
 /// (skip the card) check. `allowed` answers "is this exact pattern granted?"
 /// over the union of the session set and the persisted allowlist.
 ///
-/// Bash: a broad `Bash` grant covers everything; otherwise EVERY command
-/// segment's head must be covered by its `Bash(<head>:*)` pattern — matching
-/// only the first head would let `git status && curl -X POST …` ride into a
-/// `Bash(git:*)` grant. A command with no derivable head is never auto-allowed
-/// (the card is shown). Python: the coarse `Python` pattern (the python tool
-/// has no finer sub-scope).
-///
-/// A head-derived grant is refused outright when the command carries a
-/// code-injecting `VAR=value` preamble. The head walk skips that preamble, so
-/// `LD_PRELOAD=/tmp/evil.so ls` resolves to `ls` and a `Bash(ls:*)` grant would
-/// auto-allow arbitrary loaded code with no card and no checkpoint. The Safe
-/// fast path already refuses it; this is the same refusal on the grant lane, via
-/// the one shared predicate. A broad `Bash` grant is deliberately still honoured:
-/// it means "any command", which this is one of.
+/// Bash routes to [`command_guard::grant_covers_command`], the one predicate
+/// the coding-agent session lane also uses, so the two cannot drift. Python
+/// takes the coarse `Python` pattern: the python tool has no finer sub-scope.
 pub fn command_is_allowed(tool_name: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
-            if allowed("Bash") {
-                return true;
-            }
-            if command_guard::command_has_code_injecting_env(command) {
-                return false;
-            }
-            let heads = command_guard::segment_heads(command);
-            !heads.is_empty() && heads.iter().all(|h| allowed(&format!("Bash({h}:*)")))
+            command_guard::grant_covers_command("Bash", command, allowed)
         }
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => allowed("Python"),
         _ => false,
@@ -130,116 +101,10 @@ fn bash_narrow_pattern(command: &str) -> Option<String> {
 // Persisted allowlist file (`agent-allowed-commands`)
 // ---------------------------------------------------------------------------
 
-/// Patterns from `<user_dir>/agent-allowed-commands` (one per line, blanks and
-/// `#` comments ignored). Empty on a missing file, a `None` user_dir, or an IO
-/// error — a read failure must never auto-allow, so it degrades to "no
-/// patterns" (the user re-approves once rather than the guard silently opening).
-pub fn agent_allowed_commands_patterns(user_dir: Option<&Path>) -> Vec<String> {
-    let Some(dir) = user_dir else {
-        return DEFAULT_AGENT_ALLOWED_COMMANDS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-    };
-    let path = dir.join(AGENT_ALLOWED_COMMANDS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.to_string())
-            .collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_AGENT_ALLOWED_COMMANDS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        Err(e) => {
-            crate::log!(
-                "[CommandGuard] Failed to read {}: {} — treating as no allowlist",
-                path.display(),
-                e
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Append `pattern` to `<user_dir>/agent-allowed-commands` if not already
-/// present. Creates the file (with the header comment) if it doesn't exist.
-/// Atomic write via tmp + rename. No-op when `user_dir` is `None`.
-pub fn append_agent_allowed_command(
-    user_dir: Option<&Path>,
-    pattern: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(dir) = user_dir else {
-        return Ok(());
-    };
-    let path = dir.join(AGENT_ALLOWED_COMMANDS_FILE);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            AGENT_ALLOWED_COMMANDS_HEADER.to_string()
-        }
-        Err(e) => return Err(e.into()),
-    };
-    if existing
-        .lines()
-        .map(str::trim)
-        .any(|l| !l.is_empty() && !l.starts_with('#') && l == pattern)
-    {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(pattern);
-    next.push('\n');
-    std::fs::create_dir_all(dir)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &next)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
-/// Read the raw contents of `<user_dir>/agent-allowed-commands` for the settings
-/// UI. A missing file returns the seeded header (mirrors `read_allowed_tools_file`
-/// in `engine::claude_code` for the CC allowlist), so the editor always opens
-/// with the instructional comment even before the first "Always allow" grant.
-pub fn read_agent_allowed_commands_file(
-    user_dir: &Path,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let path = user_dir.join(AGENT_ALLOWED_COMMANDS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(AGENT_ALLOWED_COMMANDS_HEADER.to_string())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Atomically overwrite `<user_dir>/agent-allowed-commands` with `contents`. The
-/// command guard reads the file fresh on each prompt (see
-/// [`agent_allowed_commands_patterns`]), so an edit takes effect on the next
-/// gated command — no restart. Mirrors `write_allowed_tools_file` in
-/// `engine::claude_code`.
-pub fn write_agent_allowed_commands_file(
-    user_dir: &Path,
-    contents: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::create_dir_all(user_dir)?;
-    let path = user_dir.join(AGENT_ALLOWED_COMMANDS_FILE);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// Record a granted "Always allow" by scope: `Session` into the in-memory
-/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file.
-/// No-op for scopes whose pattern doesn't derive. Mirrors the CC consent
-/// endpoint's `record_allow_grant`.
+/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file
+/// ([`GrantFile::AgentCommands`]). No-op for scopes whose pattern doesn't
+/// derive. Mirrors the CC consent endpoint's `record_allow_grant`.
 pub fn record_command_allow_grant(
     engine: &LucidosEngine,
     thread_id: Uuid,
@@ -256,7 +121,8 @@ pub fn record_command_allow_grant(
             pending.allow_session(thread_id, pattern);
         }
         AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = append_agent_allowed_command(engine.user_dir(), &pattern) {
+            if let Err(e) = grants::append(&engine.grants_dir(), GrantFile::AgentCommands, &pattern)
+            {
                 crate::log!(
                     "[CommandGuard] Failed to persist allow pattern {:?}: {}",
                     pattern,
@@ -720,7 +586,7 @@ impl LucidosEngine {
             summary,
             category,
         }) = self
-            .resolve_command_lane(ctx, tool_name, input, meta.channel, cancel_token)
+            .resolve_command_lane(ctx, tool_name, input, cancel_token)
             .await
         else {
             return GuardDecision::Refuse(canceled_refusal());
@@ -1000,15 +866,13 @@ impl LucidosEngine {
     /// ambiguous middle is classified on the trigger channel too (it was skipped
     /// in Phase 3, when triggers ran everything ambiguous).
     ///
-    /// `channel` is unused here now (both chat and triggers classify the middle)
-    /// but kept on the signature for symmetry with the caller and future
-    /// channel-specific routing.
+    /// It therefore takes no channel: both channels classify the middle the
+    /// same way. Add one back when a routing rule needs it.
     async fn resolve_command_lane(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
         tool_name: &str,
         input: &Value,
-        _channel: Option<EventChannel>,
         cancel_token: &CancellationToken,
     ) -> Option<JudgedClassification> {
         match command_guard::static_classify(tool_name, input) {
@@ -1098,7 +962,7 @@ impl LucidosEngine {
                 .cloned()
                 .unwrap_or_default()
         };
-        let persisted = agent_allowed_commands_patterns(self.user_dir());
+        let persisted = grants::patterns(&self.grants_dir(), GrantFile::AgentCommands);
         if command_is_allowed(tool_name, &command, |p| {
             session_patterns.contains(p) || persisted.iter().any(|x| x == p)
         }) {
@@ -1373,6 +1237,52 @@ mod tests {
         ));
     }
 
+    /// The derivation basenames, so a click on `/usr/bin/git push` stores
+    /// `Bash(git:*)`. Matching does not, so that grant cannot cover a binary
+    /// the agent wrote inside the workspace and pointed at by path.
+    #[test]
+    fn a_stored_grant_never_covers_a_path_qualified_head() {
+        for cmd in [
+            "data/bin/ls",
+            "./ls -la",
+            "/tmp/ls",
+            "sudo ./ls",
+            "ls && ./cat x",
+        ] {
+            assert!(
+                !command_is_allowed(
+                    tn::RUN_BASH,
+                    cmd,
+                    allowed_in(&["Bash(ls:*)", "Bash(cat:*)"])
+                ),
+                "{cmd} must not be auto-allowed by a bare-name grant"
+            );
+        }
+        // A bare name is still covered, privilege prefixes and ordinary
+        // assignments included, so no stored grant loses its everyday use.
+        for cmd in ["ls -la", "sudo ls", "FOO=1 ls", "ls && cat x"] {
+            assert!(
+                command_is_allowed(
+                    tn::RUN_BASH,
+                    cmd,
+                    allowed_in(&["Bash(ls:*)", "Bash(cat:*)"])
+                ),
+                "{cmd}"
+            );
+        }
+        // A broad grant means "any command", so it is unaffected.
+        assert!(command_is_allowed(
+            tn::RUN_BASH,
+            "data/bin/ls",
+            allowed_in(&["Bash"])
+        ));
+        // Derivation is unchanged: the stored pattern is still the basename.
+        assert_eq!(
+            derive_command_allow_pattern(tn::RUN_BASH, "/usr/bin/git push", AllowScope::Narrow),
+            Some("Bash(git:*)".to_string())
+        );
+    }
+
     #[test]
     fn python_is_allowed_only_by_coarse_python_grant() {
         assert!(command_is_allowed(
@@ -1393,56 +1303,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn allowlist_roundtrip_append_then_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = Some(dir.path());
-        assert!(agent_allowed_commands_patterns(p).is_empty());
-        append_agent_allowed_command(p, "Bash(git:*)").unwrap();
-        append_agent_allowed_command(p, "Python").unwrap();
-        // Duplicate append is a no-op.
-        append_agent_allowed_command(p, "Bash(git:*)").unwrap();
-        let patterns = agent_allowed_commands_patterns(p);
-        assert!(patterns.contains(&"Bash(git:*)".to_string()));
-        assert!(patterns.contains(&"Python".to_string()));
-        assert_eq!(
-            patterns.iter().filter(|p| *p == "Bash(git:*)").count(),
-            1,
-            "duplicate must not be appended twice"
-        );
-    }
-
-    #[test]
-    fn allowlist_missing_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(agent_allowed_commands_patterns(Some(dir.path())).is_empty());
-        assert!(agent_allowed_commands_patterns(None).is_empty());
-    }
-
-    #[test]
-    fn whole_file_read_missing_returns_header() {
-        // The settings editor opens with the instructional header even before
-        // the first grant creates the file.
-        let dir = tempfile::tempdir().unwrap();
-        let contents = read_agent_allowed_commands_file(dir.path()).unwrap();
-        assert_eq!(contents, AGENT_ALLOWED_COMMANDS_HEADER);
-    }
-
-    #[test]
-    fn whole_file_write_then_read_and_parse() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = format!("{AGENT_ALLOWED_COMMANDS_HEADER}Bash(git:*)\nPython\n");
-        write_agent_allowed_commands_file(dir.path(), &body).unwrap();
-        // Round-trips verbatim …
-        assert_eq!(read_agent_allowed_commands_file(dir.path()).unwrap(), body);
-        // … and the guard's pattern reader sees the edited entries (a delete in
-        // the editor removes a line; here we confirm what's written is read).
-        let patterns = agent_allowed_commands_patterns(Some(dir.path()));
-        assert_eq!(
-            patterns,
-            vec!["Bash(git:*)".to_string(), "Python".to_string()]
-        );
-    }
+    // The allowlist file itself (append, read, overwrite, parse) is covered in
+    // `core::grants`, which owns it for all three lanes.
 
     // --- action_for_lane: resolved-lane + channel gate + trigger grant ------
 
@@ -1675,6 +1537,7 @@ mod tests {
             tool_name: tn::RUN_BASH.to_string(),
             command: "curl -X POST https://api/charge".to_string(),
             out_of_workspace: false,
+            fast_path_refused: false,
         };
         let c = command_guard::fallback_classify(&ji);
         assert_eq!(c.lane, RiskLane::IrreversibleDanger);

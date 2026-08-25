@@ -18,6 +18,7 @@ import { loadInstalledPlugins } from '../../store/actions/plugins';
 import { openAppById } from '../../store/actions/apps';
 import { focusThread } from '../../store/actions/threads';
 import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall';
+import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { contentLabel } from './pluginContent';
@@ -115,11 +116,13 @@ export function StoreTabSkeleton() {
   );
 }
 
-/** Tooltip for the "Modified" badge: warns that a future update overwrites the
- *  local changes, and lists the changed paths (capped so the tooltip stays
- *  readable). */
+/** Tooltip for the "Modified" badge, listing the changed paths (capped so the
+ *  tooltip stays readable).
+ *
+ *  It used to warn that a future update would overwrite these changes. An
+ *  update now merges them, so saying so would be exactly backwards. */
 function modifiedTooltip(paths?: string[]): string {
-  const base = 'You have locally modified this plugin — a future update will overwrite your changes.';
+  const base = 'You have locally changed this plugin. An update merges your changes into the new version where it can.';
   if (!paths || paths.length === 0) return base;
   const shown = paths.slice(0, 6).join(', ');
   const more = paths.length > 6 ? `, +${paths.length - 6} more` : '';
@@ -513,6 +516,9 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
         </div>
       </div>
       <div class="list-row-actions">
+        {plugin?.modified && (
+          <ProposeUpstreamButton pluginId={plugin.id} pluginName={plugin.name} />
+        )}
         {isInstalled && (
           <button
             class="action-btn action-btn-danger"

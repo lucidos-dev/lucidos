@@ -66,13 +66,94 @@ thread has no distinct state either, so it reads as finished.
 
 If the user only wants it to happen **once, right now** — a check, a lookup, a computation — just do it inline; no trigger. But if the one-off is anchored to a **future time** ("remind me at 5pm", "ping me in 20 minutes"), it is NOT an inline task: you are not running at 5pm and nothing auto-resumes you, so an inline "reminder" is silently dropped. A future-time one-off needs a **one-shot trigger** (ideally self-deleting) — see "One-shot triggers" below.
 
-## The most important rule: `run.intent` is intent, not procedure
+## Write the knowhow file FIRST, then the intent
 
-A trigger's `run.intent` is **what the user would say** — one sentence in their voice. Everything about *how* (which API to hit, how to parse, what to retry, when to fall back) belongs in a knowhow file. The trigger thread looks up knowhow itself by calling `load_knowhow` at fire time — same as a chat session — so the trigger config has no per-trigger allow-list to configure. The HTTP API will accept a procedure-laden intent text and won't stop you — see `docs/taxonomy.md` § Triggers for the worked bad/good example.
+This is the rule most often got wrong, and it is got wrong because it used to be
+stated as a prohibition. "Don't put procedure in `run.intent`" tells you what
+not to write; a model holding a procedure and no other place to put it writes it
+anyway. So the rule is an **ordering**, and it comes before the `triggers` call:
 
-### Don't paste procedure into `run.intent` to "make sure" the LLM sees it
+> **If the work has any procedure at all — a script to run, a flag to pass, a
+> format to follow, a threshold to compute, a fallback, a file to read first —
+> write that procedure to a knowhow file BEFORE you create the trigger. Then
+> write `run.intent` in the user's voice, with none of it in there.**
 
-The trigger thread inherits the same knowhow surface a chat thread has: the system prompt's intent registry advertises what's available, and the LLM calls `load_knowhow` when it judges a recipe relevant. Writing the procedure inline to bypass that lookup turns the intent into a recipe and the next person who reads the trigger config can't tell what the user originally asked for. Keep the intent in the user's voice ("send me a daily summary of open PRs") and let the LLM pull the procedure on demand.
+Two steps, in that order, every time. The trigger thread looks knowhow up itself
+by calling `load_knowhow` at fire time, exactly as a chat session does, so there
+is no per-trigger allow-list to configure and nothing to wire: the file existing,
+with a precise `name` and `description`, is the whole mechanism. Placement rules are in `building-knowhow.md`.
+
+**A trigger-scoped file is the one you cannot write first.** Its path is
+`data/triggers/<slug>/knowhow/`, and the tools take no `slug`: the authoritative
+one exists only once the trigger has been created. Guess it and the file strands
+in a directory no thread of that trigger ever reads. So put the recipe in shared
+`data/knowhow/`, which is its right home unless it is useless to anything else.
+If it truly is private to this trigger, create the trigger first, read the slug
+back from the triggers list, then write the file before you reply.
+
+### The test to apply to your own draft
+
+Read each sentence of the intent and ask: **would deleting it change HOW the
+work gets done, or WHAT the user wants?** How belongs in knowhow. What stays.
+
+### Worked example
+
+The user says: *"Set this up to run on its own every morning, and notify me when
+the failure rate goes over the threshold we agreed."*
+
+**Bad**, one step, everything inline:
+
+```
+intent: "Every morning at six, write the Build Health report for example-repo
+         from the BuildObserved events of the previous day, following the
+         conventions in artifacts/build-health/conventions.md. Work out the
+         failure rate as a percentage with one decimal in Europe/Oslo time. If
+         it is over 25%, tell me. Never notify between 22:00 and 07:00, so an
+         alert that would land at six waits for the seven o'clock run."
+```
+
+Every clause after the first is procedure wearing the user's voice. Nothing was
+written to knowhow, so the next thread that needs the recipe rediscovers it, and
+a reader of the trigger config cannot tell what was actually asked for.
+
+**Good**, two steps. First the knowhow file, at
+`data/knowhow/build-health-report.md`. Shared, because that is the home you can
+write before the trigger exists, and a second thread may well want the recipe:
+
+```markdown
+---
+name: Build Health daily report recipe
+description: How the daily Build Health report is produced — the collector, the
+  rate calculation, the report format and the quiet-hours hold. Load when
+  writing or debugging the Build Health daily report or its trigger.
+---
+
+- Collect with `collect.py --offline <project>`. `collect.sh` always fails.
+- Rate = failures / builds, one decimal, Europe/Oslo. Alert over 25%.
+- Report file is `YYYY-MM-DD-health.md`; no table wider than four columns.
+- Quiet hours 22:00 to 07:00: hold a would-be alert until 07:00.
+```
+
+Then the trigger:
+
+```
+intent: "Every morning, write the Build Health report and tell me if the failure
+         rate is over the threshold. Stay quiet during my quiet hours."
+```
+
+Two sentences, both things the user would say. Delete either and what they want
+changes. Delete any line of the knowhow file and only the how changes.
+
+The HTTP API accepts a procedure-laden intent and will not stop you. See
+`docs/taxonomy.md` § Triggers for the same split stated as taxonomy.
+
+**Before you call the triggers tool, ask whether the work carries any procedure at all.** A script to run, a flag to pass, a format to follow, a fallback, a threshold to compute, a file to read. If it carries any of those, write them to a knowhow file FIRST, in shared `data/knowhow/`. Only then write `run.intent`, in the user's voice, with none of the procedure left in it.
+
+The trigger thread inherits the same knowhow surface a chat thread has: the
+system prompt's intent registry advertises what's available, and the LLM calls
+`load_knowhow` when it judges a recipe relevant. Writing the procedure inline to
+bypass that lookup turns the intent into a recipe, and the next person who reads
+the trigger config can't tell what the user originally asked for.
 
 ## Cron vs. `on` vs. both
 
@@ -81,6 +162,10 @@ The trigger thread inherits the same knowhow surface a chat thread has: the syst
 - **Both** — rare; usually means cron with a payload-shaped condition that should be event-driven instead. Re-examine before doing this.
 
 If the user says "notify me when X" and X isn't an event yet, you have two work items: (1) make X emit an event, (2) trigger on it. Tell the user that explicitly.
+
+**Check first whether the engine already emits it.** An `on:` entry takes a persisted thread event, a domain event your workspace emits, or a persisted **system event**: `BackupCompleted`, `BackupFailed`, `NotificationCreated`, `TriggerCompleted`, `PluginInstalled` and the rest (ADR 0113). "Tell me if a backup fails" needs no new emitter. What stays out is a transient frame such as `BackupProgress` or `Toast`, which writes no row and reaches no matcher. Subscribe to the event that ends the run instead. `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist" carries the full rule.
+
+**Do not guess the name.** Create and update both check every `on:` entry. A misspelled or retired engine name is refused, with the real one named, because an exact-string match would arm clean and never fire. A name outside the engine's set is accepted, with a warning when this workspace has never emitted it. Look one up with the `events` tool's `event_types` action.
 
 ### One trigger, multiple events
 
@@ -119,6 +204,8 @@ One consideration that is not about cost: **a whole-window recompute is idempote
 
 **The one hard rule here, and the exception to the surrounding guidance: a trigger must not subscribe to an event class its own run emits.** That is a feedback loop, not a tradeoff. The concrete case is an *intent* trigger on any LLM-activity event: its own model call emits the event it subscribes to. Only the script flavour is even arguable on that class of event.
 
+The engine backstops this rather than preventing it. An event a run emits dispatches one level deeper in the chain, and `MAX_EVENT_TRIGGER_DEPTH` (3) stops the chain there. So the loop ends after three fires instead of never. Three fires of an opus trigger is still a bill you did not mean to pay. That is why this is a rule, not a setting.
+
 Shapes worth knowing, roughly in the order they tend to fit:
 
 1. **A cron for the projection, with the consumer merging the recent tail itself.** It queries the event store for rows above the projection's stored cursor and folds them on top, so the reader is current without the projection being current. This is what the Token Cost dashboard does.
@@ -149,6 +236,49 @@ Both rules are load-bearing for the recipes below. Neither is a bug, and neither
 ```
 
 The engine warns (without refusing) when a single expression restricts both fields in a shape that fires rarely. It stays deliberately quiet for the 7-day windows below, which use the same AND on purpose.
+
+### Day-of-week numbering
+
+Write day-of-week in standard cron numbering: 0 and 7 both mean Sunday, 1 is
+Monday, and 6 is Saturday. The engine translates this for you before parsing
+the schedule.
+
+Underneath, the `cron` crate numbers days 1 (Sunday) through 7 (Saturday).
+`translate_dow_for_cron_crate` in
+`crates/lucidos-engine/src/engine/tools/scheduler.rs` rewrites each plain
+numeric day, or a plain `a-b` range, as `(n % 7) + 1` before the crate ever
+sees it. You never write the crate's own numbering yourself.
+
+| Day | Write (standard) | `cron` crate sees |
+|---|---|---|
+| Sunday | 0 or 7 | 1 |
+| Monday | 1 | 2 |
+| Tuesday | 2 | 3 |
+| Wednesday | 3 | 4 |
+| Thursday | 4 | 5 |
+| Friday | 5 | 6 |
+| Saturday | 6 | 7 |
+
+Named days (`Mon`, `MON-FRI`, `SAT,SUN`) bypass translation. The crate
+numbers names Sunday-first too, so a plain named day or an ordinary named
+range is safe as written. This check runs per comma segment. A mixed field
+(`Mon,1`) still shifts the numeric segment: `1` becomes Monday, same as
+`Mon`.
+
+`translate_dow_for_cron_crate` also leaves an out-of-range numeric token
+(`8`, `999`) untranslated, on purpose, and the crate rejects it. You get a
+parse error, never a silent wrong day. A numeric range-and-step token
+(`1-5/2`) fails validation, since the engine cannot shift it safely, even
+inside a mixed field like `Mon,1-5/2`. Write the days out instead (`1,3,5`),
+or use the named range form (`Mon-Fri/2`), which fires on the days written.
+
+A range that crosses Sunday fails in both forms. `5-0` (Friday through
+Sunday) becomes `6-1` after translation. `6-1` (Saturday through Monday)
+becomes `7-2`. Both have a start above their end, and the crate rejects that
+shape outright. The named form fails the same way: `Fri-Sun` numbers to
+`6-1` internally and hits the identical check. For a range that crosses
+Sunday, list the days instead of ranging them (`5,6,0` or `Fri,Sat,Sun`), or
+split into two cron expressions.
 
 ### nth weekday of the month
 
@@ -201,7 +331,45 @@ Set `condition` on a trigger subscription when the event is high-volume and you 
 
 Don't use `condition` for logic that depends on external state (e.g. "only if this app's data file says X"). Conditions are pure payload filters. Stateful checks belong inside the run.
 
-**One field is always available on a thread event: `thread_id`.** It is not in any event's payload (the engine supplies it from the thread the event belongs to), and it scopes a subscription to a single thread: `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `emit_event`) belongs to no thread and has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names has to be a real top-level field of that event's own payload.
+**One field is always available on a thread event: `thread_id`.** It is not in any event's payload: the engine supplies it from the thread the event belongs to. It scopes a subscription to a single thread, so `{ "event_type": "CodingAgentIdled", "condition": { "thread_id": "<uuid>" } }` fires only when THAT coding-agent session reaches a turn boundary. A **domain event** (one your workspace emits with `emit_event`) belongs to no thread. It has no such field, so a `thread_id` condition on one matches nothing. Everything else a condition names is a **field path** into that event's own payload.
+
+A persisted **system event** is the same case. `BackupFailed` belongs to no thread, so a `thread_id` condition never matches it. Condition on the variant's own fields instead, such as `filename` on `BackupCompleted`. The stored row wraps the event in a `type` / `data` envelope, and the matcher unwraps it for you, so never name those two keys.
+
+### What a condition can say
+
+A key is a **field path**. A bare name reads a top-level field, and dots read downwards: `{ "workflow_run.event": "schedule" }` matches a GitHub payload whose `workflow_run` object says `schedule`.
+
+Two rules keep a path honest. A key that exists verbatim wins at every level, so a webhook field literally named `a.b` is still nameable, even nested under another key. A path that resolves to nothing is null, exactly like a missing top-level field, so `{ "x": { "$ne": null } }` reads as "x exists and is not null".
+
+A numeric segment is an ordinary object key, never an array index. There is no way to say "any element of this array matches", so filter arrays inside the run.
+
+Operators, every one of which reads a field path:
+
+| Operator | Matches when |
+|---|---|
+| bare value | the value is exactly equal |
+| `$eq` / `$ne` | equal / not equal |
+| `$lt` `$lte` `$gt` `$gte` | numeric comparison |
+| `$in` / `$nin` | the value is in / is not in the list |
+| `$regex` | the value is a string containing a match |
+
+`$regex` is an unanchored search, so `^` and `$` anchor it and `(?i)` makes it case-insensitive. It only ever matches a JSON string: a number or an absent path is a miss.
+
+**AND is implicit.** Several keys in one condition all have to hold, and several operators on one key do too: `{ "tokens": { "$gte": 1000, "$lt": 5000 } }` is a range.
+
+**OR has two shapes.** `$in` ORs over one field's values. `$or` takes a list of whole conditions and ANDs with its siblings:
+
+```json
+{
+  "action": "completed",
+  "$or": [
+    { "workflow_run.conclusion": "failure" },
+    { "workflow_run.conclusion": "timed_out" }
+  ]
+}
+```
+
+A bad condition is refused when you create or update the trigger, naming what is wrong. An unknown operator, an unparseable `$regex` and a malformed `$or` are all errors rather than a trigger that arms and never fires.
 
 ## Notification discipline
 
@@ -467,6 +635,8 @@ If you genuinely need a different trigger (different *workflow*, not a tweak of 
 
 **`triggers(action="run", trigger_id)`.** That is the whole answer for a cron trigger. The CLI is `lucidos triggers run --id <uuid>`, the SDK is `lucidos.triggers.run(id)`, and the trigger's row in the panel has a **Run once** button. (Not to be confused with the Thread Queue panel's **Run now**, which force-admits an entry that is *already queued* and cannot create a fire.)
 
+**When you send the user to that button, link the TRIGGER, not the panel**: `[Nightly digest](trigger:<id>)`, with the id from `list_triggers`. The link lands on the trigger's own row, which is where **Run once**, the pause toggle and the last-run status are. `[Triggers](triggers)` opens the list and leaves them to find the row themselves.
+
 It is a real fire, so it records `TriggerExecuted` / `TriggerCompleted` and the panel's `last_run` and OK/failed status, and it runs under the trigger's own identity, its side-effect grant, and (for an `intent` run) its *trigger thread* and `go_to_review` routing. Downstream nothing distinguishes it from a scheduled fire, deliberately. It returns as soon as the run is admitted, not when the run finishes.
 
 Three answers other than "started", each of which you must relay as-is rather than reporting a run:
@@ -496,7 +666,7 @@ Don't call `create_trigger` from the user's first message. Most "create a trigge
 
 1. **Recurring or one-shot — and if one-shot, now or at a future time?** Triggers are for things that should keep happening, so a recurring need is always a trigger. A one-off splits by *when*: if it's "do this **now**" ("check X and tell me"), handle it inline — no trigger. If it's anchored to a **future time** ("remind me at 5pm today", "ping me in 20 minutes"), it CANNOT be handled inline — you are not running then and nothing auto-resumes you, so an inline reminder is silently dropped — so it needs a **one-shot trigger** (cron for that time, ideally self-deleting). Whenever you create a one-shot (a future reminder, or an explicit test like "fire once in 2 min"), ask whether it should delete itself after firing — it won't on its own. Create it with `go_to_review` omitted (so the fire-thread lands in Archive, not the Current section) unless the user explicitly wants to read the run afterwards. See "One-shot triggers" below for the procedure.
 2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is a trigger subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries, not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
-3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If you're tempted to write the procedure here, stop and put it in knowhow instead.
+3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If procedure comes to mind while you draft it, that is the signal to write the knowhow file first, see § "The most important rule".
 4. **Should it notify, and on what?** Default is silent — `send_notification` only fires when there's something the user wants to hear about. Confirm whether a successful run should notify, and what the message should look like.
 5. **Surface to review or stay silent?** Always ask unless the user's phrasing clearly answers it (see the table in "Where the thread lands"). `go_to_review: true` for "I want to read this when it finishes" (daily summaries, scheduled reports, alerts that need acknowledgement); omit for silent housekeeping. A `send_notification` doesn't answer this — notifications and review-surface are independent.
 6. **If updating an existing trigger:** confirm which one — see "Edit, don't recreate" above.
@@ -580,15 +750,18 @@ in `list_triggers`.
 1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone. For anything beyond a plain daily or weekly time, read § "Writing cron expressions" above: the AND/OR split, the nth-weekday and last-weekday recipes, and the combinations the engine rejects.
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. `on` (and whether `on` needs multiple entries)** before writing the trigger.
-4. **Write `run.intent` as the user would say it.**
-5. **If the trigger needs a procedure-laden recipe, write it to a knowhow file.** Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` — `<slug>` is fixed at creation (derived from the name when not given) and never re-derived, so after a rename the folder keeps the old name. The LLM tools take no `slug`; the CLI (`lucidos triggers create --slug`) and HTTP API do, and changing it strands `knowhow/` and `scripts/` under the old slug — see § "Renamed trigger → stale `run.path`". Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
+4. **Write the knowhow file, THEN `run.intent` as the user would say it.** The ordering is the rule, not a preference: see § "Write the knowhow file FIRST, then the intent" for the test and the worked example. Trigger-scoped recipes belong at `data/triggers/<slug>/knowhow/<descriptive>.md` — `<slug>` is fixed at creation (derived from the name when not given) and never re-derived, so after a rename the folder keeps the old name. The LLM tools take no `slug`; the CLI (`lucidos triggers create --slug`) and HTTP API do, and changing it strands `knowhow/` and `scripts/` under the old slug — see § "Renamed trigger → stale `run.path`". Broadly reusable recipes go in shared `data/knowhow/` (see `building-knowhow.md`). The trigger thread discovers knowhow the same way chat does — via `load_knowhow` calls the LLM makes itself — so there is no `run.knowhow` field to populate. Any legacy `run.knowhow:[...]` you might see in old `TriggerCreated` payloads is silently dropped by the deserializer; rewrite the intent to either name the relevant knowhow inline ("see `system-knowhow/X`") or be rich enough to nudge discovery from the system-prompt knowhow listing. Make the file's `name` and `description` frontmatter precise so semantic discovery finds it.
+
+   Shared `data/knowhow/` is what you can write first. Trigger-scoped is the
+   exception to the ordering: write that one *after* `create_trigger` returns,
+   because only then is `<slug>` authoritative.
 
 ## Common mistakes to avoid
 
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
 - **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
-- **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
+- **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. Almost always because the knowhow file was never written first. See "Write the knowhow file FIRST, then the intent" above.
 - **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Picking a trigger per event to maintain an aggregate without measuring first.** A trigger fire is a thread, not a callback, and a rollup's cost is usually dominated by the window it recomputes rather than by the rows that just arrived. Weigh it against a projection. See § "Aggregating events: cron, per event, or a projection".
 - **Assuming day-of-month and day-of-week are ORed.** They are ANDed, so `0 0 9 1 * Mon` is "the 1st when it falls on a Monday", not "the 1st and every Monday". Vixie cron behaves the other way, which is where the assumption comes from. See § "Writing cron expressions".

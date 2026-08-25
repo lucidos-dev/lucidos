@@ -249,49 +249,61 @@ pub(crate) async fn lock_repo_worktree_owned() -> tokio::sync::OwnedMutexGuard<(
     REPO_WORKTREE_MUTEX.clone().lock_owned().await
 }
 
-/// Retry budget for a `.git/index.lock` collision. The lock is held only for
-/// the duration of one index write (milliseconds), so a handful of short
-/// backoffs drains any real contention; the cap keeps a genuinely wedged lock
-/// from stalling a caller far past the 30s timeout on the command itself.
-const INDEX_LOCK_RETRIES: u32 = 20;
-const INDEX_LOCK_BACKOFF: Duration = Duration::from_millis(50);
+/// Retry budget for a git lock-file collision. A lock is held for one write
+/// only, which is milliseconds, so a handful of short backoffs drains any real
+/// contention. The cap keeps a genuinely wedged lock from stalling a caller far
+/// past the 30s timeout on the command itself.
+const LOCK_FILE_RETRIES: u32 = 20;
+const LOCK_FILE_BACKOFF: Duration = Duration::from_millis(50);
 
-/// `true` when a failed git invocation lost the race for `.git/index.lock`
-/// rather than failing on its own merits. git reports it as
-/// `fatal: Unable to create '<repo>/.git/index.lock': File exists.`
-pub(crate) fn is_index_lock_collision(stderr: &str) -> bool {
-    stderr.contains("index.lock")
-        && (stderr.contains("File exists") || stderr.contains("Unable to create"))
+/// `true` when a failed git invocation lost the race for one of the repo's lock
+/// files rather than failing on its own merits. git names the lock it could not
+/// take, and any of them can be the contended one:
+///
+/// ```text
+/// fatal: Unable to create '<repo>/.git/index.lock': File exists.
+/// error: cannot lock ref 'refs/heads/main': Unable to create '<repo>/.git/refs/heads/main.lock': File exists.
+/// ```
+///
+/// Both halves are load-bearing. The quoted `.lock'` keeps this off an unrelated
+/// failure that merely mentions a file called `Cargo.lock`. `File exists` is the
+/// collision itself, since git prints `strerror` after the lock path. A
+/// PERSISTENT reason for not creating it says so there (`Permission denied`, a
+/// read-only disk). That must fail on the first attempt, rather than burn the
+/// retry budget. The git2 side of the same question is
+/// `core::is_transient_repo_contention`.
+pub(crate) fn is_lock_file_collision(stderr: &str) -> bool {
+    stderr.contains(".lock'") && stderr.contains("File exists")
 }
 
-/// Like [`git_cmd`], but waits out a concurrent holder of `.git/index.lock`
+/// Like [`git_cmd`], but waits out a concurrent holder of a repo lock file
 /// instead of failing on the collision.
 ///
 /// A workspace repo has TWO independent writers: the shell `git` calls in this
 /// module, and libgit2 through `ArtifactManager` (artifact writes, the
-/// `commit_all_dirty` auto-commit after a script run). git's index lock is not
-/// a waiting lock, so whoever loses errors out immediately. A command that MUST
+/// `commit_all_dirty` auto-commit after a script run). A git lock is not a
+/// waiting lock, so whoever loses errors out immediately. A command that MUST
 /// land (the working-tree sync after `main` moves) therefore has to retry, or a
 /// routine millisecond-long collision leaves the repo in whatever half-state
 /// the loss interrupted.
 ///
 /// Only a lock collision is retried. Every other failure, and every transport
 /// error, is returned verbatim on the first attempt.
-pub(crate) async fn git_cmd_await_index_lock(
+pub(crate) async fn git_cmd_await_lock_file(
     args: &[&str],
     dir: &Path,
 ) -> Result<std::process::Output, String> {
     let mut attempt = 0;
     loop {
         let output = git_cmd(args, dir).await?;
-        if output.status.success() || attempt == INDEX_LOCK_RETRIES {
+        if output.status.success() || attempt == LOCK_FILE_RETRIES {
             return Ok(output);
         }
-        if !is_index_lock_collision(&String::from_utf8_lossy(&output.stderr)) {
+        if !is_lock_file_collision(&String::from_utf8_lossy(&output.stderr)) {
             return Ok(output);
         }
         attempt += 1;
-        tokio::time::sleep(INDEX_LOCK_BACKOFF).await;
+        tokio::time::sleep(LOCK_FILE_BACKOFF).await;
     }
 }
 

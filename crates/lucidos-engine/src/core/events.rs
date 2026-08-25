@@ -62,6 +62,8 @@ pub struct ThreadImageMeta {
     pub index: usize,
     pub source: &'static str,
     pub mime_type: String,
+    /// Position-free address, see [`image_handle`].
+    pub handle: String,
 }
 
 /// A single image found while walking thread events. The `base64` field is
@@ -72,6 +74,34 @@ pub struct ThreadImage {
     pub source: &'static str,
     pub base64: String,
     pub mime_type: String,
+    /// Position-free address, see [`image_handle`].
+    pub handle: String,
+}
+
+/// Hex characters of the content hash carried by an `img-` handle. 16 is 64
+/// bits, far past accidental collision inside one thread, and short enough
+/// that printing it beside `thread:N` costs about 8 tokens.
+const IMAGE_HANDLE_HEX: usize = 16;
+
+/// The stable, position-free address of a thread image: `img-<16 hex>`.
+///
+/// `thread:N` renumbers whenever an earlier image appears, so a number the
+/// agent noted in one turn can name a different picture in the next. This is
+/// content-addressed, so it survives renumbering, restarts and re-reads.
+///
+/// Derived from what the payload already carries: the sha256 the blob store
+/// keyed a user upload by, or a hash of a generated image's base64. Neither
+/// reads a file, which is what keeps `walk_thread_images_meta` free of blob
+/// reads. Two byte-identical images therefore share one address and resolve
+/// to the same picture, which is the right answer.
+pub fn image_handle(image_ref: ImageRef<'_>) -> String {
+    let hex = match image_ref {
+        // Already the sha256 of the bytes, so there is nothing to rehash.
+        ImageRef::BlobHash(hash) => hash.to_string(),
+        ImageRef::InlineBase64(b64) => crate::core::blobs::compute_hash(b64.as_bytes()),
+    };
+    let short: String = hex.chars().take(IMAGE_HANDLE_HEX).collect();
+    format!("img-{short}")
 }
 
 pub trait HasEventPayload {
@@ -129,7 +159,11 @@ fn walk_thread_image_refs<E: HasEventPayload>(
     })
 }
 
-enum ImageRef<'a> {
+/// Where one thread image's bytes live: the blob store, keyed by content
+/// hash, for a user upload; inline base64 in the event payload for a
+/// generated one.
+#[derive(Clone, Copy)]
+pub enum ImageRef<'a> {
     BlobHash(&'a str),
     InlineBase64(&'a str),
 }
@@ -156,6 +190,7 @@ pub fn walk_thread_images_meta<E: HasEventPayload>(
                 index: i + 1,
                 source,
                 mime_type,
+                handle: image_handle(image_ref),
             }
         })
         .collect()
@@ -190,6 +225,7 @@ pub fn walk_thread_images<E: HasEventPayload>(
                 source,
                 base64,
                 mime_type,
+                handle: image_handle(image_ref),
             }
         })
         .collect()

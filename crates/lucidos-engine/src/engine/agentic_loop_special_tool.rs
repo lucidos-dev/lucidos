@@ -393,6 +393,43 @@ impl LucidosEngine {
                     Ok(agent) => agent,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
+                // Refuse the two arguments this tool cannot honour, rather than
+                // accepting and dropping them. `run_session` owns both: it reads
+                // the allowlist from the user's `cc-allowed-tools` file and
+                // composes the system prompt itself. Both were declared in the
+                // schema for a year and silently discarded; the schema no longer
+                // declares them, and this catches a caller working from a stale
+                // one. Naming the owner matters, because the caller's next move
+                // differs: the allowlist is a Settings edit, not a spawn argument.
+                for (arg, owner) in [
+                    ("allowed_tools", "Settings › Coding agents › allowed tools"),
+                    ("append_system_prompt", "the engine's own session prompt"),
+                ] {
+                    if tool_args.get(arg).is_some_and(|v| !v.is_null()) {
+                        return Some(format!(
+                            "Error: run_coding_agent does not take `{arg}` — it is owned by \
+                             {owner} and a value here would be ignored. Remove it and re-spawn."
+                        ));
+                    }
+                }
+                // The model and effort pins, checked against the backend that
+                // will actually run them. A bad id fails the spawn HERE, in the
+                // same turn, so the caller learns its pin did not apply instead
+                // of reporting a model choice the session never made.
+                let spawn_model = match crate::runtime::validate_coding_agent_model(
+                    coding_agent,
+                    tool_args.get("model").and_then(|v| v.as_str()),
+                ) {
+                    Ok(m) => m,
+                    Err(e) => return Some(format!("Error: {}", e)),
+                };
+                let spawn_effort = match crate::runtime::validate_coding_agent_effort(
+                    coding_agent,
+                    tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
+                ) {
+                    Ok(e) => e,
+                    Err(e) => return Some(format!("Error: {}", e)),
+                };
                 let workspace_arg = tool_args
                     .get("workspace")
                     .and_then(|v| v.as_str())
@@ -615,6 +652,8 @@ impl LucidosEngine {
                     title: caller_title.map(str::to_string),
                     app_id: spawn_app_id,
                     coding_agent,
+                    model: spawn_model,
+                    reasoning_effort: spawn_effort,
                     origin,
                 };
                 let outcome = self.thread_queue.submit(request, None, None).await;
@@ -814,6 +853,26 @@ impl LucidosEngine {
             return "Error: pass `folder` (preferred) or `repo` (deprecated alias), not both."
                 .to_string();
         }
+        // Validate the pins HERE too. This path returns before the local
+        // spawn's validation, and the receiving engine cannot do it for us: it
+        // sees an ordinary `ChatRequest` and would apply its own default for an
+        // id it does not recognise, which is the silent-drop this whole change
+        // removes. The vocabulary is compiled into both engines, so checking on
+        // the sending side gives the caller the error in its own turn.
+        let model = match crate::runtime::validate_coding_agent_model(
+            coding_agent,
+            tool_args.get("model").and_then(|v| v.as_str()),
+        ) {
+            Ok(m) => m,
+            Err(e) => return format!("Error: {}", e),
+        };
+        let reasoning_effort = match crate::runtime::validate_coding_agent_effort(
+            coding_agent,
+            tool_args.get("reasoning_effort").and_then(|v| v.as_str()),
+        ) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: {}", e),
+        };
         let ctx = crate::engine::http::workspace_client::WorkspaceCallCtx {
             self_workspace: self.workspace_name(),
             source_thread_id: Some(source.thread_id),
@@ -826,6 +885,8 @@ impl LucidosEngine {
             repo,
             folder,
             coding_agent: Some(coding_agent),
+            model: model.as_deref(),
+            reasoning_effort: reasoning_effort.as_deref(),
         };
         match crate::engine::http::workspace_client::spawn_coding_agent_in_workspace(
             cross_workspace_http_client(),
@@ -907,7 +968,16 @@ impl LucidosEngine {
         cancel_token: &CancellationToken,
         thread_id: Uuid,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let tools = build_intent_tools();
+        // Context mode is forced OFF here, and it is the one gate this loop
+        // overrides. The mode is an agreement between a chat turn's prompt and
+        // its `notes` block, and this sub-loop assembles neither: it runs on
+        // its own system prompt with no history and no notes block. Leaving the
+        // gate open would offer a `notes` field pointing at a section of the
+        // instructions that this prompt does not have.
+        let tools = build_intent_tools(&crate::llm::ToolCapabilities {
+            context_mode: false,
+            ..self.read_turn_capabilities().await.gates
+        });
 
         // Pin ONE provider Arc for this whole intent sub-loop — a runtime swap
         // (credential added/removed) must not change the in-flight provider.
@@ -934,15 +1004,28 @@ impl LucidosEngine {
                 return Ok("Intent execution reached iteration limit.".to_string());
             }
 
-            // Trim context if needed. Intent sub-loops have no user message
-            // to pin — the seed messages were synthesized by the special-tool
-            // dispatcher, not typed by a user — so pass 2 trims freely and there
-            // is no current-turn image to keep.
+            // Trim context if needed. Intent sub-loops have no user message to
+            // pin, because the special-tool dispatcher synthesized the seed
+            // messages rather than a user typing them. So removal runs freely
+            // and there is no current-turn image to keep.
             // ~266k tokens at the 1.5 chars/token the budget assumes. (The old
             // comment here said "~100k tokens" — that was the retired chars/4
             // ratio; the value itself is unchanged.)
             let message_budget = 400_000;
-            trim_context_if_needed(&mut messages, message_budget, None, &[]);
+            // The intent sub-loop runs no context mode. Nothing is protected,
+            // nothing is held open, and a stub names its own way back exactly
+            // as the control arm's does.
+            trim_context_if_needed(
+                &mut messages,
+                message_budget,
+                None,
+                &[],
+                crate::engine::context::TrimGuards {
+                    protected: &Default::default(),
+                    held_open: &Default::default(),
+                    recovery: crate::engine::context::RecoveryClause::State,
+                },
+            );
 
             // Call LLM with no streaming (sub-loop doesn't stream text to frontend)
             let response = provider
@@ -990,7 +1073,15 @@ impl LucidosEngine {
                         )
                         .await;
                 }
-                assistant_blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            // `history_text`, not `content`. The surfacing above is the
+            // user-facing half and stays on `content`, so Gemini's unprintable
+            // narration reaches nobody. History still takes the model's own
+            // words, or the next round forgets what this one decided.
+            if let Some(text) = response.history_text() {
+                assistant_blocks.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
             }
             for tc in &response.tool_calls {
                 assistant_blocks.push(ContentBlock::ToolUse {

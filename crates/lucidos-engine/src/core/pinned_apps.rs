@@ -166,4 +166,31 @@ impl PinnedAppStore {
             .await?;
         Ok(())
     }
+
+    /// Move every pin from one device id to another, silently. Called only from
+    /// `DeviceStore::hand_over`, whose `DeviceHandedOver` is the announcement:
+    /// the pins are unchanged, only the id naming them is, so a pin event per
+    /// app would report changes nobody made. Registered as a `pinned_apps`
+    /// exemption in `core::announced_surfaces`.
+    ///
+    /// Takes a connection rather than the pool, because the hand-over is one
+    /// transaction and a pool call would run outside it. Rows already under
+    /// `new_id` belong to a device that does not exist, so they are cleared
+    /// first: `UNIQUE (app_id, ui_id, device_id)` would otherwise abort the move.
+    pub async fn move_device(
+        conn: &mut sqlx::PgConnection,
+        old_id: &str,
+        new_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("DELETE FROM pinned_apps WHERE device_id = $1")
+            .bind(new_id)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("UPDATE pinned_apps SET device_id = $2 WHERE device_id = $1")
+            .bind(old_id)
+            .bind(new_id)
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
 }

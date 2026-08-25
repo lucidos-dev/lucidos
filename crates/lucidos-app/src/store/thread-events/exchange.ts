@@ -276,9 +276,18 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   // Models pruned from the picker (disabled in the registry) but still present
   // in historical exchanges — keep their labels so old threads don't render a
   // bare id.
+  ['claude-opus-4-8@default', 'Opus 4.8'],
+  ['claude-opus-4-8@default[1m]', 'Opus 4.8 (1M)'],
+  ['claude-opus-4-7', 'Opus 4.7'],
+  ['claude-opus-4-7[1m]', 'Opus 4.7 (1M)'],
+  ['claude-sonnet-4-6', 'Sonnet 4.6'],
+  ['claude-sonnet-4-6[1m]', 'Sonnet 4.6 (1M)'],
   ['claude-opus-4-6', 'Opus 4.6'],
   ['claude-opus-4-6[1m]', 'Opus 4.6 (1M)'],
   ['claude-opus-4-5@20251101', 'Opus 4.5'],
+  ['gpt-5.5', 'GPT-5.5'],
+  ['gpt-5.4', 'GPT-5.4'],
+  ['gpt-5.3-codex', 'GPT-5.3 Codex'],
   ['gpt-5.2-codex', 'GPT-5.2 Codex'],
   ['gpt-5.3-codex-spark', 'Codex Spark'],
   ['claude-opus-4-1', 'Opus 4.1'],
@@ -289,13 +298,13 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['claude-opus-4-8[1m]', 'Opus 4.8 (1M)'],
   ['claude-haiku-4-5-20251001', 'Haiku 4.5'],
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
-  ['opus', 'Opus 4.6'],
-  ['opus[1m]', 'Opus 4.6 (1M)'],
-  // Mirrors the picker row's label, which is deliberately version-free: `sonnet`
-  // is CC's always-latest alias, so a stored one says nothing about WHICH Sonnet
-  // ran. Naming a version here would be a fresh false claim on every old thread
-  // the moment Anthropic repoints the alias, which is how the previous
-  // 'Sonnet 4.6' went stale.
+  // Mirrors the picker rows, deliberately version-free: `opus` and `sonnet`
+  // are CC's own always-latest aliases, so a stored version says nothing
+  // about WHICH generation ran. Naming one goes stale the moment Anthropic
+  // repoints the alias, which is how 'Opus 4.6' and 'Sonnet 4.6' both went
+  // stale before.
+  ['opus', 'Opus (latest)'],
+  ['opus[1m]', 'Opus (latest, 1M)'],
   ['sonnet', 'Sonnet (latest)'],
   // `sonnet[1m]` was dropped from the CC picker (it selects nothing different
   // now that `sonnet` resolves to Sonnet 5 with a native 1M window). Older
@@ -328,11 +337,31 @@ export function exchangeTimestamp(exchange: Exchange): string {
     || new Date().toISOString();
 }
 
-/** Derive the response timestamp — the latest step event's `created` timestamp.
- *  Returns undefined if there are no step events (no response yet). */
+/** Steps that record something ABOUT a turn rather than part of it. Both render
+ *  nothing in the response body, and both can land arbitrarily later than the
+ *  work: an archive whenever the user gets round to it, a session end at the
+ *  next engine shutdown. Skipping them costs nothing: neither draws a row, so
+ *  the scan below cannot step over one on its way past them.
+ *
+ *  They stay steps. `exchangeStatus` reads `SessionEnded` for the shutdown and
+ *  session-end verdicts, and dropping either from the walk would change
+ *  grouping for every consumer to fix one header. */
+const NON_RESPONSE_STEP_TYPES: ReadonlySet<string> = new Set([
+  'ThreadArchived',
+  'SessionEnded',
+]);
+
+/** Derive the response timestamp: when the turn's last visible step landed.
+ *  Returns undefined if there are no such steps (no response yet).
+ *
+ *  Skipping `NON_RESPONSE_STEP_TYPES` is what keeps the header honest. Read one
+ *  and the panel dates the turn by something outside it, so a quick reply
+ *  archived hours later reports hours of work. */
 export function exchangeResponseTimestamp(exchange: Exchange): string | undefined {
   for (let i = exchange.steps.length - 1; i >= 0; i--) {
-    if (exchange.steps[i].event.created) return exchange.steps[i].event.created;
+    const { event } = exchange.steps[i];
+    if (NON_RESPONSE_STEP_TYPES.has(event.type)) continue;
+    if (event.created) return event.created;
   }
   return undefined;
 }

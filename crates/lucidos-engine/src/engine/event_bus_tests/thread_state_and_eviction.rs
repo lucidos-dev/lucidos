@@ -1070,6 +1070,248 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
     teardown_test_db(&db_name).await;
 }
 
+/// The sibling above with ONE extra fact: the thread already had a pending
+/// change when the switch tore it down. That fact was enough to lose the whole
+/// verdict. See
+/// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
+///
+/// `AbortCause::status_sql` used to answer `'waiting'` instead of the verdict
+/// whenever `coding_agent_proposed` was set, reasoning that a change to review
+/// outranks the interruption. But `'waiting'` is not a
+/// `PRESERVED_STATUS_VERDICTS` value, so the drain landing milliseconds later
+/// wrote `'running'` over it. Both such threads came back spinning, with
+/// transcripts reading "Paused by restart". The Review view dropped them too,
+/// since `threadInReview` excludes a running thread. The precedence was never
+/// the problem: `resolveVisualStatus` already ranks the verdicts above
+/// `changes`.
+///
+/// `ChangeProposed` is the second half. That teardown proposed on both threads
+/// well after their aborts, and that arm wrote `'idle'` over anything but
+/// `'running'` until it too became verdict-preserving. Both verdicts run here,
+/// because both arms carried the identical override.
+#[tokio::test]
+async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let status_of = |thread_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let coding_agent = crate::runtime::CodingAgent::ClaudeCode;
+    let cc_meta = || EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+    // A change id is workspace-wide, so the two cases below must not share one:
+    // the second would land on the first's `changes` row.
+    let propose = |change_id: String| ThreadEvent::ChangeProposed {
+        change_id,
+        description: Some("Fix".into()),
+        files: vec!["src/main.rs".into()],
+        requires_restart: false,
+        origin: None,
+        commit_sha: None,
+        branch_name: "claude-code/fix".into(),
+        repo_root: "/tmp".into(),
+        hardened: false,
+        incomplete: false,
+        path: String::new(),
+        diff: String::new(),
+    };
+
+    for (case, actor, verdict) in [
+        (
+            "user switch",
+            MessageOrigin::Device {
+                device_id: "dev-1".into(),
+                label: "My MacBook".into(),
+            },
+            "paused",
+        ),
+        (
+            "teardown nobody asked for",
+            MessageOrigin::system(),
+            "failed",
+        ),
+    ] {
+        let thread_id = Uuid::new_v4();
+
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionStarted {
+                coding_agent,
+                session_id: "cc-session".into(),
+                branch: "claude-code/fix".into(),
+                repo_id: None,
+                coding_agent_kind: Default::default(),
+                coding_agent_folder: String::new(),
+                app_id: None,
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+
+        // The change the turn had already proposed before the switch. It leaves
+        // the thread running, and sets the flag the old override keyed on.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: propose(format!("c-earlier-{verdict}")),
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            "running",
+            "{case}: a mid-session proposal must not end the live turn"
+        );
+
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+                cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                actor: Some(actor),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            verdict,
+            "{case}: the abort records its verdict whether or not a change is \
+             pending. The change surfaces through coding_agent_proposed."
+        );
+
+        // The dying subprocess's drain, the step that used to erase it.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentToolResult {
+                name: "Bash".into(),
+                result: "ok".into(),
+                coding_agent,
+                tool_use_id: String::new(),
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentTextStreamed {
+                text: "\n\nCommitting.".into(),
+                coding_agent,
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            verdict,
+            "{case}: trailing drain output must not resurrect the thread to \
+             'running'. This is the spinner the user reported."
+        );
+
+        // The proposal the teardown itself produced, on its way out.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: propose(format!("c-teardown-{verdict}")),
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            verdict,
+            "{case}: a change proposed while the turn dies is a trailing event \
+             like any other, and must leave the verdict alone"
+        );
+
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::CodingAgentIdled {
+                has_changes: true,
+                is_external_repo: false,
+                requires_restart: false,
+                cc_session_id: None,
+                coding_agent,
+                reason: Some("engine_restart_interrupt".into()),
+                worktree_path: None,
+                worktree_head_sha: None,
+                bg_bash_pending: false,
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionEnded {
+                reason: SessionEndReason::Shutdown,
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            verdict,
+            "{case}: neither the idle nor the session teardown may downgrade it"
+        );
+
+        // Still a verdict, not a wedge.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ContinuationRequested {
+                reason: "auto_resume_after_switch".into(),
+            },
+            meta: cc_meta(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            status_of(thread_id).await,
+            "running",
+            "{case}: the resume is a start event and clears the verdict"
+        );
+
+        let proposed: bool = sqlx::query_scalar(
+            "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            proposed,
+            "{case}: the change is still there to review. It was never the \
+             status column's job to say so."
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// `paused` is the promise "the engine is bringing this turn back", so only the
 /// abort that carries such a promise may write it. Three shapes go through the
 /// real projection here, differing ONLY in the pair the verdict reads:

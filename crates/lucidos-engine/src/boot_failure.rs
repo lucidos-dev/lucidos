@@ -172,10 +172,8 @@ async fn post_failure(port: &str, id: &str, message: &str) {
     // Same posture as `boot_report` / `api/history.rs::restart_via_gateway`:
     // loopback call to the co-located gateway, accept its self-signed dev cert,
     // bypass any ambient proxy.
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = crate::gateway_auth::client_builder()
         .timeout(REPORT_TIMEOUT)
-        .no_proxy()
-        .danger_accept_invalid_certs(true)
         .build()
     else {
         return;

@@ -5,6 +5,11 @@
 use super::super::*;
 use crate::engine::chat::PreEmittedOrigin;
 
+/// How long a follow-up waits for the turn ahead of it before that turn is
+/// treated as wedged and evicted. Named so the log line and the doc comment
+/// cannot drift from the value.
+const STUCK_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl LucidosEngine {
     /// Get a reference to the embedder for sharing with read-only handlers
     pub fn embedder(&self) -> &Arc<crate::memory::EmbedderSlot> {
@@ -94,31 +99,12 @@ impl LucidosEngine {
             .map(|h| (h.injection_notify.clone(), h.pending_injections.clone()))
     }
 
-    /// Register a new active thread (sync, no queuing). Used by callers that
-    /// know the thread is free (e.g., CC tool-spawned threads with unique IDs).
-    pub fn register_thread(
-        &self,
-        thread_id: Uuid,
-    ) -> (
-        CancellationToken,
-        mpsc::UnboundedReceiver<InjectedPrompt>,
-        ThreadGuard,
-    ) {
-        let token = CancellationToken::new();
-        let (injection_tx, injection_rx) = mpsc::unbounded_channel();
-        let gen = THREAD_GENERATION.fetch_add(1, Ordering::Relaxed);
-        let mut threads = self.active_threads.lock().unwrap();
-        threads.insert(
-            thread_id,
-            ThreadHandle::new(token.clone(), injection_tx, gen),
-        );
-        let guard = ThreadGuard {
-            active_threads: self.active_threads.clone(),
-            thread_id,
-            completion_notify: self.thread_completion.clone(),
-            generation: gen,
-        };
-        (token, injection_rx, guard)
+    /// Admit one run on `thread_id`, or refuse because a turn already owns it.
+    /// The engine's entry point to [`crate::engine::try_register_thread`], where
+    /// the single-flight contract is documented.
+    pub fn try_register_thread(&self, thread_id: Uuid) -> Option<ThreadRegistration> {
+        crate::engine::try_register_thread(&self.active_threads, &self.thread_completion, thread_id)
+            .admitted()
     }
 
     /// Register a thread, waiting for any existing request on the same thread
@@ -126,79 +112,52 @@ impl LucidosEngine {
     /// in-progress work. The user must explicitly cancel if they want to
     /// interrupt the current request.
     ///
-    /// Safety: if the existing thread doesn't finish within 60 seconds, it is
-    /// force-cancelled and evicted. This prevents follow-up messages from
-    /// hanging forever if a CC task gets stuck (e.g., process crash without
-    /// proper guard cleanup).
-    pub async fn register_thread_queued(
-        &self,
-        thread_id: Uuid,
-    ) -> (
-        CancellationToken,
-        mpsc::UnboundedReceiver<InjectedPrompt>,
-        ThreadGuard,
-    ) {
-        let wait_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            loop {
-                let n = {
-                    let threads = self.active_threads.lock().unwrap();
-                    if threads.contains_key(&thread_id) {
-                        let mut completions = self.thread_completion.lock().unwrap();
-                        completions
-                            .entry(thread_id)
-                            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-                            .clone()
-                    } else {
-                        return;
-                    }
-                };
-                log!(
-                    "[Chat] Thread {} is busy, queuing follow-up request",
-                    thread_id
-                );
-                // 100ms fallback guards against missed notify_waiters() — if the
-                // notification fired between contains_key and .await, we
-                // retry after 100ms and re-check the map.
-                tokio::select! {
-                    _ = n.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-            }
-        })
-        .await;
-
-        if wait_result.is_err() {
-            log!(
-                "[Chat] Thread {} stuck for 60s — force-cancelling and evicting",
-                thread_id
-            );
-            // Engine-initiated abort — emit ResponseAborted with actor=System
-            // BEFORE cancelling the token. Without this, the downstream cancel
-            // arms default to ResponseCanceled (because they read
-            // is_shutdown=false), which the frontend renders as user-initiated
-            // "Canceled" — misleading users into thinking they pressed Stop.
-            emit_stuck_thread_eviction_abort(
-                &self.event_bus,
-                &self.pool,
-                &self.agent_sessions,
-                &self.active_threads,
-                thread_id,
-            )
-            .await;
-            self.force_evict_chat_thread(thread_id);
-        }
-
-        self.register_thread(thread_id)
+    /// Safety: if the existing thread doesn't finish within
+    /// [`STUCK_TURN_TIMEOUT`], it is force-cancelled and evicted. This prevents
+    /// follow-up messages from hanging forever if a CC task gets stuck (e.g.,
+    /// process crash without proper guard cleanup).
+    ///
+    /// Both exits take the slot through the single-flight functions, so this
+    /// never installs a handle over a live turn. A caller that can coalesce a
+    /// redundant wake should reach for [`Self::try_register_thread`] first and
+    /// inject on a refusal. Queueing a second turn for one logical event is
+    /// still a second paid model call.
+    pub async fn register_thread_queued(&self, thread_id: Uuid) -> ThreadRegistration {
+        crate::engine::admit_with_stuck_turn_eviction(
+            &self.active_threads,
+            &self.thread_completion,
+            thread_id,
+            STUCK_TURN_TIMEOUT,
+            || async {
+                // Engine-initiated abort: emit ResponseAborted with actor=System
+                // BEFORE the eviction cancels the token. Without it the
+                // downstream cancel arms default to ResponseCanceled, since
+                // they read is_shutdown=false. The frontend renders that as a
+                // user-initiated "Canceled", so users think they pressed Stop.
+                emit_stuck_thread_eviction_abort(
+                    &self.event_bus,
+                    &self.pool,
+                    &self.agent_sessions,
+                    &self.active_threads,
+                    thread_id,
+                )
+                .await;
+            },
+        )
+        .await
     }
 
     /// Remove a chat thread's `ThreadHandle` from `active_threads`, cancel its
     /// token, and notify any completion waiters. The agentic loop's own
-    /// `ThreadGuard::drop` will then no-op (generation mismatch). Used by
-    /// (a) `register_thread_queued`'s 60s force-eviction and (b) the
-    /// `/api/v1/restart` chat pre-emit, where stripping the entry up-front
-    /// removes the thread from `processing_thread_ids()` so the subsequent
-    /// `shutdown_active_threads` sweep doesn't double-emit a System abort on
-    /// top of the device "Paused by restart" panel we just persisted.
+    /// `ThreadGuard::drop` will then no-op (generation mismatch).
+    ///
+    /// One caller: the `/api/v1/restart` chat pre-emit. Stripping the entry
+    /// up-front takes the thread out of `processing_thread_ids()`. The
+    /// `shutdown_active_threads` sweep then leaves it alone, instead of
+    /// double-emitting a System abort over the device "Paused by restart"
+    /// panel just persisted. The stuck-turn eviction does NOT use this:
+    /// freeing the slot and taking it are one step there
+    /// ([`crate::engine::evict_and_register`]).
     pub(super) fn force_evict_chat_thread(&self, thread_id: Uuid) {
         if let Some(handle) = self.active_threads.lock().unwrap().remove(&thread_id) {
             handle.token.cancel();
@@ -318,6 +277,7 @@ impl LucidosEngine {
         parent_thread_id: Uuid,
         child_thread_id: Uuid,
         child_completed_event_id: Uuid,
+        child_terminal_event_id: Option<Uuid>,
         parent_is_coding_agent: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Same formatter `build_session_messages` uses on reload, so the
@@ -350,7 +310,12 @@ impl LucidosEngine {
         // parent still learns everything it would have; only the duplicate turn
         // is dropped.
         if self
-            .child_completion_has_an_event_wait(parent_thread_id, child_completed_event_id, &row)
+            .child_completion_has_an_event_wait(
+                parent_thread_id,
+                child_completed_event_id,
+                child_terminal_event_id,
+                &row,
+            )
             .await
         {
             crate::log!(
@@ -412,7 +377,14 @@ impl LucidosEngine {
     /// - The dispatcher HAS run: the wait is gone from the cache, but its
     ///   `EventWaitDelivered` names this event id.
     ///
-    /// **Both probes answer "no" when they cannot run.** No is the recoverable
+    /// **The delivery may name the child's TERMINAL, not the card.** A wait
+    /// armed on `CodingAgentIdled OR ChildThreadCompleted` for one child
+    /// describes one logical event twice, and resolves on whichever arm lands
+    /// first. So `child_terminal_event_id` is threaded here from the emit
+    /// site. Matching on that id keeps a LATER completion of the same child
+    /// wakeable, since its terminal is a different row.
+    ///
+    /// **Every probe answers "no" when it cannot run.** No is the recoverable
     /// direction: it costs a duplicate turn the user can read, where a wrong
     /// yes leaves the parent with a completion card and no reaction at all. The
     /// one gap this leaves is a wait taken from the cache whose delivery emit
@@ -422,6 +394,7 @@ impl LucidosEngine {
         &self,
         parent_thread_id: Uuid,
         child_completed_event_id: Uuid,
+        child_terminal_event_id: Option<Uuid>,
         row: &crate::core::EventRow,
     ) -> bool {
         // Probe 1, the live cache. Scoped to a wait that actually MATCHES this
@@ -438,48 +411,24 @@ impl LucidosEngine {
             }
         }
 
-        // Probe 2, the persisted resolution.
-        match sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM events d \
-                 WHERE d.aggregate = 'thread' \
-                   AND d.aggregate_id = $1 \
-                   AND d.event_type = 'EventWaitDelivered' \
-                   AND d.payload->>'event_id' = $2 \
-             )",
-        )
-        .bind(parent_thread_id.to_string())
-        .bind(child_completed_event_id.to_string())
-        .fetch_one(self.pool())
-        .await
-        {
-            Ok(consumed) => consumed,
-            Err(e) => {
-                crate::log!(
-                    "[FanOut] Event-wait consumption probe failed for parent {}: {} \
-                     (sending the callback anyway; a duplicate turn beats a silent parent)",
-                    parent_thread_id,
-                    e
-                );
-                false
-            }
+        // Probe 2, the persisted resolution. Either id counts: an OR-wait
+        // resolves on one arm, and which arm won says nothing about whether
+        // the parent has been told.
+        let mut delivered_ids = vec![child_completed_event_id.to_string()];
+        if let Some(terminal_id) = child_terminal_event_id {
+            delivered_ids.push(terminal_id.to_string());
         }
+        crate::engine::event_wait::wait_delivery_names_any(
+            self.pool(),
+            parent_thread_id,
+            &delivered_ids,
+        )
+        .await
     }
 
     /// Get a reference to the memory extractor (for Flash title generation, etc.)
     pub fn extractor(&self) -> Option<&crate::memory::MemoryExtractor> {
         self.extractor.as_ref()
-    }
-
-    /// Does this thread have a live chat loop right now?
-    ///
-    /// The single-thread question `processing_thread_ids` answers in bulk, so a
-    /// caller that only cares about one thread does not allocate the whole
-    /// list. Used by the event-wait dispatcher: a delivery can only fill a
-    /// parked turn's dangling tool call in, so a thread that is already running
-    /// has to be re-entered as a new exchange instead.
-    pub fn thread_is_processing(&self, thread_id: Uuid) -> bool {
-        self.active_threads.lock().unwrap().contains_key(&thread_id)
     }
 
     /// Get list of thread IDs with a live processing task (chat loop running).
@@ -556,13 +505,8 @@ impl LucidosEngine {
             }
         };
         if let Some(ref extractor) = self.extractor {
-            let title_model = PreferenceStore::get(&self.pool, PREF_MODEL_TITLE)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let provider = match extractor.provider_for_model(&title_model) {
-                Ok(p) => p,
+            let call = match chat::title_call(&self.pool, extractor).await {
+                Ok(call) => call,
                 Err(e) => {
                     log!("[Thread] Failed to build title provider: {}", e);
                     return;
@@ -584,7 +528,7 @@ impl LucidosEngine {
 
                 chat::emit_generated_title(
                     &bus,
-                    provider.as_ref(),
+                    &call,
                     tid_uuid,
                     &first_msg,
                     image_desc.as_deref(),

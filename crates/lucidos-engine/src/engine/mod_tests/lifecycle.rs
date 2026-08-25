@@ -36,18 +36,124 @@ fn guard_drop_does_not_cancel_token() {
 }
 
 #[test]
-fn reregister_same_id_replaces_token_without_cancel() {
-    // register_thread (sync) replaces the token in the map but does NOT
-    // cancel the old one. Cancellation is only done by explicit cancel_thread.
+fn two_wakes_for_one_child_completion_admit_one_run() {
+    // The live incident. A child completing produced two independent wakes for
+    // its parent: the `EventWaitDelivered` re-entry for the awaited
+    // `CodingAgentIdled`, and the fan-in's own `ChildThreadCompleted` drive.
+    // Both reached admission with no turn yet registered.
+    //
+    // The predecessor inserted unconditionally, so both came back owning the
+    // thread and two agentic loops ran side by side, every tool call twice.
+    // Exactly one may win. The loser coalesces (see the test below).
     let threads = make_threads();
+    let completions = make_completions();
     let tid = Uuid::new_v4();
-    let (old_token, _old_rx, _old_guard) = register(&threads, tid);
-    let (new_token, _new_rx, _new_guard) = register(&threads, tid);
+
+    let wait_reentry = try_register_thread(&threads, &completions, tid).admitted();
+    let fan_in_drive = try_register_thread(&threads, &completions, tid).admitted();
+
+    assert!(wait_reentry.is_some(), "the first wake owns the turn");
     assert!(
-        !old_token.is_cancelled(),
-        "old token must NOT be cancelled on re-register"
+        fan_in_drive.is_none(),
+        "the second wake must be refused, not handed a second live handle"
     );
-    assert!(!new_token.is_cancelled(), "new token must not be cancelled");
+    assert_eq!(
+        threads.lock().unwrap().len(),
+        1,
+        "one handle for one thread, always"
+    );
+}
+
+#[test]
+fn admission_is_single_flight_under_real_parallelism() {
+    // The same invariant where it actually has to hold: several OS threads
+    // asking at once, released together by a barrier. Every one of them saw a
+    // free map under the old check-then-insert, and every one of them was
+    // handed a run.
+    const RACERS: usize = 8;
+    let threads = make_threads();
+    let completions = make_completions();
+    let tid = Uuid::new_v4();
+    let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let threads = threads.clone();
+            let completions = completions.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                try_register_thread(&threads, &completions, tid).admitted()
+            })
+        })
+        .collect();
+
+    // Collected, not dropped inside the racer: a guard released early would
+    // free the slot and let a later racer win it honestly.
+    let admitted: Vec<_> = racers
+        .into_iter()
+        .filter_map(|r| r.join().expect("racer must not panic"))
+        .collect();
+
+    assert_eq!(
+        admitted.len(),
+        1,
+        "exactly one of {} concurrent admissions may own the thread",
+        RACERS
+    );
+}
+
+#[test]
+fn a_released_thread_admits_the_next_run() {
+    // The refusal is about a LIVE turn, not about the thread id. Once the
+    // guard drops, the next run is admitted normally.
+    let threads = make_threads();
+    let completions = make_completions();
+    let tid = Uuid::new_v4();
+
+    let first = try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .expect("thread is free");
+    assert!(try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .is_none());
+
+    drop(first);
+    assert!(
+        try_register_thread(&threads, &completions, tid)
+            .admitted()
+            .is_some(),
+        "a released thread must admit the next run"
+    );
+}
+
+#[test]
+fn a_refused_wake_still_reaches_the_live_turn() {
+    // What the loser does instead of starting a second run: the prompt goes
+    // into the running turn's channel. One turn reads both wakes, which is the
+    // whole point of refusing rather than queueing.
+    let threads = make_threads();
+    let completions = make_completions();
+    let tid = Uuid::new_v4();
+
+    let (_token, mut rx, _guard) = try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .expect("free");
+    assert!(try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .is_none());
+
+    let injected = threads
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .expect("the live turn's handle")
+        .inject(test_prompt("[CHILD THREAD COMPLETED] nightly e2e"));
+    assert!(injected, "the refused wake must be injectable");
+    assert_eq!(
+        rx.try_recv().unwrap().text,
+        "[CHILD THREAD COMPLETED] nightly e2e"
+    );
 }
 
 #[test]
@@ -463,26 +569,91 @@ async fn stuck_thread_force_evicted_after_timeout() {
 }
 
 #[tokio::test]
-async fn old_guard_drop_does_not_remove_new_registration() {
-    // After force-eviction, the old ThreadGuard still exists. When it
-    // drops, it must NOT remove the new registration (different generation).
+async fn the_stuck_turn_eviction_hands_the_slot_straight_over() {
+    // The one sanctioned way past a refusal, and the only place a handle is
+    // replaced rather than added. Freeing the slot and taking it are one step,
+    // so nothing can slip in between. The evicted turn keeps unwinding, and
+    // its guard must not then remove the replacement.
     let threads = make_threads();
+    let completions = make_completions();
     let tid = Uuid::new_v4();
 
-    // Register old thread
-    let (_old_token, _old_rx, old_guard) = register(&threads, tid);
-    assert!(threads.lock().unwrap().contains_key(&tid));
+    let (stuck_token, _stuck_rx, stuck_guard) = try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .expect("thread is free");
+    let stuck_generation = stuck_guard.generation();
 
-    // Force-evict: remove old handle, register new one (simulates timeout path)
-    threads.lock().unwrap().remove(&tid);
-    let (_new_token, _new_rx, _new_guard) = register(&threads, tid);
-    assert!(threads.lock().unwrap().contains_key(&tid));
+    let (fresh_token, _fresh_rx, _fresh_guard) =
+        evict_and_register(&threads, &completions, tid, stuck_generation)
+            .expect("the wedged turn is still the holder");
+    assert!(
+        stuck_token.is_cancelled(),
+        "the evicted turn must be told to stop"
+    );
+    assert!(!fresh_token.is_cancelled(), "the replacement runs");
+    assert_eq!(threads.lock().unwrap().len(), 1);
 
-    // Drop the old guard — must NOT remove the new registration
-    drop(old_guard);
+    drop(stuck_guard);
     assert!(
         threads.lock().unwrap().contains_key(&tid),
-        "old guard drop must not remove new registration (different generation)"
+        "the evicted guard must not remove the replacement (generation mismatch)"
+    );
+}
+
+#[tokio::test]
+async fn a_second_timed_out_waiter_cannot_evict_the_first_ones_replacement() {
+    // Several follow-ups queue behind one wedged turn, so their 60 s budgets
+    // expire together. The first evicts and installs a replacement, and that
+    // replacement is live work. An unconditional eviction let the next waiter
+    // remove it, cancel it, and install a third handle. That is the very
+    // two-runs-on-one-thread state the single-flight guard exists to prevent.
+    let threads = make_threads();
+    let completions = make_completions();
+    let tid = Uuid::new_v4();
+
+    let (_stuck_token, _stuck_rx, stuck_guard) = try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .expect("thread is free");
+    // Both waiters observed the wedged turn before either timed out.
+    let stuck_generation = stuck_guard.generation();
+
+    let (first_token, _first_rx, _first_guard) =
+        evict_and_register(&threads, &completions, tid, stuck_generation)
+            .expect("the first waiter evicts the wedged turn");
+
+    assert!(
+        evict_and_register(&threads, &completions, tid, stuck_generation).is_none(),
+        "the second waiter must be refused: the slot is a live replacement now"
+    );
+    assert!(
+        !first_token.is_cancelled(),
+        "the first waiter's turn must keep running"
+    );
+    assert_eq!(threads.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn eviction_is_refused_once_the_wedged_turn_releases_on_its_own() {
+    // The other way the expected generation goes stale: the turn finished
+    // between the budget expiring and the eviction. There is nothing to evict,
+    // and the caller goes back to ordinary admission.
+    let threads = make_threads();
+    let completions = make_completions();
+    let tid = Uuid::new_v4();
+
+    let (_token, _rx, guard) = try_register_thread(&threads, &completions, tid)
+        .admitted()
+        .expect("thread is free");
+    let generation = guard.generation();
+    drop(guard);
+
+    assert!(
+        evict_and_register(&threads, &completions, tid, generation).is_none(),
+        "an empty slot is not something to evict"
+    );
+    assert!(
+        threads.lock().unwrap().is_empty(),
+        "a refused eviction must install nothing"
     );
 }
 

@@ -31,10 +31,10 @@ pub(crate) fn model_id_from_env() -> String {
 /// True when a `FastEmbedProvider::new()` error is a model-download / network
 /// failure (HF unreachable, request timed out, too many retries) rather than a
 /// logic / data bug. Decides two things: whether a real-embedder test may SKIP
-/// (`test_util::shared_embedder`), and whether engine construction may boot
-/// DEGRADED with an empty [`super::EmbedderSlot`] instead of failing — a
-/// packaged first run with no network must still boot (the model retries in
-/// the background), while a corrupt cached model must stay a loud, fatal bug.
+/// (`test_util::shared_embedder`), and whether the background loader retries or
+/// gives up (`engine::memory::embedder_retry`). Boot never depends on it, since
+/// construction always installs an empty [`super::EmbedderSlot`]. A corrupt
+/// cached model stops the retries and disables memory instead of failing boot.
 ///
 /// The match walks the **entire error source chain**, not just the top
 /// message: `fastembed` wraps the underlying transport error with anyhow
@@ -140,10 +140,10 @@ impl FastEmbedProvider {
     pub fn with_model(id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (model, dimensions) = resolve_model(id)?;
         let options = InitOptions::new(model).with_show_download_progress(true);
-        // A failed init surfaces on the boot path (a fetch-class failure boots
-        // DEGRADED via `EmbedderSlot`; anything else is fatal before HTTP
-        // binds) — make the failure name the model, the cache, and the two
-        // remedies instead of surfacing a bare hf-hub transport error.
+        // A failed init surfaces from the background loader, after HTTP binds:
+        // it retries a fetch-class failure and gives up on anything else. Make
+        // the failure name the model, the cache, and the two remedies instead
+        // of surfacing a bare hf-hub transport error.
         // `{e:#}` (anyhow alternate) flattens the WHOLE cause chain into the
         // text: this wrap turns the error into a plain string, and
         // `is_model_fetch_failure` reads the network markers from it.

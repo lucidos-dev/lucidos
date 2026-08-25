@@ -1,18 +1,19 @@
 import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, disarmFollowSeed } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
 /**
  * Pressing a turn control leaves the reader looking at the same pixel.
  *
- * `withScrollAnchor` (CreateThreadView) holds the pressed turn still while every
- * turn in the transcript changes height around it, by writing the scroll offset
- * the anchor's own movement asks for. The correction has to be measured in
- * DOUBLES: `offsetTop` is rounded to a whole pixel by the platform, so a delta
- * built from two of them is wrong by the difference of the two roundings, and
- * that difference FLIPS SIGN between the toggle's two states. Reported
+ * `withScrollAnchor` (CreateThreadView) holds the reader's own topmost line
+ * still. Every turn in the transcript changes height around it, and the
+ * correction writes the scroll offset that line's movement asks for.
+ *
+ * It has to be measured in DOUBLES. The platform rounds `offsetTop` to a whole
+ * pixel. A delta built from two of them is wrong by the difference of the two
+ * roundings, and that difference FLIPS SIGN between the states. Reported
  * 2026-08-11 as "a slight jump up and down as i toggle the show last answer",
  * with the two clues that pin the mechanism: it happened whether the steps
  * control was on or off, and it did not happen on a thread too short to scroll
@@ -90,9 +91,18 @@ function dropThread(threadId: string): void {
   ].join(';\n'));
 }
 
-/** Press the full-response control on a turn whose header is fully on screen,
- *  and report how far that header moved plus how much the transcript's height
- *  changed (so the case can be shown to be non-vacuous).
+/** Press the full-response control on a turn whose header is on screen. Reports
+ *  how far the READER'S OWN LINE moved, and how much the transcript's height
+ *  changed, so the case can be shown to be non-vacuous.
+ *
+ *  Their line, not the pressed turn. The correction holds the topmost row they
+ *  can see, so that is where its rounding shows up. The pressed turn is only
+ *  the last resort, and on a tall turn it is nowhere near them.
+ *
+ *  `null` when the press REMOVES that line, which the full-response control
+ *  does to superseded prose. Nothing of the reader's is left to hold then, and
+ *  they land on the seam instead. That is a different contract with a different
+ *  bound: `steps-toggle-holds-the-reader.spec.ts`.
  *
  *  The press is dispatched INSIDE the page rather than through Playwright's
  *  click, because Playwright scrolls a target into view first and that scroll
@@ -103,24 +113,48 @@ async function pressAndMeasure(page: Page): Promise<{ drift: number; heightChang
       .find(el => el.getBoundingClientRect().height > 0);
     if (!tc) return null;
     const box = tc.getBoundingClientRect();
-    let anchor: HTMLElement | null = null;
+    // The first line the reader can actually read, mirroring `readerTopEdge`
+    // and the sliver the anchor scan takes.
+    let edge = box.top;
+    for (const child of Array.from(tc.children) as HTMLElement[]) {
+      if (!child.matches('[data-scroller-pinned]')) continue;
+      const r = child.getBoundingClientRect();
+      if (r.height > 0 && r.bottom > edge) edge = r.bottom;
+    }
+    // Mirrors `anchorCandidates`: the reader's TURN first, then the topmost row
+    // inside it. Scanning every row in the transcript instead names a different
+    // element whenever the turn reaching the edge holds no row that does. The
+    // drift would then measure something the correction never held.
+    const reaches = (el: HTMLElement) => {
+      const r = el.getBoundingClientRect();
+      return r.height > 0 && r.bottom > edge + 1;
+    };
+    const turn = (Array.from(tc.children) as HTMLElement[])
+      .find(child => !child.matches('[data-scroller-pinned]') && reaches(child));
+    if (!turn) return null;
+    const line = Array.from(turn.querySelectorAll<HTMLElement>('.response-content > *')).find(reaches);
+    if (!line) return null;
+
+    let btn: HTMLElement | null = null;
     for (const ex of Array.from(tc.querySelectorAll<HTMLElement>('.chat-exchange'))) {
       const h = ex.querySelector<HTMLElement>('.response-header');
       if (!h) continue;
       const r = h.getBoundingClientRect();
-      if (r.top > box.top + 4 && r.bottom < box.bottom - 4) { anchor = ex; break; }
+      if (r.top > box.top + 4 && r.bottom < box.bottom - 4) {
+        btn = ex.querySelector<HTMLElement>('[data-role="toggle-details"]');
+        break;
+      }
     }
-    if (!anchor) return null;
-    const header = anchor.querySelector<HTMLElement>('.response-header')!;
-    const btn = anchor.querySelector<HTMLElement>('[data-role="toggle-details"]')!;
+    if (!btn) return null;
 
-    const before = header.getBoundingClientRect().top;
+    const before = line.getBoundingClientRect().top;
     const heightBefore = tc.scrollHeight;
     btn.click();
     // Past the correction, its next-frame re-check, and any late settle.
     await new Promise(r => setTimeout(r, 600));
+    if (!line.isConnected) return null;
     return {
-      drift: header.getBoundingClientRect().top - before,
+      drift: line.getBoundingClientRect().top - before,
       heightChange: tc.scrollHeight - heightBefore,
     };
   });
@@ -154,10 +188,18 @@ async function park(page: Page, frac: number): Promise<void> {
 }
 
 test.describe('A turn control holds the reader still', () => {
-  test('the full-response toggle moves the pressed turn by under half a pixel, at a fractional root font size', async ({ page }) => {
+  test("the full-response toggle moves the reader's line by under half a pixel, at a fractional root font size", async ({ page }) => {
     await assertHealthy(page);
     const threadId = seedThread('Turn control anchor');
     try {
+      // This spec is about a reader who has PARKED somewhere and pressed a
+      // control. The follow seed ships armed, so without this the thread opens
+      // riding the live edge. `park()` writes `scrollTop` directly rather than
+      // as a gesture, and a direct write is not what disarms a ride.
+      // `withScrollAnchor` then skips the correction on purpose: a carried
+      // reader asked for the opposite of being held still. The press reads as a
+      // jump of hundreds of pixels, not the sub-pixel drift under test.
+      await disarmFollowSeed(page);
       await navigateToApp(page);
       await openThreadDrawer(page);
       await clearToasts(page);
@@ -193,7 +235,7 @@ test.describe('A turn control holds the reader still', () => {
           ).toBeGreaterThan(100);
           expect(
             Math.abs(m.drift),
-            `scale ${scale} (root ${rootPx}px) press ${press}: the pressed turn moved ${m.drift}px`,
+            `scale ${scale} (root ${rootPx}px) press ${press}: the reader's line moved ${m.drift}px`,
           ).toBeLessThanOrEqual(MAX_DRIFT_PX);
         }
       }

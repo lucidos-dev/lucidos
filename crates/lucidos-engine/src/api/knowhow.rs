@@ -24,12 +24,16 @@ pub struct ListKnowhowResponse {
     pub knowhow: Vec<KnowhowEntry>,
 }
 
-/// List all known knowhow ids. Returns the merged user knowhow (local >
-/// shared) followed by engine-shipped system-knowhow with the
-/// `system-knowhow/` prefix already applied to ids. Each group is
-/// alphabetical (inherited from the loader); system entries follow user
-/// entries so callers (e.g. the file-preview "did you mean" suggestion)
-/// can group them naturally.
+/// List the knowhow docs. Returns the merged user knowhow (local > shared)
+/// followed by engine-shipped system-knowhow with the `system-knowhow/`
+/// prefix already applied to ids. Each group is alphabetical (inherited from
+/// the loader); system entries follow user entries so callers (e.g. the
+/// file-preview "did you mean" suggestion) can group them naturally.
+///
+/// Docs, not every file. A user root lists what
+/// [`crate::core::KnowhowListDepth`] counts as a doc, so a doc's own
+/// references are as absent here as from the Know-how routing list.
+/// `/knowhow/read` still reads any of them by full id.
 pub(super) async fn list_knowhow(State(state): State<AppState>) -> Json<ListKnowhowResponse> {
     let kh_dirs = state.engine.knowhow_dirs();
     let mut entries: Vec<KnowhowEntry> = KnowhowStore::load_merged_summaries(&kh_dirs)

@@ -142,10 +142,10 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-09. Anything not
+The currently-accepted categories, counted as of 2026-08-24. Anything not
 on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 76 sites across 48 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 79 sites across 49 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -153,6 +153,9 @@ on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
+  One of the 79 shares an attribute with `format_in_format_args`, which is
+  the same site that entry counts. Grepping the bare form alone therefore
+  reports 78 across 48 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 5 sites: intentionally-unused dispatcher
   variants (`agent_session/spawn_dispatcher.rs`, two of them) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -173,13 +176,18 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 258 sites across 89 files, every one of them
-  a test file: 86 `*.test.ts` plus three `*.test.tsx`
+  `@types/node` in project**, 458 sites across 160 files, every one of them
+  test-only code: 153 `*.test.ts`, six `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
-  `components/chat/__tests__/welcome-onboarding.test.tsx` and
-  `components/chat/__tests__/event-wait-surfaces.test.tsx`, all three of
-  which read a fixture through `node:fs`). The expectation is real: TS
-  does not know about Node globals, but Vitest provides them. Adding
+  `components/chat/__tests__/welcome-onboarding.test.tsx`,
+  `components/chat/__tests__/event-wait-surfaces.test.tsx`,
+  `components/picker/__tests__/pairing-code-boxes.test.tsx`,
+  `components/settings/__tests__/mcp-servers-page.test.tsx` and
+  `components/shared/__tests__/apps-glyph-single-source.test.tsx`), and one
+  Vitest-only helper, `styles/__tests__/css-rule-helpers.ts`, which imports
+  `node:fs` for two of the sites. The
+  expectation is real: TS does not know about Node globals, but Vitest
+  provides them. Adding
   `@types/node` to the project would contaminate the browser type-graph.
   Only the first site in a file spells the reason out; the rest say
   `same`, which counts as justified because it points at an explanation
@@ -188,16 +196,21 @@ on this list is fair game to remove and re-fix:
   older wording asserted there were none, and nothing checked it. The
   count grows with the test suite, so treat a mismatch here as ordinary
   drift to restate rather than as a finding, and check only that every
-  leftover the snippet prints is still a test file.
-- **`// eslint-disable-next-line`**, 8 sites across 4 files and 4 rules:
+  leftover the snippet prints is still test-only code. The helper is why
+  that says test-only code rather than a test file: it lives under
+  `__tests__/` and nothing else imports it.
+- **`// eslint-disable-next-line`**, 9 sites across 5 files and 5 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in
   `utils/perfProbe.ts` (permanent console-based perf instrumentation,
   whose module doc says exactly that), `@typescript-eslint/no-implied-eval`
   in `sw.test.ts` (the test evaluates service-worker source through `new
-  Function`), and `@typescript-eslint/no-explicit-any` in
+  Function`), `@typescript-eslint/no-explicit-any` in
   `components/chat/__tests__/prompt-vdom-keys.test.ts` (a `VNode<any>`
-  alias for VDOM-key assertions). **No eslint config ships in this repo**,
+  alias for VDOM-key assertions), and `no-new-func` in
+  `__tests__/cold-start-fast-path.test.ts`, which runs the inline
+  cold-start program through `new Function` the way `sw.test.ts` runs the
+  service worker. **No eslint config ships in this repo**,
   so phase 5 always skips and none of these suppress anything today. They
   are kept rather than deleted because each would be correct the moment a
   config lands. Do not "clean them up" on the grounds that they are
@@ -256,6 +269,79 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   are type checked by nothing, though they do execute: the app's
   `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
   the vitest include list, so `/run-tests` runs them.
+
+- **Phase 4's entry chunk is 661.64 kB against its 600 kB ceiling, and the
+  2026-08-25 run left it there.** `vite build` exits 0 and prints no code
+  diagnostic. What fires is Rollup's size advisory against
+  `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
+  `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
+  it. Both halves of that instruction stand. This entry reports one run,
+  and never licenses the next one to skip the phase.
+
+  **Clearing it IS clean-build's job when a clean cut exists.** Look for
+  that shape first: eagerly imported, never mounted on the path that pays
+  for it. `94d1dd817` found it in the workspace picker and took the chunk
+  from 607 kB to 585 kB. The 2026-08-24 run found one more of that shape in
+  `PairingGate`, which `main.tsx` still imported statically while rendering
+  it only under `IS_PICKER`. Splitting it took 664.98 kB to 657.02 kB.
+
+  That cut costs the picker one extra round trip, which `main.tsx` explains
+  at the split.
+
+  **The on-demand surfaces can no longer close the gap.** That is new since
+  2026-08-19, when the same list was 36 kB against a 36 kB gap. It stopped
+  there on a product call. Sourcemap attribution now puts the whole list at
+  about 38 kB, against a 61.64 kB gap:
+
+  | Surface | kB of the built chunk |
+  |---|---|
+  | `PermissionCard` | 10.01 |
+  | `CodingAgentControlMenu` | 8.52 |
+  | `ThreadFilterPanel` | 5.91 |
+  | `WorkspaceSwitcher` | 4.30 |
+  | `QuestionCard` | 3.98 |
+  | `TodoListPanel` | 2.96 |
+  | `OverflowMenu` | 2.38 |
+
+  So paying the loading-flash trade on every permission prompt would still
+  leave the advisory firing. The next cut has to come out of first-paint
+  code instead, which is a wider decision than this skill makes.
+
+  Growth is diffuse rather than one mistake. The rest of the top is
+  `icons.tsx` at 19.85 kB, `ThreadDrawer.tsx` at 17.85 and `store.ts` at
+  16.80. The three thread-event exchange modules add 41.5 kB between them. A
+  first paint reaches all of them.
+
+  **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
+  the lever.** A barrel is the one shape that splits with no loading flash.
+  The entry chunk holds every icon a lazy view reaches. Moving those out
+  costs no round trip, because the lazy chunk already loads.
+
+  Only five of the 62 icons are reached by lazy chunks alone. They are
+  `FolderUpIcon`, `FolderIcon`, `EyeOffIcon`, `ChevronLeftIcon` and
+  `ChevronRightIcon`, worth 4.2 kB of source and less once minified.
+  Re-measure before spending the churn, rather than assuming the split is
+  free money.
+
+  To attribute bytes, run
+  `npx vite build --sourcemap --outDir dist.smap` in `crates/lucidos-app`,
+  read `dist.smap/assets/index-*.js.map`, then delete `dist.smap`. Use the
+  CLI flag, not `build.sourcemap` in `vite.config.ts`. A config edit can be
+  left behind, and a scratch outDir keeps the served `dist/` untouched.
+
+  Each on-demand split also needs a preparatory move, because the panels
+  export first-paint state from the same module as the component:
+  `hooks/useThreadsHeaderState.ts` imports `filterButtonState` from
+  `ThreadFilterPanel`, and `PromptInput.tsx` imports
+  `codingAgentMenuOpenRequest` from `CodingAgentControlMenu`. The signal
+  has to move to its own module first or the component stays eager.
+
+  **Do not reach for `manualChunks` here.** Measured: forcing those eight
+  components into a named chunk drops the entry chunk to 243.26 kB, which
+  looks like a fix and is not one. Rollup relocates the shared core into
+  the named chunk, which the entry statically imports, so first paint
+  downloads the same bytes in two files. It clears the advisory while
+  changing nothing the advisory is about.
 
 ## Out of scope
 

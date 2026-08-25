@@ -56,6 +56,34 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(30);
 /// badge" prompt without meaningful idle cost.
 const SERVED_FRONTEND_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Pure: what the build-watch's status document says went wrong, if anything.
+///
+/// `None` for a healthy build, for a document that will not parse, and for one
+/// that reports a failure with no message. Every one of those means "nothing to
+/// add", and the caller then keeps the generic advice it always gave.
+///
+/// The shape is written by `crates/lucidos-app/dev-build-watch.mjs`. This reads
+/// it rather than sharing a type, since one side is a JavaScript dev tool and
+/// the other is a Rust engine. The field name plus this test is what binds them.
+fn build_failure_reason(status_json: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(status_json).ok()?;
+    if doc.get("ok")?.as_bool()? {
+        return None;
+    }
+    let reason = doc.get("error")?.as_str()?.trim();
+    (!reason.is_empty()).then(|| reason.to_string())
+}
+
+/// The build-watch's status for the checkout that owns `served_dir`.
+///
+/// `served_dir` is `<app>/dist`, and the watcher keeps its state one level up in
+/// `<app>/.build-watch/`. An absent file is the ordinary case on any stack whose
+/// watcher predates the status file, so it is a quiet `None`.
+fn read_build_failure(served_dir: &Path) -> Option<String> {
+    let status = served_dir.parent()?.join(".build-watch/status.json");
+    build_failure_reason(&std::fs::read_to_string(status).ok()?)
+}
+
 /// Whether the source `dist/` has been republished with a client different from
 /// the one we currently serve — i.e. the build-watch's rebuild has landed.
 /// `None` current (couldn't read the served snapshot) + a readable source → treat
@@ -159,13 +187,19 @@ impl LucidosEngine {
     /// `dist/` this engine serves is not the one being republished. Deliberately
     /// NOT `FrontendUpdateDeferred`: that one promises "arrives on Switch", which
     /// here would be false.
-    async fn emit_frontend_update_stranded(&self, served_dir: &Path, in_worktree: bool) {
+    async fn emit_frontend_update_stranded(
+        &self,
+        served_dir: &Path,
+        in_worktree: bool,
+        build_error: Option<String>,
+    ) {
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::System(
                     crate::engine::event_bus::SystemEvent::FrontendUpdateStranded {
                         served_dir: served_dir.display().to_string(),
                         served_in_worktree: in_worktree,
+                        build_error,
                         sent_at_ms: crate::engine::now_epoch_millis(),
                     },
                 ),
@@ -343,6 +377,13 @@ impl LucidosEngine {
                 // lands eventually and the ~10s peer sync advances the snapshot on
                 // its own. Claiming "will never arrive" there would be wrong.
                 let in_worktree = crate::paths::path_is_in_cc_worktree(&source);
+                let build_error = read_build_failure(&source);
+                if let Some(reason) = build_error.as_deref() {
+                    crate::log!(
+                        "[Frontend] the build-watch reports a FAILING build, which is why \
+                         nothing republished: {reason}"
+                    );
+                }
                 if in_worktree {
                     crate::log!(
                         "[Frontend] frontend-only Apply STRANDED: {} is inside a coding-agent \
@@ -360,7 +401,7 @@ impl LucidosEngine {
                         REBUILD_WAIT_TIMEOUT.as_secs()
                     );
                 }
-                self.emit_frontend_update_stranded(&source, in_worktree)
+                self.emit_frontend_update_stranded(&source, in_worktree, build_error)
                     .await;
                 return;
             }
@@ -585,7 +626,8 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        applying_git_gate, frontend_advance_is_safe, peer_git_gate, source_rebuilt, BuildState,
+        applying_git_gate, build_failure_reason, frontend_advance_is_safe, peer_git_gate,
+        read_build_failure, source_rebuilt, BuildState,
     };
 
     #[test]
@@ -658,5 +700,63 @@ mod tests {
             Some("engine2"),
             "engine1"
         ));
+    }
+
+    #[test]
+    fn a_failing_build_is_read_out_of_the_watch_status() {
+        // The shape `dev-build-watch.mjs` writes. This is the only thing binding
+        // the two sides, so it is spelled out rather than round-tripped.
+        let status = r#"{
+          "ok": false,
+          "at": "2026-08-21T11:13:53.249Z",
+          "error": "[vite]: Rollup failed to resolve import \"jsqr\" from \"main.tsx\".",
+          "skippedInstall": null
+        }"#;
+        assert_eq!(
+            build_failure_reason(status).as_deref(),
+            Some("[vite]: Rollup failed to resolve import \"jsqr\" from \"main.tsx\".")
+        );
+    }
+
+    #[test]
+    fn a_healthy_or_unreadable_status_adds_nothing() {
+        // Each of these must leave the generic advice in place rather than
+        // inventing a cause. A stale success is the one that would mislead.
+        for status in [
+            r#"{"ok": true, "at": "2026-08-21T11:00:00Z", "error": null}"#,
+            r#"{"ok": true, "at": "2026-08-21T11:00:00Z", "error": "an old failure"}"#,
+            r#"{"ok": false, "error": null}"#,
+            r#"{"ok": false, "error": ""}"#,
+            r#"{"ok": false, "error": "   "}"#,
+            r#"{"at": "2026-08-21T11:00:00Z"}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(build_failure_reason(status), None, "spoke for {status:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_is_looked_for_beside_the_served_dist() {
+        // `served_dir` is `<app>/dist`; the watcher keeps state in
+        // `<app>/.build-watch/`. Getting that relationship wrong reads as "the
+        // build is fine" on every stranded Apply.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path();
+        std::fs::create_dir_all(app.join(".build-watch")).unwrap();
+        std::fs::write(
+            app.join(".build-watch/status.json"),
+            r#"{"ok": false, "error": "boom"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_build_failure(&app.join("dist")).as_deref(),
+            Some("boom")
+        );
+
+        // A checkout whose watcher predates the status file is the ordinary
+        // case, and must stay quiet.
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(read_build_failure(&bare.path().join("dist")), None);
     }
 }

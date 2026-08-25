@@ -66,4 +66,4 @@ When changing event system, update all 5 surfaces:
 4. HTTP API handlers — `api/history.rs`
 5. System prompt — `engine/prompt.rs`
 
-LLM event tools: `emit_event(event_type, payload)` — PascalCase past tense, payload must include `summary`. `query_events(event_type?, since?, until?, limit?)` — newest first, default 100, max 1000.
+LLM event tools: `emit_event(event_type, payload)`: PascalCase past tense, payload must include `summary`. `query_events(event_id?, event_type?, thread_id?, since?, until?, limit?, byte_limit?)`: newest first, `limit` default 50 and max 200, `byte_limit` default 128 KB and max 512 KB. `event_id` resolves ONE event by primary key, accepting the `evt-<32 hex>` address every tool result states. It errors rather than returning an empty window when nothing matches. `thread_id` takes a uuid, or `current` / `this` for the calling thread. The alias resolves from the tool-execution context, so it exists on the LLM tool only: the HTTP and SDK surfaces have no ambient caller.

@@ -471,6 +471,10 @@ mod tests {
         // Set-but-empty (or whitespace) is not TLS.
         assert_eq!(tls_scheme_from(Some(""), Some("/k.pem")), SCHEME_HTTP);
         assert_eq!(tls_scheme_from(Some("/c.pem"), Some("  ")), SCHEME_HTTP);
+        // BOTH empty is the reported one: `export LUCIDOS_TLS_CERT="$UNSET"`
+        // spells "unset" this way, and so does `scripts/lib/service_test.sh`.
+        assert_eq!(tls_scheme_from(Some(""), Some("")), SCHEME_HTTP);
+        assert_eq!(tls_scheme_from(Some("   "), Some("   ")), SCHEME_HTTP);
     }
 
     // Tailscale detection and CLI resolution moved to the `lucidos-tailscale`

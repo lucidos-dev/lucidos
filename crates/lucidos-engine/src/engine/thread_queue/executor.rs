@@ -113,6 +113,8 @@ pub(crate) fn coding_agent_spawn_params(
         title,
         app_id,
         coding_agent,
+        model,
+        reasoning_effort,
         origin,
     } = request
     else {
@@ -130,6 +132,8 @@ pub(crate) fn coding_agent_spawn_params(
             caller_title: title,
             app_id,
             coding_agent,
+            model,
+            reasoning_effort,
             origin,
         },
     ))
@@ -252,26 +256,31 @@ impl LucidosEngine {
                     thread_id: origin_thread_id,
                 };
                 crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
-                let inner = user_tasks::EVENT_TRIGGER_DEPTH.scope(
-                    depth,
-                    user_tasks::execute_user_task(
+                // The run AND the `TriggerExecuted` that closes it are both
+                // links in this fire's chain, so both emit inside the depth
+                // scope. Recording outside it stamped depth 0, and a trigger
+                // subscribed to `TriggerExecuted` then re-fired without bound.
+                let inner = user_tasks::EVENT_TRIGGER_DEPTH.scope(depth, async {
+                    let result = user_tasks::execute_user_task(
                         self.clone(),
                         self.pool(),
                         &config,
                         invocation,
                         Some(&event_payload),
                         entry.cancel,
-                    ),
-                );
+                    )
+                    .await;
+                    self.record_trigger_executed(
+                        &config.id,
+                        crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                    )
+                    .await;
+                    result
+                });
                 let result = match origin_thread_id {
                     Some(tid) => user_tasks::ORIGIN_THREAD_ID.scope(tid, inner).await,
                     None => inner.await,
                 };
-                self.record_trigger_executed(
-                    &config.id,
-                    crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
-                )
-                .await;
                 crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
                 if let Err(e) = result {
                     log!("[Scheduler] Event trigger '{}' failed: {}", config.name, e);
@@ -457,22 +466,10 @@ impl LucidosEngine {
                             .await;
                         }
                     }
-                    Err(e) => {
-                        log!("[ThreadQueue] Agent chat spawn failed: {}", e);
-                        self.event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id,
-                                    event:
-                                        crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                            error: e.to_string(),
-                                        },
-                                    meta: EventMeta::NONE,
-                                },
-                                "[ThreadQueue] ResponseFailed (agent chat)",
-                            )
-                            .await;
-                    }
+                    // No terminator here: the turn settles its own exchange,
+                    // anchored. An unanchored copy is what the idempotency
+                    // gate cannot match, so it double-fired.
+                    Err(e) => log!("[ThreadQueue] Agent chat spawn failed: {}", e),
                 }
             }
         }
@@ -611,6 +608,8 @@ mod tests {
             title: None,
             app_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
             origin: spawning_thread_link(spawning_thread),
         };
         let (id, params) =
@@ -638,6 +637,8 @@ mod tests {
             title: None,
             app_id: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
             origin: spawning_thread_link(spawning_thread),
         };
         let (_, params) =
@@ -645,5 +646,85 @@ mod tests {
         assert_eq!(params.parent_thread_id, Some(spawning_thread));
         assert_eq!(params.spawning_event_id, Some(tool_call));
         assert_eq!(params.origin, spawning_thread_link(spawning_thread));
+    }
+
+    /// THE hop that dropped the model. `ThreadQueueRequest::CodingAgent` had no
+    /// field for it, so a caller's `model: "claude-sonnet-5"` died at the tool
+    /// boundary and the session took the `cc-settings.json` default. Nothing
+    /// failed: the spawn returned success and the executor card showed Opus
+    /// under a spawn call that said Sonnet.
+    ///
+    /// This is a pure function over the request, so the carry can be pinned
+    /// without booting a session. If it ever regresses, it regresses here.
+    #[test]
+    fn coding_agent_spawn_params_carry_the_model_and_effort_pins() {
+        let request = ThreadQueueRequest::CodingAgent {
+            prompt: "a single-file shell edit".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: Some("claude-sonnet-5".into()),
+            reasoning_effort: Some("low".into()),
+            origin: None,
+        };
+        let (_, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(params.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// An unpinned spawn must arrive unpinned, not defaulted here. The backend
+    /// owns its own default, and materialising one at this hop would hide a
+    /// later break in exactly the way the original bug hid.
+    #[test]
+    fn an_unpinned_spawn_reaches_the_backend_with_no_model() {
+        let request = ThreadQueueRequest::CodingAgent {
+            prompt: "unpinned".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        };
+        let (_, params) =
+            coding_agent_spawn_params(request, |_| None).expect("CodingAgent produces params");
+        assert_eq!(params.model, None);
+        assert_eq!(params.reasoning_effort, None);
+    }
+
+    /// The frame a fire's completion writes is a link in that fire's chain.
+    ///
+    /// `TriggerExecuted` is persisted, so a trigger may subscribe to it.
+    /// Recording it after `EVENT_TRIGGER_DEPTH.scope` resolved stamped depth 0,
+    /// and the cap never engaged for such a trigger. A behavior test would need
+    /// a whole engine, so the call site is pinned here instead.
+    #[test]
+    fn the_event_arm_records_its_completion_inside_the_depth_scope() {
+        const SRC: &str = include_str!("executor.rs");
+        let after_scope = SRC
+            .split_once("EVENT_TRIGGER_DEPTH.scope(depth, async {")
+            .expect("the event arm scopes the fire")
+            .1;
+        let scoped = after_scope
+            .split_once("let result = match origin_thread_id")
+            .expect("the scope ends where the origin-thread wrapper begins")
+            .0;
+        assert!(
+            scoped.contains("record_trigger_executed"),
+            "the completion must be recorded inside the fire's depth scope"
+        );
     }
 }

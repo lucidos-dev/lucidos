@@ -41,6 +41,21 @@ tokio::task_local! {
     pub static ORIGIN_THREAD_ID: uuid::Uuid;
 }
 
+/// How deep in an event-trigger chain the current task is running.
+///
+/// Zero outside any trigger fire, which is what an ordinary user turn, an HTTP
+/// handler and a cron fire all are. Inside a fire it is the depth the queue
+/// executor scoped. An event this task emits is therefore one link further
+/// along the chain that produced it, and [`super::task_runner`]'s cap can see
+/// that.
+///
+/// One reader, rather than one per site. A caller can only get this wrong one
+/// way: by reading it from a spawned task, where the scope does not reach and
+/// the answer silently becomes zero.
+pub fn current_event_trigger_depth() -> u32 {
+    EVENT_TRIGGER_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 /// True when the currently running trigger is deleting itself — i.e. the LLM
 /// called `delete_trigger` with its own trigger ID. The scheduler's
 /// `TriggerDeleted` handler reads this flag (carried in the event payload) to
@@ -492,6 +507,19 @@ async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Every emit stamps this onto `EmittedEvent::depth`, so an answer of 0
+    /// inside a trigger would restart the chain and let a self-subscribing
+    /// trigger run forever.
+    #[tokio::test]
+    async fn the_current_depth_is_the_scoped_one_inside_a_trigger_and_zero_outside() {
+        assert_eq!(current_event_trigger_depth(), 0);
+        let seen = EVENT_TRIGGER_DEPTH
+            .scope(2, async { current_event_trigger_depth() })
+            .await;
+        assert_eq!(seen, 2);
+        assert_eq!(current_event_trigger_depth(), 0);
+    }
 
     /// Regression for a dedup that never once fired. `has_recent_error_notification`
     /// asked `SELECT 1 ... -> Option<(i64,)>`; an unadorned `1` is `int4` and sqlx's

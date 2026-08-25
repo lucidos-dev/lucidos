@@ -20,7 +20,9 @@
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
-      "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"]
+      "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
+      "@lucidos/geometry": ["../../packages/lucidos-sdk/src/geometry.ts"],
+      "@lucidos/tooltip": ["../../packages/lucidos-sdk/src/tooltip.ts"]
     }
   },
   "include": ["src"]

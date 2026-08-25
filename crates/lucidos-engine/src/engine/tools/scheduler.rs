@@ -11,6 +11,10 @@ use crate::triggers::{
 use cron::TimeUnitSpec;
 use std::str::FromStr;
 
+/// Both write tools here arm a trigger's `on:` list, never a thread's wait.
+const TRIGGER_SURFACE: crate::core::event_subscription::SubscriptionSurface =
+    crate::core::event_subscription::SubscriptionSurface::Trigger;
+
 /// Hard guard: scheduling tools (`create_trigger`, `update_trigger`,
 /// `delete_trigger`, `pause_trigger`, `resume_trigger`) called from inside a
 /// scheduled trigger's LLM execution are usually a bug — the LLM mistook the
@@ -112,6 +116,18 @@ impl LucidosEngine {
                 let subscriptions = match parse_on_arg(args.get("on")) {
                     Ok(subs) => subs,
                     Err(e) => return Ok(e),
+                };
+                // Every entry in the `on` array. A trigger armed on a name the
+                // engine never emits looks armed and never fires.
+                let event_warnings = match crate::core::event_subscription::check_subscriptions(
+                    &self.pool,
+                    &subscriptions,
+                    TRIGGER_SURFACE,
+                )
+                .await
+                {
+                    Ok(warnings) => warnings,
+                    Err(msg) => return Ok(format!("Error: {msg}")),
                 };
 
                 // Timezone first: the never-fires guard reports its next-run
@@ -245,8 +261,9 @@ impl LucidosEngine {
                 };
 
                 Ok(format!(
-                    "[ACTION COMPLETED] Created trigger '{}' (ID: {}) running {} with {} in timezone {}.{}",
-                    name, trigger_id_str, run_desc, trigger_desc, tz_val, cron.advice_suffix()
+                    "[ACTION COMPLETED] Created trigger '{}' (ID: {}) running {} with {} in timezone {}.{}{}",
+                    name, trigger_id_str, run_desc, trigger_desc, tz_val, cron.advice_suffix(),
+                    warning_suffix(&event_warnings)
                 ))
             }
             "list_triggers" => {
@@ -340,6 +357,18 @@ impl LucidosEngine {
                     })
                 } else {
                     None
+                };
+                // Only what this call supplies. An `on:` list left absent keeps
+                // whatever the trigger already had.
+                let event_warnings = match crate::core::event_subscription::check_subscriptions(
+                    &self.pool,
+                    new_on.as_deref().unwrap_or_default(),
+                    TRIGGER_SURFACE,
+                )
+                .await
+                {
+                    Ok(warnings) => warnings,
+                    Err(msg) => return Ok(format!("Error: {msg}")),
                 };
                 // Parse cron: Option<ValidatedCron>
                 // None = not provided (keep existing), Some(empty) = clear, Some(non-empty) = set
@@ -497,8 +526,9 @@ impl LucidosEngine {
                     .unwrap_or_default();
 
                 Ok(format!(
-                    "[ACTION COMPLETED] Updated trigger '{}' (ID: {}). Changed: {}. Schedule: {} ({}){}",
-                    display_name, trigger_id, updated_fields.join(", "), display_schedule, existing.timezone, advice
+                    "[ACTION COMPLETED] Updated trigger '{}' (ID: {}). Changed: {}. Schedule: {} ({}){}{}",
+                    display_name, trigger_id, updated_fields.join(", "), display_schedule, existing.timezone, advice,
+                    warning_suffix(&event_warnings)
                 ))
             }
             "delete_trigger" => {
@@ -786,6 +816,18 @@ fn trigger_description(cron_display: &str, subscriptions: &[EventSubscription]) 
     }
 }
 
+/// The event-type warnings, appended to a trigger tool's success text.
+///
+/// The write went through, so this is a note rather than an error. It names a
+/// type nobody here has emitted, which is the caller's chance to catch a typo
+/// in a domain event name of their own.
+fn warning_suffix(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    format!("\n\nWARNING: {}", warnings.join("\nWARNING: "))
+}
+
 /// Parse the LLM tool's `on` argument into a Vec of subscriptions, accepting:
 ///
 /// 1. Absent / `null` → empty Vec.
@@ -867,13 +909,26 @@ fn translate_dow_for_cron_crate(expr: &str) -> String {
 
     let dow = parts[5];
 
-    if dow == "*" || dow.starts_with("*/") || dow.chars().any(|c| c.is_ascii_alphabetic()) {
+    if dow == "*" || dow.starts_with("*/") {
         return expr.to_string();
     }
 
+    // Decide named vs numeric per comma segment, not for the whole field. A
+    // mixed field (`Mon,1`) carries one segment of each kind: the named
+    // segment has no digits to shift, and the numeric one still needs the
+    // shift even though its sibling segment is a name. A new segment shape
+    // needs the same check added to `numeric_dow_range_with_step_token`
+    // below.
+    //
+    // A combined range-and-step token (`1-5/2`) is not shifted here, and
+    // never needs to be: `validate_cron_expressions` rejects it first, via
+    // `numeric_dow_range_with_step_token` below (see its doc comment for why).
     let translated_dow = dow
         .split(',')
         .map(|segment| {
+            if segment.chars().any(|c| c.is_ascii_alphabetic()) {
+                return segment.to_string();
+            }
             if let Some((a, b)) = segment.split_once('-') {
                 match (shift(a), shift(b)) {
                     (Some(a), Some(b)) => format!("{}-{}", a, b),
@@ -982,6 +1037,33 @@ impl ValidatedCron {
     }
 }
 
+/// Find a numeric day-of-week range-with-step token (`1-5/2`) in a day-of-week
+/// field, and return it verbatim.
+///
+/// `translate_dow_for_cron_crate` cannot shift this shape. It reads the
+/// range end as `5/2`, fails to parse it, and leaves the token unshifted.
+/// The token then fires on the `cron` crate's own numbering, not the user's.
+/// A named token (`Mon-Fri/2`) has no such gap: names bypass translation and
+/// the crate numbers them the same way the user wrote them.
+///
+/// Checked per comma-separated segment, not on the field as a whole. A
+/// mixed field (`Mon,1-5/2`) must still catch the numeric segment: a letter
+/// in one segment skips only that segment. A new segment shape must be
+/// checked here and in `translate_dow_for_cron_crate`'s classifier: past
+/// fixes here missed one of the two.
+fn numeric_dow_range_with_step_token(dow: &str) -> Option<&str> {
+    let is_numeric = |s: &str| s.parse::<u8>().is_ok();
+    dow.split(',').find(|segment| {
+        let Some((range, step)) = segment.split_once('/') else {
+            return false;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            return false;
+        };
+        is_numeric(start) && is_numeric(end) && is_numeric(step)
+    })
+}
+
 /// Validate the cron expressions a trigger will run on: field count, syntax, and
 /// whether each one can ever fire at all.
 ///
@@ -1011,6 +1093,14 @@ pub(crate) fn validate_cron_expressions(
             return Err(format!(
                 "Invalid cron expression '{}'. Must have 6 fields: second minute hour day-of-month month day-of-week. Example: '0 0 8 * * *' for 8am daily.",
                 expr
+            ));
+        }
+        if let Some(token) = numeric_dow_range_with_step_token(parts[5]) {
+            return Err(format!(
+                "Cron expression '{}' uses day-of-week token '{}', which combines a \
+                 numeric range and a step. This shape is not supported: list the days \
+                 instead ('1,3,5'), or use the named weekday range instead ('Mon-Fri/2').",
+                expr, token
             ));
         }
         let schedule = match parse_standard_cron(expr) {

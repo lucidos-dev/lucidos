@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 import { activeInlineForm } from '../../store/store';
 import type { PluginInstallForm } from '../../store/store';
+import type { PluginLocalChangeOutcome } from '../../store/types';
 import {
   cancelPluginInstallAction,
   confirmPluginInstallAction,
@@ -8,6 +9,7 @@ import {
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { PluginFileList } from './PluginFileList';
+import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 
 export function PluginInstallPanel() {
   const form = activeInlineForm.value;
@@ -21,9 +23,49 @@ export function PluginInstallPanel() {
     : <PluginInstallConfirm form={form} />;
 }
 
+/** Human label for one local-change outcome, in the second person, because the
+ *  panel is telling the user what is about to happen to THEIR edit. */
+const LOCAL_CHANGE_LABEL: Record<PluginLocalChangeOutcome, string> = {
+  merged: 'Kept, merged into the new version',
+  conflict: 'Cannot merge, your version saved aside',
+  replaced: 'Replaced, your version saved aside',
+  restored: 'You deleted this, the new version brings it back',
+};
+
+/** What the panel promises for one edited file, under the current keep control.
+ *
+ *  Clearing the control makes every row read as replaced, because that is then
+ *  what confirming does. Leaving a merged row saying "kept" would promise the
+ *  opposite of the request the button is about to send.
+ *
+ *  Exported for its unit test: the confirm panel holds the control in a hook,
+ *  so the suite's VNode walk cannot reach inside it. */
+export function localChangeLabel(
+  outcome: PluginLocalChangeOutcome,
+  keepLocal: boolean,
+): string {
+  // A restore is untouched by the keep control: the user deleted the file, so
+  // there is no edit to keep or drop, and nothing gets saved aside either way.
+  if (outcome === 'restored' || keepLocal) return LOCAL_CHANGE_LABEL[outcome];
+  return LOCAL_CHANGE_LABEL.replaced;
+}
+
+/** Overwrites with no local edit of their own. An edited path gets its own row
+ *  stating its own outcome. Listing it again under the blunt "will be replaced"
+ *  heading would contradict that row. */
+export function plainOverwrites(
+  overwrites: string[],
+  changes: { path: string }[],
+): string[] {
+  const edited = new Set(changes.map((c) => c.path));
+  return overwrites.filter((f) => !edited.has(f));
+}
+
 function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   const [busy, setBusy] = useState(false);
+  const [keepLocal, setKeepLocal] = useState(true);
   const req = form.request;
+  const localChanges = req.local_changes ?? [];
 
   const description = typeof req.manifest['description'] === 'string'
     ? (req.manifest['description'] as string)
@@ -34,6 +76,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
 
   const overwriteSet = new Set(req.overwrites);
   const newFiles = req.files.filter((f) => !overwriteSet.has(f));
+  const replacedOutright = plainOverwrites(req.overwrites, localChanges);
 
   // Rendered twice — once top-right in the header, once at the bottom — so the
   // Cancel/Install pair is reachable without scrolling past a long file list.
@@ -66,7 +109,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
   async function handleConfirm() {
     setBusy(true);
     try {
-      await confirmPluginInstallAction(form);
+      await confirmPluginInstallAction(form, keepLocal);
     } finally {
       setBusy(false);
     }
@@ -110,10 +153,48 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
           </code>
         </section>
 
-        {req.overwrites.length > 0 && (
+        {localChanges.length > 0 && (
+          <section class="plugin-install-section plugin-install-local-changes">
+            <div class="plugin-install-label">
+              Your local changes ({localChanges.length})
+            </div>
+            <p class="plugin-install-note">
+              You have edited these files since installing. Lucidos merges your
+              changes into the new version where it can, and keeps a copy plus a
+              patch under <code>data/artifacts/</code> wherever it cannot.
+            </p>
+            <ul class="plugin-install-files">
+              {localChanges.map((change) => (
+                <li
+                  key={change.path}
+                  class={`plugin-install-file plugin-install-file-${change.outcome}`}
+                >
+                  <code>{change.path}</code>
+                  <span class="plugin-install-outcome">
+                    {localChangeLabel(change.outcome, keepLocal)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <label class="plugin-install-keep-toggle">
+              <input
+                type="checkbox"
+                checked={keepLocal}
+                disabled={busy}
+                onChange={(e) => setKeepLocal((e.target as HTMLInputElement).checked)}
+              />
+              <span>
+                Keep my local changes. Clear this for a clean update that takes
+                the new version as shipped.
+              </span>
+            </label>
+          </section>
+        )}
+
+        {replacedOutright.length > 0 && (
           <PluginFileList
-            label={`Overwrites (${req.overwrites.length})`}
-            files={req.overwrites}
+            label={`Overwrites (${replacedOutright.length})`}
+            files={replacedOutright}
             sectionClass="plugin-install-overwrites"
             fileClass="plugin-install-file-overwrite"
             note="These files already exist in your workspace and will be replaced."
@@ -168,6 +249,7 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
 export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm }) {
   const req = form.request;
   const installed = form.installed!;
+  const local = installed.local_changes;
   return (
     <div class="inline-form">
       <div class="plugin-install-panel">
@@ -182,6 +264,42 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
           </div>
           <p class="plugin-install-description">{installed.summary}</p>
         </header>
+
+        {local && (
+          <section class="plugin-install-section plugin-install-local-changes">
+            <div class="plugin-install-label">Your local changes</div>
+            {local.merged.length > 0 && (
+              <p class="plugin-install-note">
+                Merged into the new version: {local.merged.join(', ')}.
+              </p>
+            )}
+            {local.conflicted.length > 0 && (
+              <p class="plugin-install-note">
+                Could not merge: {local.conflicted.join(', ')}.
+              </p>
+            )}
+            {local.replaced.length > 0 && (
+              <p class="plugin-install-note">
+                Replaced: {local.replaced.join(', ')}.
+              </p>
+            )}
+            {local.restored.length > 0 && (
+              <p class="plugin-install-note">
+                You had deleted these, and the new version brings them back:
+                {' '}{local.restored.join(', ')}.
+              </p>
+            )}
+            {local.saved_paths.length > 0 && (
+              <p class="plugin-install-note">
+                Your versions are saved under <code>data/artifacts/</code>, each
+                with a patch you can re-apply.
+              </p>
+            )}
+            {local.merged.length > 0 && (
+              <ProposeUpstreamButton pluginId={req.plugin_id} pluginName={req.plugin_name} />
+            )}
+          </section>
+        )}
 
         {installed.installed_files.length > 0 && (
           <PluginFileList

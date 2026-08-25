@@ -514,13 +514,6 @@ fn test_describe_tool_threads_and_changes() {
     );
     assert_eq!(
         describe_tool(
-            "dismiss_from_context",
-            &serde_json::json!({ "event_id": "e" })
-        ),
-        "Dismissing from context..."
-    );
-    assert_eq!(
-        describe_tool(
             "save_thread_image",
             &serde_json::json!({ "image": "thread:1", "path": "photos/a.jpg" })
         ),
@@ -606,7 +599,7 @@ fn tool_name_constants() -> Vec<String> {
 #[test]
 fn every_known_tool_name_has_a_step_label() {
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for tool in crate::llm::tools::get_default_tools() {
+    for tool in crate::llm::tools::get_default_tools(&crate::llm::ToolCapabilities::all_open()) {
         names.insert(tool.name);
     }
     for tool in crate::capability_manifest::llm_tools() {
@@ -1840,15 +1833,20 @@ fn repo_with_seed_commit(ws: &std::path::Path) -> git2::Repository {
     repo
 }
 
-/// Stage one file through `repo` and commit it, the way a competing writer
-/// (another `Repository` handle, a `git` CLI process) lands on HEAD.
-fn write_and_commit(repo: &git2::Repository, name: &str, message: &str) -> String {
+/// Write one file and stage it onto the current head.
+fn stage_one(repo: &git2::Repository, name: &str) {
     let ws = repo.workdir().unwrap().to_path_buf();
     std::fs::write(ws.join(name), name).unwrap();
     let mut index = repo.index().unwrap();
     reset_index_to_head(repo, &mut index).unwrap();
     index.add_path(std::path::Path::new(name)).unwrap();
     index.write().unwrap();
+}
+
+/// Stage one file through `repo` and commit it, the way a competing writer
+/// (another `Repository` handle, a `git` CLI process) lands on HEAD.
+fn write_and_commit(repo: &git2::Repository, name: &str, message: &str) -> String {
+    stage_one(repo, name);
     commit_index(repo, message).unwrap()
 }
 
@@ -1905,6 +1903,71 @@ fn a_lost_head_compare_and_swap_is_classified_as_contention() {
         is_transient_repo_contention(&err),
         "the real libgit2 error must be retried"
     );
+}
+
+/// The branch ref's lock file, held by whichever writer is moving `main` right
+/// now. Writing it by hand is exactly what a competing `git` process or a second
+/// libgit2 handle does for the microseconds its own ref update takes.
+fn hold_main_ref_lock(ws: &std::path::Path) -> std::path::PathBuf {
+    let lock = ws.join(".git/refs/heads/main.lock");
+    std::fs::write(&lock, "").unwrap();
+    lock
+}
+
+/// Pins the classifier against what libgit2 ACTUALLY produces when another
+/// writer holds `refs/heads/main.lock`, the sibling of the HEAD-swap test above.
+///
+/// The regression this guards: the classifier keyed on `(class, code)` pairs and
+/// knew only `Index` / `Locked`. libgit2 reports a held REF lock as `Os` /
+/// `Locked`, so the retry helper read it as a real failure and returned it at
+/// once. A trigger writing an artifact through `PUT /api/v1/data/artifacts/...`
+/// got a 500 out of a lock that would have cleared in one backoff.
+#[test]
+fn a_held_branch_ref_lock_is_classified_as_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_with_seed_commit(dir.path());
+    hold_main_ref_lock(dir.path());
+    stage_one(&repo, "ours.txt");
+
+    let err = commit_index(&repo, "ours").expect_err("a held ref lock must block the commit");
+
+    assert_eq!(err.class(), git2::ErrorClass::Os);
+    assert_eq!(err.code(), git2::ErrorCode::Locked);
+    assert!(
+        err.message().contains("main.lock"),
+        "the production symptom string changed: {}",
+        err.message()
+    );
+    assert!(
+        is_transient_repo_contention(&err),
+        "the real libgit2 error must be retried"
+    );
+}
+
+/// End to end: the write waits the ref lock out and lands, instead of failing
+/// the request. The holder releases on the third attempt, so two genuine
+/// libgit2 `Os` / `Locked` failures are retried.
+#[test]
+fn a_write_waits_out_a_held_branch_ref_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = repo_with_seed_commit(dir.path());
+    let lock = hold_main_ref_lock(dir.path());
+
+    let mut attempts = 0;
+    let ours = retry_while_repo_contended(|| {
+        attempts += 1;
+        if attempts == 3 {
+            std::fs::remove_file(&lock).unwrap();
+        }
+        stage_one(&repo, "ours.txt");
+        commit_index(&repo, "ours")
+    })
+    .expect("the write must land once the lock clears");
+
+    assert_eq!(attempts, 3, "it must retry while the lock is held");
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.id().to_string(), ours);
+    assert!(head.tree().unwrap().get_name("ours.txt").is_some());
 }
 
 /// The race itself, end to end: a competing commit lands on HEAD mid-attempt,

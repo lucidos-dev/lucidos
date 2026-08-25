@@ -187,12 +187,12 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     ).not.toBe('none');
   });
 
-  /** The two chevrons of whichever mobile header is on screen, as viewport x
+  /** The two chevrons of whichever mobile header is on screen, as viewport
    *  positions. Null while the pane is not the visible one, since a header in a
    *  `display:none` section measures zero. */
   async function chevrons(
     page: Page, headerSel: string, backSel: string, forwardSel: string,
-  ): Promise<{ backLeft: number; forwardRight: number } | null> {
+  ): Promise<{ backLeft: number; forwardRight: number; backTop: number } | null> {
     return page.evaluate(({ headerSel, backSel, forwardSel }) => {
       const header = document.querySelector(headerSel) as HTMLElement | null;
       const back = header?.querySelector(backSel) as HTMLElement | null;
@@ -201,7 +201,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
       const b = back.getBoundingClientRect();
       const f = forward.getBoundingClientRect();
       if (b.width === 0 || f.width === 0) return null;
-      return { backLeft: b.left, forwardRight: f.right };
+      return { backLeft: b.left, forwardRight: f.right, backTop: b.top };
     }, { headerSel, backSel, forwardSel });
   }
 
@@ -265,6 +265,63 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
       Math.abs(markRight - thread.forwardRight),
       `threads mark at ${markRight.toFixed(1)}, forward chevron at ${thread.forwardRight.toFixed(1)}`,
     ).toBeLessThan(1);
+  });
+
+  test('the chevrons sit on the same LINE on the thread and content panes', async ({ page }) => {
+    // The other axis of the same ask, and it needs its own test because it only
+    // shows up at a scaled root. `top: 50%` plus a `translateY(-50%)` placed
+    // each cluster by half its OWN height, and the two rows fill theirs
+    // differently: the thread row's box is the mark (2.1rem), the content row's
+    // is a chevron (1.75rem). Each rounded its own half, and the pair landed
+    // 0.14px apart at the 18px root. A fifth of a device pixel moves a hairline
+    // chevron's anti-aliasing, and the user saw the chevrons hop as they
+    // swiped. Both clusters span their row now, so the box's height is out of
+    // the placement and flexbox centres both pairs against one identical box.
+    await navigateToApp(page);
+
+    // 112.5% is the mobile stylesheet's own fallback root and a supported user
+    // setting. It is also the one this reproduced at. At the 100% the suite
+    // otherwise runs at, the same defect rounds to nothing, so a test taking
+    // the default scale would pass over it.
+    await page.evaluate(() => {
+      document.documentElement.style.setProperty('--user-ui-scale', '112.5%');
+    });
+
+    await ensureMobileView(page, 'thread');
+    const threadArgs = [
+      '.mobile-thread-header', 'button[aria-label="Previous thread"]', 'button[aria-label="Next thread"]',
+    ] as const;
+    await expect
+      .poll(() => chevrons(page, ...threadArgs), { timeout: 10_000, message: 'thread pane chevrons never laid out' })
+      .not.toBeNull();
+    const thread = (await chevrons(page, ...threadArgs))!;
+
+    await ensureMobileView(page, 'content');
+    const contentArgs = ['.mobile-content-header', '.content-back-btn', '.content-forward-btn'] as const;
+    await expect
+      .poll(() => chevrons(page, ...contentArgs), { timeout: 10_000, message: 'content pane chevrons never laid out' })
+      .not.toBeNull();
+    const content = (await chevrons(page, ...contentArgs))!;
+
+    // The scale is what gives this test the power to fail, so prove it held.
+    // The app writes `--user-ui-scale` itself (store/actions/preferences.ts),
+    // and a preference load landing late takes the root back to 16px, where
+    // the defect rounds to nothing. A revert BETWEEN the two measurements
+    // above fails loudly, on the large difference it makes. One before either
+    // is the case that would pass in silence, and this is what catches it.
+    expect(
+      await page.evaluate(() => getComputedStyle(document.documentElement).fontSize),
+      'the root left the scaled size, so the measurements above guard nothing',
+    ).toBe('18px');
+
+    // Tight, because the two are identical by construction rather than merely
+    // close: one box, one header element, nothing left to round differently.
+    // This absorbs float noise and nothing else. Widen it and the drift comes
+    // back invisible.
+    expect(
+      Math.abs(thread.backTop - content.backTop),
+      `chevron top: thread pane at ${thread.backTop.toFixed(3)}, content pane at ${content.backTop.toFixed(3)}`,
+    ).toBeLessThan(0.02);
   });
 
   test('all three header rows are the same height', async ({ page }) => {

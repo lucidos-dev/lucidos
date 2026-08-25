@@ -90,6 +90,26 @@ No login agent is installed when the executable is not inside a `.app` (dev,
 `cargo run`), and `--login` is ignored in dev, where there is no tray to reopen
 a hidden window from.
 
+### A service that keeps dying says so, and says which failure it is
+
+The gateway's staging checks (`validate_engine_bin`, `validate_embedded_pg_dirs`,
+`resolve_static_dir`) are fatal, and `KeepAlive` is what used to hide them: the
+service exited 1, launchd respawned it every `ThrottleInterval`, and the splash
+counted up at a condition that would never clear. See ADR 0120 for the
+discriminator and why it is a restart count rather than a clock.
+
+The mechanism is one file read back. Both producers stamp
+`boot failed: <reason>` into `<app-data>/logs/engine-service.err.log`: the
+gateway from its own `main`, the service from every fatal arm of `run_service`.
+`run_service` also writes a boot marker per launchd start. The client records
+that file's length when it begins waiting, then counts markers after that point.
+Past `SERVICE_CRASH_LOOP_BOOTS` it puts the reason and the log path on the
+splash in place of the timer. Below the threshold nothing changes, which is what
+keeps a cold-machine `initdb` reading as the slow start it is.
+
+The client never stops retrying, and the report never promises that it will
+work. A repaired bundle or a reinstall still recovers the window it is in.
+
 Closing the window — red X, Cmd+W, or Cmd+Q — only dismisses the window; the
 client stays resident in the macOS menu bar and the service keeps running
 (triggers, scheduled tasks, coding-agent sessions, and mobile push keep going

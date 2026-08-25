@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, _resetLinkifyCacheForTesting } from './linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting } from './linkifyPaths';
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -102,6 +102,75 @@ describe('extractAppIdFromHref', () => {
     ['application:todo', null],
   ])('returns null for %s', (href, expected) => {
     expect(extractAppIdFromHref(href)).toBe(expected);
+  });
+});
+
+describe('extractTriggerIdFromHref', () => {
+  it.each([
+    // The reported shape: the agent invented `trigger:<uuid>` by analogy with
+    // `app:<id>` when told to link the trigger itself.
+    ['trigger:3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63', '3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63'],
+    ['trigger:abc-123', 'abc-123'],
+    ['trigger:abc-123/', 'abc-123'],       // trailing slash means the same trigger
+    ['trigger:abc-123?v=2', 'abc-123'],    // query stripped
+    ['trigger:abc-123#top', 'abc-123'],    // fragment stripped
+  ])('extracts %s -> %s', (href, expected) => {
+    expect(extractTriggerIdFromHref(href)).toBe(expected);
+  });
+
+  it.each([
+    // The PANEL keeps its own routing: no scheme, so nav claims it.
+    ['triggers', null],
+    ['data/triggers', null],
+    ['/triggers', null],
+    // A workspace path under the trigger's folder is the artifact rewriter's.
+    ['triggers/nightly-digest', null],
+    ['data/triggers/nightly-digest/scripts/run.py', null],
+    // Empty id, and a sub-path with no meaning.
+    ['trigger:', null],
+    ['trigger:/', null],
+    ['trigger:abc-123/run', null],
+    // Lookalike schemes and other owners.
+    ['triggers:abc-123', null],
+    ['triggered:abc-123', null],
+    ['app:habit-tracker', null],
+    ['thread:dev/abc-123', null],
+    ['https://example.com/trigger:abc', null],
+    ['', null],
+  ])('returns null for %s', (href, expected) => {
+    expect(extractTriggerIdFromHref(href)).toBe(expected);
+  });
+});
+
+describe('browserHandlesHref', () => {
+  it.each([
+    'https://example.com',
+    'HTTPS://EXAMPLE.COM',   // scheme is case-insensitive
+    'http://example.com/x',
+    'mailto:a@example.com',
+    'tel:+4712345678',
+    'sms:+4712345678',
+  ])('%s is the browser to open', (href) => {
+    expect(browserHandlesHref(href)).toBe(true);
+  });
+
+  it.each([
+    // A scheme nothing here claims. Clicked, it does nothing and says nothing,
+    // which is what made the reported `trigger:<uuid>` link look dead.
+    'trigger:abc-123',
+    'app:habit-tracker',
+    'note:abc',
+    'vscode://file/tmp/x',
+    'zoommtg://zoom.us/join',
+    // No scheme at all: a relative href into an SPA that has no relative routes.
+    'artifacts/notes.md',
+    'README',
+    '',
+    '#section',
+    // Not a scheme, despite the colon: a path that happens to contain one.
+    'notes: draft',
+  ])('%s is not', (href) => {
+    expect(browserHandlesHref(href)).toBe(false);
   });
 });
 
@@ -332,6 +401,140 @@ describe('linkifyPaths', () => {
     expect(result).toContain('data-path="user_profile.md"');
   });
 
+  it('linkifies a bare prose path the cached list does NOT know', () => {
+    // The reported bug. The agent is told to write full paths, because they
+    // become links. Then ffmpeg's output was placed under `data/artifacts/` by
+    // a shell `cp` inside run_bash, which announces nothing. So the cache never
+    // learned the file and the promised link rendered as plain text. Resolved
+    // by shape, exactly as a deliberate anchor already is.
+    const html = '<p>artifacts/marketing/product-demo/product-demo-short-v8.mp4</p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/marketing/product-demo/product-demo-short-v8.mp4"');
+  });
+
+  it.each([
+    ['knowhow/domain/guide.md', 'knowhow/domain/guide.md'],
+    ['triggers/daily/run.md', 'triggers/daily/run.md'],
+    ['system-knowhow/js-sdk.md', 'system-knowhow/js-sdk.md'],
+    // The written form is preserved as the link TEXT; `data-path` normalizes.
+    ['data/artifacts/report.html', 'artifacts/report.html'],
+    ['/artifacts/report.html', 'artifacts/report.html'],
+    ['artifacts/.hidden.md', 'artifacts/.hidden.md'],
+    ['artifacts/archive.tar.gz', 'artifacts/archive.tar.gz'],
+  ])('resolves the prose path %s by shape with no cached paths', (written, stored) => {
+    const result = linkifyPaths(`<p>See ${written} now</p>`, [], []);
+    expect(result).toContain(`data-path="${stored}"`);
+    expect(result).toContain(`>${written}</a>`);
+  });
+
+  it.each([
+    // A directory, whichever depth. The extension rule is what tells these from
+    // a file, and it is the guard an anchor does not need.
+    ['Look in artifacts/marketing for it'],
+    ['Everything is under artifacts now'],
+    ['Look in artifacts/a/b/c for it'],
+    // Shape cannot tell a bare filename from an ordinary word, so it stays
+    // cache-gated. Covered as a positive above with the list loaded.
+    ['See user_profile.md for details'],
+    // Glued to a preceding word: not a path, and the boundary rejects it.
+    ['the xartifacts/foo.md thing'],
+  ])('leaves %s alone in prose', (text) => {
+    const result = linkifyPaths(`<p>${text}</p>`, [], []);
+    expect(result).not.toContain('artifact-link');
+  });
+
+  it('never carves a data path out of a URL', () => {
+    // The boundary rejects a preceding `/`, so the URL keeps its own anchor and
+    // no nested one appears inside it. Inside <code> the URL pass is skipped
+    // while the path pass still runs, which is where this would break first.
+    const anchored = '<p><a href="https://example.com/artifacts/foo.md">https://example.com/artifacts/foo.md</a></p>';
+    expect(linkifyPaths(anchored, [], [])).toBe(anchored);
+    const inCode = '<p>Run <code>curl https://example.com/artifacts/foo.md</code></p>';
+    expect(linkifyPaths(inCode, [], [])).toBe(inCode);
+  });
+
+  it.each([
+    ['See artifacts/notes.md.', '.'],
+    ['See artifacts/notes.md, then', ','],
+    ['See (artifacts/notes.md) now', ')'],
+  ])('keeps trailing punctuation outside the link: %s', (text, punctuation) => {
+    const result = linkifyPaths(`<p>${text}</p>`, [], []);
+    expect(result).toContain('data-path="artifacts/notes.md"');
+    expect(result).toContain(`>artifacts/notes.md</a>${punctuation}`);
+  });
+
+  it('linkifies a bare prose path inside <code> with no cached paths', () => {
+    const html = '<p>Run <code>ffmpeg -i artifacts/a.mp4 artifacts/b.mp4</code></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('data-path="artifacts/a.mp4"');
+    expect(result).toContain('data-path="artifacts/b.mp4"');
+  });
+
+  it('stops at an HTML entity rather than half-eating it', () => {
+    // renderMarkdown escapes `&`, so the segment holds `artifacts/a&amp;b.md`.
+    // The match must terminate at the entity, leaving `artifacts/a` with no
+    // extension and therefore no link, rather than linking a mangled path.
+    const result = linkifyPaths('<p>See artifacts/a&amp;b.md here</p>', [], []);
+    expect(result).not.toContain('artifact-link');
+  });
+
+  it.each([
+    'file:artifacts/report.pdf',
+    'https:artifacts/report.pdf',
+    'mailto:artifacts/report.pdf',
+  ])('never claims the workspace half of the scheme URL %s', (text) => {
+    // `hasUrlScheme` owns "is this a relative path", and it rejects these as an
+    // href. The prose boundary accepts `:`, so without the scheme guard the
+    // suffix became an artifact link that no anchor would ever produce.
+    const result = linkifyPaths(`<p>${text}</p>`, [], []);
+    expect(result).not.toContain('artifact-link');
+  });
+
+  it('links nothing rather than a different file when the extension continues', () => {
+    // The extension is alphanumeric, so a filename ending `-1` used to match
+    // only its prefix and link `artifacts/archive.tar.zst`, a path the text
+    // never named. No link beats a link to the wrong file.
+    const result = linkifyPaths('<p>See artifacts/archive.tar.zst-1 now</p>', [], []);
+    expect(result).not.toContain('artifact-link');
+  });
+
+  it.each([
+    ['artifacts/file.d.ts.map', 'artifacts/file.d.ts.map'],
+    ['artifacts/archive.tar.gz', 'artifacts/archive.tar.gz'],
+    // A query string still links the base path, matching what the cached-list
+    // matcher does. `extractDataPathTarget` strips it anyway.
+    ['artifacts/report.html?v=2', 'artifacts/report.html'],
+    ['artifacts/report.html#top', 'artifacts/report.html'],
+  ])('the trailing guard leaves %s alone', (written, stored) => {
+    const result = linkifyPaths(`<p>See ${written} now</p>`, [], []);
+    expect(result).toContain(`data-path="${stored}"`);
+  });
+
+  it.each([
+    // Inside <code> the URL pass never runs, so nothing downstream would notice
+    // an anchor spliced into a shell command the reader is meant to copy.
+    '<p>Run <code>curl https://example.com/?next=artifacts/foo.md</code></p>',
+    '<p>Run <code>curl https://example.com/x#artifacts/foo.md</code></p>',
+    '<pre><code>curl https://ex.com/a?p=artifacts/b.md&amp;q=1</code></pre>',
+  ])('never links a workspace-shaped value inside a URL: %s', (html) => {
+    expect(linkifyPaths(html, ['artifacts/foo.md', 'artifacts/b.md'], [])).toBe(html);
+  });
+
+  it('still links a path that merely follows a URL', () => {
+    const result = linkifyPaths('<p><code>see https://example.com and artifacts/foo.md</code></p>', [], []);
+    expect(result).toContain('data-path="artifacts/foo.md"');
+  });
+
+  it('prefers the longer shape match over a shorter cached one at the same start', () => {
+    // Both matchers feed one precedence pass, so the span the text actually
+    // names wins. Gating that on the cache would link `artifacts/notes.md` and
+    // strand `.bak` outside it.
+    const result = linkifyPaths('<p>See artifacts/notes.md.bak now</p>', ['artifacts/notes.md'], []);
+    expect(result).toContain('data-path="artifacts/notes.md.bak"');
+    expect(result).not.toContain('data-path="artifacts/notes.md"');
+  });
+
   it('rewrites anchors with data/notifications href to nav-link (the bug-report shape)', () => {
     // Real shape from the bug report — last response in the thread
     // 664b657a-... wrote:
@@ -375,6 +578,42 @@ describe('linkifyPaths', () => {
     const result = linkifyPaths(html, [], []);
     expect(result).toContain('class="nav-link"');
     expect(result).toContain(`data-nav-target="${target}"`);
+  });
+
+  it('rewrites trigger:<id> to a trigger-link (the bug-report shape)', () => {
+    // The exact href the agent wrote when told "u must link to the trigger".
+    // Before the rewriter it stayed a plain anchor whose unknown scheme the
+    // browser silently ignored.
+    const html = '<p><a href="trigger:3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63">Nightly digest</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="trigger-link"');
+    expect(result).toContain('data-trigger-id="3f9b21c4-0a7e-4d16-9c58-b2e40d7a1f63"');
+    expect(result).toContain('href="#"');
+    expect(result).not.toContain('href="trigger:');
+  });
+
+  it('rewrites a trigger link with NO trigger list loaded', () => {
+    // Deliberately unlike the app rewriter: the id is not checked against a
+    // cached projection, so a trigger created moments ago still links.
+    const html = '<p><a href="trigger:brand-new">New</a></p>';
+    expect(linkifyPaths(html, [], [])).toContain('data-trigger-id="brand-new"');
+  });
+
+  it('does NOT rewrite the triggers PANEL href to a trigger-link', () => {
+    // Bug 1 and bug 2 are different destinations and must stay different.
+    const html = '<p><a href="triggers">Triggers</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="nav-link"');
+    expect(result).toContain('data-nav-target="triggers"');
+    expect(result).not.toContain('trigger-link');
+  });
+
+  it('does NOT rewrite a triggers/<slug> path to a trigger-link', () => {
+    // A file under the trigger's folder stays the artifact rewriter's.
+    const html = '<p><a href="triggers/nightly-digest/scripts/run.py">run.py</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).not.toContain('trigger-link');
   });
 
   it('does NOT rewrite apps/<id>/index.html to nav-link (app rewriter must win)', () => {

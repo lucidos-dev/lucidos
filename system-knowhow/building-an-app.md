@@ -227,7 +227,7 @@ These four are the everyday set; navigation (`lucidos.ui.navigate`), opening a f
 
 ## Updating an app
 
-There is no `update_app` tool. After `create_app`, all changes go through `write_file` / `edit_file` on `apps/{id}/index.html` (and `manifest.json` when the name or description changes). Don't recreate the app to change one button.
+There is no `update_app` tool. After `create_app`, all changes go through `write_file` / `edit_file` on `apps/{id}/index.html` (and `manifest.json` when the name or description changes). Don't recreate the app to change one button. A second `create_app` for an id that already exists is refused. It would rewrite `index.html` and orphan every other file in the app, so edit the files instead.
 
 ### Editing an app with a coding agent
 

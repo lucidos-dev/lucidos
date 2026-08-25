@@ -1,6 +1,13 @@
 # 0009 — An empty completion is an error only when it's genuinely an error, classified per-cause across providers
 
-**Status:** Accepted (partially reverses the "all empty completions are `ResponseFailed`" stance of `fe553f4b2`)
+**Status:** Accepted (partially reverses the "all empty completions are
+`ResponseFailed`" stance of `fe553f4b2`). **Narrowed by
+[0089](0089-a-truncated-stream-is-a-transport-error.md)**: a Claude stream that
+ends with no stop reason and nothing salvaged is a transport truncation. It
+retries, so it never reaches this classifier as an `Unknown` stop.
+**Narrowed again by [0099](0099-openai-stream-with-no-usage-is-a-truncation.md)**:
+an OpenAI stream with no output and no usage block is the same truncation. A
+clean stop now reaches the benign branch only when the stream really completed.
 
 **Date:** 2026-06-14
 

@@ -6,7 +6,7 @@ import {
   isProviderConfigured,
   modelReasoningEfforts,
   parseContextWindow,
-  reasoningLevelsFor,
+  lucidosModelChoices,
 } from './models';
 import { formatContextWindow } from '../../utils/formatTokens';
 import { MODELS } from '../models';
@@ -47,6 +47,33 @@ describe('chatModelOptions', () => {
     expect(chatModelOptions()).toBe(MODELS);
     // The fallback includes Fable 5 so the picker is never empty pre-load.
     expect(MODELS.some((m) => m.value === 'claude-fable-5')).toBe(true);
+  });
+
+  // The registry filters on `enabled`; the fallback cannot, so it must already
+  // BE the enabled set. A retired model left here is offered for the moment
+  // before `/models` lands, then disappears under the user's cursor.
+  it('offers no model a disable migration has retired', () => {
+    const retired = [
+      'claude-opus-4-8@default',
+      'claude-opus-4-8@default[1m]',
+      'claude-opus-4-7',
+      'claude-opus-4-7[1m]',
+      'claude-sonnet-4-6',
+      'claude-sonnet-4-6[1m]',
+      'claude-opus-4-6',
+      'claude-opus-4-5@20251101',
+      'gpt-5.5',
+      'gpt-5.4',
+      'gpt-5.3-codex',
+      'gpt-5.2-codex',
+    ];
+    expect(MODELS.filter((m) => retired.includes(m.value))).toEqual([]);
+  });
+
+  // Mirrors `DEFAULT_CHAT_MODEL` in core/preferences.rs. A fresh install with no
+  // saved preference resolves to it, so the picker has to be able to show it.
+  it('offers the default chat model', () => {
+    expect(MODELS.some((m) => m.value === 'claude-opus-5@default')).toBe(true);
   });
 
   it('returns only enabled models, mapped to {value,label}, when loaded', () => {
@@ -126,13 +153,14 @@ describe('modelReasoningEfforts', () => {
   });
 });
 
-describe('reasoningLevelsFor / clampEffortFor', () => {
+describe('lucidosModelChoices / clampEffortFor', () => {
   it('offers only what the engine says the model supports', () => {
     chatModels.value = {
       status: 'loaded',
       data: [model('muse-glimmer:30b-mlx', 'Muse', true, 'local', LOCAL_TIERS)],
     };
-    expect(reasoningLevelsFor('muse-glimmer:30b-mlx').map((l) => l.value)).toEqual(LOCAL_TIERS);
+    const row = lucidosModelChoices().find((c) => c.value === 'muse-glimmer:30b-mlx');
+    expect(row?.reasoningEfforts).toEqual(LOCAL_TIERS);
   });
 
   // The reported bug, at the layer the user touches: switching to this model
@@ -149,7 +177,8 @@ describe('reasoningLevelsFor / clampEffortFor', () => {
   it('falls back to the id-shape heuristic when the registry cannot answer', () => {
     chatModels.value = { status: 'not-loaded' };
     // Pre-load, a GPT-5.6 id still gets its full set so the picker is usable.
-    expect(reasoningLevelsFor('gpt-5.6-sol').map((l) => l.value)).toContain('max');
+    const row = lucidosModelChoices('gpt-5.6-sol').find((c) => c.value === 'gpt-5.6-sol');
+    expect(row?.reasoningEfforts).toContain('max');
     expect(clampEffortFor('max', 'gpt-5.4')).toBe('xhigh');
   });
 });

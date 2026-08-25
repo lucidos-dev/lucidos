@@ -1,6 +1,6 @@
 //! Builders for the WORKSPACE-authored half of the chat prompt: the
-//! `[CURRENT FILES]` listing, the Available Apps list, and the Know-how
-//! routing list.
+//! `[CURRENT FILES]` listing, the Available Apps list, the Know-how routing
+//! list, and the open app's know-how listing inside `[ACTIVE APP UI]`.
 //!
 //! Split out of `context_sections.rs` and `system_prompt.rs` because this half
 //! is sized by what the USER put in their workspace, not by what the engine
@@ -13,26 +13,31 @@
 //! 1. **Shape the payload, never the data.** Truncation and filtering happen
 //!    here, at the point the prompt block is built. The stored file, the API
 //!    response and the UI all still carry the user's full text.
-//! 2. **Never narrow what the agent can reach.** A listing here is a sample
-//!    that saves a tool call, so it may elide. The tools it saves
-//!    (`list_files`, `glob_files`, `grep_files`) still see everything.
+//! 2. **Never narrow what the agent can reach.** The file listing is an
+//!    inventory or nothing, never a sample (ADR 0086 as amended). The tools it
+//!    saves (`list_files`, `glob_files`, `grep_files`) still see everything.
 
 use crate::core::knowhow::KnowhowSummary;
 use crate::core::App;
 use std::collections::BTreeMap;
 
-/// Directories listed in `[CURRENT FILES]` before the block stops naming new
-/// ones. Breadth beats depth here: the block exists so the agent can see the
-/// SHAPE of the workspace without calling `list_files`.
-const MAX_DIRS: usize = 40;
-
-/// File names listed per directory before its elision line. Enough to show
-/// what KIND of directory it is, which is all a routing signal needs.
-const MAX_FILES_PER_DIR: usize = 8;
-
-/// Ceiling on file names across the whole block, so a workspace with hundreds
-/// of two-file directories cannot walk past the budget one directory at a time.
-const MAX_FILES_TOTAL: usize = 120;
+/// Ceiling on the rendered `[CURRENT FILES]` block. Past it the block is not
+/// sent at all: the agent gets an inventory or nothing, never a sample
+/// (ADR 0086 as amended).
+///
+/// Derived twice, landing within 2% each way. A complete listing supplied the
+/// path on 50% of file-touching turns at 54 to 82 files. At 47 chars per file,
+/// the densest rendering observed, that range needs 3,854.
+///
+/// It must also pay for itself. At 2.538 chars per token a block of C chars
+/// costs about `C x 5.8e-6` per turn. The round trip it saves is worth $0.0976,
+/// so break-even at a 23.3% supply rate is 3,906. Move this number on that
+/// arithmetic, never back to a directory count. The full derivation is in
+/// `docs/plans/2026-08-18-file-listing-is-an-inventory-or-nothing.md`.
+///
+/// Bytes rather than chars, because a multi-byte path costs more tokens per
+/// char, so charging it more of the ceiling is the right direction.
+const FILE_LIST_MAX_BYTES: usize = 4_000;
 
 /// Ceiling on a workspace knowhow `description` as rendered into the Know-how
 /// routing list. A description is a ROUTING signal that gets matched
@@ -86,21 +91,23 @@ pub(crate) fn routing_description(description: &str) -> String {
 }
 
 /// Build the `[CURRENT FILES]` block from a data-relative file list (what
-/// `ArtifactManager::list_artifacts` returns). Empty string when the workspace
-/// has no listable file, so the caller appends nothing.
+/// `ArtifactManager::list_artifacts` returns).
 ///
-/// Vendored and build output is dropped BEFORE anything is taken, via
+/// **An inventory or nothing.** The block is returned only when it names every
+/// non-vendored file and fits [`FILE_LIST_MAX_BYTES`]. Otherwise the empty
+/// string, so the caller appends nothing. A sample was measured resolving 2.4%
+/// of first touches where a complete listing resolved 50.0%, which is what
+/// ADR 0086's amendment records.
+///
+/// Vendored and build output is dropped BEFORE anything is measured, via
 /// [`crate::core::is_vendored_path`]. Without that, a workspace with a
 /// `node_modules` tree spends the whole block on it: on the workspace this was
 /// measured against, 91 of the 100 listed paths were vendored and none of the
 /// user's own files appeared at all.
 ///
-/// What survives is listed by directory, breadth first, rather than as a flat
-/// alphabetical `take(N)`. The naive take spends the entire cap on whatever
-/// sorts first, so one deep tree can own the block even after filtering, and it
-/// repeats a long directory prefix once per file. One line per directory, a
-/// per-directory file cap, and directories ordered by depth then name give
-/// every part of the workspace a chance to appear and pay for each prefix once.
+/// What survives is listed by directory, breadth first. A long directory prefix
+/// is then paid for once rather than once per file, and the user's own
+/// top-level artifacts come first.
 pub(crate) fn build_file_list_section(files: &[String]) -> String {
     let kept: Vec<&str> = files
         .iter()
@@ -123,63 +130,40 @@ pub(crate) fn build_file_list_section(files: &[String]) -> String {
     dirs.sort_by(|(a, _), (b, _)| (a.matches('/').count(), *a).cmp(&(b.matches('/').count(), *b)));
 
     let mut section = String::from("[CURRENT FILES]");
-    let mut listed_files = 0usize;
-    let mut listed_dirs = 0usize;
     for (dir, names) in &dirs {
-        if listed_dirs == MAX_DIRS || listed_files >= MAX_FILES_TOTAL {
-            break;
-        }
-        let room = MAX_FILES_PER_DIR.min(MAX_FILES_TOTAL - listed_files);
         section.push_str(&format!("\n  {}/", dir));
-        for name in names.iter().take(room) {
+        for name in names {
             section.push_str(&format!("\n    {}", name));
-        }
-        listed_files += names.len().min(room);
-        listed_dirs += 1;
-        if names.len() > room {
-            let elided = names.len() - room;
-            section.push_str(&format!(
-                "\n    ... and {} more {} here",
-                elided,
-                noun(elided, "file", "files")
-            ));
+            // Nothing appended later shrinks the block, so a workspace already
+            // past the ceiling has no inventory to send. Per file rather than
+            // per directory: one directory holding 40,000 exports would
+            // otherwise build a megabyte of string before throwing it away.
+            if section.len() > FILE_LIST_MAX_BYTES {
+                return String::new();
+            }
         }
     }
 
-    // The partial-listing suffix. Vendored files are reported as their own
-    // number rather than folded into the remainder: the agent must not read
-    // "and 632 more" as the whole story and conclude a dependency it can see on
-    // disk is missing.
-    let remaining_files = kept.len() - listed_files;
-    let remaining_dirs = dirs.len() - listed_dirs;
-    if remaining_files > 0 {
-        section.push_str(&format!(
-            "\n  ... and {} more {}",
-            remaining_files,
-            noun(remaining_files, "file", "files")
-        ));
-        if remaining_dirs > 0 {
-            section.push_str(&format!(
-                " ({} {} not listed)",
-                remaining_dirs,
-                noun(remaining_dirs, "directory", "directories")
-            ));
-        }
-    }
+    // Vendored files are counted rather than passed over in silence. A complete
+    // inventory reads as exhaustive, so without this line the agent would take
+    // a dependency it can see on disk to be missing.
     if vendored > 0 {
         section.push_str(&format!(
             "\n  plus {} {} under vendored or build directories, not listed",
             vendored,
             noun(vendored, "file", "files")
         ));
-    }
-    if remaining_files > 0 || vendored > 0 {
         section.push_str(
             "\n  list_files returns the whole tree unfiltered including those, \
              so prefer glob_files to find a specific file",
         );
     }
     section.push_str("\n[END FILES]");
+
+    // The trailer is billed too, so the ceiling covers what is actually sent.
+    if section.len() > FILE_LIST_MAX_BYTES {
+        return String::new();
+    }
     section
 }
 
@@ -229,15 +213,60 @@ pub(crate) fn build_knowhow_section(
     }
     for (app_id, kh) in app_summaries {
         section.push_str(&format!(
-            "- **{}** (id: `{}/{}`, app: {}): {}\n",
+            "- **{}** (id: `{}`, app: {}): {}\n",
             kh.name,
-            app_id,
-            kh.id,
+            app_scoped_id(app_id, &kh.id),
             app_id,
             routing_description(&kh.description)
         ));
     }
     section
+}
+
+/// The id an app-scoped knowhow doc answers to: `<app_id>/<rest>`, which
+/// [`crate::core::KnowhowStore::load_with_fallback`] resolves to
+/// `data/apps/<app_id>/knowhow/<rest>.md`.
+///
+/// Shared by the two surfaces that name these docs: the Know-how routing list
+/// above, and [`build_app_knowhow_listing`] below. An id that differs between
+/// them is an id the agent cannot load.
+fn app_scoped_id(app_id: &str, knowhow_id: &str) -> String {
+    format!("{}/{}", app_id, knowhow_id)
+}
+
+/// Build the know-how listing for the app the user has OPEN, for the
+/// `[ACTIVE APP UI]` block. Empty string when the app has no knowhow docs.
+///
+/// A POINTER, never a body. The block is rebuilt on every round of the
+/// agentic loop, so its cost is paid hundreds of times per thread. It is
+/// billed whether or not the turn is about the app. It used to carry every
+/// doc's full text.
+///
+/// On the workspace that motivated this, one app's single doc rendered the
+/// block at 136,065 chars: about 47% of a 200k-token model's whole budget.
+/// That body bought nothing new, because the doc is one `load_knowhow` call
+/// away under an id the routing list already carries. See
+/// `docs/adr/0111-app-know-how-is-a-pointer-not-a-body.md`.
+///
+/// The consequence for anyone editing this: the rendered size must stay a
+/// function of how MANY docs the app has, never of how big they are.
+pub(crate) fn build_app_knowhow_listing(app_id: &str, summaries: &[KnowhowSummary]) -> String {
+    if summaries.is_empty() {
+        return String::new();
+    }
+    let mut listing = String::from(
+        "This app's know-how is NOT loaded. Call load_knowhow with an id below \
+         when the turn needs it.\n",
+    );
+    for kh in summaries {
+        listing.push_str(&format!(
+            "- **{}** (id: `{}`): {}\n",
+            kh.name,
+            app_scoped_id(app_id, &kh.id),
+            routing_description(&kh.description)
+        ));
+    }
+    listing
 }
 
 #[cfg(test)]
@@ -376,6 +405,10 @@ mod tests {
             file_list.contains("report00.md"),
             "the user's own files must be what the block shows:\n{file_list}"
         );
+        assert!(
+            file_list.contains("report11.md"),
+            "an emitted block names every file, not the first eight:\n{file_list}"
+        );
 
         let apps = crate::core::AppManager::new(root)
             .expect("app manager")
@@ -384,7 +417,10 @@ mod tests {
         assert_eq!(apps.len(), 20, "the fixture's apps must all load");
         let apps_section = build_apps_section(&apps);
 
-        let knowhow = crate::core::KnowhowStore::load_summaries(&root.join("data/knowhow"));
+        let knowhow = crate::core::KnowhowStore::load_summaries(
+            &root.join("data/knowhow"),
+            crate::core::KnowhowListDepth::FilesAndGroups,
+        );
         let app_knowhow = crate::core::KnowhowStore::load_app_summaries(&root.join("data/apps"));
         assert_eq!(knowhow.len(), 12);
         assert_eq!(app_knowhow.len(), 1);
@@ -440,6 +476,10 @@ mod tests {
             section.contains("prefer glob_files"),
             "the agent must be told list_files is unfiltered:\n{section}"
         );
+        assert!(
+            !section.contains("... and"),
+            "a vendored tree elides nothing the user owns:\n{section}"
+        );
     }
 
     /// Every segment is tested, not just the first, and a file the user named
@@ -458,10 +498,12 @@ mod tests {
         assert!(section.contains("out"));
     }
 
-    /// The failure a flat alphabetical take has even after filtering: one deep
-    /// directory eats the cap. Every small directory must still be represented.
+    /// The rule ADR 0086's amendment records. One directory too big to name in
+    /// full costs the whole block, including the small directories beside it
+    /// that would have fitted. A sample the agent cannot trust is worth less
+    /// than nothing.
     #[test]
-    fn one_big_directory_cannot_crowd_out_the_others() {
+    fn a_workspace_too_big_to_list_whole_gets_no_block() {
         let mut paths: Vec<String> = (0..500)
             .map(|i| format!("artifacts/aaa-huge/file{:03}.txt", i))
             .collect();
@@ -472,13 +514,27 @@ mod tests {
 
         let section = build_file_list_section(&paths);
 
-        for i in 0..10 {
-            assert!(
-                section.contains(&format!("artifacts/small{:02}/", i)),
-                "small directory {i} missing:\n{section}"
-            );
-        }
-        assert!(section.contains("... and 492 more files here"));
+        assert!(section.is_empty(), "expected nothing at all:\n{section}");
+    }
+
+    /// The predicate is what the block COSTS, not how many files it names. The
+    /// same 60 files are refused as deep paths and listed whole as short ones.
+    #[test]
+    fn the_ceiling_is_the_rendered_size_not_a_file_count() {
+        let deep = "artifacts/projects/quarterly-planning/attachments/generated";
+        let long: Vec<String> = (0..60)
+            .map(|i| format!("{deep}/section-{i:02}/a-rather-long-document-name-{i:02}.md"))
+            .collect();
+        let short: Vec<String> = (0..60).map(|i| format!("artifacts/n{i:02}.md")).collect();
+
+        assert!(
+            build_file_list_section(&long).is_empty(),
+            "60 long paths render past the ceiling and must be refused"
+        );
+        assert!(
+            !build_file_list_section(&short).is_empty(),
+            "60 short paths fit and must be listed"
+        );
     }
 
     /// Shallow before deep, so the user's own top-level artifacts are what the
@@ -497,10 +553,10 @@ mod tests {
         assert!(shallow < deep, "shallow directories come first:\n{section}");
     }
 
-    /// The partial-listing suffix survives the reshape, and its two numbers are
-    /// separate: elided-but-listable, and vendored.
+    /// A directory count decides nothing. 60 directories holding 180 short
+    /// paths render well under the ceiling, so the workspace is listed whole.
     #[test]
-    fn partial_listings_say_how_much_is_missing() {
+    fn many_directories_do_not_refuse_a_block_that_fits() {
         let mut paths: Vec<String> = Vec::new();
         for d in 0..60 {
             for f in 0..3 {
@@ -508,13 +564,73 @@ mod tests {
             }
         }
         paths.sort();
+
         let section = build_file_list_section(&paths);
-        // 40 directories x 3 files listed, 20 directories left over.
+
         assert!(
-            section.contains("... and 60 more files (20 directories not listed)"),
-            "expected the remainder suffix:\n{section}"
+            section.contains("artifacts/dir59/"),
+            "the last directory must be named:\n{section}"
         );
-        assert!(!section.contains("vendored"));
+        let named = section.lines().filter(|l| l.starts_with("    ")).count();
+        assert_eq!(named, 180, "every file must be named:\n{section}");
+        assert!(!section.contains("... and"));
+    }
+
+    /// There is no partial listing: no header, no remainder line, no elision
+    /// marker, nothing. Same shape as the test above, three times the files.
+    #[test]
+    fn nothing_is_emitted_rather_than_a_partial_listing() {
+        let mut paths: Vec<String> = Vec::new();
+        for d in 0..100 {
+            for f in 0..3 {
+                paths.push(format!("artifacts/dir{:03}/f{}.md", d, f));
+            }
+        }
+        paths.sort();
+
+        assert_eq!(build_file_list_section(&paths), "");
+    }
+
+    /// Both halves of the rule, swept across the ceiling. An emitted block
+    /// names every kept file and fits the ceiling; the only alternative is
+    /// nothing. The sweep must cross the boundary or it proves neither half.
+    #[test]
+    fn every_emitted_block_is_complete_and_within_the_ceiling() {
+        let mut paths: Vec<String> = Vec::new();
+        let (mut emitted, mut refused) = (0usize, 0usize);
+
+        for i in 0..400 {
+            paths.push(format!("artifacts/topic{:02}/note-{:03}.md", i % 25, i));
+            paths.sort();
+
+            let section = build_file_list_section(&paths);
+            if section.is_empty() {
+                refused += 1;
+                continue;
+            }
+            emitted += 1;
+
+            assert!(
+                section.len() <= FILE_LIST_MAX_BYTES,
+                "{} files rendered {} bytes, past the ceiling",
+                paths.len(),
+                section.len()
+            );
+            assert!(
+                !section.contains("... and"),
+                "an emitted block carries no elision marker:\n{section}"
+            );
+            for path in &paths {
+                let name = path.rsplit_once('/').expect("has a directory").1;
+                assert!(
+                    section.contains(name),
+                    "{name} missing from what must be an inventory:\n{section}"
+                );
+            }
+        }
+
+        assert!(emitted > 0, "the sweep never emitted a block");
+        assert!(refused > 0, "the sweep never crossed the ceiling");
     }
 
     /// A workspace whose only files are vendored produces no block at all,
@@ -640,5 +756,71 @@ mod tests {
     fn empty_inputs_produce_no_sections() {
         assert!(build_apps_section(&[]).is_empty());
         assert!(build_knowhow_section(&[], &[]).is_empty());
+        assert!(build_app_knowhow_listing("demo", &[]).is_empty());
+    }
+
+    fn summary(id: &str, name: &str, description: &str) -> KnowhowSummary {
+        KnowhowSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+        }
+    }
+
+    /// One line per doc, and a sentence saying what to do with the ids.
+    #[test]
+    fn the_app_listing_names_each_doc_and_says_how_to_load_it() {
+        let listing = build_app_knowhow_listing(
+            "habit-tracker",
+            &[
+                summary(
+                    "reach-metrics",
+                    "Reach metrics",
+                    "Where the numbers come from.",
+                ),
+                summary("nested/deep", "Deep dive", "The long version."),
+            ],
+        );
+
+        assert_eq!(
+            listing,
+            "This app's know-how is NOT loaded. Call load_knowhow with an id below \
+             when the turn needs it.\n\
+             - **Reach metrics** (id: `habit-tracker/reach-metrics`): Where the numbers come from.\n\
+             - **Deep dive** (id: `habit-tracker/nested/deep`): The long version.\n"
+        );
+    }
+
+    /// The same render-time ceiling the routing list uses. A user who writes
+    /// an essay into `description:` cannot reintroduce the cost the bodies
+    /// used to carry.
+    #[test]
+    fn an_app_listing_line_is_capped_like_a_routing_line() {
+        let long = "word ".repeat(400);
+        let listing = build_app_knowhow_listing("demo", &[summary("flow", "Flow", &long)]);
+
+        let line = listing
+            .lines()
+            .find(|l| l.starts_with("- **"))
+            .expect("a bullet");
+        assert!(
+            line.chars().count() <= KNOWHOW_DESCRIPTION_MAX_CHARS + 80,
+            "listing line not capped: {} chars",
+            line.chars().count()
+        );
+        assert!(line.ends_with('…'), "no ellipsis marker: {line}");
+    }
+
+    /// The id text is the load-bearing part, so it is built in one place. A
+    /// divergence here is a doc the agent is told about and cannot load.
+    #[test]
+    fn the_two_surfaces_print_the_same_app_scoped_id() {
+        let kh = summary("nested/deep", "Deep dive", "The long version.");
+        let listing = build_app_knowhow_listing("habit-tracker", std::slice::from_ref(&kh));
+        let routing = build_knowhow_section(&[], &[("habit-tracker".to_string(), kh)]);
+
+        let id = "(id: `habit-tracker/nested/deep`";
+        assert!(listing.contains(id), "{listing}");
+        assert!(routing.contains(id), "{routing}");
     }
 }

@@ -30,7 +30,7 @@ pub(super) const RESPONSE_TOKEN_RESERVE: usize = 8_000;
 ///
 /// Why this exists: the old `AGENT_CONTEXT_CHAR_BUDGET = 300_000` constant
 /// was calibrated for the 200k-token default Claude and ignored the 1M
-/// window on the Opus `[1m]` build entirely, so trim pass 2 would silently
+/// window on the Opus `[1m]` build entirely, so trim pass 5 would silently
 /// drop the original user message in long tool loops even though the model
 /// could easily have held the whole thread. Per-model derivation lets us
 /// actually use the headroom we paid for.
@@ -103,21 +103,66 @@ pub(super) const HISTORY_VERBATIM_TAIL: usize = 4;
 /// User messages are never compacted — their exact phrasing matters for follow-ups.
 pub(super) const HISTORY_ASSISTANT_COMPACT: usize = 1500;
 
+/// Total chars of verbatim user turns the *older region* may carry (ADR 0102).
+///
+/// User turns are never summarised, so this is the only thing bounding them.
+/// It is counted newest-first, and what falls outside becomes one count line
+/// naming the way back.
+///
+/// 20,000 is roughly 8,000 tokens, and it almost never binds. Over 30 days,
+/// 4,051 user messages had a median of 63 chars and a mean of 446. A long
+/// thread's whole user side therefore runs to a few KB. The budget exists for
+/// the thread that pastes logs into the prompt, not for the normal case.
+pub(super) const HISTORY_OLDER_USER_BUDGET: usize = 20_000;
+
+/// How many assistant turns may sit past the *conversation summary*'s boundary
+/// before the summary is rebuilt (ADR 0102).
+///
+/// The uncovered turns render compacted in the meantime, so this trades up to
+/// `N * HISTORY_ASSISTANT_COMPACT` chars against an auxiliary model call in
+/// turn setup. That call sends tens of thousands of tokens and blocks the first
+/// agentic step, so a few compacted turns is the cheaper side.
+pub(super) const HISTORY_SUMMARY_REFRESH_AFTER: usize = 5;
+
+/// How many uncovered assistant turns the *older region* renders before it
+/// elides the rest into one count line (ADR 0102).
+///
+/// Deliberately above `HISTORY_SUMMARY_REFRESH_AFTER`, and the order is the
+/// point. A refresh is attempted first, and the gap between the two numbers is
+/// the room a failing summariser gets before anything is elided. Without a cap
+/// a thread whose summariser never lands would render every assistant turn
+/// compacted, which is worse than the summary it replaced.
+pub(super) const HISTORY_OLDER_UNCOVERED_TURNS: usize = 8;
+
 /// Max bytes for a single read_file result returned to the LLM.
 pub(super) const READ_FILE_MAX_BYTES: usize = 50_000;
 
 /// Minimum content size before considering truncation of a single value.
 pub(super) const TRUNCATION_THRESHOLD: usize = 500;
 
-/// Threshold for Pass 1.5 — truncates `ToolResult` blocks in the PRESERVED
-/// tail (the last [`PRESERVE_RECENT_MESSAGES`]) when Pass 1 alone can't get
-/// under budget. Higher than [`TRUNCATION_THRESHOLD`] because tail
-/// preservation exists so the LLM can see what just happened — only the
-/// outlier "tool result that dumped 100 KB of events" gets cut, normal
-/// small results survive verbatim. The truncated note still reaches the
-/// LLM ("[content truncated — was N chars]") so it knows to re-query if
-/// the data actually mattered.
+/// What counts as outsized inside the PRESERVED tail, the last
+/// [`PRESERVE_RECENT_MESSAGES`] messages.
+///
+/// Higher than [`TRUNCATION_THRESHOLD`], because the tail exists so the model
+/// can see what just happened. Only the outlier gets cut, the tool result that
+/// dumped 100 KB of events. Ordinary small results survive verbatim, and every
+/// cut leaves a [`BUDGET_CUT_NOTE`] stub naming the way back.
 pub(super) const TAIL_TRUNCATION_THRESHOLD: usize = 20_000;
+
+/// How much of an oversized result the last-resort pass keeps.
+///
+/// That pass runs only when ONE message's own tool results exceed the whole
+/// budget, so no eviction elsewhere can help. Erasing them outright guarantees
+/// the model re-fetches what it just asked for, which is a livelock rather than
+/// a saving. Keeping a head plus the address leaves the round able to progress.
+pub(super) const LAST_RESORT_HEAD_CHARS: usize = 20_000;
+
+/// The words every budget stub opens with.
+///
+/// One string, so a reader (and a test) can find every loss the trimmer caused
+/// with a single search. The stub that follows it always states the size, and
+/// states the address when the content carried one.
+pub(super) const BUDGET_CUT_NOTE: &str = "cut to fit the context budget";
 
 /// Sanitize file content before returning it to the LLM:
 /// 1. Strip base64 data URIs (e.g. embedded images) — they burn tokens and the LLM can't use them.
@@ -228,7 +273,7 @@ pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefiniti
 /// ~1.6k tokens for a full-size photo, regardless of how many megabytes of
 /// base64 it serializes to. Counting `data.len()` (2–3 M chars for a phone
 /// photo) made one attached image dwarf the entire context budget, which forced
-/// trim Pass 2 to evict real conversation/tool context just to "fit" the image
+/// trim pass 5 to evict real conversation/tool context just to "fit" the image
 /// — or, with the image pinned, made the loop strip the bytes after the first
 /// LLM call so the model went blind to the image mid-turn ("the bot can't see
 /// my attached image"). Estimating the real token cost lets the image stay in
@@ -254,7 +299,8 @@ pub(super) fn estimate_message_chars(message: &Message) -> usize {
             blocks
                 .iter()
                 .map(|b| match b {
-                    ContentBlock::Text { text } => text.len(),
+                    // A tail block is text on the wire and is billed as text.
+                    ContentBlock::Text { text } | ContentBlock::EngineTail { text } => text.len(),
                     ContentBlock::ToolUse {
                         id, name, input, ..
                     } => id.len() + name.len() + input.to_string().len(),
@@ -293,41 +339,399 @@ pub(super) fn replace_image_blocks(
 /// What a [`trim_context_if_needed`] call actually did to the messages.
 ///
 /// Both fields mean the LLM saw less than the assembled context. They are kept
-/// separate because pass 2's `messages_removed` also shifts the caller's tracked
+/// separate because pass 5's `messages_removed` also shifts the caller's tracked
 /// message indices, whereas truncation does not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct TrimOutcome {
-    /// Messages evicted by pass 2.
+    /// Messages evicted by pass 5.
     pub messages_removed: usize,
-    /// Content cut in place by pass 1 / 1.5 — `ToolResult` bodies replaced with
-    /// a truncation note, plus oversized `ToolUse` argument strings.
+    /// Content cut in place by passes 1 to 4: `ToolResult` bodies replaced with
+    /// a stub, plus oversized `ToolUse` argument strings.
     pub blocks_truncated: usize,
+    /// Which passes actually cut something, as a bitmask: bit N is pass N.
+    ///
+    /// The counts above say how much was lost and this says where from, which
+    /// is a different question. Pass 5 is the only silent one, so a mask with
+    /// bit 5 clear means every loss on this round left a stub behind.
+    ///
+    /// Pass 0 never sets a bit. It strips image bytes before the budget gate,
+    /// so it is not a budget pass (ADR 0103).
+    pub passes: u8,
 }
 
 impl TrimOutcome {
     /// Whether anything was dropped at all. This is what `ContextCaptured.trimmed`
-    /// reports — it used to be `messages_removed > 0` alone, which silently
-    /// under-reported every turn where passes 1/1.5 gutted tool results but pass
-    /// 2 never had to evict a message.
+    /// reports. It was once `messages_removed > 0` alone, which under-reported
+    /// every turn where the stubbing passes gutted tool results and pass 5 never
+    /// had to evict a message.
     pub fn any(&self) -> bool {
         self.messages_removed > 0 || self.blocks_truncated > 0
     }
 }
 
+/// Whether a stubbing walk may also cut `ToolUse` argument strings.
+///
+/// Old arguments are fair game. The tail's are not: they are the call the model
+/// just made, and cutting them leaves it unable to see what it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arguments {
+    Cut,
+    Keep,
+}
+
+/// The bare `evt-<hex>` address a tool result ends with, or nothing.
+///
+/// `core::store::with_event_address` appends one on the live path and on the
+/// resume rebuild, in both context modes. So the address a stub needs to stay
+/// recoverable is sitting in the content the trimmer is about to destroy.
+///
+/// One result carries none: the call whose `ToolCalled` emit failed has no
+/// event id to render. Nothing addresses it, and a stub of it is a dead end.
+pub(super) fn address_trailer(content: &str) -> Option<&str> {
+    let line = content.lines().next_back()?.trim();
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    crate::core::store::parse_event_address(inner)
+        .filter(|_| inner.starts_with("evt-"))
+        .map(|_| inner)
+}
+
+/// The stub note a pass left, when it left one.
+///
+/// Matched as a line opener rather than anywhere in the text. A result that
+/// merely quotes the note is not a stub.
+fn stub_line(content: &str) -> Option<&str> {
+    let budget = format!("[{BUDGET_CUT_NOTE}");
+    content.lines().find(|line| line.starts_with(&budget))
+}
+
+/// Whether a budget pass already cut this content.
+///
+/// The context panel reports what this matches as already let go, so the model
+/// stops reasoning from bytes it can no longer inspect.
+pub(super) fn is_stub(content: &str) -> bool {
+    stub_line(content).is_some()
+}
+
+/// The keys no STUBBING pass may cut.
+///
+/// A failed action, and nothing else. Manus found that leaving mistakes in
+/// context is what stops a model repeating them, and the trimmer is the one
+/// evictor that still honours that. Keyed by the `evt-<hex>` trailer the result
+/// ends with.
+///
+/// **A keep is NOT in here.** It moves the item's clock and exempts nothing, so
+/// a liberal keeper can never fill the request with bytes the wall may not cut.
+/// What a keep buys at the wall is ordering: held items go last.
+///
+/// The live working understanding needs no key. It rides at the tail of the
+/// newest message, which pass 1 does not reach, pass 2 skips as non-assistant,
+/// and pass 5 cannot remove.
+///
+/// An empty set is every workspace with the context mode off.
+pub(super) type ProtectedAddresses = std::collections::HashSet<String>;
+
+/// Whether a placeholder names the call that reads the whole body back.
+///
+/// The recovery command is stated ONCE per request, in the standing
+/// instructions, so under the mode a placeholder drops it. The control arm
+/// keeps it: `with_event_address` stamps both arms, and ADR 0087's baseline is
+/// the bytes the control arm shipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryClause {
+    State,
+    Omit,
+}
+
+/// What every trim pass needs beyond the budget, gathered into one argument.
+///
+/// Two of the three bound what a pass may cut. The third decides what the
+/// placeholder it leaves behind says, which is not a guard. It rides here
+/// because every pass that writes one also honours the two above it. Threading
+/// them apart is how one call site disagrees with the rest.
+#[derive(Clone, Copy)]
+pub(super) struct TrimGuards<'a> {
+    /// Never cut, whatever it costs.
+    pub(super) protected: &'a ProtectedAddresses,
+    /// Cut last, and cut when nothing else is left.
+    pub(super) held_open: &'a std::collections::HashSet<String>,
+    /// Whether a placeholder names the recovery call.
+    pub(super) recovery: RecoveryClause,
+}
+
+impl TrimGuards<'_> {
+    fn is_held(&self, content: &str) -> bool {
+        address_trailer(content).is_some_and(|addr| self.held_open.contains(addr))
+    }
+}
+
+/// Whether this tool result is one no pass may cut.
+fn is_protected(content: &str, protected: &ProtectedAddresses) -> bool {
+    address_trailer(content).is_some_and(|addr| protected.contains(addr))
+}
+
+/// What the content weighed before a budget pass cut it.
+///
+/// Both stub forms state the original size, and both put it immediately before
+/// the word `chars`. The panel shows it beside the stub's own size, so the
+/// model can see what a re-fetch would cost it.
+pub(super) fn stub_original_chars(content: &str) -> Option<usize> {
+    let line = stub_line(content)?;
+    let (before, _) = line.rsplit_once(" chars")?;
+    before.rsplit(' ').next()?.parse().ok()
+}
+
+/// The note that replaces content the budget could not fit.
+///
+/// It states the size, and where `recovery` says so it names the call that
+/// reads the whole thing back. The bare address line stays last, exactly as the
+/// original had it, so a later pass still finds the block.
+pub(super) fn budget_stub(content: &str, recovery: RecoveryClause) -> String {
+    let was = content.len();
+    match (address_trailer(content), recovery) {
+        (Some(addr), RecoveryClause::State) => format!(
+            "[{BUDGET_CUT_NOTE}: was {was} chars. \
+             events(action=\"query\", event_id=\"{addr}\") reads it back.]\n[{addr}]"
+        ),
+        (Some(addr), RecoveryClause::Omit) => {
+            format!("[{BUDGET_CUT_NOTE}: was {was} chars.]\n[{addr}]")
+        }
+        (None, _) => format!("[{BUDGET_CUT_NOTE}: was {was} chars.]"),
+    }
+}
+
+/// Keep the first `keep` chars of `content` and say what happened to the rest.
+///
+/// Used only by the last-resort pass, where a full [`budget_stub`] would erase
+/// a result the model asked for on this very round.
+pub(super) fn head_stub(content: &str, keep: usize, recovery: RecoveryClause) -> String {
+    let end = content.floor_char_boundary(keep);
+    let head = &content[..end];
+    let was = content.len();
+    match (address_trailer(content), recovery) {
+        (Some(addr), RecoveryClause::State) => format!(
+            "{head}\n[{BUDGET_CUT_NOTE}: {end} of {was} chars shown. \
+             events(action=\"query\", event_id=\"{addr}\") reads the whole result back.]\n[{addr}]"
+        ),
+        (Some(addr), RecoveryClause::Omit) => {
+            format!("{head}\n[{BUDGET_CUT_NOTE}: {end} of {was} chars shown.]\n[{addr}]")
+        }
+        (None, _) => format!("{head}\n[{BUDGET_CUT_NOTE}: {end} of {was} chars shown.]"),
+    }
+}
+
+/// Replace `content` with `stub` when the stub is shorter, take the saving off
+/// `total`, and report whether it replaced anything.
+///
+/// A stub carries a note and often an address, so on content barely over its
+/// threshold it is the longer of the two. Applying it would grow the request
+/// while `total` stood still. Every later pass then works from a number that no
+/// longer matches the messages, and under-evicts by the difference.
+fn apply_stub(content: &mut String, stub: String, total: &mut usize) -> bool {
+    if stub.len() >= content.len() {
+        return false;
+    }
+    *total -= content.len() - stub.len();
+    *content = stub;
+    true
+}
+
+/// Stub oversized tool results in `messages`, oldest first, and stop the moment
+/// `total` is back under `budget`.
+///
+/// Stopping early is the whole point. The old pass cut everything in range
+/// whatever the shortfall, so a round needing 34 KB back destroyed 193 KB.
+/// **Held items go last.** The walk runs oldest-first by position, and a held
+/// item sits at an old position. One walk would destroy exactly what the model
+/// asked to hold. Two walks fix the order without exempting anything: the
+/// second takes the held items when nothing else is left.
+fn stub_oldest_first(
+    messages: &mut [Message],
+    threshold: usize,
+    arguments: Arguments,
+    budget: usize,
+    total: &mut usize,
+    guards: TrimGuards<'_>,
+) -> usize {
+    let mut cut = stub_walk(messages, threshold, arguments, budget, total, guards, true);
+    if *total > budget && !guards.held_open.is_empty() {
+        cut += stub_walk(
+            messages,
+            threshold,
+            Arguments::Keep,
+            budget,
+            total,
+            guards,
+            false,
+        );
+    }
+    cut
+}
+
+fn stub_walk(
+    messages: &mut [Message],
+    threshold: usize,
+    arguments: Arguments,
+    budget: usize,
+    total: &mut usize,
+    guards: TrimGuards<'_>,
+    spare_held: bool,
+) -> usize {
+    let mut cut = 0usize;
+    for message in messages.iter_mut() {
+        if *total <= budget {
+            break;
+        }
+        let MessageContent::Blocks(blocks) = &mut message.content else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            if *total <= budget {
+                break;
+            }
+            match block {
+                ContentBlock::ToolResult { content, .. }
+                    if content.len() > threshold
+                        && !is_protected(content, guards.protected)
+                        && !(spare_held && guards.is_held(content)) =>
+                {
+                    if apply_stub(content, budget_stub(content, guards.recovery), total) {
+                        cut += 1;
+                    }
+                }
+                ContentBlock::ToolUse { input, .. } if arguments == Arguments::Cut => {
+                    let before = input.to_string().len();
+                    let cut_here = truncate_large_json_strings(input);
+                    if cut_here > 0 {
+                        *total -= before.saturating_sub(input.to_string().len());
+                        cut += cut_here;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    cut
+}
+
+/// Collapse old assistant prose, oldest first, stopping at budget.
+///
+/// This runs before any pair removal. A stubbed message is a loss the model can
+/// see and act on, and a removed one is not. Assistant messages only: a
+/// mid-turn user injection in the same range carries a real instruction.
+fn collapse_assistant_prose(
+    messages: &mut [Message],
+    budget: usize,
+    total: &mut usize,
+    guards: TrimGuards<'_>,
+) -> usize {
+    let mut cut = 0usize;
+    for message in messages.iter_mut() {
+        if *total <= budget {
+            break;
+        }
+        if message.role != "assistant" {
+            continue;
+        }
+        match &mut message.content {
+            MessageContent::Text(text) if text.len() > TRUNCATION_THRESHOLD => {
+                if apply_stub(text, budget_stub(text, guards.recovery), total) {
+                    cut += 1;
+                }
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks.iter_mut() {
+                    if *total <= budget {
+                        break;
+                    }
+                    if let ContentBlock::Text { text } = block {
+                        if text.len() > TRUNCATION_THRESHOLD
+                            && apply_stub(text, budget_stub(text, guards.recovery), total)
+                        {
+                            cut += 1;
+                        }
+                    }
+                }
+            }
+            MessageContent::Text(_) => {}
+        }
+    }
+    cut
+}
+
+/// The last resort: cut the newest message's own tool results.
+///
+/// Only reached when that one message exceeds the whole budget by itself, so no
+/// eviction anywhere else can help. Largest first, keeping a head each time.
+/// A result is replaced outright only if the heads alone still do not fit.
+fn cut_the_newest_results(
+    message: &mut Message,
+    budget: usize,
+    total: &mut usize,
+    guards: TrimGuards<'_>,
+) -> usize {
+    let MessageContent::Blocks(blocks) = &mut message.content else {
+        return 0;
+    };
+    let mut cut = 0usize;
+    for threshold in [LAST_RESORT_HEAD_CHARS, TRUNCATION_THRESHOLD] {
+        let mut order: Vec<usize> = (0..blocks.len())
+            .filter(|i| match &blocks[*i] {
+                ContentBlock::ToolResult { content, .. } => {
+                    content.len() > threshold && !is_protected(content, guards.protected)
+                }
+                _ => false,
+            })
+            .collect();
+        // Held last, largest first inside each group. `false` sorts before
+        // `true`, so an unheld result of the same size always goes first.
+        order.sort_by_key(|i| match &blocks[*i] {
+            ContentBlock::ToolResult { content, .. } => {
+                (guards.is_held(content), std::cmp::Reverse(content.len()))
+            }
+            _ => (true, std::cmp::Reverse(0)),
+        });
+        for i in order {
+            if *total <= budget {
+                return cut;
+            }
+            let ContentBlock::ToolResult { content, .. } = &mut blocks[i] else {
+                continue;
+            };
+            let stub = if threshold == LAST_RESORT_HEAD_CHARS {
+                head_stub(content, LAST_RESORT_HEAD_CHARS, guards.recovery)
+            } else {
+                budget_stub(content, guards.recovery)
+            };
+            if apply_stub(content, stub, total) {
+                cut += 1;
+            }
+        }
+    }
+    cut
+}
+
 /// Trim the agent loop message history to fit within a character budget.
 ///
-/// Three passes:
+/// Six passes, each one stopping as soon as the total is back under budget:
 /// 0. Strip image bytes from every message except the last and `keep_image_idxs`.
-/// 1. Truncate large tool results/inputs in old messages.
-/// 2. If still over budget, remove oldest message pairs from index 1 onward.
+/// 1. Stub oversized tool results and arguments in OLD messages.
+/// 2. Collapse old assistant prose.
+/// 3. Stub outsized tool results in the preserved tail.
+/// 4. Cut the newest message's own results, when they exceed the budget alone.
+/// 5. Remove oldest message pairs from index 1 onward.
 ///
-/// `messages[0]` and the last `PRESERVE_RECENT_MESSAGES` messages are never
-/// removed or truncated in pass 2. If `protected_idx` is `Some(i)`, the message
-/// at that index is also pinned: pass 2 stops before removing it, even if that
-/// leaves the loop over budget. Callers use this to pin the current turn's
+/// The order runs from the cheapest loss to the dearest. Pass 5 is the only one
+/// that loses anything silently, so it goes last. Every pass above it leaves a
+/// stub naming the size and the way back, which means by then there is nothing
+/// left to stub. ADR 0103 records the decision per pass.
+///
+/// Pass 5 never removes `messages[0]` or the last `PRESERVE_RECENT_MESSAGES`
+/// messages. If `protected_idx` is `Some(i)`, the message at that index is also
+/// pinned: pass 5 stops before removing it, even if that leaves the loop over
+/// budget. Callers use this to pin the current turn's
 /// user message — once tool iterations push it out of the last
 /// `PRESERVE_RECENT_MESSAGES` slots, the recent-tail rule alone no longer
-/// covers it and pass 2 would otherwise drop the original request (and, with
+/// covers it and pass 5 would otherwise drop the original request (and, with
 /// the image pins covering it, the attached image) from the prompt.
 ///
 /// `keep_image_idxs` lists every message whose image bytes pass 0 must preserve,
@@ -343,7 +747,7 @@ impl TrimOutcome {
 /// deliberately NOT pinned: they snapshot state that changes under the model,
 /// so they must age out after one call.
 ///
-/// The two roles stay distinct: pass 2's eviction floor derives from the
+/// The two roles stay distinct: pass 5's eviction floor derives from the
 /// *minimum* pinned index only. Pinning a later tool result therefore never
 /// weakens eviction — and because every pin sits at or above that floor, no
 /// pinned message can be removed, so the caller's index bookkeeping stays exact.
@@ -354,6 +758,7 @@ pub(super) fn trim_context_if_needed(
     budget: usize,
     protected_idx: Option<usize>,
     keep_image_idxs: &[usize],
+    guards: TrimGuards<'_>,
 ) -> TrimOutcome {
     // The current user message is the LAST entry on the first iteration —
     // `chat::process` builds `messages = resume_tool_blocks;
@@ -385,115 +790,143 @@ pub(super) fn trim_context_if_needed(
     }
 
     let mut blocks_truncated = 0usize;
+    let mut passes = 0u8;
+    let mut running = total;
     let len = messages.len();
-    let preserve_start = if len > PRESERVE_RECENT_MESSAGES {
-        len - PRESERVE_RECENT_MESSAGES
-    } else {
-        len
-    };
+    // The recent tail is protected at EVERY message count. It used to be spared
+    // only above PRESERVE_RECENT_MESSAGES, which inverted the rule exactly when
+    // the tail was all there was: a round batching five big reads sat at three
+    // messages, and pass 1 stubbed every result before the model read a word.
+    let preserve_start = len.saturating_sub(PRESERVE_RECENT_MESSAGES).max(1);
 
-    // Pass 1: truncate large values in old messages, skipping message[0].
-    // The recent tail is spared only once there are MORE than
-    // PRESERVE_RECENT_MESSAGES messages: at or below that, `preserve_start ==
-    // len`, so this pass covers every message including the last one that
-    // pass 1.5 below goes out of its way to protect.
-    for message in &mut messages[1..preserve_start] {
-        if let MessageContent::Blocks(blocks) = &mut message.content {
-            for block in blocks.iter_mut() {
-                match block {
-                    ContentBlock::ToolResult {
-                        tool_use_id: _,
-                        content,
-                    } => {
-                        if content.len() > TRUNCATION_THRESHOLD {
-                            let orig_len = content.len();
-                            *content = format!("[content truncated — was {} chars]", orig_len);
-                            blocks_truncated += 1;
-                        }
-                    }
-                    ContentBlock::ToolUse { input, .. } => {
-                        blocks_truncated += truncate_large_json_strings(input);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let total_after_pass1: usize = messages.iter().map(estimate_message_chars).sum();
-    if total_after_pass1 <= budget {
+    // Pass 1: stub oversized results and arguments in old messages, oldest
+    // first, skipping message[0] and the tail.
+    let pass_1 = stub_oldest_first(
+        &mut messages[1..preserve_start],
+        TRUNCATION_THRESHOLD,
+        Arguments::Cut,
+        budget,
+        &mut running,
+        guards,
+    );
+    blocks_truncated += pass_1;
+    passes |= u8::from(pass_1 > 0) << 1;
+    if running <= budget {
         log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
-            budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(total_after_pass1) / 1000,
-            total, total_after_pass1, messages.len(), budget_tokens_from_chars(budget) / 1000
+            budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(running) / 1000,
+            total, running, messages.len(), budget_tokens_from_chars(budget) / 1000
         );
         return TrimOutcome {
             messages_removed: 0,
             blocks_truncated,
+            passes,
         };
     }
 
-    // Pass 1.5: if still over budget, truncate large ToolResult blocks in the
-    // preserved tail (except the very last message). Tail preservation exists
-    // so the LLM can see what just happened — but a tail full of huge
-    // `query_events` dumps will blow the budget no matter how aggressively
-    // pass 2 removes old pairs. The cut still leaves the "[content truncated
-    // — was N chars]" note so the LLM can re-query if the data mattered.
-    let mut total_after_truncation = total_after_pass1;
+    // Pass 2: collapse old assistant prose. Cheaper than removing the message
+    // it sits in, and unlike removal the model can see that it happened.
+    let pass_2 = collapse_assistant_prose(
+        &mut messages[1..preserve_start],
+        budget,
+        &mut running,
+        guards,
+    );
+    blocks_truncated += pass_2;
+    passes |= u8::from(pass_2 > 0) << 2;
+    if running <= budget {
+        log!(
+            "[Context] Context trimming: pass 2 (old prose) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
+            budget_tokens_from_chars(running) / 1000,
+            running,
+            budget_tokens_from_chars(budget) / 1000
+        );
+        return TrimOutcome {
+            messages_removed: 0,
+            blocks_truncated,
+            passes,
+        };
+    }
+
+    // Pass 3: stub outsized ToolResult blocks in the preserved tail, except the
+    // very last message. The tail is preserved so the LLM can see what just
+    // happened. But a tail full of huge `events` dumps blows the budget however
+    // aggressively pass 4 removes old pairs. The threshold is higher here, so
+    // only the outlier gets cut and ordinary results survive verbatim.
     if len > PRESERVE_RECENT_MESSAGES + 1 {
         let tail_start = len - PRESERVE_RECENT_MESSAGES;
         let tail_end = len - 1; // skip the very last message
-        for message in &mut messages[tail_start..tail_end] {
-            if let MessageContent::Blocks(blocks) = &mut message.content {
-                for block in blocks.iter_mut() {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id: _,
-                        content,
-                    } = block
-                    {
-                        if content.len() > TAIL_TRUNCATION_THRESHOLD {
-                            let orig_len = content.len();
-                            *content = format!("[content truncated — was {} chars]", orig_len);
-                            blocks_truncated += 1;
-                        }
-                    }
-                }
-            }
-        }
-        total_after_truncation = messages.iter().map(estimate_message_chars).sum();
-        if total_after_truncation <= budget {
-            log!("[Context] Context trimming: pass 1.5 (tail trim) reduced ~{}k -> ~{}k tokens ({} -> {} chars, budget ~{}k tokens)",
-                budget_tokens_from_chars(total_after_pass1) / 1000, budget_tokens_from_chars(total_after_truncation) / 1000,
-                total_after_pass1, total_after_truncation, budget_tokens_from_chars(budget) / 1000
+        let pass_3 = stub_oldest_first(
+            &mut messages[tail_start..tail_end],
+            TAIL_TRUNCATION_THRESHOLD,
+            Arguments::Keep,
+            budget,
+            &mut running,
+            guards,
+        );
+        blocks_truncated += pass_3;
+        passes |= u8::from(pass_3 > 0) << 3;
+        if running <= budget {
+            log!("[Context] Context trimming: pass 3 (tail trim) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
+                budget_tokens_from_chars(running) / 1000, running, budget_tokens_from_chars(budget) / 1000
             );
             return TrimOutcome {
                 messages_removed: 0,
                 blocks_truncated,
+                passes,
             };
         }
     }
 
-    // Pass 2: remove oldest messages (from index 1) until under budget.
+    // Pass 4: the newest message's own tool results exceed the whole budget, so
+    // no eviction anywhere else can bring the request under it. Cut them,
+    // largest first, keeping a head each time.
+    //
+    // It runs BEFORE pair removal for that exact reason. While one message is
+    // over budget on its own, every pair removed is history lost silently and
+    // for nothing. A test caught the other order throwing away four messages
+    // and then having to cut the newest one anyway.
+    //
+    // The gate is deliberately narrow. Merely being over budget is usually
+    // survivable, because the budget counts a conservative 1.5 chars per token
+    // against a measured 2.5. One message over the whole budget is different.
+    if let Some(newest) = messages.last_mut() {
+        if estimate_message_chars(newest) > budget {
+            let cut = cut_the_newest_results(newest, budget, &mut running, guards);
+            blocks_truncated += cut;
+            passes |= u8::from(cut > 0) << 4;
+            if cut > 0 {
+                log!(
+                    "[Context] Context trimming: last resort cut {} result(s) from the newest message, which exceeded the whole budget alone ({} chars now, {} budget)",
+                    cut,
+                    running,
+                    budget
+                );
+            }
+        }
+    }
+
+    // Pass 5: remove oldest messages (from index 1) until under budget.
     // Tool-use-aware: when removing an assistant message with ToolUse blocks,
     // also remove the following user message (which contains matching ToolResult
     // blocks). Never remove one without the other — orphaned ToolResult blocks
     // cause API validation errors.
     //
-    // `current_total` starts from the post-truncation count (after both Pass 1
-    // and Pass 1.5) — using the pre-1.5 number would over-credit the budget
-    // and cause Pass 2 to evict more old pairs than necessary.
+    // `current_total` starts from the post-truncation count, after every
+    // stubbing pass. Using an earlier number would over-credit the budget and
+    // evict more old pairs than necessary.
     let mut removed = 0;
-    let mut current_total = total_after_truncation;
+    let mut current_total = running;
     // Track the protected message's position as removals shift it down. Once
-    // it reaches index 1 (or its tool_result pair-mate would be removed),
-    // stop — losing the pinned request is worse than going over budget.
+    // it reaches index 1, or its tool_result pair-mate would be removed, stop.
+    // Losing the pinned request is worse than going over budget.
     //
     // Protect down to the LOWER of `protected_idx` (the latest user input) and
-    // the LOWEST image pin. They're equal in the common case, but a mid-turn
+    // the LOWEST image pin. They are equal in the common case. But a mid-turn
     // prompt injection moves `protected_idx` to the new last message while the
-    // image stays at a lower index — pass 0 keeps the image bytes, but pass 2
-    // must also refuse to remove that whole message, or the image (and the
-    // original request) is lost anyway. Stopping at the min keeps both:
-    // everything from that index up survives — which is also what makes every
+    // image stays at a lower index. Pass 0 keeps the image bytes. This pass
+    // must also refuse to remove that whole message, or the image and the
+    // original request are lost anyway. Stopping at the min keeps both:
+    // everything from that index up survives, which is also what makes every
     // *other* pin safe from eviction without protecting them individually.
     let lowest_image_pin = keep_image_idxs.iter().min().copied();
     let mut protected = match (protected_idx, lowest_image_pin) {
@@ -557,6 +990,7 @@ pub(super) fn trim_context_if_needed(
     TrimOutcome {
         messages_removed: removed,
         blocks_truncated,
+        passes: passes | (u8::from(removed > 0) << 5),
     }
 }
 
@@ -654,6 +1088,27 @@ fn strip_loaded_knowhow_bodies(content: &str, loaded_bodies: &[&str]) -> String 
         }
     }
     out
+}
+
+/// How a message's images are addressed inside its history annotation.
+///
+/// Two forms side by side. `thread:N` counts from the start of the thread, so
+/// it renumbers whenever an earlier image appears. `img-<hex>` is content
+/// addressed and does not, which is what lets the model note one and still
+/// resolve it later (ADR 0085 Decision 11).
+///
+/// `handles` is empty when we cannot state one exactly. The caller decides
+/// that, and `history.rs` records why at the call site.
+pub(crate) fn format_image_refs(img_start: usize, count: usize, handles: &[String]) -> String {
+    let range = if count <= 1 {
+        format!("thread:{}", img_start + 1)
+    } else {
+        format!("thread:{}-thread:{}", img_start + 1, img_start + count)
+    };
+    if handles.is_empty() {
+        return range;
+    }
+    format!("{range}, {}", handles.join(" "))
 }
 
 /// Bounds runaway tool-loop turns; ~6 typical tool calls fit in well under this.
@@ -1092,7 +1547,7 @@ mod context_window_tests {
             default_claude
         );
         // And large enough to hold the 552 KB iPhone screenshot from the
-        // regression thread without trim pass 2 evicting anything.
+        // regression thread without trim pass 5 evicting anything.
         assert!(opus_1m > 1_000_000, "Opus 1M budget too small: {}", opus_1m);
     }
 

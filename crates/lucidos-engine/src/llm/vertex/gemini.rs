@@ -280,15 +280,26 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
             }
         }
     }
-    if !tool_calls.is_empty() && !text_parts.is_empty() {
-        thinking_chars =
-            thinking_chars.saturating_add(text_parts.iter().map(|s| s.len()).sum::<usize>());
+    // One join, two mutually exclusive destinations, so neither can be set
+    // without the other being ruled out. Text beside a `functionCall` is Gemini
+    // narrating its plan rather than answering: it is billed as thinking and
+    // kept off the screen, and it rides back to the model as `model_only_text`.
+    let mut content = None;
+    let mut narration = None;
+    if !text_parts.is_empty() {
+        let joined = text_parts.join("\n");
+        if tool_calls.is_empty() {
+            content = Some(joined);
+        } else {
+            // Summed per part, not over the joined string, so the separators
+            // the join adds never inflate the figure the cost modal shows.
+            thinking_chars =
+                thinking_chars.saturating_add(text_parts.iter().map(|s| s.len()).sum::<usize>());
+            // An all-empty narration would put an empty text part on the next
+            // request's assistant turn. Send nothing rather than that.
+            narration = (!joined.is_empty()).then_some(joined);
+        }
     }
-    let content = if tool_calls.is_empty() && !text_parts.is_empty() {
-        Some(text_parts.join("\n"))
-    } else {
-        None
-    };
 
     let (input_tokens, output_tokens) = parsed
         .usage_metadata
@@ -316,6 +327,10 @@ fn build_gemini_llm_response(parsed: VertexResponse) -> LlmResponse {
         cache_read_tokens: None,
         thinking_chars: (thinking_chars > 0).then_some(thinking_chars),
         unknown_sse_dropped: 0,
+        // Mutually exclusive with `content` by construction above: `narration`
+        // is `Some` only on a tool-call turn, which is exactly when `content`
+        // is `None`.
+        model_only_text: narration,
     }
 }
 
@@ -442,7 +457,9 @@ fn message_content_to_parts(
         MessageContent::Blocks(blocks) => blocks
             .into_iter()
             .map(|block| match block {
-                ContentBlock::Text { text } => Ok(VertexPart {
+                // A tail block is an ordinary text part here. Only the engine
+                // and Anthropic's cache anchor care who wrote it.
+                ContentBlock::Text { text } | ContentBlock::EngineTail { text } => Ok(VertexPart {
                     text: Some(text),
                     ..Default::default()
                 }),
@@ -831,6 +848,16 @@ mod tests {
             resp.content.is_none(),
             "Gemini text that accompanies a function call is internal preamble, not printable output"
         );
+        assert_eq!(
+            resp.model_only_text.as_deref(),
+            Some(thinking),
+            "the same preamble must survive for the model's own next turn"
+        );
+        assert_eq!(
+            resp.history_text(),
+            Some(thinking),
+            "history takes the preamble even though the screen does not"
+        );
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].name, "web_search");
         assert_eq!(
@@ -838,6 +865,120 @@ mod tests {
             Some("sig-tool")
         );
         assert_eq!(resp.thinking_chars, Some(thinking.len()));
+    }
+
+    /// A final turn is the printable case: the text IS the answer, so it rides
+    /// in `content` and nothing is model-only. Guards the pair invariant from
+    /// the other side, since setting both fields would send the text twice.
+    #[test]
+    fn build_gemini_llm_response_keeps_a_final_answer_printable() {
+        let answer = "Here is the review. The rename handler closes over a stale id.";
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [ { "text": answer } ] },
+                "finishReason": "STOP"
+            }]
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(resp.content.as_deref(), Some(answer));
+        assert!(
+            resp.model_only_text.is_none(),
+            "a printable answer is never also model-only"
+        );
+        assert_eq!(resp.history_text(), Some(answer));
+    }
+
+    /// An empty text part beside a call must not become an empty text part on
+    /// the next request's assistant turn. Gemini never asked for one, and the
+    /// old code could not produce it because it dropped the text entirely.
+    #[test]
+    fn build_gemini_llm_response_drops_an_empty_narration() {
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "" },
+                        { "functionCall": { "name": "list_files", "args": {} } }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert!(resp.content.is_none());
+        assert!(
+            resp.model_only_text.is_none(),
+            "an empty narration is nothing to carry, not an empty text part"
+        );
+        assert_eq!(resp.history_text(), None);
+    }
+
+    /// The wire proof. Gemini attaches its signature to the first `functionCall`
+    /// part only, and Vertex rejects a turn that comes back without it. The
+    /// added text part must not displace it.
+    #[test]
+    fn a_gemini_tool_call_turn_goes_back_as_narration_then_calls() {
+        let narration = "Reading both files before I judge anything.";
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": narration },
+                        {
+                            "functionCall": { "name": "read_file", "args": { "path": "a.json" } },
+                            "thoughtSignature": "sig-first"
+                        },
+                        { "functionCall": { "name": "read_file", "args": { "path": "b.html" } } }
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let parsed: VertexResponse = serde_json::from_value(body).unwrap();
+        let resp = build_gemini_llm_response(parsed);
+
+        // Assembled exactly as `agentic_loop::run` assembles the assistant turn.
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        if let Some(text) = resp.history_text() {
+            blocks.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
+        }
+        for tc in &resp.tool_calls {
+            blocks.push(ContentBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+                thought_signature: tc.thought_signature.clone(),
+            });
+        }
+        let contents = messages_to_vertex_contents(vec![Message {
+            role: "assistant".to_string(),
+            content: MessageContent::Blocks(blocks),
+        }])
+        .expect("the assistant turn converts");
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role, "model");
+        let parts = &contents[0].parts;
+        assert_eq!(parts.len(), 3, "narration plus both calls");
+        assert_eq!(
+            parts[0].text.as_deref(),
+            Some(narration),
+            "the model's own notes lead its turn"
+        );
+        assert!(parts[1].function_call.is_some());
+        assert_eq!(
+            parts[1].thought_signature.as_deref(),
+            Some("sig-first"),
+            "the signature Vertex demands must survive beside the text part"
+        );
+        assert!(parts[2].function_call.is_some());
     }
 
     #[test]

@@ -5,18 +5,29 @@ use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
 
+/// The `repo` argument, spelled once for every tool that can address a
+/// registered repository. Written once because each schema is billed on every
+/// request of every thread, and because four hand-copied descriptions drift.
+fn repo_arg() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "description": "A registered repo's name or id (manage_repositories 'list'). Makes `path`/`pattern` repo-root-relative, over its working tree; gitignored files are invisible."
+    })
+}
+
 pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::READ_FILE.to_string(),
-            description: "Read a file under data/ or the ephemeral .lucidos/tmp/ scratch tree. Text and images both work; an SVG comes back as text, a large image is downsampled, and only files over 25 MB are rejected. Text over 50KB comes back in chunks ending with the exact `offset=` for the next call, and `start_line` plus `line_count` reads part of a long file. Reads inside .zip and .lucidos-plugin archives: point `path` past the archive segment.".to_string(),
+            description: "Read a file under data/, the ephemeral .lucidos/tmp/ scratch tree, or a registered repository via `repo`. Text and images both work; an SVG comes back as text, a large image is downsampled, and only files over 25 MB are rejected. Text over 50KB comes back in chunks ending with the exact `offset=` for the next call, and `start_line` plus `line_count` reads part of a long file. Reads inside .zip and .lucidos-plugin archives: point `path` past the archive segment.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g. artifacts/notes.md), or a scratch path under .lucidos/tmp/ exactly as http_request and git_clone report it back. May traverse a .zip or .lucidos-plugin segment to read an entry inside."
+                        "description": "Relative path under data/ (e.g. artifacts/notes.md), or a scratch path under .lucidos/tmp/ exactly as http_request and git_clone report it back. With `repo`, relative to that repository's root instead. May traverse a .zip or .lucidos-plugin segment to read an entry inside."
                     },
+                    "repo": repo_arg(),
                     "offset": {
                         "type": "integer",
                         "description": "Byte offset to start from (default 0), from the previous truncated response. Text only, ignored when `start_line` is set."
@@ -59,13 +70,18 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::EDIT_FILE.to_string(),
-            description: "Targeted edit to an existing file, in one of two modes. Text mode is old_string plus new_string. JSON mode is json_path plus new_value, which handles parsing and re-serialization for a .json or .slides file, avoiding escaping and matching issues; prefer it there. Under data/ only: .lucidos/tmp/ is readable but not editable here, so use run_python.".to_string(),
+            description: "Targeted edit to an existing file, in one of two modes. Text mode is old_string plus new_string, and answers N of M occurrences replaced. JSON mode is json_path plus new_value, which handles parsing and re-serialization for a .json or .slides file, avoiding escaping and matching issues; prefer it there. Targets data/, or a repo with `repo` plus `commit: false`. .lucidos/tmp/ is readable but not editable here, so use run_python.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g. artifacts/notes.md, apps/my-app/knowhow/api-reference.md). A knowhow/ path that exists in shared (~/.lucidos/knowhow/) but not locally updates the shared copy."
+                        "description": "Relative path under data/ (e.g. artifacts/notes.md, apps/my-app/knowhow/api-reference.md). A knowhow/ path that exists in shared (~/.lucidos/knowhow/) but not locally updates the shared copy. With `repo`, relative to that repository's root instead."
+                    },
+                    "repo": repo_arg(),
+                    "commit": {
+                        "type": "boolean",
+                        "description": "Required as false with `repo`, invalid without it. A repo edit commits nothing: say so, and point at git diff. run_coding_agent instead when it should land as a reviewable change."
                     },
                     "old_string": {
                         "type": "string",
@@ -110,14 +126,15 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::GLOB_FILES.to_string(),
-            description: "Find files by glob across artifacts/, apps/, knowhow/ and triggers/, relative to data/ (e.g. 'apps/**/index.html').".to_string(),
+            description: "Find files by glob across artifacts/, apps/, knowhow/ and triggers/, relative to data/. With `repo`, across a registered repository instead.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern relative to data/."
+                        "description": "Glob pattern, e.g. 'apps/**/index.html'. Braces alternate: 'artifacts/{notes,drafts}/**'."
                     },
+                    "repo": repo_arg(),
                     "limit": {
                         "type": "integer",
                         "description": "Max paths to return (default 200, max 1000). Sorted; `truncated: true` means the cap was hit."
@@ -128,7 +145,7 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::GREP_FILES.to_string(),
-            description: "Regex-search file contents (Rust regex crate syntax) across artifacts/, apps/, knowhow/ and triggers/, skipping binaries and respecting workspace ignore rules. A line over 300 chars is truncated and the total capped at ~50 KB; narrow with `path_glob` when you hit `truncated: true`.".to_string(),
+            description: "Regex-search file contents across artifacts/, apps/, knowhow/ and triggers/, or a whole repo with `repo`. USE THIS, NOT run_bash grep/rg, in a repo too. Skips binaries and respects ignore rules. A line over 300 chars is truncated and the total capped at ~50 KB; narrow with `path_glob` when you hit `truncated: true`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -136,9 +153,10 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Regex, Rust regex crate syntax. Case-sensitive by default."
                     },
+                    "repo": repo_arg(),
                     "path_glob": {
                         "type": "string",
-                        "description": "Optional glob restricting which files are searched (e.g. 'apps/**/*.html'). Defaults to all files under data/."
+                        "description": "Optional glob restricting which files are searched, e.g. 'apps/**/*.html' or '{apps,knowhow}/**'. Defaults to all files under data/."
                     },
                     "case_insensitive": {
                         "type": "boolean",

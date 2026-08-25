@@ -33,6 +33,16 @@ pub struct ImageResult {
     pub bytes: Vec<u8>,
     /// MIME type of the image.
     pub mime_type: String,
+    /// Tokens the provider billed, when it says. OpenAI's image endpoints
+    /// report a `usage` block; Imagen prices per image and reports none, so
+    /// it leaves these `None`. Shaped as flat options to match `LlmResponse`.
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    /// The model id that served this call, for `ContextCaptured.model`, which
+    /// means the serving model everywhere it appears. It rides on the result
+    /// rather than the provider because Imagen picks its model per call:
+    /// generating and editing hit different ones.
+    pub model: String,
 }
 
 /// Trait for image generation providers.
@@ -96,11 +106,32 @@ impl OpenAiImageProvider {
 #[derive(Deserialize)]
 struct OpenAiImageResponse {
     data: Vec<OpenAiImageData>,
+    /// Present on the `gpt-image-*` models, absent on older ones. Optional so
+    /// a model that reports nothing still parses.
+    #[serde(default)]
+    usage: Option<OpenAiImageUsage>,
 }
 
 #[derive(Deserialize)]
 struct OpenAiImageData {
     b64_json: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiImageUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+}
+
+/// Split an OpenAI image `usage` block into the two counts `ImageResult`
+/// carries. Absent block means the model reported nothing.
+fn usage_tokens(usage: &Option<OpenAiImageUsage>) -> (Option<u32>, Option<u32>) {
+    match usage {
+        Some(u) => (u.input_tokens, u.output_tokens),
+        None => (None, None),
+    }
 }
 
 #[async_trait]
@@ -148,9 +179,13 @@ impl ImageProvider for OpenAiImageProvider {
                 .ok_or("No image data in OpenAI response")?;
 
             let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+            let (input_tokens, output_tokens) = usage_tokens(&response.usage);
             Ok(ImageResult {
                 bytes,
                 mime_type: "image/png".to_string(),
+                input_tokens,
+                output_tokens,
+                model: self.model.clone(),
             })
         } else {
             // Image editing with multipart form
@@ -189,9 +224,13 @@ impl ImageProvider for OpenAiImageProvider {
                 .ok_or("No image data in OpenAI edit response")?;
 
             let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
+            let (input_tokens, output_tokens) = usage_tokens(&response.usage);
             Ok(ImageResult {
                 bytes,
                 mime_type: "image/png".to_string(),
+                input_tokens,
+                output_tokens,
+                model: self.model.clone(),
             })
         }
     }
@@ -262,7 +301,7 @@ impl ImageProvider for VertexImagenProvider {
         let aspect_ratio = Self::imagen_aspect_ratio(size);
         let location = self.current_location();
 
-        let (url, body) = if input_images.is_empty() {
+        let (model, url, body) = if input_images.is_empty() {
             // Text-to-image generation
             let url = format!(
                 "https://{}/v1/projects/{}/locations/{}/publishers/google/models/imagen-4.0-generate-001:predict",
@@ -276,7 +315,7 @@ impl ImageProvider for VertexImagenProvider {
                     "outputOptions": {"mimeType": "image/png"}
                 }
             });
-            (url, body)
+            ("imagen-4.0-generate-001", url, body)
         } else {
             // Image editing uses imagen-3.0-capability-001 with REFERENCE_TYPE_RAW
             // (instruct customization). imagen-4.0-generate-001 does not support referenceImages.
@@ -302,7 +341,7 @@ impl ImageProvider for VertexImagenProvider {
                     "outputOptions": {"mimeType": "image/png"}
                 }
             });
-            (url, body)
+            ("imagen-3.0-capability-001", url, body)
         };
 
         let resp = self
@@ -329,6 +368,10 @@ impl ImageProvider for VertexImagenProvider {
         Ok(ImageResult {
             bytes,
             mime_type: "image/png".to_string(),
+            // Imagen prices per image and reports no token usage.
+            input_tokens: None,
+            output_tokens: None,
+            model: model.to_string(),
         })
     }
 

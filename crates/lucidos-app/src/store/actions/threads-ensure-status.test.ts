@@ -52,7 +52,6 @@ vi.mock('../../api/threads', () => ({
 vi.mock('../../components/chat/promptFocus', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../components/chat/promptFocus')>()),
   focusPromptNow: vi.fn(),
-  focusIfNeeded: vi.fn(),
   composeHandlers: vi.fn(),
 }));
 

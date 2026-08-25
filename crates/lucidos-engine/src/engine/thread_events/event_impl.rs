@@ -112,6 +112,7 @@ impl ThreadEvent {
             Self::ToolCalled { .. } => "ToolCalled",
             Self::ToolResult { .. } => "ToolResult",
             Self::TodoListWritten { .. } => "TodoListWritten",
+            Self::WorkingUnderstandingWritten { .. } => "WorkingUnderstandingWritten",
             Self::BackgroundBashStarted { .. } => "BackgroundBashStarted",
             Self::BackgroundBashCompleted { .. } => "BackgroundBashCompleted",
             Self::ResponseGenerated { .. } => "ResponseGenerated",
@@ -166,7 +167,9 @@ impl ThreadEvent {
             Self::WorktreeCleaned { .. } => "WorktreeCleaned",
             Self::ChildThreadCompleted { .. } => "ChildThreadCompleted",
             Self::ContextDismissed { .. } => "ContextDismissed",
+            Self::ContextKeptOpen { .. } => "ContextKeptOpen",
             Self::ImageDescribed { .. } => "ImageDescribed",
+            Self::ConversationSummarized { .. } => "ConversationSummarized",
             Self::EventWaitStarted { .. } => "EventWaitStarted",
             Self::EventWaitDelivered { .. } => "EventWaitDelivered",
             Self::EventWaitExpired { .. } => "EventWaitExpired",
@@ -187,6 +190,148 @@ impl ThreadEvent {
             Self::CodingAgentDiffChanged { .. } => "CodingAgentDiffChanged",
             Self::ChildrenCountChanged { .. } => "ChildrenCountChanged",
         }
+    }
+
+    /// Every wire `type` name this enum can produce.
+    ///
+    /// `validate_emittable_event_type` refuses all of them, so an app UI cannot
+    /// write a *domain* event under a thread-event name. Such a row is
+    /// permanent, and its `aggregate_id` is the event-type STRING rather than a
+    /// thread uuid. One `emit_event("EventWaitStarted", ...)` therefore breaks
+    /// every later query that casts `aggregate_id::uuid` on that name.
+    ///
+    /// The transient variants are here too. They are never persisted as thread
+    /// rows, but the deny list is about the NAME. A domain row carrying one
+    /// poisons a future query just as well.
+    ///
+    /// `reserved_type_names_cover_every_variant` recovers the real variant list
+    /// from serde and fails if this one has drifted.
+    pub const RESERVED_TYPE_NAMES: &'static [&'static str] = &[
+        "MessageReceived",
+        "QueuedMessageRemoved",
+        "TextStreamed",
+        "ThoughtStreamed",
+        "ContextCaptured",
+        "MemoryRecalled",
+        "ToolCalled",
+        "ToolResult",
+        "TodoListWritten",
+        "WorkingUnderstandingWritten",
+        "BackgroundBashStarted",
+        "BackgroundBashCompleted",
+        "ResponseGenerated",
+        "ResponseCanceled",
+        "ResponseAborted",
+        "ResponseFailed",
+        "ContinuationStarted",
+        "SessionStarted",
+        "SessionEnded",
+        "CodingAgentTextStreamed",
+        "CodingAgentThoughtStreamed",
+        "CodingAgentToolCalled",
+        "CodingAgentToolResult",
+        "CodingAgentUserMessageSent",
+        "CodingAgentPromptSent",
+        "MissingHardeningDetected",
+        "CodingAgentIdled",
+        "ContinuationRequested",
+        "ThreadTitleGenerated",
+        "ThreadTitleRenamed",
+        "ThreadSaved",
+        "ThreadUnsaved",
+        "ThreadArchived",
+        "ThreadStarted",
+        "ThreadDiscarded",
+        "ImageUploaded",
+        "TriggerStarted",
+        "TriggerCompleted",
+        "ChangeProposed",
+        "ChangeApplied",
+        "ChangeDiscarded",
+        "ChangeReverted",
+        "ChangeApplyFailed",
+        "MergeConflictDetected",
+        "MergeResolutionStarted",
+        "MergeResolutionCleared",
+        "ChangeHardened",
+        "CodingAgentSettingsChanged",
+        "UserPromptInjected",
+        "CredentialRequested",
+        "McpConsentRequested",
+        "UserQuestionAsked",
+        "UserQuestionAnswered",
+        "CodingAgentPermissionRequest",
+        "CodingAgentPermissionResolved",
+        "CommandPermissionRequested",
+        "CommandPermissionResolved",
+        "McpPermissionRequested",
+        "McpPermissionResolved",
+        "CommandCheckpointed",
+        "CommandCheckpointReverted",
+        "WorktreeCleaned",
+        "ChildThreadCompleted",
+        "ContextDismissed",
+        "ContextKeptOpen",
+        "ImageDescribed",
+        "ConversationSummarized",
+        "EventWaitStarted",
+        "EventWaitDelivered",
+        "EventWaitExpired",
+        "EventWaitCanceled",
+        "CumulativeTextUpdated",
+        "LlmCallRetried",
+        "PreambleCompleted",
+        "CredentialPromptRequested",
+        "PluginInstallRequested",
+        "PluginUninstallRequested",
+        "EmailConfirmRequested",
+        "PushNotificationRequested",
+        "AppUiRefreshRequested",
+        "AppUiCaptureRequested",
+        "NavigationRequested",
+        "CodingAgentThreadSpawned",
+        "CodingAgentDiffChanged",
+        "ChildrenCountChanged",
+    ];
+
+    /// The `#[serde(alias = ...)]` spellings, kept for rows written before a
+    /// rename.
+    ///
+    /// Denied at the emit boundary alongside the current names. An alias
+    /// deserializes INTO its variant, so a domain row named `Thinking` reads
+    /// back as a `ThoughtStreamed` thread event to every consumer that parses
+    /// one. Refusing the new name and allowing the old one would leave the
+    /// forgery intact under its former spelling.
+    pub const LEGACY_TYPE_NAME_ALIASES: &'static [&'static str] = &[
+        "CCSettingsChanged",
+        "CaptureAppUI",
+        "CcThreadSpawned",
+        "ClaudeCodeIdled",
+        "ClaudeCodePromptSent",
+        "ClaudeCodeTextStreamed",
+        "ClaudeCodeThoughtStreamed",
+        "ClaudeCodeToolCalled",
+        "ClaudeCodeToolResult",
+        "ClaudeCodeUserMessageSent",
+        "ContinueSignal",
+        "CredentialRequest",
+        "EmailConfirmRequest",
+        "MemorySearched",
+        "PluginInstallRequest",
+        "PluginUninstallRequest",
+        "PreambleCompleting",
+        "PushNotificationRequest",
+        "RefreshAppUI",
+        "Retrying",
+        "SessionRecovered",
+        "SessionResumed",
+        "TextStreaming",
+        "Thinking",
+    ];
+
+    /// Whether `name` is a `ThreadEvent` wire name, current or legacy.
+    pub fn is_reserved_type_name(name: &str) -> bool {
+        Self::RESERVED_TYPE_NAMES.contains(&name) || Self::LEGACY_TYPE_NAME_ALIASES.contains(&name)
     }
 
     /// Whether this variant fires once per streamed text chunk (many fires per

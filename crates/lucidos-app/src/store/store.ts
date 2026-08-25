@@ -43,6 +43,7 @@ import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import { resetContentScroll } from '../hooks/useScrollMemory';
 import type { Change, ChangelogRelease, CodingAgentModelValue, CodingAgentReasoningEffort } from '../api/client';
+import type { ReleaseCheck } from '../api/client/control';
 import type { EnvironmentVariable, ModelInfo } from '../api/types';
 import { markSwUpdateDismissed, markEngineVersionDismissed } from '../hooks/sw-update';
 
@@ -191,7 +192,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -273,6 +274,10 @@ export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   // Reaching this engine from elsewhere: the mobile-access guide plus the
   // engine's network bind.
   { key: 'access', label: 'Access', group: 'Workspace' },
+  // Beside Access, because both answer "who reaches this machine from
+  // outside". Access is the door a person comes through; this is the one a
+  // third-party service posts to.
+  { key: 'webhooks', label: 'Webhooks', group: 'Workspace' },
   { key: 'devices', label: 'Devices', group: 'Workspace' },
   { key: 'system', label: 'System', group: 'Workspace' },
   // Where a link opens is behaviour rather than display, so the label says
@@ -411,6 +416,15 @@ export const changelogReleases = signal<Loadable<ChangelogRelease[]>>({ status: 
 export const whatsNewSeenRelease = signal<string | null>(
   localStorage.getItem('lucidos-whats-new-seen-release'),
 );
+/** The release the What's New panel was opened to READ, or `null` for an
+ *  ordinary open. Written by `openWhatsNew` and consumed once by the panel, the
+ *  same one-shot shape as {@link settingsScrollTarget}.
+ *
+ *  An update offer announces one specific release, and that is the one its
+ *  What's new must open. Without this the panel expands the release you are
+ *  RUNNING, which is the older one and the opposite of what an offer is
+ *  about. */
+export const whatsNewTargetRelease = signal<string | null>(null);
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
 export const latestTauriAppVersion = signal<string | null>(null);
@@ -424,6 +438,16 @@ export const latestTauriAppVersion = signal<string | null>(null);
  *  update check, beside `latestTauriAppVersion`, so the two cannot describe
  *  different releases. */
 export const latestTauriAppNotes = signal<string | null>(null);
+/** The gateway's release check (ADR 0108), or `null` when it is unknown.
+ *
+ *  Null covers three cases the UI treats alike: the status poll has not landed,
+ *  the gateway is older and omits the field, or there is no gateway at all (a
+ *  direct engine port). In every one of them there is no offer, which is the
+ *  ADR 0105 degradation.
+ *
+ *  The check itself is machine-global and lives in the gateway, so this is one
+ *  answer shared by every open window rather than a per-window poll. */
+export const releaseCheck = signal<ReleaseCheck | null>(null);
 /** Why the last packaged app-update check failed, or `null` when it succeeded
  *  or has not run. Rendered in Settings → System so a failing check is
  *  DIAGNOSABLE instead of silent. Swallowed, it makes a stranded install
@@ -941,6 +965,11 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
   // not keep that resume promise. Those land in the arm below with a Continue
   // button. A paused thread still floats to the top of Current with its own
   // dot via `reviewTier`.
+  //
+  // Both verdicts are now written whether or not a change is pending. So a
+  // coding-agent turn that failed with one counts here, instead of hiding
+  // behind the change. It is in the Review view too, since `threadInReview`
+  // only excludes a RUNNING thread.
   return status === 'waiting_for_user_answer' || status === 'failed';
 }
 
@@ -1632,7 +1661,31 @@ export const [collapsedInitiators, toggleInitiatorCollapsed] =
 
 // --- Artifacts ---
 export const artifacts = signal<Loadable<string[]>>({ status: 'not-loaded' });
-export const artifactRevision = signal(0);
+/** Cache-buster for the open file preview, and the data-relative path it
+ *  belongs to. The preview appends it to its URL. That URL is the `src` of the
+ *  `<video>` / `<audio>` / `<img>` / iframe it renders, so a bump reloads
+ *  whatever is playing.
+ *
+ *  The path is what makes that safe. A bare counter here was bumped by every
+ *  `loadArtifacts()`, so a write to ANY file under `data/` restarted a video
+ *  mid-playback. Only `invalidateFilePreview` writes this, and only for the
+ *  file on screen.
+ *
+ *  Kept per path rather than reset on each write. A stamp falling back to 0
+ *  when a different file changed would itself be a URL change. */
+export const filePreviewRevision = signal<{ path: string; rev: number } | null>(null);
+/** The cache-buster owed to whatever the CONTENT PANE is previewing, or 0.
+ *
+ *  The data preview matches the stamp against its own `path` prop, because it
+ *  also renders inside the file preview modal over a different file. A repo
+ *  preview cannot: it is handed a parsed `RepoLocator`, never the encoded
+ *  `repo:<id>:file:<path>` string the overlay holds and `refreshFilePreview`
+ *  stamps. Re-encoding the locator to compare would be a round-trip that has to
+ *  come back byte-identical, so the overlay answers instead. */
+export const openFilePreviewRevision = computed(() => {
+  const stamp = filePreviewRevision.value;
+  return stamp && stamp.path === previewFile.value ? stamp.rev : 0;
+});
 export const panelTitle = signal<string | null>(null);
 /** The URL the browser panel was opened at, so `webviewHasHistory` can tell
  *  whether the user has navigated inside the webview since. */
@@ -1747,13 +1800,35 @@ function restoreCollapsedTriggerGroups(): Set<string> {
 
 export const collapsedTriggerGroupIds = signal<Set<string>>(restoreCollapsedTriggerGroups());
 
+function persistCollapsedTriggerGroups(next: Set<string>): void {
+  collapsedTriggerGroupIds.value = next;
+  localStorage.setItem(COLLAPSED_TRIGGER_GROUPS_KEY, JSON.stringify([...next]));
+}
+
 export function toggleTriggerGroupCollapsed(groupId: string): void {
   const next = new Set(collapsedTriggerGroupIds.value);
   if (next.has(groupId)) next.delete(groupId);
   else next.add(groupId);
-  collapsedTriggerGroupIds.value = next;
-  localStorage.setItem(COLLAPSED_TRIGGER_GROUPS_KEY, JSON.stringify([...next]));
+  persistCollapsedTriggerGroups(next);
 }
+
+/** Open a collapsed group, never close an open one. A deep link to a trigger
+ *  inside a collapsed group has to expand it: `TriggersView` renders no members
+ *  of a collapsed group, so the row's anchor does not exist to scroll to.
+ *  Toggling instead would hide the row it was trying to reveal. */
+export function expandTriggerGroup(groupId: string): void {
+  if (!collapsedTriggerGroupIds.value.has(groupId)) return;
+  const next = new Set(collapsedTriggerGroupIds.value);
+  next.delete(groupId);
+  persistCollapsedTriggerGroups(next);
+}
+
+/** A trigger id the Triggers panel should scroll to and mark once it renders.
+ *  Set by `navigateToTrigger`, so a route to a trigger lands on its row rather
+ *  than in the edit form. The row is where Run once, the pause toggle and the
+ *  last-run status live. Mirrors `pluginScrollTarget`, and `TriggersView`'s
+ *  effect consumes it once. */
+export const triggerScrollTarget = signal<string | null>(null);
 
 // --- Pending message (used to send a message from outside the chat module) ---
 export const pendingChatMessage = signal<string | null>(null);
@@ -1785,6 +1860,13 @@ export const installedPlugins = signal<Loadable<InstalledPlugin[]>>({ status: 'n
  *  iframe src, so Preact propagates the reload to every iframe instance. 0 is
  *  the initial load, which needs no cache-buster. */
 export const appRefreshKey = signal(0);
+/** Incremented on every `AppUiRefreshRequested` frame: an app's files just
+ *  changed on disk. `appRefreshKey` above reloads the running iframe. This one
+ *  tells the app SOURCE editor to re-read what it shows, so an open editor
+ *  cannot save a snapshot that predates an agent's edits. The editor freezes
+ *  its epoch once the user types, because a draft outranks the disk
+ *  (ADR 0118). */
+export const appSourceEpoch = signal(0);
 /** The WIP app preview. When set, the app UI iframe renders from the named app
  *  coding-agent thread's worktree instead of the live workspace data.
  *
@@ -2156,6 +2238,29 @@ export const backupStatusVersion = signal(0);
  *  moves them. An agent writing `backup_provider`, or the same page open on a
  *  second device, then leaves the dropdown showing the old destination. */
 export const backupPreferencesVersion = signal(0);
+
+/** Bumped on every `McpServerRegistered` / `McpServerUpdated` /
+ *  `McpServerRemoved` / `McpServerDisabledToolsChanged` frame. Settings → MCP
+ *  Servers re-reads `/mcp/servers` on it. A server the agent registers, or a
+ *  tool switched off on another device, then reaches the open page
+ *  (ADR 0118). */
+export const mcpServersVersion = signal(0);
+
+/** Bumped on every `WebhookCreated` / `WebhookUpdated` / `WebhookDeleted`
+ *  frame. Settings → Webhooks re-reads its list on it. Hooks are created and
+ *  disabled from the CLI as often as from this page, so the open page was
+ *  otherwise stale for the whole session. */
+export const webhooksVersion = signal(0);
+
+/** Bumped on every `PermissionGrantsChanged` frame. The allowlist editors in
+ *  Settings → Permissions re-read their file on it, unless the user has
+ *  unsaved patterns in the editor: a draft outranks the disk (ADR 0118).
+ *
+ *  Not keyed by grant file. Both files are small and both are on the page
+ *  already, so re-reading the other one costs one request. Keying it would
+ *  put a routing decision in the arm, which is one more thing to keep in
+ *  sync. */
+export const permissionGrantsVersion = signal(0);
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
 export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);

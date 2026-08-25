@@ -4,33 +4,7 @@ if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: any) => { cb(); return 0; };
 }
 
-import { focusIfNeeded, focusPromptNow, composeHandlers, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
-
-describe('focusIfNeeded', () => {
-  it('calls focus({ preventScroll: true }) when element is not the active element', () => {
-    const el = { focus: vi.fn() } as any;
-    (globalThis as any).document = { activeElement: null };
-
-    focusIfNeeded(el);
-
-    expect(el.focus).toHaveBeenCalledWith({ preventScroll: true });
-  });
-
-  it('skips focus() when element is already the active element', () => {
-    const el = { focus: vi.fn() } as any;
-    (globalThis as any).document = { activeElement: el };
-
-    focusIfNeeded(el);
-
-    expect(el.focus).not.toHaveBeenCalled();
-  });
-
-  it('does nothing when element is null', () => {
-    (globalThis as any).document = { activeElement: null };
-    // Should not throw
-    focusIfNeeded(null);
-  });
-});
+import { focusPromptNow, composeHandlers, isComposeFocusedHere, blurPromptInputIfFocused } from '../promptFocus';
 
 describe('focusPromptNow', () => {
   it('focuses the visible prompt-input element (non-zero width)', () => {

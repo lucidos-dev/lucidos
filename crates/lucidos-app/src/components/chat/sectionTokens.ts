@@ -33,7 +33,7 @@ export function headlineTokens(snap: ContextCapture): number {
  *  packer can never overflow the window, and using it here made the tree
  *  report a measured 205k prompt as 361k, contradicting the header directly
  *  above it. Deriving the scale from the capture fixes that *and* removes the
- *  copy: `sum(section.char_count)` is the same char total the engine ran
+ *  copy: `sum(section.budget_delta_chars)` is the same char total the engine ran
  *  through `estimate_tokens_from_chars` (`agentic_loop/run.rs` builds the
  *  section list to sum to `system + tool_defs + context`), so with no usage
  *  the scale reproduces the engine's own ratio, whatever it is, and an engine
@@ -50,7 +50,7 @@ export function headlineTokens(snap: ContextCapture): number {
  */
 export function sectionTokenScale(snap: ContextCapture): TokenScale {
   const headline = headlineTokens(snap);
-  const totalChars = snap.sections.reduce((a, s) => a + s.char_count, 0);
+  const totalChars = snap.sections.reduce((a, s) => a + s.budget_delta_chars, 0);
   // Three degenerate shapes, all real:
   //  - the Claude Code producer emits `sections: []` (nothing to scale),
   //  - `synthesizeContextCapture` can yield `estimated_total_tokens: 0` for a

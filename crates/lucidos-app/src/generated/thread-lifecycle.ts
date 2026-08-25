@@ -29,6 +29,7 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ToolCalled: 'activity',
   ToolResult: 'activity',
   TodoListWritten: 'activity',
+  WorkingUnderstandingWritten: 'metadata',
   ResponseGenerated: 'terminal',
   ResponseCanceled: 'terminal',
   ResponseAborted: 'terminal',
@@ -79,9 +80,11 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   WorktreeCleaned: 'metadata',
   ChildThreadCompleted: 'start',
   ContextDismissed: 'metadata',
+  ContextKeptOpen: 'metadata',
   BackgroundBashStarted: 'metadata',
   BackgroundBashCompleted: 'metadata',
   ImageDescribed: 'metadata',
+  ConversationSummarized: 'metadata',
   CommandCheckpointed: 'metadata',
   CommandCheckpointReverted: 'metadata',
   EventWaitStarted: 'activity',
@@ -166,16 +169,19 @@ export function availableThreadActions(
   storedSection: ArchiveState,
   hasPendingChanges: boolean,
   descendantsBlockArchive: boolean,
+  hasLiveEventWaits: boolean,
+  hasActiveChildren: boolean,
   hasUnsentDraft: boolean,
   isSaved: boolean,
 ): Action[] {
   const actions: Action[] = [];
   const live = status === 'running' || status === 'waiting_for_user_answer';
+  const willResume = hasLiveEventWaits || hasActiveChildren;
   const codingAgentPending = hasPendingChanges && threadType === 'claude_code';
   if (hasUnsentDraft) actions.push('discard_draft');
   if (!live) {
     if (codingAgentPending) {
-      actions.push('discard', 'apply');
+      if (!willResume) actions.push('discard', 'apply');
     } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
       actions.push('archive');
     }

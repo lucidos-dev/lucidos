@@ -1,0 +1,20 @@
+[package]
+name = "lucidos-local-token"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The machine-local token that proves a caller is a process on this machine.
+#
+# Four crates need it: the gateway mints and verifies it, and the engine, the
+# CLI and the app send it. None of them may depend on the engine (ADR 0014 §1),
+# so this is the `lucidos-tailscale` shape: a crate small enough for every one
+# of them to take. Tailscale exists because two hand-copied halves drifted and
+# a fix landed in only some of them. A secret path plus a header name copied
+# four ways would drift the same way, and its failure mode is worse than a
+# missing feature: a stale copy is a caller that silently cannot authenticate.
+#
+# **It has no dependencies and must keep none.** That is the whole reason every
+# crate can take it.
+
+[dependencies]

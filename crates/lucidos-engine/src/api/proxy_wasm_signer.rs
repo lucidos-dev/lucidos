@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{
+    Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
+};
 
 pub struct CompiledModule {
     pub name: String,
@@ -52,12 +54,171 @@ pub enum BodyMode {
 /// the capability for the corresponding feature to engage.
 pub const CAP_REPLACE_BODY: &str = "replace_body";
 
+/// Capability to read the auth-header VALUES an earlier layer published into
+/// `prior_layer_outputs`.
+///
+/// Signer modules arrive from plugins and from workspace data, so a signer is
+/// third-party code by default. Without this grant it receives every header
+/// NAME an upstream layer produced, and [`WITHHELD_HEADER_VALUE`] in place of
+/// each value. A `script_handshake` access token then never enters the
+/// sandbox. Same two-sided gate as [`CAP_REPLACE_BODY`].
+pub const CAP_READ_PRIOR_HEADERS: &str = "read_prior_headers";
+
+/// What an ungranted signer reads where an upstream header value would be.
+///
+/// A placeholder rather than a removed key, so a signer author can still see
+/// that the header was present. It names the capability, so the fix is in the
+/// value itself rather than in a doc the author has to find.
+pub const WITHHELD_HEADER_VALUE: &str = "[withheld: grant read_prior_headers]";
+
 /// Default wall-clock execution budget for a single signer invocation
 /// (instantiate + `alloc` + `sign`). Real signers do a handful of crypto
 /// primitives and finish in microseconds; 5s is enormous headroom that only a
 /// runaway / non-terminating module would ever hit. Enforced via wasmtime
 /// epoch interruption (see [`build_wasmtime_engine`] + [`WasmSignerLayer`]).
 pub const WASM_SIGNER_BUDGET: Duration = Duration::from_secs(5);
+
+/// Maximum linear memory one signer invocation may occupy.
+///
+/// The layer hands a module at most a 1MB raw body. So 16 MiB is over ten
+/// times the largest legitimate input. It is far more than an HMAC signer
+/// touches, and still well below the host's own headroom.
+///
+/// Enforced per `Store` by [`SignerLimits`]. The execution budget cannot do
+/// this: epoch interruption bounds CPU, not resident memory.
+pub const WASM_SIGNER_MAX_MEMORY: usize = 16 * 1024 * 1024;
+
+/// Maximum funcref table elements. A signer compiled from Rust carries tens of
+/// indirect-call entries, so this is ample headroom. It caps a `table.grow`
+/// loop the way the memory ceiling caps `memory.grow`.
+const WASM_SIGNER_MAX_TABLE_ELEMENTS: usize = 10_000;
+
+/// Maximum instances per `Store`. The linker exposes host functions only, so
+/// one signer call instantiates exactly one module.
+const WASM_SIGNER_MAX_INSTANCES: usize = 1;
+
+/// Maximum linear memories per `Store`. [`WASM_SIGNER_MAX_MEMORY`] is per
+/// memory, so without this a multi-memory module would multiply the ceiling.
+const WASM_SIGNER_MAX_MEMORIES: usize = 1;
+
+/// Maximum tables per `Store`. Same reason as the memory count: the element
+/// ceiling is per table.
+const WASM_SIGNER_MAX_TABLES: usize = 1;
+
+/// Which sandbox cap a signer hit. Recorded by [`SignerLimits`] so the failure
+/// can name the limit without matching on wasmtime's error text.
+///
+/// Only the two growth caps appear here. wasmtime reads the object counts and
+/// refuses instantiation itself, with no callback to record. Those trip the
+/// instantiate error path and quote wasmtime's own wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerCap {
+    Memory,
+    TableElements,
+}
+
+impl SignerCap {
+    /// The limit as an error message states it, sized from the constant above.
+    fn describe(self) -> String {
+        match self {
+            SignerCap::Memory => format!(
+                "linear-memory limit of {} MiB",
+                WASM_SIGNER_MAX_MEMORY / (1024 * 1024)
+            ),
+            SignerCap::TableElements => {
+                format!("table-element limit of {WASM_SIGNER_MAX_TABLE_ELEMENTS}")
+            }
+        }
+    }
+}
+
+/// Per-`Store` resource limiter for one signer invocation.
+///
+/// Epoch interruption caps CPU, not resident memory. A module that declares a
+/// huge initial memory, or loops on `memory.grow`, exhausts the host inside
+/// its budget. This wraps wasmtime's `StoreLimits` with the signer ceilings.
+/// It records which one tripped, so the 502 can name it.
+///
+/// A grow our cap refuses becomes a trap, not the wasm `-1`. A hostile loop
+/// then dies at once instead of spinning out its budget. A grow refused ONLY by
+/// the module's own declared maximum keeps the standard `-1`. That is the
+/// module's business, not the sandbox's.
+pub struct SignerLimits {
+    inner: StoreLimits,
+    tripped: Option<SignerCap>,
+}
+
+impl SignerLimits {
+    pub fn new() -> Self {
+        Self {
+            inner: StoreLimitsBuilder::new()
+                .memory_size(WASM_SIGNER_MAX_MEMORY)
+                .table_elements(WASM_SIGNER_MAX_TABLE_ELEMENTS)
+                .instances(WASM_SIGNER_MAX_INSTANCES)
+                .memories(WASM_SIGNER_MAX_MEMORIES)
+                .tables(WASM_SIGNER_MAX_TABLES)
+                .build(),
+            tripped: None,
+        }
+    }
+
+    /// The cap this invocation hit, if any.
+    pub fn tripped(&self) -> Option<SignerCap> {
+        self.tripped
+    }
+}
+
+impl Default for SignerLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ResourceLimiter for SignerLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, wasmtime::Error> {
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        if !allowed && desired > WASM_SIGNER_MAX_MEMORY {
+            self.tripped = Some(SignerCap::Memory);
+            return Err(wasmtime::Error::msg(format!(
+                "linear memory growth to {desired} bytes exceeds the signer sandbox limit"
+            )));
+        }
+        Ok(allowed)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> Result<bool, wasmtime::Error> {
+        let allowed = self.inner.table_growing(current, desired, maximum)?;
+        if !allowed && desired > WASM_SIGNER_MAX_TABLE_ELEMENTS {
+            self.tripped = Some(SignerCap::TableElements);
+            return Err(wasmtime::Error::msg(format!(
+                "table growth to {desired} elements exceeds the signer sandbox limit"
+            )));
+        }
+        Ok(allowed)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
 
 /// How often the engine's epoch counter is advanced by the background ticker
 /// (see [`build_wasmtime_engine`]). The execution budget is rounded up to a
@@ -109,16 +270,30 @@ fn epoch_deadline_ticks(budget: Duration) -> u64 {
     (ticks as u64).max(1)
 }
 
-/// Map a wasmtime call error to an `(StatusCode, message)`. An epoch-deadline
-/// trip surfaces as `Trap::Interrupt`; turn that into a clear budget message
-/// (always `BAD_GATEWAY` — a runaway signer is an upstream/module fault).
-/// Any other error keeps `stage`'s default status and embeds the wasm message.
-fn budget_or(
+/// Map a wasmtime call error to a `(StatusCode, message)`.
+///
+/// Two sandbox faults read alike, and both give `BAD_GATEWAY`, because a
+/// runaway signer is a module fault. One is a resource cap recorded by
+/// [`SignerLimits`]. The other is an epoch-deadline trip, arriving as
+/// `Trap::Interrupt`. The cap is checked first, since it is the more specific
+/// fact. Any other error keeps `stage`'s default status and embeds the wasm
+/// message.
+fn sandbox_or(
     signer: &str,
     stage: &str,
     default_status: StatusCode,
+    tripped: Option<SignerCap>,
     e: wasmtime::Error,
 ) -> (StatusCode, String) {
+    if let Some(cap) = tripped {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "signer {signer} exceeded its {} during {stage} and was terminated",
+                cap.describe()
+            ),
+        );
+    }
     if let Some(wasmtime::Trap::Interrupt) = e.downcast_ref::<wasmtime::Trap>() {
         return (
             StatusCode::BAD_GATEWAY,
@@ -133,49 +308,71 @@ fn budget_or(
     )
 }
 
-/// Build the set of sensitive substrings to scrub from a signer's `log()`
-/// output: the resolved secret material in the encodings a module might emit
-/// (utf8, hex, base64) plus every auth-header/token value passed in via
-/// `prior_layer_outputs` (any `headers` object — the documented leak vector,
-/// e.g. an upstream `script_handshake` token the signer can read).
-fn collect_log_redactions(secrets: &[Vec<u8>], prior: &serde_json::Value) -> Vec<String> {
-    use base64::Engine as _;
-    let mut out: Vec<String> = Vec::new();
-    for s in secrets {
-        if let Ok(utf8) = std::str::from_utf8(s) {
-            out.push(utf8.to_string());
-        }
-        out.push(hex_lower(s));
-        out.push(base64::engine::general_purpose::STANDARD.encode(s));
-    }
-    collect_header_values(prior, &mut out);
-    out
+/// True iff both halves of a capability grant are present: the module's own
+/// manifest declares it, AND the provider config grants it to this pipeline.
+/// Either half alone is not a grant.
+fn capability_granted(cap: &str, declared: &[String], granted: &[String]) -> bool {
+    declared.iter().any(|c| c == cap) && granted.iter().any(|c| c == cap)
 }
 
-/// Walk a JSON value and push the string values of every `headers` object into
-/// `out`. Auth layers publish their produced headers under a `headers` key
+/// Prepare the two things one invocation derives from the prior layers' output:
+/// what the module is HANDED, and what its `log()` may never print.
+///
+/// Returns the outputs to serialize into `SignInput`, plus the substrings to
+/// scrub. When `grant_headers` is false every `headers` value is replaced by
+/// [`WITHHELD_HEADER_VALUE`]. The scrub list is built from the ORIGINAL values
+/// either way, so a granted signer still cannot echo a token into the log.
+///
+/// It also carries the resolved secret material in the encodings a module might
+/// emit (utf8, hex, base64). Secrets reach a module only by opaque handle, so
+/// that half is defense in depth.
+fn prepare_prior_outputs(
+    mut prior: serde_json::Value,
+    secrets: &[Vec<u8>],
+    grant_headers: bool,
+) -> (serde_json::Value, Vec<String>) {
+    use base64::Engine as _;
+    let mut redactions: Vec<String> = Vec::new();
+    for s in secrets {
+        if let Ok(utf8) = std::str::from_utf8(s) {
+            redactions.push(utf8.to_string());
+        }
+        redactions.push(hex_lower(s));
+        redactions.push(base64::engine::general_purpose::STANDARD.encode(s));
+    }
+    take_header_values(&mut prior, &mut redactions, !grant_headers);
+    (prior, redactions)
+}
+
+/// Walk a JSON value, push the string values of every `headers` object into
+/// `out`, and overwrite each with [`WITHHELD_HEADER_VALUE`] when `withhold`.
+///
+/// Auth layers publish their produced headers under a `headers` key
 /// (`ScriptHandshakeLayer::apply` → `outputs: {"headers": {…}}`), so this
-/// captures the token values a downstream signer receives without redacting
-/// every unrelated string in the prior outputs.
-fn collect_header_values(value: &serde_json::Value, out: &mut Vec<String>) {
+/// reaches exactly the token values a downstream signer would receive. Scoping
+/// it to that key is deliberate: a heuristic over every string in the prior
+/// outputs would withhold legitimate signer input.
+fn take_header_values(value: &mut serde_json::Value, out: &mut Vec<String>, withhold: bool) {
     match value {
         serde_json::Value::Object(map) => {
-            for (key, v) in map {
+            for (key, v) in map.iter_mut() {
                 if key == "headers" {
-                    if let Some(headers) = v.as_object() {
-                        for hv in headers.values() {
-                            if let Some(s) = hv.as_str() {
-                                out.push(s.to_string());
+                    if let Some(headers) = v.as_object_mut() {
+                        for hv in headers.values_mut() {
+                            let Some(s) = hv.as_str() else { continue };
+                            out.push(s.to_string());
+                            if withhold {
+                                *hv = serde_json::Value::String(WITHHELD_HEADER_VALUE.to_string());
                             }
                         }
                     }
                 }
-                collect_header_values(v, out);
+                take_header_values(v, out, withhold);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                collect_header_values(item, out);
+                take_header_values(item, out, withhold);
             }
         }
         _ => {}
@@ -346,6 +543,16 @@ impl WasmSignerLayer {
         self.budget = budget;
         self
     }
+
+    /// Whether this signer holds `cap`. See [`capability_granted`]: the
+    /// manifest must declare it and the provider config must grant it.
+    fn has_capability(&self, cap: &str) -> bool {
+        capability_granted(
+            cap,
+            &self.module.manifest.capabilities,
+            &self.granted_capabilities,
+        )
+    }
 }
 
 /// Fixed write offset for `SignInput` JSON when the module doesn't export
@@ -425,6 +632,20 @@ impl AuthLayer for WasmSignerLayer {
                 length: *length,
             },
         };
+        // Least privilege on what the signer is HANDED, not only on what it may
+        // print. An earlier layer's produced auth headers travel in
+        // prior_layer_outputs, so a signer with no `read_prior_headers` grant
+        // gets the header names and a placeholder value. The scrub list is
+        // built from the real values regardless (see `prepare_prior_outputs`).
+        let prior = serde_json::to_value(input.prior_layer_outputs).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialize prior_layer_outputs: {e}"),
+            )
+        })?;
+        let (prior_layer_outputs, log_redactions) =
+            prepare_prior_outputs(prior, &secrets, self.has_capability(CAP_READ_PRIOR_HEADERS));
+
         let sign_input = SignInput {
             method: input.method.as_str().to_string(),
             url: input.url.to_string(),
@@ -434,12 +655,7 @@ impl AuthLayer for WasmSignerLayer {
                 .map(|(n, v)| (n.as_str().to_string(), v.clone()))
                 .collect(),
             body: body_field,
-            prior_layer_outputs: serde_json::to_value(input.prior_layer_outputs).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("serialize prior_layer_outputs: {e}"),
-                )
-            })?,
+            prior_layer_outputs,
             secret_handles: handles,
             current_time_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         };
@@ -450,18 +666,21 @@ impl AuthLayer for WasmSignerLayer {
             )
         })?;
 
-        // 3. Spin up a fresh wasmtime Store + Linker for this call. Collect the
-        //    values that must never reach the log: the resolved secret material
-        //    (defense in depth — opaque handles mean the module can't see raw
-        //    secrets today) plus any auth-header/token values handed to this
-        //    signer via prior_layer_outputs (which it CAN see and could echo).
-        let log_redactions = collect_log_redactions(&secrets, &sign_input.prior_layer_outputs);
+        // 3. Spin up a fresh wasmtime Store + Linker for this call. The scrub
+        //    list came from the real prior outputs above, so `log()` stays
+        //    closed to upstream auth material even for a granted signer.
         let host_state = HostState {
             secrets,
             module_name: self.module.name.clone(),
             log_redactions,
+            limits: SignerLimits::new(),
         };
         let mut store: Store<HostState> = Store::new(&self.engine, host_state);
+        // Enforce the resource ceilings: memory, table elements and object
+        // counts. Attached BEFORE instantiate so a module declaring an oversized
+        // initial memory is refused at instantiation, not after the host has
+        // already reserved it. See `SignerLimits`.
+        store.limiter(|s| &mut s.limits);
         // Enforce the execution budget: the engine's epoch ticker advances every
         // EPOCH_TICK, and the store traps once `budget` worth of ticks elapse.
         // Set BEFORE instantiate so instantiate + alloc + sign are all bounded —
@@ -476,17 +695,24 @@ impl AuthLayer for WasmSignerLayer {
                 format!("linker init: {e}"),
             )
         })?;
-        let instance = linker
+        // Bound the awaited result before mapping the error: `map_err` reads
+        // `store.data()`, which the in-flight call still borrows mutably.
+        let instantiated = linker
             .instantiate_async(&mut store, &self.module.module)
-            .await
-            .map_err(|e| {
-                budget_or(
-                    &self.module.name,
-                    "instantiate",
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    e,
-                )
-            })?;
+            .await;
+        // A failure here is the module's, not the engine's: the linker is
+        // already up, so what is left is the module's own shape. An object-count
+        // cap is refused by wasmtime itself and records no `SignerCap`, so this
+        // default is what makes every cap trip a 502.
+        let instance = instantiated.map_err(|e| {
+            sandbox_or(
+                &self.module.name,
+                "instantiate",
+                StatusCode::BAD_GATEWAY,
+                store.data().limits.tripped(),
+                e,
+            )
+        })?;
 
         // 4. Find module memory + sign export. `alloc` is optional.
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
@@ -513,11 +739,13 @@ impl AuthLayer for WasmSignerLayer {
         // 5. Reserve space for input bytes and write them.
         let in_len = in_bytes.len() as i32;
         let in_ptr = if let Some(alloc) = &alloc {
-            alloc.call_async(&mut store, in_len).await.map_err(|e| {
-                budget_or(
+            let allocated = alloc.call_async(&mut store, in_len).await;
+            allocated.map_err(|e| {
+                sandbox_or(
                     &self.module.name,
                     "alloc",
                     StatusCode::INTERNAL_SERVER_ERROR,
+                    store.data().limits.tripped(),
                     e,
                 )
             })?
@@ -540,27 +768,28 @@ impl AuthLayer for WasmSignerLayer {
         //    by itself interrupt a tight CPU loop, since that never yields back
         //    to be polled. Grace > one epoch tick so the epoch trap wins first.
         let sign_call = sign.call_async(&mut store, (in_ptr, in_len));
-        let packed =
-            match tokio::time::timeout(self.budget + Duration::from_secs(2), sign_call).await {
-                Ok(Ok(packed)) => packed,
-                Ok(Err(e)) => {
-                    return Err(budget_or(
-                        &self.module.name,
-                        "sign",
-                        StatusCode::BAD_GATEWAY,
-                        e,
-                    ))
-                }
-                Err(_elapsed) => {
-                    return Err((
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "signer {} exceeded its execution budget and was terminated",
-                            self.module.name
-                        ),
-                    ))
-                }
-            };
+        let outcome = tokio::time::timeout(self.budget + Duration::from_secs(2), sign_call).await;
+        let packed = match outcome {
+            Ok(Ok(packed)) => packed,
+            Ok(Err(e)) => {
+                return Err(sandbox_or(
+                    &self.module.name,
+                    "sign",
+                    StatusCode::BAD_GATEWAY,
+                    store.data().limits.tripped(),
+                    e,
+                ))
+            }
+            Err(_elapsed) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "signer {} exceeded its execution budget and was terminated",
+                        self.module.name
+                    ),
+                ))
+            }
+        };
         let out_ptr = ((packed >> 32) & 0xFFFF_FFFF) as usize;
         let out_len = (packed & 0xFFFF_FFFF) as usize;
 
@@ -603,18 +832,7 @@ impl AuthLayer for WasmSignerLayer {
         })?;
 
         // 8. Capability gate: replace_body needs both manifest + grant.
-        if output.replace_body.is_some()
-            && !(self
-                .module
-                .manifest
-                .capabilities
-                .iter()
-                .any(|c| c == CAP_REPLACE_BODY)
-                && self
-                    .granted_capabilities
-                    .iter()
-                    .any(|c| c == CAP_REPLACE_BODY))
-        {
+        if output.replace_body.is_some() && !self.has_capability(CAP_REPLACE_BODY) {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!(
@@ -727,10 +945,10 @@ mod tests {
     // `crates/lucidos-engine/tests/proxy_wasm_engine.rs`. See the
     // diagnostic block atop `engine::change_ops::tests` for why.
 
-    #[test]
-    fn collect_log_redactions_covers_secrets_and_prior_header_tokens() {
-        let secrets = vec![b"super-secret-key".to_vec()];
-        let prior = serde_json::json!({
+    // ---- prior_layer_outputs least privilege ---------------------------
+
+    fn handshake_prior() -> serde_json::Value {
+        serde_json::json!({
             "script_handshake": {
                 "headers": {
                     "authorization": "Bearer upstream-token-xyz",
@@ -738,8 +956,13 @@ mod tests {
                 }
             },
             "other": { "log_url": "https://example.com/x?k=REDACTED" }
-        });
-        let red = collect_log_redactions(&secrets, &prior);
+        })
+    }
+
+    #[test]
+    fn redactions_cover_secrets_and_prior_header_tokens() {
+        let secrets = vec![b"super-secret-key".to_vec()];
+        let (_, red) = prepare_prior_outputs(handshake_prior(), &secrets, true);
 
         // Raw secret in the encodings a module might emit.
         assert!(red.iter().any(|s| s == "super-secret-key"));
@@ -753,6 +976,95 @@ mod tests {
         let scrubbed = crate::core::redact_secret_values(line, &red);
         assert!(!scrubbed.contains("upstream-token-xyz"), "got: {scrubbed}");
         assert!(scrubbed.contains("[REDACTED]"), "got: {scrubbed}");
+    }
+
+    #[test]
+    fn ungranted_signer_gets_header_names_but_not_values() {
+        let (prior, _) = prepare_prior_outputs(handshake_prior(), &[], false);
+        let headers = prior["script_handshake"]["headers"].as_object().unwrap();
+
+        // The NAME survives, so an author can see the header was present.
+        assert!(headers.contains_key("authorization"));
+        assert!(headers.contains_key("x-client-id"));
+        // The value is the placeholder, which names the missing capability.
+        assert_eq!(headers["authorization"], WITHHELD_HEADER_VALUE);
+        assert_eq!(headers["x-client-id"], WITHHELD_HEADER_VALUE);
+        // Nothing outside a `headers` object is touched.
+        assert_eq!(
+            prior["other"]["log_url"],
+            "https://example.com/x?k=REDACTED"
+        );
+    }
+
+    #[test]
+    fn withholding_still_scrubs_the_real_value_from_logs() {
+        // The scrub list is built BEFORE withholding, so a value the module
+        // never received still cannot be printed by some other route.
+        let (_, red) = prepare_prior_outputs(handshake_prior(), &[], false);
+        assert!(red.iter().any(|s| s == "Bearer upstream-token-xyz"));
+    }
+
+    #[test]
+    fn granted_signer_receives_the_real_header_value() {
+        let (prior, _) = prepare_prior_outputs(handshake_prior(), &[], true);
+        assert_eq!(
+            prior["script_handshake"]["headers"]["authorization"],
+            "Bearer upstream-token-xyz"
+        );
+    }
+
+    #[test]
+    fn withholding_reaches_a_nested_headers_object() {
+        let nested = serde_json::json!({
+            "outer": [{ "inner": { "headers": { "authorization": "Bearer deep" } } }]
+        });
+        let (prior, red) = prepare_prior_outputs(nested, &[], false);
+        assert_eq!(
+            prior["outer"][0]["inner"]["headers"]["authorization"],
+            WITHHELD_HEADER_VALUE
+        );
+        assert!(red.iter().any(|s| s == "Bearer deep"));
+    }
+
+    #[test]
+    fn the_withheld_input_is_what_gets_serialized_to_the_module() {
+        let (prior_layer_outputs, _) = prepare_prior_outputs(handshake_prior(), &[], false);
+        let input = SignInput {
+            method: "GET".into(),
+            url: "https://x".into(),
+            headers: vec![],
+            body: SignInputBody::Raw {
+                bytes: serde_bytes::ByteBuf::new(),
+            },
+            prior_layer_outputs,
+            secret_handles: std::collections::HashMap::new(),
+            current_time_ns: 0,
+        };
+        let wire = serde_json::to_string(&input).unwrap();
+        assert!(!wire.contains("upstream-token-xyz"), "wire was: {wire}");
+        assert!(wire.contains("authorization"), "wire was: {wire}");
+        assert!(wire.contains("read_prior_headers"), "wire was: {wire}");
+    }
+
+    #[test]
+    fn a_capability_needs_the_manifest_and_the_grant() {
+        let cap = CAP_READ_PRIOR_HEADERS;
+        let declared = vec![cap.to_string()];
+        let granted = vec![cap.to_string()];
+        let none: Vec<String> = vec![];
+
+        assert!(capability_granted(cap, &declared, &granted));
+        assert!(
+            !capability_granted(cap, &declared, &none),
+            "a manifest declaration alone must not grant the capability"
+        );
+        assert!(
+            !capability_granted(cap, &none, &granted),
+            "a provider grant alone must not reach a module that never declared it"
+        );
+        assert!(!capability_granted(cap, &none, &none));
+        // A grant of one capability says nothing about another.
+        assert!(!capability_granted(CAP_REPLACE_BODY, &declared, &granted));
     }
 
     #[test]

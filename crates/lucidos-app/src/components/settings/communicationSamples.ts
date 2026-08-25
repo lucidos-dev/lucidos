@@ -84,7 +84,7 @@ export function sampleProgressToast(): void {
   });
 }
 
-/** All five at once, staggered. A shape has to hold up as a STACK as well as
+/** Four at once, staggered. A shape has to hold up as a STACK as well as
  *  one at a time, and toasts do arrive in bursts. */
 export function sampleToastBurst(): void {
   sampleShortToast();

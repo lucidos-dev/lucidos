@@ -77,20 +77,24 @@ data/
     manifest.json           ← User-facing metadata (name, description, icon) — shown in UI, NOT in LLM context
     index.html, styles.css  ← App UI files
     knowhow/                ← App-specific reference docs (evolves)
+      <descriptive>.md      ← A listed doc
+      <descriptive>/        ← That doc's references, not listed
     intents/                ← App-specific user intents (stable)
     scripts/                ← App-specific helper scripts
     triggers/               ← App-specific scheduled triggers
 
   knowhow/                  ← General domain reference docs (API specs, data formats)
-    <domain>.md             ← Simple knowhow (single file)
+    <domain>.md             ← Simple knowhow (single file), a listed doc
     <domain>/               ← Knowhow domain with sub-docs
-      <descriptive>.md
+      <descriptive>.md      ← A listed doc
+      <descriptive>/        ← That doc's references, not listed
       scripts/              ← Domain-specific scripts
       intents/              ← Domain-specific intents
 
   triggers/                 ← Standalone scheduled triggers (not app-specific)
     <name>/                 ← Each trigger gets its own directory
       <descriptive>.md      ← Trigger intent definition
+      knowhow/              ← Trigger-scoped docs, same shape as an app's
       scripts/              ← Trigger-specific scripts
 
   scripts/                  ← Shared scripts NOT tied to one consumer
@@ -98,6 +102,48 @@ data/
 
   postgres/                 ← Event store — gitignored
 ```
+
+## Knowhow: Docs and References
+
+A **knowhow doc** is a file the engine names in a thread's Know-how routing
+list. That list is billed on every turn of every thread, so a root lists docs
+and nothing else. A file below the listing depth is a **knowhow reference**: it
+belongs to the doc above it, and the doc pulls it in.
+
+| Root | Listed as docs | Anything deeper |
+|---|---|---|
+| `data/knowhow/` and the shared `~/.lucidos/knowhow/` | `<name>.md` and `<group>/<name>.md` | a reference |
+| `data/apps/<id>/knowhow/` | `<name>.md` | a reference |
+| `data/triggers/<slug>/knowhow/` | `<name>.md` | a reference |
+
+An app or a trigger is already the group. That is why its root lists one level
+while the top-level root lists two.
+
+**Depth decides listing, never resolution.** A reference keeps its full id and
+stays loadable: `load_knowhow('lucidos-ops/release-process/phase-table')` reads
+it exactly as before. It just takes no row of its own.
+
+Give a doc's supporting files a folder named after the doc:
+
+```
+data/knowhow/
+  lucidos-ops/
+    release-process.md        ← a doc, listed
+    release-process/
+      phase-table.md          ← a reference, the doc loads it
+      rollback-matrix.md      ← a reference, the doc loads it
+```
+
+Name each reference and its id inside the doc that owns them. Nothing else
+routes to a reference, so one no doc names is unreachable in practice.
+
+**A file placed too deep goes quiet.** It stays on disk and stays loadable by
+id, but no thread hears about it. Nothing fails, which is what makes it worth
+checking for: `system-knowhow/workspace-audit.md` § 3 flags it, so an audit is
+how the user learns a reorg is needed.
+
+Engine-shipped `system-knowhow/` is exempt. That corpus is curated in the repo,
+so every file in it is a doc whatever its depth.
 
 ## Rules
 
@@ -122,16 +168,21 @@ Triggers are scheduled tasks that run on cron or in response to events. The **in
 
 ### Intent vs Knowhow Split (the rule everyone gets wrong)
 
-Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist.** Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in a knowhow file the LLM can discover, not in the intent.
+Triggers tempt you to dump procedure into the intent — there's one big text field, the API doesn't enforce structure, and the procedure is fresh in your head when you create it. **Resist**, and the way to resist is an ordering, not willpower: **write the knowhow file first, then the intent.** Stated as a prohibition ("don't put procedure in the intent") the rule fails in practice, because whoever holds a procedure and has nowhere to put it writes it where they can. Give it somewhere to live first and the intent comes out clean on its own.
+
+Every imperative verb about *how* (hit, parse, scan, fall back, retry, emit) belongs in that knowhow file, where the LLM discovers it at fire time.
 
 - **Intent**: a sentence the user would say. "Notify me when GPT-5.5 is available via the OpenAI API."
 - **Knowhow**: the recipe. "GET `/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`; scan `data[].id` for ids starting with `gpt-5.5`; on 401/403/network error fall back to one `web_search` for ..."
 
-Test: would a non-technical person understand the intent? If no, knowhow has leaked.
+Two tests, and the second is the sharper one:
+
+1. Would a non-technical person understand the intent? If no, knowhow has leaked.
+2. Sentence by sentence: **would deleting this change HOW the work is done, or WHAT the user wants?** How belongs in the knowhow file. What stays in the intent.
 
 ### Worked Example
 
-**Bad** (intent contains the recipe):
+**Bad** (one step, intent contains the recipe):
 ```
 run.intent: "Check whether gpt-5.5 is available. GET https://api.openai.com/v1/models
 with Authorization: Bearer $OPENAI_API_KEY. Scan data[].id for any id starting
@@ -140,7 +191,7 @@ or network error, fall back to web_search for 'gpt-5.5 OpenAI API available'.
 If not yet available, stay silent."
 ```
 
-**Good** (recipe lives in a knowhow file the trigger thread will discover at fire time):
+**Good**, two steps in this order. **Step one, the knowhow file**, written before the trigger exists:
 ```
 # data/knowhow/openai-api-availability.md
 ---
@@ -150,13 +201,17 @@ description: How to check whether a specific model is reachable via the OpenAI A
 GET `https://api.openai.com/v1/models` with `Authorization: Bearer $OPENAI_API_KEY`.
 On 200, scan `data[].id` for the requested model prefix. On 401/403/network error,
 fall back to one `web_search` distinguishing API availability from ChatGPT-only rollout.
+Stay silent until the model appears.
 ```
+**Step two, the trigger**, which now has nothing technical left to carry:
 ```
 run.intent: "Notify me when an OpenAI model with id prefix gpt-5.5 becomes available
 via the API. Once notified, disable this trigger."
 ```
 
-When OpenAI changes their endpoint, you update one knowhow file — not every trigger that touches it. When a new model needs watching, you create a new trigger; the same knowhow surfaces via semantic discovery.
+Skip step one and you reach the tool with procedure in hand and nowhere to put it, so it lands in the intent. That is the failure this ordering prevents, and it is the common one.
+
+When OpenAI changes their endpoint, you update one knowhow file — not every trigger that touches it. When a new model needs watching, you create a new trigger; the same knowhow surfaces via semantic discovery. Skip step one and neither of those holds: the recipe exists in exactly one trigger's config, invisible to discovery and unreachable from any other thread.
 
 ### Knowhow discovery at fire time
 
@@ -164,7 +219,7 @@ The trigger thread inherits the chat-thread knowhow surface: the system prompt a
 
 ### Order of Operations
 
-When creating a trigger that needs a recipe, write the knowhow file first (so it exists when the trigger fires and discovery can surface it), then create the trigger.
+Knowhow file first, trigger second, as in the worked example above. That works for shared `data/knowhow/`, which is where a recipe belongs unless it is useless to anything else. Trigger-scoped knowhow inverts it: `<slug>` is only authoritative once the trigger exists, so write that file straight after creation. The chat system prompt's `CONTENT TAXONOMY` block states the same ordering. `system-knowhow/triggers.md` § "The most important rule" is what the LLM reads at trigger-creation time.
 
 ### Locations
 
@@ -172,6 +227,7 @@ When creating a trigger that needs a recipe, write the knowhow file first (so it
 - **App-specific triggers** live in `apps/<id>/triggers/<slug>/`.
 - **Trigger-scoped knowhow** lives at `data/triggers/<slug>/knowhow/<descriptive>.md` (or `data/apps/<id>/triggers/<slug>/knowhow/` for app-specific triggers). Visible only to threads of trigger `<slug>`.
 - **Shared knowhow** lives in `data/knowhow/<id>.md` (or `data/knowhow/<id>/<descriptive>.md` for multi-file domains).
+- **A doc's own reference files** go one folder deeper, per § Knowhow: Docs and References. They are not listed, and the doc loads them by id.
 
 ## Thread Vocabulary
 

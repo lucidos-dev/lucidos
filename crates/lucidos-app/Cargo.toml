@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # Tailnet state (CLI-free) + Tailscale CLI resolution for Mobile Access.
 lucidos-tailscale = { path = "../lucidos-tailscale" }
+lucidos-local-token = { path = "../lucidos-local-token" }
 # image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
 # (install_tray in lib.rs). Not in tauri's default feature set.
 #

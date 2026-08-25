@@ -1,14 +1,5 @@
 import { isElementVisible } from './scrollState';
 
-/** Focus an element only if it isn't already the active element, avoiding flicker.
- *  Uses preventScroll to avoid iOS Safari auto-scrolling overflow:hidden
- *  containers (e.g. the mobile swipe container) when the target is offscreen. */
-export function focusIfNeeded(el: HTMLElement | null | undefined): void {
-  if (el && document.activeElement !== el) {
-    el.focus({ preventScroll: true });
-  }
-}
-
 /** The currently focused prompt textarea, or null if focus is elsewhere.
  *  Reads document.activeElement directly rather than locating the visible
  *  prompt-input and comparing: focus is exactly the question being asked, so the

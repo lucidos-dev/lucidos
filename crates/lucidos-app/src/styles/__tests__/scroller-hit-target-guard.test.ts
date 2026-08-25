@@ -32,13 +32,13 @@
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, relative } from 'node:path';
 
-import { rulesTargeting } from './css-rule-helpers';
+import { rulesTargeting, styleSheetPaths } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const STYLES_ROOT: string = resolve(here, '..');
@@ -53,23 +53,9 @@ const SCROLLERS = [
   'thread-drawer-list',    // the thread drawer's list
 ] as const;
 
-function cssFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const path = resolve(dir, entry);
-    if (statSync(path).isDirectory()) {
-      if (entry === '__tests__') continue;
-      out.push(...cssFiles(path));
-    } else if (path.endsWith('.css')) {
-      out.push(path);
-    }
-  }
-  return out;
-}
-
 describe('scroll containers stay hit targets', () => {
   const offenders: string[] = [];
-  for (const path of cssFiles(STYLES_ROOT)) {
+  for (const path of styleSheetPaths(STYLES_ROOT)) {
     const css: string = readFileSync(path, 'utf8');
     for (const scroller of SCROLLERS) {
       for (const rule of rulesTargeting(css, scroller)) {

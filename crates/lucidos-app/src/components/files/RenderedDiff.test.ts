@@ -1,3 +1,7 @@
+// @vitest-environment jsdom
+// The sanitizer runs on a real DOM. The default `node` environment has none,
+// and DOMPurify would pass its input straight back.
+
 import { describe, it, expect } from 'vitest';
 import { renderDiffMarked, additionRuns, deletionRuns, hunkCoverage } from './RenderedDiff';
 import type { DiffFile, DiffLine } from '../../store/store';

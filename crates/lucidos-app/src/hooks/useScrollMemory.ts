@@ -232,7 +232,10 @@ export function attachScrollMemory(
     return value;
   };
 
-  let saved: SavedScroll | null = readSaved();
+  /** What was recorded when this attachment was set up, which is what decides
+   *  the branch it takes below. Anything running LATER re-reads instead: an arm
+   *  this open makes changes the answer under it. */
+  const saved: SavedScroll | null = readSaved();
 
   const stopRestore = () => {
     restoring = false;
@@ -359,10 +362,21 @@ export function attachScrollMemory(
       if (isCurrent && !isCurrent()) return;
       if (el.scrollTop !== inherited) return;
       if (!openIsOurs()) return; // a newer deep-link owns it now
-      if (saved?.kind === 'live-edge') {
+      // RE-READ, exactly as the stand-down above does, and for a sharper reason.
+      // The stand-down can ARM this open through the *follow seed*, on a thread
+      // whose record was empty when this attachment read it. That arm records
+      // the live edge, so the attach-time snapshot no longer describes the
+      // thread. Read through it, the rescue takes its reset branch below and
+      // hauls an armed reader to the top.
+      //
+      // The arm's save is debounced by `SAVE_DEBOUNCE_MS`, and this timer is
+      // `EVENT_RESOLVE_DEADLINE_MS` plus its slack. The first is two orders of
+      // magnitude shorter, so the arm is committed by the time this reads.
+      const recorded = readSaved();
+      if (recorded?.kind === 'live-edge') {
         resumeFollowingBottom(el);
-      } else if (saved !== null && isFullyRestorable(saved.top, el.scrollHeight, el.clientHeight)) {
-        markNavigationScroll(el, saved.top);
+      } else if (recorded !== null && isFullyRestorable(recorded.top, el.scrollHeight, el.clientHeight)) {
+        markNavigationScroll(el, recorded.top);
       } else if (resetOnEmpty) {
         // Either there was no position, or there is one the content cannot
         // hold. Both open the thread where a thread with no position opens, at

@@ -44,6 +44,8 @@ fn cc_running_shows_no_close_actions() {
         false,
         false,
         false,
+        false,
+        false,
     );
     assert_eq!(actions, vec![Action::Save]);
 }
@@ -234,6 +236,8 @@ fn waiting_for_user_answer_returns_no_actions() {
                 false,
                 false,
                 false,
+                false,
+                false,
             );
             assert_eq!(
                 actions,
@@ -315,8 +319,9 @@ fn last_activity_events_are_valid_persisted_events() {
     }
 }
 
-// Events that update last_activity in the backend projection (event_bus.rs)
-// must be in LAST_ACTIVITY_EVENTS so the frontend drawer timestamp stays in sync.
+// Events that update last_activity in the backend projection
+// (event_bus_projection_thread.rs) must be in LAST_ACTIVITY_EVENTS so the
+// frontend drawer timestamp stays in sync.
 #[test]
 fn required_events_are_in_last_activity() {
     for event in &[
@@ -331,8 +336,8 @@ fn required_events_are_in_last_activity() {
     ] {
         assert!(
             LAST_ACTIVITY_EVENTS.contains(event),
-            "'{}' must be in LAST_ACTIVITY_EVENTS — it updates last_activity in \
-                 event_bus.rs but the frontend won't sync without it",
+            "'{}' must be in LAST_ACTIVITY_EVENTS: it updates last_activity in \
+                 event_bus_projection_thread.rs but the frontend won't sync without it",
             event
         );
     }

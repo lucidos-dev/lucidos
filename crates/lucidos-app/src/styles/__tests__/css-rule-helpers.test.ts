@@ -10,8 +10,14 @@
  * subject derivation is not, because a caller cannot see it go wrong.
  */
 import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve, relative } from 'node:path';
 
-import { cssRules, rulesTargeting } from './css-rule-helpers';
+import { cssRules, rulesTargeting, styleSheetPaths } from './css-rule-helpers';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
 
 const selectorsMatching = (css: string, cls: string): string[] =>
   rulesTargeting(css, cls).map(r => r.selector);
@@ -101,5 +107,23 @@ describe('rulesTargeting picks the rules that style the element itself', () => {
     expect(selectorsMatching('.t:is(.a > .b) { a: 1; }', 't')).toEqual(['.t:is(.a > .b)']);
     // The `~` is an attribute operator, not a sibling combinator.
     expect(selectorsMatching('[class~="x"].t { a: 1; }', 't')).toEqual(['[class~="x"].t']);
+  });
+});
+
+/** The walk three whole-tree scans share. What it must not do is hand one of
+ *  them a fixture: a suite asserting "no sheet does X" would then fail on a
+ *  sheet nobody ships. */
+describe('styleSheetPaths', () => {
+  const paths = styleSheetPaths(resolve(here, '..'));
+
+  it('finds every shipping sheet, including the nested ones', () => {
+    const names = paths.map((p: string) => relative(resolve(here, '..'), p));
+    expect(names).toContain('components.css');
+    expect(names).toContain('global/base.css');
+    expect(names.every((n: string) => n.endsWith('.css'))).toBe(true);
+  });
+
+  it('skips the test directory, so a fixture never reads as shipping CSS', () => {
+    expect(paths.filter((p: string) => p.includes('__tests__'))).toEqual([]);
   });
 });

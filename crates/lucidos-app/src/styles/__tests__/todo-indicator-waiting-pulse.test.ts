@@ -2,12 +2,12 @@
  * The todo indicator's waiting state is the app's gray pulse, not a colour.
  *
  * It used to be `--accent-yellow`, on the stated grounds that it matched the
- * subscription indicator beside it. That indicator lost its tinted state to
- * ADR 0049, so the yellow ended up matching nothing, and yellow is the CAUTION
- * tone in this palette while a thread parked on an event wait is not a caution.
- * The app already has a waiting language: `.progress-dot-waiting` is a plain
- * `--text-secondary` dot pulsing on `progress-pulse`, and the indicator now
- * speaks it.
+ * waiting indicator beside it. It matched nothing: yellow is the CAUTION tone
+ * in this palette, and a thread parked on an event wait is not a caution. Nor
+ * can this button borrow that neighbour's accent, since accent is the hue it
+ * already spends on in-progress. The app already has a waiting language:
+ * `.progress-dot-waiting` is a plain `--text-secondary` dot pulsing on
+ * `progress-pulse`, and the indicator now speaks it.
  *
  * Two things nothing else in the gate can see, which is why this scan exists:
  *

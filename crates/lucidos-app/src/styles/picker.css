@@ -432,6 +432,29 @@
   font-size: var(--font-size-lg);
 }
 
+/* The release check's first-run notice (ADR 0108). Same neutral raised surface
+   as the confirm popovers, since it states a fact and asks a question rather
+   than reporting a failure. */
+.ws-picker-notice {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 0.625rem;
+  padding: 0.75rem 0.875rem;
+  margin-bottom: 1rem;
+}
+
+.ws-picker-notice-text {
+  margin: 0 0 0.75rem;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  opacity: 0.9;
+}
+
+.ws-picker-notice-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 /* ── Loading skeleton ────────────────────────────────────────────────────────
    The list placeholder renders the real `.ws-picker-row`/`.ws-picker-open`
    markup via the shared self-skeletonizing primitives (Skeleton.tsx → `.sk-bar`
@@ -1076,4 +1099,305 @@
   .ws-picker-net-mode {
     transition: none;
   }
+  /* The pairing caret rests visible rather than blinking. It says where the
+     next digit lands, which is a fact rather than an animation. */
+  .pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* ── Pairing gate ────────────────────────────────────────────────────────────
+   The screen an unpaired device sees before the picker. Sized for a phone
+   first: this is where a new phone lands after the gateway redirects it. */
+
+/* The gate scrolls itself, the way `.ws-picker` above does. `mobile.css` sets
+   `html { overflow: hidden }` under 768px, to hold the composer still when the
+   iOS keyboard opens, so a phone document does not scroll at all. A gate
+   leaning on document scroll is therefore simply clipped, and the install
+   recipe is the tallest thing it draws. */
+.pairing-gate {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  overflow-y: auto;
+  padding: 1.5rem;
+}
+
+.pairing-card {
+  width: 100%;
+  max-width: 24rem;
+  /* Centred by auto margins rather than by the gate's `align-items`, which
+     would put the top of an over-tall card above the scroll origin, where
+     nothing can reach it. Auto margins collapse to zero with no free space, so
+     the card starts at the top edge instead and every line stays reachable. */
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.75rem;
+  background: var(--bg-secondary);
+}
+
+.pairing-title {
+  margin: 0 0 0.25rem;
+  font-size: var(--font-size-3xl);
+  font-weight: 600;
+}
+
+.pairing-lede {
+  margin: 0 0 0.75rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-lg);
+  line-height: 1.5;
+}
+
+.pairing-label {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.pairing-optional {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+.pairing-input {
+  padding: 0.625rem 0.75rem;
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  /* 1rem, so iOS Safari does not zoom the page when the field takes focus. */
+  font-size: var(--font-size-xl);
+}
+
+/* The code field: one input under one box per digit. The input fills the
+   field, so a tap anywhere in it lands in the input.
+
+   A query container, because the row is the one place in the app where eight
+   boxes have to fit across a phone at any UI scale. Every rem below the row
+   would keep growing with the root while the card cannot, so the box sizes are
+   capped against this container's width. */
+.pairing-code-field {
+  position: relative;
+  margin-bottom: 0.5rem;
+  container-type: inline-size;
+}
+
+.pairing-code-entry {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  /* Invisible, never hidden. The browser still counts it as the field on
+     screen, so autofill and scroll-into-view aim at the boxes. */
+  color: transparent;
+  caret-color: transparent;
+  text-align: center;
+  font-size: var(--font-size-xl);
+  /* The active box wears the focus ring. The browser's own would draw a second
+     one, around a field whose edges nothing else marks. */
+  outline: none;
+}
+
+/* A selection would paint a block across the boxes the digits are drawn in. */
+.pairing-code-entry::selection {
+  background: transparent;
+  color: transparent;
+}
+
+.pairing-code-boxes {
+  display: grid;
+  /* Column per box, from however many boxes the markup drew. */
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: min(0.375rem, 2cqi);
+  /* Drawn, not typed into: every pointer event belongs to the input beneath. */
+  pointer-events: none;
+  /* Positioned, so these paint OVER the input rather than under it. The input
+     is absolutely positioned, and a browser repainting it (an autofilled field
+     gets its own background) would otherwise cover the boxes. */
+  position: relative;
+}
+
+.pairing-code-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Each capped against the row's own width, so eight boxes fit a phone at
+     every UI scale. The rem arm is what a roomy row uses, and the cqi arm
+     takes over once the boxes are narrower than the digits they hold. */
+  height: min(3rem, 18cqi);
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: min(var(--font-size-3xl), 8cqi);
+  line-height: 1;
+}
+
+/* Four and four. A code is read off a terminal a group at a time, and the
+   double gap is where the eye keeps its place. */
+.pairing-code-box:nth-child(4n + 1):not(:first-child) {
+  margin-inline-start: min(0.375rem, 2cqi);
+}
+
+.pairing-code-box[data-filled] {
+  border-color: var(--text-muted);
+}
+
+/* The box the next digit lands in, marked only while the field holds focus.
+   Away from it there is no cursor to point at. */
+.pairing-code-field:focus-within .pairing-code-box[data-active] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.pairing-code-box[data-caret]::after {
+  content: '';
+  width: 1px;
+  /* Half the box, so it stays a caret rather than a bar at any size. */
+  height: 50%;
+  background: var(--accent);
+  opacity: 0;
+}
+
+/* The caret the transparent input cannot draw. Indefinite, so it carries a
+   literal duration rather than a scaled token. */
+.pairing-code-field:focus-within .pairing-code-box[data-caret]::after {
+  animation: pairing-caret 1.06s step-end infinite;
+}
+
+@keyframes pairing-caret {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.pairing-error {
+  margin: 0 0 0.5rem;
+  color: var(--accent-red);
+  font-size: var(--font-size-md);
+}
+
+.pairing-submit {
+  padding: 0.75rem 1rem;
+  border: none;
+  border-radius: 0.5rem;
+  background: var(--accent-action);
+  color: var(--text-on-accent);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pairing-submit:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ── Install first ───────────────────────────────────────────────────────────
+   What a phone browser sees instead of the form. */
+
+.pairing-steps {
+  margin: 0 0 0.75rem;
+  padding-inline-start: 1.25rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-lg);
+  line-height: 1.6;
+}
+
+.pairing-steps li + li {
+  margin-top: 0.375rem;
+}
+
+/* The already-installed case, set apart from the steps above it: those two
+   answer different questions, and running them together reads as step four. */
+.pairing-aside {
+  margin-bottom: 0.75rem;
+  padding: 0.875rem;
+  border-radius: 0.5rem;
+  background: var(--bg-tertiary);
+}
+
+.pairing-aside-title {
+  margin: 0 0 0.25rem;
+  font-size: var(--font-size-md);
+  font-weight: 600;
+}
+
+.pairing-aside-body {
+  margin: 0 0 0.75rem;
+  color: var(--text-secondary);
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+}
+
+.pairing-code-readout {
+  margin-bottom: 0.625rem;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-2xl);
+  /* Four and four, as the boxes above group them. */
+  letter-spacing: 0.15em;
+}
+
+.pairing-code-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+/* The viewfinder. Square, so the QR the user is aiming at sits in the middle of
+   a shape that matches it, and `cover` because a phone's rear camera is far
+   from square and letterboxing it would shrink what the decoder sees. */
+.pairing-scanner-video {
+  width: 100%;
+  aspect-ratio: 1;
+  margin-bottom: 0.75rem;
+  border-radius: 0.5rem;
+  background: var(--bg-primary);
+  object-fit: cover;
+}
+
+.pairing-secondary {
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--border-color);
+  border-radius: 0.5rem;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.pairing-secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The escape, drawn as a link rather than a button: it is the way past advice
+   the user has read and decided against, not a second thing to do. */
+.pairing-escape {
+  align-self: center;
+  padding: 0.5rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--font-size-md);
+  text-decoration: underline;
+  cursor: pointer;
 }

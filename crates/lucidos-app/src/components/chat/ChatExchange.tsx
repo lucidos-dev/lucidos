@@ -20,8 +20,9 @@ import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, hasVi
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
+import { navigateToTrigger } from '../../store/actions/triggers';
 import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setThreadLive } from './scrollState';
@@ -35,6 +36,16 @@ const NO_APPS: App[] = [];
 /** Toast key for the terminal dead-link guard in `handleLinkClick`, so tapping
  *  the same dead link repeatedly replaces the toast rather than stacking. */
 const DEAD_LINK_TOAST_KEY = 'chat-dead-link';
+
+/** What the terminal guard says about an href it swallowed. Three cases, named
+ *  apart because they have different fixes. An unopenable SCHEME is usually one
+ *  the agent invented. An unresolved relative href usually names something that
+ *  moved. An empty one cannot be quoted at all. */
+function deadLinkMessage(href: string): string {
+  if (!href) return 'This link has no destination';
+  if (hasUrlScheme(href)) return `Link "${href}" uses a scheme nothing here can open`;
+  return `Link "${href}" points nowhere in this workspace`;
+}
 
 /** The change_id this exchange pertains to, used to stamp `data-change-id` so
  *  the Changes panel can deep-link a row to its originating turn. The aggregate
@@ -242,6 +253,18 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       return;
     }
 
+    const triggerTarget = (e.target as HTMLElement).closest('.trigger-link') as HTMLElement | null;
+    if (triggerTarget) {
+      e.preventDefault();
+      const triggerId = triggerTarget.dataset.triggerId;
+      // navigateToTrigger, not a `triggers.find(...)` on the cached list: it
+      // re-fetches the registry on a miss before concluding the trigger is
+      // gone, and names it in the toast if it really is. Same reasoning as the
+      // app branch routing through openAppById.
+      if (triggerId) void navigateToTrigger(triggerId);
+      return;
+    }
+
     const navTarget = (e.target as HTMLElement).closest('.nav-link') as HTMLElement | null;
     if (navTarget) {
       e.preventDefault();
@@ -269,6 +292,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           openApp(app);
           return;
         }
+      }
+      const triggerId = extractTriggerIdFromHref(rawHref);
+      if (triggerId) {
+        e.preventDefault();
+        void navigateToTrigger(triggerId);
+        return;
       }
       const navName = extractNavTargetFromHref(rawHref);
       if (navName) {
@@ -316,39 +345,39 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         openLocalFile(localFile);
         return;
       }
-      // TERMINAL GUARD: nothing above claimed this href. If it carries no URL
-      // scheme it is a relative link into the SPA, and there are no relative
-      // routes: the browser resolves it against the workspace base, the
-      // engine's SPA fallback answers with the app shell, and the whole
-      // workspace reloads. The branches above are a whitelist, and a whitelist
-      // is open at the bottom. Closing it here makes the next unrecognized
-      // shape a toast the user can read rather than a reload. See ADR 0038.
+      // TERMINAL GUARD: nothing above claimed this href, so it goes nowhere
+      // useful. The branches above are a whitelist, and a whitelist is open at
+      // the bottom. Closing it here makes the next unrecognized shape a toast
+      // the user can read. See ADR 0038.
       //
-      // Two things deliberately pass through: a URL scheme (http(s), mailto,
-      // tel, all real links the browser should handle) and a pure fragment
-      // (`#section`, an in-page markdown anchor, which navigates nothing).
+      // Two failure modes, one guard. A href with NO scheme is a relative link
+      // into the SPA, and there are no relative routes: the browser resolves it
+      // against the workspace base, the SPA fallback answers with the app
+      // shell, and the whole workspace reloads. A href whose scheme nothing can
+      // open does nothing at all, and that is the worse of the two: the user
+      // cannot tell it from a dead app. `trigger:` was this until it was
+      // claimed, and the agent will invent another.
+      //
+      // Only a fragment (`#section`, which navigates nothing) and a scheme the
+      // browser genuinely acts on pass through.
       //
       // An EMPTY href is still swallowed, since `[text]()` resolves to the
       // current URL and reloads exactly like any other unclaimed relative href.
       // It just can't be named in the message. Keyed so tapping the same dead
       // link twice replaces the toast instead of stacking a duplicate.
-      if (!hasUrlScheme(rawHref) && !rawHref.startsWith('#')) {
+      if (!browserHandlesHref(rawHref) && !rawHref.startsWith('#')) {
         e.preventDefault();
-        showToast(
-          rawHref
-            ? `Link "${rawHref}" points nowhere in this workspace`
-            : 'This link has no destination',
-          'error',
-          { key: DEAD_LINK_TOAST_KEY },
-        );
+        showToast(deadLinkMessage(rawHref), 'error', { key: DEAD_LINK_TOAST_KEY });
       }
     }
   }
 
-  // The two turn controls grow the turn the reader is looking at, so
-  // `withScrollAnchor` holds the `.chat-exchange` ROOT still across the growth.
-  // Everything they reveal grows BELOW that root's top, so the reader keeps
-  // looking at the same thing.
+  // Both turn controls change the height of every turn in the transcript, so
+  // `withScrollAnchor` holds the reader still across it. The `.chat-exchange`
+  // ROOT is handed over as its LAST resort, not as the anchor. A turn taller
+  // than the screen has its top out of sight. Holding a point the reader cannot
+  // see is what let a reveal carry them back up the thread. See
+  // `anchorCandidates`, which prefers their own topmost line.
   //
   // Turning either ON also lifts THIS turn's fold, and only this turn's. A
   // folded turn draws no body. A reveal clicked from its header would land on
@@ -488,11 +517,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, { eventType: matchedEventType, eventId: matchedEventId, payloadJson: matchedPayloadJson }),
     [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson],
   );
-  const canCollapseInitiator = !!initiator.summary || !!initiator.details;
-  const isInitiatorCollapsed = canCollapseInitiator
-    && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
   const isChangePanel = isChangeLifecycleEvent(exchange.userEvent);
-  const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
   // Card-less treatment. A human chat message renders as a right-aligned
   // accent-tinted bubble and change-lifecycle turns render flat. Both drop the
   // actor chip, moving attribution to the clickable timestamp or summary. The
@@ -500,6 +525,14 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // keeps the chip slot, rendered iconless with the action AS the label (see
   // `actionInitiator`). Question dividers keep their agent chip.
   const isUserMessageBubble = exchange.userEvent.type === 'MessageReceived' && initiator.variant === 'user';
+  // Both of those are exempt from the fold, on report. A change turn's body is
+  // a summary, a description and a file list; a user message is the reader's
+  // own text. The control cost a row of chrome to fold a few short lines.
+  const canCollapseInitiator = !isChangePanel && !isUserMessageBubble
+    && (!!initiator.summary || !!initiator.details);
+  const isInitiatorCollapsed = canCollapseInitiator
+    && collapsedInitiators.value.has(`${threadId}:${exchange.userSeq}`);
+  const changeId = exchangeChangeId(exchange, isChangePanel, threadIsCC);
   // A queued follow-up shows a "Queued" tag in its own bubble header, where
   // dividers show "Answered ✓". A faux "Lucidos Agent" response panel below it
   // would misattribute it: the message is the user's, and a stack of them

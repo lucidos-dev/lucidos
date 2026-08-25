@@ -223,30 +223,57 @@ async fn find_worktree_for_branch_returns_path_when_branch_is_checked_out() {
     .unwrap();
     assert!(add.status.success(), "setup: worktree add must succeed");
 
-    let found = find_worktree_for_branch(&repo, "claude-code/feat").await;
-    assert!(
-        found.is_some(),
-        "should detect the worktree holding the branch"
-    );
+    let WorktreeLookup::Found(found) = find_worktree_for_branch(&repo, "claude-code/feat").await
+    else {
+        panic!("should detect the worktree holding the branch");
+    };
     // git canonicalizes the worktree path; compare via canonicalize to avoid
     // /private/var vs /var symlink mismatches on macOS.
     let expected = std::fs::canonicalize(&wt).unwrap();
-    let actual = std::fs::canonicalize(found.unwrap()).unwrap();
+    let actual = std::fs::canonicalize(found).unwrap();
     assert_eq!(actual, expected);
 }
 
-/// No worktree holds the branch → None. The branch may exist as a ref or not;
-/// either way the function only reports active worktrees.
+/// No worktree holds the branch → `NotFound`. The branch may exist as a ref or
+/// not; either way the function only reports active worktrees.
 #[tokio::test]
-async fn find_worktree_for_branch_returns_none_when_branch_not_checked_out() {
+async fn find_worktree_for_branch_returns_not_found_when_branch_not_checked_out() {
     let (_tmp, repo) = make_test_repo().await;
     let _ = git_cmd(&["branch", "claude-code/unattached"], &repo).await;
 
-    let found = find_worktree_for_branch(&repo, "claude-code/unattached").await;
-    assert!(found.is_none(), "branch ref alone must not match");
+    assert_eq!(
+        find_worktree_for_branch(&repo, "claude-code/unattached").await,
+        WorktreeLookup::NotFound,
+        "branch ref alone must not match"
+    );
+    assert_eq!(
+        find_worktree_for_branch(&repo, "claude-code/missing").await,
+        WorktreeLookup::NotFound,
+        "missing branch must not match"
+    );
+}
 
-    let found = find_worktree_for_branch(&repo, "claude-code/missing").await;
-    assert!(found.is_none(), "missing branch must not match");
+/// The load-bearing arm. A lookup that could not run is `Unknown`, never a
+/// `NotFound`. Four destructive call sites read a `NotFound` as permission to
+/// remove a worktree or move a branch ref.
+///
+/// Both cases are real rather than synthetic: git cannot start in a directory
+/// that does not exist, and it exits non-zero in a directory that is no repo.
+#[tokio::test]
+async fn find_worktree_for_branch_is_unknown_when_git_could_not_answer() {
+    let gone = std::path::Path::new("/definitely/not/a/directory/on/this/host");
+    assert_eq!(
+        find_worktree_for_branch(gone, "claude-code/feat").await,
+        WorktreeLookup::Unknown,
+        "a spawn failure must not read as 'no worktree holds this branch'"
+    );
+
+    let not_a_repo = tempfile::tempdir().unwrap();
+    assert_eq!(
+        find_worktree_for_branch(not_a_repo.path(), "claude-code/feat").await,
+        WorktreeLookup::Unknown,
+        "a non-zero exit leaves no listing to parse, so it is not an empty one"
+    );
 }
 
 /// Read git's effective info/exclude file for a repo or worktree, as resolved

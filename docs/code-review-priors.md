@@ -15,6 +15,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **Permission grants living under `<workspace>/.lucidos/` being agent-writable
+  is the recorded non-property, not an escalation this introduced.** A reviewer
+  reading `core/grants/mod.rs` correctly observes that an agent with `run_bash`
+  can append to the very file gating it. Codex flagged exactly this as P1 on the
+  branch that moved the files there.
+
+  ADR 0095 decides it in as many words. Every workspace shares a uid and a
+  shell, so there is no containment to be had. The property bought is semantic,
+  that no decision binds outside the context it was made in. What `.lucidos/` buys over `data/config/` is narrower and real:
+  the *engine's own file tools* refuse it, asserted in
+  `the_file_tools_cannot_address_a_permission_grant_file`.
+
+  The move also does not widen the escalation. The command guard classifies an
+  out-of-workspace **append** as safe and wanted (`command_judge.rs`). So
+  `>> ~/.lucidos/agent-allowed-commands` was ungated before this change, and
+  appending is all it takes to add a grant. Only out-of-workspace *destruction*
+  was gated, and truncating a grant file removes grants. Re-flag only if the
+  design gains a containment claim, or if workspaces start running under
+  separate uids.
+
 - **An orphaned build outliving its `build-slot` wrapper is a weighed
   trade-off, not an oversight.** `spawn_child`
   (`lucidos-cli/src/build_slot.rs`) runs the build as a child and holds the
@@ -386,18 +406,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   deliberately does not call it). Re-flag only with a legitimate command that a
   shell really executes and this refuses. (`engine/command_guard.rs`.)
 
-- **A raw-text region is bounded but still scrubbed, and that is on purpose.**
-  `sanitizeHtmlFragments` skips to the matching end tag for `textarea` / `title`
-  / `xmp` / `noscript` / `plaintext`, then recurses into the content rather than
-  copying it. A reviewer sees the browser treating that content as inert text and
-  proposes passing it through untouched, which would also stop literal markup a
-  reader typed into a textarea being altered. Declined: `title` is RCDATA in HTML
-  but ordinary markup inside `<svg>` / `<math>`, and the walk does not track
-  foreign content, so verbatim is right for one context and wrong for the other.
-  Twice on 2026-08-06 a region that skipped the scrub turned out to be reachable
-  markup. Re-flag only if the walk starts tracking foreign content.
-  (`crates/lucidos-app/src/utils/renderMarkdown.ts`.)
-
 - **`AbortCause::is_transient()` and the `paused` status verdict answer
   DIFFERENT questions and are supposed to disagree.** `RecoveryAfterRestart` is
   transient yet settles the thread at `failed`, which reads as a contradiction:
@@ -615,6 +623,108 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`api/claude_code.rs`, `engine/claude_code/control.rs`,
   `engine/agent_question.rs`.)
 
+- **An error path that abandons an `McpClient` without calling `shutdown` still
+  kills the server process.** A reviewer reads a bare `return Err(...)` in
+  `connect`, `handshake` or `discover_tools`. Noting that
+  `tokio::process::Child` does not kill on drop by default, they conclude the
+  spawned server is orphaned. Codex flagged exactly this on the branch that
+  made a failed `tools/list` fail the connect.
+
+  `impl Drop for McpClient` calls `child.start_kill()`, so every abandoned
+  client SIGKILLs its process, and tokio's orphan reaper collects it. That is
+  the whole reason `shutdown` exists as a separate method: it is the *graceful*
+  path, which also waits, not the only path that kills. Pinned by
+  `a_failed_tools_list_is_a_start_failure_not_an_empty_server`, which blocks on
+  the stub process actually exiting.
+
+  Re-flag if the `Drop` impl is removed, or if a field is added that must be
+  torn down in an order `Drop` does not give.
+  (`crates/lucidos-engine/src/mcp/client.rs`.)
+
+- **The rename shipped no alias, no doc line and no migration, and that is the
+  decision.** `WorkingUnderstandingWritten` and `ContextKeptOpen` replaced
+  `ScratchpadWritten` and `ContextKept`. Neither carries a `serde(alias)`, a
+  `LEGACY_TYPE_NAME_ALIASES` entry, or a `Legacy alias:` line in
+  `thread-events.md`. Codex read the missing reader as an upgrade dropping every
+  thread's notes.
+
+  There are no rows to read. The mode has only ever run in the maintainer's own
+  eval, whose workspaces are disposable, so no workspace holds either row.
+  Aliases for rows that do not exist are dead code.
+
+  The `Legacy alias:` line went with the alias, on purpose.
+  `.claude/rules/system-knowhow.md` requires that exact form for the
+  workspace-audit **retired-event-name check**. Keeping it would claim the
+  engine still reads the old name, which no code does. The cost is named and
+  accepted: the audit cannot tell a dead `ScratchpadWritten` subscription from a
+  workspace domain event.
+
+  The renamed **preference key** is the same finding wearing a second face,
+  and Codex flagged that one too. `self_curated_context_mode` reads nothing
+  written under `context_mode_experimental`, the name it replaced, and there is
+  no migration. There is no stored value to carry forward. Only the eval ever
+  set it, and each run writes its own rows. The two schedule keys beside it are
+  new, so they have no predecessor at all.
+
+  Re-flag if the mode ships on by default, or if a workspace is found holding
+  either row: a reader would then be back-compat rather than dead code. The
+  same reasoning covers `ContextKeptOpen` and the retired keys.
+  (`crates/lucidos-engine/src/engine/chat/process/working_understanding.rs`,
+  `crates/lucidos-engine/src/core/preferences.rs`,
+  `system-knowhow/thread-events.md`,
+  `docs/plans/2026-08-24-self-curated-context-mode-engine-half.md`.)
+
+- **The working understanding's `[TODO]` parse accepts `waiting` and
+  `abandoned`, which `todo_write` refuses, and that asymmetry is the design.** A
+  reviewer finds `todo_write_impl` rejecting both statuses from the LLM with a
+  stated reason, then finds `parse_todo_line` mapping the same two words
+  straight into `TodoItem.status`. It reads as a guard the new write path
+  dropped. Two review angles raised it independently.
+
+  The two paths are not the same act. A tool call is the model ASSERTING a
+  status. The `[TODO]` heading is the model rewriting a list the engine just
+  rendered TO it, and the render prints those two words on purpose: ADR 0109's
+  amendment says re-entry is exactly when what became of an item matters most.
+  Refusing the word would drop the whole line, so the item would vanish from
+  the list rather than keep its state.
+
+  The plan settles the syntax in as many words: the two engine-written statuses
+  "take the same shape with a word in the bracket, so one rule covers all five
+  marks". The residual is that a model can assert one fresh. It costs one round
+  of a wrong mark in the prompt bar, and the next write corrects it, because the
+  checklist is replace-whole.
+
+  Re-flag with evidence that a model asserts one unprompted, or if the render
+  ever stops echoing the engine's word: the round-trip is the whole reason the
+  parse accepts it.
+  (`crates/lucidos-engine/src/engine/chat/process/working_understanding.rs`,
+  `crates/lucidos-engine/src/engine/tools/todo.rs`,
+  `docs/plans/2026-08-24-self-curated-context-mode-engine-half.md`.)
+
+- **`segment_heads` and `segment_heads_as_written` resolve the same token two
+  different ways ON PURPOSE, and merging them reopens a bypass.** A reviewer
+  reads the pair as copy-paste drift: one basenames the head, the sibling right
+  beside it does not, and both walk the same segments. The obvious cleanup is
+  to keep one.
+
+  They sit on opposite sides of the grant lane. `segment_heads` DERIVES what an
+  "Always allow" click stores, and basenaming is right there: `/usr/bin/git
+  push` should store `git`. `segment_heads_as_written` is what a stored grant
+  is MATCHED against, and basenaming is wrong there: it would let `Bash(ls:*)`
+  cover `data/bin/ls`, a binary the agent writes in-workspace with an ordinary
+  Safe write and then runs with no card. The Safe fast path refuses a
+  path-qualified head for exactly that reason
+  (`a_path_qualified_head_never_settles_safe`).
+
+  The asymmetry has a visible cost, and it is not a bug either: a grant stored
+  from `/usr/bin/aws …` covers a later bare `aws …` and not a later
+  `/usr/bin/aws …`. The grant file header says so.
+
+  Re-flag only with evidence that the matching side can basename safely.
+  Pinned by `matching_reads_the_head_as_written_while_derivation_basenames_it`
+  and `a_stored_grant_never_covers_a_path_qualified_head`.
+  (`crates/lucidos-engine/src/engine/command_guard.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -687,6 +797,82 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **`tabIndex={-1}` on a toast or confirm-dialog scroll box takes away no
+  keyboard scrolling, because that surface's own Tab cycle never reached it.**
+  Chrome promotes an overflowing scroller to a Tab stop when it holds no
+  focusable child. A reviewer therefore reads the attribute as removing what
+  Chrome just granted. Codex flagged both boxes as P1 on the branch that added
+  them.
+
+  Neither was reachable. `handleToastKeyDown` (`components/shared/Toast.tsx`)
+  intercepts every Tab inside a toast that owns a button, and cycles
+  `a[href], button` only. `trapDialogTab` wraps at the confirm dialog's two
+  buttons via `trapTargetIndex`, which acts at the boundaries and answers null
+  in between. `.confirm-details` sits before both in DOM order, so native
+  movement only ever steps Cancel to OK. A plain scroller is not click-focusable
+  either. The attribute states in the DOM what the trap already enforced, and
+  stops the promotion racing it.
+
+  The file preview modal is the counter-case and is written the other way:
+  nothing traps Tab there, so `.file-preview-modal-body` declares
+  `tabIndex={0}` with a role, a label and the shared `--focus-ring`. Re-flag
+  only if a toast or the confirm dialog grows a Tab cycle that includes its
+  scroll box.
+
+- **`canInstallUpdateHere` subtracts `installer-rerun` rather than requiring
+  `desktop-app`, and that asymmetry is deliberate.** A reviewer reads the
+  release check's `install` field as "what can act on this offer". They then
+  propose `install === 'desktop-app'`, so an unrecognised layout
+  (`install: null`) offers no action. Codex flagged exactly this on the branch
+  that added the field (ADR 0108).
+
+  The field describes the **gateway's own** executable layout, not the client's.
+  `isTauri()` is the conjunct that answers "can this session install", and it is
+  already required. A Tauri client is a `.app` by construction and always has a
+  working updater. So `install` is only ever used to SUBTRACT the one case where
+  a Tauri session must not reach for it: a gateway that is a headless install.
+
+  Requiring `desktop-app` would withhold a working button in two live states. A
+  bundle whose layout `install_shape` stops recognising would show an offer it
+  cannot take, silently. And a Tauri DEV client has no `latest` at all
+  (`supported: false`), so `install` is `undefined` there and the dev
+  engine-health update affordance would disappear. Re-flag only if a Tauri
+  client can front a gateway it did not spawn.
+
+- **A clickable toast whose handler is idempotent needs no `acted` guard, and
+  the two that carry one say why in the comment.** The `BackupFailed` toast's
+  `onClick` (`store/actions/thread-sync.ts`) dismisses and navigates with no
+  re-entry flag. Two siblings in `store/actions/in-app-notification-toast.ts`
+  set `acted` / `opened` first, so this reads as a missed guard. Two of three
+  hardening angles flagged it on the branch that added it.
+
+  The guard's own comment states its precondition: Toast.tsx fires `onClick`
+  raw and the DOM lingers across the async dismiss render, so a double-tap must
+  not re-run a **non-idempotent** open (`openAppById`,
+  `focusThreadOrBootstrap`). A settings deep link is not one. `removeToast`
+  reassigns only while the key is present. `pushEntry` returns `null` on
+  `statesEqual` with the entry at the cursor. `revealContentPane` twice is a
+  no-op. So the second tap changes nothing.
+
+  Re-flag when the handler gains a side effect that is not idempotent: a POST,
+  a counter, an id-minting open. Not for the shape alone.
+
+- **The system-theme watcher registers its own resume listeners instead of
+  calling `onPageWake`, because it needs the case `onPageWake` drops.**
+  `preferences.ts` binds `visibilitychange` / `focus` / `pageshow` by hand.
+  `utils/pageVisit.ts` already exports a coalesced subscription over that exact
+  set, so this reads as a missed reuse.
+
+  `onPageWake` fires only when a hide PRECEDED it: `comeBack()` returns early
+  unless `away`, and `away` is set only by `pagehide` or a `hidden`
+  `visibilitychange`. A window that merely lost focus never went hidden. A Mac
+  that slept through an OS appearance flip hears nothing on the way back.
+  Repairing that is half of why the watcher exists (ADR 0092). The iOS-only
+  `onPageResume` is a worse fit again: it also arms a click-swallow.
+
+  Re-flag only if `onPageWake` starts firing on a bare focus, or if the theme
+  watcher stops needing the desktop case.
 
 - **The iOS repaint toggle's `entry.restoreTop!` is guarded by the
   `nudgedTop !== undefined` test beside it, in both readers.** A reviewer sees a
@@ -1608,6 +1794,110 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag only if per-pane columns come back AND a toast in one pane again
   displaces the other's.
+
+- **An optional chain on state a guard already narrowed is load-bearing when
+  the reader is a hoisted function.** A component early-returns on
+  `devices === null`, so `devices.length` reads as safe below it. Inside a
+  nested `function` declaration it is not: the declaration is hoisted above the
+  guard, so TypeScript resets the narrowing and `devices.length` is
+  `TS18047: possibly 'null'`.
+
+  So `(devices?.length ?? 0)` in such a body is not dead defensiveness, and
+  "simplifying" it fails the type check. This was flagged and reverted during
+  the hardening of `PairedDevicesSection`'s revoke confirm. The narrowing holds
+  in JSX and in an arrow function assigned after the guard, which is why it
+  looks inconsistent.
+
+  Re-flag only if the reader stops being a hoisted declaration, or the state
+  stops being nullable. (`crates/lucidos-app/src/components/settings/PairedDevicesSection.tsx`.)
+
+- **The header-control wash is written three times on purpose, and hoisting it
+  to a token on the bar breaks it.** A reviewer sees
+  `background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent)`
+  in three rules of `styles/panels/shell.css` (a header `.icon-btn` hovered,
+  toggled on, and both at once) and proposes one `--header-control-bg` on
+  `.pane-header`. It cannot work. The browser substitutes a `var()` inside a
+  custom property on the element that DECLARES that property. So the hoisted
+  copy resolves the veil against the bar's resting `0%`, and every state
+  inherits a transparent wash.
+
+  The alpha is the only thing the states vary, so the wash belongs where the
+  alpha is declared, on the same element. The same fact is what makes the badge
+  ring work: `.app-header .badge` mixes the veil ON THE BADGE, so it reads the
+  veil the control under it raised.
+
+  Re-flag only with a shape that keeps the substitution on the state element.
+  (`crates/lucidos-app/src/styles/panels/shell.css`, pinned by
+  `styles/__tests__/header-badge-ring.test.ts`.)
+
+- **The prose path matcher stopping at `?` or `#` is deliberate, not a
+  truncation bug** (2026-08-21). `artifacts/report.html?v=2` links only
+  `artifacts/report.html`, leaving `?v=2` as text. A reviewer reads that as an
+  extension cut short at punctuation, and Codex flagged it.
+
+  It is what the cached-list matcher already did with a query string.
+  `extractDataPathTarget` strips a query and a fragment anyway, so the
+  `data-path` is identical either way. `FILENAME_CONTINUES` therefore omits `?`
+  and `#` on purpose while rejecting `-_~+%`, which really would continue the
+  filename.
+
+  Re-flag only if `extractDataPathTarget` starts preserving a query string.
+  (`crates/lucidos-app/src/utils/linkifyPaths.ts`.)
+
+- **A hyphenated word before a sub-tree name can match, and is left alone**
+  (2026-08-21). The prose boundary accepts `-`, so `foo-knowhow/a.md` offers
+  `knowhow/a.md` as a candidate. It looks like the `system-knowhow` prefix
+  being sliced in half.
+
+  `system-knowhow` itself is safe by construction: its match starts earlier, and
+  earliest-start wins in `resolveMatches`, so the inner `knowhow` is never
+  reached. What is left needs an English word hyphenated onto a sub-tree name
+  and a real filename after it. Rejecting `-` as a boundary would cost more than
+  that case is worth.
+
+  Re-flag with a case that reads as ordinary agent prose.
+  (`crates/lucidos-app/src/utils/linkifyPaths.ts`.)
+
+- **The waiting indicator naming MORE sub-threads than `activeChildrenCount` is
+  the honest direction, not an off-by-one.** `activeSubThreads`
+  (`components/chat/WaitingPanel.tsx`) resolves rows from `threadMap` and
+  subtracts only in one direction: a shortfall becomes an "and N more" row, and
+  a surplus is listed. Codex flagged the surplus as P2 on the branch that added
+  the panel, asking for the rows to be capped to the server's count.
+
+  A capped list would hide a child the rest of the UI draws as running, since
+  the drawer row reads the same `effectiveThreadStatus` this does. The cut would
+  also land on the newest child, which is the one that just started and the
+  reason the count is briefly behind. Every listed row is a real sub-thread of
+  this parent, mid-turn by the same predicate the engine uses
+  (`active_thread_statuses()`).
+
+  The asymmetry with the `count <= 0` early return is deliberate and is the
+  performance gate: the count decides WHETHER the thread is waiting on children,
+  the map only names them, and the prompt row re-renders on every `threadMap`
+  flush. Re-flag if a caller starts treating the row list as a counter, or if
+  the count becomes the fresher of the two.
+  (`crates/lucidos-app/src/components/chat/WaitingPanel.tsx`.)
+
+- **An e2e `afterEach` that restores global workspace state asserts on purpose,
+  even though a failed restore then reds a test whose body passed.** A reviewer
+  reads the `enableMobileHeaderSticky` teardown in the four specs that turn the
+  mobile header pin off. Seeing the helper's own `expect(res.ok())`, they
+  propose a quiet restore, so teardown can neither mask nor invent a verdict.
+
+  Quiet is the worse failure. `mobile_header_sticky` is a GLOBAL preference, and
+  the e2e database resets only between projects. A restore that fails in silence
+  hands live hide-on-scroll to every later spec in the project.
+
+  The 2026-08-24 nightly is what that costs: `trigger-groups` lost its Save. The
+  mousedown landed on the button and the mouseup on the wrapper, after the
+  header shifted the form. That reads as a product bug in a spec which never
+  touched the preference. A loud teardown names the real fault instead.
+
+  Re-flag if the preference becomes per-context rather than global, or if the
+  suite starts resetting the database between specs. Either would make a failed
+  restore harmless.
+  (`crates/lucidos-app/e2e/helpers.ts`.)
 
 ## Scripts (bash)
 
@@ -2541,3 +2831,145 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if `Superseded` stops implying a live continuing session, or if
   a third answer-less kind appears and needs sorting into the two groups.
   (`crates/lucidos-engine/src/engine/agent_question.rs`, ADR 0082.)
+
+- **`lucidos-eval` passes its database URL as a `psql` argument** (2026-08-18).
+  Looks like the `DATABASE_URL`-in-argv leak `.claude/rules/rust.md` bans, and
+  it is a different situation.
+
+  That rule is about the AGENT running `psql` through the Bash tool. The URL
+  then lands in the persisted tool-call payload the steps UI renders.
+  The eval harness is a binary spawning its own subprocess, so there is no
+  transcript. The base is an operator-supplied local dev credential, and it is
+  the only string that carries host, port and credentials for every arm.
+
+  Re-flag if the harness runs `psql` through an agent tool, or if the base
+  starts holding a credential that is not a local dev one.
+  (`crates/lucidos-eval/src/workspace.rs`.)
+
+- **A `CodingAgentToolResult` clears the event-wait park unconditionally, with
+  no `tool_use_id` match** (2026-08-19). Reads as too broad, because an
+  unrelated result would end the park while the wait's own call is pending. So
+  a reviewer reaches for matching the wait's id against the result's.
+
+  That match is not expressible. A wait a CODING agent arms comes through the
+  CLI route, which mints its own `cli-<uuid>` for `EventWaitStarted.tool_use_id`
+  (verified on a real thread). No `CodingAgentToolResult` ever carries that id,
+  so an id-gated arm never fires and the park never ends. The chat agent's
+  `await_event` does carry the model's id, and its result is a plain
+  `ToolResult`, which this arm does not touch.
+
+  What is left is honest. A coding-agent tool result means that subprocess is
+  alive and answering, which is the opposite of a parked turn. An abandoned park
+  produces none.
+
+  Re-flag if the CLI route starts recording the agent's own tool id, or if the
+  arm widens to the chat agent's `ToolResult`.
+  (`crates/lucidos-app/src/store/thread-events/exchange-render.ts`.)
+
+- **The 8-char short thread id keying a worktree directory is a system-wide
+  identifier, not something the diff endpoint chose** (2026-08-21). Codex
+  flagged it twice on the branch that taught `get_thread_cc_diff` to fall back
+  to `deterministic_worktree_path`: two thread uuids sharing a prefix resolve
+  to one directory, so one thread's diff could answer for the other.
+
+  The observation is right and the altitude is wrong. `SHORT_THREAD_ID_LEN` is
+  8 (`git_ops/worktree.rs`), and two consumers weigh more than this reader.
+  `resume::resolve_worktree_path` hands both colliding threads the same spawn
+  target, so they would share a worktree before anyone clicked Diff. And
+  `worktree_cleanup_ops::parse_thread_short` recovers a full uuid by prefix
+  lookup, then deletes what it resolved. A guard on the read side alone leaves
+  both, and makes the Diff button stricter than the thing that built the tree.
+
+  What the branch DID owe is the unknown-id case, which was new: an id naming
+  no thread reaching a real one's worktree, unscoped. That is closed by
+  `thread_owns_a_coding_agent_worktree`.
+
+  Re-flag if the residual case is raised against `short_thread_id` itself, with
+  the spawn and cleanup consumers in scope. A read-side-only guard is the fix
+  this entry rejects.
+  (`crates/lucidos-engine/src/api/repositories.rs`.)
+
+- **The classifier pin reaches an arm through the harness's own `boot_engine`
+  and not through the gateway's `spawn_engine`.** That is the harness topology,
+  not a gap in the pin. A reviewer notices that `arm_engine_env` sets
+  `LUCIDOS_FORCE_QUERY_CLASSIFICATION`, while
+  `lucidos_gateway::stack::spawn_engine` builds its own set through
+  `engine_env_overrides` and would spawn an unpinned engine.
+
+  It would, and nothing about the pin changes that. The harness boots each arm
+  itself, on the port the gateway registry already holds. The gateway therefore
+  adopts that engine on the first proxy hit, rather than spawning a second one
+  against the same database. A gateway spawn happens only if an arm engine has
+  died, and such an engine loses the arm's whole configuration rather than just
+  the pin: the harness's port, its resolved TLS pair, everything `boot_engine`
+  passes. The run is already invalid at that point, and the void that pinning
+  replaces is still in `analyse.rs` to catch the retrieval half of it.
+
+  Re-flag if the gateway gains a path that spawns an arm engine on a healthy
+  run, or if the harness stops booting its arms itself.
+  (`crates/lucidos-eval/src/workspace.rs`, `crates/lucidos-gateway/src/stack.rs`.)
+
+- **`DEVICE_ID_KEY` looks origin-global and is not.** A reviewer reads
+  `localStorage.getItem('lucidos-device-id')` and notes that the gateway serves
+  every workspace from one origin. The conclusion is that a migration guarded on
+  that value runs once per browser, skipping every workspace but the first.
+  Raised against the gateway device-identity adoption, where it would
+  have stranded each later workspace's push subscription and preferences.
+
+  It does not, because `installWorkspaceStorage` (`utils/workspaceStorage.ts`)
+  overrides `getItem`/`setItem`/`removeItem` on the `localStorage` instance and
+  prefixes every key with `ws:<slug>:`. `GLOBAL_KEYS` is the entire exemption
+  list and holds two picker keys. That file says the device id in as many words:
+  each workspace has its own device identity, deliberately. So the read is
+  per workspace, and the migration runs once per workspace.
+
+  Re-flag only if `lucidos-device-id` joins `GLOBAL_KEYS`, or if a caller reads
+  it through a realm that bypasses the override. That file's header enumerates
+  the three that do: the `index.html` FOUC IIFE, the engine-served
+  `sdk-prefs.js`, and the SDK's `_storage.ts`. A fourth fails the build, at
+  `no-raw-storage.test.ts`.
+  (`crates/lucidos-app/src/utils/workspaceStorage.ts`,
+  `crates/lucidos-app/src/utils/deviceIdHeader.ts`.)
+
+- **A *model selection* is saved as two preference writes, and that is not a
+  torn pair.** A reviewer reads `saveModelSelection`
+  (`store/actions/preferences.ts`) and sees `savePreference(modelKey, …)` then
+  `savePreference(reasoningKey, …)`. A network error between them leaves the
+  new model stored beside the old effort, so the stated pairing is broken.
+
+  The two writes really are sequential, and the pattern predates the helper:
+  `setCurrentModel` has saved `chat_model` then `chat_reasoning_effort` the same
+  way since the chat pair existed. What makes it survivable is that **neither
+  end trusts the stored pair**. The picker clamps for display
+  (`clampToOffered`), and `RoutingProvider::effort_for_model` clamps the request
+  at the wire. A stale effort is therefore a value nothing acts on. That is why
+  the pair is stored as two independent keys rather than one JSON value
+  (ADR 0107). The failed write also surfaces: `savePreference` toasts.
+
+  Re-flag if either clamp is removed, or if a caller starts reading the stored
+  effort without one. Re-flag too if `PUT /api/v1/preferences` grows a
+  multi-key write, which would make the pairing free.
+  (`crates/lucidos-app/src/store/actions/preferences.ts`,
+  `crates/lucidos-engine/src/llm/reasoning.rs`.)
+
+- **The Devices list and an actor chip may call one device different things,
+  and the list's name is the better one.** A reviewer reads
+  `deviceDisplayName` (`components/settings/deviceList.ts`) beside the engine's
+  `resolve_device_name` (`core/devices.rs`) and sees them diverge: for a device
+  with no typed name but a gateway pairing, the list shows the pairing label
+  and a chip shows `device-<first 8>`. Read as drift, that argues for dropping
+  the label so both surfaces agree.
+
+  Dropping it makes both surfaces worse. The pairing label is a name a person
+  chose on the device itself. The short id is a fallback for having no name at
+  all. The engine cannot reach the label: the paired-device store is a
+  machine-global file the *workspace gateway* owns, and the engine has no
+  handle on it. So agreement is only purchasable by showing the worse name
+  twice. The bottom rung DOES match, so an unnamed and unpaired device reads
+  the same everywhere.
+
+  Re-flag if the engine gains a way to read the pairing label, which would make
+  agreement free. Re-flag too if an engine row starts adopting that label as
+  its name at registration.
+  (`crates/lucidos-app/src/components/settings/deviceList.ts`,
+  `crates/lucidos-engine/src/core/devices.rs`.)

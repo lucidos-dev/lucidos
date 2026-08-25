@@ -57,6 +57,7 @@ fn emitted_event_carries_sequence_and_type() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
     assert_eq!(emitted.seq, Some(42));
     assert!(matches!(emitted.typed, BusEvent::Thread { .. }));
@@ -74,6 +75,7 @@ fn transient_events_have_no_sequence() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
     assert_eq!(emitted.seq, None);
 }
@@ -94,6 +96,7 @@ fn broadcast_channel_works() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
 
     let _ = tx.send(emitted);
@@ -162,6 +165,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -205,6 +209,7 @@ fn thread_event_sse_json_includes_meta_channel() {
             },
         },
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -239,6 +244,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -262,6 +268,7 @@ fn thread_event_sse_json_has_created() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -289,6 +296,7 @@ fn transient_event_sse_json_has_no_seq() {
             meta: EventMeta::NONE,
         },
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -319,6 +327,7 @@ fn system_notification_created_matches_server_event_shape() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -340,6 +349,7 @@ fn system_preferences_changed_matches_server_event_shape() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -361,6 +371,7 @@ fn system_changes_updated_matches_server_event_shape() {
             restart_required: false,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -381,6 +392,7 @@ fn system_memory_rebuild_progress_matches_server_event_shape() {
             percent: 50,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -411,6 +423,7 @@ fn embedding_model_status_event_matches_the_rest_snapshot() {
             load_state: status.load_state.clone(),
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -479,6 +492,7 @@ fn system_backup_progress_matches_server_event_shape() {
             total: 10,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -499,6 +513,7 @@ fn system_backup_completed_matches_server_event_shape() {
             finished_at: Utc::now(),
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -534,6 +549,7 @@ fn system_backup_failed_matches_server_event_shape() {
             finished_at: Utc::now(),
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -575,6 +591,7 @@ fn domain_event_sse_json_uses_inner_event_type() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -772,6 +789,16 @@ fn reserved_type_names_match_event_type() {
         ProxyModulesReloaded {
             count: 0,
             names: vec![],
+            actor: None,
+        },
+        PermissionGrantsChanged {
+            grant_file: crate::core::GrantFile::CodingAgentTools,
+            patterns: vec!["Bash(git:*)".into()],
+            actor: None,
+        },
+        CredentialRevealed {
+            service_name: "anthropic".into(),
+            auth_type: "api_key".into(),
             actor: None,
         },
     ];

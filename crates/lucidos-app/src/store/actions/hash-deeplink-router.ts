@@ -1,7 +1,10 @@
 /** Route whatever's in `window.location.hash` to the right handler, then strip
  *  the consumed state so a refresh doesn't re-fire.
  *
- *  Two channels coexist in the hash:
+ *  Three channels coexist in the hash:
+ *  - Bare `#notifications` (cross-workspace landing channel, see
+ *    `openWorkspaceNotifications`) → the notifications view. Matched FIRST,
+ *    because `notification` is a prefix of it.
  *  - Bare `#thread=<uuid>` (cross-workspace landing channel — see
  *    `openThreadInWorkspace`) → focusThreadOrBootstrap.
  *  - `#notification=…&thread=…&event=…&tap=…` (Safari's declarative-push
@@ -23,6 +26,7 @@
  *  `landThreadHash`), so it holds an in-flight guard for the same purpose while
  *  its hash is still in the URL. */
 import { focusThreadOrBootstrapResult } from './threads';
+import { switchMenuItem } from './menu';
 import { THREAD_HASH_RE } from './cross-workspace';
 import {
   parseDeepLinkFromUrl,
@@ -106,7 +110,27 @@ async function landThreadHash(threadId: string): Promise<void> {
   }
 }
 
+/** The bare cross-workspace NOTIFICATIONS landing channel, written by
+ *  `openWorkspaceNotifications` when a Lucidos-menu row points at a peer.
+ *
+ *  ANCHORED, and that is load-bearing rather than tidy. `notification` is a
+ *  prefix of `notifications`, so a loose match would also swallow
+ *  `#notification=<uuid>`, the push-tap channel parsed below. An iOS push tap
+ *  would then open the inbox list instead of the notification it was raised
+ *  for. */
+const NOTIFICATIONS_HASH_RE = /^#notifications$/;
+
 export function handleHashLocation(): void {
+  // Checked BEFORE the deep-link parse, for the prefix reason above.
+  if (NOTIFICATIONS_HASH_RE.test(window.location.hash)) {
+    postClientLog('deeplink', 'route_notifications_hash', {});
+    // No retry loop, unlike the thread landing under it. There is no row to
+    // fetch, and `NotificationsView` owns its own `Loadable` states, so the
+    // switch cannot lose a race with a lazy-starting engine.
+    switchMenuItem('notifications');
+    stripConsumedHash();
+    return;
+  }
   const hashMatch = THREAD_HASH_RE.exec(window.location.hash);
   if (hashMatch) {
     if (landingThreadId === hashMatch[1]) return; // already landing this one

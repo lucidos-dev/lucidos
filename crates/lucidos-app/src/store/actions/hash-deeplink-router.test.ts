@@ -85,10 +85,17 @@ type Outcome = { kind: 'focused' } | { kind: 'not-found' } | { kind: 'failed'; e
 const focusThreadOrBootstrapResult = vi.fn<(id: string) => Promise<Outcome>>();
 const dispatchDeepLink = vi.fn();
 const showToast = vi.fn();
+const switchMenuItem = vi.fn();
 
 vi.mock('./threads', () => ({
   focusThreadOrBootstrapResult: (...args: [string]) => focusThreadOrBootstrapResult(...args),
 }));
+// Partial, for the reason the store mock below is: the router's siblings pull
+// other exports of this module in transitively.
+vi.mock('./menu', async () => {
+  const actual = await vi.importActual<typeof import('./menu')>('./menu');
+  return { ...actual, switchMenuItem: (...args: unknown[]) => switchMenuItem(...args) };
+});
 vi.mock('./in-app-notification-toast', () => ({ dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args) }));
 // Partial store mock: only the toast is stubbed. A narrow stub would break the
 // modules that pull other store exports in transitively (wipPreview reads
@@ -132,11 +139,56 @@ describe('hash-deeplink-router', () => {
     focusThreadOrBootstrapResult.mockResolvedValue({ kind: 'focused' });
     dispatchDeepLink.mockClear();
     showToast.mockClear();
+    switchMenuItem.mockClear();
     documentListeners.clear();
     windowListeners.clear();
     visibilityValue = 'visible';
     setUrl('http://localhost/');
     _resetThreadHashLandingForTesting();
+  });
+
+  // The third hash channel, written by `openWorkspaceNotifications` when a
+  // Lucidos-menu notifications row points at another workspace.
+  describe('the bare #notifications landing channel', () => {
+    it('lands on the notifications view and consumes the hash', () => {
+      setUrl('http://localhost/dev/#notifications');
+      handleHashLocation();
+      expect(switchMenuItem).toHaveBeenCalledWith('notifications');
+      expect(currentUrl.value, 'the consumed hash must be stripped')
+        .toBe('http://localhost/dev/');
+      // Not a deep link: there is no notification id to open.
+      expect(dispatchDeepLink).not.toHaveBeenCalled();
+    });
+
+    it('does not re-fire on a resume once consumed', () => {
+      setUrl('http://localhost/dev/#notifications');
+      handleHashLocation();
+      handleHashLocation();
+      expect(switchMenuItem).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT swallow the push-tap channel, whose key it is a prefix of', () => {
+      // `notification` is a prefix of `notifications`. A loose match sends an
+      // iOS push tap to the inbox list, instead of to the notification it was
+      // raised for. That is why the pattern is anchored.
+      setUrl(`http://localhost/${buildNavigateHash()}`);
+      handleHashLocation();
+      expect(switchMenuItem).not.toHaveBeenCalled();
+      expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT swallow the cross-workspace thread channel', () => {
+      setUrl(`http://localhost/#thread=${THREAD_ID}`);
+      handleHashLocation();
+      expect(switchMenuItem).not.toHaveBeenCalled();
+      expect(focusThreadOrBootstrapResult).toHaveBeenCalledWith(THREAD_ID);
+    });
+
+    it('ignores a hash that merely starts with the word', () => {
+      setUrl('http://localhost/#notifications-and-more');
+      handleHashLocation();
+      expect(switchMenuItem).not.toHaveBeenCalled();
+    });
   });
 
   describe('handleHashLocation', () => {

@@ -5,15 +5,18 @@ mod artifacts;
 pub(crate) mod backup;
 pub(crate) mod base_path;
 mod blobs;
+pub(crate) mod browser_origin;
 mod changes;
 pub(crate) mod chat;
 mod claude_code;
 mod command_checkpoint;
 mod command_permission;
+pub(crate) mod credential_reveal;
 mod data_api;
 pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
+mod file_response;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
 pub(crate) mod hex;
@@ -56,6 +59,7 @@ mod threads;
 mod threads_compose;
 mod trigger_groups;
 mod triggers;
+mod webhooks;
 mod workspace_label;
 
 use axum::{
@@ -80,6 +84,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tower::ServiceExt;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -89,7 +94,7 @@ use uuid::Uuid;
 use crate::core::oauth::OAuthFlowResult;
 use crate::core::{
     AppManager, ArtifactManager, ConversationSnapshot, CredentialInfo, EventStore, Model,
-    OAuthAccountInfo, SessionMessage, Step,
+    OAuthAccountInfo, SessionMessage,
 };
 use crate::engine::{CaptureResult, LucidosEngine};
 use crate::memory::{EmbedderSlot, PgVectorIndex};
@@ -198,6 +203,9 @@ pub struct AppState {
     /// Pending OAuth flows keyed by provider — the receiver resolves when the
     /// background listener receives the callback and completes token exchange.
     pub pending_oauth_flows: PendingOAuthFlows,
+    /// Live one-shot credential-reveal tokens. Ephemeral by design; see
+    /// `api::credential_reveal`.
+    pub reveal_tokens: credential_reveal::RevealTokens,
 }
 
 /// App context sent when an app UI is open — tells the LLM which app is active.
@@ -480,12 +488,6 @@ pub struct ChatRequest {
     pub title: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct ChatResponse {
-    pub response: String,
-    pub steps: Vec<Step>,
-}
-
 /// Body of `POST /api/v1/chat/cancel` and the default (Stop) mode of
 /// `POST /api/v1/claude-code/stop`. `canceled = true` when the call canceled
 /// live work, settled a stuck `running` projection, or cancel-stamped a pending
@@ -617,7 +619,8 @@ pub struct CreateModelRequest {
     #[serde(default)]
     pub label: String,
     /// Backend that serves the model: "vertex" | "anthropic" | "openai" |
-    /// "openrouter" | "xai" | "local". Validated by `settings::valid_provider`.
+    /// "openrouter" | "xai" | "opencode-free" | "local". Validated by
+    /// `settings::valid_provider`.
     pub provider: String,
     /// Display order; omitted user models sort after the builtins.
     #[serde(default)]
@@ -695,6 +698,13 @@ pub struct ApiResult {
     /// just wrote. Trigger create / update only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron_preview: Option<CronPreview>,
+    /// Non-fatal notes about the write that just succeeded. Today: an event
+    /// type in a trigger's `on` list that this workspace has never emitted.
+    ///
+    /// Separate from `cron_preview.warnings`, which is about the schedule. A
+    /// trigger with no cron has no preview to hang these on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
 }
 
 impl ApiResult {
@@ -704,11 +714,16 @@ impl ApiResult {
             ..Default::default()
         })
     }
-    /// Success, carrying the cron read-back the caller should surface.
-    fn ok_with_cron_preview(preview: CronPreview) -> Json<Self> {
+    /// Success for a trigger write, carrying both read-backs the caller should
+    /// surface: the cron preview, and any event-type warnings.
+    ///
+    /// One constructor rather than two, so an update that only rewrote the
+    /// `on:` list cannot drop its warnings for want of a cron preview.
+    fn ok_for_trigger(preview: Option<CronPreview>, warnings: Vec<String>) -> Json<Self> {
         Json(Self {
             success: true,
-            cron_preview: Some(preview),
+            cron_preview: preview,
+            warnings: (!warnings.is_empty()).then_some(warnings),
             ..Default::default()
         })
     }
@@ -789,6 +804,17 @@ pub struct DeviceRenameRequest {
 #[derive(Deserialize)]
 pub struct DevicePushRequest {
     pub push_enabled: bool,
+}
+
+/// Claim that this caller used to be `old_device_id`.
+///
+/// `device_id` is where it is now. The client sends both because it is the only
+/// party that can see both at once, for the one page load that spans the
+/// change. See `core::devices::DeviceStore::hand_over`.
+#[derive(Deserialize)]
+pub struct DeviceHandOverRequest {
+    pub old_device_id: String,
+    pub device_id: String,
 }
 
 #[derive(Serialize)]
@@ -1039,6 +1065,16 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
     }
 }
 
+/// Startup gate for `data/config/apis.json`: `Err` means do not boot.
+///
+/// The proxy routes re-read the file per request, so this call adds no
+/// authority. What it adds is timing. A refused entry surfaces once in the
+/// startup log, naming the provider and the value. Otherwise it surfaces as a
+/// 500, on whichever proxy somebody reaches for first.
+pub fn validate_proxy_config(workspace_path: &std::path::Path) -> Result<(), String> {
+    proxy::load_proxy_config(workspace_path).map(|_| ())
+}
+
 // Top-level wiring helper that takes every engine subsystem the router needs;
 // reducing it would force the call site to thread the same set into a holder.
 #[allow(clippy::too_many_arguments)]
@@ -1088,10 +1124,13 @@ pub fn create_router(
         scheduler,
         started_at,
         pending_oauth_flows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        reveal_tokens: credential_reveal::RevealTokens::new(),
     };
 
-    // Serve static files from data/ tree — single mount covers all subdirectories
-    let serve_data = ServeDir::new(workspace_path.join(crate::core::DATA_DIR));
+    // Serve static files from the data/ tree. One mount covers every
+    // subdirectory, gated by the same read allowlist `GET /api/v1/data/*path`
+    // applies. See `data_api::serve_workspace_data`.
+    let serve_data = data_api::static_mount(workspace_path.join(crate::core::DATA_DIR));
 
     // Clone for the top-level app-UI router; the /api/v1 router below
     // consumes `state` directly.
@@ -1120,6 +1159,7 @@ pub fn create_router(
         .merge(notifications::router())
         .merge(artifacts::router())
         .merge(settings::router())
+        .merge(credential_reveal::router())
         .merge(triggers::router())
         .merge(trigger_groups::router())
         .merge(thread_queue::router())
@@ -1144,6 +1184,7 @@ pub fn create_router(
         .merge(data_api::router())
         .merge(blobs::router())
         .merge(plugins::router())
+        .merge(webhooks::router())
         .merge(workspace_label::router())
         .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
@@ -1161,7 +1202,9 @@ pub fn create_router(
         // `text/event-stream` (the plain SSE path) and skips responses that
         // already carry `content-encoding` (the hand-rolled gzipped SSE in
         // `history.rs`), so the existing streaming transport is unchanged.
-        .layer(CompressionLayer::new())
+        // `compression_predicate` extends it to leave media alone, which is what
+        // keeps `Accept-Ranges` on a data-file response.
+        .layer(CompressionLayer::new().compress_when(compression_predicate()))
         // Refuse a request that named a DIFFERENT workspace than this engine
         // serves (409). Layered here rather than per-handler because a
         // mis-aimed write is a hazard on every mutating endpoint, and a
@@ -1174,6 +1217,24 @@ pub fn create_router(
             target_workspace::enforce_target_workspace,
         ))
         .with_state(state);
+
+    // Refuse a browser request that came from another origin (403), in front of
+    // everything. An engine binds loopback, so its remaining browser-shaped
+    // exposure is a page on some other origin driving this port out of the
+    // user's own browser. Layered last, which makes it OUTERMOST, so it runs
+    // before routing and before any handler resolves a credential.
+    //
+    // `LUCIDOS_PERMISSIVE_CORS` skips it: that variable already declares this
+    // deployment wants cross-origin browser access, and a gate refusing exactly
+    // what the CORS layer below allows would answer to nobody. `/proxy/*` keeps
+    // its own copy of the check for that case, since a credentialed route must
+    // refuse even then. See `api::browser_origin`.
+    let api_routes = if permissive_cors_enabled() {
+        crate::log!("[API] permissive CORS is on, so the same-origin gate is off with it");
+        api_routes
+    } else {
+        api_routes.layer(axum::middleware::from_fn(browser_origin::enforce))
+    };
 
     let router = Router::new()
         .nest("/api/v1", api_routes)
@@ -1220,6 +1281,29 @@ pub fn create_router(
     }
 }
 
+/// Compress text-shaped payloads only. Already-compressed media gains nothing
+/// and loses two headers it needs.
+///
+/// tower-http strips `Accept-Ranges` from every response it compresses, and
+/// drops `Content-Length` with it. So compressing a video is on its own enough
+/// to stop a `<video>` element seeking, however the handler answers. A `206` is
+/// already safe, since tower-http never compresses a response carrying
+/// `Content-Range`; the full `200` is the exposure. Curl hides this, because it
+/// sends no `accept-encoding` unless asked; every browser does.
+///
+/// `DefaultPredicate` covers `image/`, gRPC and SSE. Added here: video and audio
+/// (both are compressed containers, and both want seeking), woff/woff2 (already
+/// deflated), and the archive types.
+fn compression_predicate() -> impl Predicate {
+    DefaultPredicate::new()
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new("font/"))
+        .and(NotForContentType::const_new("application/pdf"))
+        .and(NotForContentType::const_new("application/zip"))
+        .and(NotForContentType::const_new("application/gzip"))
+}
+
 fn permissive_cors_enabled() -> bool {
     permissive_cors_enabled_value(std::env::var("LUCIDOS_PERMISSIVE_CORS").ok().as_deref())
 }
@@ -1247,6 +1331,45 @@ mod tests {
         ChatImage {
             base64: base64_data,
             mime_type: "image/png".to_string(),
+        }
+    }
+
+    /// Compressing a media response would strip `Accept-Ranges`, so the
+    /// exclusion list is what makes the data route seekable in a browser.
+    #[test]
+    fn compression_skips_media_and_still_covers_json() {
+        // Above `SizeAbove`'s 32-byte floor, so content type is what decides.
+        let probe = |content_type: &str| {
+            let body = axum::body::Body::from(vec![b'x'; 4096]);
+            let response = Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, "4096")
+                .body(body)
+                .unwrap();
+            compression_predicate().should_compress(&response)
+        };
+
+        for compressible in [
+            "application/json",
+            "text/plain",
+            "text/html",
+            "application/javascript",
+            "image/svg+xml",
+        ] {
+            assert!(probe(compressible), "{compressible} should compress");
+        }
+        for skipped in [
+            "video/mp4",
+            "video/webm",
+            "audio/mpeg",
+            "audio/wav",
+            "font/woff2",
+            "application/pdf",
+            "application/zip",
+            "application/gzip",
+            "image/png",
+        ] {
+            assert!(!probe(skipped), "{skipped} should not compress");
         }
     }
 

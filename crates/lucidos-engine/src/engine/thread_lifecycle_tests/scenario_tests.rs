@@ -144,6 +144,8 @@ fn all_scenarios_pass() {
                     has_pending_changes,
                     false, // descendants_block_archive: the cross-validation contract exhausts
                     // this axis; this scenario file covers no-blocking-descendants only
+                    false, // has_live_event_waits: no scenario parks on a subscription
+                    false, // has_active_children: no scenario spawns one
                     false, // has_unsent_draft: scenarios predate the draft layer
                     false, // is_saved: scenarios assert the close set only
                 );

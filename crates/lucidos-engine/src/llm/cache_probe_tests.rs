@@ -29,6 +29,7 @@ fn message(role: &str, content: serde_json::Value) -> ClaudeMessage {
     ClaudeMessage {
         role: role.into(),
         content,
+        cache_anchor: None,
     }
 }
 
@@ -105,9 +106,9 @@ fn identical_requests_produce_an_identical_line() {
 
 #[test]
 fn reordering_tools_changes_the_hash_and_not_the_byte_count() {
-    // The exact shape a `char_count` comparison cannot see, and the reason the
-    // probe hashes bytes instead of counting them. Same tools, same total
-    // size, different prefix, so the cache lookup cannot match.
+    // The exact shape a size comparison cannot see, and the reason the probe
+    // hashes bytes instead of counting them. Same tools, same total size,
+    // different prefix, so the cache lookup cannot match.
     let forward = line(&request(
         vec![
             tool("read_file", "read a file"),

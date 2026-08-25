@@ -3,7 +3,7 @@ import { useRef, useLayoutEffect } from 'preact/hooks';
 import { toasts, dismissToast, focusedPane, speedMultiplier, splitRatio, toastPlacement } from '../../store/store';
 import type { ToastItem, ToastType } from '../../store/types';
 import { CloseIcon } from './icons';
-import { parseToastMessage } from './toastMessage';
+import { parseToastMessage, type ParsedToastMessage } from './toastMessage';
 import { linkifyText } from './linkifyText';
 import { toastAutofocusTarget, toastTabTarget } from './toastFocus';
 import { computeToastShifts } from './toastReflow';
@@ -122,23 +122,17 @@ function handleToastKeyDown(e: KeyboardEvent): void {
   }
 }
 
-function renderMessage(message: string) {
-  if (!message.includes('\n')) return linkifyText(message);
-  const { heading, sections } = parseToastMessage(message);
+/** One titled group of bullets, as `parseToastMessage` hands it over. */
+function renderSection(s: ParsedToastMessage['sections'][number], i: number) {
   return (
-    <>
-      {linkifyText(heading)}
-      {sections.map((s, i) => (
-        <div key={i} class="toast-section">
-          {s.title && <div class="toast-section-title">{linkifyText(s.title)}</div>}
-          {s.bullets.length > 0 && (
-            <ul class="toast-bullets">
-              {s.bullets.map((b, j) => <li key={j}>{linkifyText(b)}</li>)}
-            </ul>
-          )}
-        </div>
-      ))}
-    </>
+    <div key={i} class="toast-section">
+      {s.title && <div class="toast-section-title">{linkifyText(s.title)}</div>}
+      {s.bullets.length > 0 && (
+        <ul class="toast-bullets">
+          {s.bullets.map((b, j) => <li key={j}>{linkifyText(b)}</li>)}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -257,20 +251,44 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
 }
 
 /** One toast row. A plain function rather than a component so the surrounding
- *  `ToastList` stays hook-free and directly callable from unit tests. */
+ *  `ToastList` stays hook-free and directly callable from unit tests.
+ *
+ *  The message is mounted in two boxes, and that split IS the layout. Line 1
+ *  goes in the heading, outside the scroll box, so a scroll to the last bullet
+ *  still shows what the toast is about. The sections box below can then run to
+ *  the card's right edge, where the close X is not. See the `.toast-heading`
+ *  and `.toast-sections` rules in components.css.
+ *
+ *  `parseToastMessage` answers `{heading: message, sections: []}` for a message
+ *  with no newline, so a plain toast needs no branch: it is all heading. */
 function renderToast(t: ToastItem, entryDurationMs: number) {
   const autoTarget = toastAutofocusTarget(t);
+  const { heading, sections } = parseToastMessage(t.message);
   return (
     <div key={t.id} class={`toast toast-${t.type}`} style={{ animationDuration: `${entryDurationMs}ms` }} data-toast-id={t.id}>
-      <div class="toast-body">
-        {t.spinning
-          ? <span class="mini-spinner toast-icon" />
-          : <svg class="toast-icon" viewBox="0 0 24 24" dangerouslySetInnerHTML={{ __html: icons[t.type] }} />
-        }
-        <span
-          class={`toast-message${t.onClick ? ' toast-clickable' : ''}`}
-          onClick={t.onClick}
-        >{renderMessage(t.message)}</span>
+      {/* The icon is the body's SIBLING, positioned over the gutter the body
+          pads out for it. Out of the flow it can never sit inside a scroll box,
+          which is what used to shear the spinning one. */}
+      {t.spinning
+        ? <span class="mini-spinner toast-icon" />
+        : <svg class="toast-icon" viewBox="0 0 24 24" dangerouslySetInnerHTML={{ __html: icons[t.type] }} />
+      }
+      <div
+        class={`toast-body${t.onClick ? ' toast-clickable' : ''}`}
+        onClick={t.onClick}
+      >
+        {/* `tabIndex={-1}` on both scroll boxes, so Chrome leaves them out of
+            the Tab order. It promotes an overflowing scroller with no focusable
+            child to a Tab stop, and a toast that grew past the cap has two of
+            them. `handleToastKeyDown` above is the toast's whole keyboard
+            contract and knows only buttons and links, so each promoted box was
+            a stop it could not name, wearing the browser's default ring around
+            the message text. Losing the stop costs nothing: a click already
+            blurred whatever held focus, and the buttons are unaffected. */}
+        <div class="toast-heading" tabIndex={-1}>{linkifyText(heading)}</div>
+        {sections.length > 0 && (
+          <div class="toast-sections" tabIndex={-1}>{sections.map(renderSection)}</div>
+        )}
       </div>
       {/* Determinate progress for a long operation (a packaged update's
           download). Absent when the operation has no honest percentage: the

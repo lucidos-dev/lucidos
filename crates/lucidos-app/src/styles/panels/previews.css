@@ -186,8 +186,70 @@
 .file-editor-toolbar {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
     flex-shrink: 0;
+}
+
+/* The buttons form one positioned cluster, and the point of it is that the
+   primary button never moves. This box takes Cancel OUT OF FLOW, so the cluster
+   is exactly as wide as the primary button. Cancel then arrives and leaves by
+   fading in place, and a save cannot reflow the row the user just clicked in. */
+.file-editor-actions {
+    position: relative;
+    display: flex;
+}
+
+/* Inert is instant; looking inert waits for the delay gate. A save goes out and
+   both buttons are `disabled` on that same frame, so nobody can hit Cancel on a
+   write already on the wire. Wearing `.action-btn:disabled`'s dim that early is
+   what the user saw as a flash, since the save is usually done in tens of
+   milliseconds. `.is-saving` arrives with the Saving… label and brings the dim
+   with it.
+
+   Harmless for the shut Cancel button, which is also disabled: the slot around
+   it carries that state's opacity, not the button. */
+.file-editor-actions:not(.is-saving) .action-btn:disabled {
+    opacity: 1;
+}
+
+/* EditorToolbar mounts Cancel in both states; this class shuts it rather than
+   unmounting it. See EditorToolbar for why a rebuilt row cannot animate.
+
+   The wrapper carries the fade, not the button. `.action-btn:disabled` sets an
+   opacity of its own and outranks a single class on the same element, and two
+   elements' opacities multiply with no cascade to lose. `visibility` rides the
+   same transition, which takes a shut slot out of the accessibility tree. It
+   flips late on the way out, since any value between the two counts as
+   visible, so nothing cuts the fade short. */
+.file-editor-cancel-slot {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    margin-right: 0.5rem;
+    display: flex;
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity var(--duration-normal) ease,
+        visibility var(--duration-normal);
+}
+
+.file-editor-cancel-slot.is-open {
+    opacity: 1;
+    visibility: visible;
+}
+
+/* Hold the primary button at its widest label, so the row does not jitter as
+   Save becomes Saving… and then Close. `.send-cancel-morph` carries a reserve
+   for the same reason.
+
+   `ch` is the width of a "0" in the button's OWN font, so this follows the
+   user's font preference instead of pinning a pixel count measured against one
+   of them. Half a character over the 7 in "Saving…", since an ellipsis is
+   wider than a digit in the default face. It sits on the label rather than the
+   button, so it need not restate `.action-btn`'s padding. */
+.file-editor-primary-label {
+    display: inline-block;
+    min-width: 7.5ch;
 }
 
 .file-editor-textarea {
@@ -209,10 +271,6 @@
 
 .file-editor-textarea:focus {
     border-color: var(--accent);
-}
-
-.file-editor-textarea:disabled {
-    opacity: 0.6;
 }
 
 /* --- Slides preview (.slides files) --- */

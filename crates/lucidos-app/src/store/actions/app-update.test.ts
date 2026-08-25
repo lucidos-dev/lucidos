@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
 import type { AppUpdateProgress, AppUpdateRunning } from '../../utils/tauri';
+import type { ReleaseCheck, ReleaseOffer } from '../../api/client/control';
 // The real copy module, not a mock: these tests are about what the user reads,
 // and it is pure, so there is nothing to stub.
 import { appUpdateNarration, appUpdateDialogState } from '../progressDialogCopy';
@@ -12,8 +15,30 @@ const mocks = vi.hoisted(() => ({
   listen: vi.fn(),
   showToast: vi.fn(),
   removeToast: vi.fn(),
+  openWhatsNew: vi.fn(),
   openSettingsSubview: vi.fn(),
+  requestUpdateCheck: vi.fn(),
 }));
+
+/** What the gateway's `release_check` object looks like. Defaults describe an
+ *  installed deployment with the notice acknowledged and nothing published. */
+function releaseCheckOf(
+  latest: Partial<ReleaseOffer> | null = null,
+  over: Partial<ReleaseCheck> = {},
+): ReleaseCheck {
+  return {
+    enabled: true,
+    notice_acknowledged: true,
+    supported: true,
+    current_version: '1.2.3',
+    checked_at: '2026-08-23T10:00:00Z',
+    last_error: null,
+    latest: latest
+      ? { version: '9.9.9', notes: null, install: null, command: null, ...latest }
+      : null,
+    ...over,
+  };
+}
 
 // The persistent Settings → System surface reads these, so the tests assert on
 // the values that page would actually render. A `.value` box is all the action
@@ -24,6 +49,7 @@ const storeSignals = vi.hoisted(() => ({
   latestTauriAppNotes: { value: null as string | null },
   appUpdateCheckError: { value: null as string | null },
   appUpdateProgress: { value: null as AppUpdateProgress | null },
+  releaseCheck: { value: null as ReleaseCheck | null },
 }));
 
 /** What `check_app_update` resolves to. Notes default to absent, which is the
@@ -37,7 +63,11 @@ vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
 // the menu action's own tests. Mocked rather than left real because pulling the
 // real module in would drag the whole store graph through this file's partial
 // `../store` mock.
-vi.mock('./menu', () => ({ openSettingsSubview: mocks.openSettingsSubview }));
+vi.mock('./menu', () => ({
+  openWhatsNew: mocks.openWhatsNew,
+  openSettingsSubview: mocks.openSettingsSubview,
+}));
+vi.mock('../../api/client/control', () => ({ requestUpdateCheck: mocks.requestUpdateCheck }));
 vi.mock('../../utils/tauri', () => ({
   checkAppUpdate: mocks.checkAppUpdate,
   installAppUpdateAndRestart: mocks.installAppUpdateAndRestart,
@@ -52,26 +82,24 @@ vi.mock('../store', () => ({
   latestTauriAppNotes: storeSignals.latestTauriAppNotes,
   appUpdateCheckError: storeSignals.appUpdateCheckError,
   appUpdateProgress: storeSignals.appUpdateProgress,
+  releaseCheck: storeSignals.releaseCheck,
 }));
 
 const {
-  checkForAppUpdate,
+  canInstallUpdateHere,
+  checkAppUpdateViaClient,
   installAppUpdate,
-  recheckAppUpdateOnResume,
-  startAppUpdateChecks,
-  stopAppUpdateChecks,
+  packagedUpdateVersion,
+  refreshReleaseCheck,
+  startAppUpdateProgress,
+  stopAppUpdateProgress,
 } = await import('./app-update');
 
-/** Mirrors `APP_UPDATE_RESUME_MIN_INTERVAL_MS` in the module under test. Kept as
- *  a literal rather than exported: the constant is an internal tuning knob, and a
- *  test that reads it back could not fail if it were changed by accident. */
-const RESUME_THROTTLE_MS = 5 * 60 * 1000;
-
 /** Push a frame through the REAL subscription wiring — the handler is whatever
- *  `startAppUpdateChecks` registered, so these tests exercise the actual path an
- *  event takes rather than a private function called directly. */
+ *  `startAppUpdateProgress` registered, so these tests exercise the actual path
+ *  an event takes rather than a private function called directly. */
 let emitProgress: (frame: AppUpdateProgress) => void = () => {
-  throw new Error('startAppUpdateChecks() must run before a frame can be emitted');
+  throw new Error('startAppUpdateProgress() must run before a frame can be emitted');
 };
 
 /** The options of the most recent `showToast` call. */
@@ -93,7 +121,10 @@ beforeEach(() => {
   mocks.cancelAppUpdate.mockResolvedValue(undefined);
   mocks.showToast.mockReset();
   mocks.removeToast.mockReset();
+  mocks.openWhatsNew.mockReset();
   mocks.openSettingsSubview.mockReset();
+  mocks.requestUpdateCheck.mockReset();
+  mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
   mocks.listen.mockReset();
   mocks.listen.mockImplementation((_event: string, handler: (e: { payload: AppUpdateProgress }) => void) => {
     emitProgress = (frame) => handler({ payload: frame });
@@ -103,13 +134,14 @@ beforeEach(() => {
   storeSignals.latestTauriAppNotes.value = null;
   storeSignals.appUpdateCheckError.value = null;
   storeSignals.appUpdateProgress.value = null;
+  storeSignals.releaseCheck.value = null;
 });
 
 afterEach(() => {
-  // Drops the interval AND the progress subscription, so the next test's
-  // `startAppUpdateChecks` registers a fresh handler instead of being skipped by
-  // the idempotence guard.
-  stopAppUpdateChecks();
+  // Drops the progress subscription, so the next test's
+  // `startAppUpdateProgress` registers a fresh handler instead of being skipped
+  // by the idempotence guard.
+  stopAppUpdateProgress();
   vi.restoreAllMocks();
 });
 
@@ -230,7 +262,7 @@ describe('update progress narration', () => {
   });
 
   it('records a determinate frame, which the dialog paints as a bar', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 50, total: 200 });
     const dialog = dialogNow();
     expect(dialog.message).toContain('Downloading Lucidos 2026.7.30');
@@ -239,7 +271,7 @@ describe('update progress narration', () => {
   });
 
   it('raises no toast for a running frame, and clears the offer behind it', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 50, total: 200 });
     expect(mocks.showToast).not.toHaveBeenCalled();
     // The offer would otherwise sit behind the modal, inviting a second click on
@@ -248,7 +280,7 @@ describe('update progress narration', () => {
   });
 
   it('drops the cancel affordance once the run has committed', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'installing' });
     const dialog = dialogNow();
     expect(dialog.cancel).toBeUndefined();
@@ -258,7 +290,7 @@ describe('update progress narration', () => {
   // A failure must end the run AND say why — this one runs on a click, so the
   // best-effort console.warn carve-out does not apply.
   it('reports a failure with its reason and leaves nothing spinning', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
     emitProgress({ version: '2026.7.30', phase: 'failed', message: 'signature mismatch' });
     const { message, type, opts } = lastToast();
@@ -272,7 +304,7 @@ describe('update progress narration', () => {
   // which is NOT the same as an update that failed: there is nothing left to
   // retry against, and the message already carries the reinstall instruction.
   it('shows a bundle-swap failure verbatim, with no "Update failed" prefix', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'installing' });
     emitProgress({
       version: '2026.7.30',
@@ -292,7 +324,7 @@ describe('update progress narration', () => {
   // bundle must not, because clicking "Update & restart" again would download
   // and install into a location with no app in it.
   it('does not re-offer the update after a bundle-swap failure', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'installing' });
     emitProgress({ version: '2026.7.30', phase: 'bundle-swap-failed', message: 'gone' });
     expect(lastToast().opts.action).toBeUndefined();
@@ -301,7 +333,7 @@ describe('update progress narration', () => {
   // Nothing was written to disk, so the update is still there to install —
   // leaving the user with no affordance would strand them until the next poll.
   it('re-offers the update after a cancel', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
     emitProgress({ version: '2026.7.30', phase: 'cancelled' });
     const { message, opts } = lastToast();
@@ -311,7 +343,7 @@ describe('update progress narration', () => {
   });
 
   it('keeps one surface for the whole run, whatever the phase', () => {
-    startAppUpdateChecks();
+    startAppUpdateProgress();
     emitProgress({ version: '2026.7.30', phase: 'checking' });
     emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
     emitProgress({ version: '2026.7.30', phase: 'installing' });
@@ -336,37 +368,37 @@ describe('update progress narration', () => {
   // behind the dialog narrating the run it is offering.
   it('does not let the periodic check clobber a live run', async () => {
     storeSignals.appUpdateProgress.value = { version: '2026.7.30', phase: 'installing' };
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   it('subscribes once however many times the workspace remounts', () => {
-    startAppUpdateChecks();
-    startAppUpdateChecks();
-    startAppUpdateChecks();
+    startAppUpdateProgress();
+    startAppUpdateProgress();
+    startAppUpdateProgress();
     expect(mocks.listen).toHaveBeenCalledTimes(1);
   });
 });
 
-describe('checkForAppUpdate', () => {
+describe('checkAppUpdateViaClient', () => {
   it('is a no-op outside the Tauri client (browser / PWA / dev)', async () => {
     mocks.isTauri.mockReturnValue(false);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   it('shows no toast when there is no update', async () => {
     mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
   it('surfaces the in-app "Update & restart" toast when an update is available', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.showToast).toHaveBeenCalledTimes(1);
     const [message, type, opts] = mocks.showToast.mock.calls[0];
     expect(message).toContain('2026.6.25');
@@ -378,7 +410,7 @@ describe('checkForAppUpdate', () => {
   it('clicking the toast action installs the update + restarts the stack', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
     mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     const opts = mocks.showToast.mock.calls[0][2];
     opts.action.onClick();
     expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(1);
@@ -389,21 +421,37 @@ describe('checkForAppUpdate', () => {
   // this binary, so it is absent from the changelog baked into it.
   it("keeps the offered release's notes beside the version they describe", async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe('2026.6.25');
     expect(storeSignals.latestTauriAppNotes.value).toBe('### Added\n\n- a thing');
   });
 
-  it('offers a way to read them, which lands on What\'s New', async () => {
+  it('offers a way to read them, which opens the release it just announced', async () => {
+    // Naming the version is the whole of it. An unnamed open falls back to
+    // expanding the release already RUNNING, which is the one the offer is
+    // asking the user to move off.
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     const opts = mocks.showToast.mock.calls[0][2];
     expect(opts.secondaryAction.label).toBe("What's new");
     opts.secondaryAction.onClick();
-    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('whats-new');
+    expect(mocks.openWhatsNew).toHaveBeenCalledWith('2026.6.25');
     // Reading is not taking: the primary action stays the only thing that
     // installs anything.
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  it('re-offers after a cancel with the version still named', async () => {
+    // The cancel path rebuilds the offer from the frame, and the link must not
+    // quietly lose its release on the way through.
+    mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added\n\n- a thing'));
+    startAppUpdateProgress();
+    await vi.waitFor(() => expect(mocks.listen).toHaveBeenCalled());
+    await checkAppUpdateViaClient();
+    emitProgress({ version: '2026.6.25', phase: 'cancelled' });
+    const { secondaryAction } = lastToast().opts as { secondaryAction: { onClick: () => void } };
+    secondaryAction.onClick();
+    expect(mocks.openWhatsNew).toHaveBeenCalledWith('2026.6.25');
   });
 
   it('offers no way to read notes the manifest never carried', async () => {
@@ -411,7 +459,7 @@ describe('checkForAppUpdate', () => {
     // falling back to the installed changelog would show the notes for the
     // version already running.
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.showToast.mock.calls[0][2].secondaryAction).toBeUndefined();
   });
 
@@ -419,16 +467,16 @@ describe('checkForAppUpdate', () => {
     // A stale note beside a fresh version would tell the user what a DIFFERENT
     // update contains, so the two are written and cleared together.
     mocks.checkAppUpdate.mockResolvedValue(offer('2026.6.25', '### Added'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe(null);
     expect(storeSignals.latestTauriAppNotes.value).toBe(null);
   });
 
   it('swallows a failed check (best-effort) — no toast, retried next poll', async () => {
     mocks.checkAppUpdate.mockRejectedValue(new Error('network'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
@@ -436,7 +484,7 @@ describe('checkForAppUpdate', () => {
   // the outcome has to be RECORDED, not just announced.
   it('records the available version for the persistent System surface', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
     expect(storeSignals.appUpdateCheckError.value).toBeNull();
   });
@@ -445,7 +493,7 @@ describe('checkForAppUpdate', () => {
   // up-to-date one — the whole point of recording it.
   it('records why a check failed instead of only console.warn-ing', async () => {
     mocks.checkAppUpdate.mockRejectedValue(new Error('network'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.appUpdateCheckError.value).toContain('network');
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
@@ -456,149 +504,296 @@ describe('checkForAppUpdate', () => {
   // source — and the two would fight on every poll.
   it('does not clobber a version it did not set', async () => {
     mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate(); // relinquish ownership if an earlier case took it
+    await checkAppUpdateViaClient(); // relinquish ownership if an earlier case took it
     storeSignals.latestTauriAppVersion.value = '2026.07.03.0'; // as if from /health
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe('2026.07.03.0');
   });
 
   it('does clear the version it set once the update is gone', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBe('0.16.0');
 
     mocks.checkAppUpdate.mockReset();
     mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.latestTauriAppVersion.value).toBeNull();
   });
 
   it('clears a previous error once a check succeeds again', async () => {
     mocks.checkAppUpdate.mockRejectedValue(new Error('network'));
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.appUpdateCheckError.value).not.toBeNull();
 
     mocks.checkAppUpdate.mockReset();
     mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate();
+    await checkAppUpdateViaClient();
     expect(storeSignals.appUpdateCheckError.value).toBeNull();
     expect(storeSignals.latestTauriAppVersion.value).toBeNull();
   });
 });
 
-describe('recheckAppUpdateOnResume', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-  });
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  /** Put the module's "last checked" stamp at the current fake time, the way a
-   *  startup or interval check would, so each case starts from a known baseline
-   *  instead of inheriting whatever an earlier test left behind. */
-  async function justChecked(): Promise<void> {
-    mocks.checkAppUpdate.mockResolvedValue(null);
-    await checkForAppUpdate();
-    mocks.checkAppUpdate.mockClear();
-    mocks.showToast.mockClear();
-  }
-
-  // The 2026-07-31 stranding, in miniature: a 0.18.0 client checked at launch
-  // while 0.18.0 still WAS the latest, then sat there. Two newer releases were
-  // published, and with no resume check and an hours-long interval the client
-  // went on reporting itself current all morning.
-  it('surfaces a release published while the client sat idle', async () => {
-    await justChecked();
-    mocks.checkAppUpdate.mockResolvedValue(offer('0.18.2'));
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
-    expect(lastToast().message).toBe('Lucidos 0.18.2 available');
+describe('startAppUpdateProgress', () => {
+  it('subscribes once however many times a workspace remounts', () => {
+    startAppUpdateProgress();
+    startAppUpdateProgress();
+    startAppUpdateProgress();
+    expect(mocks.listen).toHaveBeenCalledTimes(1);
   });
 
-  // Window focus and visibilitychange fire on every alt-tab, and each check is a
-  // network round-trip to the release host.
-  it('collapses a flurry of window switches into no extra checks', async () => {
-    await justChecked();
-    vi.advanceTimersByTime(60 * 1000);
-    await recheckAppUpdateOnResume();
-    await recheckAppUpdateOnResume();
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+  it('starts no timer of its own, because the gateway owns the check', () => {
+    const setInterval = vi.spyOn(globalThis, 'setInterval');
+    startAppUpdateProgress();
+    expect(setInterval).not.toHaveBeenCalled();
   });
 
-  it('checks again once the throttle window has passed', async () => {
-    await justChecked();
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS - 1);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(1);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
-  });
-
-  // A resume that DID reach the host restarts the throttle; one that was
-  // suppressed must not, or a single suppressed resume would push the next real
-  // check out by another window every time the user switched away.
-  it('restarts the throttle from the check, not from the attempt', async () => {
-    await justChecked();
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS - 1);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
-  });
-
-  // The suppression guard runs before the stamp, so a resume landing mid-install
-  // must not count as a check and defer the next real one.
-  it('does not consume the throttle when a run is already in flight', async () => {
-    await justChecked();
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
-    storeSignals.appUpdateProgress.value = { version: '0.18.2', phase: 'installing' };
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
-
-    storeSignals.appUpdateProgress.value = null;
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(1);
-  });
-
-  it('stays a no-op outside the Tauri client', async () => {
-    await justChecked();
+  it('stays a no-op outside the Tauri client', () => {
     mocks.isTauri.mockReturnValue(false);
-    vi.advanceTimersByTime(RESUME_THROTTLE_MS);
-    await recheckAppUpdateOnResume();
-    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+    startAppUpdateProgress();
+    expect(mocks.listen).not.toHaveBeenCalled();
   });
 });
 
-describe('startAppUpdateChecks', () => {
-  // The regression this exists to prevent: the old guard returned early when a
-  // timer already existed, so only the FIRST workspace mount of a client process
-  // ever checked. With an hours-long interval behind it, an update published mid-session
-  // stayed invisible until the app was fully quit and relaunched.
-  it('re-checks on every mount, not just the first of a client process', async () => {
-    mocks.checkAppUpdate.mockResolvedValue(null);
-    startAppUpdateChecks();
-    startAppUpdateChecks();
-    startAppUpdateChecks();
-    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(3);
+describe('refreshReleaseCheck', () => {
+  // The offer dedupe is per PROCESS, not per call, so each case announces its
+  // own version. Reusing one across two cases would make the second silent for
+  // the right reason and fail for the wrong one.
+  it('records the gateway answer and offers the version it announces', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.1.0', install: 'desktop-app', command: null }),
+    );
+    await refreshReleaseCheck();
+    expect(mocks.requestUpdateCheck).toHaveBeenCalledWith(false);
+    expect(storeSignals.releaseCheck.value?.latest?.version).toBe('9.1.0');
+    expect(lastToast().message).toBe('Lucidos 9.1.0 available');
   });
 
-  it('does not stack a second interval when called again', async () => {
-    mocks.checkAppUpdate.mockResolvedValue(null);
-    const setInterval = vi.spyOn(globalThis, 'setInterval');
-    startAppUpdateChecks();
-    startAppUpdateChecks();
-    expect(setInterval).toHaveBeenCalledTimes(1);
+  it('makes the offer actionable in a Tauri client fronting a bundle', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.2.0', install: 'desktop-app', command: null }),
+    );
+    await refreshReleaseCheck();
+    const opts = lastToastOpts() as { action: { label: string; onClick: () => void } };
+    expect(opts.action.label).toBe('Update & restart');
+    opts.action.onClick();
+    expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(1);
   });
 
-  it('stays a no-op outside the Tauri client', async () => {
+  // A browser or PWA session can install nothing, so an Update button there
+  // would be a control that cannot do what it says.
+  it('offers no install action in a browser or PWA session', async () => {
     mocks.isTauri.mockReturnValue(false);
-    startAppUpdateChecks();
-    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
-    expect(mocks.listen).not.toHaveBeenCalled();
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.3.0', install: 'desktop-app', command: null }),
+    );
+    await refreshReleaseCheck();
+    expect(lastToast().message).toBe('Lucidos 9.3.0 available');
+    expect(lastToastOpts().action).toBeUndefined();
+    expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  // A headless install updates by re-running the installer, so the toast routes
+  // to Settings, System, which is where the composed command is shown.
+  it('routes a headless install to the page carrying its command', async () => {
+    mocks.isTauri.mockReturnValue(false);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({
+        version: '9.4.0',
+        install: 'installer-rerun',
+        command: 'curl -fsSL https://lucidos.dev/install.sh | sh -s -- --name default',
+      }),
+    );
+    await refreshReleaseCheck();
+    const opts = lastToastOpts() as { action: { label: string; onClick: () => void } };
+    expect(opts.action.label).toBe('How to update');
+    opts.action.onClick();
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
+    expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  it('offers one toast per version, however often it refreshes', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.5.0', install: 'desktop-app', command: null }),
+    );
+    await refreshReleaseCheck();
+    await refreshReleaseCheck();
+    await refreshReleaseCheck();
+    expect(mocks.showToast).toHaveBeenCalledTimes(1);
+  });
+
+  it('says nothing when the gateway reports nothing published', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
+    await refreshReleaseCheck();
+    expect(mocks.showToast).not.toHaveBeenCalled();
+    expect(storeSignals.releaseCheck.value?.supported).toBe(true);
+  });
+
+  // The notes are what answer "what is in it", and they must describe the
+  // version being offered rather than the one already installed.
+  it('carries the offered release notes beside the version they describe', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.6.0', install: 'desktop-app', notes: '- a thing' }),
+    );
+    await refreshReleaseCheck();
+    expect(storeSignals.latestTauriAppNotes.value).toBe('- a thing');
+    const opts = lastToastOpts() as { secondaryAction: { onClick: () => void } };
+    opts.secondaryAction.onClick();
+    expect(mocks.openWhatsNew).toHaveBeenCalledWith('9.6.0');
+  });
+
+  it('offers no way to read notes the origin never carried', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.7.0', install: 'desktop-app' }),
+    );
+    await refreshReleaseCheck();
+    expect(storeSignals.latestTauriAppNotes.value).toBeNull();
+    expect(lastToastOpts().secondaryAction).toBeUndefined();
+  });
+
+  it('asks for a poll now when forced', async () => {
+    await refreshReleaseCheck(true);
+    expect(mocks.requestUpdateCheck).toHaveBeenCalledWith(true);
+  });
+
+  // An older gateway has no such route, and there is none at all on a direct
+  // engine port. Both must read as "no offer", not as an error the user sees.
+  it('leaves the answer unknown when the gateway cannot answer', async () => {
+    mocks.requestUpdateCheck.mockRejectedValue(new Error('404'));
+    await refreshReleaseCheck();
+    expect(storeSignals.releaseCheck.value).toBeNull();
+    expect(storeSignals.appUpdateCheckError.value).toBeNull();
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  // A poll that FAILED must never read as "you are up to date". Settings turns
+  // this signal into a notice, and into the toast the Check button reports on.
+  it('records the gateway poll failure rather than reporting no update', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf(null, { last_error: 'origin served markup, not JSON' }),
+    );
+    await refreshReleaseCheck();
+    expect(storeSignals.appUpdateCheckError.value).toContain('markup');
+  });
+
+  it('clears the recorded failure once a poll succeeds again', async () => {
+    storeSignals.appUpdateCheckError.value = 'stale failure';
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
+    await refreshReleaseCheck();
+    expect(storeSignals.appUpdateCheckError.value).toBeNull();
+  });
+
+  // The user clicked and is owed an answer. A forced call that cannot reach
+  // the gateway says so, rather than falling through to "up to date".
+  it('records an unreachable gateway when the user asked', async () => {
+    mocks.requestUpdateCheck.mockRejectedValue(new Error('connection refused'));
+    await refreshReleaseCheck(true);
+    expect(storeSignals.appUpdateCheckError.value).toContain('connection refused');
+  });
+
+  // A run in flight owns the shared toast key, and its narration is a more
+  // specific answer than a fresh offer would be.
+  it('raises no offer over an install already running', async () => {
+    storeSignals.appUpdateProgress.value = { version: '9.8.0', phase: 'installing' };
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.8.0', install: 'desktop-app' }),
+    );
+    await refreshReleaseCheck();
+    expect(mocks.showToast).not.toHaveBeenCalled();
+    expect(storeSignals.releaseCheck.value?.latest?.version).toBe('9.8.0');
+  });
+});
+
+describe('packagedUpdateVersion', () => {
+  it('prefers the gateway answer, which covers every install shape', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.1.0',
+      install: 'installer-rerun',
+      command: 'curl …',
+    });
+    storeSignals.latestTauriAppVersion.value = '0.27.0';
+    expect(packagedUpdateVersion()).toBe('9.1.0');
+  });
+
+  it('falls back to the client check while the gateway announces nothing', () => {
+    storeSignals.releaseCheck.value = null;
+    storeSignals.latestTauriAppVersion.value = '1.3.0';
+    window.__LUCIDOS_APP_VERSION__ = '1.2.3';
+    expect(packagedUpdateVersion()).toBe('1.3.0');
+  });
+
+  it('offers nothing when the gateway says the install is current', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    expect(packagedUpdateVersion()).toBeNull();
+  });
+});
+
+// An offer exists for every install shape, but only one session can act on it.
+// Settings asks this before invoking the updater, so a "Check for Updates"
+// click cannot reach Tauri IPC that is not there.
+describe('canInstallUpdateHere', () => {
+  it('is true for a Tauri client fronting a bundle', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.11.0',
+      install: 'desktop-app',
+    });
+    expect(canInstallUpdateHere()).toBe(true);
+  });
+
+  it('is false for a headless install, which re-runs the installer', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.11.0',
+      install: 'installer-rerun',
+      command: 'curl …',
+    });
+    expect(canInstallUpdateHere()).toBe(false);
+  });
+
+  it('is false in a browser or PWA session, which has no updater to call', () => {
+    mocks.isTauri.mockReturnValue(false);
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.11.0',
+      install: 'desktop-app',
+    });
+    expect(canInstallUpdateHere()).toBe(false);
+  });
+
+  it('is false when there is nothing on offer', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    expect(canInstallUpdateHere()).toBe(false);
+  });
+});
+
+/**
+ * The webview timer is gone, not dormant.
+ *
+ * ADR 0108 moved the check into the gateway for one reason: a timer here runs
+ * once per open window, so N windows on one machine made N polls an hour. A
+ * timer reintroduced beside the gateway's would put that straight back, and
+ * nothing else in the suite would notice. It would simply ask twice.
+ *
+ * A source scan, because absence is the property. There is no call to make and
+ * no state to observe, so only reading the module can prove it.
+ */
+describe('the check does not live in the webview', () => {
+  const src = readFileSync(
+    new URL('./app-update.ts', import.meta.url),
+    'utf8',
+  ) as string;
+
+  it('starts no timer', () => {
+    expect(src).not.toContain('setInterval');
+    expect(src).not.toContain('setTimeout');
+  });
+
+  it('names no poll interval of its own', () => {
+    expect(src).not.toContain('APP_UPDATE_POLL_MS');
+  });
+
+  it('reaches the release host only through the gateway', () => {
+    // `checkAppUpdate` is the Tauri fallback for a gateway too old to announce
+    // anything, and it runs on user intent alone.
+    expect(src).toContain('requestUpdateCheck(');
+    expect(src).not.toContain('startAppUpdateChecks');
   });
 });

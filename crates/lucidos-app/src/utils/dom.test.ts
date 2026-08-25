@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // Stub HTMLElement before importing — match scroll.test.ts pattern.
 if (typeof globalThis.HTMLElement === 'undefined') {
@@ -12,7 +12,36 @@ if (typeof globalThis.HTMLElement === 'undefined') {
   };
 }
 
-import { isTextInput, opensSoftwareKeyboard } from './dom';
+import { focusIfNeeded, isTextInput, opensSoftwareKeyboard } from './dom';
+
+describe('focusIfNeeded', () => {
+  const realDocument = (globalThis as any).document;
+  afterEach(() => { (globalThis as any).document = realDocument; });
+
+  it('calls focus({ preventScroll: true }) when element is not the active element', () => {
+    const el = { focus: vi.fn() } as any;
+    (globalThis as any).document = { activeElement: null };
+
+    focusIfNeeded(el);
+
+    expect(el.focus).toHaveBeenCalledWith({ preventScroll: true });
+  });
+
+  it('skips focus() when element is already the active element', () => {
+    const el = { focus: vi.fn() } as any;
+    (globalThis as any).document = { activeElement: el };
+
+    focusIfNeeded(el);
+
+    expect(el.focus).not.toHaveBeenCalled();
+  });
+
+  it('does nothing when element is null', () => {
+    (globalThis as any).document = { activeElement: null };
+    // Should not throw
+    focusIfNeeded(null);
+  });
+});
 
 function input(type: string) {
   const el = new (globalThis as any).HTMLElement();

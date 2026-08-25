@@ -328,15 +328,17 @@ pub struct ThreadCcDiff {
     pub base_ref: String,
 }
 
-/// GET /api/v1/threads/:thread_id/cc-diff — 3-dot diff of the CC worktree's
-/// branch vs the repo's default remote branch. Used for external-repo CC
-/// sessions that never create a Lucidos `Change` row.
+/// GET /api/v1/threads/:thread_id/cc-diff: a 3-dot diff of the coding agent's
+/// branch against the repo's default branch. This is what the Diff button reads
+/// for every coding-agent thread: app, Lucidos-source and external-repo alike.
 ///
-/// Falls back to the registered repo + branch ref when the recorded worktree
-/// is gone — pre-May-2026 `agent_recovery` removed worktrees for idle
-/// external-repo sessions without emitting `WorktreeCleaned`, so the
-/// historical state is `coding_agent_proposed=true` + branch alive + worktree dir
-/// missing.
+/// Falls back to the registered repo + branch ref when no worktree is left on
+/// disk. Pre-May-2026 `agent_recovery` removed worktrees for idle external-repo
+/// sessions without emitting `WorktreeCleaned`. The historical state is
+/// therefore `coding_agent_proposed=true` + branch alive + worktree dir missing.
+/// That fallback needs a `SessionStarted.repo_id`, which only an external-repo
+/// thread carries. Finding the worktree is the only way an app or
+/// Lucidos-source thread ever gets a diff.
 pub async fn get_thread_cc_diff(
     State(state): State<AppState>,
     axum::extract::Path(thread_id): axum::extract::Path<Uuid>,
@@ -347,10 +349,17 @@ pub async fn get_thread_cc_diff(
     // Diff button's response — the user asked for the diff scoped to the
     // app, not to whatever the agent happened to touch.
     let app_pathspec = lookup_app_pathspec(&state.pool, thread_id).await;
-    if let Some(worktree_path) =
-        crate::engine::agent_session::resume::lookup_latest_worktree_path(&state.pool, thread_id)
-            .await
-            .filter(|p| p.exists())
+    let live_worktree = {
+        let sessions = state.engine.agent_sessions.lock().await;
+        live_thread_worktree(sessions.get(&thread_id))
+    };
+    if let Some(worktree_path) = resolve_diff_worktree(
+        &state.pool,
+        thread_id,
+        live_worktree,
+        state.engine.workspace_path(),
+    )
+    .await
     {
         return diff_via_worktree(&worktree_path, app_pathspec.as_deref())
             .await
@@ -359,6 +368,94 @@ pub async fn get_thread_cc_diff(
     diff_via_branch_ref(&state.pool, thread_id, app_pathspec.as_deref())
         .await
         .map(Json)
+}
+
+/// The worktree a live session is working the THREAD's own branch in.
+///
+/// A conflict-resolution spawn runs in the merge worktree on a temp branch,
+/// which `conflict_change_id` marks (ADR 0060). That tree belongs to the merge,
+/// so the Diff button answers from the thread's own worktree while one runs.
+fn live_thread_worktree(
+    session: Option<&crate::engine::types::AgentSession>,
+) -> Option<std::path::PathBuf> {
+    session
+        .filter(|s| s.conflict_change_id.is_none())
+        .and_then(|s| s.worktree_path.clone())
+}
+
+/// The worktree to diff, or `None` when the thread has none left on disk.
+///
+/// Three sources, most current first. The recorded idle used to be the only
+/// one, which left the Diff button dead for a thread's whole FIRST turn. No
+/// `CodingAgentIdled` exists yet, so the handler fell through to a branch-ref
+/// fallback an app or Lucidos-source thread can never satisfy. The button
+/// lights up mid-turn, from the worktree's post-commit hook. So the window it
+/// answered with a 404 is the window the user has work to look at.
+///
+/// The read-side sibling of `resume::resolve_worktree_path`, which answers the
+/// spawn-side question: where to PUT a worktree. That one invents a path when
+/// none is there, so it can never say "gone". This one has to.
+async fn resolve_diff_worktree(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    live_session: Option<std::path::PathBuf>,
+    workspace_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    // A running turn holds the ground truth: the tree the agent is writing to,
+    // recorded nowhere else until the turn ends.
+    if let Some(path) = live_session.filter(|p| p.exists()) {
+        return Some(path);
+    }
+    if let Some(path) =
+        crate::engine::agent_session::resume::lookup_latest_worktree_path(pool, thread_id)
+            .await
+            .filter(|p| p.exists())
+    {
+        return Some(path);
+    }
+    // Every thread's worktree lands at this one path, so a thread whose idle
+    // recorded none (a crash, a legacy row) is still findable. Gated on the
+    // thread being real, because this path is derived from the id alone: see
+    // `thread_owns_a_coding_agent_worktree`.
+    if !thread_owns_a_coding_agent_worktree(pool, thread_id).await {
+        return None;
+    }
+    let deterministic = crate::engine::agent_session::resume::deterministic_worktree_path(
+        workspace_path,
+        thread_id,
+    );
+    deterministic.exists().then_some(deterministic)
+}
+
+/// True when `thread_id` names a coding-agent thread of this workspace.
+///
+/// `deterministic_worktree_path` reads the thread id's first 8 hex characters
+/// and nothing else, so an id that names no thread still resolves to a
+/// directory. Let one through and a caller passing an id whose prefix collides
+/// with a real thread gets that thread's worktree, unscoped: `lookup_app_pathspec`
+/// finds no row, so the app pathspec that should narrow the diff is `None`.
+///
+/// A query that could not run answers `false`, which costs a diff the caller
+/// can retry. The other direction serves one thread's work under another
+/// thread's id.
+async fn thread_owns_a_coding_agent_worktree(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| {
+        crate::log!(
+            "[Repositories] Failed to check thread {} is a coding-agent thread: {}",
+            thread_id,
+            e
+        );
+        e
+    })
+    .ok()
+    .flatten()
+    .unwrap_or(false)
 }
 
 /// Look up the in-app pathspec for an app coding-agent thread, e.g.
@@ -450,7 +547,9 @@ async fn diff_via_branch_ref(
         .await
         .ok_or((
             StatusCode::NOT_FOUND,
-            "No worktree on disk and no SessionStarted recorded for this thread".into(),
+            "No worktree on disk for this thread, and its session recorded no \
+             repository to diff against instead"
+                .into(),
         ))?;
     if super::is_dangerous_git_ref(&branch_name) {
         return Err((StatusCode::BAD_REQUEST, "Invalid branch name".into()));

@@ -27,18 +27,20 @@
 import { test, expect } from './fixtures';
 import { assertHealthy, gotoWithRetry } from './helpers';
 
-/** A body in the shape that produced the report: a couple of sentences of
- *  metrics, a shell command to run, and a verbatim sample line. Nothing about
- *  the assertion depends on the wording, only on it being far longer than the
- *  cap. */
+/** A body in the shape that produced the report: metrics, a shell command to
+ *  run, and a verbatim sample line. Nothing about the assertion depends on the
+ *  wording, only on it being far longer than the cap.
+ *
+ *  Deliberately ONE line, with no blank line to start a section. In that shape
+ *  the heading is the whole message, and it has to scroll on its own with no
+ *  `.toast-sections` box under it. The sectioned shape is covered by
+ *  `toast-scroll-shape.spec.ts`. */
 const LONG_BODY = [
   'Memory is being squeezed: free 3.67 GB (18.32 GB reclaimable), compressor 11.40 GB, swap 0.08 GB, pressure critical.',
-  'Nothing safe to reclaim automatically. Save your work and find the hogs:',
-  '',
-  'ps -Aww -o rss,command | sort -rn | head -20',
-  '',
+  'Nothing safe to reclaim automatically. Save your work and find the hogs with',
+  'ps -Aww -o rss,command | sort -rn | head -20.',
   'Latest: up 2 days | wired 3.80GB | comp 11.40GB | free 3.67GB | press critical | swap 0.08GB | wk 0/0.00GB',
-].join('\n');
+].join(' ');
 
 /** Above this the toast stops reading as an overlay and starts reading as a
  *  page. The reported card was ~0.8; the cap puts it around a quarter. Kept
@@ -57,9 +59,15 @@ test.describe('toast height cap on mobile', () => {
     await expect(page.locator('.app-header').first()).toBeVisible({ timeout: 15_000 });
 
     const geom = await page.evaluate((body: string) => {
-      // Mirrors the markup `renderToast` emits (Toast.tsx): the message inside a
-      // scrolling `.toast-body`, with the actions row and the close X as its
-      // SIBLINGS, which is what keeps them reachable under the cap.
+      // Mirrors the markup `renderToast` emits (Toast.tsx). The whole body goes
+      // in `.toast-heading`, because this probe's message is ONE line: line 1
+      // is all there is, so there is no `.toast-sections` box under it. That is
+      // the case under test. A heading with nothing below it has to scroll on
+      // its own, or a long section-less message is clipped at the cap.
+      //
+      // The icon, the actions row and the close X are the body's SIBLINGS. That
+      // keeps the spinner out of a scroll box, and [Open] reachable under the
+      // cap.
       const container = document.createElement('div');
       container.className = 'toast-container';
       const column = document.createElement('div');
@@ -67,21 +75,21 @@ test.describe('toast height cap on mobile', () => {
       const toast = document.createElement('div');
       toast.className = 'toast toast-info';
       toast.innerHTML =
-        '<div class="toast-body">' +
         '<svg class="toast-icon" viewBox="0 0 24 24"></svg>' +
-        '<span class="toast-message"></span>' +
+        '<div class="toast-body">' +
+        '<div class="toast-heading"></div>' +
         '</div>' +
         '<div class="toast-actions button-group">' +
         '<button class="action-btn">Open</button>' +
         '</div>' +
         '<button class="icon-btn toast-close" aria-label="Dismiss"></button>';
-      (toast.querySelector('.toast-message') as HTMLElement).textContent = body;
+      (toast.querySelector('.toast-heading') as HTMLElement).textContent = body;
       column.appendChild(toast);
       container.appendChild(column);
       document.body.appendChild(container);
 
       const toastRect = toast.getBoundingClientRect();
-      const messageBody = toast.querySelector('.toast-body') as HTMLElement;
+      const heading = toast.querySelector('.toast-heading') as HTMLElement;
       const open = toast.querySelector('.toast-actions .action-btn') as HTMLElement;
       const openRect = open.getBoundingClientRect();
       const result = {
@@ -90,8 +98,8 @@ test.describe('toast height cap on mobile', () => {
         viewportHeight: window.innerHeight,
         // Proves the message really did overflow, so the cap is under test
         // rather than the body simply being short enough to fit.
-        bodyOverflows: messageBody.scrollHeight > messageBody.clientHeight + 1,
-        bodyScrolls: getComputedStyle(messageBody).overflowY === 'auto',
+        headingOverflows: heading.scrollHeight > heading.clientHeight + 1,
+        headingScrolls: getComputedStyle(heading).overflowY === 'auto',
         openTop: openRect.top,
         openBottom: openRect.bottom,
         openHeight: openRect.height,
@@ -101,10 +109,10 @@ test.describe('toast height cap on mobile', () => {
     }, LONG_BODY);
 
     expect(
-      geom.bodyOverflows,
+      geom.headingOverflows,
       'the probe body did not overflow, so this asserts nothing about the cap',
     ).toBe(true);
-    expect(geom.bodyScrolls, 'the clamped overflow must scroll, not be clipped away').toBe(true);
+    expect(geom.headingScrolls, 'the clamped overflow must scroll, not be clipped away').toBe(true);
 
     const fraction = geom.toastHeight / geom.viewportHeight;
     expect(

@@ -603,6 +603,18 @@
     margin-top: 0.25rem;
 }
 
+/* An error that carries its own recovery control. The message wraps and the
+   button keeps its natural size, so a long error never squashes the button. */
+.form-error-row {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+}
+
+.form-error-row > span {
+    flex: 1;
+}
+
 /* ===== Apps ===== */
 
 /* Clickable list rows (e.g. single-UI apps) */

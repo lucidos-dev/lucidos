@@ -175,8 +175,9 @@ impl AppManager {
     /// Whether the app exists as far as the apps list is concerned: a
     /// `manifest.json` is present under `data/apps/<id>/`. Matches `list_apps`,
     /// which skips directories without a readable manifest — so this is the
-    /// honest "would this id appear in the list?" check used to decide
-    /// AppCreated vs AppUpdated when the raw file tools touch an app.
+    /// honest "would this id appear in the list?" check. It decides AppCreated
+    /// vs AppUpdated when the raw file tools touch an app, and it is what
+    /// `create_app` refuses on.
     pub fn app_exists(&self, app_id: &str) -> bool {
         if reject_path_traversal(app_id).is_err() {
             return false;
@@ -196,6 +197,13 @@ impl AppManager {
     /// `AppCreated` is what puts the app in every client's list; the emit lives
     /// here rather than at the call site so a second creation path cannot ship
     /// an app nothing can see.
+    ///
+    /// **Creating is not overwriting.** An id that already exists is refused,
+    /// because this call writes exactly two files. A second `create_app` for a
+    /// live app would rewrite `index.html` and orphan everything else it grew:
+    /// the extra pages, the scripts, the knowhow. That loss is silent, and most
+    /// users cannot reach git history to undo it. `ArtifactManager` makes the
+    /// same decision in its write path.
     pub async fn create_app(
         &self,
         event_bus: &EventBus,
@@ -205,6 +213,15 @@ impl AppManager {
         html_content: &str,
     ) -> Result<(PathBuf, String), Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
+        if self.app_exists(app_id) {
+            return Err(format!(
+                "App '{}' already exists. Creating it again would rewrite index.html and \
+                 orphan every other file in it. To change the app, edit its files with \
+                 edit_file or write_file under data/apps/{}/ instead.",
+                app_id, app_id
+            )
+            .into());
+        }
         let app_dir = self.apps_path.join(app_id);
         std::fs::create_dir_all(&app_dir)?;
 
@@ -213,11 +230,15 @@ impl AppManager {
             description: description.to_string(),
             icon: None,
         };
+        // The manifest lands LAST, because its presence is what `app_exists`
+        // reads and what the guard above refuses on. A create that dies partway
+        // leaves a directory that is not an app yet. The next attempt then
+        // finishes it, instead of hitting "already exists".
+        std::fs::write(app_dir.join("index.html"), html_content)?;
         std::fs::write(
             app_dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest)?,
         )?;
-        std::fs::write(app_dir.join("index.html"), html_content)?;
 
         let commit = self.commit_batch(
             &[
@@ -608,5 +629,122 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
+    }
+
+    // --- re-creating a live app (the silent truncation) -------------------
+
+    /// `AppCreated` is a transient event, so it reaches subscribers and never
+    /// the events table. Counting it means draining the bus.
+    fn app_created_ids(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(emitted) = rx.try_recv() {
+            if let BusEvent::System(SystemEvent::AppCreated { app_id, .. }) = emitted.typed {
+                ids.push(app_id);
+            }
+        }
+        ids
+    }
+
+    /// A model re-issuing `create_app` for a live id used to rewrite
+    /// `index.html` and orphan every other file the app had grown. The refusal
+    /// keeps the app whole, and names the tool that changes it instead.
+    #[tokio::test]
+    async fn create_app_refuses_an_id_that_already_exists() {
+        let bus = crate::test_support::offline_event_bus();
+        let mut rx = bus.subscribe();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        manager
+            .create_app(&bus, "habit-tracker", "Habit Tracker", "Habits", "<h1>v1")
+            .await
+            .expect("first create");
+
+        // The app grows a second page the way a real one does.
+        let app_dir = tmp.path().join("data/apps/habit-tracker");
+        let sibling = app_dir.join("stats.html");
+        std::fs::write(&sibling, "<h1>stats").unwrap();
+
+        let err = manager
+            .create_app(&bus, "habit-tracker", "Habit Tracker", "Habits", "<h1>v2")
+            .await
+            .expect_err("re-creating a live app must be refused");
+        let err = err.to_string();
+        assert!(err.contains("habit-tracker"), "names the id: {err}");
+        assert!(err.contains("already exists"), "got: {err}");
+        assert!(err.contains("edit_file"), "names the recovery: {err}");
+
+        assert_eq!(
+            std::fs::read_to_string(app_dir.join("index.html")).unwrap(),
+            "<h1>v1",
+            "the live index.html must survive"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sibling).unwrap(),
+            "<h1>stats",
+            "the sibling page must survive"
+        );
+        assert_eq!(
+            app_created_ids(&mut rx),
+            vec!["habit-tracker".to_string()],
+            "the refusal path must not announce a second creation"
+        );
+    }
+
+    /// "Exists" means what the apps list means: a readable `manifest.json`. A
+    /// bare directory laid down by `write_file` is not an app yet, so
+    /// `create_app` still finishes it.
+    #[tokio::test]
+    async fn create_app_still_finishes_a_manifest_less_directory() {
+        let bus = crate::test_support::offline_event_bus();
+        let mut rx = bus.subscribe();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        let app_dir = tmp.path().join("data/apps/half-built");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("notes.md"), "scaffolding").unwrap();
+        assert!(!manager.app_exists("half-built"));
+
+        manager
+            .create_app(&bus, "half-built", "Half Built", "", "<h1>done")
+            .await
+            .expect("a directory without a manifest is not an app yet");
+
+        assert!(manager.app_exists("half-built"));
+        assert_eq!(app_created_ids(&mut rx), vec!["half-built".to_string()]);
+        assert!(app_dir.join("notes.md").exists(), "scaffolding survives");
+    }
+
+    /// A create that dies before the manifest stays retryable. The manifest is
+    /// the marker the guard reads, so writing it last is what keeps a
+    /// half-written app finishable.
+    #[tokio::test]
+    async fn create_app_can_be_retried_after_a_failed_attempt() {
+        let bus = crate::test_support::offline_event_bus();
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = AppManager::new(tmp.path()).unwrap();
+
+        // A directory sitting where index.html goes fails the first write.
+        let app_dir = tmp.path().join("data/apps/habit-tracker");
+        std::fs::create_dir_all(app_dir.join("index.html")).unwrap();
+
+        manager
+            .create_app(&bus, "habit-tracker", "Habit Tracker", "Habits", "<h1>v1")
+            .await
+            .expect_err("writing index.html over a directory must fail");
+        assert!(
+            !manager.app_exists("habit-tracker"),
+            "a failed create must not mark the app as existing"
+        );
+
+        std::fs::remove_dir(app_dir.join("index.html")).unwrap();
+        manager
+            .create_app(&bus, "habit-tracker", "Habit Tracker", "Habits", "<h1>v1")
+            .await
+            .expect("the retry must finish the app");
+        assert!(manager.app_exists("habit-tracker"));
     }
 }

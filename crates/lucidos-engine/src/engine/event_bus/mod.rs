@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
+use crate::scheduler::user_tasks::current_event_trigger_depth;
 
 /// CC session-end status — always `'idle'`. A proposed change is a review
 /// artifact, not a parked loop, so it does not block the parent's "is my
@@ -35,6 +36,12 @@ pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 /// They share this list because they share the hazard: each is emitted at the
 /// moment a coding-agent turn dies, and each is followed by that turn's trailing
 /// events. See [`preserving_verdict`].
+///
+/// **These two are the whole set, and that is load-bearing.** A third value
+/// escaping into an abort's status write is not a widening of the list, it is a
+/// hole in it. `status_sql` used to answer `'waiting'` whenever a change was
+/// pending, and the drain then overwrote it within milliseconds. Say the verdict
+/// here, and let the reader rank it against a pending change.
 pub(super) const PRESERVED_STATUS_VERDICTS: &[&str] = &["failed", "paused"];
 
 /// [`PRESERVED_STATUS_VERDICTS`] as a SQL `IN (...)` body. Every name is a
@@ -62,11 +69,12 @@ pub(super) static PRESERVED_STATUS_VERDICTS_SQL: std::sync::LazyLock<String> =
 /// This matters far more for coding agents than for the Lucidos Agent, which
 /// is why the two channels visibly disagreed before this was applied
 /// uniformly. A chat turn's loop emits nothing after its own terminator, so
-/// its verdict is never touched. A coding-agent turn emits three more things:
-/// the subprocess's trailing drain output (`external_terminal_emitted`
-/// suppresses the duplicate terminal, not the activity stream),
-/// `CodingAgentIdled`, and `SessionEnded` — each of which used to write a
-/// status and, between them, walked an interrupted thread back to `'idle'`.
+/// its verdict is never touched. A coding-agent turn emits four more things:
+/// the subprocess's trailing drain output, the `ChangeProposed` it commits on
+/// its way out, `CodingAgentIdled`, and `SessionEnded`. Each used to write a
+/// status and, between them, they walked an interrupted thread back to
+/// `'idle'`. The drain is not suppressed by `external_terminal_emitted`, which
+/// covers the duplicate terminal rather than the activity stream.
 ///
 /// Not expressible in the coarse `StatusRule::ConditionalCc` model that
 /// `thread_lifecycle::status_transitions()` publishes, so the contract table
@@ -111,6 +119,15 @@ pub struct EmittedEvent {
     /// thread broadcasts that carry out-of-band projection refreshes.
     /// `None` for System events and projection-free transient Thread events.
     pub aggregate: Option<crate::core::store::ThreadAggregate>,
+    /// How deep in an event-trigger chain the EMITTING task was running
+    /// (`scheduler::user_tasks::current_event_trigger_depth`).
+    ///
+    /// Broadcast-only, and never persisted: it describes the task, not the
+    /// event. The scheduler dispatches a thread event at this depth. That is
+    /// what makes `MAX_EVENT_TRIGGER_DEPTH` engage for a trigger subscribed to
+    /// an event its own run emits. A domain event carries the same number in
+    /// its own variant, where it IS persisted, so a replay reconstructs it.
+    pub depth: u32,
 }
 
 /// Arguments to [`EventBus::replay_historical_event`]. Fields mirror the
@@ -124,6 +141,15 @@ pub(crate) struct HistoricalReplay<'a> {
     pub payload: &'a serde_json::Value,
     pub thread_id: Option<Uuid>,
     pub created: Option<DateTime<Utc>>,
+    /// Whether subscribers hear about the row. `true` is the default a
+    /// backfill wants: SSE, the memory indexer and everything else observe
+    /// the replay as they would a live emit.
+    ///
+    /// `false` for a bulk pass writing rows nothing needs to see arrive.
+    /// `core::aux_context_backfill` writes tens of thousands of accounting
+    /// rows. A burst that size buys no client anything, and would flood every
+    /// open SSE connection on engine start.
+    pub broadcast: bool,
 }
 
 /// Typed union of all aggregate events.
@@ -219,6 +245,16 @@ pub struct ParentCallback {
     pub parent_thread_id: Uuid,
     pub child_thread_id: Uuid,
     pub child_completed_event_id: Uuid,
+    /// The child's own terminal event, the one that drove this fan-in.
+    ///
+    /// Load-bearing for the stand-down gate in
+    /// `notify_parent_of_child_completion`. An OR-wait naming both
+    /// `CodingAgentIdled` and `ChildThreadCompleted` for one child resolves on
+    /// whichever arm lands first. The delivery therefore routinely names THIS
+    /// id rather than the completion card's. `None` on the boot re-fire sweep,
+    /// which reads the card and not the terminal behind it. Absent means the
+    /// probe abstains, and the wake is sent.
+    pub child_terminal_event_id: Option<Uuid>,
     /// Parent's `is_coding_agent` flag — captured here on the existing
     /// `notify_parent_if_child` query (self-join in `thread_summaries`) so
     /// the FanOut consumer doesn't need a second roundtrip just to pick the
@@ -385,6 +421,7 @@ impl EventBus {
             created: Utc::now(),
             typed: BusEvent::System(event),
             aggregate: None,
+            depth: current_event_trigger_depth(),
         });
     }
 
@@ -431,6 +468,7 @@ impl EventBus {
                     meta: EventMeta::NONE,
                 },
                 aggregate: Some(aggregate),
+                depth: current_event_trigger_depth(),
             });
         }
 
@@ -509,6 +547,7 @@ impl EventBus {
             payload,
             thread_id,
             created,
+            broadcast,
         } = replay;
         let seq: Option<i64> = sqlx::query_scalar(
             r#"INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, thread_id, created)
@@ -543,7 +582,7 @@ impl EventBus {
         // scan a moment later rather than never, and the scan is what covers
         // this path anyway: a backfill runs at startup, where the wait cache is
         // still being rebuilt.
-        if let Some(seq_val) = seq {
+        if let (Some(seq_val), true) = (seq, broadcast) {
             let _ = self.event_tx.send(EmittedEvent {
                 event_id,
                 seq: Some(seq_val),
@@ -556,6 +595,9 @@ impl EventBus {
                     actor: None,
                 }),
                 aggregate: None,
+                // A backfill is not a link in anyone's trigger chain, and the
+                // variant above says the same thing.
+                depth: 0,
             });
         }
 
@@ -624,6 +666,10 @@ impl EventBus {
         &self,
         event: BusEvent,
     ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // Read before the first `.await`, so it is this caller's chain depth
+        // and not something a later hop happens to be running under. Every
+        // branch below stamps the same value onto its broadcast.
+        let depth = current_event_trigger_depth();
         match &event {
             BusEvent::Thread {
                 thread_id,
@@ -789,6 +835,7 @@ impl EventBus {
                         created: broadcast_created,
                         typed: event,
                         aggregate,
+                        depth,
                     });
                     // Rebroadcast each affected ancestor's aggregate so the
                     // frontend's `meta.blockingDescendantCount` stays live —
@@ -821,7 +868,7 @@ impl EventBus {
                         );
                     }
                     // Run after broadcast so a panic here can't skip SSE delivery
-                    self.notify_parent_if_child(notify_thread_id, &notify_event)
+                    self.notify_parent_if_child(notify_thread_id, event_id, &notify_event)
                         .await;
                     // If a child was just created, notify the parent with updated counts
                     if let ThreadEvent::MessageReceived {
@@ -848,6 +895,7 @@ impl EventBus {
                         created: Utc::now(),
                         typed: event,
                         aggregate: None,
+                        depth,
                     });
                     Ok(None)
                 }
@@ -855,10 +903,7 @@ impl EventBus {
             BusEvent::System(se) => {
                 if se.is_persisted() {
                     let event_id = Uuid::new_v4();
-                    let stored_event_type = match &se {
-                        SystemEvent::DomainEvent { event_type, .. } => event_type.as_str(),
-                        _ => se.event_type(),
-                    };
+                    let stored_event_type = se.stored_event_type();
                     let mut tx = self.pool.begin().await?;
                     let seq = self
                         .persist(
@@ -879,6 +924,7 @@ impl EventBus {
                         created: Utc::now(),
                         typed: event,
                         aggregate: None,
+                        depth,
                     });
                     Ok(Some(EmitResult { event_id, seq }))
                 } else {
@@ -896,6 +942,7 @@ impl EventBus {
                             created: Utc::now(),
                             typed: event,
                             aggregate: None,
+                            depth,
                         });
                     }
                     Ok(None)

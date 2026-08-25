@@ -257,5 +257,6 @@ below they do apply to engine-spawned sessions.
 `claude` launch in this repo**. The engine passes `--allowedTools` when it
 spawns a session, which overrides settings.json permission rules entirely; the
 compiled default is empty and the effective list comes from
-`~/.lucidos/cc-allowed-tools`. See `DEFAULT_CC_ALLOWED_TOOLS` in
-`crates/lucidos-engine/src/engine/claude_code/mod.rs`.
+`<workspace>/.lucidos/cc-allowed-tools`, which is **per workspace** (ADR 0095):
+a grant made in one workspace is asked again in the next. See `GrantFile` in
+`crates/lucidos-engine/src/core/grants/mod.rs`.

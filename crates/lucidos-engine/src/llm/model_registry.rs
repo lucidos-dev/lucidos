@@ -12,10 +12,10 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Which provider backend serves a model. `OpenAi`, `OpenRouter`, `XAi` and
-/// `Local` all speak the OpenAI Chat Completions wire format but are distinct
-/// backends (different base URL / key / headers). Each maps to its own provider
-/// instance in [`crate::llm::routing::RoutingProvider`].
+/// Which provider backend serves a model. `OpenAi`, `OpenRouter`, `XAi`,
+/// `OpenCodeFree` and `Local` all speak the OpenAI Chat Completions wire format
+/// but are distinct backends (different base URL / key / headers). Each maps to
+/// its own provider instance in [`crate::llm::routing::RoutingProvider`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Vertex,
@@ -27,6 +27,11 @@ pub enum ProviderKind {
     /// (`grok-4.6`); the same models via OpenRouter carry its `x-ai/` prefix and
     /// are separate rows on [`Self::OpenRouter`].
     XAi,
+    /// OpenCode's free tier on the Zen relay (`https://opencode.ai/zen/v1`),
+    /// served anonymously. The only backend with no credential at all: the relay
+    /// rejects an unrecognized bearer, so the request carries no `Authorization`
+    /// header. Off unless the user opts in.
+    OpenCodeFree,
     /// A generic OpenAI-compatible local server (Ollama / LM Studio / vLLM /
     /// llama.cpp), base URL configurable.
     Local,
@@ -43,6 +48,7 @@ impl ProviderKind {
             "openai" => Self::OpenAi,
             "openrouter" => Self::OpenRouter,
             "xai" => Self::XAi,
+            "opencode-free" => Self::OpenCodeFree,
             "local" => Self::Local,
             _ => Self::Vertex,
         }
@@ -58,6 +64,7 @@ impl ProviderKind {
             Self::OpenAi => "openai",
             Self::OpenRouter => "openrouter",
             Self::XAi => "xai",
+            Self::OpenCodeFree => "opencode-free",
             Self::Local => "local",
         }
     }
@@ -251,6 +258,10 @@ mod tests {
         assert_eq!(ProviderKind::parse("openai"), ProviderKind::OpenAi);
         assert_eq!(ProviderKind::parse("openrouter"), ProviderKind::OpenRouter);
         assert_eq!(ProviderKind::parse("xai"), ProviderKind::XAi);
+        assert_eq!(
+            ProviderKind::parse("opencode-free"),
+            ProviderKind::OpenCodeFree
+        );
         assert_eq!(ProviderKind::parse("local"), ProviderKind::Local);
         assert_eq!(ProviderKind::parse("vertex"), ProviderKind::Vertex);
         assert_eq!(ProviderKind::parse("something-new"), ProviderKind::Vertex);
@@ -267,6 +278,7 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderKind::OpenRouter,
             ProviderKind::XAi,
+            ProviderKind::OpenCodeFree,
             ProviderKind::Local,
         ] {
             assert_eq!(ProviderKind::parse(kind.as_str()), kind, "{kind:?}");
@@ -321,6 +333,31 @@ mod tests {
         // shapes, so it falls back to Vertex (documented limitation).
         assert_eq!(
             provider_kind_for(&empty(), "z-ai/glm-5.2"),
+            ProviderKind::Vertex
+        );
+    }
+
+    /// The keyless free ids carry no shared shape, so the registry row is the
+    /// only thing that routes them. A missing row must not land them on a
+    /// provider that would need a credential.
+    #[test]
+    fn free_tier_ids_route_by_exact_hit_only() {
+        let reg = registry(&[
+            ("laguna-s-2.1-free", ProviderKind::OpenCodeFree),
+            ("x-preview-f-free", ProviderKind::OpenCodeFree),
+        ]);
+        assert_eq!(
+            provider_kind_for(&reg, "laguna-s-2.1-free"),
+            ProviderKind::OpenCodeFree
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "x-preview-f-free"),
+            ProviderKind::OpenCodeFree
+        );
+        // No `-free` suffix rule: an id absent from the table takes the same
+        // documented Vertex fallback every unshaped id takes.
+        assert_eq!(
+            provider_kind_for(&empty(), "laguna-s-2.1-free"),
             ProviderKind::Vertex
         );
     }
@@ -397,6 +434,11 @@ mod tests {
         assert_eq!(context_window_from_prefix("claude-opus-4-7[1m]"), 1_000_000);
         assert_eq!(context_window_from_prefix("claude-opus-4-7"), 200_000);
         assert_eq!(context_window_from_prefix("claude-sonnet-4-6"), 200_000);
+        // Sonnet 5 stays 200k HERE even though a Claude Code session on it runs
+        // 1M. This map answers for the request LUCIDOS makes, which sends no
+        // 1M beta for a bare id. The coding-agent answer is declared on the
+        // backend's own picker row (`runtime::coding_agent_context_window`).
+        assert_eq!(context_window_from_prefix("claude-sonnet-5"), 200_000);
         assert_eq!(context_window_from_prefix("gpt-5"), 400_000);
         assert_eq!(context_window_from_prefix("unknown-model"), 200_000);
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay, toasts } from '../store';
+import { triggers, historicalTriggers, selectedTriggerIds, panelOverlay, toasts, triggerScrollTarget } from '../store';
 import { makeTrigger } from '../__tests__/fixtures';
 
 const STORAGE_KEY = 'lucidos-selected-trigger-ids';
@@ -21,12 +21,13 @@ vi.mock('../../api/client', () => ({
 // split on desktop), NOT an ad-hoc isMobile()+navigateToPane('content') that
 // only handles mobile. See `.claude/rules/frontend.md`.
 // Use vi.hoisted to declare the spy BEFORE vi.mock's hoisted call needs it.
-const { mockRevealContentPane } = vi.hoisted(() => ({
+const { mockRevealContentPane, mockSetActiveMenu } = vi.hoisted(() => ({
   mockRevealContentPane: vi.fn(),
+  mockSetActiveMenu: vi.fn(),
 }));
 vi.mock('./pane', () => ({ revealContentPane: mockRevealContentPane, navigateToPane: vi.fn() }));
 
-vi.mock('./menu', () => ({ setActiveMenu: vi.fn() }));
+vi.mock('./menu', () => ({ setActiveMenu: mockSetActiveMenu }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
 
 const { pruneStaleSelectedTriggerIds, submitTrigger, navigateToTrigger } = await import('./triggers');
@@ -217,6 +218,69 @@ describe('submitTrigger: the trigger model and reasoning effort', () => {
   });
 });
 
+describe('submitTrigger surfaces the engine warnings', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    toasts.value = [];
+    panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 't1' } };
+    triggers.value = { status: 'loaded', data: [] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    mockCreateTrigger.mockReset();
+    mockUpdateTrigger.mockReset();
+    mockListTriggers.mockReset().mockResolvedValue({ triggers: [] });
+  });
+
+  const base = {
+    name: 'Digest',
+    run: { type: 'intent', intent: 'summarize' } as const,
+    cronExpressions: ['0 0 8 * * *'],
+    goToReview: false,
+    sideEffectGrant: [],
+    model: null,
+    reasoningEffort: null,
+  };
+
+  it('toasts an event-type warning on create, so a typo is caught at save time', async () => {
+    // A trigger armed on a type nobody has emitted looks armed and never fires.
+    // A warning nobody reads is the same bug one layer up.
+    mockCreateTrigger.mockResolvedValue({
+      success: true,
+      warnings: ['ReleaseFinnished has never been emitted in this workspace.'],
+    });
+
+    const ok = await submitTrigger({ ...base, on: [{ event_type: 'ReleaseFinnished' }] });
+
+    expect(ok).toBe(true);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].type).toBe('warning');
+    expect(toasts.value[0].message).toContain('ReleaseFinnished');
+  });
+
+  it('toasts both families on update, the schedule one and the event one', async () => {
+    mockUpdateTrigger.mockResolvedValue({
+      success: true,
+      cron_preview: { next_runs: [], warnings: ['Day-of-month and day-of-week are OR-ed.'] },
+      warnings: ['OrderShiped has never been emitted in this workspace.'],
+    });
+
+    await submitTrigger({ ...base, triggerId: 't1', on: [{ event_type: 'OrderShiped' }] });
+
+    // Toasts prepend, so the column reads newest first and the cron one is
+    // last.
+    expect(toasts.value.map(t => t.type)).toEqual(['warning', 'warning']);
+    expect(toasts.value[0].message).toContain('OrderShiped');
+    expect(toasts.value[1].message).toContain('Day-of-month');
+  });
+
+  it('stays quiet when the engine sends no warnings', async () => {
+    mockCreateTrigger.mockResolvedValue({ success: true });
+
+    await submitTrigger({ ...base, on: [{ event_type: 'ChangeProposed' }] });
+
+    expect(toasts.value).toHaveLength(0);
+  });
+});
+
 describe('navigateToTrigger pane reveal', () => {
   beforeEach(() => {
     mockRevealContentPane.mockClear();
@@ -274,5 +338,50 @@ describe('navigateToTrigger stale-cache reconfirm', () => {
     // Names the id AND where the navigate came from — never a bare generic.
     expect(toasts.value[0].message).toContain('gone-id');
     expect(toasts.value[0].message).toContain('thread "X"');
+  });
+});
+
+describe('navigateToTrigger lands on the row, not the edit form', () => {
+  beforeEach(() => {
+    mockRevealContentPane.mockClear();
+    mockSetActiveMenu.mockClear();
+    mockListTriggers.mockReset();
+    toasts.value = [];
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 't1', name: 'X' })] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    panelOverlay.value = null;
+    triggerScrollTarget.value = null;
+  });
+
+  it('switches to the Triggers panel with NO overlay and stamps the scroll target', async () => {
+    // The row carries Run once, the pause toggle and the last-run chip, which
+    // is what "here is your trigger" points at. The edit form carries none of
+    // them, and it is one tap away from the row.
+    await navigateToTrigger('t1');
+
+    expect(mockSetActiveMenu).toHaveBeenCalledWith('triggers');
+    expect(triggerScrollTarget.value).toBe('t1');
+  });
+
+  it('closes an edit form left open on another trigger', async () => {
+    panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 'other' } };
+
+    await navigateToTrigger('t1');
+
+    // setActiveMenu is called with no overlay argument, so its `null` default
+    // clears whatever was open. Pinned because passing the form back would
+    // silently restore the old landing.
+    expect(mockSetActiveMenu).toHaveBeenCalledWith('triggers');
+    expect(mockSetActiveMenu.mock.calls[0]).toHaveLength(1);
+  });
+
+  it('stamps no scroll target when the trigger is genuinely gone', async () => {
+    triggers.value = { status: 'loaded', data: [] };
+    mockListTriggers.mockResolvedValue({ triggers: [] });
+
+    await navigateToTrigger('gone-id');
+
+    expect(triggerScrollTarget.value).toBeNull();
+    expect(mockSetActiveMenu).not.toHaveBeenCalled();
   });
 });

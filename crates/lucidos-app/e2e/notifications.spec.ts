@@ -127,6 +127,42 @@ test.describe('Notification detail does not auto-open', () => {
   });
 });
 
+test.describe('Notification row: jump, or read the card', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    clearNotifications();
+  });
+
+  test('the chevron opens the card even though it sits over the row button', async ({ page }) => {
+    await navigateToApp(page);
+
+    // A source event makes this a jumping row, which is the only kind that has
+    // a chevron. The thread need not exist: nothing here follows the jump.
+    await postNotification(page, {
+      title: 'Chevron reaches the card',
+      message: 'the row body jumps to the thread instead',
+      thread_id: randomUUID(),
+      event_id: randomUUID(),
+    });
+
+    await ensureMobileView(page, 'content');
+    await clickVisibleElement(page, '.notifications-bell');
+    await waitForVisibleElement(page, '.notification-item', 10_000);
+
+    // A REAL click, not the synthetic `el.click()` the helpers dispatch. The
+    // chevron is absolutely positioned over the row button, so only hit-testing
+    // proves the tap reaches it rather than the row underneath.
+    const chevron = page.locator('.notification-row-detail-btn:visible').first();
+    await expect(chevron).toBeVisible({ timeout: 10_000 });
+    await chevron.click();
+
+    await waitForVisibleElement(page, '.notification-detail-body', 10_000);
+    await expect(page.locator('.notification-detail-body:visible').first()).toContainText(
+      'the row body jumps to the thread instead',
+    );
+  });
+});
+
 test.describe('Notifications infinite scroll', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
@@ -229,14 +265,13 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
       event_id: firstEventId,
     });
 
-    // The reported surface: the in-app notifications panel → the notification's
-    // detail panel → its "Open thread" action.
+    // The reported surface: the in-app notifications panel. The row honours the
+    // notification's own tap. A notification naming a source event carries a
+    // derived navigate tap, so one click lands in the thread.
     await ensureMobileView(page, 'content');
     await clickVisibleElement(page, '.notifications-bell');
     await waitForVisibleElement(page, '.notification-item', 10_000);
     await clickVisibleElement(page, '.notification-item', 'Jump to first message');
-    await waitForVisibleElement(page, '.notification-detail-actions button.action-btn', 10_000);
-    await clickVisibleElement(page, '.notification-detail-actions button.action-btn', 'Open thread');
 
     // The thread lazy-loads; wait for its exchanges to render.
     await ensureMobileView(page, 'thread');
@@ -274,9 +309,9 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     // observer is created AFTER scrollToEventAndPulse's. It therefore fired
     // last and snapped back to the saved offset, so a deep-link landed there
     // instead of on the source event. An already-focused thread does not re-run
-    // useScrollMemory, which is why the scroll worked only in that case. Every
-    // surface shares the path (inbox detail panel, in-app toast, push), and the
-    // detail panel reproduces it deterministically.
+    // useScrollMemory, which is why the scroll worked only in that case. All
+    // four surfaces share one router (inbox row, in-app toast, web push, native
+    // banner), and the inbox row reproduces it deterministically.
     seeded = seedTallChatThread(16);
     const { threadId, lastEventId } = seeded;
 
@@ -301,8 +336,6 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     await clickVisibleElement(page, '.notifications-bell');
     await waitForVisibleElement(page, '.notification-item', 10_000);
     await clickVisibleElement(page, '.notification-item', 'Jump to last message');
-    await waitForVisibleElement(page, '.notification-detail-actions button.action-btn', 10_000);
-    await clickVisibleElement(page, '.notification-detail-actions button.action-btn', 'Open thread');
 
     await ensureMobileView(page, 'thread');
     await waitForExchangeCount(page, 16, 15_000);

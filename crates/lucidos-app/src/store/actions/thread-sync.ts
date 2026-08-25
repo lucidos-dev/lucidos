@@ -1,7 +1,7 @@
 import { API } from '../../api/client';
 import type { Change } from '../../api/client';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
@@ -33,7 +33,7 @@ import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences } from './preferences';
-import { loadArtifacts } from './artifacts';
+import { loadArtifacts, invalidateFilePreview } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
 import { clearWipIfMatches } from './wipPreview';
 import { openCredentialRequest } from './credentials';
@@ -56,8 +56,13 @@ import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 import { errorDetail } from '../../utils/errorDetail';
 import { handleNavigationRequest, describeNavTarget } from './navigation-request';
+import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
 import type { EmbeddingModelStatus } from '../../api/types';
+
+/** Keyed so a second failure replaces the first instead of stacking, and so the
+ *  tap can dismiss the toast it just acted on. */
+const BACKUP_FAILED_TOAST_KEY = 'backup-failed';
 
 /** The nil UUID the engine stamps on a thread-less `NavigationRequested`. The
  *  SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs) emits it, being
@@ -421,7 +426,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // events (with seq) justify creating a new thread entry. Side effects
     // (e.g. CodingAgentThreadSpawned creating a child thread) still run.
     if (seq === null) {
-      handleTransientSideEffects(event, threadId);
+      handleTransientSideEffects(event, threadId, eventId);
       return;
     }
     // Infer source from event type — coding-agent events mean claude_code, not chat
@@ -508,10 +513,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     forgetThreadEventsFailures(threadId);
   }
 
-  // seq from SSE: present (number > 0) for persisted events, absent for transient
-  const effectiveSeq = seq ?? null;
-
-  const handled = handleEvent(map, threadId, effectiveSeq, event, created, eventId, aggregate);
+  // seq from SSE: present (number > 0) for persisted events, null for transient
+  const handled = handleEvent(map, threadId, seq, event, created, eventId, aggregate);
   if (handled.metaChanged) metaChanged = true;
   if (event.type === 'QueuedMessageRemoved') {
     const key = queuedMessageRemovalKey(threadId, event.removed_message_id);
@@ -606,7 +609,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
 
   // Dispatch side effects for transient events
-  handleTransientSideEffects(event, threadId);
+  handleTransientSideEffects(event, threadId, eventId);
 
   // Manage optimistic "Apply Now" phase transitions.
   // 'requesting' → 'applying' on ChangeProposed (backend started the merge).
@@ -916,6 +919,10 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // envelopes. This branch is the one that fires for the live SystemEvent
       // SSE frame.
       void refreshAppUI(data.app_id as string | undefined);
+      // The running iframe is not the only surface reading those files. An
+      // open app source editor is too, and it must re-read rather than save
+      // over the merge. See `appSourceEpoch`.
+      appSourceEpoch.value++;
       break;
 
     case 'FrontendUpdateDeferred':
@@ -1070,7 +1077,16 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
 
     case 'BackupFailed': {
       backupProgress.value = null;
-      showToast(`Backup failed: ${String(data.error ?? 'Unknown error')}`, 'error');
+      // Tapping the toast opens the Backup page: the health card, the error and
+      // Grant access all live there. Without it the toast names a problem and
+      // leaves the user to find the page.
+      showToast(`Backup failed: ${String(data.error ?? 'Unknown error')}`, 'error', {
+        key: BACKUP_FAILED_TOAST_KEY,
+        onClick: () => {
+          dismissToast(BACKUP_FAILED_TOAST_KEY);
+          openBackupSettings();
+        },
+      });
       backupStatusVersion.value++;
       break;
     }
@@ -1183,7 +1199,14 @@ function clearComposeIfUnfocused(threadId: string): void {
 }
 
 /** Tool names whose `ToolResult` means `data/` may have changed, so the Files
- *  list and any open file preview must re-read.
+ *  list must re-read.
+ *
+ *  This governs the LIST only. Whether the open file preview re-reads is a
+ *  separate question, answered per path by `invalidateFilePreview`: a write to
+ *  something else must not restart a video the user is watching. `bash_output`
+ *  and `BackgroundBashCompleted` name no path anywhere, so they refresh the
+ *  list and leave the preview alone. The header Refresh button covers a log
+ *  file a background job is still appending to.
  *
  *  The five file tools are the obvious members. `bash_output` is here for a
  *  different reason: a background task writes to `data/` UNSTAGED by design, so
@@ -1195,17 +1218,70 @@ function clearComposeIfUnfocused(threadId: string): void {
  *  writing to `data/`, which is `run_python`'s job. Every entry here costs a
  *  full `data/` walk server-side via `list_artifacts`, not worth paying after
  *  each curl and ls. A bash write to `data/` is tool misuse, and the header
- *  Refresh button covers it. */
+ *  Refresh button covers it.
+ *
+ *  Chat links no longer depend on this list being warm. `linkifyPaths` resolves
+ *  a full path by shape (ADR 0038), which is what stopped a bash-placed file
+ *  from rendering flat. The Files panel and the open preview still do. */
 const ARTIFACT_REFRESHING_TOOLS = [
   'write_file', 'edit_file', 'copy_file', 'delete_file', 'import_file', 'bash_output',
 ];
+
+/** Which argument of a file tool names the path it WRITES, data-relative.
+ *
+ *  Every value here has to be in the same frame the preview addresses a file
+ *  in, or it silently matches nothing. `copy_file` takes a source too, and only
+ *  its destination (declared "under data/") can be the file on screen.
+ *
+ *  `import_file` is deliberately absent, though it looks like a member. Its
+ *  destination is relative to `artifacts/imported/` rather than to `data/`, and
+ *  it is optional, so the engine often derives the name. `ArtifactImported`
+ *  announces the path it settled on, which is the one worth trusting. */
+const FILE_TOOL_TARGET_ARG: Record<string, string> = {
+  write_file: 'path',
+  edit_file: 'path',
+  delete_file: 'path',
+  copy_file: 'destination',
+};
+
+/** The path a file tool is about to write, remembered from its `ToolCalled`
+ *  until the paired `ToolResult` says the write landed.
+ *
+ *  A `ToolResult` carries no path of its own, and the engine announces one
+ *  only for `artifacts/` writes (`engine/tools/files.rs`). So this is how an
+ *  open `knowhow/` or `apps/` preview learns that its own file changed.
+ *
+ *  One slot per thread, because chat tools run one at a time inside the
+ *  agentic loop. Every `ToolResult` clears the slot, so a path recorded for
+ *  one call can never be attributed to a later one. A turn interrupted between
+ *  the call and its result leaves one short string behind. */
+const pendingFileToolWrite = new Map<string, { eventId?: string; path: string }>();
+
+/** Take the thread's pending write and invalidate the preview for it.
+ *
+ *  Both ids present and different means the result belongs to some other call,
+ *  so the recorded path proves nothing about it. */
+function consumePendingFileToolWrite(threadId: string, toolCalledEventId?: string): void {
+  const pending = pendingFileToolWrite.get(threadId);
+  pendingFileToolWrite.delete(threadId);
+  if (!pending) return;
+  if (toolCalledEventId && pending.eventId && toolCalledEventId !== pending.eventId) return;
+  invalidateFilePreview(pending.path);
+}
 
 /** Handle transient ThreadEvent types that trigger side effects (modals, refreshes).
  *
  *  `sourceThreadId` is the thread the event was emitted on. It scopes
  *  `NavigationRequested`, so a navigate from a sibling thread cannot hijack
- *  the page the user is viewing. */
-function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceThreadId: string): void {
+ *  the page the user is viewing.
+ *
+ *  `eventId` is this event's own id, used to pair a `ToolResult` back to the
+ *  `ToolCalled` whose path it wrote. */
+function handleTransientSideEffects(
+  event: ThreadEvent | TransientEvent,
+  sourceThreadId: string,
+  eventId?: string,
+): void {
   switch (event.type) {
     case 'CredentialPromptRequested':
       try {
@@ -1267,20 +1343,44 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
     // permission card (rendered in ChatExchange via PermissionCard), replacing
     // the old transient `McpConsentPromptRequested` + showConfirm modal.
 
+    // Remember where a file tool is about to write, for the ToolResult arm
+    // below. Any other tool clears the slot, so it always holds the newest
+    // call and a stale path can never outlive the call that recorded it.
+    case 'ToolCalled': {
+      const call = event as { name: string; args: unknown };
+      const arg = FILE_TOOL_TARGET_ARG[call.name];
+      const args = call.args as Record<string, unknown> | null | undefined;
+      // `edit_file` takes an optional `repo`, and with it `path` is relative to
+      // that repository's root instead of to `data/`. Such an edit writes
+      // nothing under `data/` at all, so its path says nothing about the file
+      // the preview shows.
+      const dataRelative = args?.repo === undefined;
+      const path = arg && dataRelative && typeof args?.[arg] === 'string'
+        ? args[arg] as string
+        : null;
+      if (path) pendingFileToolWrite.set(sourceThreadId, { eventId, path });
+      else pendingFileToolWrite.delete(sourceThreadId);
+      break;
+    }
+
     // A tool call that may have changed `data/`. `loadArtifacts` refreshes the
-    // Files list AND bumps `artifactRevision`, which cache-busts an open file
-    // preview. This arm is what makes an agent edit show up on its own.
-    // loadArtifacts sets `artifacts` to `failed` via toFailed on error.
+    // Files list; the preview re-reads only if the path this tool wrote is the
+    // one it shows. Together they are what makes an agent edit appear on its
+    // own. loadArtifacts sets `artifacts` to `failed` via toFailed on error.
     case 'ToolResult': {
-      const name = (event as { name: string }).name;
-      if (ARTIFACT_REFRESHING_TOOLS.includes(name)) {
-        void loadArtifacts();
+      const result = event as { name: string; tool_called_event_id?: string };
+      if (!ARTIFACT_REFRESHING_TOOLS.includes(result.name)) {
+        pendingFileToolWrite.delete(sourceThreadId);
+        break;
       }
+      void loadArtifacts();
+      consumePendingFileToolWrite(sourceThreadId, result.tool_called_event_id);
       break;
     }
 
     // The background task finished, so its last writes have landed. Same
-    // reasoning as `bash_output` in ARTIFACT_REFRESHING_TOOLS above.
+    // reasoning as `bash_output` in ARTIFACT_REFRESHING_TOOLS above, including
+    // that it names no path, so the open preview is left alone.
     case 'BackgroundBashCompleted':
       void loadArtifacts();
       break;

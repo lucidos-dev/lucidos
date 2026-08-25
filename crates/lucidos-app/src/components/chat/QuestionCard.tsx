@@ -278,8 +278,8 @@ function OptionButton({
       type="button"
       class="question-option"
       aria-pressed={isToggle ? pressed : undefined}
-      onPointerDown={e => gate.down(e.clientX, e.clientY)}
-      onPointerMove={e => gate.move(e.clientX, e.clientY)}
+      onPointerDown={e => gate.down(e)}
+      onPointerMove={e => gate.move(e)}
       onPointerCancel={() => gate.cancel()}
       onClick={() => {
         if (!gate.isTap()) return;

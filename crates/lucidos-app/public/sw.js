@@ -57,7 +57,10 @@ self.addEventListener('install', (event) => {
       try {
         const shellKey = new Request(self.location.origin + SCOPE_PATH);
         const resp = await fetch(self.location.origin + SCOPE_PATH, { cache: 'reload' });
-        if (resp && resp.ok && !resp.redirected) {
+        // Never the pairing screen (see isPairingShell). Installing while
+        // unpaired would otherwise freeze a pairing form in as the offline
+        // shell, and nothing evicts it until the build id moves.
+        if (resp && resp.ok && !resp.redirected && !isPairingShell(resp)) {
           const cache = await caches.open(SHELL_CACHE);
           await cache.put(shellKey, resp.clone());
         }
@@ -231,6 +234,14 @@ function isHtmlResponse(response) {
   return typeof ct === 'string' && ct.includes('text/html');
 }
 
+// True if the gateway answered with the pairing screen rather than the app.
+// It marks that body `X-Lucidos-Pairing` (gateway `serve_pairing_shell`) for
+// exactly this: the response is an ordinary 200, so nothing else tells it apart
+// from the shell, and caching it would outlive the pairing it exists for.
+function isPairingShell(response) {
+  return !!(response && response.headers && response.headers.get('x-lucidos-pairing'));
+}
+
 // Cache-first for immutable content (content-addressed blobs, content-hashed app
 // bundles): serve from the Cache API on a hit with no network, otherwise fetch
 // (with the iOS SW-restart retry) and populate the cache off the response path.
@@ -282,9 +293,28 @@ async function networkFirstShell(request) {
     if (cached) return cached;
     throw err;
   }
+  // The gateway answers an unpaired navigation with the PAIRING screen, at the
+  // url we asked for, marked `X-Lucidos-Pairing` (gateway `serve_pairing_shell`).
+  // It is a 200 and not redirected, so the branch below would pin it as the app
+  // shell. An offline launch after pairing would then open on a form the device
+  // no longer needs. Show it, cache nothing. Same contract as the boot splash.
+  if (isPairingShell(response)) {
+    return response;
+  }
   if (response && response.ok && !response.redirected) {
     cache.put(shellKey, response.clone()).catch(() => {});
     return response;
+  }
+  // A redirected navigation. Hand the browser a real redirect rather than the
+  // cached shell: replaying a followed response for a navigation throws, and the
+  // cached shell would boot an app whose every call fails. Nothing in the
+  // gateway 3xxs an unpaired navigation now, so this guards whatever else might.
+  //
+  // `response.url` is gated because `Response.redirect` throws on anything that
+  // is not an absolute URL. A throw here fails the navigation outright, which is
+  // worse than the cached-shell fallback below that this branch replaces.
+  if (response && response.redirected && response.url) {
+    return Response.redirect(response.url, 302);
   }
   // The gateway answers a navigation to a stopped / cold-booting workspace with a
   // 503 (ADR 0014 §11): the branded boot SPLASH (Retry-After + meta-refresh) for

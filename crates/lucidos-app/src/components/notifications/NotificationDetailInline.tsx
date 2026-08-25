@@ -88,6 +88,19 @@ export function NotificationDetailInline() {
 
   function handleBodyClick(e: MouseEvent) {
     const target = e.target as HTMLElement;
+    // A `[name](trigger:<id>)` the agent wrote into the notification body. Same
+    // destination as the Open trigger button above, so the same call.
+    const triggerLink = target.closest<HTMLAnchorElement>('a.trigger-link');
+    if (triggerLink) {
+      e.preventDefault();
+      const linkedTriggerId = triggerLink.dataset.triggerId;
+      if (!linkedTriggerId) {
+        showToast('Cannot open trigger link: the link is missing its trigger id', 'error');
+        return;
+      }
+      void navigateToTrigger(linkedTriggerId, 'a notification');
+      return;
+    }
     const link = target.closest<HTMLAnchorElement>('a.app-link');
     if (!link) return;
     e.preventDefault();

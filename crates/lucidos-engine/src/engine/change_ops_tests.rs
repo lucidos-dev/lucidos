@@ -849,3 +849,147 @@ fn api_handlers_never_drive_a_coding_agent_session_directly() {
         );
     }
 }
+
+// ── An unanswerable `git worktree list` is not a "no worktree" ──
+
+mod unknown_worktree_lookup_is_not_a_no {
+    //! Regression for the class in `.claude/rules/rust.md`: a probe that could
+    //! not run must never authorize a destructive arm.
+    //!
+    //! `find_worktree_for_branch` used to answer `None` for a spawn failure, a
+    //! non-zero exit and its 30s timeout, all routine on a saturated host. Apply
+    //! read that as "nothing holds the branch" and force-removed the hardening
+    //! worktree; Discard read it the same way and moved the branch ref.
+    //!
+    //! Both take the lookup as a parameter now, so these drive the `Unknown` arm
+    //! against a real repo. A bogus root would prove nothing, since the git
+    //! command would have failed against it anyway.
+
+    use super::super::apply::resolve_harden_worktree;
+    use super::super::discard::settle_discarded_branch;
+    use super::{git_cmd, rev_parse};
+    use crate::engine::git_ops::WorktreeLookup;
+    use crate::test_support::make_repo_and_worktree;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    const BRANCH: &str = "lucidos-claude-code-repo-add-streaks-1c0ffee0";
+    /// A branch with a ref but no worktree: what a true `NotFound` looks like.
+    const UNHELD: &str = "lucidos-claude-code-repo-no-tree-2d0ffee0";
+
+    /// A repo whose `harden-<id>` directory is a live worktree with uncommitted
+    /// work in it. That is the state a second Apply arrives into while the first
+    /// one's hardening session is still running.
+    async fn repo_with_live_harden_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, repo, _wt) = make_repo_and_worktree(BRANCH).await;
+        git_cmd(&["branch", UNHELD, "main"], &repo).await.unwrap();
+
+        let harden = tmp.path().join("harden-1c0ffee0");
+        git_cmd(
+            &[
+                "worktree",
+                "add",
+                harden.to_str().unwrap(),
+                "-b",
+                "harden-work",
+            ],
+            &repo,
+        )
+        .await
+        .unwrap();
+        std::fs::write(harden.join("uncommitted.txt"), "hardening in progress").unwrap();
+        (tmp, repo, harden)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_lookup_never_clears_the_hardening_worktree() {
+        let (_tmp, repo, harden) = repo_with_live_harden_worktree().await;
+
+        let err = resolve_harden_worktree(&repo, BRANCH, &harden, WorktreeLookup::Unknown)
+            .await
+            .expect_err("an unanswerable lookup must refuse, not clear the tree");
+        assert!(
+            err.contains("Try Apply again"),
+            "the refusal must say the click is retryable; got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(harden.join("uncommitted.txt")).unwrap(),
+            "hardening in progress",
+            "a live hardening session's uncommitted work must survive the refusal"
+        );
+    }
+
+    /// The other side of the same arm, so the refusal above is not vacuous.
+    /// `NotFound` really does force-remove the directory before recreating it.
+    #[tokio::test]
+    async fn a_not_found_lookup_clears_and_recreates_the_hardening_worktree() {
+        let (_tmp, repo, harden) = repo_with_live_harden_worktree().await;
+
+        let path = resolve_harden_worktree(&repo, UNHELD, &harden, WorktreeLookup::NotFound)
+            .await
+            .expect("no worktree holds the branch, so a fresh one is created");
+
+        assert_eq!(path, harden, "the fresh tree lands at the path Apply chose");
+        assert!(
+            !harden.join("uncommitted.txt").exists(),
+            "NotFound clears the tree, which is what Unknown must never do"
+        );
+    }
+
+    /// A branch one commit ahead of main with its worktree already gone. Git
+    /// refuses to force-update a branch some worktree holds, so this is the
+    /// state where `git branch -f` really would drop the commit.
+    async fn repo_with_orphan_branch_ahead_of_main() -> (tempfile::TempDir, PathBuf) {
+        let (tmp, repo, wt) = make_repo_and_worktree(BRANCH).await;
+        std::fs::write(wt.join("work.txt"), "the only copy").unwrap();
+        git_cmd(&["add", "."], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: work"], &wt).await.unwrap();
+        git_cmd(
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+            &repo,
+        )
+        .await
+        .unwrap();
+        (tmp, repo)
+    }
+
+    #[tokio::test]
+    async fn an_unknown_lookup_never_moves_the_discarded_branch_ref() {
+        let (_tmp, repo) = repo_with_orphan_branch_ahead_of_main().await;
+
+        let before = rev_parse(&repo, BRANCH).await;
+        assert_ne!(
+            before,
+            rev_parse(&repo, "main").await,
+            "setup: the branch holds a commit main does not"
+        );
+
+        settle_discarded_branch(&repo, BRANCH, Uuid::new_v4(), WorktreeLookup::Unknown)
+            .await
+            .expect("the change is still discarded; only the ref move is skipped");
+
+        assert_eq!(
+            rev_parse(&repo, BRANCH).await,
+            before,
+            "git branch -f moves a ref with no old-value guard, so an unanswerable \
+             lookup must not run it over the only copy of the work"
+        );
+    }
+
+    /// The counterpart, so the skip above is not vacuous. A real `NotFound`
+    /// still resets the ref, and on this same repo it succeeds.
+    #[tokio::test]
+    async fn a_not_found_lookup_still_resets_the_discarded_branch_ref() {
+        let (_tmp, repo) = repo_with_orphan_branch_ahead_of_main().await;
+
+        settle_discarded_branch(&repo, BRANCH, Uuid::new_v4(), WorktreeLookup::NotFound)
+            .await
+            .expect("git branch -f runs when git said no worktree holds the branch");
+
+        assert_eq!(
+            rev_parse(&repo, BRANCH).await,
+            rev_parse(&repo, "main").await,
+            "the discarded branch is back at main"
+        );
+    }
+}

@@ -122,7 +122,7 @@ struct TokenResponse {
 /// the streaming request. A token exchange is one small POST; 60s (the value
 /// `llm::web_search` uses for its outbound calls) is far past any real latency,
 /// and on timeout `fetch_access_token` still falls back to the gcloud path.
-const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Exchange the refresh token for a fresh access token. Errors carry the HTTP
 /// status + Google's `error_description` body (which never contains the secrets

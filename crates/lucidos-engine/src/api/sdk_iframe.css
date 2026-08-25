@@ -24,6 +24,11 @@
     --radius-lg: 0.5rem;
     --transition: 0.15s ease;
 
+    /* Z-index for the shared #tooltip rules appended from shared-components.css.
+       Mirrors base.css, whose wider scale the iframe has no use for. Keep in
+       sync with base.css. It must also clear .lucidos-select-menu (1000). */
+    --z-tooltip: 10000;
+
     /* Transition durations — mirror base.css so the shared component classes
        below animate identically to the host. Keep in sync with base.css.
 

@@ -11,7 +11,7 @@
 
 /* Shell geometry, placement, the title bar and the close button all come
    from `.prompt-bar-popover*` in `styles/chat/prompt-bar-popover.css`, which
-   the subscription indicator beside it uses too, and which `chat.css` imports
+   the waiting indicator beside it uses too, and which `chat.css` imports
    FIRST so a surface's own width beats the shell's fit cap.
 
    Both bounds go through that fit cap. A bare `min-width` outranks `max-width`
@@ -20,6 +20,39 @@
 .todo-panel {
     min-width: min(14rem, var(--prompt-bar-popover-fit));
     max-width: min(22rem, var(--prompt-bar-popover-fit));
+}
+
+/* *Todo notes*: what the agent kept, above what it planned. Rendered only
+   under ADR 0085's context mode, which is where the block is load-bearing;
+   a list without notes renders exactly as it did before. Raised on
+   --bg-tertiary and separated by its own margin rather than a left stripe,
+   which `.claude/rules/frontend-css.md` forbids outright. */
+.todo-panel-notes {
+    margin: 0 0 0.625rem;
+    padding: 0.5rem 0.625rem;
+    background: var(--bg-tertiary, var(--bg-primary));
+    border-radius: 0.25rem;
+}
+
+.todo-panel-notes-label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+/* Notes are prose the model wrote, so newlines are meaningful and the block
+   has to be free to be tall. `pre-wrap` keeps its line breaks; `break-word`
+   stops a pasted path or URL widening the popover past its fit cap. */
+.todo-panel-notes-body {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.4;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
 }
 
 .todo-panel-list {
@@ -104,11 +137,12 @@
    pulsing. That is what `.progress-dot-waiting` does in a drawer row
    (chat/input-messages.css), and the `progress-pulse` keyframes here are
    literally that dot's, since keyframes are global. It used to be
-   --accent-yellow, justified as matching the *subscription indicator* beside
-   it, but that indicator lost its tinted state to ADR 0049 and is plain
-   --text-secondary now, so the yellow matched nothing: in this palette yellow
-   is the CAUTION tone, and a parked thread is not a caution (same call as
-   `.thread-info-dot-waiting`, which is --accent-notable rather than yellow).
+   --accent-yellow, justified as matching the *waiting indicator* beside it,
+   and it matched nothing: in this palette yellow is the CAUTION tone, and a
+   parked thread is not a caution (same call as `.thread-info-dot-waiting`,
+   which is --accent-notable rather than yellow). Nor can it borrow that
+   neighbour's accent, which is the one hue this button already spends, on
+   in-progress directly above.
 
    No `color` of its own, so waiting and idle are the same gray and MOTION is
    the whole difference: a moving glyph reads as "still going somewhere" in a

@@ -305,6 +305,26 @@ impl LucidosEngine {
         .await
     }
 
+    /// The thread an indexing job's LLM cost belongs to.
+    ///
+    /// `None` for an artifact, which no thread produced, and for an event row
+    /// with no `thread_id`. One primary-key lookup, next to an LLM round
+    /// trip, so the cost of asking does not register.
+    async fn source_thread_id(&self, source: &MemorySource) -> Option<Uuid> {
+        let MemorySource::Event { id } = source else {
+            return None;
+        };
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT thread_id FROM events WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or_else(|e| {
+                log!(@Memory, "Could not resolve the thread for event {}: {}", id, e);
+                None
+            })
+            .flatten()
+    }
+
     async fn index_memory_inner_impl(
         &self,
         source: MemorySource,
@@ -342,12 +362,11 @@ impl LucidosEngine {
         // probably has no facts (e.g., CSV exports, data files).
         let is_artifact = matches!(source, MemorySource::Artifact { .. });
         let mut used_fallback = false;
-        let memory_model =
-            crate::core::PreferenceStore::get(&self.pool, crate::core::PREF_MODEL_MEMORY)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+        let memory_call = crate::engine::aux_purpose::AuxCall::resolve(
+            &self.pool,
+            crate::engine::ContextPurpose::Memory,
+        )
+        .await;
         // Cloned, and hoisted out of the retry loop, so no `RwLock` guard is held
         // across the `extract_facts` await below. `user_language` is a
         // write-preferring `tokio::sync::RwLock`, so a read guard parked on a
@@ -357,39 +376,63 @@ impl LucidosEngine {
         // writer. Every other read site already clones.
         let language = self.user_language.read().await.clone();
         let facts: Vec<ExtractedFact> = if let Some(ref extractor) = self.extractor {
-            let mut facts = None;
-            for attempt in 1..=3u32 {
-                let lang_ref = if language.is_empty() {
-                    None
-                } else {
-                    Some(language.as_str())
-                };
-                match extractor
-                    .extract_facts(content, context, lang_ref, Some(&memory_model))
-                    .await
-                {
-                    Ok(f) if !f.is_empty() => {
-                        facts = Some(f);
-                        break;
-                    }
-                    Ok(_) => {
-                        if verbose {
-                            log!(@Memory, "Extraction returned no facts (attempt {}/3)", attempt);
+            // Extraction is billed to the thread the source event belongs to,
+            // so its cost lands where the conversation that caused it lives.
+            // An artifact has no thread and goes uncaptured, as does an event
+            // row predating the `thread_id` column. Resolved inside this
+            // branch: with no extractor there is no call to bill.
+            let capture = crate::engine::AuxCapture::for_thread(
+                &self.event_bus,
+                self.source_thread_id(&source).await,
+                crate::engine::ContextPurpose::Memory,
+            );
+            // The purpose's deadline bounds the WHOLE resample, not each call
+            // inside it. Three attempts, each carrying the provider's own
+            // retries, is exactly how a caller escapes a per-call bound.
+            let resample = async {
+                let mut facts = None;
+                for attempt in 1..=3u32 {
+                    let lang_ref = if language.is_empty() {
+                        None
+                    } else {
+                        Some(language.as_str())
+                    };
+                    match extractor
+                        .extract_facts(content, context, lang_ref, &memory_call, capture.as_ref())
+                        .await
+                    {
+                        Ok(f) if !f.is_empty() => {
+                            facts = Some(f);
+                            break;
                         }
-                    }
-                    Err(e) => {
-                        if verbose {
-                            log!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
+                        Ok(_) => {
+                            if verbose {
+                                log!(@Memory, "Extraction returned no facts (attempt {}/3)", attempt);
+                            }
                         }
-                        // Exponential backoff before next attempt (provider already retried
-                        // internally — this delay lets the rate limit window reset)
-                        if attempt < 3 {
-                            let delay = crate::llm::retry_delay(attempt, 2);
-                            tokio::time::sleep(delay).await;
+                        Err(e) => {
+                            if verbose {
+                                log!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
+                            }
+                            // Exponential backoff before the next attempt. The
+                            // provider already retried internally; this delay
+                            // lets the rate-limit window reset.
+                            if attempt < 3 {
+                                let delay = crate::llm::retry_delay(attempt, 2);
+                                tokio::time::sleep(delay).await;
+                            }
                         }
                     }
                 }
-            }
+                facts
+            };
+            let facts = match tokio::time::timeout(memory_call.deadline(), resample).await {
+                Ok(facts) => facts,
+                Err(_) => {
+                    log!(@Memory, "Extraction timed out ({:?}), falling back", memory_call.deadline());
+                    None
+                }
+            };
             match facts {
                 Some(f) => f,
                 None if is_artifact => {

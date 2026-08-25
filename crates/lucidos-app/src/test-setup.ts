@@ -38,6 +38,7 @@ if (typeof globalThis.document === 'undefined') {
       style: { setProperty: () => {}, getPropertyValue: () => '', removeProperty: () => {} },
       toggleAttribute: () => {},
       setAttribute: () => {},
+      getAttribute: () => null,
       removeAttribute: () => {},
       hasAttribute: () => false,
     },
@@ -144,4 +145,37 @@ if (typeof globalThis.matchMedia === 'undefined') {
 if (typeof globalThis.requestAnimationFrame === 'undefined') {
   (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
   (globalThis as any).cancelAnimationFrame = () => {};
+}
+// jsdom ships no `CSS` object at all, so every deep-link effect that builds a
+// selector through `CSS.escape` throws there instead of running. Without this a
+// test can only prove the effect STARTED, which is how a landing bug hides.
+// Follows the CSSOM serialize-an-identifier steps.
+if (typeof (globalThis as any).CSS === 'undefined') {
+  const hexEscape = (ch: string): string => `\\${ch.codePointAt(0)!.toString(16)} `;
+  (globalThis as any).CSS = {
+    escape(value: string): string {
+      const s = String(value);
+      let out = '';
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        const code = s.charCodeAt(i);
+        if (code === 0) { out += '�'; continue; }
+        const isDigit = code >= 0x30 && code <= 0x39;
+        if ((code >= 0x01 && code <= 0x1f) || code === 0x7f
+          || (i === 0 && isDigit)
+          || (i === 1 && isDigit && s.charCodeAt(0) === 0x2d)) {
+          out += hexEscape(ch);
+          continue;
+        }
+        if (i === 0 && code === 0x2d && s.length === 1) { out += `\\${ch}`; continue; }
+        if (code >= 0x80 || code === 0x2d || code === 0x5f || isDigit
+          || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) {
+          out += ch;
+          continue;
+        }
+        out += `\\${ch}`;
+      }
+      return out;
+    },
+  };
 }

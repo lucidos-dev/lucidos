@@ -65,6 +65,15 @@
          other way. */
     --header-mark-badge-offset: 0rem;
     --header-mark-badge-hit-reach: 0.75rem;
+    /* The unread count's box, on the opposite corner. Smaller than the base
+       `.badge` (0.875rem), because that one is sized for a roomy icon button
+       and here it covers most of a 1.6rem glyph. The count still has to be
+       READ, unlike the pending dot, so it keeps a line box and its padding. */
+    --header-mark-count-size: 0.75rem;
+    /* NO ring token here, deliberately. Both of the mark's badges are ringed
+       away from the glyph by `.app-header .badge` (panels/shell.css), the same
+       rule that paints every badge on the bar white. The fusing it fixes is a
+       property of the BAR, not of the mark, so the bell owns it too. */
 
     /* Connection cues, expressed as STRENGTH. Connected is the brand at full
        light, the same --header-fg an active control in the bar takes, because
@@ -168,16 +177,29 @@
  * line: hold the span when it fits, give way to the edge reserve when it does
  * not, never squeeze below the cluster's own natural width. (That is the same
  * fact `useHeaderActionCollapse` used to MEASURE for; it is expressible here
- * only because the trailing cluster is now a constant, see ContentHeaderActions.)
+ * only because the trailing cluster is now bounded, see ContentHeaderActions.)
  *
  * `e2e/mobile-threads-title-alignment.spec.ts` pins both the cross-pane
  * agreement and the clearance; any control added to either edge spends the
- * reserve. */
+ * reserve.
+ *
+ * VERTICALLY it spans the row instead of centring on it, and that is the same
+ * agreement on the other axis. `top: 50%` plus a `translateY(-50%)` places the
+ * box by its OWN height, so each row's chevrons inherited whatever rounding
+ * that row's tallest member produced: the thread row's box is the mark's
+ * 2.1rem, the content row's is a chevron's 1.75rem, and at the 18px mobile root
+ * WebKit landed the two 0.14px apart. That is a fifth of a device pixel on a
+ * phone, enough to shift the anti-aliasing of a hairline chevron, and the user
+ * saw it as the chevrons hopping as they swiped between panes. Spanning the row
+ * takes the box's own height out of the placement entirely, so flexbox centres
+ * the members against one identical box on all three rows. Pinned by
+ * e2e/mobile-threads-title-alignment.spec.ts. */
 .header-nav-cluster {
     position: absolute;
     left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
+    top: 0;
+    bottom: 0;
+    transform: translateX(-50%);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -268,6 +290,12 @@
     display: inline-flex;
     align-items: center;
     flex: 0 0 auto;
+    /* Half the difference between the host's box and the glyph, which IS the
+       glyph's corner at any tuning. Declared HERE rather than on a badge,
+       because both badges inherit it and place themselves against it: the state
+       one at the top corner, the count at the bottom. The rules below own the
+       reasoning; this owns the arithmetic. */
+    --brand-badge-corner: calc((100% - var(--header-mark-size)) / 2);
 }
 
 /* ON the mark, not beside it. The badge's own rules (panels/shell.css) put it
@@ -308,11 +336,48 @@
    `.badge` for the smaller mobile icon buttons. */
 .brand-mark-slot .badge.brand-badge {
     position: absolute;
-    --brand-badge-corner: calc((100% - var(--header-mark-size)) / 2);
     top: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
     right: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    /* This badge stays inside its host, so it keeps whatever veil the slot
+       carries. mobile.css drops the veil along with the corner it re-corners,
+       because a badge it has pushed onto the button's edge straddles the bar.
+       This one it never moves. */
+    --header-control-veil: inherit;
     /* The flex-slot lift and tuck, which mean nothing out of flow and would
        otherwise offset the corner placement above. */
+    margin: 0;
+}
+
+/* The UNREAD COUNT, on the mark's BOTTOM-right corner.
+   Same derived inset as the state badge above, so the two share one geometry
+   and neither names a size. What differs is which corner, and that is the whole
+   rule: the artwork's sparkle sits TOP-right (LucidosMarkIcon draws it inside a
+   `translate(13 13) scale(0.74)` group), so a badge parked there erases it and
+   leaves the brand as three plain squares. The state badge covers it too, but
+   only while a build runs or an update waits. A count is resident, so it takes
+   the corner the artwork can spare.
+   `top: auto` is required, not tidiness: the base `.badge` sets `top`, and an
+   absolutely positioned box given both `top` and `bottom` stretches between
+   them into a tall pill.
+   Compact, because the mark is 1.6rem of glyph and the full badge box covers
+   most of it. Doubled up (`.badge.brand-unread-badge`) for the specificity
+   reason the rule above documents. */
+.brand-mark-slot .badge.brand-unread-badge {
+    position: absolute;
+    top: auto;
+    bottom: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    right: calc(var(--brand-badge-corner) + var(--header-mark-badge-offset));
+    /* Inside its host too, for the reason the rule above gives. */
+    --header-control-veil: inherit;
+    min-width: var(--header-mark-count-size);
+    min-height: var(--header-mark-count-size);
+    line-height: var(--header-mark-count-size);
+    padding: 0 0.1875rem;
+    border-radius: 0.5rem;
+    /* The tap belongs to the mark underneath, which opens the menu holding the
+       matching rows. Same reason the ready badge is click-through below: this
+       is a positioned span over a SIBLING button, so its own taps would die. */
+    pointer-events: none;
     margin: 0;
 }
 
@@ -458,6 +523,15 @@
 @media (hover: hover) {
     .brand-mark:hover .brand-mark-glyph {
         color: var(--header-fg);
+    }
+
+    /* The row mark's badges are SIBLINGS of its button (HeaderMark.tsx). The
+       veil the button raises on itself never reaches them, so their rings
+       would stay bar-coloured over a washed square. Raise it on the slot the
+       three share. The cluster mark is not an `.icon-btn` and never washes, so
+       this leaves it alone. See --header-control-veil in panels/shell.css. */
+    .app-header .brand-mark-slot:has(.icon-btn:hover) {
+        --header-control-veil: var(--header-control-veil-hover);
     }
 }
 
@@ -924,9 +998,12 @@ div.brand-menu-ws-row {
     white-space: nowrap;
 }
 
-/* This workspace's unread count. The same blue every count in the app uses (see
+/* A workspace's unread count. The same blue every count in the app uses (see
    `.badge` in header.css), but not that rule: `.badge` is `position: absolute`,
-   for pinning to an icon's corner, and this one sits in the row's flow. */
+   for pinning to an icon's corner, and this one sits in the row's flow.
+   Worn by two surfaces, the switcher list's rows and the notifications group's
+   (`NotificationsMenuRows.tsx`), which show the same thing and must look the
+   same. Same for `.brand-menu-ws-name` above. */
 .brand-menu-ws-badge {
     flex: 0 0 auto;
     min-width: 1.125rem;

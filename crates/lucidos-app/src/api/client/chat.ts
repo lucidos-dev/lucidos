@@ -154,8 +154,12 @@ export interface CodingAgentCommandOption {
   value: string;
   label: string;
   description: string;
-  /** When present, the option is available only for these explicit model ids. */
-  supported_models?: string[];
+  /** Present on a MODEL option only: the reasoning tiers that model accepts.
+   *  The engine transposes it out of the menu JSON's effort-to-models matrix
+   *  (`runtime::claude_code::model_and_effort_options`). So it matches the
+   *  `reasoning_efforts` served for the Lucidos Agent, and the picker reads one
+   *  rule on both surfaces. */
+  reasoning_efforts?: string[];
 }
 
 export interface CodingAgentCommandParam {
@@ -342,7 +346,7 @@ export async function getCommandCheckpointDiff(
   return json(`${API}/command-checkpoint/diff?checkpoint_id=${encodeURIComponent(checkpointId)}`);
 }
 
-// --- CC allowed tools (~/.lucidos/cc-allowed-tools) ---
+// --- CC allowed tools (<workspace>/.lucidos/cc-allowed-tools) ---
 export async function getCcAllowedTools(): Promise<string> {
   const body = await json<{ contents: string }>(`${API}/cc-allowed-tools`);
   return body.contents;
@@ -357,7 +361,7 @@ export async function putCcAllowedTools(contents: string): Promise<void> {
   await throwIfNotOk(resp);
 }
 
-// --- Lucidos Agent command allowlist (~/.lucidos/agent-allowed-commands, ADR 0002) ---
+// --- Lucidos Agent command allowlist (<workspace>/.lucidos/agent-allowed-commands) ---
 export async function getAgentAllowedCommands(): Promise<string> {
   const body = await json<{ contents: string }>(`${API}/agent-allowed-commands`);
   return body.contents;

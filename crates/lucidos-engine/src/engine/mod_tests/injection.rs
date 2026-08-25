@@ -2,18 +2,6 @@ use super::common::*;
 use super::*;
 use uuid::Uuid;
 
-fn test_prompt(text: &str) -> InjectedPrompt {
-    InjectedPrompt {
-        text: text.into(),
-        event_id: None,
-        mode: thread_events::ActorMode::Human,
-        spawning_event_id: None,
-        images: None,
-        origin: None,
-        kind: crate::engine::InjectedPromptKind::UserText,
-    }
-}
-
 /// A blocking tool (`bash_output(wait_secs=120)` is the one that really
 /// blocks) parks on `injection_notify` so a follow-up doesn't sit unread
 /// for two minutes — the agentic loop only `try_recv`s injections BETWEEN
@@ -133,13 +121,16 @@ fn failed_inject_rolls_back_its_reservation() {
 #[test]
 fn a_stale_generations_drain_cannot_erase_the_new_turns_unread_count() {
     let engine_threads = make_threads();
+    let completions = make_completions();
     let tid = Uuid::new_v4();
 
-    // Turn 1 registers, then is force-evicted and replaced by turn 2 —
-    // re-registering overwrites the map entry with a fresh generation.
+    // Turn 1 registers, then is force-evicted and replaced by turn 2. The
+    // eviction swaps the map entry for one with a fresh generation.
     let (_t1, _rx1, guard1) = register(&engine_threads, tid);
     let stale_generation = guard1.generation();
-    let (_t2, _rx2, guard2) = register(&engine_threads, tid);
+    let (_t2, _rx2, guard2) =
+        evict_and_register(&engine_threads, &completions, tid, stale_generation)
+            .expect("turn 1 is still the holder");
     assert_ne!(
         stale_generation,
         guard2.generation(),

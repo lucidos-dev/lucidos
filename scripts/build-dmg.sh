@@ -206,11 +206,24 @@ STAGE="$APP_DIR/bundle-resources"
 # submitted DMG is paired with, and `set -u` turns a not-yet-assigned global into
 # a crash rather than an empty string).
 BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
-# `lucidos` (the CLI) is a bundled Mach-O executable too — it MUST be codesigned
-# (BUNDLED_EXECUTABLES) or notarization rejects it, and it MUST be staged
-# (RESOURCE_NAMES) or the engine can't launch the CC permission MCP server.
-BUNDLED_EXECUTABLES=(lucidos-engine lucidos-gateway lucidos)
-RESOURCE_NAMES=(lucidos-engine lucidos-gateway lucidos frontend postgres sdk system-knowhow)
+
+# The staged-resource contract. Sourced HERE, ahead of the other libs, because
+# the two arrays below read from it and `set -u` makes an unsourced function a
+# crash rather than an empty array. Pure shell, public-mirror-safe.
+# shellcheck source=scripts/lib/resource_contract.sh
+source "$SCRIPT_DIR/lib/resource_contract.sh"
+
+# The staged resource set and the Mach-O subset of it, both READ from
+# scripts/lib/resource_contract.sh rather than restated. Neither list lives here
+# any more: this file used to carry two of them and check one against the other,
+# which is how system-knowhow could have been dropped with every gate green.
+# `lucidos` (the CLI) is in both, and load-bearing in each: unsigned, notarization
+# rejects the bundle; unstaged, the engine can't launch the CC permission MCP
+# server.
+# shellcheck disable=SC2207  # resource names are single words by construction
+BUNDLED_EXECUTABLES=($(resource_contract_executables))
+# shellcheck disable=SC2207
+RESOURCE_NAMES=($(resource_contract_names))
 # Hardened-runtime capabilities claimed by the OUTER .app signature, and by
 # nothing else in the bundle. Today that is the camera, which the composer's
 # Camera item reaches through getUserMedia in the WKWebView: the release path
@@ -466,14 +479,15 @@ assert_release_credentials() {
 }
 
 # The bundle.resources map (`bundle-resources/<name>` → `<name>` for each staged
-# RESOURCE_NAME) as inner JSON object members. Single source of truth so the two
-# consumers — the no-version resource_config_json (also the verify loop's
-# expectation) and the versioned tauri_build_config_json — can't drift, and a new
-# resource is added in exactly one place. `lucidos` (the CLI) is load-bearing:
-# without it cargo tauri build never copies the binary into Contents/Resources,
-# so the engine can't launch the CC permission MCP server.
+# RESOURCE_NAME) as inner JSON object members. DERIVED from the contract, not
+# written out: it used to be a literal, checked against the RESOURCE_NAMES
+# literal above it, so the two agreed by construction and proved nothing. Its two
+# consumers are the no-version resource_config_json (also the verify loop's
+# expectation) and the versioned tauri_build_config_json. `lucidos` (the CLI) is
+# load-bearing: without it cargo tauri build never copies the binary into
+# Contents/Resources, so the engine can't launch the CC permission MCP server.
 resource_map_json() {
-    printf '%s' '"bundle-resources/lucidos-engine":"lucidos-engine","bundle-resources/lucidos-gateway":"lucidos-gateway","bundle-resources/lucidos":"lucidos","bundle-resources/frontend":"frontend","bundle-resources/postgres":"postgres","bundle-resources/sdk":"sdk","bundle-resources/system-knowhow":"system-knowhow"'
+    resource_contract_tauri_map_json
 }
 
 resource_config_json() {
@@ -607,7 +621,16 @@ Env knobs (all optional):
 EOF
 }
 
+# Validate the staged-resource contract. It asks the two RUNTIME launchers what
+# they need, not a second literal in this file: see scripts/lib/resource_contract.sh
+# for why, and scripts/lib/resource_contract_test.sh for the proof that removing
+# a resource turns this red.
 check_resource_contract() {
+    resource_contract_check "$APP_DIR/src/desktop.rs" \
+        || die "the staged resource contract does not hold (see the errors above)"
+    # And the Tauri map, which is what actually copies the resources into
+    # Contents/Resources. Derived from the same list, so this asserts the
+    # derivation rather than a second hand-written map.
     local cfg expected
     cfg="$(resource_config_json)"
     for expected in "${RESOURCE_NAMES[@]}"; do
@@ -616,13 +639,6 @@ check_resource_contract() {
             *) die "Tauri resource map missing bundle-resources/$expected → $expected" ;;
         esac
     done
-    for expected in "${BUNDLED_EXECUTABLES[@]}"; do
-        case " ${RESOURCE_NAMES[*]} " in
-            *" $expected "*) ;;
-            *) die "bundled executable $expected is not listed in RESOURCE_NAMES" ;;
-        esac
-    done
-    printf 'OK: build-dmg resources include %s\n' "${RESOURCE_NAMES[*]}"
 }
 
 # stage_release_artifacts <staging-dir> — copy the just-built signed/notarized DMG
@@ -2591,9 +2607,20 @@ PG_PREFIX="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$TA
 
 # ── 4. stage resources ──────────────────────────────────────────────────────
 step "Staging bundle resources → $STAGE"
-stage_runtime_assemble "$STAGE" "$ENGINE_BIN" "$GATEWAY_BIN" "$CLI_BIN" "$APP_DIR/dist" \
-    "$PG_PREFIX" "$REPO_ROOT/packages/lucidos-sdk/dist" "$REPO_ROOT/system-knowhow" >/dev/null \
+stage_runtime_assemble "$STAGE" \
+    "lucidos-engine=$ENGINE_BIN" \
+    "lucidos-gateway=$GATEWAY_BIN" \
+    "lucidos=$CLI_BIN" \
+    "frontend=$APP_DIR/dist" \
+    "postgres=$PG_PREFIX" \
+    "sdk=$REPO_ROOT/packages/lucidos-sdk/dist" \
+    "system-knowhow=$REPO_ROOT/system-knowhow" >/dev/null \
     || die "failed to stage bundle resources into $STAGE"
+# What was actually written, against the contract. The named call above cannot
+# put a resource in the wrong place, but it can still omit one, and a bundle that
+# is missing system-knowhow looks entirely normal until a chat turn needs it.
+resource_contract_assert_staged "$STAGE" \
+    || die "the staged tree does not match the resource contract (see the errors above)"
 
 # ── 5. tauri build ──────────────────────────────────────────────────────────
 step "Running cargo tauri build (app + dmg)"

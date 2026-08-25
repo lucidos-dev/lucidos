@@ -234,6 +234,7 @@ fn frontend_update_stranded_is_transient_on_engine_aggregate() {
     let e = SystemEvent::FrontendUpdateStranded {
         served_dir: "/w/dev/.lucidos/worktrees/thread-abc/crates/lucidos-app/dist".into(),
         served_in_worktree: true,
+        build_error: None,
         sent_at_ms: 1_700_000_000_000,
     };
     assert!(!e.is_persisted());
@@ -249,6 +250,27 @@ fn frontend_update_stranded_is_transient_on_engine_aggregate() {
     );
     assert_eq!(json["data"]["served_in_worktree"], true);
     assert_eq!(json["data"]["sent_at_ms"], 1_700_000_000_000_i64);
+    // Omitted rather than null when the build-watch said nothing, so a client
+    // that never heard of the field sees exactly the body it always did.
+    assert!(json["data"].get("build_error").is_none());
+}
+
+#[test]
+fn a_failing_build_rides_along_with_the_stranded_signal() {
+    // The other way an Apply strands. Until this field existed the message
+    // could only ask "is the build-watch running?", while the real answer sat
+    // in a log file nobody reads.
+    let e = SystemEvent::FrontendUpdateStranded {
+        served_dir: "/w/dev/crates/lucidos-app/dist".into(),
+        served_in_worktree: false,
+        build_error: Some("Rollup failed to resolve import \"jsqr\"".into()),
+        sent_at_ms: 1_700_000_000_000,
+    };
+    let json = serde_json::to_value(&e).unwrap();
+    assert_eq!(
+        json["data"]["build_error"],
+        "Rollup failed to resolve import \"jsqr\""
+    );
 }
 
 #[test]
@@ -362,4 +384,63 @@ fn native_push_dismiss_requested_is_transient_on_notification_aggregate() {
     assert!(json_all["data"].get("notification_id").is_none());
     let json_one = serde_json::to_value(&one).unwrap();
     assert_eq!(json_one["data"]["notification_id"], Uuid::nil().to_string());
+}
+
+/// `PERSISTED_TYPE_NAMES` is the one list behind both `is_persisted` and
+/// `is_persisted_type_name`, so a typo in it silently stops an event being
+/// written. Every entry must be a real wire name, which `RESERVED_TYPE_NAMES`
+/// already enumerates and `reserved_type_names_match_event_type` already pins.
+#[test]
+fn every_persisted_name_is_a_real_reserved_name() {
+    for name in SystemEvent::PERSISTED_TYPE_NAMES {
+        assert!(
+            SystemEvent::is_reserved_type_name(name),
+            "'{name}' is in PERSISTED_TYPE_NAMES but is not a SystemEvent wire name"
+        );
+    }
+}
+
+#[test]
+fn persisted_type_names_holds_no_duplicates() {
+    let mut seen = std::collections::HashSet::new();
+    for name in SystemEvent::PERSISTED_TYPE_NAMES {
+        assert!(seen.insert(*name), "'{name}' appears twice");
+    }
+}
+
+/// `DomainEvent` is a transport variant: no row is ever stored under that
+/// literal name, so nothing may wait on it. Its persistence is decided by the
+/// `transient` field instead, which is the one field-dependent answer.
+#[test]
+fn domain_event_is_not_a_persisted_name_but_a_persisted_event() {
+    assert!(!SystemEvent::is_persisted_type_name("DomainEvent"));
+
+    let durable = SystemEvent::DomainEvent {
+        event_type: "SleepImported".to_string(),
+        payload: serde_json::json!({}),
+        depth: 0,
+        transient: false,
+        actor: None,
+    };
+    assert!(durable.is_persisted());
+
+    let ephemeral = SystemEvent::DomainEvent {
+        event_type: "SleepImported".to_string(),
+        payload: serde_json::json!({}),
+        depth: 0,
+        transient: true,
+        actor: None,
+    };
+    assert!(!ephemeral.is_persisted());
+}
+
+/// The subscribe side reads the same answer as the write side. A backup
+/// completion is a durable fact, its progress tick is a UI frame.
+#[test]
+fn the_name_keyed_predicate_agrees_with_the_event_keyed_one() {
+    assert!(SystemEvent::is_persisted_type_name("BackupCompleted"));
+    assert!(SystemEvent::is_persisted_type_name("BackupFailed"));
+    assert!(!SystemEvent::is_persisted_type_name("BackupProgress"));
+    assert!(!SystemEvent::is_persisted_type_name("Toast"));
+    assert!(!SystemEvent::is_persisted_type_name("NotAnEventAtAll"));
 }

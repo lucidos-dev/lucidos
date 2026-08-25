@@ -574,24 +574,24 @@ async fn imap_connect_times_out_with_descriptive_error_when_server_stalls() {
 fn account_name_is_the_credential_service_name() {
     assert_eq!(EmailStore::account_name_for_credential("work"), "work");
     assert_eq!(
-        EmailStore::account_name_for_credential("Telenor"),
-        "Telenor"
+        EmailStore::account_name_for_credential("ExampleMail"),
+        "ExampleMail"
     );
 }
 
-/// The stranded-row case, which real data hits: a workspace holding BOTH an
-/// `email:Telenor` mailbox password and a separate `Telenor` credential of
-/// another type keeps the prefixed name, because `email_password` may not shadow
-/// a name. Its `email_accounts` row is still called `Telenor`, so resolving the
-/// account by the service name verbatim would find nothing: the edit form's
-/// settings fetch 404s, and the password write silently touches zero rows while
-/// reporting success. Temporary measure, removed with the
+/// The stranded-row case, which real data hits. A workspace can hold BOTH an
+/// `email:ExampleMail` mailbox password and a separate `ExampleMail` credential
+/// of another type. The prefixed name then stays, because `email_password` may
+/// not shadow a name. Its `email_accounts` row is still called `ExampleMail`, so
+/// resolving the account by the service name verbatim would find nothing: the
+/// edit form's settings fetch 404s, and the password write silently touches zero
+/// rows while reporting success. Temporary measure, removed with the
 /// `get_email_password` fallback.
 #[test]
 fn account_name_strips_a_prefix_the_migration_had_to_leave() {
     assert_eq!(
-        EmailStore::account_name_for_credential("email:Telenor"),
-        "Telenor"
+        EmailStore::account_name_for_credential("email:ExampleMail"),
+        "ExampleMail"
     );
 }
 

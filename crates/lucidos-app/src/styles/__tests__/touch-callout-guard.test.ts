@@ -16,11 +16,13 @@
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve, relative } from 'node:path';
+
+import { styleSheetPaths } from './css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const STYLES_ROOT = resolve(here, '..');
@@ -43,25 +45,11 @@ const ALLOWED: ReadonlyArray<readonly [selector: string, why: string]> = [
     'thread-drawer rows: whole-row tap targets; ThreadDrawer.tsx renders no anchor'],
 ];
 
-function cssFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const path = resolve(dir, entry);
-    if (statSync(path).isDirectory()) {
-      if (entry === '__tests__') continue;
-      out.push(...cssFiles(path));
-    } else if (path.endsWith('.css')) {
-      out.push(path);
-    }
-  }
-  return out;
-}
-
 /** Every selector whose block sets `-webkit-touch-callout: none`, normalized to
  *  single-spaced one-liners so formatting churn doesn't churn the allowlist. */
 function suppressingSelectors(): Array<{ selector: string; file: string }> {
   const found: Array<{ selector: string; file: string }> = [];
-  for (const path of cssFiles(STYLES_ROOT)) {
+  for (const path of styleSheetPaths(STYLES_ROOT)) {
     const src = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
     // Naive block split is enough: these rules are never inside @media in this
     // tree, and a nested-at-rule selector would still surface (just prefixed),

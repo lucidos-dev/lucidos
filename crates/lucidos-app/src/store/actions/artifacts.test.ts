@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { normalizeDataPath } from './artifacts';
 
 // Mock the API client so loadArtifacts() returns a controlled artifact list.
@@ -171,5 +171,111 @@ describe('openFilePreview clears the previous file line state', () => {
 
     expect(selectedLines.value).toBeNull();
     expect(lineScrollTarget.value).toBeNull();
+  });
+});
+
+// The revision stamp is the preview URL's cache-buster, and the URL is the
+// `src` of the video it renders. A bare counter here was bumped by every
+// `loadArtifacts()`, so any write under `data/` restarted a watched video.
+describe('invalidateFilePreview: only the file on screen re-reads', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function showing(path: string | null) {
+    const store = await import('../store');
+    store.panelOverlay.value = path ? { type: 'file-preview', path } : null;
+    return { store, actions: await import('./artifacts') };
+  }
+
+  it('bumps the stamp for the file the preview shows', async () => {
+    const { store, actions } = await showing('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toEqual({ path: 'artifacts/clip.mp4', rev: 1 });
+  });
+
+  it('leaves the stamp untouched for any other file', async () => {
+    const { store, actions } = await showing('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/notes.md');
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toBeNull();
+  });
+
+  // The reported bug in one sequence. A stamp that fell back when a different
+  // file changed would itself be a URL change, one write later.
+  it('keeps a bumped stamp stable across a write to a different file', async () => {
+    const { store, actions } = await showing('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    vi.runAllTimers();
+    const stamped = store.filePreviewRevision.value;
+
+    actions.invalidateFilePreview('artifacts/notes.md');
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toEqual(stamped);
+  });
+
+  it('does nothing when the pane shows something other than a file', async () => {
+    const { store, actions } = await showing(null);
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toBeNull();
+  });
+
+  // An `artifacts/` write announces twice, as its `Artifact*` event and as the
+  // file tool's `ToolResult`. Two reloads for one write is what this stops.
+  it('coalesces a burst of announcements into one bump', async () => {
+    const { store, actions } = await showing('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    actions.invalidateFilePreview('artifacts/clip.mp4');
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toEqual({ path: 'artifacts/clip.mp4', rev: 1 });
+  });
+
+  it('refreshFilePreview bumps whatever the pane shows, no path asked for', async () => {
+    const { store, actions } = await showing('knowhow/ops/deploy.md');
+    actions.refreshFilePreview();
+    vi.runAllTimers();
+    expect(store.filePreviewRevision.value).toEqual({ path: 'knowhow/ops/deploy.md', rev: 1 });
+  });
+
+  // A repo preview is handed a parsed locator, never the encoded `repo:` string
+  // the overlay holds. So it reads `openFilePreviewRevision` rather than
+  // matching the stamp itself, and without that its Refresh button was inert.
+  it('answers the open repo preview through openFilePreviewRevision', async () => {
+    const encoded = 'repo:r1:file:src/main.rs';
+    const { store, actions } = await showing(encoded);
+    expect(store.openFilePreviewRevision.value).toBe(0);
+
+    actions.refreshFilePreview();
+    vi.runAllTimers();
+    expect(store.openFilePreviewRevision.value).toBe(1);
+  });
+
+  it('answers 0 once the pane moves off the file the stamp names', async () => {
+    const { store, actions } = await showing('repo:r1:file:src/main.rs');
+    actions.refreshFilePreview();
+    vi.runAllTimers();
+
+    store.panelOverlay.value = { type: 'file-preview', path: 'repo:r1:file:src/other.rs' };
+    expect(store.openFilePreviewRevision.value).toBe(0);
+  });
+
+  // The Files list and the preview are separate concerns now. A list refresh
+  // carries no path, so it cannot know whether the open file changed.
+  it('loadArtifacts refreshes the list and leaves the stamp alone', async () => {
+    mockListArtifacts.mockResolvedValue({ artifacts: ['artifacts/clip.mp4'] });
+    const { store, actions } = await showing('artifacts/clip.mp4');
+    await actions.loadArtifacts();
+    vi.runAllTimers();
+    expect(store.artifacts.value).toEqual({ status: 'loaded', data: ['artifacts/clip.mp4'] });
+    expect(store.filePreviewRevision.value).toBeNull();
   });
 });

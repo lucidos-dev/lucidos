@@ -59,6 +59,7 @@ vi.mock('./menu', () => ({
   setActiveMenu: vi.fn(),
   switchMenuItem: vi.fn(),
   openSettingsSubview: vi.fn(),
+  openBackupSettings: vi.fn(),
 }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));

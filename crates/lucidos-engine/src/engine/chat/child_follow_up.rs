@@ -696,27 +696,14 @@ impl crate::engine::LucidosEngine {
                             .await;
                         }
                         Ok(_) => {}
-                        Err(e) => {
-                            crate::log!(
-                                "[ChildFollowUp] Follow-up turn failed on child {}: {}",
-                                child_thread_id,
-                                e
-                            );
-                            engine
-                            .event_bus
-                            .emit_or_log(
-                                crate::engine::event_bus::BusEvent::Thread {
-                                    thread_id: child_thread_id,
-                                    event:
-                                        crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                                            error: e.to_string(),
-                                        },
-                                    meta: crate::engine::thread_events::EventMeta::NONE,
-                                },
-                                "[ChildFollowUp] ResponseFailed after a failed follow-up turn",
-                            )
-                            .await;
-                        }
+                        // No terminator here: the turn settles its own
+                        // exchange, anchored. An unanchored copy is what the
+                        // idempotency gate cannot match, so it double-fired.
+                        Err(e) => crate::log!(
+                            "[ChildFollowUp] Follow-up turn failed on child {}: {}",
+                            child_thread_id,
+                            e
+                        ),
                     }
                 });
             let handle = tokio::spawn(turn);

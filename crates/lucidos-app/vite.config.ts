@@ -314,8 +314,16 @@ export default defineConfig({
         // the entry chunk and pushes it past Rollup's advisory.
         manualChunks(id) {
           if (id.includes('node_modules')) {
+            // Each name below is a dependency only ONE lazy chunk imports.
+            // Without its own name the `vendor` catch-all takes it, and vendor
+            // is loaded by the entry: a lazily-imported package then ships on
+            // first paint anyway. `jsqr` is reached only by `PairingScanner`,
+            // on the screen a cold PWA launch paints first.
             if (id.includes('highlight.js')) return 'highlight';
-            if (id.includes('marked')) return 'marked';
+            // `dompurify` rides with `marked`: the sanitizer has exactly one
+            // importer, and that importer is the markdown renderer.
+            if (id.includes('marked') || id.includes('dompurify')) return 'marked';
+            if (id.includes('jsqr')) return 'jsqr';
             return 'vendor';
           }
         },
@@ -343,6 +351,11 @@ export default defineConfig({
       // import time, so widening that graph reorders side effects.
       // Mirrored in tsconfig.json `paths` so tsc resolves it too.
       '@lucidos/appearance': resolve(__dirname, '../../packages/lucidos-sdk/src/appearance.ts'),
+      // The tooltip, and the viewport clamps it shares with the host's anchored
+      // popover. Both are reached WITHOUT the barrel, for the same reason.
+      // Mirrored in tsconfig.json `paths` so tsc resolves them too.
+      '@lucidos/geometry': resolve(__dirname, '../../packages/lucidos-sdk/src/geometry.ts'),
+      '@lucidos/tooltip': resolve(__dirname, '../../packages/lucidos-sdk/src/tooltip.ts'),
     },
   },
   server: {

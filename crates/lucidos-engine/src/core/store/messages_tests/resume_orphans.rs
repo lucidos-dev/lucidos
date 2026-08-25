@@ -530,8 +530,8 @@ fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
             sequence: Some(2),
         },
     ];
-    // Empty loaded set — no recovery yet, or the doc was unloaded. The body
-    // must survive verbatim so the LLM doesn't lose context.
+    // Empty loaded set: no recovery yet, or the doc was unloaded. The body must
+    // survive so the LLM does not lose context.
     let loaded = std::collections::HashSet::new();
     let (messages, _skip) =
         crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &loaded);
@@ -543,7 +543,16 @@ fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
         .expect("expect a user-role ToolResult message");
     if let MessageContent::Blocks(blocks) = &result_msg.content {
         if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-            assert_eq!(content, "ORIGINAL DOC BODY");
+            // Body verbatim, plus the address of its own `ToolCalled`. The
+            // rebuild is what a follow-up turn sends, so an unaddressed result
+            // would be unkeepable and unsweepable for the rest of the thread.
+            assert_eq!(
+                content,
+                &crate::core::store::with_event_address(
+                    "ORIGINAL DOC BODY".into(),
+                    Some(&events[0].id)
+                )
+            );
         } else {
             panic!("expected ToolResult block");
         }
@@ -554,8 +563,8 @@ fn resume_blocks_keep_load_knowhow_body_when_doc_not_in_loaded_set() {
 
 #[test]
 fn resume_blocks_keep_other_tools_unchanged_regardless_of_loaded_set() {
-    // Loaded set affects only `load_knowhow`. Other tools (e.g. query_events)
-    // pass through verbatim no matter what's in the set.
+    // Loaded set affects only `load_knowhow`. Another tool keeps its body
+    // whatever is in the set, and is addressed the same way.
     use crate::core::EventRow;
     use chrono::Utc;
     let now = Utc::now();
@@ -590,7 +599,10 @@ fn resume_blocks_keep_other_tools_unchanged_regardless_of_loaded_set() {
         .expect("expect a user-role ToolResult message");
     if let MessageContent::Blocks(blocks) = &result_msg.content {
         if let ContentBlock::ToolResult { content, .. } = &blocks[0] {
-            assert_eq!(content, "[1,2,3]");
+            assert_eq!(
+                content,
+                &crate::core::store::with_event_address("[1,2,3]".into(), Some(&events[0].id))
+            );
         } else {
             panic!("expected ToolResult block");
         }

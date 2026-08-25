@@ -4,7 +4,10 @@ import {
   panelOverlay,
   settingsSubview,
   settingsScrollTarget,
+  whatsNewTargetRelease,
 } from '../store';
+import { settingsViewKey } from '../../components/layout/contentViewKey';
+import { resetContentScroll } from '../../hooks/useScrollMemory';
 import type { PanelOverlay } from '../store';
 import { revealContentPane } from './pane';
 import type { SettingsSubview } from '../store';
@@ -22,7 +25,7 @@ import { pushNavState } from './navigation';
 /** Set the active menu item, without pushing nav state or loading data.
  *  `overlay` defaults to `null` — clears any open sub-panel (app UI, file
  *  preview, URL preview, etc.) so the menu's main content is shown. Pass an
- *  overlay to atomically land on a deep link (e.g. a trigger details panel)
+ *  overlay to atomically land on a deep link (e.g. the new-trigger form)
  *  in the same render as the menu switch — avoids the empty-list flash that
  *  results from clear-then-set across an await.
  *
@@ -110,12 +113,30 @@ export function openProviderSettings(): void {
   openSettingsSubview('models');
 }
 
-/** Deep-link to Settings → System → Backup in a single render. Used by the
- *  app-shell backup reminder's "Set up backup" button. No scroll target: the page
- *  is short and its health card, provider picker and schedule dropdown are all at
- *  the top, which is exactly what someone arriving from the reminder came for. */
+/** Deep-link to Settings → System → Backup in a single render. Two callers: the
+ *  app-shell backup reminder's "Set up backup" button, and the tap on the
+ *  backup-failure toast. No scroll target: the page is short, and its health
+ *  card, provider picker and schedule dropdown all sit at the top. That is
+ *  exactly what either caller sends someone here for. */
 export function openBackupSettings(): void {
   openSettingsSubview('backup');
+}
+
+/** Deep-link to Settings → System → What's New, opened on the release `release`
+ *  names. The single way in, so every caller says what it is announcing.
+ *
+ *  An update offer names one: its whole subject is that release, and the panel's
+ *  ordinary rule (expand the release you are RUNNING) is the older one. Callers
+ *  with nothing to announce pass nothing, which also CLEARS a target left by an
+ *  offer the user walked away from.
+ *
+ *  A named release also drops the panel's remembered scroll. Landing on that
+ *  release is the whole request, so restoring where the reader last parked would
+ *  put them somewhere else entirely. An ordinary open still restores it. */
+export function openWhatsNew(release?: string | null): void {
+  whatsNewTargetRelease.value = release ?? null;
+  if (release) resetContentScroll(settingsViewKey('whats-new'));
+  openSettingsSubview('whats-new');
 }
 
 /** Deep-link to Settings → Accounts → Connected accounts and scroll to it.

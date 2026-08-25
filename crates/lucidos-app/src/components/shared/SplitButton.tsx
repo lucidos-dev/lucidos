@@ -3,6 +3,7 @@ import { useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { Overlay } from './Overlay';
 import { ChevronUpIcon } from './icons';
+import { useTouchActivated } from '../../hooks/useTouchActivated';
 
 /** A one-tap primary face joined to a caret that opens an upward Overlay menu
  *  of secondary actions. The face + caret read as a single pill (the CSS
@@ -38,6 +39,12 @@ export interface SplitButtonProps {
   primaryTooltip?: string;
   primaryAriaLabel?: string;
   primaryDisabled?: boolean;
+  /** Also fire the primary face on `touchend`, for a face the user reaches with
+   *  the mobile keyboard up. Opt-in: WebKit drops the synthetic click when the
+   *  tap blurs a focused field, and the composer's Submit is the face that
+   *  lives against the keyboard. The change-action banner's Apply is not, and
+   *  leaves this off. See `touchActivated`. */
+  primaryTouchActivate?: boolean;
   /** Full class for the caret button — usually identical to primaryClassName. */
   caretClassName: string;
   caretAriaLabel: string;
@@ -49,6 +56,12 @@ export function SplitButton(props: SplitButtonProps) {
   const caretRef = useRef<HTMLButtonElement>(null);
   const hasMenu = props.menuItems.length > 0;
   const close = () => { open.value = false; };
+  // A disabled button dispatches no click. WebKit still dispatches touch events
+  // on it, so the disabled state has to gate the touch path by hand.
+  const primaryActivate = useTouchActivated(
+    () => props.onPrimary(),
+    !!props.primaryTouchActivate && !props.primaryDisabled,
+  );
   return (
     <div class={`split-button${open.value ? ' open' : ''}`} data-row-item>
       <button
@@ -56,7 +69,8 @@ export function SplitButton(props: SplitButtonProps) {
         data-tooltip={props.primaryTooltip}
         aria-label={props.primaryAriaLabel}
         disabled={props.primaryDisabled}
-        onClick={() => props.onPrimary()}
+        onTouchEnd={primaryActivate.onTouchEnd}
+        onClick={primaryActivate.onClick}
       >
         {props.primaryLabel}
       </button>

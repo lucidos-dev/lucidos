@@ -225,6 +225,25 @@ Four properties keep a payload-mode green honest, and all four are load-bearing:
   both uninstaller-pin parses all **fail closed**. A parser that finds nothing
   must never report green.
 
+**The arm now needs two vantages, and two vantages are still not two POPs.**
+`rc_front_door_confirms_version` reads the plain URL, which is what a stranger
+on this POP gets. It also reads a nonced no-cache URL, which is what the origin
+holds. It arms only when both serve the candidate, which separates "the
+publisher has not deployed" from "it deployed and propagation is running". It
+records the answering POP from `cf-ray`, so a red leg can be compared against
+what the Mac saw.
+
+A genuinely different POP is out of reach. Anycast offers no route to one, and
+a third-party fetch service is not a dependency a release gate takes. So the
+bounded re-read above stays the load-bearing half.
+
+**One propagation fault reds up to three legs**, because each resolves its own
+POP. Both the expiry error and the convergence warning therefore state that the
+verdict is per-POP and that siblings report independently. Legs quoting the
+same last-read value are one fault, not three. Reducing the legs was considered
+and rejected: `front-door-macos` on the `rc/**` push is exactly what caught
+v0.18.5.
+
 The **full** mode is still deliberately **not** on the `rc/**` push: it tests
 production, not the RC tree, so a live-site outage must never be able to block
 cutting a release. Payload mode is the inverse: it gates the RC's *own* copy.

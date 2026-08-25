@@ -6,11 +6,11 @@
 // Tauri WKWebView, which uses a native dock badge instead, simply no-op. A
 // non-positive count clears the badge; a positive count sets the number.
 
-import { signal } from '@preact/signals';
+import { computed, signal } from '@preact/signals';
 import { unreadCount } from '../store';
 import { IS_PICKER, WORKSPACE_ID } from '../../utils/basePath';
 import { isTauri } from '../../utils/platform';
-import { listWorkspaces } from '../../api/client/control';
+import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
 
 type BadgingNavigator = Navigator & {
   setAppBadge?: (count?: number) => Promise<void>;
@@ -29,14 +29,17 @@ export function applyAppBadge(count: number): void {
   }
 }
 
-/** Unread notifications across every workspace on this gateway origin EXCEPT
- *  this one, from the gateway's control listing. `0` until the first listing
- *  lands, and `0` forever outside a gateway-served workspace context.
+/** Every workspace this gateway serves, as of the last refresh. Empty until the
+ *  first listing lands, and empty outside a gateway-served workspace context.
  *
- *  A signal rather than a plain number so the `unreadCount` effect in
- *  `store/effects.ts` subscribes to it and re-asserts the icon when a refresh
- *  moves it, exactly as it does for our own count. */
-const otherWorkspacesUnread = signal(0);
+ *  The ROWS rather than a sum, because two surfaces read them. The icon badge
+ *  wants the total. The Lucidos menu's notifications group wants one row per
+ *  workspace holding unreads. One poll feeds both, so the two can never
+ *  disagree about a workspace's count.
+ *
+ *  A signal, so the effect in `store/effects.ts` subscribes through the
+ *  computeds below and re-asserts the icon when a refresh moves the total. */
+export const peerWorkspaces = signal<WorkspaceStatus[]>([]);
 
 /** Monotonic id of the newest refresh issued, so a slower earlier listing can
  *  never land on top of a fresher one. Three triggers can overlap (startup, a
@@ -62,6 +65,30 @@ function badgesEveryWorkspace(): boolean {
   return WORKSPACE_ID !== null;
 }
 
+/** Unread notifications across every workspace on this origin EXCEPT this one.
+ *
+ *  Our own row is dropped rather than read back. For a second or two after an
+ *  optimistic mark-read it still reports the pre-read count. Using it would let
+ *  the icon disagree with the bell about the workspace on screen. */
+export const otherWorkspacesUnread = computed(() =>
+  peerWorkspaces.value
+    .filter((w) => w.id !== WORKSPACE_ID)
+    .reduce((sum, w) => sum + (w.unread_count ?? 0), 0),
+);
+
+/** The number BOTH badges show: this workspace's live unread count plus every
+ *  other workspace behind the gateway.
+ *
+ *  One computed, two readers. `syncWorkspaceAppBadge` writes it onto the
+ *  installed app's icon, and the brand mark renders it. Deriving the same total
+ *  twice is exactly how the two would drift apart.
+ *
+ *  Our own half is ALWAYS the live `unreadCount`, so an optimistic mark-read
+ *  drops both on the same tick. */
+export const crossWorkspaceUnreadTotal = computed(
+  () => unreadCount.value + (badgesEveryWorkspace() ? otherWorkspacesUnread.value : 0),
+);
+
 /** Re-read the OTHER workspaces' unread counts from the gateway and re-assert
  *  the icon badge. A no-op outside a gateway-served workspace context.
  *
@@ -71,11 +98,11 @@ function badgesEveryWorkspace(): boolean {
  *  same "running workspaces only" rule the picker badge and the desktop dock
  *  badge already follow.
  *
- *  Only the OTHERS are taken from it: our own row is dropped and
- *  `syncWorkspaceAppBadge` supplies this workspace's count from the live
- *  `unreadCount` instead, so an optimistic mark-read drops the icon on the same
- *  tick and the icon can never disagree with the bell about the workspace on
- *  screen (the polled row would still be showing the pre-read count).
+ *  The rows are stored whole, but only the OTHERS are counted. Our own row is
+ *  dropped, and {@link crossWorkspaceUnreadTotal} supplies this workspace's
+ *  share from the live `unreadCount` instead. An optimistic mark-read therefore
+ *  drops the icon on the same tick, and the icon can never disagree with the
+ *  bell about the workspace on screen.
  *
  *  Best-effort, per `.claude/rules/frontend.md`'s telemetry carve-out: it runs
  *  on a timer and on resume rather than on user intent, a blip keeps the
@@ -83,14 +110,14 @@ function badgesEveryWorkspace(): boolean {
  *  the next push, which carries a fresh aggregate) recovers on its own. A toast
  *  would be noise about a number the user is not looking at. */
 export async function refreshOtherWorkspacesUnread(): Promise<void> {
-  if (IS_PICKER || isTauri() || !badgesEveryWorkspace()) return;
+  // NOT gated on Tauri, unlike the icon write below. The desktop client badges
+  // its dock from Rust. Its PAGE still draws the brand badge and the menu's
+  // notifications group, and both need these rows.
+  if (IS_PICKER || !badgesEveryWorkspace()) return;
   const seq = ++refreshSeq;
-  let total: number;
+  let rows: WorkspaceStatus[];
   try {
-    const list = await listWorkspaces();
-    total = list
-      .filter((w) => w.id !== WORKSPACE_ID)
-      .reduce((sum, w) => sum + (w.unread_count ?? 0), 0);
+    rows = await listWorkspaces();
   } catch (e) {
     // Telemetry carve-out (`.claude/rules/frontend.md`): nobody asked for this
     // request, it is about a number on an icon the user may not even have
@@ -100,7 +127,7 @@ export async function refreshOtherWorkspacesUnread(): Promise<void> {
     return;
   }
   if (seq !== refreshSeq) return; // superseded while in flight (see refreshSeq)
-  otherWorkspacesUnread.value = total;
+  peerWorkspaces.value = rows;
   syncWorkspaceAppBadge();
 }
 
@@ -132,6 +159,5 @@ export async function refreshOtherWorkspacesUnread(): Promise<void> {
  *  native dock badge / tray title from the gateway total. */
 export function syncWorkspaceAppBadge(): void {
   if (IS_PICKER || isTauri()) return;
-  const others = badgesEveryWorkspace() ? otherWorkspacesUnread.value : 0;
-  applyAppBadge(unreadCount.value + others);
+  applyAppBadge(crossWorkspaceUnreadTotal.value);
 }

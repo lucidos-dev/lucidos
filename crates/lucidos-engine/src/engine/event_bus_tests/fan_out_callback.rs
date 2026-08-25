@@ -1,3 +1,4 @@
+use super::super::parent_callback::ParentWake;
 use super::super::*;
 use super::*;
 
@@ -1112,6 +1113,354 @@ async fn fresh_coding_agent_child_reports_its_first_completion() {
     teardown_test_db(&db_name).await;
 }
 
+/// Read a thread's projected status.
+async fn read_status(pool: &PgPool, thread_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+/// The wake IS the exchange opening, so it has to land with the card.
+///
+/// A user message flips its thread to `running` the instant it persists, which
+/// is what makes the exchange read "Requesting" through the turn setup. The
+/// fan-in used to leave the parent `idle` until the turn's first activity
+/// event, a full classification round-trip later. The card rendered "Done" for
+/// that window and the parent looked like it never woke. See
+/// `docs/plans/2026-08-19-waking-a-parent-starts-its-exchange.md`.
+///
+/// Asserted on the projection alone, with no turn driven: the callback sits
+/// unread on `callback_rx`, so nothing but the fan-in could have written this.
+#[tokio::test]
+async fn a_child_completion_wakes_its_parent_into_running() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    // The parent's own turn ended long before its child did.
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "spawned it".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("idle"),
+        "precondition: the parent is quiescent before its child completes"
+    );
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("running"),
+        "the completion card must open the parent's exchange, so the parent \
+         reads `running` from the moment the card commits"
+    );
+    assert!(
+        callback_rx.try_recv().is_ok(),
+        "and the wake it stands for is really on its way"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A parent parked on a question keeps that status through a child
+/// completion, and it is the one status a wake must not touch.
+///
+/// `is_attention_needing` returns TRUE on `waiting_for_user_answer` before any
+/// other test, so overwriting it puts out the needs-attention badge while the
+/// question is still on screen unanswered.
+#[tokio::test]
+async fn a_wake_never_overwrites_a_parent_parked_on_a_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: "tu-1".into(),
+            cc_session_id: "sess-1".into(),
+            question: "which approach?".into(),
+            options: vec![],
+            worktree_path: None,
+            multi_select: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("waiting_for_user_answer"),
+        "precondition: the parent is parked on its question"
+    );
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("waiting_for_user_answer"),
+        "the wake must not demote a parked parent: the question is still \
+         unanswered, and `running` would put out its needs-attention badge"
+    );
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "the card still lands, only the status is preserved"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Wake, then lose the card: the rollback restores what the wake overwrote.
+///
+/// The typed emit has no deterministic way to fail, so the rollback is driven
+/// directly. Its guard is the half worth pinning: `last_revived_at` is a
+/// fencing token, so a revive landing in the window keeps the row.
+#[tokio::test]
+async fn undo_parent_wake_restores_the_previous_status_and_fences_on_a_revive() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "spawned it".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // Wake it for real, then read back the stamp the rollback fences on.
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert!(callback_rx.try_recv().is_ok());
+    let (status, revived_at) = read_wake(&pool, parent_id).await;
+    assert_eq!(status, "running", "precondition: the parent is awake");
+
+    // A revive lands before the rollback runs, so the rollback is stale.
+    sqlx::query("UPDATE thread_summaries SET last_revived_at = NOW() WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stale = ParentWake {
+        prev_status: "idle".into(),
+        prev_revived_at: None,
+        revived_at,
+    };
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&stale)).await;
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("running"),
+        "a turn that started after the wake keeps the row: the rollback is \
+         fenced on the stamp it wrote, and that stamp is gone"
+    );
+
+    // With the stamp intact, the rollback puts the previous status back.
+    let (_, current_stamp) = read_wake(&pool, parent_id).await;
+    let fresh = ParentWake {
+        prev_status: "idle".into(),
+        prev_revived_at: None,
+        revived_at: current_stamp,
+    };
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&fresh)).await;
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("idle"),
+        "no turn will run, so the parent must not keep spinning"
+    );
+
+    // Nothing to undo is a no-op, not a blanket settle.
+    EventBus::undo_parent_wake(&pool, parent_id, None).await;
+    assert_eq!(read_status(&pool, parent_id).await.as_deref(), Some("idle"));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The wake reports the status it REPLACED, not the one it wrote.
+///
+/// The rollback restores whatever this returns. Make the self-join read the
+/// post-UPDATE row and it hands back `running`, leaving the parent spinning on
+/// exactly the path the rollback exists for. Silent without this assertion,
+/// because every other test builds its own `ParentWake`.
+#[tokio::test]
+async fn a_wake_reports_the_status_it_replaced() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let parent_id = Uuid::new_v4();
+    emit_thread_message(&bus, parent_id, None, "parent work").await;
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_status(&pool, parent_id).await.as_deref(), Some("idle"));
+
+    let wake = bus
+        .update_parent_after_child_terminal(parent_id)
+        .await
+        .expect("the parent row exists, so the wake lands");
+
+    assert_eq!(
+        wake.prev_status, "idle",
+        "the wake must carry the status it replaced, since that is what the \
+         rollback puts back"
+    );
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("running"),
+        "and the row itself is now awake"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Two wakes on one parent unwind in any order.
+///
+/// Both children complete, then both callbacks fail. Restoring the status but
+/// keeping the new stamp would fence the FIRST rollback out, and the parent
+/// would sit `running` with neither turn behind it.
+#[tokio::test]
+async fn two_failed_wakes_on_one_parent_unwind_completely() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let parent_id = Uuid::new_v4();
+    emit_thread_message(&bus, parent_id, None, "parent work").await;
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert_eq!(read_status(&pool, parent_id).await.as_deref(), Some("idle"));
+
+    // Two child completions land before either callback is handled.
+    let first = bus
+        .update_parent_after_child_terminal(parent_id)
+        .await
+        .expect("first wake");
+    let second = bus
+        .update_parent_after_child_terminal(parent_id)
+        .await
+        .expect("second wake");
+    assert_eq!(first.prev_status, "idle");
+    assert_eq!(
+        second.prev_status, "running",
+        "the second wake sees what the first one wrote"
+    );
+
+    // Both fail, newest first, the order a LIFO unwind takes.
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&second)).await;
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&first)).await;
+
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("idle"),
+        "neither turn will run, so the parent must end where it started"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The other unwind order does NOT fully settle, and that is a known bound
+/// rather than an accident. See `ParentWake`.
+///
+/// Pinned so the limit is visible and so a future change that closes it fails
+/// here loudly instead of quietly widening behaviour nobody re-checked.
+#[tokio::test]
+async fn two_failed_wakes_unwinding_oldest_first_leave_the_boot_reset_to_finish() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let parent_id = Uuid::new_v4();
+    emit_thread_message(&bus, parent_id, None, "parent work").await;
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let first = bus
+        .update_parent_after_child_terminal(parent_id)
+        .await
+        .expect("first wake");
+    let second = bus
+        .update_parent_after_child_terminal(parent_id)
+        .await
+        .expect("second wake");
+
+    // Oldest first: the older rollback is already fenced out.
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&first)).await;
+    EventBus::undo_parent_wake(&pool, parent_id, Some(&second)).await;
+
+    assert_eq!(
+        read_status(&pool, parent_id).await.as_deref(),
+        Some("running"),
+        "the documented bound: this order needs the boot reset to finish, \
+         which is what `main.rs` does for every orphaned `running`"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Read the two columns a wake writes.
+async fn read_wake(pool: &PgPool, thread_id: Uuid) -> (String, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as("SELECT status, last_revived_at FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 /// Read the child's `parent_callback_pending` marker.
 async fn read_callback_pending(pool: &PgPool, thread_id: Uuid) -> bool {
     sqlx::query_scalar("SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1")
@@ -1260,6 +1609,14 @@ async fn missing_parent_row_leaves_the_callback_pending() {
         read_callback_pending(&pool, child_id).await,
         "the card exists and the wake does not, so the parent callback is \
          still pending and the next terminal must retry"
+    );
+    // The wake's UPDATE is unguarded on row existence by design: with no row
+    // it matches nothing, which is why this corruption branch needs no check
+    // of its own. An UPSERT here would resurrect a half-built parent.
+    assert_eq!(
+        read_status(&pool, parent_id).await,
+        None,
+        "waking a parent whose row is gone must write nothing at all"
     );
 
     pool.close().await;

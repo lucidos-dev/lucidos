@@ -5,12 +5,14 @@ pub(crate) mod agent_session;
 mod agentic_loop;
 mod apply_all_batches;
 pub(crate) mod apply_all_driver;
+pub(crate) mod aux_capture;
+pub(crate) mod aux_purpose;
 pub mod cc_permission;
 pub mod cc_question_wait;
 pub(crate) mod cc_settings;
 mod change_ops;
 pub mod changelog;
-mod chat;
+pub(in crate::engine) mod chat;
 pub(crate) mod claude_code;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
@@ -22,6 +24,9 @@ pub mod command_permission;
 pub(crate) mod context;
 pub mod db_health;
 pub mod engine_version;
+/// The eval-only full-capture gate (ADR 0110). Inert without
+/// `LUCIDOS_EVAL_FULL_CAPTURE`, which only the eval harness sets.
+pub(crate) mod eval_capture;
 pub mod event_bus;
 pub mod event_wait;
 pub mod frontend_preview;
@@ -62,6 +67,7 @@ pub(crate) use agentic_loop::{
     coalesced_images_for_reprocess, coalesced_user_text_for_reprocess,
     emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
+pub(crate) use aux_capture::AuxCapture;
 pub(crate) use change_ops::now_epoch_millis;
 // Re-exported for `api::claude_code`, which classifies an `apply_now` refusal
 // into an HTTP status by identity against this const (a 404 there means "no
@@ -75,10 +81,22 @@ pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 pub(crate) use chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpUrgency,
 };
-pub(crate) use chat::generate_thread_title;
 pub(crate) use chat::PreEmittedOrigin;
+pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
 pub(crate) use context::format_history_steps;
+// The two provisional numbers, so `PreferenceStore` states its fallbacks in the
+// same place the sweep reads them.
+// `SweepSchedule` rides with them because `core` resolves the two numbers and
+// `chat` is not reachable from there. One type crossing beats two bare `usize`
+// a caller can transpose in silence.
+pub(crate) use chat::process::context_mode::SweepSchedule;
+// Public for the same reason the prompt below is: the eval pins a schedule, and
+// a default it hardcodes would silently stop being the shipped one.
+pub use chat::process::context_mode::{DEFAULT_EXPIRE_AFTER_ROUNDS, DEFAULT_SWEEP_EVERY_ROUNDS};
+// Public because the eval's `guidance_hash` has to cover the text a model
+// actually saw, and two arms swept at different values must hash differently.
+pub use chat::process::context_mode::rendered_context_mode_prompt;
 pub use types::*;
 
 /// Public re-export so binaries (notably `main.rs`) can start the CC spawn
@@ -90,7 +108,6 @@ pub mod spawn_dispatcher {
 
 use crate::core::{
     AppManager, ArtifactManager, CredentialStore, EventStore, PinnedAppStore, PreferenceStore,
-    PREF_MODEL_TITLE,
 };
 use crate::llm::LlmProvider;
 use crate::memory::{EmbedderSlot, MemoryExtractor, PgVectorIndex};
@@ -324,9 +341,9 @@ pub struct LucidosEngine {
     python_runtime: PythonRuntime,
     browser_runtime: BrowserRuntime,
     app_manager: Arc<AppManager>,
-    /// Active LLM provider behind a swappable handle so the credential subscriber
-    /// (`spawn_provider_credential_subscriber`) can hot-swap it at runtime when a
-    /// provider credential is added/removed — no engine restart. All reads go
+    /// Active LLM provider behind a swappable handle. The config subscriber
+    /// (`spawn_provider_config_subscriber`) hot-swaps it when a provider is
+    /// configured or removed, with no engine restart. All reads go
     /// through [`LucidosEngine::current_provider`], which clones the inner `Arc`
     /// out under a short read guard (never held across an `.await`). Mirrors the
     /// `Arc<RwLock<…>>` convention of `ModelRegistry` / `LocationHandle`.
@@ -925,22 +942,52 @@ fn spawn_models_registry_subscriber(
     });
 }
 
-/// Hot-swap the engine's active LLM provider when a provider credential changes.
-/// On any `Credential{Created,Updated,Deleted}` for a provider service
-/// (`openai`/`anthropic`/`openrouter`/`xai`/`local`), re-resolve `select_provider`
-/// against current DB state via [`crate::llm::build_active_provider`] and swap
-/// the shared provider handle in place — so a first-run user who adds a key in
-/// Settings → Models → Providers gets a working chat with NO restart, and removing the
-/// last key swaps back to the unconfigured sentinel (when
-/// `LUCIDOS_BOOT_WITHOUT_PROVIDER` is set). Mirrors
-/// `spawn_models_registry_subscriber`.
+/// What in this event changed the LLM provider configuration, if anything.
+///
+/// `Some(label)` means rebuild, and the label names the source for the log.
+/// Everything else on the bus is ignored, including a preference the provider
+/// build never reads.
+fn provider_config_trigger(event: &event_bus::BusEvent) -> Option<String> {
+    use event_bus::{BusEvent, SystemEvent};
+    match event {
+        BusEvent::System(
+            SystemEvent::CredentialCreated { service_name, .. }
+            | SystemEvent::CredentialUpdated { service_name, .. }
+            | SystemEvent::CredentialDeleted { service_name, .. },
+        ) if crate::llm::PROVIDER_CREDENTIAL_SERVICES.contains(&service_name.as_str()) => {
+            Some(format!("the '{service_name}' credential"))
+        }
+        BusEvent::System(SystemEvent::PreferencesChanged { key, .. })
+            if crate::llm::PROVIDER_PREFERENCE_KEYS.contains(&key.as_str()) =>
+        {
+            Some(format!("the '{key}' preference"))
+        }
+        _ => None,
+    }
+}
+
+/// Hot-swap the engine's active LLM provider when its configuration changes.
+///
+/// Two kinds of change qualify, because a provider is configured two ways. A
+/// `Credential{Created,Updated,Deleted}` for a service in
+/// [`crate::llm::PROVIDER_CREDENTIAL_SERVICES`], and a `PreferencesChanged` for
+/// a key in [`crate::llm::PROVIDER_PREFERENCE_KEYS`]. The keyless OpenCode Free
+/// tier has no credential at all, so a credential-only watch would leave its
+/// toggle needing a restart.
+///
+/// Either way, re-resolve `select_provider` against current DB state via
+/// [`crate::llm::build_active_provider`] and swap the shared provider handle in
+/// place. A first-run user who configures a provider in Settings → Models →
+/// Providers then gets a working chat with NO restart. Removing the last one
+/// swaps back to the unconfigured sentinel, when `LUCIDOS_BOOT_WITHOUT_PROVIDER`
+/// is set. Mirrors `spawn_models_registry_subscriber`.
 ///
 /// **Mock isolation:** the caller does not spawn this under `LUCIDOS_MODEL=mock`,
 /// and `ctx.model_is_mock` is `false`, so `build_active_provider` can never
 /// return `MockProvider` here — the mock stays reachable only via the explicit
 /// env opt-in. A `FailFast` rebuild (no provider, gate off) keeps the current
 /// provider rather than panicking the running engine.
-fn spawn_provider_credential_subscriber(
+fn spawn_provider_config_subscriber(
     mut rx: tokio::sync::broadcast::Receiver<event_bus::EmittedEvent>,
     llm_handle: Arc<std::sync::RwLock<Arc<dyn crate::llm::LlmProvider>>>,
     web_search_handle: Arc<std::sync::RwLock<Arc<crate::llm::WebSearchChain>>>,
@@ -948,34 +995,25 @@ fn spawn_provider_credential_subscriber(
     ctx: crate::llm::ProviderBuildContext,
 ) {
     tokio::spawn(async move {
-        use event_bus::{BusEvent, SystemEvent};
         use tokio::sync::broadcast::error::RecvError;
         loop {
             let emitted = match rx.recv().await {
                 Ok(e) => e,
                 // Lag = subscriber fell behind. Skip the dropped events but keep
-                // listening, so a single lag doesn't stop tracking credential
-                // changes for the rest of the engine's lifetime.
+                // listening, so a single lag doesn't stop tracking provider
+                // config changes for the rest of the engine's lifetime.
                 Err(RecvError::Lagged(n)) => {
                     log!(
-                        "[Providers] credential subscriber lagged by {} events — continuing",
+                        "[Providers] config subscriber lagged by {} events, continuing",
                         n
                     );
                     continue;
                 }
                 Err(RecvError::Closed) => break,
             };
-            let service = match &emitted.typed {
-                BusEvent::System(
-                    SystemEvent::CredentialCreated { service_name, .. }
-                    | SystemEvent::CredentialUpdated { service_name, .. }
-                    | SystemEvent::CredentialDeleted { service_name, .. },
-                ) => service_name,
-                _ => continue,
-            };
-            if !crate::llm::PROVIDER_CREDENTIAL_SERVICES.contains(&service.as_str()) {
+            let Some(trigger) = provider_config_trigger(&emitted.typed) else {
                 continue;
-            }
+            };
             match crate::llm::build_active_provider(Some(&pool), &ctx).await {
                 Ok(crate::llm::ProviderBuildOutcome::Install {
                     llm,
@@ -986,9 +1024,9 @@ fn spawn_provider_credential_subscriber(
                         Ok(mut guard) => {
                             *guard = llm;
                             log!(
-                                "[Providers] active LLM provider swapped to {:?} after '{}' credential change — no restart",
+                                "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
                                 selection,
-                                service
+                                trigger
                             );
                         }
                         Err(e) => {
@@ -1018,14 +1056,14 @@ fn spawn_provider_credential_subscriber(
                 }
                 Ok(crate::llm::ProviderBuildOutcome::FailFast) => {
                     log!(
-                        "[Providers] '{}' credential change left no provider configured and LUCIDOS_BOOT_WITHOUT_PROVIDER is off — keeping the current provider (a restart would fail-fast)",
-                        service
+                        "[Providers] {} changed and left no provider configured, with LUCIDOS_BOOT_WITHOUT_PROVIDER off. Keeping the current provider (a restart would fail-fast)",
+                        trigger
                     );
                 }
                 Err(e) => {
                     log!(
-                        "[Providers] provider rebuild after '{}' credential change failed: {} — keeping current provider",
-                        service,
+                        "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
+                        trigger,
                         e
                     );
                 }
@@ -1095,6 +1133,226 @@ fn partition_chat_thread_ids(
         .filter(|tid| !all_cc_thread_ids.contains(tid))
         .copied()
         .collect()
+}
+
+/// What a caller gets when it wins admission for a thread: the turn's cancel
+/// token, its injection receiver, and the guard whose drop releases the thread.
+pub(crate) type ThreadRegistration = (
+    CancellationToken,
+    mpsc::UnboundedReceiver<InjectedPrompt>,
+    ThreadGuard,
+);
+
+/// Build the handle and its guard, and put the handle in the map.
+///
+/// The shared body of the two admission functions below. Never call it
+/// directly: on its own it is the unconditional insert they exist to prevent.
+fn install_thread_handle(
+    threads: &mut HashMap<Uuid, ThreadHandle>,
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+) -> ThreadRegistration {
+    let token = CancellationToken::new();
+    let (injection_tx, injection_rx) = mpsc::unbounded_channel();
+    let generation = THREAD_GENERATION.fetch_add(1, Ordering::Relaxed);
+    threads.insert(
+        thread_id,
+        ThreadHandle::new(token.clone(), injection_tx, generation),
+    );
+    let guard = ThreadGuard {
+        active_threads: active_threads.clone(),
+        thread_id,
+        completion_notify: completion_notify.clone(),
+        generation,
+    };
+    (token, injection_rx, guard)
+}
+
+/// The answer to one admission attempt.
+pub(crate) enum Admission {
+    /// The caller owns the turn.
+    Admitted(ThreadRegistration),
+    /// A turn already owns the thread, at this registration generation.
+    ///
+    /// The number is what makes an eviction safe later: it names the turn the
+    /// caller waited for. Two waiters whose budgets expire together would
+    /// otherwise take turns removing each other's replacement.
+    Busy { generation: u64 },
+}
+
+impl Admission {
+    /// The registration, or `None` when a turn already owns the thread. For a
+    /// caller that coalesces instead of waiting, and so has no use for the
+    /// blocking generation.
+    pub(crate) fn admitted(self) -> Option<ThreadRegistration> {
+        match self {
+            Self::Admitted(registration) => Some(registration),
+            Self::Busy { .. } => None,
+        }
+    }
+}
+
+/// Admit one run on `thread_id`, or refuse because a turn already owns it.
+///
+/// **This is the single-flight point for the whole engine.** The question "is a
+/// turn already live here?" and the insert that answers it for the next caller
+/// happen under ONE lock acquisition, through a vacant entry. Nothing else may
+/// put a handle in `active_threads`.
+///
+/// The predecessor asked and inserted separately, and inserted unconditionally.
+/// Two wakes for one logical event both read "free", both inserted, and the
+/// second overwrote the first's handle. Both agentic loops then ran, and the
+/// first one's `ThreadGuard::drop` no-oped on the generation check, so nothing
+/// observed that a thread was running twice. See
+/// `docs/plans/2026-08-24-one-event-one-run-and-a-depth-that-reaches-thread-events.md`.
+///
+/// A refusal is not an error. The caller coalesces into the live turn by
+/// injecting (`chat::process`), or waits for it to release the thread
+/// ([`admit_with_stuck_turn_eviction`]).
+pub(crate) fn try_register_thread(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+) -> Admission {
+    let mut threads = active_threads.lock().unwrap();
+    if let Some(handle) = threads.get(&thread_id) {
+        return Admission::Busy {
+            generation: handle.generation,
+        };
+    }
+    Admission::Admitted(install_thread_handle(
+        &mut threads,
+        active_threads,
+        completion_notify,
+        thread_id,
+    ))
+}
+
+/// Evict the turn holding `thread_id` and take the slot in the same breath.
+/// `None` when `stuck_generation` no longer owns the slot.
+///
+/// The stuck-turn backstop, reached only after the caller's wait budget has
+/// expired. Removal and re-insert share one lock acquisition on purpose. A
+/// remove that let go of the lock first would free the slot for another
+/// waiter. This caller would then insert over a turn that had just started.
+///
+/// `stuck_generation` closes the same hole one step out. Several waiters can
+/// queue behind one wedged turn, so their budgets expire together. The first
+/// evicts and installs a replacement, and the next must NOT remove that live
+/// replacement in turn. Refusing sends it back to waiting, this time on work
+/// that is actually running.
+///
+/// The evicted turn keeps unwinding with a stale generation, so its guard's
+/// drop no-ops and cannot remove the replacement.
+pub(crate) fn evict_and_register(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    stuck_generation: u64,
+) -> Option<ThreadRegistration> {
+    let (evicted, registration) = {
+        let mut threads = active_threads.lock().unwrap();
+        match threads.get(&thread_id) {
+            Some(handle) if handle.generation == stuck_generation => {}
+            // Already released, or already replaced by another waiter's
+            // eviction. Either way this caller has nothing to evict.
+            _ => return None,
+        }
+        let evicted = threads.remove(&thread_id);
+        let registration =
+            install_thread_handle(&mut threads, active_threads, completion_notify, thread_id);
+        (evicted, registration)
+    };
+    // Outside the lock: cancelling wakes the evicted loop, which reaches for
+    // the same map on its way out.
+    if let Some(handle) = evicted {
+        handle.token.cancel();
+    }
+    if let Some(notify) = completion_notify.lock().unwrap().remove(&thread_id) {
+        notify.notify_waiters();
+    }
+    Some(registration)
+}
+
+/// Wait for the thread to come free, and evict the turn holding it once this
+/// caller's budget expires. The body of
+/// [`LucidosEngine::register_thread_queued`], as a free function so the engine
+/// method and its tests exercise one implementation rather than two.
+///
+/// `announce_eviction` runs once, immediately before the eviction, and is
+/// where the engine emits its `ResponseAborted`. It runs even when the
+/// eviction is then refused. That costs at most a duplicate terminator on the
+/// wedged exchange, which the emit gate drops, and never a missed one.
+///
+/// **The budget is per HOLDER, not per caller.** Each time a different turn
+/// takes the thread, the wait starts again against that turn. A caller must
+/// not inherit impatience earned against work that has already finished.
+pub(crate) async fn admit_with_stuck_turn_eviction<F, Fut>(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    stuck_turn_timeout: std::time::Duration,
+    announce_eviction: F,
+) -> ThreadRegistration
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    /// Re-ask this often even without a notification, so a completion that
+    /// landed between the refusal and the park cannot hold a caller up.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let mut waited_for: Option<u64> = None;
+    let mut deadline = tokio::time::Instant::now() + stuck_turn_timeout;
+
+    loop {
+        let (generation, notify) =
+            match try_register_thread(active_threads, completion_notify, thread_id) {
+                Admission::Admitted(registration) => return registration,
+                Admission::Busy { generation } => {
+                    if waited_for != Some(generation) {
+                        waited_for = Some(generation);
+                        deadline = tokio::time::Instant::now() + stuck_turn_timeout;
+                    }
+                    let notify = completion_notify
+                        .lock()
+                        .unwrap()
+                        .entry(thread_id)
+                        .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                        .clone();
+                    (generation, notify)
+                }
+            };
+
+        if tokio::time::Instant::now() >= deadline {
+            log!(
+                "[Chat] Thread {} stuck for {}s, force-cancelling and evicting",
+                thread_id,
+                stuck_turn_timeout.as_secs()
+            );
+            announce_eviction().await;
+            if let Some(registration) =
+                evict_and_register(active_threads, completion_notify, thread_id, generation)
+            {
+                return registration;
+            }
+            log!(
+                "[Chat] Thread {} was handed to another waiter first, queuing behind its turn",
+                thread_id
+            );
+            continue;
+        }
+
+        log!(
+            "[Chat] Thread {} is busy, queuing follow-up request",
+            thread_id
+        );
+        tokio::select! {
+            _ = notify.notified() => {}
+            _ = tokio::time::sleep(POLL) => {}
+        }
+    }
 }
 
 /// Record `request_event_id` on `thread_id`'s handle, unless the registration
@@ -1241,6 +1499,10 @@ mod common;
 #[cfg(test)]
 #[path = "mod_tests/migration.rs"]
 mod migration_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/provider_config_trigger.rs"]
+mod provider_config_trigger_tests;
 
 #[cfg(test)]
 #[path = "mod_tests/lifecycle.rs"]

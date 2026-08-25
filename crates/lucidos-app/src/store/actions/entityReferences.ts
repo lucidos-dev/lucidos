@@ -5,16 +5,16 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
 import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { loadChatModels } from './models';
-import { loadTriggers } from './triggers';
+import { loadTriggers, loadHistoricalTriggers } from './triggers';
 import { loadThreadQueue } from './threadQueue';
 import { loadTriggerGroups } from './triggerGroups';
-import { loadArtifacts } from './artifacts';
+import { loadArtifacts, invalidateFilePreview } from './artifacts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
@@ -24,6 +24,26 @@ import { loadDevices, devices, getDeviceId } from './devices';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
+
+/** Should an entity event refresh the `artifacts` list?
+ *
+ *  `not-loaded` means the user never opened a surface that needs it, and
+ *  warming a cache nobody asked for is pure network waste. Every other state
+ *  means they DID ask, `failed` included.
+ *
+ *  Admitting `failed` is what stops one bad fetch latching. `loadArtifacts`
+ *  writes `toFailed` on error, which discards the loaded list, so a single
+ *  timed-out refresh used to leave every later event unable to retry: the gate
+ *  wanted `loaded` and nothing could get back there short of a page reload.
+ *  Chat links, the Files panel and the preview all went stale together and
+ *  stayed that way.
+ *
+ *  `loading` is excluded so a burst of events cannot stampede parallel fetches
+ *  whose completion order decides the winner. */
+function artifactsWereAskedFor(): boolean {
+  const status = artifacts.value.status;
+  return status === 'loaded' || status === 'failed';
+}
 
 /** Re-probe `/health` and update `llmConfigured` after a provider credential
  *  change. The backend hot-swaps the active LLM provider in an in-process
@@ -51,6 +71,64 @@ async function probeLlmConfigured(): Promise<void> {
       configuredProviders.value = result.data.configured_providers;
     }
   }
+}
+
+/** Re-fetch the open preview when an `Artifact*` event names the file it shows.
+ *
+ *  These events carry `artifact_path` relative to `artifacts/`, while the
+ *  preview addresses a file the data-relative way, so the prefix goes back on
+ *  here. `invalidateFilePreview` ignores every other path. */
+function invalidateArtifactPreview(data: Record<string, unknown>): void {
+  const artifactPath = data.artifact_path as string | undefined;
+  if (artifactPath) invalidateFilePreview(`artifacts/${artifactPath}`);
+}
+
+/** The plugin id, wherever the frame carries it. `PluginInstalled` nests it in
+ *  the manifest; every other `Plugin*` frame has it at the top level. */
+function pluginIdOf(data: Record<string, unknown>): string | undefined {
+  const manifest = data.manifest as Record<string, unknown> | undefined;
+  return (data.id as string | undefined) ?? (manifest?.id as string | undefined);
+}
+
+/** Close a plugin install / uninstall panel whose pending entry somebody else
+ *  resolved.
+ *
+ *  Both panels open from a THREAD event, so every client of that thread shows
+ *  one. Once a peer confirms or cancels, the pending entry is gone and Confirm
+ *  here can only 404, which `cancelPluginInstallAction` swallows: the panel
+ *  vanishes and nothing happened.
+ *
+ *  **The acting device is exempt by its ACTOR, not by the receipt its confirm
+ *  leaves.** The engine emits before it answers the POST, so the frame can
+ *  arrive while that panel is still pending. Closing on it would beat
+ *  `markPluginInstalled` to the overlay, and the receipt would silently
+ *  degrade to a toast. Same test as `handleOAuthAccountConnected`.
+ *
+ *  A receipt is skipped too. It is already resolved, so there is nothing to
+ *  close and a record to lose. */
+function closeResolvedPluginPanel(
+  eventType: string,
+  pluginId: string | undefined,
+  actor: { kind?: string; device_id?: string } | null | undefined,
+): void {
+  if (!pluginId) return;
+  if (actor?.kind === 'device' && actor.device_id === getDeviceId()) return;
+  const overlay = panelOverlay.value;
+  if (overlay?.type !== 'form') return;
+  const form = overlay.form;
+  const installing = eventType === 'PluginInstalled' || eventType === 'PluginInstallCanceled';
+  if (installing) {
+    if (form.type !== 'plugin-install' || form.installed) return;
+  } else if (form.type !== 'plugin-uninstall' || form.removed) {
+    return;
+  }
+  if (form.request.plugin_id !== pluginId) return;
+  panelOverlay.value = null;
+}
+
+/** The `actor` a `Plugin*` frame carries, in the shape the device test needs. */
+function actorOf(data: Record<string, unknown>): { kind?: string; device_id?: string } | null {
+  return (data.actor as { kind?: string; device_id?: string } | null | undefined) ?? null;
 }
 
 function refreshLlmConfigured(): void {
@@ -105,6 +183,11 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       }
       void loadTriggers();
       void loadTriggerGroups();
+      // A deleted trigger joins the HISTORICAL registry, which is what the
+      // thread filter offers as trigger options. Nothing else reloads that
+      // list, so without this the filter keeps offering the live trigger and
+      // never offers the historical one until a page reload.
+      void loadHistoricalTriggers();
       break;
     }
     // Trigger group lifecycle — pure organizational events; refresh the
@@ -140,17 +223,25 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // File events. `ArtifactImported` is the user-driven import flow;
     // `ArtifactCreated`/`Updated`/`Deleted` fire from `emit_entity_events_for_change_apply`
     // when a coding-agent change lands files in `data/artifacts/`. All four
-    // refresh the same `artifacts` list — gated on `loaded` for the latter
-    // three to match the PluginInstalled pattern (don't warm caches the user
-    // hasn't opened), unconditional for ArtifactImported because the import
-    // flow always has a settings panel open.
+    // refresh the same `artifacts` list. The latter three are gated on
+    // `artifactsWereAskedFor`, matching the PluginInstalled pattern: don't warm
+    // a cache the user hasn't opened. ArtifactImported is unconditional,
+    // because the import flow always has a settings panel open.
+    //
+    // All four also carry `artifact_path`, relative to `artifacts/`. Prefixed
+    // back to the data-relative form, that is what tells the open preview
+    // whether the file IT shows just changed. The list refresh and the preview
+    // invalidation are independent: a preview can be open on a file whose list
+    // this device never loaded, so the gate must not swallow it.
     case 'ArtifactImported':
+      invalidateArtifactPreview(data);
       void loadArtifacts();
       break;
     case 'ArtifactCreated':
     case 'ArtifactUpdated':
     case 'ArtifactDeleted':
-      if (artifacts.value.status === 'loaded') void loadArtifacts();
+      invalidateArtifactPreview(data);
+      if (artifactsWereAskedFor()) void loadArtifacts();
       break;
     // `RepositoryImported` is the `git_clone` tool landing a repo's files under
     // `data/artifacts/imported/<name>/` — a BULK ARTIFACT import, not a change
@@ -160,7 +251,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // list, which never contains the clone — so an agent-imported repo never
     // appeared anywhere live.)
     case 'RepositoryImported':
-      if (artifacts.value.status === 'loaded') void loadArtifacts();
+      if (artifactsWereAskedFor()) void loadArtifacts();
       break;
     // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
     // `lucidos` CLI). These are the API-origin AUDIT events; the paired
@@ -170,12 +261,16 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // subtree still only produces a `DataFile*`, and because reloading the
     // same list twice is idempotent. `path` is relative to `data/`
     // (e.g. `artifacts/notes.md`); refresh the artifacts cache when it targets
-    // the artifacts subtree. Gated on `loaded` like the Artifact* trio.
+    // the artifacts subtree. Same gate as the Artifact* trio.
     case 'DataFileWritten':
     case 'DataFileEdited':
     case 'DataFileDeleted': {
       const dataPath = data.path as string | undefined;
-      if (dataPath?.startsWith('artifacts/') && artifacts.value.status === 'loaded') {
+      // Already data-relative, so it goes straight to the preview. Note the
+      // wider reach than the list refresh below: a `config/` or `knowhow/`
+      // write changes no artifact list, but it may well be the file on screen.
+      if (dataPath) invalidateFilePreview(dataPath);
+      if (dataPath?.startsWith('artifacts/') && artifactsWereAskedFor()) {
         void loadArtifacts();
       }
       break;
@@ -190,6 +285,13 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appsList.value.status === 'loaded') void loadApps();
       if (triggers.value.status === 'loaded') void loadTriggers();
       if (installedPlugins.value.status === 'loaded') void loadInstalledPlugins();
+      closeResolvedPluginPanel(type, pluginIdOf(data), actorOf(data));
+      break;
+    // A peer resolved the pending entry this device's panel is offering, so
+    // its buttons can now only 404. Close it rather than leave a dead one up.
+    case 'PluginInstallCanceled':
+    case 'PluginUninstallCanceled':
+      closeResolvedPluginPanel(type, pluginIdOf(data), actorOf(data));
       break;
     // Marketplace registry mutations. One arm serves BOTH surfaces that list
     // marketplaces, because both render off the single `marketplaceCatalog`
@@ -232,6 +334,27 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'ModelDeleted':
       if (chatModels.value.status === 'loaded') void loadChatModels();
       break;
+    // Three settings pages fetch their own data rather than holding it in a
+    // store signal, so they subscribe through a version counter instead: they
+    // re-read when it moves. See `useVersionedRefresh`. Bumping is free when
+    // the page is closed, since nothing reads the counter then.
+    case 'McpServerRegistered':
+    case 'McpServerUpdated':
+    case 'McpServerRemoved':
+    case 'McpServerDisabledToolsChanged':
+      mcpServersVersion.value++;
+      break;
+    case 'WebhookCreated':
+    case 'WebhookUpdated':
+    case 'WebhookDeleted':
+      webhooksVersion.value++;
+      break;
+    // The agent grants a command or tool pattern by writing the allowlist file,
+    // which is exactly what the Permissions editors show. Both files bump the
+    // one counter; see the signal's own note for why it is not keyed.
+    case 'PermissionGrantsChanged':
+      permissionGrantsVersion.value++;
+      break;
     // Settings → Accounts. Both halves of the pair matter: connecting used to
     // emit nothing at all (the engine wrote the row straight from the OAuth
     // callback), so a disconnect refreshed every client while a connect
@@ -271,6 +394,9 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'DeviceRenamed':
     case 'DevicePushChanged':
     case 'DeviceDeleted':
+    // A hand-over moves a whole row to a new id, so a Settings page open on
+    // another device is showing one that no longer exists.
+    case 'DeviceHandedOver':
       if (devices.value.status === 'loaded') void loadDevices();
       break;
     // Pinned apps are device-scoped. Refresh only when the event targets THIS

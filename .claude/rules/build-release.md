@@ -6,6 +6,7 @@ paths:
   - "scripts/rebuild-mirror-history.sh"
   - "scripts/lib/build_*.sh"
   - "scripts/lib/stage_runtime*.sh"
+  - "scripts/lib/resource_contract*.sh"
   - "scripts/lib/headless_tarball*.sh"
   - "scripts/lib/install*.sh"
   - "scripts/lib/service*.sh"
@@ -197,7 +198,19 @@ The self-contained runtime tree — the 7 `RESOURCE_NAMES`: `lucidos-engine`, `l
 
 - `stage_runtime_triple` — target-triple resolution from `uname`.
 - `stage_runtime_fetch_postgres` — the theseus-rs PG18 + pgvector fetch/compile recipe; the same code resolves the macOS `*-apple-darwin` and Linux `*-unknown-linux-gnu` relocatable Postgres asset by triple. The `PG_SYSROOT` override applies only on a Darwin host; Linux uses system gcc.
-- the frontend/binary builds, and the 7-resource `stage_runtime_assemble`.
+- the frontend/binary builds, and `stage_runtime_assemble`, which takes **`<name>=<path>` pairs**, not ordered paths. Adding a resource used to mean a new argument in the middle of two call sites. Swapping two inputs of the same kind staged a tree that looked fine.
+
+### The resource contract is checked against the launchers (ADR 0121)
+
+**`scripts/lib/resource_contract.sh` is the ONE list**, and it is what both build scripts read `RESOURCE_NAMES`, `BUNDLED_EXECUTABLES` and the Tauri `bundle.resources` map out of. Do not restate any of them.
+
+`resource_contract_check` asserts a **three-way set equality** against the two RUNTIME launchers, neither of which the build scripts own: `service_runtime_env_pairs` + `service_runtime_program` (`scripts/lib/service.sh`, the headless service), and the `*_RESOURCE_NAME` constants in `crates/lucidos-app/src/desktop.rs` (the packaged `.app`). Both name all seven. Drop one from the list and both other sources still carry it, so `--check` goes red on both vehicles.
+
+That shape is the whole fix. `build-dmg.sh`'s old `check_resource_contract` compared `RESOURCE_NAMES` against a literal `resource_map_json()` **in the same file**, so editing both together passed. `build-headless.sh`'s `--check` was a `printf` and an `exit 0` and could not fail at all. Net effect: `system-knowhow` could be dropped from `Contents/Resources` **and** from `--emit-tarball` with every gate green, shipping an engine whose live per-turn reference docs are absent.
+
+**A new resource is added in one place**, plus the launcher(s) that resolve it. `resource_contract_assert_staged` then re-reads the tree each vehicle actually wrote. A named call that simply omits a resource is therefore caught by the stage rather than by a user. Offline-tested by `scripts/lib/resource_contract_test.sh`, whose load-bearing half is the RED cases: it doctors each of the three sources in a scratch copy and asserts the check refuses, naming the resource. A green-only suite here would reproduce the bug it replaced.
+
+`stage_runtime.sh` deliberately does NOT source the contract lib: `install.sh` fetches `stage_runtime.sh` over the network when piped, so a transitive dependency would have to be published beside it.
 
 **The stage outlives the build, so it is guarded at the point of consumption.** `stage_runtime_assemble` `rm -rf`s its target before copying, so every sanctioned build path is correct by construction. What is not correct by construction is `build-dmg.sh`'s stage *between* runs: `crates/lucidos-app/bundle-resources/` is gitignored and survives, and a `cargo tauri build --config '<resource map>'` typed by hand skips step 4 and hands Tauri whatever that leftover holds. Found on 2026-08-07 carrying 12,732 characters of stale `system-knowhow` descriptions against 6,584 live, including a doc that had since been rewritten, with nothing anywhere saying so.
 

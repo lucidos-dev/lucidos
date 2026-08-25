@@ -21,12 +21,12 @@ priority can't starve triggers/cron.
 
 | Path | Kind | How it's gated |
 |---|---|---|
-| An event trigger matching a domain/thread event | `event-trigger` | background — `submit` |
-| A trigger's cron schedule firing (incl. missed-grace catch-up) | `cron` | background — `submit` |
-| `run_thread` LLM tool (agent-driven sub-thread) | `sub-thread` | background — `submit` |
-| `run_coding_agent` LLM tool (agent-driven coding-agent thread; `coding_agent` preserves Claude Code vs Codex) | `coding-agent` | background — `submit` |
-| Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background — `submit` |
-| User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user — `acquire_user_slot` |
+| An event trigger matching a domain/thread event | `event-trigger` | background, via `submit` |
+| A trigger's cron schedule firing (incl. missed-grace catch-up) | `cron` | background, via `submit` |
+| `run_thread` LLM tool (agent-driven sub-thread) | `sub-thread` | background, via `submit` |
+| `run_coding_agent` LLM tool (agent-driven coding-agent thread; `coding_agent` preserves Claude Code vs Codex) | `coding-agent` | background, via `submit` |
+| Agent/Engine-mode `POST /api/v1/chat/stream` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background, via `submit` |
+| User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user, via `acquire_user_slot` |
 
 | Waking a thread parked on an *event wait* (a matching event arrived, or the wait timed out) | `user-chat` | user, `acquire_user_slot` |
 

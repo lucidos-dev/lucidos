@@ -14,14 +14,16 @@ export type VisualStatus = ThreadStatus | 'changes' | 'question';
  *  `status` of `idle`, and both mean the same thing to the reader: something
  *  else will wake this, do not treat it as finished. They deliberately share
  *  one dot rather than splitting into two, since the distinction between them
- *  is detail the subscription indicator carries.
+ *  is detail the waiting indicator carries.
  *
- *  Note what this does NOT do: an event wait changes only what the dot draws.
- *  `is_blocking`, `is_attention_needing`, `displaySection` and the thread
- *  actions never see it, so a subscribed thread stays non-blocking,
- *  non-attention-needing and archivable (ADR 0049). `VisualStatus` is the
- *  right home for the fact precisely because it is already a derived axis:
- *  `changes` and `question` are not `ThreadStatus` values either. */
+ *  Both outrank `changes`, and the Apply gate agrees with the dot: a parked
+ *  thread wakes and may commit again, so `availableThreadActions` withholds
+ *  Apply and Discard on the same two facts. `is_blocking`,
+ *  `is_attention_needing` and `displaySection` still never see them, so a
+ *  parked thread stays archivable when it has no change to resolve (ADR 0049).
+ *  `VisualStatus` is the right home for the fact precisely because it is
+ *  already a derived axis: `changes` and `question` are not `ThreadStatus`
+ *  values either. */
 export function resolveVisualStatus(
   status: ThreadStatus,
   hasActiveChildren: boolean,
@@ -33,15 +35,20 @@ export function resolveVisualStatus(
   if (status === 'waiting_for_user_answer') return 'question';
   // The user's own version switch interrupted this turn, and the engine is
   // bringing it back. It outranks `changes` for the same reason `failed` does:
-  // it describes what happened to the turn, and the backend has already resolved
-  // the two against each other (a paused thread that HAS a proposed change is
-  // written `waiting`, not `paused`, by `AbortCause::status_sql`), so reaching
-  // here means there is nothing to review.
+  // it describes what happened to the turn, which the user needs before they
+  // decide whether to review anything.
+  //
+  // THIS function is where that precedence lives, and the only place. The
+  // backend used to state it a second time, writing `waiting` instead of the
+  // verdict whenever a change was pending. That cost the verdict outright, so
+  // an interrupted thread with a change came back reading Running. See
+  // `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
   if (status === 'paused') return 'paused';
-  // `changes` still outranks `waiting`: a proposed change needs the user, and a
-  // subscription does not.
-  if (codingAgentProposed) return 'changes';
+  // `waiting` outranks `changes`: the thread is not finished, so its change is
+  // not final and cannot be resolved yet. Reading it as "Changes to review"
+  // invited an Apply that would merge a branch still being worked on.
   if (hasActiveChildren || hasLiveEventWaits) return 'waiting';
+  if (codingAgentProposed) return 'changes';
   return 'idle';
 }
 
@@ -69,8 +76,8 @@ const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   // One description for both causes, because one dot covers both (see
   // `resolveVisualStatus`). Naming only children would be a lie on a thread
   // that is watching for an event, and the per-wait detail is one tap away in
-  // the subscription indicator.
-  { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to.' },
+  // the waiting indicator.
+  { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to. Any proposed change waits with it.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
   { status: 'paused', label: 'Paused', desc: 'Your switch to a new version interrupted this turn. It resumes on its own, so there is nothing to do.' },

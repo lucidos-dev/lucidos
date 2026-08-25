@@ -70,12 +70,20 @@ export function bootSplashPlaysNoReveal(): boolean {
 
 /** Update the status line under the mark (e.g. "Opening your workspace…",
  *  "Connecting…") and fade it in (it starts hidden so a fast load never flashes
- *  text). No-op if the splash is absent. */
+ *  text). No-op if the splash is absent.
+ *
+ *  A label carrying line breaks is a FAILURE REPORT, not a status: the packaged
+ *  desktop sends one when the background service has crash-looped
+ *  (`desktop::crash_loop_label`). The one-line rules in index.html would clip it
+ *  to its first ellipsized line, so a multi-line label switches the element into
+ *  the wrapping report state. Decided on the text rather than by a second
+ *  argument, so every caller inherits it and none has to know the state exists. */
 export function setBootStatus(text: string): void {
   const el = document.querySelector(SPLASH_SELECTOR + ' ' + STATUS_SELECTOR);
   if (!el) return;
   el.textContent = text;
   el.classList.toggle('boot-splash-status-shown', text.length > 0);
+  el.classList.toggle('boot-splash-status-report', text.includes('\n'));
 }
 
 /** Reveal the inline splash's gateway escape link, when this document has one to
@@ -96,6 +104,25 @@ export function revealBootEscape(): boolean {
     .__lucidosGatewayEscape;
   if (typeof reveal !== 'function') return false;
   return reveal() != null;
+}
+
+/** Tell the inline boot watchdog (index.html) that the module graph is live.
+ *
+ *  It clears the 15s stall timer and the entry-script error listener. A boot
+ *  failure after this call is the application's to recover, not the document's.
+ *  Handing over too early is therefore a real regression: the watchdog is the
+ *  only recovery a picker document has.
+ *
+ *  Two callers, and each is deliberate about WHEN. `main.tsx` hands over at once
+ *  on the workspace path, and defers to the picker's lazy loader on the picker
+ *  path. `PairingGate` hands over once it knows this device is unpaired, because
+ *  that screen paints entirely from its own chunk, which has landed by then, so
+ *  nothing is in flight. Its camera scanner is lazy, and a tap fetches it long
+ *  after this.
+ *
+ *  Lives here rather than in `main.tsx` so both reach one implementation. */
+export function handOverBootOwnership(): void {
+  (window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
 }
 
 /** Fade out and remove the splash. Idempotent — safe to call from the readiness

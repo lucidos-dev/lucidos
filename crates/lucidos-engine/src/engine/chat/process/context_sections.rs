@@ -141,15 +141,23 @@ impl LucidosEngine {
                 .map(|a| a.name.clone())
                 .unwrap_or_else(|| ctx.app_id.clone());
 
-            // Load app-specific knowhow from data/apps/{id}/knowhow/*.md
+            // Name the app's knowhow docs from data/apps/{id}/knowhow/*.md.
+            // The same loader the Know-how routing list is built from, so the
+            // two surfaces cannot disagree about what exists or what it is
+            // called. Ids only: bodies are one `load_knowhow` away.
             let app_knowhow_dir = self
                 .workspace_path
                 .join(crate::core::APPS_DIR)
                 .join(&ctx.app_id)
                 .join("knowhow");
-            let app_knowhow = crate::core::knowhow::load_app_knowhow(&app_knowhow_dir);
+            let summaries = crate::core::KnowhowStore::load_summaries(
+                &app_knowhow_dir,
+                crate::core::KnowhowListDepth::FilesOnly,
+            );
+            let knowhow_listing =
+                super::workspace_payload::build_app_knowhow_listing(&ctx.app_id, &summaries);
 
-            active_app_ui_section(&app_name, &ctx.app_id, &app_knowhow)
+            active_app_ui_section(&app_name, &ctx.app_id, &knowhow_listing)
         } else {
             String::new()
         };
@@ -281,7 +289,12 @@ indicates otherwise.";
 /// Build the `[ACTIVE APP UI]` context section for an open app. Pure so the
 /// prompt text (including [`ANCHOR_DEFAULT_RULE`]) is unit-testable without a
 /// `LucidosEngine`/DB.
-fn active_app_ui_section(app_name: &str, app_id: &str, app_knowhow: &str) -> String {
+///
+/// `knowhow_listing` names the app's docs and their ids, and carries no doc
+/// bodies. It comes from
+/// [`super::workspace_payload::build_app_knowhow_listing`], which owns the
+/// reasoning and the size rule.
+fn active_app_ui_section(app_name: &str, app_id: &str, knowhow_listing: &str) -> String {
     format!(
         "[ACTIVE APP UI]\n\
         The user has the '{name}' app UI open. \
@@ -297,7 +310,7 @@ fn active_app_ui_section(app_name: &str, app_id: &str, app_knowhow: &str) -> Str
         name = app_name,
         id = app_id,
         anchor = ANCHOR_DEFAULT_RULE,
-        knowhow = app_knowhow
+        knowhow = knowhow_listing
     )
 }
 
@@ -320,7 +333,82 @@ tooltip, a logo, styling). Edit THIS file.{anchor}\n\
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace_payload::{build_app_knowhow_listing, build_knowhow_section};
     use super::{active_app_ui_section, active_file_context_section};
+    use crate::core::knowhow::KnowhowDirs;
+    use crate::core::{KnowhowListDepth, KnowhowStore};
+    use std::path::Path;
+
+    /// The marker a body carries in these fixtures. It must never reach the
+    /// block: finding it there is the regression this file guards against.
+    const BODY_MARKER: &str = "BODY-TEXT-THAT-MUST-NOT-BE-INJECTED";
+
+    /// A knowhow file with the frontmatter the loader expects.
+    fn doc(name: &str, description: &str, body: &str) -> String {
+        format!(
+            "---\nname: {}\ndescription: {}\n---\n{}\n",
+            name, description, body
+        )
+    }
+
+    /// A workspace tree holding one app and its knowhow files, laid out the
+    /// way the engine reads them. An empty `docs` leaves the app with no
+    /// knowhow dir. That is the common case: 24 of 27 apps on the workspace
+    /// this was measured against. The caller keeps the tempdir alive.
+    fn app_workspace(app_id: &str, docs: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("data/knowhow")).expect("local knowhow dir");
+        for (rel, text) in docs {
+            let path = dir.path().join("data/apps").join(app_id).join("knowhow");
+            let path = path.join(rel);
+            std::fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+            std::fs::write(&path, text).expect("write");
+        }
+        dir
+    }
+
+    /// The two-doc fixture the listing tests share. Both sit at the app's
+    /// knowhow root, which is where its docs live: the app is already the
+    /// group, so a folder inside that root holds one doc's references.
+    fn two_doc_workspace() -> tempfile::TempDir {
+        let reach = doc("Reach metrics", "Where the numbers come from.", "Body.");
+        let deep = doc("Deep dive", "The long version.", "Body.");
+        app_workspace(
+            "habit-tracker",
+            &[("reach-metrics.md", &reach), ("deep-dive.md", &deep)],
+        )
+    }
+
+    /// The dirs a chat turn resolves an id against, rooted in the fixture.
+    fn fixture_dirs(ws: &Path) -> KnowhowDirs {
+        KnowhowDirs {
+            shared: None,
+            local: ws.join("data/knowhow"),
+            apps: Some(ws.join("data/apps")),
+            triggers: None,
+        }
+    }
+
+    /// Assemble the block the way a chat turn does: the production loader, the
+    /// production listing builder, the production template.
+    fn render(ws: &Path, app_id: &str, app_name: &str) -> String {
+        let kh_dir = ws.join("data/apps").join(app_id).join("knowhow");
+        let summaries = KnowhowStore::load_summaries(&kh_dir, KnowhowListDepth::FilesOnly);
+        let listing = build_app_knowhow_listing(app_id, &summaries);
+        active_app_ui_section(app_name, app_id, &listing)
+    }
+
+    /// Pull the ids back out of a rendered block. A test then asserts against
+    /// what the agent reads, rather than against a hand-written copy of it.
+    fn listed_ids(section: &str) -> Vec<String> {
+        section
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .filter_map(|line| line.split_once("(id: `"))
+            .filter_map(|(_, rest)| rest.split_once('`'))
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
 
     #[test]
     fn app_ui_section_anchors_on_open_app_without_forbidding_other_work() {
@@ -354,13 +442,209 @@ mod tests {
         );
     }
 
+    /// Most apps have no knowhow dir. They get the anchoring half and nothing
+    /// else: no header sentence left dangling over an empty list.
     #[test]
-    fn app_knowhow_is_appended_inside_the_section() {
-        let section = active_app_ui_section("Demo", "demo", "[APP KNOWHOW]\nfoo\n");
-        assert!(section.contains("[APP KNOWHOW]\nfoo\n"));
-        // Knowhow sits before the closing marker.
-        let kh = section.find("[APP KNOWHOW]").unwrap();
-        let end = section.find("[END ACTIVE APP UI]").unwrap();
-        assert!(kh < end);
+    fn app_ui_section_omits_the_listing_when_the_app_has_no_knowhow() {
+        let ws = app_workspace("habit-tracker", &[]);
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        assert!(section.contains("DEFAULT TO THIS APP"));
+        assert!(!section.contains("load_knowhow"), "{section}");
+        assert!(!section.contains("- **"), "{section}");
+        assert_eq!(
+            section,
+            active_app_ui_section("Habit Tracker", "habit-tracker", "")
+        );
+    }
+
+    /// Every doc is named, with its id and description, and the listing sits
+    /// inside the block. Each id carries the app that scopes it.
+    #[test]
+    fn app_ui_section_lists_every_knowhow_doc_by_id_name_and_description() {
+        let ws = two_doc_workspace();
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        assert!(
+            section.contains("Call load_knowhow with an id below"),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "- **Reach metrics** (id: `habit-tracker/reach-metrics`): \
+                 Where the numbers come from."
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "- **Deep dive** (id: `habit-tracker/deep-dive`): \
+                 The long version."
+            ),
+            "{section}"
+        );
+
+        let listing_start = section.find("- **").expect("a bullet");
+        let end = section.find("[END ACTIVE APP UI]").expect("closing marker");
+        assert!(listing_start < end, "the listing sits inside the block");
+    }
+
+    /// Today's behaviour, kept: the loader logs the file and moves on. One
+    /// unparseable doc must not cost the agent the docs beside it.
+    #[test]
+    fn a_doc_with_broken_frontmatter_is_skipped_rather_than_rendered() {
+        let good = doc("Good", "A description.", "Body.");
+        let ws = app_workspace(
+            "habit-tracker",
+            &[
+                ("good.md", &good),
+                (
+                    "no-frontmatter.md",
+                    "# Just a heading\n\nNo frontmatter here.\n",
+                ),
+                ("no-name.md", "---\ndescription: nameless\n---\nBody.\n"),
+            ],
+        );
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        assert_eq!(
+            listed_ids(&section),
+            vec!["habit-tracker/good"],
+            "{section}"
+        );
+        assert!(!section.contains("nameless"), "{section}");
+    }
+
+    /// The guard that gives this change its point. A doc body of any size
+    /// renders the same block, because only the id, name and description are
+    /// billed. See `docs/adr/0111-app-know-how-is-a-pointer-not-a-body.md`.
+    #[test]
+    fn app_ui_section_carries_no_body_however_big_the_doc() {
+        let tiny = doc("Reach metrics", "Where the numbers come from.", "x");
+        let huge = doc(
+            "Reach metrics",
+            "Where the numbers come from.",
+            &format!("{}\n{}", BODY_MARKER, "filler ".repeat(20_000)),
+        );
+        assert!(
+            huge.len() > 100_000,
+            "the fixture must be big or it proves nothing"
+        );
+
+        let small_ws = app_workspace("habit-tracker", &[("reach-metrics.md", &tiny)]);
+        let huge_ws = app_workspace("habit-tracker", &[("reach-metrics.md", &huge)]);
+        let small = render(small_ws.path(), "habit-tracker", "Habit Tracker");
+        let big = render(huge_ws.path(), "habit-tracker", "Habit Tracker");
+
+        assert!(!big.contains(BODY_MARKER), "a body reached the block");
+        assert_eq!(
+            small.chars().count(),
+            big.chars().count(),
+            "block size must follow the doc COUNT, never the doc SIZE"
+        );
+        assert!(big.chars().count() < 2_000, "{} chars", big.chars().count());
+    }
+
+    /// A doc with no `description:` derives one from its body, so the body is
+    /// a size input on that path too. It is bounded, and stays bounded.
+    #[test]
+    fn a_derived_description_is_bounded_by_the_render_ceiling() {
+        let body = format!(
+            "Opening line. {} {}",
+            "padding ".repeat(20_000),
+            BODY_MARKER
+        );
+        let ws = app_workspace(
+            "demo-director",
+            &[("flow.md", &format!("---\nname: Flow\n---\n{}\n", body))],
+        );
+        let section = render(ws.path(), "demo-director", "Demo Director");
+
+        assert!(
+            section.contains("- **Flow** (id: `demo-director/flow`)"),
+            "{section}"
+        );
+        assert!(
+            !section.contains(BODY_MARKER),
+            "the body's tail reached the block"
+        );
+        assert!(
+            section.chars().count() < 2_000,
+            "{} chars",
+            section.chars().count()
+        );
+    }
+
+    /// Anti-drift, half one. Every id the block prints must be an id
+    /// `load_knowhow` resolves. The ids are parsed back out of the rendered
+    /// text, so a change to the line shape cannot slip past this.
+    #[test]
+    fn every_id_the_block_lists_resolves_the_way_load_knowhow_resolves_it() {
+        let ws = two_doc_workspace();
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        let ids = listed_ids(&section);
+        assert_eq!(ids.len(), 2, "{section}");
+
+        let dirs = fixture_dirs(ws.path());
+        for id in &ids {
+            let loaded = KnowhowStore::load_with_fallback(&dirs, id);
+            assert!(
+                loaded.is_some(),
+                "the block lists '{id}', which does not load"
+            );
+            assert_eq!(loaded.expect("checked above").content.trim(), "Body.");
+        }
+    }
+
+    /// A folder inside the app's knowhow root belongs to one doc. Its files
+    /// take no row of their own, and the doc that owns them loads them by id.
+    #[test]
+    fn a_reference_folder_takes_no_row_but_still_loads_by_id() {
+        let reach = doc("Reach metrics", "Where the numbers come from.", "Body.");
+        let table = doc("Field table", "Column by column.", "Body.");
+        let ws = app_workspace(
+            "habit-tracker",
+            &[
+                ("reach-metrics.md", &reach),
+                ("reach-metrics/field-table.md", &table),
+            ],
+        );
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        assert_eq!(
+            listed_ids(&section),
+            vec!["habit-tracker/reach-metrics"],
+            "a reference must not take a row of its own:\n{section}"
+        );
+        let loaded = KnowhowStore::load_with_fallback(
+            &fixture_dirs(ws.path()),
+            "habit-tracker/reach-metrics/field-table",
+        );
+        assert_eq!(
+            loaded.map(|kh| kh.name),
+            Some("Field table".to_string()),
+            "the doc must still be able to load its own reference"
+        );
+    }
+
+    /// Anti-drift, half two. The block and the Know-how routing list name the
+    /// same docs by the same id, because both build it with `app_scoped_id`.
+    #[test]
+    fn every_id_the_block_lists_also_appears_in_the_routing_list() {
+        let ws = two_doc_workspace();
+        let section = render(ws.path(), "habit-tracker", "Habit Tracker");
+
+        let app_summaries = KnowhowStore::load_app_summaries(&ws.path().join("data/apps"));
+        let routing = build_knowhow_section(&[], &app_summaries);
+
+        let ids = listed_ids(&section);
+        assert_eq!(ids.len(), 2, "{section}");
+        for id in &ids {
+            assert!(
+                routing.contains(&format!("(id: `{}`", id)),
+                "'{id}' is in the app block but not the routing list:\n{routing}"
+            );
+        }
     }
 }

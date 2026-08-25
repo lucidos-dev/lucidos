@@ -34,9 +34,53 @@
     display: none;
 }
 
+/* The row's SURFACE (dim, unread tint, hover) lives on this wrapper, and its
+   text box and tap live on the .notification-item button inside. The split is
+   what lets a row carry a trailing chevron: the chevron is a sibling of the
+   button, so a tint painted on the button alone would stop short of it, and a
+   hover bound to the button alone would not fire over it. */
+.notification-row {
+    display: flex;
+    align-items: center;
+    /* Animate background-color only, never opacity: fading a text-bearing row's
+       opacity composites it to a translucent layer and drops subpixel AA, so the
+       text looks blurry mid-transition. It is most visible on "Mark all read",
+       where every row dims at once. The dim still applies, it just snaps
+       instead of fading. */
+    transition: background-color var(--duration-normal);
+    opacity: 0.5; /* Read notifications are greyed out (static, see above) */
+}
+
+/* Unread is signalled by the tinted surface alone. A colored left border here
+   would be the banned left-accent stripe (.claude/rules/frontend.md F18).
+
+   The tint is mixed from `--accent` rather than written as a literal rgba, so
+   the light theme gets ITS accent. The literal it replaced was the dark theme's
+   blue, painted on both. */
+.notification-row.unread {
+    opacity: 1; /* Unread notifications are full opacity */
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+
+@media (hover: hover) {
+    .notification-row:hover {
+        background: var(--bg-hover);
+        opacity: 0.8;
+    }
+
+    .notification-row.unread:hover {
+        background: color-mix(in srgb, var(--accent) 10%, transparent);
+        opacity: 1;
+    }
+}
+
 .notification-item {
     display: block;
-    width: 100%;
+    /* Takes the row minus the chevron, so a long title stops before it.
+       `min-width: 0` lets it shrink, since a flex item floors at its content
+       width otherwise. */
+    flex: 1;
+    min-width: 0;
     /* --space-lg (1rem) horizontal gutter shared across content-pane views; the
        taller --space-md vertical is intentional for these 3-line rows (title +
        summary + time). */
@@ -50,38 +94,26 @@
     font-feature-settings: inherit;
     text-align: left;
     cursor: pointer;
-    /* Animate background-color only, never opacity: fading a text-bearing row's
-       opacity composites it to a translucent layer and drops subpixel AA, so the
-       text looks blurry mid-transition — most visible on "Mark all read" where
-       every row dims at once. The dim still applies, it just snaps instead of
-       fading. */
-    transition: background-color var(--duration-normal);
-    opacity: 0.5; /* Read notifications are greyed out (static — see above) */
     -webkit-tap-highlight-color: rgba(88, 166, 255, 0.2);
 }
 
-@media (hover: hover) {
-    .notification-item:hover {
-        background: var(--bg-hover);
-        opacity: 0.8;
-    }
-}
+/* The chevron takes the shared `row-icon` band (host-components.css) for its
+   box, its glyph step and its 2.25rem tap target. That target is the size a row
+   icon was grown to after the queued message's trash was reported unhittable on
+   a phone, and this sits in the same column.
 
-.notification-item:last-child {
-    border-bottom: none;
-}
-
-/* Unread is signalled by the tinted surface alone. A colored left border here
-   would be the banned left-accent stripe (.claude/rules/frontend.md F18). */
-.notification-item.unread {
-    opacity: 1; /* Unread notifications are full opacity */
-    background: rgba(88, 166, 255, 0.05);
-}
-
-@media (hover: hover) {
-    .notification-item.unread:hover {
-        background: rgba(88, 166, 255, 0.1);
-    }
+   The z-index clears `.edge-swipe-zone` (z-index: 1, mobile.css), a transparent
+   1.25rem strip lying over the right edge of every mobile pane. Any control
+   pinned to a row's right edge sits under it, and a tap landing on the strip
+   reaches neither the button nor `isInteractiveTarget`, so it is read as an edge
+   gesture and preventDefault()ed. `.trigger-group-actions` in mobile.css carries
+   the same lift and the full reasoning. It is unconditional here rather than
+   inside the mobile query, since desktop has no strip and no competing layer,
+   and one rule keeps this button's whole box in one place. The band already
+   gives it `position: relative`, which is what the z-index needs. */
+.notification-row-detail-btn {
+    margin-right: var(--space-sm);
+    z-index: 2;
 }
 
 .notification-title {
@@ -229,14 +261,16 @@
     padding: var(--space-sm) var(--space-md);
 }
 
-.notification-detail-body a.app-link {
+.notification-detail-body a.app-link,
+.notification-detail-body a.trigger-link {
     color: var(--accent);
     text-decoration: underline dashed;
     cursor: pointer;
 }
 
 @media (hover: hover) {
-    .notification-detail-body a.app-link:hover {
+    .notification-detail-body a.app-link:hover,
+    .notification-detail-body a.trigger-link:hover {
         text-decoration: underline solid;
     }
 }

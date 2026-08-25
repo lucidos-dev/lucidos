@@ -511,7 +511,11 @@ pub(in crate::api) async fn get_older_threads(
             format!("Invalid 'before' timestamp: {}", e),
         )
     })?;
-    let limit = query.limit.unwrap_or(15).min(50);
+    // `clamp`, not `min`: the value is bound straight into `LIMIT $6`, and
+    // Postgres rejects a negative one, so `?limit=-1` came back as a 500
+    // instead of a page. Every sibling list endpoint clamps both ends
+    // (`memory.rs`, `changes.rs`, `history.rs`, `list_thread_summaries`).
+    let limit = query.limit.unwrap_or(15).clamp(1, 50);
     let sources = parse_source_filter(&query.sources);
     let trigger_ids: Option<Vec<String>> = query.trigger_ids.as_deref().map(parse_csv);
     let repo_ids: Option<Vec<String>> = query.repo_ids.as_deref().map(parse_csv);

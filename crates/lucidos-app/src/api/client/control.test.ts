@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   listWorkspaces,
   createWorkspace,
@@ -7,6 +7,8 @@ import {
   restoreBackup,
   getGatewayStatus,
   reloadGateway,
+  openWorkspace,
+  openWorkspaceNotifications,
   slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
 } from './control';
@@ -168,5 +170,46 @@ describe('restore name helpers', () => {
     expect(parseWorkspaceNameFromArchive('random.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws.enc')).toBeNull();
     expect(parseWorkspaceNameFromArchive('lucidos-backup-myws-20260601.enc')).toBeNull();
+  });
+});
+
+// Regression pin for the reported bug: on the iOS PWA, a pane swipe fired
+// WebKit's native back gesture and landed the user in the workspace they had
+// switched away from. The switch had PUSHED a history entry, so back had
+// somewhere to go. See `utils/documentNavigation.ts`.
+describe('workspace navigation leaves nothing on the back stack', () => {
+  // The node test env has no window.location (test-setup.ts aliases window to
+  // globalThis), so it is installed as a global, as openExternalUrl.test.ts does.
+  const CURRENT = 'https://gateway.example.com/dev/';
+  let fakeLocation: { href: string; replace: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    fakeLocation = { href: CURRENT, replace: vi.fn() };
+    vi.stubGlobal('location', fakeLocation);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('openWorkspace replaces the current history entry', () => {
+    openWorkspace('loopws');
+    expect(fakeLocation.replace).toHaveBeenCalledWith('/loopws/');
+  });
+
+  it('openWorkspace never assigns location.href, which would push', () => {
+    openWorkspace('loopws');
+    expect(fakeLocation.href).toBe(CURRENT);
+  });
+
+  it('openWorkspace encodes a slug that needs it', () => {
+    openWorkspace('a b');
+    expect(fakeLocation.replace).toHaveBeenCalledWith('/a%20b/');
+  });
+
+  it('openWorkspaceNotifications replaces, and carries the landing hash', () => {
+    openWorkspaceNotifications('loopws');
+    expect(fakeLocation.replace).toHaveBeenCalledWith('/loopws/#notifications');
+    expect(fakeLocation.href).toBe(CURRENT);
   });
 });

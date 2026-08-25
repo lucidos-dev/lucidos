@@ -37,7 +37,10 @@ impl OpenAiProvider {
 
                     for block in blocks {
                         match block {
-                            ContentBlock::Text { text } => {
+                            // A tail block is ordinary text here. Only the
+                            // engine and the Anthropic cache anchor care who
+                            // wrote it.
+                            ContentBlock::Text { text } | ContentBlock::EngineTail { text } => {
                                 text_parts.push(text.clone());
                             }
                             ContentBlock::ToolUse {
@@ -201,6 +204,8 @@ impl OpenAiProvider {
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        // Bytes of a character the transport split across two chunks.
+        let mut carry: Vec<u8> = Vec::new();
         let chunk_timeout = Duration::from_secs(CHUNK_TIMEOUT_SECS);
 
         let mut content = String::new();
@@ -223,7 +228,7 @@ impl OpenAiProvider {
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            crate::llm::push_utf8_chunk(&mut carry, &chunk, &mut buffer);
 
             while let Some(newline_pos) = buffer.find('\n') {
                 let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
@@ -558,10 +563,54 @@ mod tests {
         assert!(done, "response.completed must terminate the stream");
 
         assert_eq!(content, "ok");
+        // 11 processed, 4 of them a cache read. `input_tokens` already covers
+        // `input_tokens_details.cached_tokens`, so the two overlap.
         assert_eq!(meta.input_tokens, Some(11));
         assert_eq!(meta.output_tokens, Some(3));
         assert_eq!(meta.cache_read_tokens, Some(4));
         assert_eq!(meta.stop_reason.as_deref(), Some("completed"));
+    }
+
+    /// The overlap, on its own, matching the Chat Completions case exactly.
+    /// One convention across both APIs, or a cost figure depends on which one
+    /// the request happened to take.
+    #[test]
+    fn a_cached_prefix_overlaps_the_input_total_rather_than_reducing_it() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map = std::collections::HashMap::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            r#"{"response":{"status":"completed","usage":{"input_tokens":42,"output_tokens":0,"input_tokens_details":{"cached_tokens":12}}}}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, Some(12));
+    }
+
+    /// A response that read no cache leaves the count unset.
+    #[test]
+    fn an_input_total_with_no_cache_reports_no_cache_read() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map = std::collections::HashMap::new();
+        let mut meta = StreamMeta::default();
+        OpenAiProvider::process_responses_chunk(
+            "response.completed",
+            r#"{"response":{"status":"completed","usage":{"input_tokens":42,"output_tokens":0}}}"#,
+            &mut content,
+            &mut tools,
+            &mut item_id_map,
+            &mut meta,
+        )
+        .unwrap();
+        assert_eq!(meta.input_tokens, Some(42));
+        assert_eq!(meta.cache_read_tokens, None);
     }
 
     /// `incomplete_details.reason` takes precedence over `status` when both

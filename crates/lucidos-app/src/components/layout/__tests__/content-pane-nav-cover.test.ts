@@ -41,7 +41,7 @@ describe('content pane navigation cover', () => {
     // One definition of "the pane navigated". A second notion of view identity
     // would let the two disagree: a scroll restore under an uncovered pane, or
     // a cover over a view that never changed.
-    expect(src).toMatch(/const viewKey = contentViewKey\(active, overlay\)/);
+    expect(src).toMatch(/const viewKey = contentViewKey\(active, overlay, subview\)/);
     expect(src).toMatch(/coveredKeyRef\.current === viewKey/);
     expect(src).toMatch(/setCoverKey\(viewKey\)/);
   });

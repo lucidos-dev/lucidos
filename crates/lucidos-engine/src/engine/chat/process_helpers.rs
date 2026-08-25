@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::sync::Mutex as TokioMutex;
@@ -149,51 +150,189 @@ pub(super) fn build_trigger_started_event(
     )
 }
 
-/// Wall-clock cap on auxiliary Flash calls in the chat slow path
-/// (history summarization, query classification). The Vertex non-streaming
-/// client itself allows 900s, so without this an occasional Flash hang would
-/// silently stall the chat between MessageReceived and the first agentic step
-/// — exactly the "stuck thread" symptom users observe. Defaults are safe: on
-/// timeout we fall back to truncation / "needs everything" classification.
-const AUX_LLM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Chars a summary must reach per assistant turn it covers, before the floor
+/// below counts it as a failed roll rather than a paragraph.
+///
+/// Deliberately generous. The measured healthy answers ran 380 to 850 output
+/// tokens, so roughly 1,500 to 3,400 chars. The one bad roll was 24 output
+/// tokens, about 100 chars. Anything between the two is a judgment we have no
+/// data for, so the floor only catches answers close to the bad one.
+const SUMMARY_MIN_CHARS_PER_TURN: usize = 60;
 
-/// Run the Flash summarization future under `AUX_LLM_TIMEOUT`. On error or
-/// timeout, fall back to the truncation placeholder used elsewhere in the
-/// chat path.
-pub(super) async fn summarize_or_fallback<F>(fut: F, older_len: usize) -> String
+/// Ceiling on that requirement. A thread covering 40 turns does not owe a
+/// 2,400-char paragraph: the summariser compresses, and past a point a longer
+/// segment yields a denser paragraph rather than a proportionally longer one.
+const SUMMARY_MIN_CHARS_CAP: usize = 600;
+
+/// Whether a summary is implausibly short for the number of assistant turns it
+/// claims to cover.
+///
+/// A thin paragraph reads as a SUCCESS to everything downstream, and since ADR
+/// 0102 a success is cached. The refresh gate is the count of uncovered turns,
+/// which a success resets. So one bad roll then holds for about five turns.
+/// Before the cache the same roll was discarded within the turn and re-rolled
+/// on the next one, which is why it used to self-correct.
+///
+/// Pure so the thresholds are testable without a model.
+pub(super) fn summary_is_too_thin(chars: usize, covered_turns: usize) -> bool {
+    let required = (covered_turns * SUMMARY_MIN_CHARS_PER_TURN).min(SUMMARY_MIN_CHARS_CAP);
+    chars < required
+}
+
+/// Run the summarization future under `deadline`, or `None`.
+///
+/// `None` means the call did not produce a usable paragraph, and the caller
+/// decides what to render instead. Since ADR 0102 that is the thread's cached
+/// summary where one exists. So a failure costs freshness rather than the whole
+/// earlier region, and the refresh gate stays open for the next turn to re-roll.
+///
+/// `deadline` comes from `engine::aux_purpose::budget_for`, which sizes it to
+/// contain the provider's own retries. It used to be one 30s constant shared
+/// with classification, which the 4-attempt retry budget could not fit inside.
+pub(super) async fn summarize_or_none<F>(
+    fut: F,
+    older_len: usize,
+    deadline: Duration,
+) -> Option<String>
 where
     F: Future<Output = Result<String, Box<dyn std::error::Error + Send + Sync>>>,
 {
-    let truncation_fallback = || format!("({} earlier messages not shown)", older_len);
-    match tokio::time::timeout(AUX_LLM_TIMEOUT, fut).await {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(deadline, fut).await {
+        // CHARACTERS, not `len()`'s bytes. The summariser writes in the user's
+        // language, and a CJK paragraph is 3 bytes per character: measured in
+        // bytes, a third-length one clears the floor.
+        Ok(Ok(s))
+            if !s.trim().is_empty()
+                && !summary_is_too_thin(s.trim().chars().count(), older_len) =>
+        {
+            log!(
+                "[Chat] Compressed {} older assistant turns into {} char summary in {:?}",
+                older_len,
+                s.trim().chars().count(),
+                started.elapsed()
+            );
+            Some(s)
+        }
         Ok(Ok(s)) => {
             log!(
-                "[Chat] Compressed {} older messages into {} char summary",
-                older_len,
-                s.len()
+                "[Chat] History summarization returned {} chars for {} turns, too thin to cache; keeping any cached summary",
+                s.trim().chars().count(),
+                older_len
             );
-            s
+            None
         }
         Ok(Err(e)) => {
             log!(
-                "[Chat] History summarization failed, falling back to truncation: {}",
+                "[Chat] History summarization failed after {:?}, keeping any cached summary: {}",
+                started.elapsed(),
                 e
             );
-            truncation_fallback()
+            None
         }
         Err(_) => {
             log!(
-                "[Chat] History summarization timed out ({}s), falling back to truncation",
-                AUX_LLM_TIMEOUT.as_secs()
+                "[Chat] History summarization timed out ({}s), keeping any cached summary",
+                deadline.as_secs()
             );
-            truncation_fallback()
+            None
         }
     }
 }
 
-/// Run the Flash classification future under `AUX_LLM_TIMEOUT`. On error or
-/// timeout, fall back to `QueryClassification::default()` ("needs everything").
-pub(super) async fn classify_or_fallback<F>(fut: F) -> crate::memory::QueryClassification
+/// Pins the query classification for the whole process, instead of asking the
+/// LLM each turn.
+///
+/// Classification is a Flash call, so two engines over byte-identical
+/// workspaces routinely disagree on `needs_memory`. The context-mode eval runs
+/// exactly that shape, and a disagreement voids the whole task pair
+/// (`lucidos_eval::analyse::retrieval_disagreed`). Pinning both arms removes
+/// the confound. See `crates/lucidos-eval/src/workspace.rs`.
+pub(super) const FORCE_QUERY_CLASSIFICATION_ENV: &str = "LUCIDOS_FORCE_QUERY_CLASSIFICATION";
+
+/// Read one raw env value into a pinned classification.
+///
+/// `all` needs everything, which is `QueryClassification::default()`. `none`
+/// needs nothing. Every other value, including unset, returns `None` and
+/// leaves the caller on the LLM call. A typo must not pin, and must not fail
+/// the boot either: an engine that refuses to start over a stray variable is
+/// worse than one that classifies as it always did.
+///
+/// Pure, so the tests never touch the process environment.
+pub(super) fn forced_classification(
+    raw: Option<&str>,
+) -> Option<crate::memory::QueryClassification> {
+    let raw = raw?.trim();
+    if raw.eq_ignore_ascii_case("all") {
+        return Some(crate::memory::QueryClassification::default());
+    }
+    if raw.eq_ignore_ascii_case("none") {
+        return Some(crate::memory::QueryClassification {
+            needs_memory: false,
+            needs_file_list: false,
+            needs_credentials: false,
+            sub_queries: vec![],
+        });
+    }
+    None
+}
+
+/// This turn's classification when the process pins one, logged like any other.
+///
+/// `None` leaves the caller on today's path: consult the extractor and pay the
+/// round-trip. The env read happens once, because process configuration cannot
+/// change under a running engine.
+pub(super) fn pinned_classification() -> Option<crate::memory::QueryClassification> {
+    static PIN: OnceLock<Option<crate::memory::QueryClassification>> = OnceLock::new();
+    let pinned = PIN
+        .get_or_init(|| {
+            let raw = std::env::var(FORCE_QUERY_CLASSIFICATION_ENV).ok();
+            let parsed = forced_classification(raw.as_deref());
+            // A set-but-unparsed value earns a line of its own. The pin is
+            // opt-in, so silence reads as "not set". Without this, a run that
+            // meant to pin classifies on and says nothing about why.
+            if parsed.is_none() {
+                if let Some(value) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                    log!(
+                        "[Chat] {} is set to {:?}, which is neither `all` nor `none`. Ignoring \
+                         it and classifying normally.",
+                        FORCE_QUERY_CLASSIFICATION_ENV,
+                        value
+                    );
+                }
+            }
+            parsed
+        })
+        .clone()?;
+    log_classification(&pinned, true);
+    Some(pinned)
+}
+
+/// The one line a turn writes about its classification.
+///
+/// Shared so a pinned turn logs at the same place an unpinned one does, and
+/// says which it was. A pinned run that logged nothing would read as a run
+/// where classification never happened.
+fn log_classification(c: &crate::memory::QueryClassification, pinned: bool) {
+    let pin = if pinned {
+        format!(" (pinned by {FORCE_QUERY_CLASSIFICATION_ENV})")
+    } else {
+        String::new()
+    };
+    log!("[Chat] Query classification{}: needs_memory={}, needs_file_list={}, needs_credentials={}, sub_queries={:?}",
+        pin, c.needs_memory, c.needs_file_list, c.needs_credentials, c.sub_queries);
+}
+
+/// Run the Flash classification future under `deadline`. On error or timeout,
+/// fall back to `QueryClassification::default()` ("needs everything").
+///
+/// `deadline` comes from `engine::aux_purpose::budget_for`. Classification runs
+/// on every turn with the user waiting behind it, so its budget is the short
+/// one, not the summariser's.
+pub(super) async fn classify_or_fallback<F>(
+    fut: F,
+    deadline: Duration,
+) -> crate::memory::QueryClassification
 where
     F: Future<
         Output = Result<
@@ -202,15 +341,17 @@ where
         >,
     >,
 {
-    match tokio::time::timeout(AUX_LLM_TIMEOUT, fut).await {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(c)) => {
-            log!("[Chat] Query classification: needs_memory={}, needs_file_list={}, needs_credentials={}, sub_queries={:?}",
-                c.needs_memory, c.needs_file_list, c.needs_credentials, c.sub_queries);
+            log_classification(&c, false);
+            log!("[Chat] Query classification took {:?}", started.elapsed());
             c
         }
         Ok(Err(e)) => {
             log!(
-                "[Chat] Query classification failed (defaulting to all): {}",
+                "[Chat] Query classification failed after {:?} (defaulting to all): {}",
+                started.elapsed(),
                 e
             );
             crate::memory::QueryClassification::default()
@@ -218,7 +359,7 @@ where
         Err(_) => {
             log!(
                 "[Chat] Query classification timed out ({}s), defaulting to all",
-                AUX_LLM_TIMEOUT.as_secs()
+                deadline.as_secs()
             );
             crate::memory::QueryClassification::default()
         }

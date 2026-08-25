@@ -3,6 +3,8 @@
 //! Contract:
 //! - Script reads creds from env vars (`CRED_<NAME>_USERNAME` /
 //!   `CRED_<NAME>_PASSWORD` for password creds; `CRED_<NAME>` for others).
+//! - Those creds plus [`RUNTIME_ENV_ALLOWLIST`] are the script's WHOLE
+//!   environment. It inherits nothing else from the engine.
 //! - Script prints exactly one JSON object to stdout:
 //!   `{"headers": {"<name>": "<value>", ...}, "expires_in": <seconds>}`.
 //! - Non-zero exit → stderr is captured into the engine's 502 response.
@@ -16,6 +18,38 @@ use tokio::time::timeout;
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The only ambient environment a handshake script keeps, once
+/// [`run_handshake_script`] clears the engine's own.
+///
+/// Everything here is a path, a locale or a workspace location. None of it is
+/// a secret, and dropping any of it would break a script that works today.
+/// Its credentials arrive separately, as the `CRED_*` / `OAUTH_*` values the
+/// pipeline layer granted.
+///
+/// **No loader hook belongs here.** `PYTHONPATH`, `PYTHONSTARTUP` and
+/// `PYTHONHOME` each let a planted file run before the script does.
+/// `engine::command_guard` already treats the first two as code injecting.
+/// Allowlisting one would undo the clear.
+const RUNTIME_ENV_ALLOWLIST: &[&str] = &[
+    // `python3` itself resolves off PATH, and a script may shell out by bare
+    // name. HOME is what makes the macOS login keychain readable.
+    "PATH",
+    "HOME",
+    // Per-user on macOS, so a script writing a temp file without it lands
+    // somewhere it may not own.
+    "TMPDIR",
+    // Python's stdio and filesystem encoding.
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    // Paths to a CA bundle, not secrets. Without them a script verifies TLS
+    // against the wrong trust store on a machine that supplies its own.
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    // The one ambient value a script needs to find a file in the workspace.
+    "LUCIDOS_WORKSPACE",
+];
+
 #[derive(Debug)]
 pub struct HandshakeOutput {
     pub headers: Vec<(HeaderName, HeaderValue)>,
@@ -25,8 +59,15 @@ pub struct HandshakeOutput {
 #[derive(Debug)]
 pub enum RunError {
     NotFound(String),
+    /// The configured path is not one the engine will ever run. Distinct from
+    /// `NotFound`, which says the file is absent. An operator who reads "not
+    /// found" for a `..` path goes looking for a file that was never missing.
+    PathRejected(String),
     Timeout,
-    NonZeroExit { code: Option<i32>, stderr: String },
+    NonZeroExit {
+        code: Option<i32>,
+        stderr: String,
+    },
     InvalidOutput(String),
     Spawn(String),
 }
@@ -35,6 +76,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunError::NotFound(p) => write!(f, "auth handshake script not found: {}", p),
+            RunError::PathRejected(reason) => write!(f, "{}", reason),
             RunError::Timeout => write!(f, "auth handshake script timed out after 30s"),
             RunError::NonZeroExit { code, stderr } => write!(
                 f,
@@ -50,16 +92,38 @@ impl std::fmt::Display for RunError {
     }
 }
 
+/// Why this `script_handshake` path is refused, or `None` if it is fine.
+///
+/// **The one rule, shared by both sites that ask.** `load_proxy_config` calls
+/// it when the config is read, and `run_handshake_script` calls it again before
+/// the spawn. Two hand-rolled predicates disagreed here once. The load-time one
+/// rejected only whole `..` segments. A value could pass the config and then be
+/// refused at request time, and the weaker check was the one guarding the file.
+///
+/// Strict on purpose. This is a filesystem path, so any `..` substring is out.
+/// `proxy::request_path_has_traversal` guards an upstream URL path and is
+/// deliberately looser; it is not a substitute here.
+pub fn script_path_rejection(script: &str) -> Option<String> {
+    crate::api::is_path_traversal(script).then(|| {
+        format!(
+            "script path '{}' must be relative under the workspace \
+             (no '..', no leading '/' or '\\')",
+            script
+        )
+    })
+}
+
 pub async fn run_handshake_script(
     workspace_path: &FsPath,
     script_rel_path: &str,
     env_vars: Vec<(String, String)>,
 ) -> Result<HandshakeOutput, RunError> {
     // The script path comes from workspace config (`apis.json`). Reject any
-    // value that would escape the workspace tree (`..`, absolute path) before
-    // joining — otherwise a crafted config could run an arbitrary host script.
-    if crate::api::is_path_traversal(script_rel_path) {
-        return Err(RunError::NotFound(script_rel_path.to_string()));
+    // value that would escape the workspace tree before joining, otherwise a
+    // crafted config could run an arbitrary host script. Startup already
+    // refused such a config; this is the guard for a caller that skipped it.
+    if let Some(reason) = script_path_rejection(script_rel_path) {
+        return Err(RunError::PathRejected(reason));
     }
     // Resolve the script relative to `data/` first — that's where all
     // user-authored, git-tracked workspace content lives, and what the
@@ -98,6 +162,18 @@ pub async fn run_handshake_script(
 
     let mut cmd = Command::new("python3");
     cmd.arg(&script_abs);
+    // Least privilege: the script is untrusted code. It starts from an EMPTY
+    // environment and gets back only the runtime names below, plus the
+    // credentials its own pipeline layer was granted. Inheriting the engine's
+    // environment handed it the database password, every other provider's key
+    // and every subprocess-origin credential. No handshake needs any of them.
+    // Injected last, so a credential always wins a name collision.
+    cmd.env_clear();
+    for name in RUNTIME_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
     for (k, v) in env_vars {
         cmd.env(k, v);
     }
@@ -153,6 +229,10 @@ pub async fn run_handshake_script(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for every unrelated secret the engine's own environment
+    /// carries. Uniquely named so planting it disturbs no sibling test.
+    const AMBIENT_DECOY: &str = "LUCIDOS_TEST_AMBIENT_SECRET";
 
     fn write_script(tmp: &FsPath, name: &str, body: &str) -> String {
         let dir = tmp.join("scripts/auth");
@@ -253,20 +333,34 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
     #[tokio::test]
     async fn traversal_script_path_rejected_before_spawn() {
         // The script path comes from workspace config (`apis.json`), so a
-        // crafted `..` escape must be rejected by the `is_path_traversal` guard
-        // before we ever join it onto the workspace and spawn python3. The
-        // traversal branch returns the *original* relative path, whereas the
-        // on-disk-not-found branch returns the joined absolute path — asserting
-        // on the relative value proves the guard fired (and is still wired in),
-        // not merely that the file happens to be absent.
+        // crafted `..` escape must be refused before we ever join it onto the
+        // workspace and spawn python3. `PathRejected` rather than `NotFound`
+        // is what proves the guard fired, rather than the file being absent.
         let tmp = tempfile::tempdir().unwrap();
         let err = run_handshake_script(tmp.path(), "../../etc/evil.py", vec![])
             .await
             .expect_err("traversal path must be rejected");
         match err {
-            RunError::NotFound(p) => assert_eq!(p, "../../etc/evil.py"),
-            other => panic!("expected NotFound for traversal, got {:?}", other),
+            RunError::PathRejected(reason) => {
+                assert!(reason.contains("../../etc/evil.py"), "got: {reason}");
+            }
+            other => panic!("expected PathRejected for traversal, got {:?}", other),
         }
+    }
+
+    /// A segment that merely CONTAINS `..` is refused too. This is the case
+    /// the load-time guard used to let through, and the whole point of the two
+    /// sites sharing one predicate.
+    #[tokio::test]
+    async fn a_dot_dot_substring_is_rejected_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_handshake_script(tmp.path(), "scripts/auth/a..b.py", vec![])
+            .await
+            .expect_err("a '..' substring must be rejected");
+        assert!(
+            matches!(err, RunError::PathRejected(_)),
+            "expected PathRejected, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -471,5 +565,95 @@ print(json.dumps({"headers": {"X-User": u, "X-Pass": p}, "expires_in": 60}))
             .collect();
         assert_eq!(map.get("x-user").copied(), Some("alice"));
         assert_eq!(map.get("x-pass").copied(), Some("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn script_sees_only_the_allowlist_and_its_own_credentials() {
+        // A handshake script is named by `apis.json`, which is workspace
+        // config an agent can write. So it is untrusted code, and the engine's
+        // own environment carries the database password, every provider key
+        // and every subprocess-origin credential. The decoy below stands in
+        // for all of them.
+        std::env::set_var(AMBIENT_DECOY, "ambient-secret-value");
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = write_data_script(
+            tmp.path(),
+            "env-dump.py",
+            r#"
+import os, json
+print(json.dumps({
+    "headers": {
+        "X-Env-Names": ",".join(sorted(os.environ)),
+        "X-Cred": os.environ.get("CRED_SVC", "<absent>"),
+    },
+    "expires_in": 60,
+}))
+"#,
+        );
+        let out = run_handshake_script(
+            tmp.path(),
+            &rel,
+            vec![("CRED_SVC".to_string(), "injected-value".to_string())],
+        )
+        .await
+        .unwrap();
+        let map: std::collections::HashMap<&str, &str> = out
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.to_str().unwrap()))
+            .collect();
+        let seen: Vec<&str> = map
+            .get("x-env-names")
+            .copied()
+            .expect("the script reports its own environment")
+            .split(',')
+            .filter(|n| !n.is_empty())
+            .collect();
+
+        // The whole point: nothing ambient survives the clear.
+        assert!(
+            !seen.contains(&AMBIENT_DECOY),
+            "an ambient engine secret reached the handshake script: {seen:?}"
+        );
+        // `__CF_USER_TEXT_ENCODING` is not something we passed. CoreFoundation
+        // writes it into its OWN process as it initialises, and Python links
+        // CoreFoundation on macOS, so the child sets it after the clear.
+        let unexpected: Vec<&str> = seen
+            .iter()
+            .copied()
+            .filter(|name| {
+                !RUNTIME_ENV_ALLOWLIST.contains(name)
+                    && *name != "CRED_SVC"
+                    && !name.starts_with("__CF_")
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "these are neither allowlisted nor credentials this layer was granted: {unexpected:?}"
+        );
+        // A loader hook would let a hostile script run code the engine chose,
+        // so it must never be allowlisted. Named here rather than planted in
+        // the parent, which would reach every other python-spawning test.
+        for hook in ["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"] {
+            assert!(
+                !RUNTIME_ENV_ALLOWLIST.contains(&hook),
+                "{hook} must stay out of the allowlist"
+            );
+        }
+        // The allowlist is a floor as well as a ceiling. Both shipped
+        // handshake scripts need these two: one resolves `security` off PATH,
+        // and reading the login keychain needs HOME.
+        for required in ["PATH", "HOME"] {
+            assert!(
+                seen.contains(&required),
+                "{required} must survive the clear; the script saw {seen:?}"
+            );
+        }
+        assert_eq!(
+            map.get("x-cred").copied(),
+            Some("injected-value"),
+            "the layer's own credential must still be injected"
+        );
+        std::env::remove_var(AMBIENT_DECOY);
     }
 }

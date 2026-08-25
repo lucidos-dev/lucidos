@@ -22,6 +22,7 @@ import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
+import { copyToClipboard } from '../../utils/clipboard';
 import { Dropdown, DropdownSkeleton } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { LoadingFade } from '../shared/LoadingFade';
@@ -644,13 +645,7 @@ export function BackupSection() {
   }
 
   function copyKey() {
-    if (keyInfo) {
-      navigator.clipboard.writeText(keyInfo.key).then(() => {
-        showToast('Key copied to clipboard', 'success');
-      }).catch(() => {
-        showToast('Failed to copy key to clipboard', 'error');
-      });
-    }
+    if (keyInfo) copyToClipboard(keyInfo.key, 'Key copied to clipboard');
   }
 
   /** `keepPrevious` leaves whatever is on screen there while the new answer is

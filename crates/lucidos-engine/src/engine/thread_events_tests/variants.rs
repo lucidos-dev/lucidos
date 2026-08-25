@@ -69,7 +69,8 @@ fn context_captured_event_type_and_persistence() {
         sections: vec![crate::engine::ContextSection {
             name: "User Message".to_string(),
             content: Some("hi".to_string()),
-            char_count: 2,
+            budget_delta_chars: 2,
+            content_chars: Some(2),
             role: crate::engine::ContextRole::User,
             group: None,
         }],
@@ -82,6 +83,9 @@ fn context_captured_event_type_and_persistence() {
             cache_creation_tokens: 200,
         }),
         trimmed: false,
+        trim_passes: Vec::new(),
+        purpose: crate::engine::ContextPurpose::Turn,
+        reconstructed: false,
     };
     assert_eq!(event.event_type(), "ContextCaptured");
     assert!(event.is_persisted());
@@ -106,7 +110,7 @@ fn context_captured_event_type_and_persistence() {
             "producer":"claude_code",
             "model":"claude-sonnet-4-6",
             "context_window":200000,
-            "sections":[{"name":"Conversation","char_count":500}],
+            "sections":[{"name":"Conversation","budget_delta_chars":500,"content_chars":1200}],
             "tools":[],
             "estimated_total_tokens":125,
             "trimmed":false
@@ -125,8 +129,120 @@ fn context_captured_event_type_and_persistence() {
                 sections[0].content.is_none(),
                 "content should be None when capture_context off"
             );
+            assert_eq!(
+                sections[0].content_chars,
+                Some(1_200),
+                "a dropped body does not move the region's measured size"
+            );
         }
         other => panic!("expected ContextCaptured, got {other:?}"),
+    }
+}
+
+/// Back-compat for every capture row written before `purpose` existed, which
+/// is 600k of them. A payload with neither new key must read as an ordinary
+/// turn, not fail to decode and not read as an auxiliary call.
+#[test]
+fn a_capture_row_without_the_new_keys_reads_as_a_turn() {
+    let legacy_json = r#"{
+            "type":"ContextCaptured",
+            "producer":"main_llm",
+            "model":"claude-opus-4-7",
+            "context_window":200000,
+            "sections":[{"name":"Conversation","char_count":500}],
+            "estimated_total_tokens":125,
+            "usage":{"input_tokens":100,"output_tokens":5,
+                     "cache_read_tokens":0,"cache_creation_tokens":0}
+        }"#;
+    let parsed: ThreadEvent = serde_json::from_str(legacy_json).unwrap();
+    let ThreadEvent::ContextCaptured {
+        purpose,
+        reconstructed,
+        sections,
+        ..
+    } = parsed
+    else {
+        panic!("expected ContextCaptured");
+    };
+    assert_eq!(purpose, crate::engine::ContextPurpose::Turn);
+    assert!(!reconstructed, "a recorded row is not a reconstruction");
+    // The stored value always was the delta, so the alias puts it where a
+    // delta belongs. Nobody measured the region, so that stays unknown.
+    assert_eq!(sections[0].budget_delta_chars, 500);
+    assert_eq!(sections[0].content_chars, None);
+}
+
+/// The other half of back-compat. A turn row keeps its previous wire shape,
+/// so nothing downstream sees a new key on the path that carries almost
+/// every row.
+#[test]
+fn a_turn_capture_writes_neither_new_key() {
+    let event = ThreadEvent::ContextCaptured {
+        producer: crate::engine::ContextProducer::MainLlm,
+        model: "claude-opus-4-7".to_string(),
+        context_window: 200_000,
+        sections: vec![],
+        tools: vec![],
+        estimated_total_tokens: 1,
+        usage: None,
+        trimmed: false,
+        trim_passes: Vec::new(),
+        purpose: crate::engine::ContextPurpose::Turn,
+        reconstructed: false,
+    };
+    let json = serde_json::to_value(&event).unwrap();
+    assert!(json.get("purpose").is_none());
+    assert!(json.get("reconstructed").is_none());
+}
+
+/// An auxiliary row does write the key, which is what the transcript filter
+/// and any cost breakdown key on.
+#[test]
+fn an_auxiliary_capture_writes_its_purpose_and_producer() {
+    let event = crate::engine::aux_capture::auxiliary_capture(
+        crate::engine::ContextPurpose::Memory,
+        "gemini-3-flash-preview",
+        800,
+        None,
+        true,
+    );
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["purpose"], "memory");
+    assert_eq!(json["producer"], "auxiliary");
+    assert_eq!(json["reconstructed"], serde_json::json!(true));
+    assert!(
+        json.get("usage").is_none(),
+        "a reconstruction carries no measured usage"
+    );
+}
+
+/// The purpose round-trips through the wire form the DB stores.
+#[test]
+fn every_purpose_survives_a_round_trip() {
+    for (purpose, wire) in [
+        (crate::engine::ContextPurpose::Title, "title"),
+        (
+            crate::engine::ContextPurpose::ImageDescribe,
+            "image_describe",
+        ),
+        (crate::engine::ContextPurpose::Memory, "memory"),
+        (
+            crate::engine::ContextPurpose::ConversationSummary,
+            "conversation_summary",
+        ),
+        (crate::engine::ContextPurpose::ImageGen, "image_gen"),
+    ] {
+        let event = crate::engine::aux_capture::auxiliary_capture(purpose, "m", 1, None, false);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["purpose"], wire);
+        let parsed: ThreadEvent = serde_json::from_value(json).unwrap();
+        let ThreadEvent::ContextCaptured {
+            purpose: decoded, ..
+        } = parsed
+        else {
+            panic!("expected ContextCaptured");
+        };
+        assert_eq!(decoded, purpose);
     }
 }
 
@@ -269,6 +385,24 @@ fn context_dismissed_event_round_trips() {
     let back: ThreadEvent = serde_json::from_value(v).unwrap();
     assert!(matches!(back, ThreadEvent::ContextDismissed { .. }));
     assert_eq!(evt.event_type(), "ContextDismissed");
+    assert!(evt.is_persisted());
+}
+
+/// `ContextKeptOpen` is the durable record of a keep, written when the span
+/// naming the address is parsed. The PascalCase name and the payload key are
+/// the wire, and the eval counts dispositions off both.
+#[test]
+fn context_kept_open_event_round_trips() {
+    let id = uuid::Uuid::new_v4();
+    let evt = ThreadEvent::ContextKeptOpen {
+        kept_open_event_id: id,
+    };
+    let v = serde_json::to_value(&evt).unwrap();
+    assert_eq!(v["type"], "ContextKeptOpen");
+    assert_eq!(v["kept_open_event_id"], id.to_string());
+    let back: ThreadEvent = serde_json::from_value(v).unwrap();
+    assert!(matches!(back, ThreadEvent::ContextKeptOpen { .. }));
+    assert_eq!(evt.event_type(), "ContextKeptOpen");
     assert!(evt.is_persisted());
 }
 

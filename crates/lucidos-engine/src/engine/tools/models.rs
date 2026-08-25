@@ -18,6 +18,7 @@ const VALID_PROVIDERS: &[&str] = &[
     "openai",
     "openrouter",
     "xai",
+    "opencode-free",
     "local",
 ];
 

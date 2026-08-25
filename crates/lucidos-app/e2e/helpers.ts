@@ -209,7 +209,7 @@ export async function waitForResponse(page: Page, timeout = 90_000): Promise<Loc
  *  afterwards. */
 export async function revealSteps(page: Page, timeout = 30_000): Promise<void> {
   const toggle = page
-    .locator('.response-controls [data-role="toggle-steps"]:visible')
+    .locator('.turn-controls [data-role="toggle-steps"]:visible')
     .first();
   await expect(toggle).toBeVisible({ timeout });
   if (await toggle.getAttribute('aria-pressed') === 'false') await toggle.click();
@@ -228,6 +228,34 @@ export async function waitForVisibleElement(page: Page, selector: string, timeou
 export async function waitAndClick(page: Page, selector: string, text?: string, timeout = 5_000): Promise<void> {
   await waitForVisibleElement(page, selector, timeout);
   await clickVisibleElement(page, selector, text);
+}
+
+/** Drive the open model picker's two steps: a model, then one of its tiers.
+ *
+ *  A step-1 row carries the model id, because a model is not a selection yet.
+ *  A step-2 row carries the encoded pair, which is what the pick reports.
+ *  Returns that pair. Omit `tier` to take the first the model offers. */
+export async function pickModelPair(page: Page, model: string, tier?: string): Promise<string> {
+  await waitAndClick(page, `.control-option[data-value="${model}"]`, undefined, 10_000);
+  const row = tier
+    ? page.locator(`.control-option[data-value="${model}|${tier}"]:visible`).first()
+    : page.locator('.control-option:visible').first();
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  const pair = (await row.getAttribute('data-value')) ?? '';
+  await row.click();
+  return pair;
+}
+
+/** Open the tiers of the model the picker has checked, returning its id.
+ *
+ *  Step 1 shows the model in force with its tier in the label, but the VALUE
+ *  is the model alone. A test asserting on the tier has to step in. */
+export async function openCurrentModelTiers(page: Page): Promise<string> {
+  const current = page.locator('.control-option-current:visible').first();
+  await expect(current).toBeVisible({ timeout: 5_000 });
+  const model = (await current.getAttribute('data-value')) ?? '';
+  await current.click();
+  return model;
 }
 
 /** Click a content-header action by its ACTION class (`.file-edit-btn`,
@@ -487,7 +515,20 @@ export async function getHeaderTop(page: Page): Promise<number> {
  *  With the pin on, the header never slides off and the hide assertions time
  *  out. Set the GLOBAL pref to 'false' BEFORE navigating so the page boots with
  *  hide enabled: with `device_id` omitted, the app's device-scoped preference
- *  load merges the global value. Must be called before `navigateToApp`. */
+ *  load merges the global value. Must be called before `navigateToApp`.
+ *
+ *  A spec about the reader's own EDGE calls it for a second reason. That edge is
+ *  the bottom of the sticky thread title. A pinned header holds it still, so the
+ *  spec stops covering the half where chrome slides over the transcript. Being
+ *  global, the pref is otherwise whatever the previous spec left.
+ *
+ *  PUT IT BACK. Every caller pairs this with `enableMobileHeaderSticky` in an
+ *  `afterEach`, because the pref is global and the e2e database resets only
+ *  between projects. A later spec then runs with live hide-on-scroll it never
+ *  asked for, and a header moving mid-click is not a layout it was written
+ *  against. That cost `trigger-groups` its save. The mousedown landed on the
+ *  button and the header then shifted the form, so the mouseup landed on the
+ *  wrapper. No click reached the button, and the form never submitted. */
 export async function disableMobileHeaderSticky(page: Page): Promise<void> {
   const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'false' },

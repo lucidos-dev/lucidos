@@ -259,6 +259,270 @@ fn translate_dow_out_of_range_passes_through() {
     assert!(parse_standard_cron("0 0 12 * * 999").is_err());
 }
 
+// -- day-of-week crossing-range tests: what the `cron` crate does with 5-0 --
+//
+// A numeric range like `5-0` (Friday through Sunday) or `6-1` (Saturday
+// through Monday) crosses Sunday. `translate_dow_for_cron_crate` shifts each
+// endpoint alone, so the crossing survives translation with start > end
+// (`5-0` becomes `6-1`, `6-1` becomes `7-2`). These tests establish, rather
+// than assume, what `cron` 0.15 actually does. It rejects the range with a
+// parse error, on both the numeric and the named form.
+
+#[test]
+fn cron_crate_numeric_dow_range_5_0_crossing_sunday_is_rejected() {
+    let translated = translate_dow_for_cron_crate("0 0 12 * * 5-0");
+    assert_eq!(translated, "0 0 12 * * 6-1");
+    let err = parse_standard_cron("0 0 12 * * 5-0")
+        .expect_err("cron 0.15 rejects a day-of-week range whose start exceeds its end");
+    assert!(err.contains("Invalid range"), "got: {err}");
+    assert!(err.contains("6-1"), "got: {err}");
+}
+
+#[test]
+fn cron_crate_numeric_dow_range_6_1_crossing_sunday_is_rejected() {
+    let translated = translate_dow_for_cron_crate("0 0 12 * * 6-1");
+    assert_eq!(translated, "0 0 12 * * 7-2");
+    let err = parse_standard_cron("0 0 12 * * 6-1")
+        .expect_err("cron 0.15 rejects a day-of-week range whose start exceeds its end");
+    assert!(err.contains("Invalid range"), "got: {err}");
+    assert!(err.contains("7-2"), "got: {err}");
+}
+
+#[test]
+fn cron_crate_named_dow_range_fri_sun_crossing_sunday_is_also_rejected() {
+    // Named days bypass translation entirely. The crate numbers them
+    // Sunday-first too (Sun=1 ... Sat=7), so Fri-Sun hits the same
+    // start <= end check as the numeric form above.
+    assert_eq!(
+        translate_dow_for_cron_crate("0 0 12 * * Fri-Sun"),
+        "0 0 12 * * Fri-Sun",
+        "named ranges must not be touched by translation"
+    );
+    let err = parse_standard_cron("0 0 12 * * Fri-Sun")
+        .expect_err("the named form hits the same start <= end check as the numeric form");
+    assert!(err.contains("Invalid named range"), "got: {err}");
+}
+
+// -- day-of-week range-with-step: a crate quirk, blocked before it can fire --
+//
+// Found by /harden's Codex review pass on this same branch, not by the
+// crossing-range investigation above. `translate_dow_for_cron_crate` only
+// shifts a plain number or a plain `a-b` range. A combined `a-b/step` token
+// is misread: `split_once('-')` treats `5/2` as the range end, `shift` can't
+// parse it as a number, and the whole segment passes through untranslated.
+//
+// This shape never reaches a real trigger: `validate_cron_expressions`
+// rejects it first (see the test below). The test here calls
+// `translate_dow_for_cron_crate` and `parse_standard_cron` directly,
+// bypassing that validation layer, to document what the `cron` crate itself
+// does with the token. It is a characterisation test of the crate, not a
+// path a Lucidos user can reach.
+
+#[test]
+fn cron_crate_dow_range_with_step_is_silently_untranslated() {
+    use chrono::{Datelike, TimeZone};
+
+    // Standard cron: 1-5/2 should mean "Mon, Wed, Fri" (every other weekday).
+    // It passes through unshifted, so the crate parses it under its OWN
+    // Sunday-first numbering instead: 1=Sun..5=Thu, stepped by 2 = Sun,Tue,Thu.
+    let translated = translate_dow_for_cron_crate("0 0 12 * * 1-5/2");
+    assert_eq!(
+        translated, "0 0 12 * * 1-5/2",
+        "the gap: this token is left exactly as written, not shifted"
+    );
+
+    let schedule = parse_standard_cron("0 0 12 * * 1-5/2")
+        .expect("this token parses without error: the bug is silent, not a rejection");
+    let monday = chrono_tz::UTC
+        .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+        .unwrap();
+    // A set, not a sequence: the crate returns fires in calendar order, not
+    // shift order. A plain Vec comparison would depend on which weekday
+    // `monday` falls on.
+    let fires: std::collections::HashSet<chrono::Weekday> = schedule
+        .after(&monday)
+        .take(3)
+        .map(|t| t.weekday())
+        .collect();
+    assert_eq!(
+        fires,
+        [
+            chrono::Weekday::Sun,
+            chrono::Weekday::Tue,
+            chrono::Weekday::Thu
+        ]
+        .into(),
+        "got the crate's own Sunday-first reading, not the Mon/Wed/Fri the user wrote: {fires:?}"
+    );
+}
+
+#[test]
+fn validate_cron_expressions_rejects_numeric_dow_range_with_step() {
+    let err = validate_cron_expressions(vec!["0 0 12 * * 1-5/2".to_string()], UTC)
+        .expect_err("a numeric range-with-step day-of-week token must be rejected");
+    assert!(
+        err.contains("1-5/2"),
+        "must name the offending token: {err}"
+    );
+    assert!(
+        err.contains("Mon-Fri/2"),
+        "must name the named form as a safe alternative: {err}"
+    );
+}
+
+#[test]
+fn validate_cron_expressions_rejects_the_numeric_token_even_mixed_with_a_named_day() {
+    // The range-with-step token can't be safely shifted (see
+    // numeric_dow_range_with_step_token below), even now that
+    // translate_dow_for_cron_crate shifts other segments in a mixed field.
+    // A mixed field carrying it must still be caught: the check inspects
+    // each comma segment on its own, matching the granularity translate uses.
+    let err = validate_cron_expressions(vec!["0 0 12 * * Mon,1-5/2".to_string()], UTC)
+        .expect_err("the numeric segment must still be caught inside a mixed list");
+    assert!(
+        err.contains("1-5/2"),
+        "must name the offending token: {err}"
+    );
+}
+
+#[test]
+fn named_dow_range_with_step_still_fires_mon_wed_fri() {
+    use chrono::{Datelike, TimeZone};
+
+    // Mon-Fri/2 bypasses translation entirely (names are untouched). The
+    // crate numbers names Sunday-first, same as digits, so this lands on
+    // Mon,Wed,Fri exactly as written. A later tightening of the numeric
+    // check must not catch this working form too.
+    validate_cron_expressions(vec!["0 0 12 * * Mon-Fri/2".to_string()], UTC)
+        .expect("the named form is a working expression and must be accepted");
+
+    let schedule = parse_standard_cron("0 0 12 * * Mon-Fri/2").unwrap();
+    let monday = chrono_tz::UTC
+        .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+        .unwrap();
+    let fires: std::collections::HashSet<chrono::Weekday> = schedule
+        .after(&monday)
+        .take(3)
+        .map(|t| t.weekday())
+        .collect();
+    assert_eq!(
+        fires,
+        [
+            chrono::Weekday::Mon,
+            chrono::Weekday::Wed,
+            chrono::Weekday::Fri
+        ]
+        .into(),
+        "named range-with-step must fire on the days written, not a Sunday-first misread: {fires:?}"
+    );
+}
+
+// -- mixed named/numeric day-of-week: a sibling of the range-with-step bug --
+//
+// `translate_dow_for_cron_crate` used to bail on the WHOLE field when any
+// character was alphabetic. That is correct for a purely named field, but
+// wrong for a mixed one: the numeric segment shares the field with a name
+// and needs the shift just as much as it would alone. Checked per
+// comma-segment now, so a letter in one segment skips only that segment.
+
+#[test]
+fn mixed_dow_named_and_numeric_shifts_only_the_numeric_segment() {
+    use chrono::{Datelike, TimeZone};
+
+    // Standard numbering: 1 = Monday, same as "Mon". The field is redundant
+    // and means Monday only.
+    validate_cron_expressions(vec!["0 0 12 * * Mon,1".to_string()], UTC)
+        .expect("a mixed named/numeric day-of-week field is a working expression");
+
+    let schedule = parse_standard_cron("0 0 12 * * Mon,1").unwrap();
+    let monday = chrono_tz::UTC
+        .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+        .unwrap();
+    let fires: std::collections::HashSet<chrono::Weekday> = schedule
+        .after(&monday)
+        .take(2)
+        .map(|t| t.weekday())
+        .collect();
+    assert_eq!(
+        fires,
+        [chrono::Weekday::Mon].into(),
+        "Mon,1 both name Monday under standard numbering: {fires:?}"
+    );
+}
+
+#[test]
+fn mixed_dow_named_and_numeric_range_shifts_only_the_numeric_segment() {
+    use chrono::{Datelike, TimeZone};
+
+    // Standard numbering: 1-2 = Mon-Tue, so the field means Sat, Mon, Tue.
+    validate_cron_expressions(vec!["0 0 12 * * Sat,1-2".to_string()], UTC)
+        .expect("a mixed named/numeric range day-of-week field is a working expression");
+
+    let schedule = parse_standard_cron("0 0 12 * * Sat,1-2").unwrap();
+    let monday = chrono_tz::UTC
+        .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+        .unwrap();
+    let fires: std::collections::HashSet<chrono::Weekday> = schedule
+        .after(&monday)
+        .take(3)
+        .map(|t| t.weekday())
+        .collect();
+    assert_eq!(
+        fires,
+        [
+            chrono::Weekday::Sat,
+            chrono::Weekday::Mon,
+            chrono::Weekday::Tue
+        ]
+        .into(),
+        "Sat,1-2 must fire Sat, Mon, Tue under standard numbering: {fires:?}"
+    );
+}
+
+#[test]
+fn mixed_dow_named_and_numeric_step_shifts_only_the_numeric_segment() {
+    use chrono::{Datelike, TimeZone};
+
+    // `1/2` has a step and no range, so the range-with-step rejection guard
+    // does not catch it: it requires a `-`. This is a plain wrong-day case,
+    // not a rejectable shape. Standard numbering: 1/2 starts at Monday and
+    // steps by 2 through the week, landing on Mon, Wed, Fri.
+    validate_cron_expressions(vec!["0 0 12 * * Sat,1/2".to_string()], UTC)
+        .expect("a mixed named/numeric step day-of-week field is a working expression");
+
+    let schedule = parse_standard_cron("0 0 12 * * Sat,1/2").unwrap();
+    let monday = chrono_tz::UTC
+        .with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+        .unwrap();
+    let fires: std::collections::HashSet<chrono::Weekday> = schedule
+        .after(&monday)
+        .take(4)
+        .map(|t| t.weekday())
+        .collect();
+    assert_eq!(
+        fires,
+        [
+            chrono::Weekday::Sat,
+            chrono::Weekday::Mon,
+            chrono::Weekday::Wed,
+            chrono::Weekday::Fri
+        ]
+        .into(),
+        "Sat,1/2 must fire Sat, Mon, Wed, Fri under standard numbering: {fires:?}"
+    );
+}
+
+#[test]
+fn mixed_dow_named_and_out_of_range_numeric_still_rejected() {
+    // The numeric segment `8` is out of range and deliberately left
+    // untranslated so the crate rejects it. That must survive per-segment
+    // translation: a mixed field carrying it still errors rather than
+    // getting silently mangled.
+    let err = validate_cron_expressions(vec!["0 0 12 * * Mon,8".to_string()], UTC)
+        .expect_err("an out-of-range numeric day-of-week segment must still be rejected");
+    assert!(err.contains("Invalid cron expression"), "got: {err}");
+}
+
 // -- trigger helpers tests --
 
 fn sub(name: &str) -> EventSubscription {

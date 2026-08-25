@@ -158,6 +158,73 @@ async fn post_blob_rejects_non_image_with_unsupported_mime() {
     );
 }
 
+/// The 415 must say what these bytes turned out to be. Reciting the allowlist
+/// leaves the caller to guess, which is what the paste bug did to the user.
+#[tokio::test]
+async fn post_blob_names_the_uploaded_format_in_its_415() {
+    let client = http_client();
+    let thread_id = create_thread(&client, "lucidos").await;
+
+    // A little-endian TIFF header. The declared mime is a lie the server
+    // ignores: it reads the bytes.
+    let mut tiff = vec![0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00];
+    tiff.resize(64, 0);
+    let form = Form::new().part(
+        "file",
+        Part::bytes(tiff)
+            .file_name("screenshot.tiff")
+            .mime_str("image/png")
+            .unwrap(),
+    );
+    let resp = client
+        .post(blobs_url(&thread_id))
+        .multipart(form)
+        .send()
+        .await
+        .expect("POST failed");
+    assert_eq!(resp.status(), 415, "a TIFF is outside the allowlist");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("TIFF"),
+        "the 415 must name the format, got: {error}"
+    );
+    assert!(
+        !error.contains("webp"),
+        "the 415 must not recite the allowlist, got: {error}"
+    );
+}
+
+/// An empty upload is its own verdict, not "we could not recognize this".
+#[tokio::test]
+async fn post_blob_calls_an_empty_upload_empty() {
+    let client = http_client();
+    let thread_id = create_thread(&client, "lucidos").await;
+
+    let form = Form::new().part(
+        "file",
+        Part::bytes(Vec::new())
+            .file_name("image.png")
+            .mime_str("image/png")
+            .unwrap(),
+    );
+    let resp = client
+        .post(blobs_url(&thread_id))
+        .multipart(form)
+        .send()
+        .await
+        .expect("POST failed");
+    assert_eq!(resp.status(), 415, "zero bytes are not an image");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("empty"),
+        "the 415 must say the upload was empty, got: {error}"
+    );
+}
+
 #[tokio::test]
 async fn post_blob_rejects_missing_thread() {
     let client = http_client();

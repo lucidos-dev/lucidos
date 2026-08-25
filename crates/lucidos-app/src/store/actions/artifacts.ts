@@ -1,6 +1,6 @@
 import {
   artifacts,
-  artifactRevision,
+  filePreviewRevision,
   expandedFolders,
   panelOverlay,
   webviewInitialUrl,
@@ -38,7 +38,6 @@ export async function loadArtifacts(): Promise<void> {
     const data = await listArtifacts();
     const paths = data.artifacts || [];
     artifacts.value = { status: 'loaded', data: paths };
-    artifactRevision.value++;
 
     // Expand top-level folders by default on first load
     if (expandedFolders.value.size === 0 && paths.length > 0) {
@@ -162,8 +161,56 @@ export function openFilePreview(path: string, opts?: { preserveSource?: boolean 
   pushNavState();
 }
 
+/** Coalesce a flurry of announcements into one reload, the same 150 ms
+ *  `refreshAppUI` uses on the app iframe. An `artifacts/` write announces
+ *  twice, once as its `Artifact*` event and once as the file tool's
+ *  `ToolResult`. A multi-file edit announces once per file.
+ *
+ *  One module-scoped slot is enough. Only one file preview is open at a time,
+ *  and `invalidateFilePreview` drops every other path, so two pending bumps
+ *  always name the same file. */
+let previewBumpDebounce: ReturnType<typeof setTimeout> | null = null;
+const PREVIEW_BUMP_DEBOUNCE_MS = 150;
+
+function bumpOpenPreview(path: string): void {
+  if (previewBumpDebounce) clearTimeout(previewBumpDebounce);
+  previewBumpDebounce = setTimeout(() => {
+    previewBumpDebounce = null;
+    const current = filePreviewRevision.peek();
+    filePreviewRevision.value = {
+      path,
+      rev: current?.path === path ? current.rev + 1 : 1,
+    };
+  }, PREVIEW_BUMP_DEBOUNCE_MS);
+}
+
+/** Re-fetch the open file preview, but ONLY when `path` is the file it shows.
+ *
+ *  This is the whole reason the revision carries a path. Every write under
+ *  `data/` used to re-URL whatever was on screen, so an agent editing an
+ *  unrelated file restarted a video the user was watching. The app iframe has
+ *  scoped its own refresh on `app_id` since it grew one (`refreshAppUI`).
+ *
+ *  `path` is data-relative (`artifacts/clip.mp4`), matching what `panelOverlay`
+ *  carries. An `Artifact*` event's `artifact_path` is relative to `artifacts/`
+ *  and must be prefixed by the caller.
+ *
+ *  A write to a file the preview is NOT showing is dropped rather than banked.
+ *  Coming back to that file remounts the element on the same URL. The engine
+ *  sends `Cache-Control: no-cache` on every response (`api/mod.rs`), so the
+ *  browser revalidates and cannot serve the pre-write bytes. */
+export function invalidateFilePreview(path: string): void {
+  const overlay = panelOverlay.peek();
+  if (overlay?.type !== 'file-preview' || overlay.path !== path) return;
+  bumpOpenPreview(path);
+}
+
+/** Re-fetch whatever the preview shows, because the user asked: the header
+ *  Refresh button, and the inline editor once a save has landed. */
 export function refreshFilePreview(): void {
-  artifactRevision.value++;
+  const overlay = panelOverlay.peek();
+  if (overlay?.type !== 'file-preview') return;
+  bumpOpenPreview(overlay.path);
 }
 
 // --- URL preview in panel ---

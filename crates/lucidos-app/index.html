@@ -51,7 +51,9 @@
       picker→workspace cross-document reload seam (the persistent cold-start
       jank/flicker). The browser goes straight to /<slug>/, which plays the single
       reveal. Skipped when `?pick` is present (the in-app "Manage workspaces"
-      escape) or no workspace is remembered, so the picker still renders its list.
+      escape), when `?pair=` is (a scanned pairing QR, which has to stay on the
+      public picker path so the gateway can stamp its code into the manifest),
+      or when no workspace is remembered, so the picker still renders its list.
       Reads the RAW device-global `lucidos-last-workspace` key (this runs before
       workspaceStorage.install namespacing, matching how the picker writes it).
       `location.replace` so the picker is not left in history. A since-deleted slug
@@ -74,7 +76,20 @@
         try {
           var base = document.querySelector('base');
           if (!base || base.getAttribute('href') !== '/~/') return;
-          if (new URLSearchParams(location.search).has('pick')) return;
+          // The pairing screen is the picker document, served in place at the
+          // url asked for (gateway `serve_pairing_shell`). So it wears the base
+          // this redirect keys on, and redirecting lands right back on it. The
+          // gateway stamps `PAIRING_SHELL_META` ahead of this script to say so.
+          if (document.querySelector('meta[name="lucidos-pairing"]')) return;
+          var search = new URLSearchParams(location.search);
+          if (search.has('pick')) return;
+          // A scanned pairing QR lands on `/~/?pair=<code>`, which is public,
+          // and the gateway stamps that code into the manifest `start_url` an
+          // Add-to-Home-Screen install then launches with. Redirecting carries
+          // the code onto `/<slug>/`, which is gated: the caller is unpaired,
+          // so `enforce` answers with the pairing shell and the install gets a
+          // manifest with no code in it. Pairing belongs on the picker anyway.
+          if (search.has('pair')) return;
           var slug = localStorage.getItem('lucidos-last-workspace');
           // Preserve the deep link (notification/thread/tap query + any hash) so a
           // push tap that cold-launches into the picker still reaches the workspace
@@ -318,6 +333,32 @@
         transition: opacity 0.3s ease;
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      /* A FAILURE REPORT, which is several lines rather than one: what went
+         wrong, the reason the background service gave, and where to read more
+         (desktop.rs `crash_loop_label`). The one-line rules above exist so the
+         mark never shifts during an ordinary start, and they still do: this is
+         a separate state, entered only once there is a failure to show, and by
+         then nothing above is still animating. Kept off the one-line path so a
+         reason with no line breaks in it cannot silently widen the splash. */
+      .boot-splash-status.boot-splash-status-report {
+        height: auto;
+        /* Generous, and viewport-relative rather than a line count. A real
+           staging failure names a path twice over, so the report runs to about
+           eight wrapped lines: an 8.4em (six-line) cap clipped the LAST line,
+           which is the log path, the one actionable thing on the splash. The
+           inherited overflow:hidden stays as the last-resort guard. */
+        max-height: 40vh;
+        /* px, not rem: see the no-rem rule on .boot-splash. 720px is about 80
+           columns at the 15px monospace above. */
+        max-width: min(80vw, 720px);
+        white-space: pre-line;
+        /* `break-word`, not `anywhere`: a long path must wrap rather than
+           overflow, and this is the form every WebKit the gateway splash can
+           land in already supports. */
+        overflow-wrap: break-word;
+        text-align: center;
+        text-overflow: clip;
+      }
       /* The one action a splash can offer when boot cannot proceed: a link out.
          Both surfaces render one, so the appearance is declared here once and
          each surface owns only WHEN it is shown. The gateway page renders its

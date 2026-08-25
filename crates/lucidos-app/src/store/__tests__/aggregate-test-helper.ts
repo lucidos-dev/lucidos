@@ -171,12 +171,11 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
   // cause: only the user's own switch teardown (`isSwitchTeardownAbort`) settles
   // at 'paused', because that is the one interruption the engine promised to
   // resume. Every other abort is 'failed', except 'stale_settle' at the
-  // cancel-style idle/waiting. Pending changes override every arm.
+  // cancel-style idle. A pending change does NOT enter into it: the verdict is
+  // recorded either way, and `resolveVisualStatus` ranks the two.
   else if (t === 'ResponseAborted') {
     const { cause, actor } = event as { cause?: AbortCause; actor?: MessageOrigin };
-    out.status = out.codingAgentProposed
-      ? 'waiting'
-      : cause === 'stale_settle' ? 'idle'
+    out.status = cause === 'stale_settle' ? 'idle'
       : isSwitchTeardownAbort(actor, cause) ? 'paused' as ThreadStatus
       : 'failed';
   }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -25,12 +25,17 @@ import {
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
-import { chatModelOptions, loadChatModels, reasoningLevelsFor } from '../../store/actions/models';
+import {
+  loadChatModels, lucidosModelChoices, modelReasoningEfforts, LUCIDOS_TIER_VOCABULARY,
+} from '../../store/actions/models';
+import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
+import { ModelSelectionRow } from './ModelSelectionRow';
 import { ModelsManager } from './ModelsManager';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
 import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
 import { XaiProviderSettings } from './XaiProviderSettings';
+import { OpenCodeFreeSettings } from './OpenCodeFreeSettings';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
@@ -40,7 +45,10 @@ import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgent
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { MarketplacesSection } from './MarketplacesSection';
 import { McpServersPage } from './McpServersPage';
+import { WebhooksPage } from './WebhooksPage';
 import { MobileAccessPage } from './MobileAccessPage';
+import { usePairedDevices, revokePaired, pairedRows, pairingIsKnown } from './pairedDevices';
+import { buildDeviceRows, deviceDisplayName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
@@ -60,7 +68,6 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { focusFirstFocusableWithin } from '../layout/paneFocus';
 import { formatTimeAgo } from '../../utils/formatTime';
-import type { DeviceInfo } from '../../api/types';
 import type { ImageModel } from '../../store/actions/preferences';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -141,12 +148,31 @@ const IMAGE_MODELS = [
 // options are the low-cost tiers. GPT-5.4 mini is the OpenAI option — the
 // Flash/Haiku-class peer of the others (not the flagship GPT-5.4 Standard);
 // routed via the MemoryExtractor's gpt-* prefix when picked.
-const BACKGROUND_MODELS = [
+const BACKGROUND_MODEL_IDS = [
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
   { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
   { value: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
 ];
+
+/** The background models as *model selections*: each row carries the tiers the
+ *  engine will actually accept for it, so the paired Reasoning control offers
+ *  the set `RoutingProvider` clamps onto. */
+function backgroundModelChoices(): ModelChoice[] {
+  return BACKGROUND_MODEL_IDS.map((m) => ({
+    value: m.value,
+    label: m.label,
+    reasoningEfforts: lucidosTiers(m.value, modelReasoningEfforts(m.value)),
+  }));
+}
+
+/** Image generation has no reasoning tiers at all, so its picker renders the
+ *  model alone. The empty list is what decides that, not a prop. */
+const IMAGE_MODEL_CHOICES: ModelChoice[] = IMAGE_MODELS.map((m) => ({
+  value: m.value,
+  label: m.label,
+  reasoningEfforts: [],
+}));
 
 /** Self-skeletonizing device row: rendered with no props inside a
  *  SkeletonProvider (`<DeviceRow />`) it draws itself as a loading placeholder
@@ -154,16 +180,18 @@ const BACKGROUND_MODELS = [
  *  lives in the parent (`editingId`/`setEditingId`) so the skeleton call passes
  *  nothing. Props are optional only to support that call; real call sites pass
  *  them all. */
-function DeviceRow({ device, editingId, setEditingId }: {
-  device?: DeviceInfo;
+function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: {
+  row?: DeviceRowModel;
   editingId?: string | null;
   setEditingId?: (id: string | null) => void;
+  onRevoke?: (row: DeviceRowModel) => void;
+  gatewayAnswered?: boolean;
 }) {
   const sk = useSkeleton();
   const [editValue, setEditValue] = useState('');
-  const currentDeviceId = getDeviceId();
-  const isCurrent = !sk && device?.id === currentDeviceId;
-  const displayName = device?.name || device?.id || '';
+  const device = row?.device;
+  const isCurrent = !sk && row?.isCurrent === true;
+  const displayName = row ? deviceDisplayName(row) : '';
   const editing = !sk && device != null && editingId === device.id;
   const inputRef = useCallback((el: HTMLInputElement | null) => {
     if (el) { el.focus(); el.select(); }
@@ -171,17 +199,18 @@ function DeviceRow({ device, editingId, setEditingId }: {
 
   function startEditing() {
     if (!device) return;
-    setEditValue(device.name || displayName);
+    // `displayName` already IS the stored name when there is one. So it is the
+    // single source for the prefill and for `saveEdit`'s unchanged check.
+    setEditValue(displayName);
     setEditingId?.(device.id);
   }
 
   function saveEdit() {
     if (!device) return;
     setEditingId?.(null);
-    const trimmed = editValue.trim();
-    const newName = (trimmed && trimmed !== device.id) ? trimmed : null;
-    if (newName !== device.name) {
-      void updateDeviceName(device.id, newName);
+    const next = submittedDeviceName(device.name ?? null, displayName, editValue);
+    if (next !== undefined) {
+      void updateDeviceName(device.id, next);
     }
   }
 
@@ -194,7 +223,10 @@ function DeviceRow({ device, editingId, setEditingId }: {
   // enabling push for a non-current device is impossible; the toggle is disabled
   // in that state (see below) rather than firing an error on click. Disabling
   // push remotely (and Remove) stays allowed.
-  const enableBlocked = !sk && !isCurrent && !device?.push_enabled;
+  //
+  // A row with no engine row is blocked too, whether or not it is current:
+  // push hangs off that row, so there is nothing here to switch on.
+  const enableBlocked = !sk && (!device || (!isCurrent && !device.push_enabled));
 
   return (
     <div class={`list-row ${isCurrent ? 'device-current' : ''}`}>
@@ -216,15 +248,25 @@ function DeviceRow({ device, editingId, setEditingId }: {
               ref={inputRef}
             />
           ) : (
-            <span class="device-name" onClick={startEditing}>{displayName}</span>
+            // Renaming writes the ENGINE row, so a device that only paired
+            // has nothing to rename. Render it as plain text rather than a
+            // control that silently does nothing.
+            device ? (
+              <span class="device-name" onClick={startEditing}>{displayName}</span>
+            ) : (
+              <span>{displayName}</span>
+            )
           )}
           {isCurrent && <span class="device-badge">This device</span>}
         </div>
-        {/* Two FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
+        {/* FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
             No manual middle-dot glue: it would be its own anonymous flex item
             and pick the gap up on both sides (see the oauth row's note below). */}
         <SkText class="list-row-details" as="div" w="14rem">
-          <span>{describeDeviceUserAgent(device?.user_agent)}</span>
+          {(row
+            ? deviceRowSummary(row, describeDeviceUserAgent, gatewayAnswered === true, Date.now())
+            : [describeDeviceUserAgent(undefined)]
+          ).map((clause) => <span key={clause}>{clause}</span>)}
           {device && (
             <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
               {formatTimeAgo(new Date(device.last_seen_at))}
@@ -233,7 +275,13 @@ function DeviceRow({ device, editingId, setEditingId }: {
         </SkText>
       </div>
       <div class="list-row-actions">
-        {!sk && <span class={`device-push-label${device?.push_enabled ? '' : ' push-disabled'}`}>Push</span>}
+        {/* Push is per WORKSPACE, so it hangs off the engine row. A device that
+            only paired has none yet, and the toggle STILL renders, off and
+            disabled: leaving it out asks the reader why this one row has no
+            push, and the answer is not that push is unavailable to it. */}
+        {!sk && (
+          <span class={`device-push-label${device?.push_enabled ? '' : ' push-disabled'}`}>Push</span>
+        )}
         <SkBlock w="2.25rem" h="1.25rem" round>
           <label
             class={`toggle-switch${enableBlocked ? ' toggle-switch-disabled' : ''}`}
@@ -241,7 +289,7 @@ function DeviceRow({ device, editingId, setEditingId }: {
           >
             <input
               type="checkbox"
-              checked={device?.push_enabled}
+              checked={device?.push_enabled ?? false}
               disabled={enableBlocked}
               onChange={() => {
                 if (device) void setDevicePushEnabled(device.id, !device.push_enabled);
@@ -250,16 +298,31 @@ function DeviceRow({ device, editingId, setEditingId }: {
             <span class="toggle-slider" />
           </label>
         </SkBlock>
-        <SkBlock w="4.5rem" h="2rem" round>
-          {isCurrent ? (
-            <span class="action-btn" style="visibility: hidden">Remove</span>
-          ) : (
+        {/* Revoke is MACHINE-GLOBAL and Remove is per workspace, so they are
+            two buttons rather than one. Revoking cuts this device off every
+            workspace at once; removing forgets its push and preferences here
+            and leaves it paired. */}
+        {!sk && row?.paired && onRevoke && (
+          <button
+            class="action-btn action-btn-danger"
+            data-tooltip="Stop this device reaching the machine, on every workspace"
+            onClick={() => onRevoke(row)}
+          >Revoke</button>
+        )}
+        {/* Rendered only when there is something to remove. An invisible
+            placeholder used to hold this slot open so the buttons lined up in a
+            column, but it also sat to the RIGHT of Revoke on every row without
+            a Remove, holding that button a button's width off the edge. The
+            actions are flush right instead, which is where the eye looks. */}
+        {(sk || (device && !isCurrent)) && (
+          <SkBlock w="4.5rem" h="2rem" round>
             <button
               class="action-btn action-btn-danger"
+              data-tooltip="Forget this device's push and preferences in this workspace"
               onClick={() => { if (device) void removeDevice(device.id); }}
             >Remove</button>
-          )}
-        </SkBlock>
+          </SkBlock>
+        )}
       </div>
     </div>
   );
@@ -430,6 +493,10 @@ function askLucidosToConnectAccount(): void {
 export function SettingsView() {
   const loadable = devices.value;
   const showLoading = useDelayedLoading(loadable);
+  // The pairing half of the device list. Fetched unconditionally: a hook
+  // cannot be called from inside the Devices branch alone. It costs one local
+  // request, which resolves to "no gateway" everywhere else.
+  const paired = usePairedDevices();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
@@ -750,6 +817,14 @@ export function SettingsView() {
     );
   }
 
+  /** Devices: the one list of every device, and the two things you can do to
+   *  one. Pairing decides whether it reaches the machine at all, on every
+   *  workspace; the engine row decides where push goes and which preferences
+   *  apply, here. Both used to be their own list under their own word, which is
+   *  how the same phone read as two different devices.
+   *
+   *  `buildDeviceRows` joins them, outer on both sides, because neither half
+   *  missing is an error. See `deviceList.ts`. */
   function devicesSection() {
     if (loadable.status === 'failed') {
       return (
@@ -758,27 +833,41 @@ export function SettingsView() {
         </div>
       );
     }
+    const rowsPaired = pairedRows(paired.paired);
+    function revoke(row: DeviceRowModel) {
+      if (!row.paired) return;
+      void revokePaired(row.paired, {
+        selfId: paired.selfId,
+        count: rowsPaired?.length ?? 0,
+        reload: paired.reload,
+      });
+    }
     return (
-      <div class="list-rows">
+      <div class="list-rows" data-search-anchor="devices:list">
+        {/* A gateway that broke is not a deployment that never had one, so it
+            says so instead of silently dropping the pairing column. The engine
+            half below still renders: push and preferences are unaffected. */}
+        {paired.paired.status === 'failed' && (
+          <LoadableError noun="paired devices" error={paired.paired.error} />
+        )}
         <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
           {loadable.status === 'loaded'
             ? (() => {
-                if (loadable.data.length === 0) {
+                const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
+                if (rows.length === 0) {
                   return <div class="empty-state">No devices registered</div>;
                 }
-                // Current device first; then push-enabled; within each group keep the
-                // backend's last_seen_at DESC ordering via Array.prototype.sort's ES2019
-                // stability guarantee.
-                const currentId = getDeviceId();
-                const sorted = [...loadable.data].sort((a, b) => {
-                  if (a.id === currentId) return -1;
-                  if (b.id === currentId) return 1;
-                  return Number(b.push_enabled) - Number(a.push_enabled);
-                });
                 return (
                   <>
-                    {sorted.map((device) => (
-                      <DeviceRow key={device.id} device={device} editingId={editingId} setEditingId={setEditingId} />
+                    {rows.map((row) => (
+                      <DeviceRow
+                        key={row.id}
+                        row={row}
+                        editingId={editingId}
+                        setEditingId={setEditingId}
+                        onRevoke={revoke}
+                        gatewayAnswered={pairingIsKnown(paired.paired)}
+                      />
                     ))}
                   </>
                 );
@@ -911,15 +1000,21 @@ export function SettingsView() {
             onChange={(c) => void setCommandGuardJudge(c)}
           />
         </div>
-        <div class="settings-row settings-row-child" data-search-anchor="command-safety:judge-model">
-          <span class="settings-row-label">Judge model</span>
-          <Dropdown
-            options={BACKGROUND_MODELS}
-            value={currentBackgroundModel('model_command_judge')}
-            onChange={(v) => void setBackgroundModel('model_command_judge', v)}
-            disabled={!guardOn || !judgeOn}
-          />
-        </div>
+        <ModelSelectionRow
+          label="Judge model"
+          anchor="command-safety:judge-model"
+          nested
+          models={backgroundModelChoices()}
+          vocabulary={LUCIDOS_TIER_VOCABULARY}
+          model={currentBackgroundModel('model_command_judge')}
+          effort={currentBackgroundReasoning('reasoning_command_judge')}
+          disabled={!guardOn || !judgeOn}
+          onChange={(p) => void saveModelSelection(
+            'model_command_judge',
+            'reasoning_command_judge',
+            p,
+          )}
+        />
       </div>
     );
   }
@@ -1035,22 +1130,15 @@ export function SettingsView() {
               </p>
             </Explainer>
           </div>
-          <div class="settings-row">
-            <span class="settings-row-label">Model</span>
-            <Dropdown
-              options={chatModelOptions()}
-              value={currentModel.value}
-              onChange={(v) => void setCurrentModel(v)}
-            />
-          </div>
-          <div class="settings-row" data-search-anchor="models:reasoning">
-            <span class="settings-row-label">Reasoning</span>
-            <Dropdown
-              options={reasoningLevelsFor(currentModel.value)}
-              value={reasoningEffort.value}
-              onChange={(v) => void setReasoningEffort(v)}
-            />
-          </div>
+          <ModelSelectionRow
+            label="Model"
+            anchor="models:chat-model"
+            models={lucidosModelChoices(currentModel.value)}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentModel.value}
+            effort={reasoningEffort.value}
+            onChange={(p) => void setChatModelSelection(p)}
+          />
           <div class="settings-row" data-search-anchor="models:max-tool-calls">
             <span class="settings-row-label">
               Max tool calls
@@ -1089,41 +1177,63 @@ export function SettingsView() {
         </div>
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:image-generation">Image generation</div>
-          <div class="settings-row">
-            <span class="settings-row-label">Model</span>
-            <Dropdown
-              options={IMAGE_MODELS}
-              value={imageModel}
-              onChange={(v) => void setImageModel(v as ImageModel)}
-            />
-          </div>
+          {/* One row per model, no tier beside it: an image model has no tiers,
+              and the empty tier set is what decides that. */}
+          <ModelSelectionRow
+            label="Model"
+            models={IMAGE_MODEL_CHOICES}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={imageModel}
+            effort={null}
+            onChange={(p) => void setImageModel(p.model as ImageModel)}
+          />
         </div>
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:background-tasks">Background tasks</div>
-          <div class="settings-row" data-search-anchor="models:title-generation">
-            <span class="settings-row-label">Title generation</span>
-            <Dropdown
-              options={BACKGROUND_MODELS}
-              value={currentBackgroundModel('model_title')}
-              onChange={(v) => void setBackgroundModel('model_title', v)}
-            />
-          </div>
-          <div class="settings-row" data-search-anchor="models:image-description">
-            <span class="settings-row-label">Image description</span>
-            <Dropdown
-              options={BACKGROUND_MODELS}
-              value={currentBackgroundModel('model_image_description')}
-              onChange={(v) => void setBackgroundModel('model_image_description', v)}
-            />
-          </div>
-          <div class="settings-row" data-search-anchor="models:memory-context">
-            <span class="settings-row-label">Memory & context</span>
-            <Dropdown
-              options={BACKGROUND_MODELS}
-              value={currentBackgroundModel('model_memory')}
-              onChange={(v) => void setBackgroundModel('model_memory', v)}
-            />
-          </div>
+          <ModelSelectionRow
+            label="Title generation"
+            anchor="models:title-generation"
+            models={backgroundModelChoices()}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentBackgroundModel('model_title')}
+            effort={currentBackgroundReasoning('reasoning_title')}
+            onChange={(p) => void saveModelSelection('model_title', 'reasoning_title', p)}
+          />
+          <ModelSelectionRow
+            label="Image description"
+            anchor="models:image-description"
+            models={backgroundModelChoices()}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentBackgroundModel('model_image_description')}
+            effort={currentBackgroundReasoning('reasoning_image_description')}
+            onChange={(p) => void saveModelSelection(
+              'model_image_description',
+              'reasoning_image_description',
+              p,
+            )}
+          />
+          <ModelSelectionRow
+            label="Memory extraction"
+            anchor="models:memory-extraction"
+            models={backgroundModelChoices()}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentBackgroundModel('model_memory')}
+            effort={currentBackgroundReasoning('reasoning_memory')}
+            onChange={(p) => void saveModelSelection('model_memory', 'reasoning_memory', p)}
+          />
+          <ModelSelectionRow
+            label="Conversation summary"
+            anchor="models:conversation-summary"
+            models={backgroundModelChoices()}
+            vocabulary={LUCIDOS_TIER_VOCABULARY}
+            model={currentBackgroundModel('model_conversation_summary')}
+            effort={currentBackgroundReasoning('reasoning_conversation_summary')}
+            onChange={(p) => void saveModelSelection(
+              'model_conversation_summary',
+              'reasoning_conversation_summary',
+              p,
+            )}
+          />
         </div>
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
@@ -1132,6 +1242,7 @@ export function SettingsView() {
           <OpenAiProviderSettings />
           <OpenRouterProviderSettings />
           <XaiProviderSettings />
+          <OpenCodeFreeSettings />
           <LocalProviderSettings />
         </div>
         <ModelsManager />
@@ -1407,6 +1518,7 @@ export function SettingsView() {
       case 'access': return accessSection();
       case 'permissions': return permissionsSection();
       case 'mcp': return <McpServersPage />;
+      case 'webhooks': return <WebhooksPage />;
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;

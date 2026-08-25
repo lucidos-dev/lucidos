@@ -553,7 +553,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Added:** 2026-08-07
 - **Lives in:** `build_file_list_section`
   (`crates/lucidos-engine/src/engine/chat/process/workspace_payload.rs`), the
-  trailing advisory emitted whenever the block is partial.
+  trailing advisory emitted whenever the workspace holds a vendored file. The
+  block itself is never partial: it is an inventory or nothing (ADR 0086 as
+  amended), and vendored paths are the one thing it names by count instead.
 - **Impermanent because:** it warns the chat agent about a defect in a
   neighbouring surface rather than describing its own. The `list_files` tool
   (`engine/tools/files.rs`) returns `all_files.join("\n")` with no ignore filter
@@ -648,6 +650,30 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   the one piece a partial removal leaves behind compiling.
 - **Status:** active
 - **Investigation:** `prompt-cache-first-of-turn-miss`
+
+### Movement distance in the discarded-tap toast
+
+- **Added:** 2026-08-24
+- **Lives in:** `crates/lucidos-app/src/components/chat/PromptInput.tsx`
+  (`morphTapPassed`), which reads `tapRejection()` from
+  `crates/lucidos-app/src/utils/tapGesture.ts` and puts the number in the
+  toast. The toast is permanent; only the `moved Npx` half is not.
+- **Impermanent because:** The scroll-vs-tap gate silently ate real taps on the
+  composer's Submit with the iOS keyboard up. The cause was the gate measuring
+  page-viewport coordinates instead of finger movement, so the fix switched it
+  to screen coordinates. The bug is intermittent, so normal use is the only way
+  to confirm the fix landed. A bare "Tap ignored" cannot tell a fixed gate from
+  a still-broken one, and the number can. A rejection at 30px is a real swipe,
+  where one at 9px is the gate still measuring something that is not the finger.
+- **Removal / resolution condition:** When the user confirms the composer's
+  Submit no longer misfires on an iOS PWA with the keyboard up. A reported
+  rejection whose distance names a remaining cause closes it too. Then drop the
+  distance from the message in `morphTapPassed`, keeping the plain sentence.
+  Drop `tapRejection` from the gate and its tests in `tapGesture.test.ts` if
+  nothing else reads it. The toast itself stays: a
+  discarded press is user intent dropped, which the no-hidden-errors rule
+  requires surfacing.
+- **Status:** active
 
 ---
 
@@ -793,6 +819,32 @@ condition; fix the condition rather than acting on it.
   created after 2026-06-25, only 3 were token-choosing (all `--font-ui`, no
   aliases). Below the 10-app threshold, so the measure stays. The one alias use in
   the sampled period predates the measure and is not a post-measure regression.
+
+### Gemini's plan narration is kept off the screen
+
+- **Added:** 2026-08-20
+- **Lives in:** `crates/lucidos-engine/src/llm/vertex/gemini.rs`
+  (`build_gemini_llm_response`, the `narration` branch).
+- **Impermanent because (tolerates):** Gemini writes its reasoning into
+  ordinary, non-`thought` text parts beside a `functionCall`, even with
+  `includeThoughts: true` asking for it in `thought` parts instead. Printing it
+  would show the user a monologue rather than an answer. Measured on
+  `gemini-3.5-flash`, 10 of 15 samples on one round emitted such a part;
+  `gemini-3.1-pro-preview` emitted one in 16. So `content` is held at `None` for
+  that turn, and the text rides back to the model as *model-only text*.
+- **Removal / resolution condition:** When every Gemini model in the *model
+  registry* confines its reasoning to `thought` parts. Verify by sampling a
+  multi-round tool-using turn per enabled Gemini model. Count the responses
+  whose parts include a non-`thought` `text` part alongside a `functionCall`.
+  The bar is the weakest routed Gemini, not the newest, so a new flagship is not
+  on its own evidence. At zero across at least 15 samples per model, drop the
+  branch and let `content` carry the text like the other two providers. That
+  also retires the `model_only_text` field, if no other provider has claimed it
+  by then.
+- **Status:** active. The suppression predates this entry. It is registered now
+  because the fix that split its two halves made both of them explicit. The
+  half that was never intended (erasing the text from the model's own history)
+  is a defect and has been fixed, not tolerated.
 
 ### `generate_image` vision-misuse guard
 
@@ -1160,6 +1212,66 @@ carry a **concrete** removal condition (NOT permanent back-compat — that's OUT
 flag belongs here the moment it lands; a shim belongs here only if you can name the
 event that retires it.
 
+### `self_curated_context_mode` flag (ADR 0085)
+
+- **Added:** 2026-08-19
+- **Lives in:** `crates/lucidos-engine/src/core/preferences.rs` (the key, the
+  two schedule keys and their readers), `core/preference_catalog.rs` (the three
+  settable rows), and `engine/chat/process/context_mode.rs`, which owns the
+  whole mode. Also the `todo_write` gate in `llm/tools/misc.rs`.
+
+  The rest is spread thin on purpose. `context_panel.rs` renders the panel,
+  `working_understanding.rs` parses and renders the document and holds
+  `ThreadEvent::WorkingUnderstandingWritten` and `ContextKeptOpen`. The agentic
+  loop takes a `CuratedTurn`, runs the sweep and appends the tail.
+  `engine/context.rs` carries `ProtectedAddresses`, `TrimGuards` and the
+  mode-aware recovery clause. `llm/anthropic_wire.rs` anchors its cache marker
+  in front of a `ContentBlock::EngineTail`, and `SummaryPlan::needs_refresh`
+  holds the summariser gate.
+- **Impermanent because:** it is one arm of an experiment, not a setting anyone
+  is meant to live with. The mode ships dark so the benchmark can measure it
+  against a baseline. Until that measurement is read, "on" is a claim nobody has
+  evidence for, and the flag exists only to make the two comparable.
+- **The default inverted, and the flag did not move.** ADR 0085's second
+  amendment made a body leave at the end of the round it arrived on, unless the
+  model kept it. That is a treatment change under ADR 0087's decision 14,
+  distinguished by the `guidance_hash`. So the flag is still one arm of one
+  experiment, and the bar it has to clear is unchanged.
+- **The first run at the ceiling did not answer it.** Run
+  `07e4aa2ef0bc4317952150e4e363f433` recorded zero `ContextKept` and zero
+  `ContextDismissed` in 206 rounds. ADR 0103 found the blind trimmer had
+  destroyed the lean arm's context on the hardest task. So the run cannot
+  separate a wrong default from a sabotaged arm. It fixes the trimmer and leaves
+  the flag where it is, for one more run.
+- **The bar it was measured against is gone, and the condition is rewritten.**
+  ADR 0110 supersedes ADR 0087 and retires the graduation and kill conditions.
+  Nothing computes a verdict now, so "the eval reports against the bar" is a
+  condition nothing can satisfy. A condition nobody can meet is how a temporary
+  measure becomes permanent quietly, which is what this registry exists to stop.
+- **What the flag gates was rebuilt, and the flag itself did not move.** The
+  one-round rule became the *swept window*, the scratchpad became the *working
+  understanding*, and the keep verb became a `[KEEP OPEN]` line. The key was
+  renamed from `context_mode_experimental` in the same change, because no
+  workspace had ever set it. The record is
+  `docs/plans/2026-08-24-the-working-understanding-and-the-ten-round-window.md`.
+  The flag stays one arm of one experiment throughout.
+- **Removal / resolution condition:** a benchmark run at the full window and at
+  the budgets below it, in both arms, read by a human who then decides. Kept:
+  delete the flag, the catalog row, the branches and the baseline paths, leaving
+  the mode unconditional. Dropped: delete the flag, the mode, the keep verb, the
+  working understanding, the context panel and the gate row, leaving today's
+  behaviour. `dismiss_from_context` went with ADR 0109 and is not coming back
+  either way.
+- **The benchmark does NOT go with it.** ADR 0087 promised
+  `crates/lucidos-eval` and `eval/context-mode/` would be deleted alongside the
+  flag, because they existed to decide it. Under ADR 0110 they measure how any
+  configuration handles its context, which outlives this decision. What goes
+  with the flag is `Arm`, its preference rows, and the paired path.
+  **Anything else leaves the mode experimental and this row open.** Verify with
+  a grep for the three keys across `crates/**`, `system-knowhow/**` and
+  `eval/**`, which must return nothing but this row and `Arm::preference_rows`.
+- **Status:** active
+
 ### `lucidos spawn-thread --parent` deprecated alias
 
 - **Added:** 2026-06-30 (registered by the temporary-measures survey — the alias
@@ -1223,7 +1335,7 @@ event that retires it.
   `data/config/apis.json` entry that still names a credential
   `oauth:<provider>`. That third site is the load-bearing one: `data/config/` is
   user data no DB migration can rewrite, so a live config would otherwise 502 on
-  every request the moment the prefix migration runs (the `personal` workspace
+  every request the moment the prefix migration runs (a live workspace
   had two such entries when this shipped). Pinned by
   `client_provider_name_strips_a_legacy_prefix`,
   `fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name`, and
@@ -1583,11 +1695,11 @@ measure now eligible for removal** — search this file for the id to find them 
 - **What the data already ruled out** (do not re-investigate): tool count, model
   id, elapsed time, concurrent-thread eviction, and `frontend_origin`. Section
   composition too: in 1,029 zero-read cases both cached blocks were
-  byte-identical in `char_count` to the previous call. The 30s
+  byte-identical in declared size to the previous call. The 30s
   `pool_idle_timeout` is a second-order effect and cannot be the mechanism, per
   the matched-gap number.
 - **The CURRENT TIME stamp is NO LONGER ruled out, and is now fixed.** The
-  `char_count` evidence above was the reason it was cleared, and equal counts
+  size evidence above was the reason it was cleared, and equal counts
   are not equal content: the wire probe caught a boundary where `system_bytes`
   held constant while `system_hash` moved, which is a fixed-width field
   changing. That is a PARTIAL read (tools survived, system did not), so it is a

@@ -36,7 +36,9 @@ const PREVIEW_JPEG_QUALITY: u8 = 85;
 /// extension). `sniff_image_mime` returns one of these mime strings;
 /// `ext_for_mime` and `resolve_blob` look up the paired extension.
 /// Add a new image format by appending one entry here AND extending the
-/// magic-byte sniff in `sniff_image_mime`.
+/// magic-byte sniff in `sniff_image_mime`. The client sniffs the same bytes
+/// before it draws a chip, so `utils/imageBytes.ts` mirrors this table and
+/// `imageBytes.mirror.test.ts` fails on a one-sided edit.
 const ALLOWED_IMAGE_MIME_EXT: &[(&str, &str)] = &[
     ("image/png", "png"),
     ("image/jpeg", "jpg"),
@@ -45,9 +47,52 @@ const ALLOWED_IMAGE_MIME_EXT: &[(&str, &str)] = &[
     ("image/heic", "heic"),
 ];
 
+/// Formats recognized only so a rejection can name them: (id, label).
+/// Nothing here is stored. The label tells the user what they really have,
+/// which is more use than a recital of the allowlist. Mirrored by
+/// `UNSUPPORTED_IMAGE_FORMATS` in `utils/imageBytes.ts`.
+const UNSUPPORTED_IMAGE_FORMATS: &[(&str, &str)] = &[
+    ("TIFF", "a TIFF image"),
+    ("BMP", "a BMP image"),
+    ("AVIF", "an AVIF image"),
+    ("SVG", "an SVG vector image"),
+    ("PDF", "a PDF document"),
+    ("ICO", "an icon file"),
+];
+
+/// What an upload turned out to be, once the allowlist sniff said no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedImage {
+    /// No bytes at all. A macOS clipboard flavour can hand over an empty
+    /// `image/png`, which is what the reported paste failure was.
+    Empty,
+    /// A format we can name but do not store, e.g. `a TIFF image`.
+    Named(&'static str),
+    /// Bytes matching nothing we know.
+    Unknown,
+}
+
+impl std::fmt::Display for UnsupportedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnsupportedImage::Empty => {
+                write!(f, "unsupported image: the upload was empty (0 bytes)")
+            }
+            UnsupportedImage::Named(label) => write!(
+                f,
+                "unsupported image: that's {label}, save it as PNG or JPEG first"
+            ),
+            UnsupportedImage::Unknown => write!(
+                f,
+                "unsupported image: those bytes are not an image Lucidos can read"
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BlobError {
-    UnsupportedMime,
+    UnsupportedMime(UnsupportedImage),
     BadEncoding(String),
     Io(std::io::Error),
 }
@@ -55,10 +100,7 @@ pub enum BlobError {
 impl std::fmt::Display for BlobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BlobError::UnsupportedMime => write!(
-                f,
-                "unsupported image mime (allowed: jpeg, png, webp, gif, heic)"
-            ),
+            BlobError::UnsupportedMime(found) => write!(f, "{found}"),
             BlobError::BadEncoding(detail) => write!(f, "invalid base64 in image: {detail}"),
             BlobError::Io(e) => write!(f, "blob io error: {e}"),
         }
@@ -131,6 +173,55 @@ pub fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// How much of a text file to read when looking for an SVG root element.
+const SVG_SNIFF_LIMIT: usize = 512;
+
+/// Name a format we refuse, so the rejection can say what the bytes really
+/// are. Diagnosis only: every id here stays a refusal. Mirrored by
+/// `describeUnsupportedImage` in `utils/imageBytes.ts`.
+pub fn describe_unsupported_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
+        return Some("TIFF");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("BMP");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") {
+        return Some("AVIF");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("PDF");
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("ICO");
+    }
+    if looks_like_svg(bytes) {
+        return Some("SVG");
+    }
+    None
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(SVG_SNIFF_LIMIT)]).to_lowercase();
+    let start = head.trim_start();
+    start.starts_with("<svg") || (start.starts_with("<?xml") && head.contains("<svg"))
+}
+
+/// Classify bytes the allowlist sniff already turned down.
+pub fn classify_unsupported_image(bytes: &[u8]) -> UnsupportedImage {
+    if bytes.is_empty() {
+        return UnsupportedImage::Empty;
+    }
+    match describe_unsupported_image(bytes) {
+        Some(id) => UNSUPPORTED_IMAGE_FORMATS
+            .iter()
+            .find_map(|(known, label)| (*known == id).then_some(UnsupportedImage::Named(label)))
+            .unwrap_or(UnsupportedImage::Unknown),
+        None => UnsupportedImage::Unknown,
+    }
+}
+
 /// Canonical filename extension for a recognized mime. Pairs with
 /// `sniff_image_mime` — the same set of types is supported.
 pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
@@ -159,8 +250,9 @@ fn blob_path(workspace: &Path, hash: &str, ext: &str) -> PathBuf {
 /// The write goes to a sibling `.tmp-<hash>` path then renames into
 /// place atomically; a crash mid-write leaves no half-written blob.
 pub fn write_blob(workspace: &Path, bytes: &[u8]) -> Result<ResolvedBlob, BlobError> {
-    let mime = sniff_image_mime(bytes).ok_or(BlobError::UnsupportedMime)?;
-    let ext = ext_for_mime(mime).ok_or(BlobError::UnsupportedMime)?;
+    let mime = sniff_image_mime(bytes)
+        .ok_or_else(|| BlobError::UnsupportedMime(classify_unsupported_image(bytes)))?;
+    let ext = ext_for_mime(mime).ok_or(BlobError::UnsupportedMime(UnsupportedImage::Unknown))?;
     let hash = compute_hash(bytes);
     let path = blob_path(workspace, &hash, ext);
 
@@ -518,12 +610,137 @@ mod tests {
     fn write_blob_rejects_non_image_bytes_with_unsupported_mime() {
         let dir = tempfile::tempdir().unwrap();
         let result = write_blob(dir.path(), b"plain text not an image");
-        assert!(matches!(result, Err(BlobError::UnsupportedMime)));
+        assert!(matches!(
+            result,
+            Err(BlobError::UnsupportedMime(UnsupportedImage::Unknown))
+        ));
         // Guarantee no disk write happened.
         assert!(
             !dir.path().join("data/blobs").exists(),
             "rejected upload must not create the blobs directory"
         );
+    }
+
+    fn tiff_bytes() -> Vec<u8> {
+        let mut v = vec![0x49, 0x49, 0x2A, 0x00];
+        v.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]);
+        v.extend_from_slice(&[0x00; 16]);
+        v
+    }
+
+    /// The exact clipboard shape that produced the reported paste failure:
+    /// a flavour declared `image/png` carrying no bytes at all.
+    #[test]
+    fn write_blob_calls_an_empty_upload_empty_rather_than_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_blob(dir.path(), b"").expect_err("empty bytes must be refused");
+        assert!(matches!(
+            err,
+            BlobError::UnsupportedMime(UnsupportedImage::Empty)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "unsupported image: the upload was empty (0 bytes)"
+        );
+    }
+
+    #[test]
+    fn write_blob_names_tiff_instead_of_reciting_the_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_blob(dir.path(), &tiff_bytes()).expect_err("TIFF must be refused");
+        assert_eq!(
+            err.to_string(),
+            "unsupported image: that's a TIFF image, save it as PNG or JPEG first"
+        );
+        assert!(
+            !err.to_string().contains("allowed:"),
+            "the rejection must not recite the allowlist"
+        );
+    }
+
+    /// A declared mime is not evidence. These bytes arrive from a multipart
+    /// part claiming `image/png`; only the bytes decide.
+    #[test]
+    fn write_blob_ignores_a_declared_mime_and_reads_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_blob(dir.path(), &tiff_bytes()).expect_err("TIFF must be refused");
+        assert!(matches!(
+            err,
+            BlobError::UnsupportedMime(UnsupportedImage::Named("a TIFF image"))
+        ));
+    }
+
+    #[test]
+    fn write_blob_reports_unplaceable_bytes_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_blob(dir.path(), &[0x13, 0x37, 0x42, 0x99]).expect_err("must be refused");
+        assert_eq!(
+            err.to_string(),
+            "unsupported image: those bytes are not an image Lucidos can read"
+        );
+    }
+
+    #[test]
+    fn describe_unsupported_image_names_the_formats_in_the_table() {
+        assert_eq!(describe_unsupported_image(&tiff_bytes()), Some("TIFF"));
+        assert_eq!(
+            describe_unsupported_image(&[0x4D, 0x4D, 0x00, 0x2A, 0x00]),
+            Some("TIFF")
+        );
+        assert_eq!(describe_unsupported_image(b"BM\x36\x00"), Some("BMP"));
+        assert_eq!(describe_unsupported_image(b"%PDF-1.7\n"), Some("PDF"));
+        assert_eq!(
+            describe_unsupported_image(&[0x00, 0x00, 0x01, 0x00, 0x01]),
+            Some("ICO")
+        );
+        assert_eq!(
+            describe_unsupported_image(b"<svg width=\"1\"/>"),
+            Some("SVG")
+        );
+        assert_eq!(
+            describe_unsupported_image(b"<?xml version=\"1.0\"?><svg/>"),
+            Some("SVG")
+        );
+        let mut avif = vec![0x00, 0x00, 0x00, 0x1C];
+        avif.extend_from_slice(b"ftypavif");
+        avif.extend_from_slice(&[0x00; 8]);
+        assert_eq!(describe_unsupported_image(&avif), Some("AVIF"));
+    }
+
+    /// Every label the client can show must come from this table, so the two
+    /// gates say the same thing. `imageBytes.mirror.test.ts` reads it.
+    #[test]
+    fn describe_unsupported_image_never_names_a_format_we_store() {
+        for accepted in [
+            png_bytes(),
+            jpeg_bytes(),
+            webp_bytes(),
+            gif_bytes(),
+            heic_bytes(),
+        ] {
+            assert_eq!(describe_unsupported_image(&accepted), None);
+        }
+    }
+
+    #[test]
+    fn unsupported_image_ids_all_have_a_label() {
+        for (id, label) in UNSUPPORTED_IMAGE_FORMATS {
+            assert!(!label.is_empty(), "{id} has no label");
+            assert!(
+                label.starts_with("a ") || label.starts_with("an "),
+                "{id}'s label must read as a noun phrase, got {label:?}"
+            );
+        }
+    }
+
+    /// Bytes in equal bytes out. Nothing on the ingest path re-encodes.
+    #[test]
+    fn write_blob_stores_the_uploaded_bytes_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = png_bytes();
+        let written = write_blob(dir.path(), &bytes).unwrap();
+        let on_disk = std::fs::read(&written.path).unwrap();
+        assert_eq!(compute_hash(&on_disk), compute_hash(&bytes));
     }
 
     #[test]

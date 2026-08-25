@@ -5,8 +5,10 @@ import {
   submitTrigger,
 } from '../../store/actions/triggers';
 import {
-  chatModelOptions, clampEffortFor, loadChatModels, reasoningLevelsFor,
+  chatModelOptions, loadChatModels, lucidosModelChoices, LUCIDOS_TIER_VOCABULARY,
 } from '../../store/actions/models';
+import type { ModelChoice } from '../../store/modelSelection';
+import { ModelSelectionField } from '../shared/ModelSelectionField';
 import { REASONING_LEVELS } from '../../store/models';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
@@ -16,6 +18,7 @@ import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useServerBackedField, sameJson, sameSet } from '../../hooks/useServerBackedField';
 import { LoadableError } from '../shared/LoadableError';
 import { Explainer, FieldLabel } from '../shared/Explainer';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
@@ -38,8 +41,77 @@ const SIDE_EFFECT_CATEGORIES: { value: SideEffectCategory; label: string }[] = [
 
 // Module-level cache: shared across all TriggerFormInner mounts (open/reopen
 // the form without refetching). Loadable so consumers see all 4 states.
+//
+// A failure is not sticky. `loadEventTypes` runs unless the cache is `loaded`.
+// So the next mount retries, the error row's Retry button re-drives it, and
+// opening the picker retries it too. A loaded list is never refreshed for the
+// life of the page. An event type first emitted after that load is missing
+// until Retry, or a reload.
 let cachedEventTypes: Loadable<string[]> = { status: 'not-loaded' };
 let inflightFetch: Promise<string[]> | null = null;
+
+/** Fill the module cache, deduping concurrent callers onto one request.
+ *
+ *  `apply` publishes each state to the calling component. Every retry path
+ *  comes through here, so there is one load path. */
+function loadEventTypes(apply: (l: Loadable<string[]>) => void): void {
+  cachedEventTypes = { status: 'loading' };
+  apply(cachedEventTypes);
+  if (!inflightFetch) {
+    inflightFetch = fetchEventTypes();
+  }
+  inflightFetch
+    .then(types => {
+      cachedEventTypes = { status: 'loaded', data: types };
+      apply(cachedEventTypes);
+    })
+    .catch((e: unknown) => {
+      cachedEventTypes = toFailed(e);
+      apply(cachedEventTypes);
+    })
+    .finally(() => { inflightFetch = null; });
+}
+
+/** Retry a failed list from the user's own gesture of opening the picker, the
+ *  same bargain `retryFailedDestinationLists` strikes for the compose
+ *  destination lists. The error row's Retry button is the visible affordance;
+ *  this catches the user who opens the picker without reading the row. Only a
+ *  failed cache refetches, and `loadEventTypes` single-flights, so an open
+ *  costs at most one request. */
+function retryFailedEventTypes(apply: (l: Loadable<string[]>) => void): void {
+  if (cachedEventTypes.status === 'failed') loadEventTypes(apply);
+}
+
+/** The event-subscription editor's value. The parsed condition lives on
+ *  `subs[i].condition` so submit can forward it directly. The raw JSON the
+ *  user is typing lives in `drafts[i]`. Parsing it back on every keystroke
+ *  would lose the in-flight cursor and every invalid intermediate state. Both
+ *  are keyed by row index, so they travel as one value. */
+interface SubscriptionDraft {
+  subs: EventSubscription[];
+  drafts: Record<number, string>;
+}
+
+/** The subscription editor as the stored trigger describes it. */
+function servedSubscriptions(on: EventSubscription[] | undefined): SubscriptionDraft {
+  const subs = (on ?? []).map(s => ({ ...s }));
+  const drafts: Record<number, string> = {};
+  subs.forEach((s, i) => {
+    if (s.condition) drafts[i] = JSON.stringify(s.condition, null, 2);
+  });
+  return { subs, drafts };
+}
+
+/** Rekey an index-keyed map after row `index` was removed, so trailing entries
+ *  shift down with the array they annotate. */
+function reindexAfterRemoval<T>(map: Record<number, T>, index: number): Record<number, T> {
+  return Object.fromEntries(
+    Object.entries(map)
+      .map(([k, v]) => [Number(k), v] as const)
+      .filter(([k]) => k !== index)
+      .map(([k, v]) => [k > index ? k - 1 : k, v]),
+  );
+}
 
 export function TriggerDetails() {
   const form = activeInlineForm.value;
@@ -89,88 +161,73 @@ function MissingTriggerCloser() {
 
 function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; existingTrigger: TriggerInfo | null }) {
 
+  // Every field below is a *server-backed field*: untouched it renders the
+  // trigger the store holds, so a `TriggerUpdated` frame repaints the open
+  // page; touched it holds the user's draft. See ADR 0118.
   const derived = existingTrigger ? deriveTriggerType(existingTrigger) : null;
-  const initialFormType: TriggerFormType = derived === 'hybrid' ? 'both' : derived === 'event' ? 'event' : 'schedule';
+  const servedFormType: TriggerFormType = derived === 'hybrid' ? 'both' : derived === 'event' ? 'event' : 'schedule';
 
-  const [formType, setFormType] = useState<TriggerFormType>(initialFormType);
-  const [name, setName] = useState(existingTrigger?.name || '');
+  const [formType, setFormType] = useServerBackedField<TriggerFormType>(servedFormType);
+  const [name, setName] = useServerBackedField(existingTrigger?.name || '');
 
   const existingRun = existingTrigger?.run;
-  const [runType, setRunType] = useState<RunType>(existingRun?.type === 'script' ? 'script' : 'intent');
-  const [intentText, setIntentText] = useState(
+  const [runType, setRunType] = useServerBackedField<RunType>(
+    existingRun?.type === 'script' ? 'script' : 'intent'
+  );
+  const [intentText, setIntentText] = useServerBackedField(
     existingRun?.type === 'intent' ? existingRun.intent : ''
   );
-  const [scriptPath, setScriptPath] = useState(
+  const [scriptPath, setScriptPath] = useServerBackedField(
     existingRun?.type === 'script' ? existingRun.path : ''
   );
 
-  const [cronExpressions, setCronExpressions] = useState<string[]>(
-    existingTrigger?.cron_expressions?.length ? [...existingTrigger.cron_expressions] : []
+  const [cronExpressions, setCronExpressions] = useServerBackedField<string[]>(
+    existingTrigger?.cron_expressions ?? [], sameJson,
   );
   const [cronInput, setCronInput] = useState('');
   const [cronError, setCronError] = useState<string | null>(null);
 
-  // Parsed condition lives on `subs[i].condition` so submit can forward it
-  // directly. The raw JSON source the user is typing lives in `conditionDrafts`
-  // — parsing it back on every keystroke would lose the in-flight cursor /
-  // invalid intermediate state, so we hold the string until submit.
-  const initialSubs: EventSubscription[] = (existingTrigger?.on ?? []).map(s => ({ ...s }));
-  const initialDrafts: Record<number, string> = {};
-  (existingTrigger?.on ?? []).forEach((s, i) => {
-    if (s.condition) initialDrafts[i] = JSON.stringify(s.condition, null, 2);
-  });
-  const [subs, setSubs] = useState<EventSubscription[]>(initialSubs);
-  const [conditionDrafts, setConditionDrafts] = useState<Record<number, string>>(initialDrafts);
+  // One field, not two: the rows and their drafts are index-parallel, and
+  // `removeSubscription` reindexes both. Touching one alone would desync them.
+  const [subscriptions, setSubscriptions] = useServerBackedField(
+    servedSubscriptions(existingTrigger?.on), sameJson,
+  );
+  const { subs, drafts: conditionDrafts } = subscriptions;
   const [subErrors, setSubErrors] = useState<Record<number, string>>({});
   const [eventTypesLoadable, setEventTypesLoadable] = useState<Loadable<string[]>>(cachedEventTypes);
   const showEventTypesLoading = useDelayedLoading(eventTypesLoadable);
 
   useEffect(() => {
     if (cachedEventTypes.status === 'loaded') return;
-    setEventTypesLoadable({ status: 'loading' });
-    cachedEventTypes = { status: 'loading' };
-    if (!inflightFetch) {
-      inflightFetch = fetchEventTypes();
-    }
-    inflightFetch
-      .then(types => {
-        cachedEventTypes = { status: 'loaded', data: types };
-        setEventTypesLoadable(cachedEventTypes);
-      })
-      .catch((e: unknown) => {
-        cachedEventTypes = toFailed(e);
-        setEventTypesLoadable(cachedEventTypes);
-      })
-      .finally(() => { inflightFetch = null; });
+    loadEventTypes(setEventTypesLoadable);
   }, []);
 
   const eventTypeOptions: { value: string; label: string }[] = (() => {
     if (eventTypesLoadable.status === 'loaded') {
       return eventTypesLoadable.data.map(t => ({ value: t, label: t }));
     }
-    if (eventTypesLoadable.status === 'failed') {
-      return [{ value: '', label: 'Failed to load event types' }];
-    }
     if (eventTypesLoadable.status === 'loading' && showEventTypesLoading) {
       return [{ value: '', label: 'Loading event types...' }];
     }
+    // A failed load offers nothing. An empty-valued placeholder would clear
+    // the field, and `freeText` keeps hand-entry working with no options.
     return [];
   })();
 
-  const [goToReview, setGoToReview] = useState(existingTrigger?.go_to_review ?? false);
-  const [sideEffectGrant, setSideEffectGrant] = useState<SideEffectCategory[]>(
-    existingTrigger?.side_effect_grant ?? []
+  const [goToReview, setGoToReview] = useServerBackedField(existingTrigger?.go_to_review ?? false);
+  const [sideEffectGrant, setSideEffectGrant] = useServerBackedField<SideEffectCategory[]>(
+    existingTrigger?.side_effect_grant ?? [], sameSet,
   );
   const toggleSideEffect = (cat: SideEffectCategory, on: boolean) => {
-    setSideEffectGrant(prev =>
-      on ? [...prev.filter(c => c !== cat), cat] : prev.filter(c => c !== cat)
+    setSideEffectGrant(
+      on ? [...sideEffectGrant.filter(c => c !== cat), cat] : sideEffectGrant.filter(c => c !== cat)
     );
   };
   // '' is the Default option: the trigger inherits the account chat model /
   // effort, which is what a trigger without a pin has always done. Kept as ''
   // rather than null so the <Dropdown> value round-trips as a plain string.
-  const [model, setModel] = useState<string>(existingTrigger?.model ?? '');
-  const [triggerEffort, setTriggerEffort] = useState<string>(existingTrigger?.reasoning_effort ?? '');
+  const [model, setModel] = useServerBackedField(existingTrigger?.model ?? '');
+  const [triggerEffort, setTriggerEffort] = useServerBackedField(existingTrigger?.reasoning_effort ?? '');
   // The picker reads the DB-backed registry; kick a load if nothing has yet
   // (loadChatModels single-flights via setLoadingIfFresh). Until it lands,
   // chatModelOptions() falls back to the static list, so the field is never
@@ -179,7 +236,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     if (chatModels.value.status === 'not-loaded') void loadChatModels();
   }, []);
 
-  const [groupId, setGroupId] = useState<string>(existingTrigger?.group_id ?? '');
+  const [groupId, setGroupId] = useServerBackedField(existingTrigger?.group_id ?? '');
   // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
   // Enter and blur BOTH call commitNewGroupDraft; committing hides the field,
@@ -306,30 +363,28 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   }
 
   function addSubscription() {
-    setSubs([...subs, { event_type: '' }]);
+    setSubscriptions({ subs: [...subs, { event_type: '' }], drafts: conditionDrafts });
   }
 
   function setEventType(index: number, eventType: string) {
-    setSubs(subs.map((s, i) => i === index ? { ...s, event_type: eventType } : s));
+    setSubscriptions({
+      subs: subs.map((s, i) => i === index ? { ...s, event_type: eventType } : s),
+      drafts: conditionDrafts,
+    });
     clearSubError(index);
   }
 
   function setConditionDraft(index: number, source: string) {
-    setConditionDrafts({ ...conditionDrafts, [index]: source });
+    setSubscriptions({ subs, drafts: { ...conditionDrafts, [index]: source } });
     clearSubError(index);
   }
 
   function removeSubscription(index: number) {
-    setSubs(subs.filter((_, i) => i !== index));
-    // Rekey both maps so trailing entries shift down with the array.
-    const reindex = <T,>(m: Record<number, T>) => Object.fromEntries(
-      Object.entries(m)
-        .map(([k, v]) => [Number(k), v] as const)
-        .filter(([k]) => k !== index)
-        .map(([k, v]) => [k > index ? k - 1 : k, v]),
-    );
-    setConditionDrafts(reindex(conditionDrafts));
-    setSubErrors(reindex(subErrors));
+    setSubscriptions({
+      subs: subs.filter((_, i) => i !== index),
+      drafts: reindexAfterRemoval(conditionDrafts, index),
+    });
+    setSubErrors(reindexAfterRemoval(subErrors, index));
   }
 
   function handleGroupChange(value: string) {
@@ -352,39 +407,27 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     setNewGroupDraft(null);
   }
 
-  // Default first, then the same registry-backed list the chat picker offers
-  // (enabled models whose provider is configured). The Default row names the
-  // account model so the user can see what they are inheriting, mirroring the
-  // coding-agent menu's "(currently ...)" annotation.
-  const modelOptions: { value: string; label: string }[] = (() => {
-    const options = chatModelOptions();
-    const accountLabel =
-      options.find(o => o.value === currentModel.value)?.label ?? currentModel.value;
-    return [{ value: '', label: `Default (${accountLabel})` }, ...options];
-  })();
-
-  // Which tiers to offer depends on the model this trigger will actually run
-  // on: its own pin when it has one, otherwise the account model.
-  const effectiveModel = model || currentModel.value;
-  const effortOptions: { value: string; label: string }[] = (() => {
-    const accountLabel =
-      REASONING_LEVELS.find(l => l.value === reasoningEffort.value)?.label ?? reasoningEffort.value;
-    return [
-      { value: '', label: `Default (${accountLabel})` },
-      ...reasoningLevelsFor(effectiveModel),
-    ];
-  })();
-
-  /** Switching the model can drop a tier the new one doesn't support, so snap a
-   *  pinned effort the way the account picker does (`setCurrentModel`). A
-   *  Default effort stays Default: it follows the account setting, which the
-   *  engine clamps per model at call time. */
-  function handleModelChange(next: string) {
-    setModel(next);
-    if (triggerEffort) {
-      setTriggerEffort(clampEffortFor(triggerEffort, next || currentModel.value));
-    }
-  }
+  // The trigger form uses the shared dropdown shell inside its own
+  // `.form-group`, because the field explainer lives here.
+  //
+  // Its extra row is Default, which inherits the whole pair. It carries no
+  // tiers of its own, so picking it clears both halves. Its label names the
+  // pair the run will actually use. For a legacy trigger that pinned an effort
+  // and no model, that is the pinned tier.
+  const tierLabel = (value: string) =>
+    REASONING_LEVELS.find(l => l.value === value)?.label ?? value;
+  const accountLabel =
+    chatModelOptions().find(o => o.value === currentModel.value)?.label ?? currentModel.value;
+  // The account's tier, except on a legacy trigger that pinned an effort and no
+  // model. Once a model IS pinned the tier belongs to that pick, and naming it
+  // here would claim Default runs on it.
+  const inheritedTier = tierLabel(
+    model === '' && triggerEffort ? triggerEffort : reasoningEffort.value,
+  );
+  const modelChoices: ModelChoice[] = [
+    { value: '', label: `Default (${accountLabel} · ${inheritedTier})`, reasoningEfforts: [] },
+    ...lucidosModelChoices(model || null),
+  ];
 
   const groupsLoadable = triggerGroups.value;
   const groupOptions: { value: string; label: string }[] = (() => {
@@ -532,11 +575,24 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
               <FieldLabel title="Event Subscriptions">
                   <p>
                     Each subscription's condition only filters that event: different
-                    events can carry different payloads.
+                    events can carry different payloads. A key is a field path, so
+                    dots read into nested payload fields.
                   </p>
               </FieldLabel>
               {eventTypesLoadable.status === 'failed' && (
-                <div class="form-error">Failed to load event types: {eventTypesLoadable.error}</div>
+                <div class="form-error form-error-row">
+                  <span>
+                    Failed to load event types: {eventTypesLoadable.error}. You can
+                    still type an event type by hand.
+                  </span>
+                  <button
+                    type="button"
+                    class="action-btn"
+                    onClick={() => loadEventTypes(setEventTypesLoadable)}
+                  >
+                    Retry
+                  </button>
+                </div>
               )}
               {eventTypesLoadable.status === 'loading' && showEventTypesLoading && (
                 <div class="form-hint">Loading event types...</div>
@@ -555,6 +611,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                       onChange={(v) => setEventType(i, v)}
                       placeholder="e.g. OuraSleepImported"
                       freeText
+                      onOpen={() => retryFailedEventTypes(setEventTypesLoadable)}
                     />
                     <button
                       type="button"
@@ -660,27 +717,23 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             <>
               <div class="form-group">
                 <FieldLabel title="Model">
-                    <p>What this trigger's unattended runs use.</p>
+                    <p>The model and reasoning this trigger's unattended runs use.</p>
                     <p>
-                      The default follows Settings → Models → Chat &amp; triggers, so
-                      pick a model here only when this trigger should differ, e.g.
+                      Default follows Settings → Models → Chat &amp; triggers, so
+                      pick here only when this trigger should differ, e.g.
                       something cheap for a routine digest or something stronger for a
                       weekly analysis.
                     </p>
                 </FieldLabel>
-                <Dropdown
-                  value={model}
-                  onChange={handleModelChange}
-                  options={modelOptions}
-                />
-              </div>
-
-              <div class="form-group">
-                <label>Reasoning</label>
-                <Dropdown
-                  value={triggerEffort}
-                  onChange={setTriggerEffort}
-                  options={effortOptions}
+                <ModelSelectionField
+                  models={modelChoices}
+                  vocabulary={LUCIDOS_TIER_VOCABULARY}
+                  model={model}
+                  effort={triggerEffort || null}
+                  onChange={(patch) => {
+                    setModel(patch.model);
+                    setTriggerEffort(patch.reasoningEffort ?? '');
+                  }}
                 />
               </div>
 

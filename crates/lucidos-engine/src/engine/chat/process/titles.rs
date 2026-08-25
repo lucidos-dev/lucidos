@@ -4,13 +4,12 @@
 //! `process_message_with_steps_internal`; the actual title generation
 //! primitives live in `super::super::title`.
 
-use crate::core::{PreferenceStore, PREF_MODEL_TITLE};
 use crate::engine::thread_events::EventMeta;
 use crate::engine::LucidosEngine;
 use uuid::Uuid;
 
 use super::super::process_helpers::TriggerContext;
-use super::super::title::emit_generated_title;
+use super::super::title::{emit_generated_title, title_call};
 
 impl LucidosEngine {
     /// Emit thread titles for this turn as needed: a caller-provided title
@@ -71,16 +70,11 @@ impl LucidosEngine {
             // It's a follow-up — generate title if none exists yet
             let event_store = self.event_store.clone();
             if let Some(ref extractor) = self.extractor {
-                let title_model = PreferenceStore::get(&self.pool, PREF_MODEL_TITLE)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                match extractor.provider_for_model(&title_model) {
+                match title_call(&self.pool, extractor).await {
                     Err(e) => {
                         log!("[Chat] Failed to build title provider for follow-up: {}", e);
                     }
-                    Ok(provider) => {
+                    Ok(call) => {
                         let msg = user_message.to_string();
                         let attached_images = user_images.map_or(0, |i| i.len());
                         let bus = self.event_bus.clone();
@@ -97,7 +91,7 @@ impl LucidosEngine {
                                         .and_then(|(_, desc, _)| desc);
                                     emit_generated_title(
                                         &bus,
-                                        provider.as_ref(),
+                                        &call,
                                         thread_id,
                                         &msg,
                                         image_desc.as_deref(),

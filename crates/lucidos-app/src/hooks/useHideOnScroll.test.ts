@@ -38,6 +38,26 @@ describe('--mobile-header-offset stays off the document root', () => {
     expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
   });
 
+  // The scroll-delta logic below is a hand-written MIRROR of the hook, so these
+  // two keep the mirror honest about the anchored-reveal behaviour it pins.
+  it('gates the navigation reveal on the anchor kind', () => {
+    expect(hookSource).toMatch(/if \(!isAnchorScroll\(\)\) headerOffset = 0;/);
+  });
+
+  it('re-takes its baseline at the anchor write, not on the scroll event', () => {
+    expect(hookSource).toMatch(/onAnchorScroll\(\(el\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+  });
+
+  it('re-takes it again on the settling frame, and cancels that frame on teardown', () => {
+    // The write is not the end of a reveal. A shrinking transcript is still
+    // settling, and the browser's own clamp lands a frame later. Unabsorbed,
+    // the header spent that clamp as a full reveal over the line the correction
+    // had just held. The mirror below models the synchronous half only, so the
+    // frame is pinned here.
+    expect(hookSource).toMatch(/anchorSettleRaf = requestAnimationFrame\(\(\) => \{[\s\S]*prevScrollTop = clampedScrollTop\(el\)/);
+    expect(hookSource).toMatch(/if \(anchorSettleRaf !== null\) cancelAnimationFrame\(anchorSettleRaf\);[\s\S]*observer\.disconnect\(\)/);
+  });
+
   it('keeps the offset off `top`, which would reinstate the forced layout', () => {
     // The companion half of the fix, in CSS: both consumers take the offset on
     // `transform` (composited) so the write cannot dirty layout. A `top` that
@@ -60,6 +80,7 @@ function createScrollTracker(
   isNavigationScroll: () => boolean = () => false,
   isRepaintNudging: () => boolean = () => false,
   isUserScrolling: () => boolean = () => false,
+  isAnchorScroll: () => boolean = () => false,
 ) {
   let prevScrollTop = 0;
   let headerOffset = 0;
@@ -85,7 +106,10 @@ function createScrollTracker(
     if (isNavigationScroll()) {
       const maxScroll = Math.max(0, scrollHeight - clientHeight);
       prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
-      headerOffset = 0;
+      // An ANCHOR write is the exception: the app moved the container so the
+      // reader's own line would NOT move, so the chrome stays where they left
+      // it. Revealing it there covers that line.
+      if (!isAnchorScroll()) headerOffset = 0;
       return;
     }
 
@@ -133,6 +157,14 @@ function createScrollTracker(
       headerOffset = 0;
       prevScrollTop = 0;
     }
+  }
+
+  /** The app re-based the container to hold the reader on the same content
+   *  (`onAnchorScroll`). Re-take the baseline at the write, so the scroll event
+   *  it fires carries a delta of zero whenever it lands. */
+  function rebaseAnchor(scrollTop: number, scrollHeight: number, clientHeight: number) {
+    const maxScroll = Math.max(0, scrollHeight - clientHeight);
+    prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
   }
 
   /** Sync header to match container scroll position (used after keyboard dismiss). */
@@ -190,6 +222,7 @@ function createScrollTracker(
 
   return {
     applyScrollDelta,
+    rebaseAnchor,
     switchContainer,
     syncToScroll,
     onFocusIn,
@@ -1030,5 +1063,93 @@ describe('useHideOnScroll recovery re-applies header transform', () => {
 
     expect(t.keyboardOpen).toBe(true);
     expect(t.appliedOffset).toBe(before);
+  });
+});
+
+describe('useHideOnScroll across an anchored reveal correction', () => {
+  /* The step-log toggle changes the height of every turn. `withScrollAnchor`
+   * re-bases `scrollTop` by whatever grew or went away above the reader, so
+   * their own line does not move. That re-base is not the reader scrolling, and
+   * the header must not spend it.
+   *
+   * It is the one navigation that must NOT reveal the header either. The other
+   * three land content on `.chat-exchange`'s `scroll-margin-top`, which clears
+   * a VISIBLE header. This one lands the reader exactly where they already
+   * were, so revealing covers their own line by a header plus a thread title.
+   *
+   * Both halves are pinned, because each covers a case the other cannot. The
+   * FLAG covers the scroll event that arrives inside the navigation window. The
+   * RE-BASE covers the one that does not, which is a large programmatic jump on
+   * WebKit under load.
+   */
+  let anchoring = false;
+  let navigating = false;
+
+  beforeEach(() => {
+    anchoring = false;
+    navigating = false;
+  });
+
+  function tracker() {
+    return createScrollTracker(
+      () => null,
+      () => navigating,
+      () => false,
+      () => false,
+      () => anchoring,
+    );
+  }
+
+  it('keeps the header hidden when the correction scrolls the reader up', () => {
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+    expect(t.headerOffset).toBe(-48);
+
+    // Hiding the steps takes 940px out of the transcript above the reader, and
+    // the correction takes the same out of `scrollTop`.
+    navigating = true;
+    anchoring = true;
+    t.applyScrollDelta(2060, 8000, 800);
+
+    expect(t.headerOffset).toBe(-48);
+  });
+
+  it('still reveals the header for a navigation that is not an anchor', () => {
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+    expect(t.headerOffset).toBe(-48);
+
+    navigating = true;
+    t.applyScrollDelta(2060, 12000, 800);
+
+    expect(t.headerOffset).toBe(0);
+  });
+
+  it('spends nothing when the correction has already re-based the baseline', () => {
+    // The scroll event arrives after the navigation window closed, so the flag
+    // above says nothing. The re-base is what makes the delta zero.
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+    expect(t.headerOffset).toBe(-48);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    t.applyScrollDelta(2060, 8000, 800);
+
+    expect(t.headerOffset).toBe(-48);
+  });
+
+  it('reads the reader own scroll after the re-base from the new baseline', () => {
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    // The reader now scrolls UP 30px of their own accord, which reveals 30px.
+    t.applyScrollDelta(2030, 8000, 800);
+
+    expect(t.headerOffset).toBe(-18);
   });
 });

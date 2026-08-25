@@ -15,7 +15,7 @@ vi.mock('../../hooks/sw-update', () => ({
   markSwUpdateDismissed: vi.fn(),
 }));
 
-import { checkEngineVersion, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
+import { checkEngineVersion, strandedMessage, openEngineVersionToast, resetEngineVersionToastForTest, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 // Type-only, so it is erased before the `vi.mock` above replaces that module.
 import type { BuildFailure, PendingCommits } from '../../api/client';
@@ -913,5 +913,46 @@ describe('handleFrontendUpdateStranded — the change is NOT coming', () => {
     });
     strandedToasts()[0].action?.onClick();
     expect(strandedToasts()).toHaveLength(0);
+  });
+});
+
+describe('strandedMessage: the reason, when the build-watch knows it', () => {
+  const base = { served_dir: '/repo/crates/lucidos-app/dist', sent_at_ms: 0 };
+
+  it('names the build failure instead of guessing', () => {
+    // The failure this replaced: the user was told to "check the build-watch"
+    // while the answer sat in its log file.
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: false,
+      build_error: 'Rollup failed to resolve import "jsqr"',
+    });
+    expect(message).toContain('the build is failing');
+    expect(message).toContain('jsqr');
+    expect(message).not.toContain('check the build-watch');
+  });
+
+  it('keeps the recoverable wording when no reason was reported', () => {
+    // A build slower than the wait still lands, so this must not claim the
+    // change is lost.
+    const message = strandedMessage({ ...base, served_in_worktree: false });
+    expect(message).toContain("hasn't rebuilt");
+    expect(message).not.toContain('will not appear');
+  });
+
+  it('lets the worktree case keep its own permanent advice', () => {
+    // That one can never receive the rebuild, whatever the build says.
+    const message = strandedMessage({
+      ...base,
+      served_in_worktree: true,
+      build_error: 'Rollup failed to resolve import "jsqr"',
+    });
+    expect(message).toContain('will not appear');
+    expect(message).toContain('Relaunch the stack');
+  });
+
+  it('ignores a blank reason rather than showing an empty sentence', () => {
+    const message = strandedMessage({ ...base, served_in_worktree: false, build_error: '  ' });
+    expect(message).toContain("hasn't rebuilt");
   });
 });

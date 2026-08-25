@@ -163,6 +163,11 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
         ("z-ai/glm-5.2", vec!["none", "low", "medium", "high"]),
         // xAI is the same shape: OpenAI-compatible, but not OpenAI.
         ("grok-4.6", vec!["none", "low", "medium", "high"]),
+        // The keyless free tier is the one provider whose set varies per model.
+        // Ox Alpha rejects none, medium and xhigh with a 400, so the picker
+        // must offer exactly the three it accepts.
+        ("x-preview-f-free", vec!["low", "high", "max"]),
+        ("laguna-s-2.1-free", vec!["none", "low", "medium", "high"]),
     ] {
         let m = find_model(&client, &api, id)
             .await
@@ -207,23 +212,29 @@ async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
 /// The Grok family is seeded on the xAI provider, and every row declares its
 /// real window over the wire. The id-shape fallback has no rule for a `grok-`
 /// id, so an undeclared row would budget the 2M model at 200k.
+///
+/// Grok 4.5 and 4.3 are switched off by the prior-generation prune, and are
+/// asserted here precisely BECAUSE they are: `GET /models` serves every row,
+/// enabled or not, and a disabled row still has to carry a true window. Routing
+/// resolves it for a saved `chat_model`, and the picker filters on `enabled`
+/// separately.
 #[tokio::test]
 async fn seeded_grok_models_report_xai_and_their_declared_windows() {
     let client = http_client();
     let api = base_url();
 
-    for (id, window) in [
-        ("grok-4.6", 500_000),
-        ("grok-4.5", 500_000),
-        ("grok-4.20", 2_000_000),
-        ("grok-4.3", 1_000_000),
+    for (id, window, enabled) in [
+        ("grok-4.6", 500_000, true),
+        ("grok-4.5", 500_000, false),
+        ("grok-4.20", 2_000_000, true),
+        ("grok-4.3", 1_000_000, false),
     ] {
         let m = find_model(&client, &api, id)
             .await
             .unwrap_or_else(|| panic!("{id} must be seeded in the e2e workspace"));
         assert_eq!(m["provider"], "xai", "{id}");
         assert_eq!(m["source"], "builtin", "{id}");
-        assert_eq!(m["enabled"], true, "{id}");
+        assert_eq!(m["enabled"], enabled, "{id}");
         assert_eq!(m["context_window"], window, "{id}");
     }
 }
@@ -272,6 +283,45 @@ async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
         find_model(&client, &api, "grok-4.6").await.is_some(),
         "removing the OpenRouter row must not touch the xAI one"
     );
+}
+
+/// `opencode-free` is accepted wherever a provider name is, and its seeded rows
+/// are real rows over HTTP. Four lists validate a provider name in this repo, so
+/// a value that parses in Rust can still be refused at the API.
+#[tokio::test]
+async fn the_keyless_provider_is_accepted_at_the_models_api() {
+    let client = http_client();
+    let api = base_url();
+    let id = unique_marker("e2e-free-model");
+
+    let resp = client
+        .post(format!("{}/api/v1/models", api))
+        .json(&json!({
+            "id": id,
+            "label": "E2E Free Model",
+            "provider": "opencode-free",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true,
+        "the models API must accept the opencode-free provider"
+    );
+
+    let listed = find_model(&client, &api, &id).await.expect("model listed");
+    assert_eq!(listed["provider"], "opencode-free");
+
+    // The seed ships six of these, with their windows declared.
+    let seeded = find_model(&client, &api, "laguna-s-2.1-free")
+        .await
+        .expect("the seeded free models must be listed");
+    assert_eq!(seeded["provider"], "opencode-free");
+    assert_eq!(seeded["context_window"], 256_000);
+
+    delete_model(&client, &api, &id).await;
 }
 
 /// A model added without the field is simply undeclared — the engine infers a

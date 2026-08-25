@@ -63,15 +63,40 @@ pub(crate) fn parse_worktree_list(output: &str) -> std::collections::HashMap<Str
     map
 }
 
-/// Return the on-disk path of the worktree currently holding `branch_name`,
-/// or `None` if no worktree has it checked out. Subprocess failures are logged
-/// (callers treat the result as authoritative "no worktree exists" — silently
-/// drifting on a `git worktree list` failure could lose CC work in the
-/// discard / stale-recovery paths).
+/// Which worktree holds a branch, keeping "could not ask" separate from
+/// "nothing holds it". The [`GitAnswer`] shape, for a question whose yes-side
+/// carries a path.
+///
+/// `Unknown` is the variant that has to stay distinguishable. `git worktree
+/// list` failed to spawn, exited non-zero, or exceeded [`GIT_TIMEOUT`], all of
+/// which are routine on a saturated host. Collapsing that into `NotFound` is
+/// the bug class in `docs/plans/2026-08-03-unknown-git-state-must-not-delete-worktrees.md`.
+///
+/// So there is no collapse to `Option<PathBuf>`, no `Default`, no
+/// `unwrap_or`-shaped method. Every caller matches three arms, and the
+/// `Unknown` arm must skip whatever it was about to do and log which branch it
+/// skipped. It must never delete a worktree, delete or move a branch ref, or
+/// resolve a change as an already-applied no-op. The per-site decisions are
+/// tabulated in `docs/plans/2026-08-24-find-worktree-for-branch-is-a-tri-state.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreeLookup {
+    /// git ran and this worktree has the branch checked out.
+    Found(PathBuf),
+    /// git ran and no worktree has the branch checked out.
+    NotFound,
+    /// git could not be asked: spawn failure, non-zero exit, or timeout.
+    Unknown,
+}
+
+/// Ask which worktree currently holds `branch_name`.
+///
+/// A non-zero exit is [`WorktreeLookup::Unknown`], not a `NotFound`. The answer
+/// comes from parsing stdout, so a failed exit leaves no listing to parse
+/// rather than an empty one.
 pub(crate) async fn find_worktree_for_branch(
     repo_root: &Path,
     branch_name: &str,
-) -> Option<PathBuf> {
+) -> WorktreeLookup {
     let output = match git_cmd(&["worktree", "list", "--porcelain"], repo_root).await {
         Ok(o) => o,
         Err(e) => {
@@ -80,7 +105,7 @@ pub(crate) async fn find_worktree_for_branch(
                 repo_root.display(),
                 e
             );
-            return None;
+            return WorktreeLookup::Unknown;
         }
     };
     if !output.status.success() {
@@ -89,9 +114,12 @@ pub(crate) async fn find_worktree_for_branch(
             repo_root.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
-        return None;
+        return WorktreeLookup::Unknown;
     }
-    parse_worktree_list(&String::from_utf8_lossy(&output.stdout)).remove(branch_name)
+    match parse_worktree_list(&String::from_utf8_lossy(&output.stdout)).remove(branch_name) {
+        Some(path) => WorktreeLookup::Found(path),
+        None => WorktreeLookup::NotFound,
+    }
 }
 
 /// Resolve the main working tree starting from the runtime repo root.

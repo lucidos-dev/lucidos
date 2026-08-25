@@ -811,3 +811,179 @@ fn read_text_from_zip_missing_entry_errors() {
         err
     );
 }
+
+// --- edit_file: the replacement count, and the repo target ---
+
+/// The silent partial edit this count exists to expose: without `replace_all`
+/// the file keeps three of its four occurrences, and the old result said only
+/// "UPDATED".
+#[test]
+fn a_partial_text_edit_reports_both_counts_and_names_replace_all() {
+    let content = "a\nfoo\nb\nfoo\nc\nfoo\nd\nfoo\n";
+    let (out, outcome) = apply_text_edit(content, "foo", "bar", false, "x.md").unwrap();
+
+    assert_eq!(out, "a\nbar\nb\nfoo\nc\nfoo\nd\nfoo\n");
+    assert_eq!(out.matches("bar").count(), 1);
+    assert_eq!(out.matches("foo").count(), 3);
+
+    let msg = FileEditResult {
+        path: "x.md".to_string(),
+        outcome,
+        target: EditTarget::Workspace {
+            commit: "abc1234".to_string(),
+        },
+    }
+    .tool_message();
+    assert!(msg.contains("1 of 4 occurrences replaced"), "got: {msg}");
+    assert!(msg.contains("replace_all"), "got: {msg}");
+}
+
+#[test]
+fn replace_all_reports_every_occurrence_and_never_mentions_the_flag() {
+    let content = "foo foo foo foo";
+    let (out, outcome) = apply_text_edit(content, "foo", "bar", true, "x.md").unwrap();
+
+    assert_eq!(out, "bar bar bar bar");
+    let msg = FileEditResult {
+        path: "x.md".to_string(),
+        outcome,
+        target: EditTarget::Workspace {
+            commit: "abc1234".to_string(),
+        },
+    }
+    .tool_message();
+    assert!(msg.contains("4 of 4 occurrences replaced"), "got: {msg}");
+    assert!(
+        !msg.contains("replace_all"),
+        "nothing was left behind, so the hint is noise: {msg}"
+    );
+}
+
+#[test]
+fn a_single_occurrence_reports_one_of_one() {
+    let (_, outcome) = apply_text_edit("only once here", "once", "twice", false, "x.md").unwrap();
+    let msg = FileEditResult {
+        path: "x.md".to_string(),
+        outcome,
+        target: EditTarget::Workspace {
+            commit: "abc1234".to_string(),
+        },
+    }
+    .tool_message();
+    assert!(msg.contains("1 of 1 occurrences replaced"), "got: {msg}");
+}
+
+/// The counts describe the write, so they have to be derived from the content
+/// the edit actually produced, not from the caller's intent.
+#[test]
+fn the_reported_counts_match_the_written_content() {
+    for (content, replace_all, expect_replaced, expect_found) in [
+        ("x x x", false, 1, 3),
+        ("x x x", true, 3, 3),
+        ("x", false, 1, 1),
+    ] {
+        let (out, outcome) = apply_text_edit(content, "x", "y", replace_all, "f").unwrap();
+        let EditOutcome::Text {
+            replaced,
+            occurrences,
+        } = outcome
+        else {
+            panic!("text mode must produce a text outcome");
+        };
+        assert_eq!(replaced, expect_replaced, "{content:?}");
+        assert_eq!(occurrences, expect_found, "{content:?}");
+        assert_eq!(out.matches('y').count(), replaced, "{content:?}");
+        assert_eq!(out.matches('x').count(), occurrences - replaced);
+    }
+}
+
+#[test]
+fn json_mode_reports_no_occurrence_count() {
+    let msg = FileEditResult {
+        path: "artifacts/x.json".to_string(),
+        outcome: EditOutcome::JsonValueSet,
+        target: EditTarget::Workspace {
+            commit: "abc1234".to_string(),
+        },
+    }
+    .tool_message();
+    assert_eq!(
+        msg,
+        "[ACTION COMPLETED] UPDATED: artifacts/x.json (commit: abc1234)"
+    );
+}
+
+#[test]
+fn a_missing_old_string_still_errors_by_its_recognised_phrase() {
+    // The dispatch keys its "here is the current content" recovery arm off
+    // this exact substring.
+    let err = apply_text_edit("nothing here", "absent", "x", false, "x.md").unwrap_err();
+    assert!(err.contains("old_string not found"), "got: {err}");
+}
+
+/// A repo edit's result must not look like a committed one. It carries no sha,
+/// and it says where the change is instead.
+#[test]
+fn a_repo_edit_result_says_uncommitted_and_carries_no_sha() {
+    let msg = FileEditResult {
+        path: "Lucidos/src/main.rs".to_string(),
+        outcome: EditOutcome::Text {
+            replaced: 2,
+            occurrences: 2,
+        },
+        target: EditTarget::RepoWorkingTree,
+    }
+    .tool_message();
+
+    assert!(msg.contains("Lucidos/src/main.rs"), "got: {msg}");
+    assert!(msg.contains("2 of 2 occurrences replaced"), "got: {msg}");
+    assert!(msg.contains("NOT committed"), "got: {msg}");
+    assert!(msg.contains("git diff"), "got: {msg}");
+    assert!(!msg.contains("commit:"), "no sha may appear: {msg}");
+}
+
+#[test]
+fn commit_pairing_accepts_only_the_two_honest_combinations() {
+    // A data/ edit commits, and says nothing about it.
+    assert!(check_commit_pairing(false, None).is_ok());
+    // A repo edit states that it does not.
+    assert!(check_commit_pairing(true, Some(false)).is_ok());
+}
+
+#[test]
+fn commit_pairing_refuses_a_repo_edit_that_would_commit() {
+    let err = check_commit_pairing(true, Some(true)).unwrap_err();
+    assert!(err.contains("never committed"), "got: {err}");
+    assert!(err.contains("run_coding_agent"), "got: {err}");
+}
+
+#[test]
+fn commit_pairing_refuses_a_repo_edit_that_stays_silent() {
+    let err = check_commit_pairing(true, None).unwrap_err();
+    assert!(err.contains("commit: false"), "got: {err}");
+}
+
+/// `commit: false` on a `data/` path would mean an uncommitted workspace write,
+/// which is exactly the contract ADR 0051 refused to break.
+#[test]
+fn commit_pairing_refuses_an_uncommitted_workspace_write() {
+    let err = check_commit_pairing(false, Some(false)).unwrap_err();
+    assert!(err.contains("needs `repo`"), "got: {err}");
+    assert!(err.contains("run_python"), "got: {err}");
+}
+
+/// An empty `old_string` matches at every character boundary in Rust, so a
+/// replace would interleave the replacement through the whole file. Against a
+/// registered repository that write is uncommitted, so there is nothing to
+/// recover from.
+#[test]
+fn an_empty_old_string_is_refused_rather_than_matching_everywhere() {
+    for (new, replace_all) in [("x", true), ("x", false), ("", false)] {
+        let err = apply_text_edit("ab", "", new, replace_all, "x.md").unwrap_err();
+        assert!(err.contains("old_string is empty"), "got: {err}");
+        assert!(
+            err.contains("write_file"),
+            "the refusal names a route: {err}"
+        );
+    }
+}

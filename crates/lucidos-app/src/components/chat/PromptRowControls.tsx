@@ -1,10 +1,10 @@
 import type { CodingAgent } from '../../api/types';
 import { FollowLiveEdgeIcon } from '../shared/icons';
 import { CodingAgentControlMenu } from './CodingAgentControlMenu';
-import { EventWaitIndicator } from './EventWaitPanel';
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
 import { TodoListIndicator } from './TodoListPanel';
+import { WaitingIndicator } from './WaitingPanel';
 
 /** The leading control cluster of `.prompt-actions-row`: whichever backend's
  *  control menu the focused thread resolves to, the follow toggle, and the
@@ -18,7 +18,7 @@ import { TodoListIndicator } from './TodoListPanel';
  *  Lucidos Agent thread, second on a coding-agent one, and fourth while a
  *  subscription was armed, so the button moved under the thumb depending on
  *  what the thread happened to be doing. Everything below this pair is
- *  conditional by nature (a todo list, an armed *event wait*), so it floats
+ *  conditional by nature (a todo list, a wait), so it floats
  *  behind the fixed pair rather than displacing it. A new control goes AFTER
  *  the follow toggle, never between it and the menu.
  *
@@ -49,10 +49,11 @@ import { TodoListIndicator } from './TodoListPanel';
  *  backend-specific.** The control menu obviously is. `TodoListIndicator` is
  *  too, and it is the reason the branch exists at all: `TodoListWritten` is the
  *  Lucidos Agent's own todo list, so a coding-agent thread has none to show.
- *  The *subscription indicator* is NOT, and it sits outside the branch for the
+ *  The *waiting indicator* is NOT, and it sits outside the branch for the
  *  same reason `await_event` has a CLI mirror: an *event wait* belongs to the
  *  thread, and both agents arm them (`system-knowhow/glossary.md` §§ "Event
- *  wait", "Subscription indicator"; ADR 0052 item 3).
+ *  wait", "Waiting indicator"; ADR 0052 item 3). Sub-threads, its other half,
+ *  are no more backend-specific than that.
  *
  *  It used to live inside the Lucidos arm, and that hid it from exactly the
  *  threads that use it most. `.claude/skills/e2e-lock-wait/SKILL.md` exists to
@@ -106,7 +107,7 @@ export function PromptRowControls({
         <FollowLiveEdgeIcon />
       </button>
       {codingAgent === null && <TodoListIndicator />}
-      <EventWaitIndicator />
+      <WaitingIndicator />
     </>
   );
 }

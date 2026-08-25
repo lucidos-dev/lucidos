@@ -412,9 +412,10 @@ async fn sequential_apply_two_changes_succeeds() {
 
     // Both applies below put files into the shared workspace working tree,
     // which the command-checkpoint test snapshots whole; see
-    // `workspace_tree_lock`. Held across the pair, since the point here is that
-    // the SECOND apply follows the first on a clean tree.
-    let _tree = crate::support::workspace_tree_lock().read().await;
+    // `workspace_tree_lock`. A WRITE guard, held across the pair. The point
+    // here is that the SECOND apply follows the first on a clean tree. A read
+    // guard leaves other writers free to dirty it under both.
+    let _tree = crate::support::workspace_tree_lock().write().await;
 
     // Apply change 1
     let url1 = format!("{}/api/v1/changes/{}/apply", base_url(), change1_id);

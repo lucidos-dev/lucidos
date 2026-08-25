@@ -106,6 +106,11 @@ const MIRRORING_TIMERS: Array<{ file: string; expr: RegExp; what: string }> = [
     expr: /scaledDurationMs\(COVER_FADE_MS\) \+ COVER_FADE_SLACK_MS/,
     what: "keeps the app frame's load cover mounted through its fade",
   },
+  {
+    file: '../../components/chat/PromptInput.tsx',
+    expr: /scaledDurationMs\(TOGGLES_FADE_MS\) \+ TOGGLES_FADE_SLACK_MS/,
+    what: 'keeps the compose-destination row mounted through its fade-out',
+  },
 ];
 
 describe('timers that mirror a CSS duration', () => {

@@ -3,6 +3,7 @@ pub(crate) mod bash;
 pub(crate) mod bash_background;
 mod browser;
 mod bulk_limits;
+mod capabilities;
 pub(crate) mod credentials;
 mod email;
 mod env_vars;
@@ -19,11 +20,14 @@ pub(crate) mod plugins;
 mod preferences;
 mod proxy;
 mod python;
+pub(crate) mod repo_files;
 mod repositories;
 pub(crate) mod scheduler;
 pub(crate) mod search;
 pub(crate) mod todo;
 mod web;
+
+pub(crate) use capabilities::TurnCapabilities;
 
 use super::LucidosEngine;
 use crate::engine::thread_lifecycle::ThreadStatus;
@@ -235,8 +239,9 @@ impl LucidosEngine {
                 self.execute_notifications(name, args).await
             }
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
-            tn::QUERY_EVENTS => self.execute_query_events(args).await,
+            tn::QUERY_EVENTS => self.execute_query_events(args, thread_id).await,
             tn::COUNT_EVENTS => self.execute_count_events(args).await,
+            tn::LIST_EVENT_TYPES => self.execute_list_event_types().await,
             tn::FOLLOW_UP_CHILD_THREAD => {
                 self.execute_follow_up_child_thread(args, thread_id).await
             }
@@ -250,7 +255,6 @@ impl LucidosEngine {
                 self.execute_update_thread_queue_policy(args, thread_id)
                     .await
             }
-            tn::DISMISS_FROM_CONTEXT => self.execute_dismiss_from_context(args, thread_id).await,
             tn::TODO_WRITE => self.execute_todo_write(args, thread_id).await,
             tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args, thread_id).await,
             tn::INSTALL_PLUGIN
@@ -423,7 +427,7 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        use crate::scheduler::notifications::Tap;
+        use crate::scheduler::notifications::{default_tap, Tap};
 
         let title = match args.get("title").and_then(|v| v.as_str()) {
             Some(t) if !t.is_empty() => t,
@@ -445,20 +449,40 @@ impl LucidosEngine {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        // Treat missing / null / empty-string the same way: default to Modal.
-        // Some LLM providers emit `"tap": null` or `"tap": ""` for unset
-        // optionals; both should land on the safe modal default rather than
-        // surface a deserialize error to the LLM. The structured `{kind, to?}`
-        // object is the only accepted positive shape — `Tap::Deserialize`
-        // strictly rejects the legacy bare-string form ("modal" / "open_app" /
-        // "open_thread" / "none") and the LLM is documented against the
-        // structured shape.
+        // Optional event_id deep-link target. The LLM passes the row id of the
+        // event the user should jump straight to (e.g. the UserQuestionAsked
+        // from the triggering event payload). Validated as a UUID; empty, null
+        // and missing all mean "no event anchor".
+        let link_event: Option<uuid::Uuid> =
+            crate::api::parse_optional_uuid_trimmed(args.get("event_id").and_then(|v| v.as_str()))
+                .map_err(|raw| format!("Error: event_id is not a valid UUID: {}", raw))?;
+
+        // When this trigger fired in response to a thread-scoped event (e.g.
+        // `UserQuestionAsked`), the originating thread lives in a task-local
+        // set by `handle_domain_event`. Prefer it as the deep-link target.
+        // Otherwise the push would point at the trigger LLM's own thread, which
+        // the user has no reason to open.
+        let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID
+            .try_with(|t| *t)
+            .unwrap_or(thread_id);
+
+        // Missing, null and empty-string all mean the same thing: use
+        // `default_tap`. It navigates to the source event when this
+        // notification names one, and opens the card otherwise. Some LLM
+        // providers emit `"tap": null` or `"tap": ""` for an unset optional, so
+        // both take that default rather than erroring. The structured
+        // `{kind, to?}` object is the only accepted positive shape.
+        // `Tap::Deserialize` strictly rejects the legacy bare-string form
+        // ("modal" / "open_app" / "open_thread" / "none"), and the LLM is
+        // documented against the structured shape.
         let tap: Tap = match args.get("tap") {
-            None | Some(serde_json::Value::Null) => Tap::Modal,
-            Some(serde_json::Value::String(s)) if s.is_empty() => Tap::Modal,
+            None | Some(serde_json::Value::Null) => default_tap(Some(link_thread), link_event),
+            Some(serde_json::Value::String(s)) if s.is_empty() => {
+                default_tap(Some(link_thread), link_event)
+            }
             Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
                 format!(
-                    "Error: invalid tap {} — expected an object like \
+                    "Error: invalid tap {}: expected an object like \
                      {{\"kind\":\"modal\"}} or \
                      {{\"kind\":\"navigate\",\"to\":{{\"target\":\"app\",\"app_id\":\"...\"}}}}. \
                      Parse error: {}",
@@ -466,23 +490,6 @@ impl LucidosEngine {
                 )
             })?,
         };
-
-        // Optional event_id deep-link target — the LLM passes the row id of
-        // the event the user should jump straight to (e.g. the
-        // UserQuestionAsked from the triggering event payload). Validated as
-        // a UUID; empty/null/missing all mean "no event anchor".
-        let link_event: Option<uuid::Uuid> =
-            crate::api::parse_optional_uuid_trimmed(args.get("event_id").and_then(|v| v.as_str()))
-                .map_err(|raw| format!("Error: event_id is not a valid UUID: {}", raw))?;
-
-        // When this trigger fired in response to a thread-scoped event (e.g.
-        // `UserQuestionAsked`), the originating thread lives in a task-local
-        // set by `handle_domain_event`. Prefer it as the deep-link target —
-        // otherwise the push would point at the trigger LLM's own thread,
-        // which the user has no reason to open.
-        let link_thread = crate::scheduler::user_tasks::ORIGIN_THREAD_ID
-            .try_with(|t| *t)
-            .unwrap_or(thread_id);
 
         match self
             .create_notification(
@@ -603,25 +610,10 @@ impl LucidosEngine {
         }
     }
 
-    /// Drop a prior `ToolCalled` (and its matching `ToolResult`) or
-    /// `ChildThreadCompleted` from the agent's future resume context. Emits a
-    /// `ContextDismissed` event the resume helper honours on every subsequent
-    /// assembly. Validates that the referenced event exists in *this* thread
-    /// and is one of the dismissible event types — cross-thread dismissals
-    /// would let one agent prune another's history, and dismissing arbitrary
-    /// events (e.g. ResponseGenerated) would corrupt history rendering.
-    async fn execute_dismiss_from_context(
-        &self,
-        args: &serde_json::Value,
-        thread_id: uuid::Uuid,
-    ) -> ToolOutcome {
-        dismiss_from_context_impl(&self.pool, &self.event_bus, args, thread_id).await
-    }
-
     /// Thin wrapper over [`repositories::manage_repositories_impl`], which owns
     /// the add/list/remove branches plus their `Repository{Added,Removed}`
-    /// emits. Same split as `execute_dismiss_from_context`: the free function
-    /// takes the pool + bus so tests can drive it without booting the engine.
+    /// emits. Same split as [`query_events_impl`]: the free function takes the
+    /// pool + bus so tests can drive it without booting the engine.
     async fn execute_manage_repositories(
         &self,
         args: &serde_json::Value,
@@ -630,58 +622,18 @@ impl LucidosEngine {
         repositories::manage_repositories_impl(&self.pool, &self.event_bus, args, thread_id).await
     }
 
-    async fn execute_query_events(&self, args: &serde_json::Value) -> ToolOutcome {
-        let event_type = args.get("event_type").and_then(|v| v.as_str());
-        let since = parse_time_filter(args, "since")?;
-        let until = parse_time_filter(args, "until")?;
-        let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
-        let byte_limit =
-            QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
-        // Refused rather than ignored. This is the read half of "we talked
-        // about this": the model finds a thread with `threads` 'search' and
-        // asks for its messages here, so silently widening a malformed id to
-        // EVERY thread would hand it another conversation entirely and it
-        // would have no way to tell.
-        // Matched on the VALUE, not on `as_str()`. Filtering to strings first
-        // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
-        // arm, which widens the query to every thread: silently the wrong
-        // conversation, which is the failure this refusal exists to prevent.
-        let thread_id = match args.get("thread_id") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(serde_json::Value::String(raw)) => match uuid::Uuid::parse_str(raw.trim()) {
-                Ok(id) => Some(id),
-                Err(_) => {
-                    return Err(format!(
-                        "Error: thread_id '{raw}' is not a uuid. Copy it from the \
-                         `threads` tool's 'search' or 'list' result."
-                    ))
-                }
-            },
-            Some(other) => {
-                return Err(format!(
-                    "Error: thread_id must be a uuid string, got {other}. Copy it from \
-                     the `threads` tool's 'search' or 'list' result."
-                ))
-            }
-        };
-
-        match self
-            .event_store
-            .query_events(
-                crate::core::store::EventQueryFilters {
-                    event_type,
-                    since,
-                    until,
-                    thread_id,
-                    ..Default::default()
-                },
-                limit,
-            )
-            .await
-        {
-            Ok(events) => Ok(build_query_events_response(&events, byte_limit)),
-            Err(e) => Err(format!("Error: failed to query events: {}", e)),
-        }
+    /// Thin wrapper over [`query_events_impl`], which owns the arg parsing and
+    /// the dereference branch. The free function takes the store, so tests can
+    /// drive every refusal against a real Postgres without booting the engine.
+    ///
+    /// `thread_id` is the caller's own, ambient from `execute_tool`. It resolves
+    /// the `current` alias, and the model cannot set it.
+    async fn execute_query_events(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        query_events_impl(&self.event_store, args, thread_id).await
     }
 
     /// LLM tool: per-`event_type` count + byte total over the same time
@@ -728,6 +680,34 @@ impl LucidosEngine {
                 Err(e) => Err(format!("Error: failed to count events: {}", e)),
             }
         }
+    }
+
+    /// LLM tool: the event names this workspace can subscribe to.
+    ///
+    /// **The answer the refusals point at.** `engine` is a closed set, checked
+    /// hard: a name that merely resembles one of these is refused with a
+    /// suggestion. `workspace` is open, holding this workspace's own domain
+    /// events. A name in neither list is accepted with a warning.
+    ///
+    /// Drawn from the trigger surface, the wider of the two, so it names the
+    /// one family a wait may not watch.
+    async fn execute_list_event_types(&self) -> ToolOutcome {
+        use crate::core::event_subscription::{event_type_catalog, SubscriptionSurface};
+        let catalog = event_type_catalog(&self.event_store, SubscriptionSurface::Trigger)
+            .await
+            .map_err(|e| format!("Error: {e}"))?;
+        Ok(serde_json::json!({
+            "engine": catalog.engine,
+            "workspace": catalog.workspace,
+            "retired": crate::engine::thread_events::ThreadEvent::LEGACY_TYPE_NAME_ALIASES,
+            "note": "Subscribe by exact name. 'engine' is closed, so a near miss on one \
+                     is refused rather than armed. 'workspace' holds this workspace's own \
+                     domain events; a name in neither list is accepted, with a warning, \
+                     for a domain event you are about to start emitting. 'retired' names \
+                     still read back in history but nothing emits them again. A wait \
+                     cannot watch the EventWait* family, a trigger can.",
+        })
+        .to_string())
     }
 
     /// LLM tool: redirect a child thread this thread already spawned.
@@ -1087,7 +1067,7 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
 
 /// Parse the required `change_id` UUID arg for the `apply_change` tool. Pure
 /// so the validation branches are unit-testable without booting an engine
-/// (same pattern as `dismiss_from_context_impl`). Missing / null / empty /
+/// (same pattern as `query_events_impl`). Missing / null / empty /
 /// whitespace-only all collapse to "required"; a non-UUID string is rejected
 /// before the heavyweight merge pipeline runs.
 pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
@@ -1375,85 +1355,147 @@ fn split_csv(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Validation core for the `dismiss_from_context` tool, factored out of the
-/// `LucidosEngine` impl so unit tests can exercise the parsing / event-type /
-/// thread-scope branches against a real Postgres pool without booting the
-/// full engine. The handler on `LucidosEngine` is now a thin wrapper.
+/// One refusal for a malformed event address, shared by every tool that takes
+/// one. It names where the agent saw the address, because the commonest cause
+/// is a paraphrase rather than a copy.
+fn bad_event_address(got: impl std::fmt::Display) -> String {
+    format!(
+        "event_id '{got}' is not an event address. Pass the `evt-<32 hex>` \
+         form a tool result states, or a bare uuid."
+    )
+}
+
+/// What the model writes for "the thread I am in", instead of an id it has to
+/// go and look up. Matched case-insensitively, after a trim.
 ///
-/// Accepts the event_id as either:
-/// - bare UUID (hyphenated `xxxxxxxx-xxxx-...` or simple `xxxxxxxx...`), or
-/// - the `evt-<uuid>` form rendered as `tool_use_id` in resumed tool blocks
-///   (see [`synthesize_tool_use_id`](crate::core::store::messages)).
-pub(crate) async fn dismiss_from_context_impl(
-    pool: &sqlx::PgPool,
-    event_bus: &crate::engine::event_bus::EventBus,
+/// The LLM tool is the only surface that takes them. `/api/v1/events/query` and
+/// the SDK have no ambient caller to resolve, and an alias there would name
+/// whichever thread the engine happened to be serving.
+const CURRENT_THREAD_ALIASES: [&str; 2] = ["current", "this"];
+
+/// Read core for the `events` tool's `query` action. Factored out of the
+/// `LucidosEngine` impl so unit tests can drive every refusal branch against
+/// a real Postgres pool without booting the full engine.
+///
+/// `caller_thread_id` is the thread the tool call runs in, ambient from
+/// `execute_tool`. It is what the `current` alias resolves to, so the model
+/// cannot point the alias at somebody else's conversation.
+pub(crate) async fn query_events_impl(
+    event_store: &crate::core::store::EventStore,
     args: &serde_json::Value,
-    thread_id: uuid::Uuid,
+    caller_thread_id: uuid::Uuid,
 ) -> ToolOutcome {
-    // Errors flow through the typed `Err` arm — the agentic loop persists
-    // ToolResult.success from the Result tag, not from a string prefix.
-    let event_id_str = match args.get("event_id").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => return Err("Error: event_id is required".to_string()),
-    };
-    // Accept the `evt-<uuid>` form the LLM sees as tool_use_id in resumed
-    // tool blocks; `Uuid::parse_str` then handles either hyphenated or
-    // simple-form UUID after the prefix is stripped.
-    let stripped = event_id_str.strip_prefix("evt-").unwrap_or(event_id_str);
-    let event_id = match uuid::Uuid::parse_str(stripped) {
-        Ok(u) => u,
-        Err(_) => {
-            return Err(
-                "Error: event_id must be a UUID (or 'evt-<uuid>' as shown in tool blocks)"
-                    .to_string(),
-            );
+    let event_type = args.get("event_type").and_then(|v| v.as_str());
+    let since = parse_time_filter(args, "since")?;
+    let until = parse_time_filter(args, "until")?;
+    let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
+    let byte_limit =
+        QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
+    // Refused rather than ignored. This is the read half of "we talked
+    // about this": the model finds a thread with `threads` 'search', then
+    // asks for its messages here. Silently widening a malformed id to EVERY
+    // thread would hand it another conversation, with no way to tell.
+    // Matched on the VALUE, not on `as_str()`. Filtering to strings first
+    // would send a `thread_id` of `["<uuid>"]` or `{...}` down the absent
+    // arm, which widens the query to every thread.
+    // The alias is the one string that is not an id, and it resolves to the
+    // caller's own thread. Anything else still has to parse as a uuid.
+    let thread_id = match args.get("thread_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            let raw = raw.trim();
+            if CURRENT_THREAD_ALIASES
+                .iter()
+                .any(|alias| raw.eq_ignore_ascii_case(alias))
+            {
+                Some(caller_thread_id)
+            } else {
+                match uuid::Uuid::parse_str(raw) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return Err(format!(
+                            "Error: thread_id '{raw}' is not a uuid. Pass 'current' for \
+                             this thread. For another thread, copy its id from the \
+                             `threads` tool's 'search' or 'list' result."
+                        ))
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "Error: thread_id must be a uuid string or 'current', got {other}. Pass \
+                 'current' for this thread. For another thread, copy its id from the \
+                 `threads` tool's 'search' or 'list' result."
+            ))
         }
     };
-    // Lookup must scope to (event_id, thread_id) AND restrict event_type
-    // to the dismissible set — otherwise a typo or hallucinated id silently
-    // succeeds, leaving phantom ContextDismissed rows the resume helper
-    // would happily honour.
-    let row: Option<(String,)> = match sqlx::query_as(
-        "SELECT event_type FROM events \
-         WHERE id = $1 AND aggregate_id = $2 \
-         AND event_type IN ('ToolCalled', 'ChildThreadCompleted')",
-    )
-    .bind(event_id)
-    .bind(thread_id.to_string())
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(opt) => opt,
-        Err(e) => {
-            crate::log!(
-                "[DismissFromContext] DB lookup failed for thread={} event={}: {}",
+
+    // Dereference half of a noted pointer (ADR 0085). Matched on the VALUE
+    // for the same reason `thread_id` is. A non-string is a malformed
+    // address. Reading it as absent would silently turn a lookup of one
+    // named row into a newest-first window over everything.
+    let event_id = match args.get("event_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            match crate::core::store::parse_event_address(raw) {
+                Some(id) => Some(id),
+                None => return Err(format!("Error: {}", bad_event_address(raw))),
+            }
+        }
+        Some(other) => return Err(format!("Error: {}", bad_event_address(other))),
+    };
+
+    let mut events = event_store
+        .query_events(
+            crate::core::store::EventQueryFilters {
+                event_type,
+                since,
+                until,
                 thread_id,
                 event_id,
-                e
-            );
-            return Err(format!("Error: failed to look up event: {}", e));
-        }
-    };
-    if row.is_none() {
-        return Err("Error: event id not found or not dismissible".to_string());
+                ..Default::default()
+            },
+            limit,
+        )
+        .await
+        .map_err(|e| format!("Error: failed to query events: {}", e))?;
+
+    // A dereference that resolves to nothing is a failure, not an empty
+    // window. Said plainly, so a mistyped or hallucinated address never
+    // reads to the agent as "that event no longer exists".
+    if let Some(id) = event_id.filter(|_| events.is_empty()) {
+        return Err(format!(
+            "Error: no event has id {id}. Check the address, and drop any \
+             other filter that could exclude it (event_type, thread_id, \
+             since, until)."
+        ));
     }
 
-    if let Err(e) = event_bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event: crate::engine::thread_events::ThreadEvent::ContextDismissed {
-                dismissed_event_id: event_id,
-            },
-            meta: crate::engine::thread_events::EventMeta::NONE,
-        })
-        .await
-    {
-        return Err(format!("Error: failed to emit ContextDismissed: {}", e));
+    // Dereferencing a tool call returns the PAIR, call then result.
+    //
+    // The address names the call, because that is the form the panel
+    // prints and resumed blocks carry. What the boundary
+    // dropped, though, is the result. The arguments alone resolve the pointer
+    // to the half the agent still remembers. Nothing on this surface gets from
+    // a call id to its result either, since there is no payload filter. That
+    // is a recovery tool that does not recover, which ADR 0085 Decision 5
+    // rules out.
+    if let Some(call) = events.first().filter(|_| event_id.is_some()) {
+        if call.event_type == "ToolCalled" {
+            match event_store
+                .tool_result_for_call(call.id, call.thread_id)
+                .await
+            {
+                // An orphan call has no result to add. Returning the call
+                // alone is the honest answer, not an error.
+                Ok(None) => {}
+                Ok(Some(result)) => events.push(result),
+                Err(e) => return Err(format!("Error: failed to read the tool result: {}", e)),
+            }
+        }
     }
-    Ok(format!(
-        "Dismissed event {} from future resume context.",
-        event_id
-    ))
+    Ok(build_query_events_response(&events, byte_limit))
 }
 
 #[cfg(test)]

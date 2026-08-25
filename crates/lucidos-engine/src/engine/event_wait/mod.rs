@@ -137,7 +137,7 @@ impl LiveWaits {
         }
     }
 
-    /// Every live wait for one thread, for the subscription indicator and for
+    /// Every live wait for one thread, for the waiting indicator and for
     /// the cancel-on-archive sweep.
     pub async fn for_thread(&self, thread_id: Uuid) -> Vec<LiveWait> {
         self.inner
@@ -187,7 +187,7 @@ pub fn waits_matching_row(waits: &[LiveWait], row: &crate::core::EventRow) -> Ve
     waits_matching(
         waits,
         &row.event_type,
-        &matchable_payload(row.payload.clone(), row.thread_id),
+        &matchable_payload(&row.event_type, row.payload.clone(), row.thread_id),
     )
 }
 
@@ -381,7 +381,7 @@ pub async fn catch_up_from_watermark(
         for (id, event_type, payload, thread_id, _) in rows {
             // The same view the live dispatcher matched against, so a wait that
             // would have matched live matches on replay too.
-            let payload = matchable_payload(payload, thread_id);
+            let payload = matchable_payload(&event_type, payload, thread_id);
             if let Some(idx) = wait.matched_index(&event_type, &payload) {
                 return Ok(Some((id, event_type, payload, idx)));
             }
@@ -508,7 +508,7 @@ pub async fn arming_lookback_matches(
             // as that view. The injected `thread_id` tells the model which
             // thread the match belongs to, which is what it needs to scope the
             // wait it arms next.
-            let payload = matchable_payload(payload, thread_id);
+            let payload = matchable_payload(&event_type, payload, thread_id);
             if !already_delivered.contains(&id)
                 && EventSubscription::any_matches(on, &event_type, &payload)
             {
@@ -533,33 +533,6 @@ pub async fn arming_lookback_matches(
         matches: found,
         more,
     })
-}
-
-/// Has this wait already been resolved?
-///
-/// The same predicate `LIVE_WAITS_SQL`'s `NOT EXISTS` encodes, asked of one
-/// wait. Used where a caller has taken a wait out of the cache and has to
-/// decide whether putting it back is safe: a resolution that landed meanwhile
-/// (a cancel racing a detach) must not be undone.
-pub async fn wait_is_resolved(
-    pool: &sqlx::PgPool,
-    wait: &LiveWait,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let resolved: bool = sqlx::query_scalar(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM events r \
-             WHERE r.aggregate = 'thread' \
-               AND r.aggregate_id = $1 \
-               AND r.event_type IN \
-                   ('EventWaitDelivered','EventWaitExpired','EventWaitCanceled') \
-               AND r.payload->>'wait_id' = $2 \
-         )",
-    )
-    .bind(wait.thread_id.to_string())
-    .bind(wait.wait_id.to_string())
-    .fetch_one(pool)
-    .await?;
-    Ok(resolved)
 }
 
 use crate::llm::tool_names::AWAIT_EVENT;
@@ -870,7 +843,7 @@ async fn emit_persisted_with(
     let emitted = bus
         .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id,
-            event: event.clone(),
+            event,
             meta,
         })
         .await?;
@@ -957,6 +930,48 @@ pub async fn lost_wait_reentries(
             })
         })
         .collect())
+}
+
+/// Has a wait on `thread_id` already been delivered by one of `event_ids`?
+///
+/// The persisted half of the child-completion stand-down gate
+/// (`LucidosEngine::child_completion_has_an_event_wait`), which is where the
+/// two ids it is asked about, and the fail-open policy, are explained. A free
+/// function over the pool so a test can seed a delivery and ask, without
+/// standing up an engine.
+///
+/// An unreadable answer is `false`: the caller then wakes the thread, which
+/// costs a duplicate turn rather than silence.
+pub async fn wait_delivery_names_any(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    event_ids: &[String],
+) -> bool {
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM events d \
+             WHERE d.aggregate = 'thread' \
+               AND d.aggregate_id = $1 \
+               AND d.event_type = 'EventWaitDelivered' \
+               AND d.payload->>'event_id' = ANY($2) \
+         )",
+    )
+    .bind(thread_id.to_string())
+    .bind(event_ids)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(delivered) => delivered,
+        Err(e) => {
+            crate::log!(
+                "[EventWait] Delivery probe failed for thread {}: {}. Answering no, \
+                 so the caller wakes the thread",
+                thread_id,
+                e
+            );
+            false
+        }
+    }
 }
 
 /// One-off boot sweep for threads caught mid-**attached** wait by the upgrade

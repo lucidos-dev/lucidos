@@ -57,8 +57,11 @@ use super::{
     is_awaitable_event, rebuild_live_waits, waits_matching, CancelWaitOutcome, LiveWait,
     ResolutionEmitError, WaitReentry, WaitReentryRequest, DEADLINE_SWEEP_INTERVAL,
 };
-use crate::core::event_subscription::matchable_thread_payload;
-use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+use crate::core::event_subscription::{
+    is_subscribable_system_event, matchable_system_payload, matchable_thread_payload,
+    validate_subscribable_event_type, SubscriptionSurface, SubscriptionVerdict,
+};
+use crate::engine::event_bus::{BusEvent, EmittedEvent};
 use crate::engine::thread_events::{ActorMode, EventMeta, EventWaitCancelCause};
 use crate::engine::{LucidosEngine, PreEmittedOrigin};
 
@@ -189,10 +192,11 @@ impl LucidosEngine {
 
     /// Offer one bus event to every live wait, resolving the ones it matches.
     ///
-    /// Covers the same two carriers as the trigger matcher: non-streaming
-    /// `BusEvent::Thread`, and `SystemEvent::DomainEvent` (a workspace's own
-    /// `emit_event`). Awaiting a `ReleasePublished` is a first-class case, not
-    /// an afterthought.
+    /// Covers the same three carriers as the trigger matcher: non-streaming
+    /// `BusEvent::Thread`, `SystemEvent::DomainEvent` (a workspace's own
+    /// `emit_event`), and any persisted `SystemEvent`. Awaiting a
+    /// `ReleasePublished` or a `BackupCompleted` is a first-class case, not an
+    /// afterthought.
     ///
     /// Declines outright during a teardown (mechanism 5 in the module doc): the
     /// events an engine emits on its way down are exactly the ones a wait is
@@ -236,15 +240,21 @@ impl LucidosEngine {
                     matchable_thread_payload(event, *thread_id),
                 )
             }
-            // A domain event belongs to no thread (`SystemEvent::DomainEvent`
-            // carries none, and its row's `thread_id` column is NULL), so it
-            // gets no injected id here either. Supplying one on this path alone
-            // is precisely the live-versus-replay split described above.
-            BusEvent::System(SystemEvent::DomainEvent {
-                event_type,
-                payload,
-                ..
-            }) => (event_type.clone(), payload.clone()),
+            // The system-side gate, shared with the trigger fan-out so the two
+            // offer the identical set (I8). It admits a workspace's own domain
+            // event and any persisted frame (ADR 0113): a `BackupCompleted` has
+            // no thread event and no domain event beside it, so this is the only
+            // path to it.
+            //
+            // No thread id is injected. A system frame belongs to no thread and
+            // its row's `thread_id` column is NULL, so supplying one here is
+            // precisely the live-versus-replay split described above.
+            // `matchable_system_payload` builds from `to_payload`, the function
+            // the row itself is written from, for the same reason.
+            BusEvent::System(se) if is_subscribable_system_event(se) => (
+                se.stored_event_type().to_string(),
+                matchable_system_payload(se),
+            ),
             _ => return,
         };
 
@@ -312,8 +322,18 @@ impl LucidosEngine {
         // registration confirms only that the subscription was accepted, and an
         // unknown name is accepted on purpose (it may be a domain event nobody
         // has emitted yet), so a typo stays invisible until its timeout.
+        //
+        // Only such a name can be a typo. A name the engine ships is real even
+        // where this workspace has emitted none, so the note would be wrong
+        // advice about a correct spelling.
         let mut never_seen = Vec::new();
         for sub in &wait.on {
+            if !matches!(
+                validate_subscribable_event_type(&sub.event_type, SubscriptionSurface::Wait),
+                Ok(SubscriptionVerdict::UnknownName)
+            ) {
+                continue;
+            }
             if !self.event_type_seen_before(&sub.event_type).await {
                 never_seen.push(sub.event_type.clone());
             }
@@ -476,30 +496,17 @@ impl LucidosEngine {
             )
             .await
         {
+            // A log line and nothing else. An ATTACHED resolution has already
+            // flipped the projection to `running`, so this turn MUST settle,
+            // and it does: the setup paths that used to return `Err` ahead of
+            // the loop's safety net now settle the exchange themselves. The
+            // terminator this site used to add carried no anchor, so the
+            // idempotency gate could not see it was a duplicate.
             crate::log!(
                 "[EventWait] Re-entry turn failed for thread {}: {}",
                 thread_id,
                 e
             );
-            // A terminator, not just a log line. An ATTACHED resolution has
-            // already flipped the projection to `running`, and several of this
-            // turn's setup paths return `Err` before `run_agentic_loop`'s own
-            // safety net exists, so logging alone leaves the thread spinning
-            // with no Continue affordance until the next restart's stale-settle
-            // sweep. Same handling as the structurally identical
-            // `child_follow_up` re-entry.
-            self.event_bus
-                .emit_or_log(
-                    BusEvent::Thread {
-                        thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
-                            error: e.to_string(),
-                        },
-                        meta: EventMeta::NONE,
-                    },
-                    "[EventWait] ResponseFailed after a failed re-entry turn",
-                )
-                .await;
         }
     }
 

@@ -2,13 +2,15 @@ import { apiUrl, requestVoid } from './_fetch';
 import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
 import {
-  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, THEME_BG,
+  DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
+  SYSTEM_THEME_SETTLE_MS, THEME_BG,
   fontFeaturesFor, parseUiScale, resolveFontKey, resolveTheme, resolveThemePreference,
-  type FontFamily,
+  type FontFamily, type ThemePref,
 } from './appearance';
 import { preferences as prefsModule } from './preferences';
 import { sse } from './sse';
 import { Select, enhanceSelects } from './select';
+import { disableTooltips } from './tooltip';
 import type { NavigateTarget, NavigateUi } from './notifications';
 
 /** Params for `lucidos.ui.navigate`: the `NavigateUi` payload minus `target`,
@@ -33,12 +35,35 @@ export function webFontUrl(fontKey: FontFamily): string | undefined {
 
 const loadedFonts = new Set<string>();
 let watchingPrefs = false;
+/** The theme PREFERENCE the last `applyPreferences()` settled on, which is what
+ *  says whether this frame follows the OS at all. `null` until the first run. */
+let lastThemePreference: ThemePref | null = null;
+let systemThemeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+/** Kept alive for as long as its listener must be. See `watchPreferences`. */
+let systemThemeQuery: MediaQueryList | null = null;
+
+/** Whether the OS is asking for light right now. */
+function osPrefersLight(): boolean {
+  return window.matchMedia('(prefers-color-scheme: light)').matches;
+}
+
+/** Which theme preference this frame is on.
+ *
+ *  Before the first `applyPreferences()` resolves, fall back to the precedence
+ *  the boot script already used. An app may call `watchPreferences()` first, or
+ *  not await the fetch, and an OS flip in that window must not be dropped. */
+function currentThemePreference(): ThemePref {
+  return lastThemePreference ?? resolveThemePreference(
+    undefined,
+    wsLocalGet('lucidos-theme'),
+    () => document.documentElement.getAttribute('data-theme'),
+  );
+}
 
 /**
  * iOS / iPadOS detection, mirroring `crates/lucidos-app/src/utils/platform.ts`.
- * Exported for tests; `nav` defaults to the global navigator. Used to skip the
- * live OS-appearance listener on iOS, whose WKWebView fires bogus
- * `prefers-color-scheme` change events and flashes the theme.
+ * Exported for tests; `nav` defaults to the global navigator. Used to spot an
+ * installed iOS PWA, whose external links need the host's hand-off.
  */
 export function isIOSAgent(
   nav: { userAgent: string; platform?: string; maxTouchPoints?: number } | undefined =
@@ -49,6 +74,20 @@ export function isIOSAgent(
     (nav.platform === 'MacIntel' && (nav.maxTouchPoints ?? 0) > 1);
 }
 
+/** Only the window this frame posted to may answer it.
+ *
+ *  Every request below goes to `window.parent`, so a reply from anywhere else
+ *  is a forgery. A nested iframe an app embeds can post to that app's frame,
+ *  and the ids here are a counter plus a timestamp. Without this check such a
+ *  frame could resolve a pending `confirm` as OK, with no dialog ever shown.
+ *
+ *  The host guards the request direction the same way, and against the same
+ *  threat (`isKnownAppFrame` in `hooks/useStartup.ts`). This is the reply
+ *  half. */
+function fromHost(event: MessageEvent): boolean {
+  return event.source === window.parent;
+}
+
 let confirmCounter = 0;
 const pendingConfirms = new Map<string, (value: boolean) => void>();
 let confirmListenerInstalled = false;
@@ -57,6 +96,7 @@ function installConfirmListener() {
   if (confirmListenerInstalled) return;
   confirmListenerInstalled = true;
   window.addEventListener('message', (event: MessageEvent) => {
+    if (!fromHost(event)) return;
     const data = event.data as { type?: unknown; id?: unknown; ok?: unknown } | null;
     if (!data || typeof data !== 'object') return;
     if (data.type !== 'lucidos:ui:confirm:result') return;
@@ -123,6 +163,7 @@ function installPromptListener() {
   if (promptListenerInstalled) return;
   promptListenerInstalled = true;
   window.addEventListener('message', (event: MessageEvent) => {
+    if (!fromHost(event)) return;
     const data = event.data as { type?: unknown; id?: unknown; value?: unknown } | null;
     if (!data || typeof data !== 'object') return;
     if (data.type !== 'lucidos:ui:prompt:result') return;
@@ -174,6 +215,7 @@ function installPreviewListener() {
   if (previewListenerInstalled) return;
   previewListenerInstalled = true;
   window.addEventListener('message', (event: MessageEvent) => {
+    if (!fromHost(event)) return;
     const data = event.data as { type?: unknown; id?: unknown; ok?: unknown; error?: unknown } | null;
     if (!data || typeof data !== 'object') return;
     if (data.type !== 'lucidos:ui:preview-file:result') return;
@@ -314,14 +356,15 @@ export const ui = {
     // applied (server, then localStorage, then data-theme) over a hard default,
     // so a missing server-scoped theme can't flip the iframe to dark. Then
     // resolve "system" against the OS.
-    const theme = resolveTheme(
-      resolveThemePreference(
-        prefs['theme'],
-        wsLocalGet('lucidos-theme'),
-        () => document.documentElement.getAttribute('data-theme'),
-      ),
-      window.matchMedia('(prefers-color-scheme: light)').matches,
+    //
+    // The preference is kept, not just its resolution: `watchPreferences` has
+    // to know whether this frame follows the OS before it acts on an OS flip.
+    lastThemePreference = resolveThemePreference(
+      prefs['theme'],
+      wsLocalGet('lucidos-theme'),
+      () => document.documentElement.getAttribute('data-theme'),
     );
+    const theme = resolveTheme(lastThemePreference, osPrefersLight());
     const bg = THEME_BG[theme];
     document.documentElement.setAttribute('data-theme', theme);
     document.documentElement.style.setProperty('--bg-primary', bg);
@@ -384,15 +427,38 @@ export const ui = {
     };
     sse.on('PreferencesChanged', reapply);
     sse.connect();
-    // A live OS light/dark flip under a `system` theme preference does NOT emit
-    // PreferencesChanged, so also re-apply on the media-query change, matching
-    // the host shell. `applyPreferences` stays the source of truth for which
-    // theme actually applies. Skipped on iOS, whose WKWebView fires bogus
-    // prefers-color-scheme events: there `system` resolves once per
-    // applyPreferences().
-    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function' && !isIOSAgent()) {
-      window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', reapply);
-    }
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+
+    // An OS light/dark flip under a `system` preference emits no
+    // PreferencesChanged, so the media query and the resume events drive it
+    // instead. Both guards mirror the host shell, and both are load-bearing
+    // (`crates/lucidos-app/src/store/actions/preferences.ts` carries the full
+    // reasoning): an iOS snapshot pass announces an appearance that exists only
+    // while the app is backgrounded, and a resumed iOS PWA is never reloaded.
+    //
+    // Sampling here rather than inside `applyPreferences` is what keeps a wake
+    // that changed nothing free: `applyPreferences` fetches.
+    const refreshSystemTheme = () => {
+      systemThemeSettleTimer = null;
+      if (currentThemePreference() !== 'system') return;
+      if (document.visibilityState !== 'visible') return;
+      const resolved = resolveTheme('system', osPrefersLight());
+      if (document.documentElement.getAttribute('data-theme') === resolved) return;
+      reapply();
+    };
+    const scheduleRefresh = () => {
+      if (systemThemeSettleTimer !== null) return;
+      systemThemeSettleTimer = setTimeout(refreshSystemTheme, SYSTEM_THEME_SETTLE_MS);
+    };
+    // Held in a variable rather than subscribed to inline. A `MediaQueryList`
+    // with no strong reference has historically been collected in WebKit, which
+    // takes its listener with it. `preferences.ts` keeps its own for the same
+    // reason, and this is the engine where the theme has to keep working.
+    systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
+    systemThemeQuery.addEventListener('change', scheduleRefresh);
+    document.addEventListener('visibilitychange', scheduleRefresh);
+    window.addEventListener('focus', scheduleRefresh);
+    window.addEventListener('pageshow', scheduleRefresh);
   },
 
   /**
@@ -695,4 +761,15 @@ export const ui = {
    * `value` mirrors the user's selection.
    */
   enhanceSelects,
+
+  /**
+   * Turn the built-in tooltip off, for an app that ships its own. The SDK
+   * installs the tooltip on load, so this is an override rather than a switch:
+   * call it once at startup. `data-lucidos-tooltips="off"` on `<html>` or
+   * `<body>` does the same from markup, before any script runs.
+   *
+   * Neither is needed just because the app renders its own `#tooltip`: the
+   * layer already stands down when it finds one.
+   */
+  disableTooltips,
 };

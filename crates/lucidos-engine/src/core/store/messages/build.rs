@@ -68,9 +68,11 @@ pub fn format_child_thread_completed_block(event: &EventRow) -> String {
     } else {
         format!("\nSummary: {}", summary)
     };
-    // The event_id (not child_thread_id) is what dismiss_from_context
-    // accepts as the lookup key — surface it so the LLM can pass it back
-    // verbatim without inventing a synthetic prefix.
+    // The event_id (not child_thread_id) is the lookup key the event-reading
+    // tools accept, so surface it. The LLM can then pass it back verbatim
+    // without inventing a synthetic prefix. `dismiss_from_context` was the
+    // original reader and is retired (ADR 0109); the `events` tool's
+    // `event_id` argument takes the same form.
     format!(
         "[CHILD THREAD COMPLETED] {} {}\nevent_id: {}{}\nPending changes: {}{}\n\
          Note: phrases like \"session can finish\" or \"## Session Summary\" in \
@@ -106,11 +108,11 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
     let mut current_request_event_id: Option<String> = None;
     let mut current_thread_id: Option<String> = None;
 
-    // `ContextDismissed` records (emitted by the agent's `dismiss_from_context`
-    // tool) ask the projection to drop the corresponding history entry on every
-    // future read. The set is collected up-front so dismissals can land out of
-    // order relative to the dismissed event itself — emitting a dismissal
-    // before its target is still respected.
+    // `ContextDismissed` records ask the projection to drop the corresponding
+    // history entry on every future read. They came from the retired
+    // `dismiss_from_context` tool (ADR 0109), so every row is historical. The
+    // set is collected up-front so a dismissal that landed out of order,
+    // before the event it names, is still respected.
     let dismissed_event_ids = collect_dismissed_event_ids(events);
 
     // `ImageDescribed` events carry the Flash-generated description for an
@@ -870,6 +872,51 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
     }
 
     messages
+}
+
+/// The thread's cached *conversation summary*, or `None` before its first
+/// successful summarisation (ADR 0102).
+///
+/// The newest `ConversationSummarized` wins. Events arrive in chronological
+/// order, so the last one seen is it. A row missing either field is skipped
+/// rather than trusted: a summary with no boundary cannot be checked for
+/// staleness, and a boundary with no text is not a summary.
+pub(crate) fn newest_conversation_summary(events: &[EventRow]) -> Option<CachedSummary> {
+    let mut found: Option<CachedSummary> = None;
+    for event in events {
+        if event.event_type != "ConversationSummarized" {
+            continue;
+        }
+        let Some(summary) = event
+            .payload
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(covers_through) = event
+            .payload
+            .get("covers_through_event_id")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        found = Some(CachedSummary {
+            summary: summary.to_string(),
+            covers_through_event_id: covers_through.to_string(),
+        });
+    }
+    found
+}
+
+/// A `ConversationSummarized` payload, reduced to what the history builder
+/// reads. The count and model live on the event for the audit trail only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedSummary {
+    pub summary: String,
+    /// The `SessionMessage::event_id` of the newest turn this paragraph covers.
+    pub covers_through_event_id: String,
 }
 
 /// Walk every `ImageDescribed` event and collect the latest description per

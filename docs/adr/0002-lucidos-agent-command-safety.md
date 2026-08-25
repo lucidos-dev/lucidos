@@ -357,3 +357,66 @@ Implementation: `engine/git_ops/checkpoint.rs` (`create_command_post_image`,
 (`finalize_command_checkpoint`), `api/command_checkpoint.rs`, `api/diff.rs`,
 `components/chat/CheckpointDiffModal.tsx`. Plan:
 `docs/plans/2026-08-06-command-checkpoint-undo-removes-created-files.md`.
+
+## Addendum (2026-08-24): an unattended REFUSAL denies; an unattended omission runs
+
+**Context.** The unattended lane mapped `fallback_classify`'s `Safe` straight to
+`RequestVerdict::Benign`. So every shape the Safe fast path deliberately refuses
+to settle was re-settled as an auto-allow with no card and no human: command
+substitution, a code-injecting `VAR=value` preamble, a path-qualified command
+head, an out-of-workspace write target, an executable git config. A `Bash` or
+`command_execution` request whose `command` field could not be read fell to the
+same default. "Not a command request" and "a command request I cannot read"
+were one `None`.
+
+**The distinction.** The fast path declines a command for two different reasons,
+and only one of them is a security judgment.
+
+- A **refusal** is a shape where the head is not what runs, or not all of it.
+  The allowlist refuses it on purpose. `command_guard::FastPathDecline` carries
+  the full set.
+- An **omission** is a head that is simply not on the allowlist. Its own header
+  says the cost: a judge call, never safety. `cargo`, `npm`, `make`, `python`
+  and `lucidos` are all omissions.
+
+**The refusal set is coarser than an attack shape.** Separating `sort -o
+/etc/crontab data/f` from `sort /etc/passwd` needs per-head flag arity, which
+`WRITE_CAPABLE_READ_ONLY_HEADS` exists to avoid, so both are refusals. So are a
+`/tmp` log redirect and a `./scripts/x.sh` head. That cost is accepted rather
+than overlooked. A deny is one request, not the run, and the reason string tells
+the agent which shape to retry with.
+
+**Decision.** An unattended session denies a refusal, whatever the trigger's
+grant, and still runs an omission.
+
+1. `segment_safety` reports WHICH of the two it hit, and `JudgeInput` carries the
+   answer as `fast_path_refused`. The chat lane ignores it: both outcomes route
+   to the judge there.
+2. `RequestVerdict::Unclassified` is the refusal verdict, and it also covers an
+   unreadable command payload. `decide_unattended` denies it with no grant
+   check, outranking the category the fallback derived from text the guard had
+   already refused to trust.
+3. `grant_covers_command` reads the same flag, so no stored grant covers a
+   refusal either. On the coding-agent lane that check runs BEFORE
+   classification, so it is the only thing standing there.
+4. An omission stays `Benign`. Denying it would stop an unattended coding-agent
+   session from building or testing anything. The worked example in the
+   2026-06-25 addendum above is itself an omission: a trigger-spawned Codex
+   scan running `lucidos data write`.
+
+**Every unattended DENY is recorded; an unattended ALLOW still is not.** The deny
+emits the ordinary `CodingAgentPermissionRequest` +
+`CodingAgentPermissionResolved` pair, back to back, with the command redacted the
+same way the card path redacts it. No new event variant: the timeline already
+renders that pair as an answered card, and emitting both leaves the thread's
+attention counter at zero. Without it the agent reports a failed step and the
+user has no way to see what the engine refused, or why.
+
+**Non-goals.** No new `SideEffectCategory` and no trigger-config change, so a
+refusal is not grantable at all. No LLM judge on the permission path (the
+2026-06-25 addendum's rule stands: it must not be able to stall).
+
+Implementation: `engine/command_guard.rs` (`FastPathDecline`, `segment_safety`,
+`bash_fast_path`), `engine/cc_permission.rs` (`CommandPayload`,
+`RequestVerdict::Unclassified`, `record_unattended_denial`). Plan:
+`docs/plans/2026-08-24-command-guard-bypass-cluster.md`.

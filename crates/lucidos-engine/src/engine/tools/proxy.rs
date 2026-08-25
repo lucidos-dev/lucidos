@@ -25,7 +25,7 @@ impl LucidosEngine {
             _ => return Ok("Error: 'name' is required".to_string()),
         };
         let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        if api_proxy::has_traversal(path) {
+        if api_proxy::request_path_has_traversal(path) {
             return Ok("Error: path may not contain '..' or backslash segments".to_string());
         }
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");

@@ -1,18 +1,16 @@
-//! Validation-path tests for `dismiss_from_context_impl`.
+//! Validation-path tests for `query_events_impl`, the dereference half of the
+//! event-address surface.
 //!
-//! The handler is exercised via the standalone `dismiss_from_context_impl`
-//! function (the `LucidosEngine::execute_dismiss_from_context` method is a
-//! thin wrapper) so the tests don't need to boot a full engine — only a
-//! Postgres pool + `EventBus`. This mirrors how `event_bus_tests.rs`
+//! Every handler is exercised via its standalone `*_impl` function, since
+//! the `LucidosEngine` methods are thin wrappers. So the tests need no engine,
+//! only a Postgres pool + `EventBus`. This mirrors how `event_bus_tests.rs`
 //! exercises bus paths.
 
 use super::{
-    dismiss_from_context_impl, merge_thread_queue_policy_patch, parent_filter_arg,
-    parse_apply_change_id, parse_source_arg, parse_status_arg, status_filter_arg,
-    BACKUP_SETTINGS_NAVIGATED,
+    merge_thread_queue_policy_patch, parent_filter_arg, parse_apply_change_id, parse_source_arg,
+    parse_status_arg, query_events_impl, status_filter_arg, BACKUP_SETTINGS_NAVIGATED,
 };
-use crate::core::store::StatusFilter;
-use crate::engine::event_bus::EventBus;
+use crate::core::store::{EventStore, StatusFilter};
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -121,7 +119,7 @@ fn status_filter_arg_prefers_explicit_statuses_and_falls_back_to_active() {
 }
 
 /// Insert a raw thread event directly into the events table, bypassing the
-/// EventBus. The dismiss handler queries by `(id, aggregate_id, event_type)`
+/// EventBus. The keep handler queries by `(id, aggregate_id, event_type)`
 /// — that's the entire fixture surface we need to drive the validation
 /// branches.
 async fn insert_thread_event(
@@ -144,267 +142,389 @@ async fn insert_thread_event(
     .expect("insert thread event");
 }
 
-#[tokio::test]
-async fn dismiss_from_context_rejects_missing_event_id() {
-    let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
+// ============================================================================
+// `query_events_impl`: read-by-id, the dereference half of ADR 0085
+// ============================================================================
 
-    let thread_id = Uuid::new_v4();
-    let out = dismiss_from_context_impl(&pool, &bus, &json!({}), thread_id).await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("event_id is required")),
-        "missing event_id should error, got: {:?}",
-        out
-    );
-
-    // Empty string also counts as missing — guard against the LLM passing "".
-    let out = dismiss_from_context_impl(&pool, &bus, &json!({"event_id": ""}), thread_id).await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("event_id is required")),
-        "empty event_id should error, got: {:?}",
-        out
-    );
-
-    // Whitespace-only also counts as missing.
-    let out = dismiss_from_context_impl(&pool, &bus, &json!({"event_id": "   "}), thread_id).await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("event_id is required")),
-        "whitespace-only event_id should error, got: {:?}",
-        out
-    );
-
-    pool.close().await;
-    teardown_test_db(&db).await;
+/// A caller thread for the tests that pass no `thread_id`. Only the `current`
+/// alias reads it, and these tests do not use the alias.
+fn some_caller() -> Uuid {
+    Uuid::new_v4()
 }
 
+/// The three spellings of one address must all reach the same row. The `evt-`
+/// form is what a tool result states, and the two bare forms are what a
+/// `query_events` result or a log line hands back.
 #[tokio::test]
-async fn dismiss_from_context_rejects_malformed_event_id() {
+async fn query_events_resolves_one_event_by_any_spelling_of_its_address() {
     let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
+    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": "not-a-uuid-at-all"}),
-        thread_id,
-    )
-    .await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("must be a UUID")),
-        "malformed event_id should error, got: {:?}",
-        out
-    );
-
-    // The `evt-` prefix without a valid UUID body must also fail validation
-    // (otherwise typos in the prefix path silently succeed).
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": "evt-not-a-uuid"}),
-        thread_id,
-    )
-    .await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("must be a UUID")),
-        "evt-<garbage> should error, got: {:?}",
-        out
-    );
-
-    pool.close().await;
-    teardown_test_db(&db).await;
-}
-
-#[tokio::test]
-async fn dismiss_from_context_rejects_event_in_different_thread() {
-    let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-
-    // Insert a ToolCalled on thread A; the dismiss call is scoped to thread B
-    // — the (event_id, aggregate_id) join must not match across threads.
-    let thread_a = Uuid::new_v4();
-    let thread_b = Uuid::new_v4();
-    let event_id = Uuid::new_v4();
+    let wanted = Uuid::new_v4();
+    insert_thread_event(&pool, wanted, thread_id, "ToolResult", json!({"r": "hit"})).await;
+    // A decoy the newest-first window would otherwise return first.
     insert_thread_event(
         &pool,
-        event_id,
-        thread_a,
-        "ToolCalled",
-        json!({"tool": "read_file"}),
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"r": "decoy"}),
     )
     .await;
 
-    let out = dismiss_from_context_impl(
+    for spelling in [
+        format!("evt-{}", wanted.simple()),
+        wanted.to_string(),
+        wanted.simple().to_string(),
+    ] {
+        let out = query_events_impl(
+            &store,
+            &json!({"event_id": spelling.clone()}),
+            some_caller(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{spelling} must resolve, got: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+        assert_eq!(parsed["returned"], 1, "{spelling} must return one row");
+        assert_eq!(parsed["events"][0]["id"], wanted.to_string());
+        assert_eq!(parsed["events"][0]["payload"]["r"], "hit");
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// THE point of the dereference. The address a tool result states is its
+/// CALL's id, because that is the form a keep takes. What the sweep dropped is
+/// the RESULT, so reading the call must bring it back. One row of arguments
+/// would be the half the agent still remembers.
+#[tokio::test]
+async fn dereferencing_a_tool_call_brings_back_its_result() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    insert_thread_event(
         &pool,
-        &bus,
-        &json!({"event_id": event_id.to_string()}),
-        thread_b,
+        call,
+        thread_id,
+        "ToolCalled",
+        json!({"name": "run_bash", "args": {"command": "ls"}}),
     )
     .await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("not found or not dismissible")),
-        "cross-thread dismiss must error, got: {:?}",
-        out
-    );
-
-    // And the negative side: nothing should have been emitted on thread B.
-    let dismissed_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'ContextDismissed'",
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "run_bash", "result": "total 4", "tool_called_event_id": call}),
     )
-    .bind(thread_b.to_string())
-    .fetch_one(&pool)
+    .await;
+    // A second call's result, to prove the pairing is by id and not by
+    // "the next ToolResult in the thread".
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "read_file", "result": "other", "tool_called_event_id": Uuid::new_v4()}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &store,
+        &json!({"event_id": format!("evt-{}", call.simple())}),
+        some_caller(),
+    )
     .await
-    .unwrap();
-    assert_eq!(
-        dismissed_count, 0,
-        "no ContextDismissed should have been emitted on the wrong-thread call"
-    );
+    .expect("the call resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 2, "the pair, not just the call");
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+    assert_eq!(parsed["events"][1]["event_type"], "ToolResult");
+    assert_eq!(parsed["events"][1]["payload"]["result"], "total 4");
 
     pool.close().await;
     teardown_test_db(&db).await;
 }
 
+/// An orphan call has no result to add, which is an answer rather than a
+/// failure: the engine crashed mid-tool, and the call really is all there is.
 #[tokio::test]
-async fn dismiss_from_context_rejects_non_dismissible_event_type() {
+async fn dereferencing_an_orphan_call_returns_the_call_alone() {
     let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
-
-    // Same-thread, same event_id, but the event_type is `ResponseGenerated`
-    // — not in the `('ToolCalled', 'ChildThreadCompleted')` allow list.
-    // Dismissing a ResponseGenerated would corrupt history rendering.
-    let thread_id = Uuid::new_v4();
-    let event_id = Uuid::new_v4();
-    insert_thread_event(
-        &pool,
-        event_id,
-        thread_id,
-        "ResponseGenerated",
-        json!({"text": "done"}),
-    )
-    .await;
-
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": event_id.to_string()}),
-        thread_id,
-    )
-    .await;
-    assert!(
-        matches!(&out, Err(msg) if msg.contains("not found or not dismissible")),
-        "non-dismissible event_type must error, got: {:?}",
-        out
-    );
-
-    pool.close().await;
-    teardown_test_db(&db).await;
-}
-
-#[tokio::test]
-async fn dismiss_from_context_succeeds_for_tool_called_in_same_thread() {
-    let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
+    let store = EventStore::new(pool.clone());
 
     let thread_id = Uuid::new_v4();
-    let event_id = Uuid::new_v4();
-    insert_thread_event(
-        &pool,
-        event_id,
-        thread_id,
-        "ToolCalled",
-        json!({"tool": "read_file"}),
-    )
-    .await;
+    let call = Uuid::new_v4();
+    insert_thread_event(&pool, call, thread_id, "ToolCalled", json!({"name": "x"})).await;
 
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": event_id.to_string()}),
-        thread_id,
+    let out = query_events_impl(
+        &store,
+        &json!({"event_id": call.to_string()}),
+        some_caller(),
     )
-    .await;
-    let success_text = out
-        .as_ref()
-        .expect("valid same-thread ToolCalled dismiss must succeed")
-        .clone();
-    assert!(
-        success_text.contains("Dismissed event") && success_text.contains(&event_id.to_string()),
-        "success string must echo the event id, got: {}",
-        success_text
-    );
-
-    // Verify the ContextDismissed event was actually persisted on the same
-    // thread, with the correct dismissed_event_id payload.
-    let row: Option<(serde_json::Value,)> = sqlx::query_as(
-        "SELECT payload FROM events \
-         WHERE aggregate_id = $1 AND event_type = 'ContextDismissed'",
-    )
-    .bind(thread_id.to_string())
-    .fetch_optional(&pool)
     .await
-    .unwrap();
-    let payload = row.expect("ContextDismissed must be persisted").0;
-    let dismissed_id = payload
-        .get("dismissed_event_id")
-        .and_then(|v| v.as_str())
-        .expect("dismissed_event_id field present");
-    assert_eq!(
-        dismissed_id,
-        event_id.to_string(),
-        "dismissed_event_id must round-trip the input event id"
+    .expect("an orphan call still resolves");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 1);
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The pair is added only for a by-id dereference. A windowed query full of
+/// `ToolCalled` rows must return exactly what it matched, or `limit` would
+/// stop meaning what it says.
+#[tokio::test]
+async fn a_windowed_query_never_pulls_in_paired_results() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let call = Uuid::new_v4();
+    insert_thread_event(&pool, call, thread_id, "ToolCalled", json!({"name": "x"})).await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        thread_id,
+        "ToolResult",
+        json!({"name": "x", "result": "r", "tool_called_event_id": call}),
+    )
+    .await;
+
+    let out = query_events_impl(&store, &json!({"event_type": "ToolCalled"}), some_caller())
+        .await
+        .expect("plain query");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 1, "only the matched row");
+    assert_eq!(parsed["events"][0]["event_type"], "ToolCalled");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A pointer that resolves to nothing fails loudly. An empty window would
+/// read to the agent as "the event is gone", which is a different claim and
+/// the wrong one to act on.
+#[tokio::test]
+async fn query_events_errors_when_an_address_resolves_to_nothing() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let missing = Uuid::new_v4();
+    let out = query_events_impl(
+        &store,
+        &json!({"event_id": format!("evt-{}", missing.simple())}),
+        some_caller(),
+    )
+    .await;
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("no event has id") && msg.contains(&missing.to_string())),
+        "a dangling pointer must name the id it could not resolve, got: {:?}",
+        out
+    );
+
+    // Same when a contradicting filter is what excluded it, and the message
+    // says so, because the id itself is fine in that case.
+    let present = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
+    insert_thread_event(&pool, present, thread_id, "ToolResult", json!({})).await;
+    let out = query_events_impl(
+        &store,
+        &json!({"event_id": present.to_string(), "event_type": "MessageReceived"}),
+        some_caller(),
+    )
+    .await;
+    assert!(
+        matches!(&out, Err(msg) if msg.contains("drop any other filter")),
+        "a contradicting filter must be named as a possible cause, got: {:?}",
+        out
     );
 
     pool.close().await;
     teardown_test_db(&db).await;
 }
 
+/// A malformed address is refused, never dropped. Ignoring it would widen a
+/// one-row lookup into the newest 50 events of every type. The agent would
+/// then read that window as the event it asked for.
 #[tokio::test]
-async fn dismiss_from_context_accepts_evt_prefixed_form() {
+async fn query_events_refuses_a_malformed_address_rather_than_widening() {
     let (pool, db) = setup_test_db().await;
-    let (bus, _rx) = EventBus::new(pool.clone());
+    let store = EventStore::new(pool.clone());
 
-    // C1: tool blocks render the synthetic id as `evt-<32-hex-uuid>`. The
-    // handler must accept that shape verbatim — the LLM never sees the raw
-    // hyphenated UUID for tool blocks, only this form.
-    let thread_id = Uuid::new_v4();
-    let event_id = Uuid::new_v4();
-    insert_thread_event(
-        &pool,
-        event_id,
-        thread_id,
-        "ToolCalled",
-        json!({"tool": "read_file"}),
-    )
-    .await;
-
-    let prefixed = format!("evt-{}", event_id.simple());
-    let out =
-        dismiss_from_context_impl(&pool, &bus, &json!({"event_id": prefixed}), thread_id).await;
-    assert!(out.is_ok(), "evt-<uuid> form must succeed, got: {:?}", out);
-
-    // And the bare hyphenated form should also still work (regression
-    // check — both shapes the description promises are accepted).
-    let event_id_2 = Uuid::new_v4();
-    insert_thread_event(
-        &pool,
-        event_id_2,
-        thread_id,
-        "ChildThreadCompleted",
-        json!({"child_thread_id": Uuid::new_v4().to_string(), "status": "success"}),
-    )
-    .await;
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": event_id_2.to_string()}),
-        thread_id,
-    )
-    .await;
+    for bad in [json!("evt-not-a-uuid"), json!("nonsense"), json!("")] {
+        let out = query_events_impl(&store, &json!({"event_id": bad}), some_caller()).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not an event address")),
+            "{bad} must be refused, got: {:?}",
+            out
+        );
+    }
+    // A non-string must not fall down the "absent" arm either.
+    let out = query_events_impl(&store, &json!({"event_id": ["deadbeef"]}), some_caller()).await;
     assert!(
-        out.is_ok(),
-        "bare hyphenated UUID must succeed, got: {:?}",
+        matches!(&out, Err(msg) if msg.contains("is not an event address")),
+        "an array must be refused, got: {:?}",
         out
     );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// Read-by-id inherits the byte budget. The row a pointer names is usually a
+/// `ToolResult`, which is exactly the row that runs to megabytes. Returning
+/// one unconditionally is how a dereference blows the next turn's prompt.
+#[tokio::test]
+async fn query_events_by_id_still_honours_the_byte_limit() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let big = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        big,
+        thread_id,
+        "ToolResult",
+        json!({"result": "x".repeat(8000)}),
+    )
+    .await;
+
+    let out = query_events_impl(
+        &store,
+        &json!({"event_id": big.to_string(), "byte_limit": 1024}),
+        some_caller(),
+    )
+    .await
+    .expect("a truncated response is still a response");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["truncated"], true);
+    assert_eq!(parsed["returned"], 0);
+    assert_eq!(
+        parsed["total_matching"], 1,
+        "the row matched, it just did not fit"
+    );
+    assert!(parsed["hint"].is_string(), "truncation must carry its hint");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// Absent `event_id`, the query behaves exactly as it always did. Every
+/// caller predating the argument passes nothing, so the filter can only
+/// narrow, never widen or reorder.
+#[tokio::test]
+async fn query_events_without_an_address_is_unchanged() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    for i in 0..3 {
+        insert_thread_event(
+            &pool,
+            Uuid::new_v4(),
+            thread_id,
+            "ToolResult",
+            json!({"i": i}),
+        )
+        .await;
+    }
+
+    let out = query_events_impl(&store, &json!({"event_type": "ToolResult"}), some_caller())
+        .await
+        .expect("plain query");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+    assert_eq!(parsed["returned"], 3);
+    assert_eq!(parsed["truncated"], false);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// `thread_id: "current"` cost a whole round every time the model guessed it,
+/// because reading your own thread back is the commonest reason to call this.
+/// The alias resolves from the tool-execution context, so the model cannot aim
+/// it at another conversation.
+#[tokio::test]
+async fn thread_id_current_reads_the_calling_thread() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let caller = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        caller,
+        "ToolResult",
+        json!({"r": "mine"}),
+    )
+    .await;
+    insert_thread_event(
+        &pool,
+        Uuid::new_v4(),
+        other,
+        "ToolResult",
+        json!({"r": "theirs"}),
+    )
+    .await;
+
+    for alias in ["current", "this", "  Current  ", "THIS"] {
+        let out = query_events_impl(&store, &json!({"thread_id": alias}), caller)
+            .await
+            .unwrap_or_else(|e| panic!("{alias} must resolve, got: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json wrapper");
+        assert_eq!(
+            parsed["returned"], 1,
+            "{alias} must return the caller's row"
+        );
+        assert_eq!(parsed["events"][0]["payload"]["r"], "mine");
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The alias is the only string that is not an id. Every other guard stands:
+/// a bad uuid and a non-string are still refused, never widened to every
+/// thread. The refusal now states the alias, which is the one-step answer.
+#[tokio::test]
+async fn a_bad_thread_id_is_still_refused_and_names_the_alias() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let caller = Uuid::new_v4();
+    insert_thread_event(&pool, Uuid::new_v4(), caller, "ToolResult", json!({})).await;
+
+    for bad in [json!("currently"), json!("the one we discussed"), json!("")] {
+        let out = query_events_impl(&store, &json!({"thread_id": bad}), caller).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("is not a uuid") && msg.contains("'current'")),
+            "{bad} must be refused and point at the alias, got: {:?}",
+            out
+        );
+    }
+
+    // A non-string must not fall down the "absent" arm, which would widen the
+    // query to every thread.
+    for bad in [
+        json!([caller.to_string()]),
+        json!({"id": "current"}),
+        json!(7),
+    ] {
+        let out = query_events_impl(&store, &json!({"thread_id": bad}), caller).await;
+        assert!(
+            matches!(&out, Err(msg) if msg.contains("must be a uuid string or 'current'")),
+            "{bad} must be refused rather than widening, got: {:?}",
+            out
+        );
+    }
 
     pool.close().await;
     teardown_test_db(&db).await;

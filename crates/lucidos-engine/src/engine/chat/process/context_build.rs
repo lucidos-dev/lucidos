@@ -6,10 +6,14 @@
 
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 
-/// Cap on per-section body persistence in `ContextCaptured` events. The
-/// section's `char_count` is always real; the `content` body is truncated
+/// Cap on per-section body persistence in `ContextCaptured` events. Both
+/// sizes a section carries stay real; the `content` body is truncated
 /// head/tail to this many characters so a 100 KB system prompt doesn't
 /// bloat every captured row.
+///
+/// Every section built here is a true count, so its `budget_delta_chars` and
+/// its `content_chars` agree. `Conversation` is the one row where they part,
+/// and the agentic loop builds that one.
 const SECTION_PERSIST_MAX: usize = 8_000;
 
 /// Build the 500-char extraction summary fed to the memory extractor: pipe-
@@ -66,10 +70,10 @@ struct LabeledSection<'a> {
 ///    matches the actual API request shape (system / prior messages /
 ///    user).
 ///
-/// `capture_body` mirrors the workspace's `capture_context` preference:
-/// when `false`, every row's `content` is `None` and only `name` +
-/// `char_count` are persisted, so the viewer can render the budget
-/// breakdown without billing event-row storage for full bodies.
+/// `capture_body` mirrors the workspace's `capture_context` preference.
+/// When `false`, every row's `content` is `None` and only its name and its
+/// two sizes are persisted. The viewer still renders the budget breakdown,
+/// and event-row storage is not billed for full bodies.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capture_sections(
     system_prompt: &str,
@@ -88,7 +92,7 @@ pub(crate) fn build_capture_sections(
     setup_reminder: &str,
     thread_depth_context: &str,
     user_message: &str,
-    current_time_block: &str,
+    tail: &super::turn_tail::TurnTail<'_>,
     loaded_knowhow_docs: &[LoadedKnowhow],
     resume_tool_blocks: &[crate::llm::Message],
     capture_body: bool,
@@ -97,20 +101,23 @@ pub(crate) fn build_capture_sections(
     use crate::engine::{ContextRole, ContextSection};
 
     // Body capped at SECTION_PERSIST_MAX with head/tail preservation so a
-    // 100 KB system prompt doesn't bloat every captured event row. char_count
-    // remains the true length so the viewer's budget bar stays honest.
+    // 100 KB system prompt doesn't bloat every captured event row. Both sizes
+    // remain the true length so the viewer's budget bar stays honest.
+    //
+    // The eval lifts that cap (ADR 0110), because a benchmark of context
+    // handling has to be able to read what was in the context.
+    let cap = crate::engine::eval_capture::body_cap(SECTION_PERSIST_MAX);
     let truncate = |content: &str| -> Option<String> {
         if !capture_body {
             return None;
         }
-        Some(if content.len() > SECTION_PERSIST_MAX {
-            truncate_head_tail(content, SECTION_PERSIST_MAX)
-        } else {
-            content.to_string()
+        Some(match cap {
+            Some(cap) if content.len() > cap => truncate_head_tail(content, cap),
+            _ => content.to_string(),
         })
     };
 
-    let labeled: [LabeledSection; 17] = [
+    let labeled: [LabeledSection; 19] = [
         LabeledSection {
             name: "System Instructions",
             content: system_prompt,
@@ -153,14 +160,18 @@ pub(crate) fn build_capture_sections(
             role: ContextRole::User,
             group: Some("Workspace inventory"),
         },
+        // Both names come from `context_mode`, which is also where the eval's
+        // manipulation check reads them. The name IS the contract: that check
+        // asks whether these two rows are present on a round, so a rename here
+        // would silently pass a lean arm that dropped nothing.
         LabeledSection {
-            name: "Long-term Memory",
+            name: super::context_mode::MEMORY_SECTION,
             content: memory_context,
             role: ContextRole::User,
             group: Some("Memory & history"),
         },
         LabeledSection {
-            name: "Conversation History",
+            name: super::context_mode::HISTORY_SECTION,
             content: history_context,
             role: ContextRole::User,
             group: Some("Memory & history"),
@@ -207,12 +218,24 @@ pub(crate) fn build_capture_sections(
             role: ContextRole::User,
             group: Some("The request"),
         },
-        // Last, mirroring where it rides on the wire. It is the one section
-        // that moves every turn, and it is here rather than in the system
-        // prompt for exactly that reason (`super::turn_clock`).
+        // Last three, mirroring where they ride on the wire. These are the
+        // sections that move every turn, and they are here rather than in the
+        // system prompt for exactly that reason (`super::turn_tail`).
+        LabeledSection {
+            name: "Engine Build",
+            content: tail.engine_build,
+            role: ContextRole::User,
+            group: Some("The request"),
+        },
+        LabeledSection {
+            name: "Client URL",
+            content: tail.client_url,
+            role: ContextRole::User,
+            group: Some("The request"),
+        },
         LabeledSection {
             name: "Current Time",
-            content: current_time_block,
+            content: tail.current_time,
             role: ContextRole::User,
             group: Some("The request"),
         },
@@ -221,24 +244,32 @@ pub(crate) fn build_capture_sections(
     let mut capture_sections: Vec<ContextSection> = labeled
         .into_iter()
         .filter(|ls| !ls.content.is_empty())
-        .map(|ls| ContextSection {
-            name: ls.name.to_string(),
-            content: truncate(ls.content),
-            char_count: ls.content.chars().count(),
-            role: ls.role,
-            group: ls.group.map(|s| s.to_string()),
+        .map(|ls| {
+            // Nothing else counts these bytes, so the delta is the section's
+            // own size and the two agree.
+            let chars = ls.content.chars().count();
+            ContextSection {
+                name: ls.name.to_string(),
+                content: truncate(ls.content),
+                budget_delta_chars: chars,
+                content_chars: Some(chars),
+                role: ls.role,
+                group: ls.group.map(|s| s.to_string()),
+            }
         })
         .collect();
 
     // Phase 5.2: surface every loaded knowhow doc as its own collapsible
     // row so the viewer shows the body in a dedicated section instead of
-    // buried inside the User Message blob. Char count reflects the full
+    // buried inside the User Message blob. Both sizes reflect the full
     // body so the budget bar stays honest even when capture_body is off.
     for doc in loaded_knowhow_docs {
+        let chars = doc.body.chars().count();
         capture_sections.push(ContextSection {
             name: format!("knowhow: {}", doc.id),
             content: truncate(&doc.body),
-            char_count: doc.body.chars().count(),
+            budget_delta_chars: chars,
+            content_chars: Some(chars),
             role: ContextRole::User,
             group: Some("Loaded knowhow".to_string()),
         });
@@ -275,11 +306,13 @@ pub(crate) fn build_capture_sections(
             tool_name, args_preview, result_body
         );
         let pair_chars = pair_body.chars().count();
+        // The same cap and the same gate as the static sections above. A
+        // resumed tool pair is a prior turn's work, which is exactly what a
+        // two-turn task's replay needs to show.
         let content = if capture_body {
-            Some(if pair_body.len() > SECTION_PERSIST_MAX {
-                truncate_head_tail(&pair_body, SECTION_PERSIST_MAX)
-            } else {
-                pair_body
+            Some(match cap {
+                Some(cap) if pair_body.len() > cap => truncate_head_tail(&pair_body, cap),
+                _ => pair_body,
             })
         } else {
             None
@@ -287,7 +320,8 @@ pub(crate) fn build_capture_sections(
         capture_sections.push(ContextSection {
             name: format!("ToolUse: {}", tool_name),
             content,
-            char_count: pair_chars,
+            budget_delta_chars: pair_chars,
+            content_chars: Some(pair_chars),
             role: ContextRole::PriorMessage,
             group: None,
         });

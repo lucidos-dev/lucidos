@@ -2,6 +2,14 @@
 //! `EventBus` projection — the before/after `BlockingSample`, the ancestor
 //! `active_children_count` / `blocking_descendant_count` /
 //! `attention_descendant_count` reconciles, and the one-shot rebuild.
+//!
+//! Every recursive CTE below walks `parent_thread_id` with plain `UNION`, never
+//! `UNION ALL`. A cycle in that column would otherwise never terminate, and the
+//! boot path awaits `rebuild_blocking_descendant_count`, so one bad row would
+//! hang every future startup. The dedup changes no count. A thread has one
+//! parent, so exactly one path reaches it from any ancestor. Each walk already
+//! selects a tuple unique per (root, node). The read path made the same swap,
+//! and `fetch_family_extension_terminates_on_cycle` pins it.
 
 use uuid::Uuid;
 
@@ -290,7 +298,7 @@ async fn reconcile_blocking_descendant_count_for_ancestors(
             SELECT parent_thread_id AS thread_id \
             FROM thread_summaries \
             WHERE thread_id = $1 AND parent_thread_id IS NOT NULL \
-            UNION ALL \
+            UNION \
             SELECT t.parent_thread_id AS thread_id \
             FROM thread_summaries t \
             JOIN ancestors a ON t.thread_id = a.thread_id \
@@ -301,7 +309,7 @@ async fn reconcile_blocking_descendant_count_for_ancestors(
                    c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo \
             FROM ancestors a \
             JOIN thread_summaries c ON c.parent_thread_id = a.thread_id \
-            UNION ALL \
+            UNION \
             SELECT d.root_id, c.thread_id, c.status, c.archive_state, \
                    c.coding_agent_proposed, c.is_coding_agent, c.coding_agent_is_external_repo \
             FROM descendants d \
@@ -370,7 +378,7 @@ pub(crate) async fn propagate_blocking_change(
             SELECT parent_thread_id AS thread_id \
             FROM thread_summaries \
             WHERE thread_id = $1 AND parent_thread_id IS NOT NULL \
-            UNION ALL \
+            UNION \
             SELECT t.parent_thread_id AS thread_id \
             FROM thread_summaries t \
             JOIN ancestors a ON t.thread_id = a.thread_id \
@@ -467,7 +475,7 @@ impl EventBus {
                        c.coding_agent_is_external_repo \
                 FROM thread_summaries t \
                 JOIN thread_summaries c ON c.parent_thread_id = t.thread_id \
-                UNION ALL \
+                UNION \
                 SELECT d.root_id, \
                        c.thread_id, c.status, c.archive_state, \
                        c.coding_agent_proposed, c.is_coding_agent, \

@@ -175,6 +175,15 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "reasoning_title",
+        label: "Title reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "none",
+        description: "Thinking budget for thread-title generation. Naming a thread needs none of it; raise this only if titles are poor.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "model_image_description",
         label: "Image-description model",
         scope: PrefScope::Global,
@@ -184,12 +193,48 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "reasoning_image_description",
+        label: "Image-description reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "none",
+        description: "Thinking budget for describing an uploaded image. Captioning is a perception task, so the default spends nothing on deliberation.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "model_memory",
         label: "Memory model",
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "gemini-3-flash-preview",
-        description: "Background model the memory extractor uses.",
+        description: "Background model for the two memory calls every turn makes: extracting facts, and classifying what the turn needs retrieved. It no longer writes the conversation summary, which has its own model_conversation_summary; that key falls back to this one while it is unset.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "reasoning_memory",
+        label: "Memory reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "none",
+        description: "Thinking budget for fact extraction and query classification. Both return short JSON and run on every turn, so the default spends nothing.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "model_conversation_summary",
+        label: "Conversation-summary model",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(the model_memory model)",
+        description: "Background model that writes a thread's conversation summary: the one paragraph standing in for its older assistant turns. Split out of model_memory, so it inherits that value until you set this one. The input can be 80k tokens, far larger than any other background call.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "reasoning_conversation_summary",
+        label: "Conversation-summary reasoning",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(REASONING_EFFORTS),
+        default: "low",
+        description: "Thinking budget for the conversation summary. Measured output length does not track this setting, so raising it is unlikely to help; the summariser's failures are calls that never complete.",
         side_effect: PrefSideEffect::None,
     },
     // ---- Providers (global) ----
@@ -209,6 +254,15 @@ pub const CATALOG: &[PrefSpec] = &[
         value: PrefValue::Text,
         default: "http://localhost:11434/v1",
         description: "Base URL for the 'local' OpenAI-compatible provider (Ollama / LM Studio / vLLM / llama.cpp).",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "opencode_free_enabled",
+        label: "OpenCode Free models",
+        scope: PrefScope::Global,
+        value: PrefValue::Bool,
+        default: "false",
+        description: "Off by default. When 'true', the keyless OpenCode Free tier is available and its models appear in the picker. Requests go anonymously to a third-party relay with no API key and no account, and several of those free models may train on what they receive. Turn it on only if the user asked for free models and accepts that.",
         side_effect: PrefSideEffect::None,
     },
     // ---- Behavior (global) ----
@@ -246,6 +300,39 @@ pub const CATALOG: &[PrefSpec] = &[
         value: PrefValue::Bool,
         default: "false",
         description: "Whether the new-workspace welcome message + starter suggestions are hidden. Set 'false' to SHOW the welcome message again, 'true' to hide it.",
+        side_effect: PrefSideEffect::None,
+    },
+    // The key is spelled out rather than reusing `PREF_SELF_CURATED_CONTEXT_MODE`
+    // because the context-mode eval reads this file as TEXT: it scans for
+    // `key: "…"` to decide whether the engine it is about to measure knows the
+    // flag at all. A constant here would read as absent and refuse the run.
+    // `the_context_mode_key_is_spelled_out_for_the_eval_scan` pins both halves.
+    PrefSpec {
+        key: "self_curated_context_mode",
+        label: "Self-curated context mode",
+        scope: PrefScope::Global,
+        value: PrefValue::Bool,
+        default: "false",
+        description: "EXPERIMENTAL, off by default. When 'true', a chat or trigger thread runs the self-curated context mode. Tool results are then swept away in batches: every ten rounds the sweep takes everything more than five rounds old, and the call that made each one leaves with it. Nothing stands in their place, and doing nothing holds a result until the sweep. The agent keeps its picture of the job in a working understanding it writes as ordinary text in its own reply, and holds one item longer by naming its evt-<hex> address under a [KEEP OPEN] heading there. A context panel rides at the tail of every round, stating how full the prompt is, what each item costs and how long it has left. Everything else rides as it always did, except that the previous turn's tool calls are not re-sent, the conversation summariser does not run, and `todo_write` is withdrawn because the checklist moved into the same block. Coding-agent threads are unaffected. The risk is a re-fetch: a result the agent needed and did not write down costs a round to read back. Leave it off unless the user asked for it.",
+
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "self_curated_context_expire_after_rounds",
+        label: "Context expiry age (rounds)",
+        scope: PrefScope::Global,
+        value: PrefValue::Number { min: 1.0, max: 1000.0 },
+        default: "5",
+        description: "How old a tool result has to be before a sweep may take it, in rounds. Only read when `self_curated_context_mode` is 'true'. A sweep takes everything past this age, so with the default sweep interval an item lives 6 to 15 rounds and averages ten. The number is provisional and the eval sweeps it, so the prompt and the panel both quote whatever is in force.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "self_curated_context_sweep_every_rounds",
+        label: "Context sweep interval (rounds)",
+        scope: PrefScope::Global,
+        value: PrefValue::Number { min: 1.0, max: 1000.0 },
+        default: "10",
+        description: "How often the sweep runs, in rounds. Only read when `self_curated_context_mode` is 'true'. Removing a pair from the middle of the request invalidates every cached byte after it, so the pass is scheduled rather than run every round: nine rounds in ten are pure appends and keep the cache discount. Setting it to 1 restores a per-round drop and pays that cost on every round.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -363,6 +450,7 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("command_guard", "the command guard is the safety gate over the agent's own bash/python — toggle it in Settings → Permissions, not via set_preference"),
     ("command_guard_judge", "managed in Settings → Permissions (Command safety)"),
     ("model_command_judge", "managed in Settings → Permissions (Command safety)"),
+    ("reasoning_command_judge", "the judge's thinking budget is part of the command guard, so it is managed in Settings → Permissions (Command safety), not via set_preference"),
     ("max_tool_calls", "the per-turn tool-call cap is the backstop over your own agentic loop, so you must not raise your own limit; the user changes it in Settings → Models → Chat & triggers"),
     ("capture_context", "a debug-only context-capture toggle; change it in Settings if you really need to"),
     ("backup_last_run", "internal backup state, not a setting"),
@@ -630,6 +718,28 @@ mod tests {
         );
     }
 
+    /// Settings advertises a default the sweep must actually run at. The pair
+    /// is written in three places (here, the engine, and the eval's pins), and
+    /// only the engine's is the one the pass reads.
+    #[test]
+    fn the_catalog_states_the_schedule_the_sweep_runs_at() {
+        let lookup = |key: &str| CATALOG.iter().find(|spec| spec.key == key);
+        assert_eq!(
+            lookup("self_curated_context_expire_after_rounds")
+                .expect("the expiry key is in the catalog")
+                .default,
+            crate::engine::DEFAULT_EXPIRE_AFTER_ROUNDS.to_string(),
+            "Settings advertises an expiry age the sweep does not use"
+        );
+        assert_eq!(
+            lookup("self_curated_context_sweep_every_rounds")
+                .expect("the interval key is in the catalog")
+                .default,
+            crate::engine::DEFAULT_SWEEP_EVERY_ROUNDS.to_string(),
+            "Settings advertises a sweep interval the sweep does not use"
+        );
+    }
+
     /// A default the enum does not allow is a default nothing can ever hold: the
     /// agent reports it, the user asks for it, and `set_preference` rejects the
     /// value it was just told to use. A single typo is enough, and nothing else
@@ -650,6 +760,80 @@ mod tests {
                 spec.key,
                 spec.default,
                 allowed.join(", ")
+            );
+        }
+    }
+
+    /// The mode's flag, in the exact shape its eval reads.
+    ///
+    /// The harness resolves whether the engine implements the mode by scanning
+    /// this file for `key: "…"` and asking whether the flag is among them
+    /// (`lucidos_eval::manipulation::declared_keys`). It has no HTTP route to
+    /// ask, because the write path accepts any key. A constant in the spec
+    /// literal would read as a missing flag and refuse a lean run, while the
+    /// engine itself still compiled and worked.
+    #[test]
+    fn the_context_mode_key_is_spelled_out_for_the_eval_scan() {
+        let source = include_str!("preference_catalog.rs");
+        assert!(
+            source.contains(&format!(
+                "key: \"{}\"",
+                crate::core::PREF_SELF_CURATED_CONTEXT_MODE
+            )),
+            "the catalog must spell the context-mode key out as a literal"
+        );
+
+        let spec = lookup(crate::core::PREF_SELF_CURATED_CONTEXT_MODE)
+            .expect("the context-mode flag is agent-settable");
+        assert_eq!(spec.scope, PrefScope::Global);
+        assert_eq!(spec.default, "false", "the mode ships dark");
+        assert!(validate(spec, "true").is_ok());
+        assert!(validate(spec, "false").is_ok());
+        assert!(validate(spec, "lean").is_err());
+    }
+
+    /// The catalog tells the agent what a background reasoning key defaults
+    /// to; `engine::aux_purpose` is what the call actually uses. Two
+    /// declarations of one number drift, and the agent would then describe a
+    /// default the engine does not apply.
+    #[test]
+    fn background_reasoning_defaults_match_what_the_call_uses() {
+        for purpose in [
+            crate::engine::ContextPurpose::Title,
+            crate::engine::ContextPurpose::ImageDescribe,
+            crate::engine::ContextPurpose::Memory,
+            crate::engine::ContextPurpose::ConversationSummary,
+        ] {
+            let reasoning = crate::engine::aux_purpose::model_prefs(purpose)
+                .and_then(|p| p.reasoning)
+                .expect("every background purpose has a reasoning half");
+            let spec = lookup(reasoning.key)
+                .unwrap_or_else(|| panic!("{} must be in the catalog", reasoning.key));
+            assert_eq!(
+                spec.default, reasoning.default,
+                "{} defaults differ between the catalog and the call",
+                reasoning.key
+            );
+        }
+    }
+
+    /// Same drift guard for the model half, so the catalog cannot name a key
+    /// no purpose reads.
+    #[test]
+    fn every_background_model_key_is_in_the_catalog() {
+        for purpose in [
+            crate::engine::ContextPurpose::Title,
+            crate::engine::ContextPurpose::ImageDescribe,
+            crate::engine::ContextPurpose::Memory,
+            crate::engine::ContextPurpose::ConversationSummary,
+            crate::engine::ContextPurpose::ImageGen,
+        ] {
+            let prefs = crate::engine::aux_purpose::model_prefs(purpose).expect("prefs");
+            assert!(
+                lookup(prefs.model_key).is_some(),
+                "{} is read by {:?} but is not settable",
+                prefs.model_key,
+                purpose
             );
         }
     }

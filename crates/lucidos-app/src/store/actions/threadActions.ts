@@ -100,6 +100,8 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     thread.meta.section,
     hasPendingChanges,
     descendantsBlockArchive,
+    thread.meta.liveEventWaitCount > 0,
+    thread.meta.activeChildrenCount > 0,
     hasUnsentDraft,
     isSaved,
   );

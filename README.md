@@ -232,6 +232,8 @@ for the architecture.
 - **An LLM provider** (Anthropic, OpenAI, OpenRouter, xAI, Vertex AI, or a local
   OpenAI-compatible endpoint such as Ollama / LM Studio / vLLM). Configure it in
   **Settings → Models → Providers**, or via the environment variables below.
+  The same screen also offers **OpenCode Free**, a keyless tier that needs no
+  account and no key. It is off by default, and the toggle explains the terms.
 
 ## Dev Setup
 
@@ -347,7 +349,7 @@ instead.
 |-----------|--------|
 | Language | Rust |
 | UI | Web frontend, wrapped by Tauri on the desktop |
-| LLM | Anthropic / OpenAI / OpenRouter / xAI / Vertex AI / local (configurable) |
+| LLM | Anthropic / OpenAI / OpenRouter / xAI / Vertex AI / OpenCode Free / local (configurable) |
 | Event Store | PostgreSQL + pgvector |
 | Embeddings | fastembed (in-process, local) |
 | Execution | Lucidos-managed Python |

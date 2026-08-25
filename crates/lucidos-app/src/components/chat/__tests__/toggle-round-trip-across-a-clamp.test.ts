@@ -1,4 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 
 // Stub HTMLElement before importing the modules that reference it, exactly as
 // the sibling scroll suites do.
@@ -205,6 +211,26 @@ describe('a turn-control toggle returns the reader across a clamp', () => {
     toggle(el, anchor, ANCHOR_TALL, TALL);
 
     expect(el.scrollTop).toBe(SHORT_MAX + (ANCHOR_TALL - ANCHOR_SHORT));
+  });
+
+  it('derives the clamp from the extent, never from reading the write back', () => {
+    // `wanted - container.scrollTop` is ONE read rather than a difference of
+    // two, so it carries whatever the engine answers with. Reading `scrollTop`
+    // in the write's own task, on a container whose children just changed, does
+    // not reliably answer the new value. On WebKit that measured a debt nobody
+    // was owed. The reverse press then paid out several hundred pixels of it,
+    // in one run out of a few.
+    //
+    // A source scan rather than a behavioural test. The failure is a browser's
+    // own timing, which this suite's honest container cannot produce. Every
+    // model of it that could was a fiction the rest of the harness saw through.
+    // What IS checkable is that no read-back is used.
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../CreateThreadView.tsx'),
+      'utf8',
+    );
+    expect(source).toMatch(/const landed = landingScrollTop\(container, wanted\);/);
+    expect(source).not.toMatch(/rememberAnchorDebt\([^)]*container\.scrollTop/);
   });
 
   it('a transcript too short to scroll never moves at all', () => {

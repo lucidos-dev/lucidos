@@ -1,17 +1,17 @@
 /* ───────────────────────────────────────────────────────────────────────
    The prompt-bar popover shell, shared by the todo indicator
-   (`styles/chat/todo-list.css`) and the subscription indicator
-   (`styles/chat/event-waits.css`). Both open off an `.icon-btn` in the prompt
+   (`styles/chat/todo-list.css`) and the waiting indicator
+   (`styles/chat/waiting-indicator.css`). Both open off an `.icon-btn` in the prompt
    bar's actions row through the same `<Overlay anchor backdrop={false} portal>`
    wiring, and were written identically before this was extracted. A surface
    keeps only its own width.
 
    It lives in its OWN file, imported by `chat.css` BEFORE both surfaces, and
    that ordering is load-bearing rather than tidy. The shell and a surface class
-   land on the SAME element (`panelClass="prompt-bar-popover event-wait-panel"`)
+   land on the SAME element (`panelClass="prompt-bar-popover waiting-panel"`)
    at the same specificity, so the cascade is decided by source order alone.
    While the shell sat inside `todo-list.css` it therefore beat every rule in
-   `event-waits.css`, which loads first: `.event-wait-panel`'s
+   `waiting-indicator.css`, which loads first: `.waiting-panel`'s
    `max-width: min(26rem, …)` lost to the shell's bare fit cap and the panel grew
    to the full viewport width, running out of the thread pane and leaving its
    description on one unbroken line. `.todo-panel` never showed it, because it is

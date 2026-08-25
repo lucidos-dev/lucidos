@@ -15,3 +15,4 @@ export * from './client/settings';
 export * from './client/models';
 export * from './client/mcp';
 export * from './client/pluginMarketplaces';
+export * from './client/webhooks';

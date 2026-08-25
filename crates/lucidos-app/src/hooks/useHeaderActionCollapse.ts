@@ -102,6 +102,21 @@ export function computeHeaderCollapse(input: HeaderCollapseInput): HeaderCollaps
   return { collapsed: candidates[candidates.length - 1], titleEllipsized: true };
 }
 
+/** Mobile's collapse count, which measures nothing: the row folds every action
+ *  into the ⋯ menu at any width. The one exception is a LONE action, which keeps
+ *  its own icon. The ⋯ trigger replaces it one box for one box, so the menu buys
+ *  the user a tap to reach a glyph that already fits. Desktop refuses the same
+ *  trade by never offering a collapse of exactly one (see
+ *  `HeaderCollapseResult.collapsed`).
+ *
+ *  It costs the row nothing either. An action and the ⋯ trigger are the same
+ *  `.icon-btn.header-icon` box, so the trailing cluster stays two boxes wide.
+ *  The centred cluster's edge reserve is untouched
+ *  (`--header-nav-edge-reserve`, styles/header-mark.css). */
+export function mobileCollapseCount(actionCount: number): number {
+  return actionCount === 1 ? 0 : actionCount;
+}
+
 /** Which boxes a cluster's collapse measurement reads. Every collapsing header
  *  row has the same shape, so the two callers differ only in selectors.
  *
@@ -136,11 +151,12 @@ export interface HeaderCollapseTargets {
  * header this is, since both are mounted at once and only one is visible. The
  * two layouts answer the question completely differently:
  *
- * - **Mobile** collapses EVERYTHING, always. The trailing cluster is the
- *   overflow trigger plus the bell whatever the view carries, so it is a
- *   constant width, which is what lets the centred nav cluster be pinned to a
- *   fixed span in CSS (`.header-nav-cluster`) and land in the same place on the
- *   thread and content panes. Nothing is measured. This branch used to run a
+ * - **Mobile** collapses EVERYTHING, always, bar the lone action
+ *   `mobileCollapseCount` leaves standing. The trailing cluster is therefore two
+ *   icon boxes at most: the ⋯ trigger or that one action, plus the bell. That
+ *   bound pins the centred nav cluster to a fixed span in CSS
+ *   (`.header-nav-cluster`), landing it in one place on both panes.
+ *   Nothing is measured. This branch used to run a
  *   `computeMobileHeaderCollapse` that folded the nearest-title actions in one
  *   at a time and published `--mobile-content-title-max` / `-shift` so the
  *   centred box could slide into whichever side had slack; a constant trailing
@@ -254,9 +270,9 @@ export function useHeaderActionCollapse(
     };
   }, [hostRef, actionCount, gapRem, alwaysCollapseFrom, layout, targets.container,
       targets.centre, targets.anchor]);
-  // Mobile collapses the whole set, unconditionally and without a measurement,
-  // so it is also immune to the stale-count race the desktop clamp handles.
-  if (layout === 'mobile') return actionCount;
+  // Mobile answers from the action count alone, without a measurement, so it is
+  // also immune to the stale-count race the desktop clamp handles.
+  if (layout === 'mobile') return mobileCollapseCount(actionCount);
   // Clamp against a stale measurement from a larger action set: the layout
   // effect re-measures before paint, but the intervening render must not
   // slice past the list.

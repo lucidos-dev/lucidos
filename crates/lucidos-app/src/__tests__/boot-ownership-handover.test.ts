@@ -33,6 +33,10 @@ import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src: string = readFileSync(resolve(here, '../main.tsx'), 'utf8');
+const gate: string = readFileSync(
+  resolve(here, '../components/picker/PairingGate.tsx'),
+  'utf8',
+);
 
 /** Source lines with `//` comments stripped, so the prose explaining a rule
  *  cannot be what satisfies the rule. */
@@ -57,12 +61,19 @@ describe('boot ownership handover', () => {
   });
 
   it('never hands over unconditionally at the top level', () => {
-    // A bare `__lucidosBootLoaded?.()` statement at column 0 is the regression:
-    // it disarms the watchdog before the picker chunk has landed. Inside the
-    // `handOverBootOwnership` body the call is indented, so only an unindented
-    // one is a top-level statement.
+    // A handover statement at column 0 is the regression: it disarms the
+    // watchdog before the picker chunk has landed. The `if (!IS_PICKER)` form
+    // below is the one sanctioned unindented call, and the next test pins it.
+    //
+    // Both spellings are scanned. `handOverBootOwnership` is the one main.tsx
+    // uses today, and the raw `__lucidosBootLoaded?.()` is what re-inlining the
+    // helper here would bring back. Matching only the raw hook is how this guard
+    // went vacuous the moment the helper moved to `utils/bootSplash.ts`.
     const unconditional = codeLines.filter(
-      (l: string) => /__lucidosBootLoaded\?\.\(\)/.test(l) && /^\S/.test(l),
+      (l: string) =>
+        /^\S/.test(l) &&
+        /(handOverBootOwnership|__lucidosBootLoaded\?\.)\(\)/.test(l) &&
+        !l.startsWith('if ('),
     );
     expect(
       unconditional,
@@ -82,5 +93,53 @@ describe('boot ownership handover', () => {
       /handOverBootOwnership\(\);/.test(pickerLoaderBody() ?? ''),
       'the picker path must hand over once its own chunk resolves',
     ).toBe(true);
+  });
+});
+
+/**
+ * The pairing screen is the third boot path, and it reaches neither of the two
+ * above. `PairingGate` renders it INSTEAD of `WorkspacePicker`, so the lazy
+ * loader that hands over never runs and the picker's `dismissBootSplash` never
+ * fires. Both were missing when pairing shipped: the screen reloaded itself at
+ * 15s, then sat under a full-viewport tap-to-retry splash that reloaded on a
+ * click anywhere.
+ */
+describe('the pairing screen owns its own boot', () => {
+  it('hands over once, and only for the unpaired state', () => {
+    const calls = gate.match(/handOverBootOwnership\(\)/g) ?? [];
+    expect(calls, 'exactly one handover site in the gate').toHaveLength(1);
+    expect(
+      /if \(state === 'unpaired'\) handOverBootOwnership\(\);/.test(gate),
+      "gate the handover on 'unpaired': the other states still render the lazy picker",
+    ).toBe(true);
+  });
+
+  it('dismisses the boot splash, which otherwise covers the form', () => {
+    expect(
+      /dismissBootSplash\(\)/.test(gate),
+      'nothing else dismisses the splash on this path',
+    ).toBe(true);
+  });
+
+  it('leaves no screen it can paint under the cover', () => {
+    // One call per screen: the self-pair card, the install recipe, the form.
+    // Each uncovers for itself, because a parent cannot see a child decide.
+    const uses = gate.match(/useUncoverOnPaint\(/g) ?? [];
+    expect(uses, 'one per screen the gate can paint, plus the definition').toHaveLength(4);
+    expect(
+      /dismissBootSplash\(\)/.test(gate.slice(gate.indexOf('function useUncoverOnPaint'))),
+      'the hook is the only thing that lifts the cover',
+    ).toBe(true);
+    const raw = gate.match(/dismissBootSplash\(\)/g) ?? [];
+    expect(raw, 'no screen may call it around the hook').toHaveLength(1);
+  });
+
+  it('uncovers on paint, not on mount, wherever a branch can draw nothing', () => {
+    // Two screens hold the cover past a decision: the Tauri self-pair, and a
+    // launch code redeeming on sight. Uncovering there would swap a covered
+    // screen for a blank one. On the launch-code path it is worse than blank:
+    // the form asks the user to pair a device already pairing.
+    expect(gate).toMatch(/useUncoverOnPaint\(auto === 'running' && showBusy\);/);
+    expect(gate).toMatch(/useUncoverOnPaint\(autoPair === 'done' \|\| showAutoPair\);/);
   });
 });

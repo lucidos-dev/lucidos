@@ -40,7 +40,7 @@ pub(crate) const MAX_TODO_ITEMS: usize = 50;
 
 /// Standalone handler so tests can drive validation branches without a full
 /// engine boot — `LucidosEngine::execute_todo_write` is the thin wrapper.
-/// Pattern mirrors `dismiss_from_context_impl` in `tools/mod.rs`.
+/// Pattern mirrors `query_events_impl` in `tools/mod.rs`.
 pub(crate) async fn todo_write_impl(
     event_bus: &EventBus,
     args: &serde_json::Value,
@@ -116,17 +116,40 @@ pub(crate) async fn todo_write_impl(
         items.push(item);
     }
 
+    // Replace-whole-list covers the notes too, so an omitted `notes` clears
+    // them exactly as an omitted item drops it. Blank counts as absent: a
+    // whitespace note is not worth storing, and "clear my notes" then has one
+    // spelling the model cannot get wrong.
+    //
+    // A non-string is refused rather than read as absent, matching `todos`.
+    // No schema offers the field, so nothing reaches here but a model writing
+    // one anyway. Dropping that silently would erase a gloss on a call the
+    // model believed had kept it.
+    let notes = match args.get("notes") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(raw)) => {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Some(_) => return Err("Error: `notes` must be a string".to_string()),
+    };
+
     let count = items.len();
+    let noted = notes.is_some();
     event_bus
         .emit(BusEvent::Thread {
             thread_id,
-            event: ThreadEvent::TodoListWritten { items },
+            event: ThreadEvent::TodoListWritten { items, notes },
             meta: EventMeta::NONE,
         })
         .await
         .map_err(|e| format!("Error: failed to emit TodoListWritten: {}", e))?;
 
-    Ok(format!("Todo list updated ({} items)", count))
+    Ok(format!(
+        "Todo list updated ({} items{})",
+        count,
+        if noted { ", notes kept" } else { "" }
+    ))
 }
 
 /// Was this thread holding an unresolved *event wait* as of `as_of_seq`?
@@ -173,25 +196,39 @@ async fn thread_held_event_wait(
     .await
 }
 
-/// The thread's newest todo list, as its items plus the sequence it was written
-/// at.
+/// The thread's newest todo list: its items, its *todo notes*, and the sequence
+/// it was written at.
 ///
-/// `Ok(None)` folds together three cases every caller treats alike: no list was
-/// ever written, the row's payload is malformed, and the list is empty. A
-/// coding-agent thread is always the first of those, since Claude Code has its
-/// own `TodoWrite` and never emits this event.
+/// An EMPTY list is a real snapshot here and is returned as one, because the
+/// notes can outlive the items: an agent that finished its plan and still holds
+/// a pointer worth keeping writes `todos: []` with notes. Callers that only
+/// care about work in flight check `items` themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TodoSnapshot {
+    pub(crate) items: Vec<TodoItem>,
+    pub(crate) notes: Option<String>,
+    pub(crate) sequence: i64,
+}
+
+/// The thread's newest todo list, or `None` when there is nothing to read.
 ///
-/// `Err` is none of those. It is the question going unanswered, which callers
-/// must not read as "nothing open" (`.claude/rules/rust.md`).
+/// `Ok(None)` folds two cases every caller treats alike: no list was ever
+/// written, and the row's payload is malformed. A coding-agent thread is always
+/// the first, since Claude Code has its own `TodoWrite` and never emits this.
 ///
-/// Shared by the settle and the *wake check* so the two cannot come to disagree
-/// about which list is current. They differ in what they do next: the settle
-/// compares the sequence against its terminator, while the wake check runs
-/// inside the turn, where the newest list is current by definition.
-async fn latest_todo_list(
+/// `Err` is neither. It is the question going unanswered, which callers must
+/// not read as "nothing open" (`.claude/rules/rust.md`).
+///
+/// Shared by the settle, the *wake check* and the mode's turn setup, which
+/// seeds the `[TODO]` heading of the *working understanding*. None of the three
+/// can then disagree about which list is current. They differ in
+/// what they do next: the settle compares the sequence against its terminator,
+/// while the other two run inside the turn, where the newest list is current by
+/// definition.
+pub(crate) async fn latest_todo_list(
     pool: &PgPool,
     thread_id: Uuid,
-) -> Result<Option<(Vec<TodoItem>, i64)>, sqlx::Error> {
+) -> Result<Option<TodoSnapshot>, sqlx::Error> {
     let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
         "SELECT payload, sequence FROM events \
          WHERE thread_id = $1 AND event_type = 'TodoListWritten' \
@@ -201,7 +238,7 @@ async fn latest_todo_list(
     .fetch_optional(pool)
     .await?;
 
-    let Some((payload, seq)) = row else {
+    let Some((payload, sequence)) = row else {
         return Ok(None);
     };
 
@@ -216,7 +253,16 @@ async fn latest_todo_list(
         return Ok(None);
     };
 
-    Ok((!items.is_empty()).then_some((items, seq)))
+    let notes = payload
+        .get("notes")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    Ok(Some(TodoSnapshot {
+        items,
+        notes,
+        sequence,
+    }))
 }
 
 /// How many items on the thread's newest todo list are still open.
@@ -225,11 +271,9 @@ async fn latest_todo_list(
 /// question the settle answers moments later. A second definition of "open"
 /// would let the gate and the panel describe different work.
 pub(crate) async fn open_todo_count(pool: &PgPool, thread_id: Uuid) -> Result<usize, sqlx::Error> {
-    Ok(latest_todo_list(pool, thread_id)
-        .await?
-        .map_or(0, |(items, _)| {
-            items.iter().filter(|i| i.status.is_open()).count()
-        }))
+    Ok(latest_todo_list(pool, thread_id).await?.map_or(0, |list| {
+        list.items.iter().filter(|i| i.status.is_open()).count()
+    }))
 }
 
 impl LucidosEngine {
@@ -320,7 +364,11 @@ pub async fn settle_open_todos(
     // The list is read at-or-before nothing: `latest_todo_list` takes the
     // newest row whatever its sequence, and the race check below is what scopes
     // it to this terminator.
-    let (items, latest_seq) = match latest_todo_list(pool, thread_id).await {
+    let TodoSnapshot {
+        items,
+        notes,
+        sequence: latest_seq,
+    } = match latest_todo_list(pool, thread_id).await {
         Ok(Some(found)) => found,
         Ok(None) => return,
         Err(e) => {
@@ -356,7 +404,15 @@ pub async fn settle_open_todos(
     // exactly the reported bug the Waiting split exists to fix. Read from the
     // in-memory registry, so it depends on no ordering.
     if holds_background_work {
-        settle_to(event_bus, pool, thread_id, items, TodoStatus::Waiting).await;
+        settle_to(
+            event_bus,
+            pool,
+            thread_id,
+            items,
+            notes,
+            TodoStatus::Waiting,
+        )
+        .await;
         return;
     }
 
@@ -376,7 +432,7 @@ pub async fn settle_open_todos(
         }
     };
 
-    settle_to(event_bus, pool, thread_id, items, settled_status).await;
+    settle_to(event_bus, pool, thread_id, items, notes, settled_status).await;
 }
 
 /// Rewrite every OPEN item to `settled_status` and re-emit the list.
@@ -385,11 +441,16 @@ pub async fn settle_open_todos(
 /// unresolved *event wait* at the terminator, and unfinished background work
 /// the tail is about to subscribe to. `pool` is unused today and is taken so
 /// the signature does not change if the no-op check ever needs the store.
+///
+/// `notes` rides through untouched. Replace-whole-list means this re-emit IS
+/// the list from here on. Dropping them would have the engine erase what the
+/// agent wrote, every time a turn ended with an item still open.
 async fn settle_to(
     event_bus: &EventBus,
     _pool: &PgPool,
     thread_id: Uuid,
     items: Vec<TodoItem>,
+    notes: Option<String>,
     settled_status: TodoStatus,
 ) {
     // A list already settled to this exact status is left alone. Without this
@@ -420,7 +481,10 @@ async fn settle_to(
         .emit_or_log(
             BusEvent::Thread {
                 thread_id,
-                event: ThreadEvent::TodoListWritten { items: settled },
+                event: ThreadEvent::TodoListWritten {
+                    items: settled,
+                    notes,
+                },
                 meta: EventMeta::NONE,
             },
             "[Todo] TodoListWritten (auto-settle open items)",
@@ -450,7 +514,7 @@ mod tests {
             match ev.typed {
                 BusEvent::Thread {
                     thread_id: tid,
-                    event: ThreadEvent::TodoListWritten { items },
+                    event: ThreadEvent::TodoListWritten { items, .. },
                     ..
                 } if tid == thread_id => return items,
                 _ => continue,
@@ -485,6 +549,145 @@ mod tests {
         assert_eq!(items[2].status, TodoStatus::Pending);
         assert_eq!(items[1].content, "Write tests");
         assert_eq!(items[1].active_form, "Writing tests");
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Read the notes off the newest list, which is what the prompt block does.
+    async fn latest_notes(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+        latest_todo_list(pool, thread_id)
+            .await
+            .expect("the list reads")
+            .and_then(|list| list.notes)
+    }
+
+    /// ADR 0085 decision 1: notes ride beside the items on the same call, and
+    /// replace-whole-list covers them too.
+    #[tokio::test]
+    async fn todo_write_keeps_notes_beside_the_items_and_replaces_them_whole() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let with_notes = json!({
+            "todos": [
+                { "content": "a", "active_form": "doing a", "status": "pending" },
+            ],
+            "notes": "collect.sh needs bash 5, /opt/homebrew/bin/bash works",
+        });
+        let out = todo_write_impl(&bus, &with_notes, thread_id).await;
+        assert!(
+            matches!(&out, Ok(s) if s.contains("notes kept")),
+            "got: {:?}",
+            out
+        );
+        assert_eq!(
+            latest_notes(&pool, thread_id).await.as_deref(),
+            Some("collect.sh needs bash 5, /opt/homebrew/bin/bash works")
+        );
+
+        // A later call that carries no notes drops them, exactly as an omitted
+        // item drops it. There is one way to clear the block and it is the same
+        // way the list is cleared.
+        let without = json!({
+            "todos": [
+                { "content": "a", "active_form": "doing a", "status": "completed" },
+            ]
+        });
+        todo_write_impl(&bus, &without, thread_id)
+            .await
+            .expect("second write");
+        assert_eq!(latest_notes(&pool, thread_id).await, None);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// Blank is absent. A whitespace note is not worth storing, and folding the
+    /// two means the model has one spelling for "clear my notes".
+    #[tokio::test]
+    async fn todo_write_treats_a_blank_note_as_no_note() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let args = json!({ "todos": [], "notes": "   \n  " });
+        let out = todo_write_impl(&bus, &args, thread_id).await;
+        assert!(
+            matches!(&out, Ok(s) if !s.contains("notes kept")),
+            "got: {:?}",
+            out
+        );
+        assert_eq!(latest_notes(&pool, thread_id).await, None);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// A wrong-typed `notes` is refused, not read as "clear them".
+    ///
+    /// `todos` already errors on the wrong type. Notes are the one block the
+    /// context mode leaves the model across a boundary. Losing them with no
+    /// message is the worst way for this call to go wrong.
+    #[tokio::test]
+    async fn todo_write_refuses_a_non_string_note() {
+        let (bus, _rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        todo_write_impl(&bus, &json!({"todos": [], "notes": "kept"}), thread_id)
+            .await
+            .expect("seed write");
+
+        for bad in [json!(42), json!(["a"]), json!({"text": "a"}), json!(true)] {
+            let out = todo_write_impl(&bus, &json!({"todos": [], "notes": bad}), thread_id).await;
+            assert!(
+                matches!(&out, Err(msg) if msg.contains("`notes` must be a string")),
+                "got: {:?}",
+                out,
+            );
+        }
+        assert_eq!(
+            latest_notes(&pool, thread_id).await.as_deref(),
+            Some("kept"),
+            "a refused call must not have written anything"
+        );
+
+        // Explicit null is the model saying "no notes", not a type error.
+        todo_write_impl(&bus, &json!({"todos": [], "notes": null}), thread_id)
+            .await
+            .expect("null clears");
+        assert_eq!(latest_notes(&pool, thread_id).await, None);
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// The settle re-emits the whole list, so it must carry the notes through.
+    /// Dropping them would erase what the agent wrote every time a turn ended
+    /// with an item still open, which is most of them.
+    #[tokio::test]
+    async fn settling_the_list_leaves_the_notes_alone() {
+        let (bus, mut rx, pool, db) = setup().await;
+        let thread_id = Uuid::new_v4();
+
+        let args = json!({
+            "todos": [
+                { "content": "a", "active_form": "doing a", "status": "in_progress" },
+            ],
+            "notes": "the report is at artifacts/reports/week.md",
+        });
+        todo_write_impl(&bus, &args, thread_id)
+            .await
+            .expect("seed write");
+        drain_todo_events_for(&mut rx, thread_id).await;
+
+        settle_open_todos(&bus, &pool, thread_id, i64::MAX, false).await;
+        let settled = next_todo_event(&mut rx, thread_id).await;
+        assert_eq!(settled[0].status, TodoStatus::Abandoned);
+        assert_eq!(
+            latest_notes(&pool, thread_id).await.as_deref(),
+            Some("the report is at artifacts/reports/week.md"),
+            "the settle must not erase the agent's notes"
+        );
 
         pool.close().await;
         teardown_test_db(&db).await;
@@ -685,7 +888,7 @@ mod tests {
                 Ok(Ok(ev)) => {
                     if let BusEvent::Thread {
                         thread_id: tid,
-                        event: ThreadEvent::TodoListWritten { items },
+                        event: ThreadEvent::TodoListWritten { items, .. },
                         ..
                     } = ev.typed
                     {

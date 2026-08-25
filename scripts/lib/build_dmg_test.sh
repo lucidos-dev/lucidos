@@ -21,13 +21,22 @@ else
     fail "--check exited $rc; output: $out"
 fi
 
-for name in lucidos-gateway lucidos-engine frontend postgres sdk; do
+for name in lucidos-gateway lucidos-engine frontend postgres sdk system-knowhow; do
     if echo "$out" | grep -q "$name"; then
         pass "mentions $name"
     else
         fail "missing $name from --check output: $out"
     fi
 done
+# The `lucidos` CLI is a distinct bundled resource, and the loop above cannot
+# assert it: every name there is a substring match, so a bare `lucidos` would
+# pass on `lucidos-engine` alone. Match the space-delimited standalone token,
+# as build_headless_test.sh does for the same resource.
+if echo "$out" | grep -qE '(^| )lucidos( |$)'; then
+    pass "mentions the lucidos CLI"
+else
+    fail "missing the lucidos CLI from --check output: $out"
+fi
 
 echo ""
 echo "test: --release version-stamp guard rejects a release-version != RELEASE"

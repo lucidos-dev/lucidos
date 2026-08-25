@@ -182,7 +182,9 @@ impl ScriptHandshakeLayer {
                 let ttl = Duration::from_secs(out.expires_in.max(MIN_HANDSHAKE_TTL_SECS));
                 Ok((out.headers, ttl))
             }
-            Err(e @ RunError::NotFound(_)) => {
+            // Both name a broken `apis.json`, not a broken upstream, so they
+            // answer 500 rather than the 502 every other arm gets.
+            Err(e @ (RunError::NotFound(_) | RunError::PathRejected(_))) => {
                 Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
             }
             Err(e) => Err((StatusCode::BAD_GATEWAY, e.to_string())),

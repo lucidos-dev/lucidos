@@ -239,8 +239,17 @@
        see the note where it used to live, at the end of this file. */
     --header-fg: #ffffff;
     --header-fg-muted: rgba(255, 255, 255, 0.72);
-    --header-control-hover-bg: rgba(255, 255, 255, 0.12);
-    --header-control-active-bg: rgba(255, 255, 255, 0.22);
+    /* The white veil a header control wears: nothing at rest, one step under
+       the pointer, a stronger one while it is toggled on. An ALPHA, plus the
+       CURRENT one, because two things wash the same veil over two different
+       backdrops. The control washes it over the bar. A badge riding that
+       control washes it over the ring colour below. So the ring matches the
+       lighter square its own button drew, instead of notching a dark hole in
+       it. The state rules at the end of this file raise it. */
+    --header-control-veil: 0%;
+    --header-control-veil-hover: 12%;
+    --header-control-veil-active: 22%;
+    --header-control-veil-active-hover: 30%;
     /* Header divider: currently disabled (transparent) so the brand-blue bar
        reads as one seamless header across the drawer/chat/content splits. The
        full-height ::before/::after geometry is kept (matching the pane
@@ -248,6 +257,21 @@
     --header-divider: transparent;
     --header-badge-bg: #ffffff;
     --header-badge-fg: var(--brand-blue-deep);
+    /* The gap that stops a badge FUSING with the glyph it rides. The badge is
+       painted white above and the bar's glyphs are white too, so a badge
+       overlapping one merged into a single shape: the Lucidos mark's count and
+       its bottom-right square read as one teardrop.
+       Painted in the bar's own colour, never transparent. What sits behind the
+       badge is the glyph, so a see-through ring would show the glyph and
+       separate nothing. Mixed from the gradient's two stops rather than
+       written out, so it follows every theme and cannot drift from the bar;
+       35% lands it where a header badge actually sits, about two thirds down.
+       See --header-bar-top in global/base.css.
+
+       This is the BARE bar, and `.app-header .badge` adds the veil of the
+       control the badge rides. */
+    --header-badge-ring: color-mix(in srgb, var(--header-bar-top) 35%, var(--header-bar-bottom));
+    --header-badge-ring-width: 1.5px;
     /* Base bar color: any inherited text / currentColor glyph (e.g. the
        recovery spinner) reads light by default; explicit muted/active variants
        and popout resets override below. */
@@ -1880,11 +1904,15 @@
     color: var(--header-fg-muted);
 }
 
-.app-header .icon-btn.pinned,
+/* Every veiled state below declares its ALPHA and washes it in the same rule,
+   on the same element. Do not hoist the wash to a token on `.pane-header`. The
+   browser substitutes a var() inside a custom property where that property is
+   DECLARED, so the hoisted copy bakes in the resting 0%. */
 .app-header .icon-btn.filter-active,
 .app-header .icon-btn.view-selector-active {
+    --header-control-veil: var(--header-control-veil-active);
     color: var(--header-fg);
-    background: var(--header-control-active-bg);
+    background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
 }
 
 .app-header .icon-btn:focus-visible {
@@ -1896,14 +1924,16 @@
 
 @media (hover: hover) {
     .app-header .icon-btn:hover {
+        --header-control-veil: var(--header-control-veil-hover);
         color: var(--header-fg);
-        background: var(--header-control-hover-bg);
+        background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
     }
 
     .app-header .icon-btn.filter-active:hover,
     .app-header .icon-btn.view-selector-active:hover {
+        --header-control-veil: var(--header-control-veil-active-hover);
         color: var(--header-fg);
-        background: rgba(255, 255, 255, 0.3);
+        background: color-mix(in srgb, var(--header-fg) var(--header-control-veil), transparent);
     }
 }
 
@@ -1936,10 +1966,35 @@
 }
 
 /* Count badges (notification bell, brand update count): a white pill with blue
-   text, so they read against the bar instead of vanishing into the blue. */
+   text, so they read against the bar instead of vanishing into the blue.
+   The ring is the other half of that: white-on-blue is what makes them legible
+   against the BAR, and white-on-white is what made them fuse with the GLYPH
+   they sit on. Every badge on this bar gets both, so the bell, the Lucidos
+   mark's unread count, and its build / update / pending badge all sit the same
+   way. `box-shadow` rather than a border, so the ring costs no layout: a border
+   would grow the badge's box, and the mark places both of its badges with a
+   `calc()` against that box.
+
+   The ring takes the bar PLUS whatever veil the control it rides is wearing.
+   On a hovered or toggled-on button it then reads as that button's own lighter
+   square, rather than as a dark hole punched through it. It transitions on the
+   button's own timing, so the two arrive together. */
 .app-header .badge {
     background: var(--header-badge-bg);
     color: var(--header-badge-fg);
+    box-shadow: 0 0 0 var(--header-badge-ring-width)
+        color-mix(in srgb, var(--header-fg) var(--header-control-veil), var(--header-badge-ring));
+    transition: box-shadow var(--duration-normal);
+}
+
+/* The reduced-motion block in global/modal-overlay.css cancels the button's
+   own transitions. The ring's cancel lives here instead. main.tsx imports that
+   sheet before this one, and both selectors are (0,2,0). The copy there would
+   lose the tie, and the ring would fade against a button that snapped. */
+@media (prefers-reduced-motion: reduce) {
+    .app-header .badge {
+        transition: none;
+    }
 }
 
 /* A popout anchored in the header needs no token restore, because it is never

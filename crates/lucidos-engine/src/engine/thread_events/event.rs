@@ -136,10 +136,20 @@ pub enum ThreadEvent {
     /// trim budget's conservative 1.5); the modal renders both so the user
     /// can spot estimator drift.
     ///
-    /// `sections` sum to exactly the chars behind `estimated_total_tokens`,
-    /// which is what lets the LLM Context Viewer render each section as a
-    /// share of the capture's headline total rather than re-deriving a ratio
-    /// of its own. Keep that true when adding a section.
+    /// A section's `budget_delta_chars` is the one that sums, and over a
+    /// capture they sum to exactly the chars behind `estimated_total_tokens`.
+    /// That is what lets the LLM Context Viewer render each section as a share
+    /// of the headline total. Without it the panel would re-derive a ratio of
+    /// its own. Keep it true when adding a section, and never sum
+    /// `content_chars`: on `Conversation` it counts the tree a second time.
+    ///
+    /// **Not every capture is a turn.** `purpose` names which call this was.
+    /// An *auxiliary model call* emits one too, so token accounting sees the
+    /// engine's own spend. Build those through
+    /// [`crate::engine::AuxCapture`], never by hand: it is what keeps
+    /// `producer` and `purpose` agreeing. The transcript projection renders
+    /// only `Turn` rows. A capture binds to the step it follows, so an aux
+    /// row would overwrite that step's context chip.
     ContextCaptured {
         producer: crate::engine::ContextProducer,
         model: String,
@@ -152,6 +162,30 @@ pub enum ThreadEvent {
         usage: Option<crate::engine::ApiUsage>,
         #[serde(default, skip_serializing_if = "is_false")]
         trimmed: bool,
+        /// Which trim passes cut something, ascending. Empty when none did.
+        ///
+        /// `trimmed` says a round lost content and this says where from. The
+        /// distinction that matters is pass 5, the only one that removes a
+        /// message rather than leaving an addressed stub. Absent on every row
+        /// written before the field existed, which reads as unknown rather
+        /// than as none: those rows recorded a boolean and nothing else.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trim_passes: Vec<u8>,
+        /// Which call this records. Absent on every row written before the
+        /// field existed. Absent on every turn row since, so it defaults to
+        /// `Turn` and serializes only for an auxiliary call.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::ContextPurpose::is_turn"
+        )]
+        purpose: crate::engine::ContextPurpose,
+        /// True when the row was rebuilt after the fact from other events
+        /// rather than recorded at the call. Its numbers are estimates, and
+        /// it deliberately carries no `usage`, so a rollup that filters on a
+        /// present `usage` block keeps reporting measured spend only. Written
+        /// by `core::aux_context_backfill` and by nothing else.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reconstructed: bool,
     },
     /// The engine's automatic pre-turn recall: `retrieve_context` vector-searched
     /// long-term memory with classifier-derived `queries` and injected the hits
@@ -207,6 +241,12 @@ pub enum ThreadEvent {
     /// inline on the tool-call step.
     TodoListWritten {
         items: Vec<TodoItem>,
+        /// *Todo notes*: free text the agent keeps beside the items, replaced
+        /// whole with them (ADR 0085). Absent on an older row and on a call
+        /// that passes none, so it is skipped when serializing and defaults
+        /// when read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
     },
     /// Background task spawned via `run_bash_background` (shell command) OR
     /// `run_python_background` (venv-rooted python script — the engine
@@ -1048,14 +1088,44 @@ pub enum ThreadEvent {
         pending_change_ids: Vec<String>,
     },
 
-    /// The agent (LLM) explicitly asked to drop a prior `ToolCalled` (and its
-    /// matching `ToolResult`) or `ChildThreadCompleted` from future resume
-    /// context. Emitted by the `dismiss_from_context` tool handler after it
-    /// validates that `dismissed_event_id` is a real, dismissible event in the
-    /// same thread. The resume helper (`build_resume_tool_blocks_with_skip_ids`)
-    /// honours these on every subsequent assembly.
+    /// The agent (LLM) asked to drop a prior `ToolCalled` (and its matching
+    /// `ToolResult`) or `ChildThreadCompleted` from future resume context.
+    ///
+    /// **Retired by ADR 0109 and still readable.** Nothing emits it any more:
+    /// `dismiss_from_context` is gone, because the swept window now takes a
+    /// result on its own. Existing workspaces hold rows, and the resume helper
+    /// (`build_resume_tool_blocks_with_skip_ids`) still honours every one, so a
+    /// body dropped before the change stays dropped.
     ContextDismissed {
         dismissed_event_id: uuid::Uuid,
+    },
+
+    /// The agent asked to set one tool result's clock back to zero, by writing
+    /// its address under `[KEEP OPEN]` in its working understanding.
+    ///
+    /// It names a `ToolCalled` on the same thread, that being the one event
+    /// whose body reaches the model as a `tool_result` block. The keep is
+    /// applied where the span is parsed. So this event is the durable record
+    /// the eval counts dispositions from, never the mechanism.
+    ///
+    /// A keep moves the clock and nothing else. It exempts the item from no
+    /// pass, so the trimmer at the wall can always cut.
+    ContextKeptOpen {
+        kept_open_event_id: uuid::Uuid,
+    },
+
+    /// The model's picture of the job, as it wrote it in its own reply.
+    ///
+    /// The one thing that outlives a turn. It carries the body and the
+    /// constraints, and nothing else. The checklist goes to `TodoListWritten`,
+    /// and the held-open addresses are applied and dropped, so a rewrite
+    /// cannot re-assert a keep it made ten rounds ago.
+    ///
+    /// Two forms reach it. A replace sets the document, and an add appends to
+    /// the body and the constraints. Either way this row carries the whole of
+    /// what the thread now holds, so the newest one is the document.
+    WorkingUnderstandingWritten {
+        document: String,
     },
 
     /// A background Flash call produced a text description for one of the
@@ -1083,6 +1153,30 @@ pub enum ThreadEvent {
         model: String,
     },
 
+    /// An auxiliary model compressed this thread's older assistant turns into
+    /// one paragraph. Cached here so a later turn reuses it (ADR 0102).
+    ///
+    /// The summariser lands on a minority of turns. Before this event each
+    /// miss lost the paragraph and rendered a bare "not shown" line. Cached,
+    /// the first success holds for the rest of the thread.
+    ///
+    /// Consumers join by `covers_through_event_id`, which addresses the newest
+    /// assistant turn the paragraph accounts for. `load_chat_history` compares
+    /// it against the older segment to decide whether a refresh is due.
+    ///
+    /// User turns never reach the summariser, so this only ever stands in for
+    /// assistant work.
+    ConversationSummarized {
+        /// The paragraph, exactly as the history block renders it.
+        summary: String,
+        /// The newest assistant turn this paragraph accounts for.
+        covers_through_event_id: uuid::Uuid,
+        /// How many assistant turns went into it.
+        covered_count: u32,
+        /// The model that produced it.
+        model: String,
+    },
+
     /// The thread registered an **event wait**. Emitted by the `await_event`
     /// tool between its `ToolCalled` and that call's `ToolResult`, and it is the
     /// SOURCE OF TRUTH for the wait: there is no `thread_event_waits` table,
@@ -1101,7 +1195,7 @@ pub enum ThreadEvent {
         /// trigger's `on:` list (`core::event_subscription`), per-entry OR.
         on: Vec<EventSubscription>,
         /// The model's own words for why it is waiting. Shown in the
-        /// subscription indicator and the thread card, so the user can tell an
+        /// waiting indicator and the thread card, so the user can tell an
         /// asleep thread from a stalled one.
         reason: String,
         /// When the subscription was armed.

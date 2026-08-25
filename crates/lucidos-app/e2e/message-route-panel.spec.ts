@@ -1,11 +1,17 @@
 import { test, expect } from './fixtures';
 import { randomUUID } from 'crypto';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, disarmFollowSeed } from './helpers';
 import { psql } from './db-helpers';
 
 test.describe('Message route panel', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
+    // Every test here addresses the FIRST badge in the transcript and one
+    // scrolls the pane away from the bottom. The follow seed ships armed, so
+    // it would write the reader back to the live edge under both. That is what
+    // timed out the scroll test on mobile-webkit: Playwright scrolled the badge
+    // into view, the follow took it away again, and the click never landed.
+    await disarmFollowSeed(page);
   });
 
   test('clicking the route badge opens the panel; outside-click closes it', async ({ page }) => {

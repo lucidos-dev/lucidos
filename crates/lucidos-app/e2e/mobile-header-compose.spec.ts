@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { assertHealthy, navigateToApp, waitForVisibleInput, blurActiveElement, getHeaderTop, disableMobileHeaderSticky } from './helpers';
+import { assertHealthy, navigateToApp, waitForVisibleInput, blurActiveElement, getHeaderTop, disableMobileHeaderSticky, enableMobileHeaderSticky } from './helpers';
 
 test.describe('Mobile header in compose view', () => {
   test.use({ viewport: { width: 375, height: 812 } });
@@ -10,6 +10,12 @@ test.describe('Mobile header in compose view', () => {
     // assert the header hides on prompt focus / stays out of the way, so opt
     // out of the sticky pin before the page boots.
     await disableMobileHeaderSticky(page);
+  });
+
+  // The pref is global and the e2e database resets only between projects, so
+  // put it back. See `disableMobileHeaderSticky`.
+  test.afterEach(async ({ page }) => {
+    await enableMobileHeaderSticky(page);
   });
 
   test('prompt is not auto-focused and header is visible after reload in compose view', async ({ page }) => {

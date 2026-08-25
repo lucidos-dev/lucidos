@@ -1023,6 +1023,59 @@ describe('the follow puts the reader back when the PLATFORM moves them', () => {
 
     expect(el.scrollTop).toBe(2500);
   });
+
+  /** THE SAME SCROLL, ARRIVING INSIDE OUR OWN WRITE WINDOW. The helper above
+   *  waits that window out, and the wait is what hid this case.
+   *
+   *  The ride marks a NAVIGATION on every growth round, `markHeldScroll` routing
+   *  through `markNavigationScroll` for the mobile header's sake. A settling
+   *  transcript therefore holds the window open almost continuously, and scroll
+   *  anchoring moves the container all through that settle.
+   *
+   *  A held write's own event lands exactly on the stamp, so `tookOver` already
+   *  excludes it. A scroll that is NOT on the stamp cannot be that write's own
+   *  event, whatever the clock says. */
+  function platformScrollsNowTo(el: { scrollTop: number }, top: number, onScroll: () => void) {
+    el.scrollTop = top;
+    onScroll();
+  }
+
+  it("corrects one landing inside the ride's own write window", () => {
+    const { el, onScroll, onResize } = ridingAndAnchored();
+    setThreadLive(false);
+
+    el.scrollHeight = 4000;
+    onResize();                 // the ride's own write, marked this instant
+    expect(el.scrollTop).toBe(3500);
+
+    platformScrollsNowTo(el, 900, onScroll);
+
+    expect(el.scrollTop).toBe(3500);
+    expect(followingLiveEdge.value).toBe(true);
+    // The recording side reads the position as the ride's own again, so this
+    // thread keeps the live edge as its reading position. Recording the offset
+    // the platform briefly left is what disarmed the follow on the next open.
+    expect(isFollowScroll(el)).toBe(true);
+  });
+
+  it('and does not strand them for every round after it', () => {
+    // One missed correction used to be permanent. The round that missed it also
+    // cleared the held claim and recorded the anchor OFF the edge, which is both
+    // of the readings `keepTheLiveEdge` has. Growth then wrote nothing, ever
+    // again, and the toggle stayed lit over a transcript nothing was following.
+    const { el, onScroll, onResize } = ridingAndAnchored();
+    setThreadLive(false);
+
+    el.scrollHeight = 4000;
+    onResize();
+    platformScrollsNowTo(el, 900, onScroll);
+
+    el.scrollHeight = 5000;
+    onResize();
+
+    expect(el.scrollTop).toBe(4500);
+    expect(followingLiveEdge.value).toBe(true);
+  });
 });
 
 describe('scrolling an IDLE thread keeps the follow', () => {

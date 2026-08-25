@@ -235,8 +235,9 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  every label for this concept contains a waiting word.
  *
  *  At the label rather than at the stored reason, because the text is the
- *  model's and belongs on disk as written. The *subscription indicator*
- *  deliberately does NOT call this: it supplies no verb of its own.
+ *  model's and belongs on disk as written. The *waiting indicator* calls it in
+ *  the one place it supplies a verb, its aria-label. Its tooltip says the
+ *  reason alone, so that one takes the text as written.
  *
  *  Three judgments sit behind the two lines below, and each is a decision
  *  rather than a gap: `to` is not one of the prepositions, only a LEADING
@@ -350,10 +351,12 @@ export type ChildCompletionStatus = 'success' | 'failure' | 'no_changes' | 'canc
 export type PersistScope = 'narrow' | 'broad' | 'session';
 
 /** Mirrors the Rust `EventSubscription` (`core::event_subscription`). One entry
- *  in a subscriber's `on:` list: an event name plus an optional payload filter
- *  using the `$eq/$ne/$lt/$lte/$gt/$gte/$in` operators. A trigger's `on:` and a
- *  thread's event wait are the same shape and run the same matcher, so this one
- *  type serves both. */
+ *  in a subscriber's `on:` list: an event name plus an optional condition. A
+ *  condition key is a field path: a dot reads one level down. Operators:
+ *  `$eq/$ne/$lt/$lte/$gt/$gte/$in/$nin/$regex`, plus `$or` in key position
+ *  taking a list of conditions. A trigger's `on:` and a thread's event wait
+ *  are the same shape and run the same matcher, so this one type serves
+ *  both. */
 export interface EventSubscription {
   event_type: string;
   condition?: unknown;
@@ -390,7 +393,7 @@ export type ThreadEvent =
   | { type: 'ContextAssembled'; sections: ContextSection[]; tools: string[]; model: string; total_chars: number }
   | {
       type: 'ContextCaptured';
-      producer: 'main_llm' | 'claude_code' | 'codex';
+      producer: 'main_llm' | 'claude_code' | 'codex' | 'auxiliary';
       model: string;
       context_window: number;
       /** Absent on snapshot rows (server strips for size — see
@@ -402,8 +405,21 @@ export type ThreadEvent =
       estimated_total_tokens: number;
       usage?: { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number };
       trimmed?: boolean;
+      /** Which trim passes cut something, ascending. `trimmed` says a round
+       *  lost content and this says where from. Pass 5 is the only one that
+       *  removes a message instead of leaving an addressed stub. Absent on
+       *  every row written before the field existed. */
+      trim_passes?: number[];
       /** Stamped by the snapshot endpoint when `sections` + `tools` were dropped. */
       sections_stripped?: boolean;
+      /** Which model call this records. Absent means `turn`, an agent's own
+       *  round trip, which is the only kind the transcript renders. Anything
+       *  else is an *auxiliary model call* the engine made for itself, and
+       *  `isAuxiliaryCapture` keeps it out of the exchange fold. */
+      purpose?: 'turn' | 'title' | 'image_describe' | 'memory' | 'conversation_summary' | 'image_gen';
+      /** Rebuilt after the fact from other events, so its numbers are
+       *  estimates and it carries no `usage`. */
+      reconstructed?: boolean;
     }
   // The engine's automatic pre-turn recall: it vector-searched memory with
   // classifier-derived `queries` and injected the hits before the model ran.
@@ -427,7 +443,11 @@ export type ThreadEvent =
       /** Stamped by the snapshot endpoint when `result` was dropped. */
       result_stripped?: boolean;
     }
-  | { type: 'TodoListWritten'; items: TodoItem[] }
+  | { type: 'TodoListWritten'; items: TodoItem[]; notes?: string }
+  // The agent's picture of the job under the self-curated context mode,
+  // written as ordinary text in its own reply. Rendered as a folded step: the
+  // user can read what the agent decided without it landing in the chat.
+  | { type: 'WorkingUnderstandingWritten'; document: string }
   | { type: 'ResponseGenerated'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; channel?: EventChannel }
   | { type: 'ResponseCanceled'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: CancelCause }
   | { type: 'ResponseAborted'; text?: string; images?: string[]; model?: string; reasoning_effort?: string; request_event_id?: string; actor?: MessageOrigin; channel?: EventChannel; cause?: AbortCause }
@@ -540,6 +560,10 @@ export type ThreadEvent =
   // The agent dropped a prior ToolCalled/ToolResult/ChildThreadCompleted from
   // future resume context via the `dismiss_from_context` tool.
   | { type: 'ContextDismissed'; dismissed_event_id: string }
+  // The agent set one tool result's clock back to zero, by naming its address
+  // under a [KEEP OPEN] heading in its working understanding. A record, never
+  // the mechanism: the keep is applied where the span is parsed.
+  | { type: 'ContextKeptOpen'; kept_open_event_id: string }
   // Background task lifecycle (run_bash_background / run_python_background). The
   // durable audit trail behind the bash_output / bash_kill tools; `command` is
   // the exact shell invocation. Started is paired with a later Completed.
@@ -558,6 +582,13 @@ export type ThreadEvent =
   // title-generation paths — but the type belongs on the union so projections
   // can pattern-match without `as` casts when the SSE stream delivers one.
   | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string }
+  | {
+      type: 'ConversationSummarized';
+      summary: string;
+      covers_through_event_id: string;
+      covered_count: number;
+      model: string;
+    }
   // ── Event-wait lifecycle ──────────────────────────────────────────────
   // The thread subscribed to an event and parked; the engine re-enters it on a
   // match, the deadline, or a user cancel. These DO render. `EventWaitStarted`
@@ -567,7 +598,7 @@ export type ThreadEvent =
   // resolve that row in place by `wait_id`, adding the outcome to the same
   // subject line. A cancel never touches it: see the `EventWaitCanceled` note
   // below. They also feed `meta.liveEventWaits`, which backs the always-visible
-  // subscription indicator.
+  // waiting indicator.
   //
   // `was_attached` records whether the delivery filled in the model's own
   // dangling `await_event` tool call (a seamless mid-thought resume) or arrived
@@ -613,6 +644,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ToolCalled: true,
   ToolResult: true,
   TodoListWritten: true,
+  WorkingUnderstandingWritten: true,
   ResponseGenerated: true,
   ResponseCanceled: true,
   ResponseAborted: true,
@@ -669,9 +701,11 @@ const THREAD_EVENT_TYPE_FLAGS = {
   EventWaitCanceled: true,
   WorktreeCleaned: true,
   ContextDismissed: true,
+  ContextKeptOpen: true,
   BackgroundBashStarted: true,
   BackgroundBashCompleted: true,
   ImageDescribed: true,
+  ConversationSummarized: true,
 } satisfies Record<ThreadEvent['type'], true>;
 
 /** Runtime-enumerable set of every `ThreadEvent['type']` discriminant. Derived
@@ -707,14 +741,8 @@ export interface TodoItem {
  *  the `EventWait*` events (see `handleEvent`).
  *
  *  Held in meta rather than re-derived per render for the same reason as
- *  `latestTodoList`: the subscription indicator is always mounted, so walking
- *  the events Map on every `threadMap` flush would cost a scan per keystroke.
- *
- *  `attached` says whether this wait is the one holding the turn parked. It
- *  starts true (`await_event` is terminal, so registration always parks) and is
- *  flipped by the filler `ToolResult` the engine writes when something forces a
- *  turn to run. That is the same derived fact the engine reads off the pairing,
- *  seen from the client. */
+ *  `latestTodoList`: the waiting indicator is always mounted, so walking
+ *  the events Map on every `threadMap` flush would cost a scan per keystroke. */
 export interface EventWaitSummary {
   wait_id: string;
   on: EventSubscription[];

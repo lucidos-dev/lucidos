@@ -299,6 +299,19 @@
     color: var(--accent);
 }
 
+/* WAITING: the follow toggle's shape again, accent only and no frame, but with
+ * no `.active` to hang it on. The waiting indicator is not a toggle: it renders
+ * only while the thread is parked on a subscription or on a sub-thread, so its
+ * presence IS the on-state and there is no second state to tell apart.
+ *
+ * The token is `--accent`, deliberately, and not the `--accent-notable` a
+ * Waiting thread wears in the Info popover. That one is the neutral tone of a
+ * STATUS, and the status dot keeps it. This is the armed thing behind the
+ * status, so it reads with the row's other live modes. */
+.prompt-actions-row .icon-btn.header-icon[data-role="waiting-indicator"] {
+    color: var(--accent);
+}
+
 .prompt-actions-right {
     display: flex;
     align-items: center;
@@ -486,88 +499,13 @@
 }
 
 /* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
-   control-menu styles, but its root view holds only two rows — a fixed 20rem
-   height would leave a large empty panel. Size to content, capped so a long
-   model list still scrolls. */
+   control-menu styles, but it holds one list rather than a filter box over
+   several sections, so a fixed 20rem height would leave a large empty panel on
+   a short registry. Size to content, capped so a long list still scrolls and a
+   phone keeps the panel inside the viewport. */
 .control-dropdown-auto {
     height: auto;
-    max-height: 20rem;
-}
-
-.control-list {
-    display: flex;
-    flex-direction: column;
-    padding: 0.25rem;
-}
-
-.control-filter {
-    margin: 0.25rem;
-}
-
-.control-empty {
-    padding: 0.5rem 0.625rem;
-    font-size: var(--font-size-md);
-    color: var(--text-secondary);
-}
-
-.control-section-label {
-    padding: 0.25rem 0.625rem;
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-}
-
-.control-item {
-    display: block;
-    width: 100%;
-    padding: 0.375rem 0.625rem;
-    text-align: left;
-    background: none;
-    border: none;
-    border-radius: 0.25rem;
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    cursor: pointer;
-}
-
-.control-item:hover,
-.control-item-active {
-    background: var(--bg-hover);
-}
-
-.control-option {
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-}
-
-.control-option-label {
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-.control-checkmark {
-    color: var(--accent);
-    font-size: var(--font-size-sm);
-    font-weight: 700;
-}
-
-.control-current-value {
-    color: var(--text-muted);
-    font-weight: 400;
-}
-
-.control-option-current {
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-.control-option-desc {
-    font-size: var(--font-size-xs);
-    color: var(--text-secondary);
+    max-height: min(24rem, 60vh);
 }
 
 /* The frontend preview's direct actions. Buttons rather than `.control-item`
@@ -607,20 +545,6 @@
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.03em;
-}
-
-.control-input {
-    padding: 0.375rem 0.5rem;
-    border: 1px solid var(--border-color);
-    border-radius: 0.25rem;
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-}
-
-.control-input:focus {
-    outline: none;
-    border-color: var(--accent);
 }
 
 .control-form-actions {
@@ -1210,7 +1134,13 @@ html[data-theme="dark"] .thread-status-question-badge::after {
    one --turn-header-line tall and centre their own content, so a one-row header
    is unchanged and a wrapped one keeps the actor's name level with the status
    beside it instead of dropping half a line to centre against the stacked
-   pair. */
+   pair.
+
+   NEITHER turn header is a click target, so neither carries a cursor or a
+   hover tint. Both once folded on a row click, and both lost it to the collapse
+   control: a row that swallows a click fires wherever the pointer misses a
+   chip, and announces itself only to a mouse. The hover cues that remain are
+   the chips' own (button.initiator-actor, the timestamp and summary buttons). */
 .initiator-header {
     display: flex;
     align-items: flex-start;
@@ -1224,21 +1154,6 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     flex-wrap: wrap;
-}
-
-/* The INITIATOR header collapses its body when clicked, and cursor: pointer is
-   the affordance. It does not light the whole row up on hover: the hover
-   highlight lives on the chips INSIDE the header (the actor chip
-   button.initiator-actor, and the timestamp/summary buttons), so only the
-   "[icon] You" chip tints, never the edge-to-edge row. A full-row tint read as
-   a heavy affordance stacked on the chip's own.
-
-   The RESPONSE header used to work the same way and no longer does: folding a
-   turn is the third turn control's job (`turnControls`), so that row is inert
-   and carries no clickable class. */
-.initiator-header-clickable {
-    cursor: pointer;
-    user-select: none;
 }
 
 .initiator-icon {
@@ -1304,8 +1219,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
 /* The field that shares the actor's line carries the header's row unit, so the
    two sit on one line once the cluster stacks. Copy of the `.response-meta`
    rule (chat/response.css), which is where the reasoning lives, including why
-   it is the first field only. On a chromeless turn the timestamp IS the first
-   field, which is the case this has to cover as much as the status. */
+   it is the first field only. Which field that is varies: the status, or the
+   timestamp on a chromeless turn with none. The fold is never in here: it
+   leads the header row, outside this cluster, on every turn. */
 .initiator-meta > :first-child {
     display: flex;
     align-items: center;
@@ -1392,6 +1308,137 @@ button.initiator-actor,
     }
 }
 
+/* The turn controls (`turnControls` / `collapseControl`): three on a response
+   header (the full response, the step log, and the turn's fold), one on an
+   initiator header (the fold). Their rules live here, beside the chip rule both
+   headers share, because every measurement below is taken against that chip.
+
+   The run always sits immediately right of that chip, on both headers. The two
+   chipless initiator turns carry no fold at all, so no run ever leads a row: a
+   user message and a change turn are both exempt (`ChatExchange`).
+
+   One gap for all three, the collapse control included. It used to carry an
+   extra 0.3125rem so its narrower scope read as a group break. The break is
+   gone: its label and its turning glyph carry that scope on their own, and two
+   different gaps inside a run of three icons are a claim the eye reads before
+   it reads any tooltip, which landed as "two things and a stray" rather than
+   as a scope split. The class stays, since the brightness rule below still
+   singles the control out by it. */
+.turn-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.125rem;
+    flex-shrink: 0;
+    /* One row unit tall, so the header can align its fields at flex-start
+       without the icons riding up off the label's line. The buttons are the
+       tallest thing on the row at 0.875rem plus their 0.25rem of padding, which
+       is under the unit, so this reserves the difference rather than adding
+       any: the run keeps the height it already had inside the header's
+       min-height. */
+    min-height: var(--turn-header-line);
+    /* Pulled back out of the header's 0.5rem gap, because that gap is measured
+       between BOXES and the eye measures ink. The button adds its 0.125rem
+       padding and the glyph its own inset (the chevron starts 5/24 of the way
+       in), so the flex gap alone left ~10px of white between the label's last
+       letter and the first stroke: the controls read as adrift rather than as
+       the label's. At 0.25rem it is ~8px.
+
+       Bounded on both sides, and the floor is now the binding one. With the
+       group break gone this is the ONE gap in the run that differs, so it is
+       the only thing keeping the label out of the run: a 0.375rem pull leaves
+       0.125rem between the boxes, exactly the gap the icons hold between
+       themselves, and the label reads as a fourth item in the row. 0.25rem is
+       double the intra-run gap, which is enough to group.
+
+       The ceiling: the actor/executor chip carries 0.375rem of trailing padding
+       cancelled by an equal negative margin (above), so its hit area and its
+       hover chip both run that much past the text with only the header's
+       0.125rem of real gap after them. This pull laps 2px of that padding,
+       where 0.375rem lapped 4px; the label's own text is still exclusively the
+       chip's, but going further starts eating a target the user can feel and
+       only sees on hover.
+
+       One position, so one job: there is no chipless turn with a fold to land
+       on the transcript's own column. */
+    margin-left: -0.25rem;
+}
+
+/* Tighter than the base .icon-btn's 0.25rem, deliberately: at 0.125rem the
+   button is the 0.875rem glyph plus 0.25rem, which fits inside the header's
+   existing 1.2rem min-height, so adding the controls grows no row anywhere in
+   the transcript. The base padding would push a control-bearing header ~3px
+   past a control-less one, and a row height that varies by turn TYPE reads
+   worse than a uniformly compact one. Everything here is rem, so the button is
+   ~20px on the 18px mobile root and ~27px at 150% ui-scale; the 18px is the
+   plain-desktop floor, not the common case.
+
+   What it costs, at a 16px root with the widest state ("Lucidos Agent" plus
+   "Requesting" plus the timestamp): the header's one-line width goes from
+   251px bare to 293px with two controls and 313px with three, and a thread
+   pane dragged to its 300px floor gives the header less than that. So at the
+   floor an in-flight turn's header runs to two rows, settling back to one when
+   the status shrinks to "Done" (269px with all three). Accepted rather than
+   fixed: wrapping is what that degradation is for, it keeps every field
+   readable where truncating the executor name would not, and a finished turn,
+   which is the whole transcript bar one row, still fits at the floor. Where
+   the break lands is `.response-meta`'s job, not this row's: the meta gives up
+   its width first and stacks the timestamp under the status, so the second row
+   costs the pair its own line rather than costing the whole header one. An
+   initiator header pays the first figure only, having one control.
+
+   Those two figures are arithmetic off the measured bare one, not fresh
+   measurements: the run costs 22px for its first control (an 18px box after
+   the 8px header gap less the 4px pull) and 20px for each one after it (the
+   box plus the run's 2px gap), which is 42px and 62px. They therefore move
+   whenever either gap above does, so keep them in step rather than reading
+   them as fixed. */
+.turn-controls .icon-btn {
+    padding: 0.125rem;
+    color: var(--text-muted);
+}
+
+/* Hover lifts an OFF control one step, to secondary rather than all the way to
+   the primary the ON state uses. Going the whole way made the two states
+   identical under the cursor (both a bright glyph on a hover chip), so the one
+   control the pointer is on was the one you could not read. The chip is the
+   hover cue; the colour stays the state cue.
+
+   Out-specifies the muted default above (2 classes + a pseudo-class), so this
+   holds whichever file the cascade sees last, and the ON rule below both
+   out-specifies this one (its `:not()` argument counts, making it 2 classes +
+   an attribute + a class) and comes later, so a pressed control keeps its
+   brightness while hovered. The collapse control has no ON rule to lose, so
+   hover is the only thing that moves it, which is the whole point. */
+@media (hover: hover) {
+    .turn-controls .icon-btn:hover {
+        color: var(--text-secondary);
+    }
+}
+
+/* On: the glyph brightens to full-contrast text and that is the whole state,
+   deliberately NOT the accent-on-a-chip the header's active icons wear
+   (.icon-btn.filter-active in host-components.css). Those sit alone on the app
+   bar; these repeat on every turn, and a column of filled accent chips down a
+   long thread reads as a column of alerts. Muted to bright is enough contrast
+   to answer "is it on" at a glance, and it leaves the hover background as the
+   one thing that fills, in both states, so hover still reads as hover.
+
+   The collapse control is excluded, and the scope split is why. For the pair
+   it belongs to, bright means "on, and you are seeing MORE": their off state
+   looks like nothing at all, so a turn with no steps drawn is indistinguishable
+   from a turn whose steps are hidden unless the control says which. Bright on
+   the collapse control would mean the turn is FOLDED, which is the same cue
+   inverted, sitting 0.125rem from the two it contradicts, with nothing in the
+   spacing left to hint that it answers a different question. And it reports a
+   state nothing else is hiding: the turn underneath it has become a `⋯` stub,
+   which is unmissable and is the affordance for unfolding. So it stays muted
+   in both states, hover is its only change, and `aria-pressed` carries the
+   state for a screen reader. Pinned by
+   styles/__tests__/turn-control-brightness.test.ts. */
+.turn-controls .icon-btn[aria-pressed="true"]:not(.turn-control-collapse) {
+    color: var(--text-primary);
+}
+
 .initiator-body {
     color: var(--text-primary);
     word-wrap: break-word;
@@ -1421,27 +1468,18 @@ button.initiator-actor,
 }
 
 /* Collapsed turn indicator — shown on ANY collapsed panel (initiator or
-   response) so a folded turn isn't an empty row: a muted "⋯", rendered as a
-   small accent-tinted stub bubble on the right for a user message. */
+   response) so a folded turn isn't an empty row: a muted "⋯" on the turn's own
+   left column, wherever the fold was clicked. */
 .turn-collapsed {
     cursor: pointer;
     /* Match the header/body left inset so the folded "⋯" lines up with the
        rest of the turn content instead of sitting flush against the edge. */
     padding-left: var(--turn-body-inset);
 }
-.turn-collapsed-bubble {
-    display: flex;
-    justify-content: flex-end;
-}
 .turn-collapsed-dots {
     color: var(--text-muted);
     font-size: var(--font-size-xl);
     line-height: 1;
-}
-.turn-collapsed-bubble .turn-collapsed-dots {
-    background: var(--picked-surface);
-    border-radius: 0.9rem;
-    padding: 0.1rem 0.7rem;
 }
 
 .initiator-summary {

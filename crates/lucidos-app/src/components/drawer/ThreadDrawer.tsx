@@ -990,8 +990,8 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
 
     return (
         <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
-            {/* Dot lives on the wrapper (outside the row's nested clip-path) so it
-                holds a fixed left column at every depth — matching ThreadRowContent. */}
+            {/* Dot lives on the wrapper, beside the row, and takes the row's
+                depth from there. Matches ThreadRowContent. */}
             <ThreadStatusIcon status="idle" />
             {/* The draft's structured details (Status / Type / Created) live behind
                 the ⋯ menu's Info item now, not a row tooltip — see DraftOverflowMenu. */}
@@ -1111,9 +1111,8 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
 
     const wrapClasses = ['thread-row-wrap'];
     if (depth > 0) wrapClasses.push('is-nested');
-    // On the WRAPPER, not the row. The status dot is the wrapper's child,
-    // holding a fixed left column at every depth. It has to dim with the rest
-    // of the row.
+    // On the WRAPPER, not the row. The status dot is the wrapper's child, so
+    // the dim has to reach it from here to cover the whole row.
     if (props.isArchivedSubThread) wrapClasses.push('is-archived');
 
     // aria stays a smart-plural bare count. The visible sub-thread count rides
@@ -1141,9 +1140,9 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     // an unknown channel, never paints an empty bordered chip.
     const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
 
-    // The status dot is the wrapper's child, not the row's, so it stays in a
-    // fixed left column at every depth. It is anchored to the un-indented
-    // wrapper rather than tracking the title's per-depth indent (drawer.css).
+    // The status dot is the wrapper's child, beside the row rather than inside
+    // it. The wrapper carries the row's depth, so drawer.css can indent the dot
+    // with the title from out here.
     return (
         <div class={wrapClasses.join(' ')}
              style={depthStyle(depth)}

@@ -26,6 +26,16 @@ const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 pub(crate) const HEADER_TARGET_WORKSPACE: &str = "x-lucidos-target-workspace";
 const ENV_WORKSPACE: &str = "LUCIDOS_WORKSPACE";
 
+/// The *local token*: proof that this caller is a process on this machine.
+///
+/// Unlike the two headers above, this one is NOT hand-mirrored. It comes from
+/// `lucidos-local-token`, a crate with no dependencies. The gateway, the
+/// engine, the CLI and the app all take it, so the header name and the file
+/// path have exactly one home. Four hand-copies would drift, and a stale copy
+/// here is not a missing feature. It is a CLI that silently cannot
+/// authenticate.
+use lucidos_local_token::{read as local_token, HEADER_LOCAL_TOKEN};
+
 /// Default headers for a request to THIS workspace's engine:
 ///
 /// - the thread-bound origin token, when the matching env var is in scope (that
@@ -34,6 +44,8 @@ const ENV_WORKSPACE: &str = "LUCIDOS_WORKSPACE";
 /// - the target workspace assertion, derived from `$LUCIDOS_WORKSPACE`'s
 ///   basename, so a subcommand that reached the wrong engine is refused rather
 ///   than served.
+/// - the local token, when this machine has a gateway that minted one. It is
+///   what proves the caller is local, since a loopback peer address does not.
 ///
 /// A subcommand that deliberately targets ANOTHER workspace (`lucidos
 /// spawn-thread --to`) sets the assertion itself on the request builder, which
@@ -49,6 +61,12 @@ fn default_headers_from_env() -> reqwest::header::HeaderMap {
     if let Some(name) = self_workspace_name() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&name) {
             h.insert(HEADER_TARGET_WORKSPACE, v);
+        }
+    }
+    if let Some(token) = local_token() {
+        if let Ok(mut v) = reqwest::header::HeaderValue::from_str(&token) {
+            v.set_sensitive(true);
+            h.insert(HEADER_LOCAL_TOKEN, v);
         }
     }
     h

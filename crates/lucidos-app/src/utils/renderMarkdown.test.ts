@@ -1,3 +1,7 @@
+// @vitest-environment jsdom
+// The sanitizer runs on a real DOM. The default `node` environment has none,
+// and DOMPurify would pass its input straight back.
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { marked } from 'marked';
 
@@ -127,7 +131,7 @@ describe('renderMarkdown', () => {
 
     it('escapes structural HTML tags inside code blocks so they render as text', () => {
       // Regression: <html>, <head>, <body>, <title>, <!DOCTYPE> are not in the
-      // DANGEROUS_TAG filter. If the code renderer doesn't escape its text,
+      // ESCAPE_TO_TEXT_TAG filter. If the code renderer doesn't escape its text,
       // the browser parses these as actual elements and the code block renders
       // empty (the user-reported bug for the JS SDK boilerplate snippet).
       const md = '```html\n<!DOCTYPE html>\n<html>\n  <head>\n    <title>X</title>\n  </head>\n  <body>hi</body>\n</html>\n```';
@@ -186,13 +190,11 @@ describe('renderMarkdown', () => {
       expect(() => renderMarkdown('<a href="&#99999999;">x</a>')).not.toThrow();
     });
 
-    // The attribute scrubbers are shaped like `\s+name=value`, and prose
-    // contains that shape too. Run over the whole rendered string they deleted
-    // the user's own words with no sign anything had gone: "Set online=yes in
-    // the config" came out as "Set in the config", and a line listing
-    // `on_error=` / `on_success=` came out as the bare "Values:" label. They
-    // are scoped to tag regions now (`scrubTagAttributes`, walked from
-    // `sanitizeHtmlFragments`).
+    // The old hand-rolled scrubbers matched `\s+name=value` anywhere, and prose
+    // has that shape too. So they deleted the user's own words with no sign
+    // anything had gone: "Set online=yes in the config" came out as "Set in the
+    // config". A parser cannot make that mistake, because it knows text from
+    // markup. These cases stay as the regression they were filed as.
     it.each([
       ['Set online=yes in the config file.', 'Set online=yes in the config file.'],
       ['Use once=true to run it a single time.', 'Use once=true to run it a single time.'],
@@ -208,9 +210,8 @@ describe('renderMarkdown', () => {
       expect(html).toContain('data-copy-text="lucidos trigger set on_event=ThreadCompleted"');
     });
 
-    // Attribute values may contain `>`, so a tag scan that stopped at the first
-    // one would leave everything after it outside any tag region and therefore
-    // unscrubbed. That would turn the prose fix above into an XSS hole.
+    // An attribute value may contain `>`, which is where a regex that stops at
+    // the first one loses the rest of the tag.
     it('still strips a handler/href hidden behind a `>` inside an earlier attribute value', () => {
       const html = renderMarkdown(
         '<a title="a>b" href="javascript:alert(1)" onmouseover="alert(2)">x</a>',
@@ -221,10 +222,11 @@ describe('renderMarkdown', () => {
       expect(html).not.toContain('alert(');
     });
 
+    // A text node escapes `<`, `>` and `&`, and leaves `"` alone.
     it('leaves an unterminated tag inert: marked escapes it to text', () => {
       const html = renderMarkdown('<a href="javascript:alert(1)" onclick="alert(2)"', { cache: false });
       expect(html).not.toContain('<a ');
-      expect(html).toContain('&lt;a href=&quot;javascript:alert(1)&quot;');
+      expect(html).toContain('&lt;a href="javascript:alert(1)"');
     });
 
     it('drops a handler attribute without leaving a double space behind', () => {
@@ -232,16 +234,16 @@ describe('renderMarkdown', () => {
         .toContain('<span class="a" id="b">y</span>');
     });
 
+    // A bare boolean attribute serializes with an empty value, which is the
+    // same attribute: HTML gives it its meaning by presence, not by value.
     it('keeps a bare boolean attribute and the attribute after it', () => {
       expect(renderMarkdown('<input disabled onfocus="x" value="v">', { cache: false }))
-        .toContain('<input disabled value="v">');
+        .toContain('<input disabled="" value="v">');
     });
 
-    // A quote only delimits an attribute VALUE, so it counts only where a value
-    // is expected. Treating every `'` as one reopened the prose-deletion bug
-    // through a different door: an apostrophe in an HTML comment, or in an
-    // unquoted attribute value, opened a quote that never closed, so the tag
-    // region ran to the end of the document and the scrub walked plain prose.
+    // An apostrophe in a comment, or in an unquoted attribute value, used to
+    // open a quote that never closed. Every word after it was then scrubbed as
+    // if it sat inside a tag.
     it('keeps prose after an HTML comment containing an apostrophe', () => {
       const html = renderMarkdown("<!-- don't forget -->\n\nSet online=yes in the config.", { cache: false });
       expect(html).toContain('online=yes');
@@ -257,12 +259,10 @@ describe('renderMarkdown', () => {
       expect(html).toContain('online=yes');
     });
 
-    // RCDATA is where the sanitizer and the browser disagree about what a
-    // comment IS. Inside `<textarea>` / `<title>` a `<!--` is plain text to the
-    // browser and `</textarea>` still closes the element, so treating the rest
-    // of the document as comment body and passing it through would hand back a
-    // live handler. The comment region is BOUNDED (so prose after a real comment
-    // survives) but still scrubbed (so this cannot become an escape hatch).
+    // RCDATA is where a hand-rolled scanner and the browser disagree about what
+    // a comment IS. Inside `<textarea>` a `<!--` is plain text to the browser,
+    // and `</textarea>` still closes the element. Only the browser's own parser
+    // settles that, which is the whole argument for using one.
     it.each([
       '<textarea><!--</textarea><img src=x onerror=alert(1)>',
       '<title><!--</title><img src=x onerror=alert(1)>',
@@ -273,17 +273,15 @@ describe('renderMarkdown', () => {
       expect(html).not.toMatch(/javascript:/i);
     });
 
-    // The two XSS guarantees the quote handling exists for must survive the
-    // narrowing: a `>` hidden in a quoted value, and an unquoted handler.
     it('still strips an unquoted handler attribute', () => {
       const html = renderMarkdown('<img src=x onerror=alert(1)>', { cache: false });
       expect(html).not.toContain('onerror');
       expect(html).not.toContain('alert(');
     });
 
-    // A raw-text element stops the browser tokenizing tags until its end tag,
-    // so a scan that keeps tokenizing lands a live element inside what it
-    // believes is a quoted attribute value and never sees its handler.
+    // A raw-text element stops the browser tokenizing tags until its end tag.
+    // A scanner that keeps tokenizing lands a live element inside what it
+    // believes is a quoted attribute value, and never sees its handler.
     it.each([
       '<textarea><a title="</textarea><img src=x onerror="alert(1)">',
       "<title><a title='</title><img src=x onerror='alert(1)'>",
@@ -304,15 +302,34 @@ describe('renderMarkdown', () => {
       expect(html).not.toMatch(/onerror/i);
     });
 
-    // The region is bounded at the end tag but still scrubbed, because `title`
-    // is RCDATA in HTML and ordinary markup inside `<svg>` / `<math>`, and this
-    // walk does not track foreign content. The visible cost is that literal
-    // markup typed into a textarea loses its handler attributes.
-    it('scrubs inside a raw-text element rather than trusting it as text', () => {
+    // A textarea's content is TEXT, so markup typed into one is shown, not run.
+    it('shows markup inside a raw-text element as the text it is', () => {
       const html = renderMarkdown('<textarea><b onclick="x">hi</b></textarea>', { cache: false });
-      expect(html).not.toContain('onclick');
-      expect(html).toContain('hi');
+      expect(html).toContain('<textarea>&lt;b onclick="x"&gt;hi&lt;/b&gt;</textarea>');
+      expect(html).not.toMatch(/<b[^>]*onclick/i);
     });
+
+    // DOMPurify's `FORBID_CONTENTS` deletes these WITH their content. Escaping
+    // the tags keeps what the model wrote on screen.
+    it.each(['xmp', 'plaintext', 'noscript', 'noembed', 'noframes'])(
+      'shows a %s element as text instead of deleting its content',
+      (tag) => {
+        const html = renderMarkdown(`<${tag}><b onclick="x">hi</b></${tag}>`, { cache: false });
+        expect(html).toContain(`&lt;${tag}&gt;`);
+        expect(html).toContain('hi');
+        expect(html).not.toMatch(/<b[^>]*onclick/i);
+      },
+    );
+
+    // A `/`-terminated tag has no whitespace after its name, so an escape
+    // pattern that demands whitespace hands it to DOMPurify's deletion instead.
+    it.each(['style', 'script', 'iframe'])(
+      'keeps the prose after a self-closing <%s/>',
+      (tag) => {
+        const html = renderMarkdown(`Before. <${tag}/> After the tag.`, { cache: false });
+        expect(html).toContain('After the tag.');
+      },
+    );
 
     it('scrubs a handler inside an SVG title, which is markup and not RCDATA', () => {
       const html = renderMarkdown('<svg><title><b onclick="alert(1)">t</b></title></svg>', { cache: false });
@@ -359,6 +376,54 @@ describe('renderMarkdown', () => {
       const html = renderMarkdown("<img alt=it's onerror=\"alert(1)\">", { cache: false });
       expect(html).not.toMatch(/<img[^>]*onerror/i);
     });
+
+    // Each of these was a bypass in the hand-rolled tokenizer, and each one is
+    // the same root cause: a second model of HTML disagreeing with the
+    // browser's. They are kept as a set so the class stays covered, not just
+    // the three spellings that happened to be reported.
+    it.each([
+      // An abrupt-closing comment. `<!-->` is a complete comment, so a scanner
+      // hunting for `-->` swallows the image and hands it back live.
+      ['abrupt-closing comment', '<!--><img src=x onerror=alert(1)>'],
+      // A nested `<!--` inside a comment does not open a second one.
+      ['nested comment open', '<!-- <!-- --><img src=x onerror=alert(1)>'],
+      // Foreign content: inside `<svg>`, `<style>` is raw text and `<p>` is not
+      // the same element it is in HTML.
+      ['svg style breakout', '<svg><style><a title="</style><img src=x onerror=alert(1)>'],
+      // MathML annotation puts the parser back into HTML mid-subtree.
+      ['mathml annotation', '<math><annotation-xml encoding="text/html"><img src=x onerror=alert(1)>'],
+      // A tag name with an embedded newline is still that tag to a parser.
+      ['newline in tag name', '<img\nsrc=x\nonerror=alert(1)>'],
+      // A NUL inside the scheme is skipped by a URL parser, not honoured.
+      ['nul byte in scheme', '<a href="java\u0000script:alert(1)">x</a>'],
+    ])('closes the parser-disagreement bypass class: %s', (_name, src) => {
+      const html = renderMarkdown(src, { cache: false });
+      expect(html).not.toMatch(/<[a-z][^>]*\son[a-z]+\s*=/i);
+      expect(html).not.toMatch(/<[a-z][^>]*javascript:/i);
+    });
+
+    // `data:` on an `<img>` is the one DOMPurify allows by default, through
+    // `DATA_URI_TAGS`, and it has no negative form. The URL hook is what closes
+    // it, so this fails the moment the hook stops running.
+    it.each([
+      '<img src="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%3E%3C/svg%3E">',
+      '<video poster="data:text/html,evil"></video>',
+      '<audio src="data:text/html,evil"></audio>',
+    ])('strips a data: URL that the sanitizer would otherwise allow: %s', (src) => {
+      expect(renderMarkdown(src, { cache: false })).not.toMatch(/data:/i);
+    });
+
+    // Each of these is claimed by an extractor that runs after the sanitizer.
+    // A stripped href leaves that extractor nothing to read, and the link then
+    // renders as underlined text that does nothing when clicked.
+    it.each([
+      'file:///Users/me/dist/Lucidos.dmg',
+      'repo:aa11aaaa-bbbb-cccc-dddd-eeeeffff0001:file:README.md',
+      'app:habit-tracker',
+      'trigger:aa11aaaa-bbbb-cccc-dddd-eeeeffff0002',
+    ])('keeps an app-owned scheme the extractors run on: %s', (href) => {
+      expect(renderMarkdown(`[x](${href})`, { cache: false })).toContain(`href="${href}"`);
+    });
   });
 
   describe('copy blocks', () => {
@@ -370,10 +435,11 @@ describe('renderMarkdown', () => {
       expect(html).toContain('+1-555-0123');
     });
 
+    // An attribute value escapes `&` and `"`, and keeps a newline literal.
     it('renders multiline copy block with multi class', () => {
       const html = renderMarkdown('<copy>line one\nline two</copy>');
       expect(html).toContain('copyable-block-multi');
-      expect(html).toContain('data-copy-text="line one&#10;line two"');
+      expect(html).toContain('data-copy-text="line one\nline two"');
     });
 
     it('uses span for inline and div for multiline', () => {
@@ -529,7 +595,7 @@ Use this pattern for all prompts.`;
 
     it('preserves inline code in multiline copy block data-copy-text', () => {
       const html = renderMarkdown('<copy>Run `npm install`\nthen `npm start`</copy>');
-      expect(html).toContain('data-copy-text="Run `npm install`&#10;then `npm start`"');
+      expect(html).toContain('data-copy-text="Run `npm install`\nthen `npm start`"');
       expect(html).not.toContain('CODE');
     });
 

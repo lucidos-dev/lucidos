@@ -144,8 +144,8 @@ impl AbortCause {
     ///
     /// * **`StaleSettle`** is engine cleanup of a stuck row whose process was
     ///   already gone, fired by a user button (Stop / Apply / Discard / Archive /
-    ///   Interrupt). No real abort happened, so it uses the cancel-style mapping
-    ///   (idle, or waiting if pending changes) rather than any verdict.
+    ///   Interrupt). No real abort happened, so it uses the cancel-style
+    ///   `STATUS_FROM_PROPOSED_CHANGE` mapping rather than any verdict.
     /// * **A promised auto-resume** ([`promises_auto_resume`](Self::promises_auto_resume),
     ///   the user's own *Switch to new version*) surfaces `paused`: nothing
     ///   failed, and the engine brings the turn back by itself, usually within
@@ -158,26 +158,31 @@ impl AbortCause {
     ///   boundary, and the boot floor's withdrawal of a resume promise it could
     ///   not keep), and a system-actor `EngineShutdown`.
     ///
-    /// The paused arm keyed on [`is_transient`](Self::is_transient) until
-    /// 2026-08-06, which was too wide in exactly the direction that matters:
-    /// `RecoveryAfterRestart` is transient, so a crash, and the boot floor
-    /// handing the Continue button *back*, both sat behind a reassuring pause
-    /// glyph and stayed out of the needs-attention count. Transience is about the
-    /// parent's child counter; the verdict is about whether anyone is coming
-    /// back for this turn, and only the actor can say.
+    /// The paused arm keyed on [`is_transient`](Self::is_transient) until it got
+    /// crashes wrong for the reason that method's own doc gives. Transience is
+    /// about the parent's child counter; the verdict is about whether anyone is
+    /// coming back for this turn, and only the actor can say.
     ///
-    /// Pending changes override both verdicts to `waiting`: a change ready to
-    /// review is more actionable than either the interruption or the failure.
+    /// **A pending change does not change the answer.** Both verdict arms used
+    /// to open `CASE WHEN coding_agent_proposed THEN 'waiting'`, on the
+    /// reasoning that a change to review outranks the interruption. That
+    /// ordering is right and it survives, but it belongs to the *reader*: the
+    /// frontend's `resolveVisualStatus` already returns `failed` and `paused`
+    /// ahead of `changes`, and `coding_agent_proposed` is what carries the
+    /// change. Saying it a second time here cost the verdict outright, because
+    /// `'waiting'` is not a `PRESERVED_STATUS_VERDICTS` value: the dying
+    /// subprocess's drain landed milliseconds later and wrote `'running'` over
+    /// it. It also hid such a thread from the boot floor, which is scoped
+    /// `status = 'paused'`. See
+    /// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
     ///
     /// Both verdicts must also survive the dying turn's trailing events. See
     /// `event_bus::preserving_verdict`, whose list this function feeds.
     pub fn status_sql(&self, actor: Option<&super::MessageOrigin>) -> &'static str {
         match self {
             Self::StaleSettle => crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
-            _ if self.promises_auto_resume(actor) => {
-                "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END"
-            }
-            _ => "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END",
+            _ if self.promises_auto_resume(actor) => "'paused'",
+            _ => "'failed'",
         }
     }
 }
@@ -206,7 +211,7 @@ impl AbortCause {
 #[serde(rename_all = "snake_case")]
 pub enum EventWaitCancelCause {
     /// The **Stop waiting** button on the subscription itself, in the
-    /// subscription indicator.
+    /// waiting indicator.
     UserStop,
     /// The agent stood a subscription of its own down, through
     /// `cancel_event_wait` / `lucidos event-waits cancel`. Its own arm so the

@@ -1,9 +1,11 @@
+use crate::engine::aux_purpose::AuxCall;
 use crate::llm::openai::OpenAiProvider;
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, MessageContent};
 use crate::llm::vertex::{location_handle, LocationHandle, TokenCache, VertexProvider};
 use crate::memory::RETRIEVAL_MIN_IMPORTANCE;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Bump when extractor logic changes in a way that produces materially
 /// different facts from the same input — new prompt, new filter, new context
@@ -99,6 +101,13 @@ For each fact, provide:
 Return ONLY a JSON array, no markdown fences, no extra text. If there are no meaningful facts, return [].
 Example: [{"fact": "Started the [project] migration to [technology]", "importance": 0.7, "topic": "Work Projects", "entities": ["[project]", "[technology]"]}]"#;
 
+/// Chars the extraction instruction adds to every fact-extraction request,
+/// before the content itself. Read by `core::aux_context_backfill` to size a
+/// reconstruction of a call whose request was never recorded.
+pub(crate) fn extraction_prompt_chars() -> usize {
+    EXTRACTION_PROMPT.chars().count()
+}
+
 const QUERY_CLASSIFICATION_PROMPT: &str = r#"Classify this user message and optionally decompose into search queries.
 You will receive the current message and optionally a summary of the recent conversation for context.
 Use the conversation context to understand the TOPIC being discussed, not just the latest message in isolation.
@@ -116,7 +125,7 @@ Example (referencing past content): {"needs_memory": true, "needs_file_list": tr
 Example (asking for a judgement): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["Example Project recent progress", "Example Project launch outcome", "Example Project adoption and traction"]}
 Example (no memory): {"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryClassification {
     pub needs_memory: bool,
     pub needs_file_list: bool,
@@ -187,6 +196,13 @@ impl MemoryExtractor {
         })
     }
 
+    /// The model an empty *model selection* resolves to: this extractor's own
+    /// default, which `provider_for_model` uses for an empty or `"default"` id.
+    /// Callers that record which model ran need the resolved name.
+    pub(crate) fn default_background_model(&self) -> &str {
+        self.provider.default_model()
+    }
+
     /// Attach the resolved OpenAI key so background-task models named `gpt-*`
     /// (title, image description, memory, command judge) route to OpenAI.
     /// Builder-style so the existing constructor call sites stay unchanged.
@@ -205,9 +221,14 @@ impl MemoryExtractor {
     /// providers a background-task model can name: the picker offers Gemini
     /// Flash, Vertex-served Haiku, and GPT-5.4. Direct-Anthropic models (Fable)
     /// are deliberately never offered as background options.
+    ///
+    /// `attempt_timeout` caps one HTTP attempt, so the purpose's deadline can
+    /// contain the provider's retries rather than cutting one off mid-flight.
+    /// Callers take it from `engine::aux_purpose::budget_for`.
     pub fn provider_for_model(
         &self,
         model: &str,
+        attempt_timeout: Duration,
     ) -> Result<Arc<dyn LlmProvider>, Box<dyn std::error::Error + Send + Sync>> {
         if model.starts_with("gpt-") {
             let key = self.openai_api_key.clone().ok_or_else(|| {
@@ -215,46 +236,70 @@ impl MemoryExtractor {
                     "OpenAI background model '{model}' selected but no OpenAI key is configured (Settings → Models → Providers or OPENAI_API_KEY)"
                 )
             })?;
-            Ok(Arc::new(OpenAiProvider::new(key, model.to_string())?))
-        } else if model.is_empty() || model == "default" {
-            Ok(Arc::new(self.provider.clone()))
+            Ok(Arc::new(
+                OpenAiProvider::new(key, model.to_string())?
+                    .with_request_timeout(attempt_timeout)?,
+            ))
+        } else if crate::engine::aux_purpose::is_extractor_default(model) {
+            Ok(Arc::new(
+                self.provider
+                    .clone()
+                    .with_request_timeout(attempt_timeout)?,
+            ))
         } else {
-            Ok(Arc::new(VertexProvider::with_location_handle(
-                self.project_id.clone(),
-                self.location.clone(),
-                model.to_string(),
-                self.token_cache.clone(),
-            )?))
+            Ok(Arc::new(
+                VertexProvider::with_location_handle(
+                    self.project_id.clone(),
+                    self.location.clone(),
+                    model.to_string(),
+                    self.token_cache.clone(),
+                )?
+                .with_request_timeout(attempt_timeout)?,
+            ))
         }
     }
 
     /// Single-shot LLM call against a routed provider.
+    ///
+    /// Every memory call funnels through here, so this is the one place that
+    /// records them for token accounting. A caller with no thread to anchor
+    /// to passes no capture, and the call goes unrecorded rather than
+    /// inventing a thread: artifact indexing is the case that has none.
     async fn chat_with_provider(
         &self,
         provider: &dyn LlmProvider,
         system: &str,
         user_content: &str,
         reasoning_effort: Option<&str>,
+        capture: Option<&crate::engine::AuxCapture>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let messages = vec![Message {
             role: "user".to_string(),
             content: MessageContent::Text(user_content.to_string()),
         }];
-        provider
+        let response = provider
             .chat(messages, vec![], None, Some(system), None, reasoning_effort)
-            .await
+            .await?;
+        if let Some(capture) = capture {
+            let request_chars = system.chars().count() + user_content.chars().count();
+            capture
+                .record(provider.default_model(), request_chars, &response)
+                .await;
+        }
+        Ok(response)
     }
 
     /// Extract atomic facts from raw content.
     /// Optional `context` provides background (system, user, conversation) so
     /// the model can correctly identify implicit entities and assess importance.
-    /// Optional `model` overrides the default extraction model.
-    pub async fn extract_facts(
+    /// `call` carries the resolved *model selection* and the call's budget.
+    pub(crate) async fn extract_facts(
         &self,
         content: &str,
         context: Option<&str>,
         language: Option<&str>,
-        model: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
     ) -> Result<Vec<ExtractedFact>, Box<dyn std::error::Error + Send + Sync>> {
         let language_instruction = match language {
             Some(lang) if !lang.is_empty() => {
@@ -271,9 +316,15 @@ impl MemoryExtractor {
             Some(ctx) => format!("{}{}\n\n{}", EXTRACTION_PROMPT, language_instruction, ctx),
             None => format!("{}{}", EXTRACTION_PROMPT, language_instruction),
         };
-        let provider = self.provider_for_model(model.unwrap_or_default())?;
+        let provider = self.provider_for_model(call.model(), call.attempt_timeout())?;
         let response = self
-            .chat_with_provider(provider.as_ref(), &system, content, Some("none"))
+            .chat_with_provider(
+                provider.as_ref(),
+                &system,
+                content,
+                call.reasoning(),
+                capture,
+            )
             .await?;
 
         let raw = response.content.unwrap_or_default();
@@ -318,12 +369,13 @@ impl MemoryExtractor {
     /// Optional `conversation_context` provides recent conversation summary so the
     /// classifier can understand the topic (e.g. a follow-up "try again" in an API
     /// conversation still needs credentials).
-    /// Optional `model` overrides the default extraction model.
-    pub async fn classify_query(
+    /// `call` carries the resolved *model selection* and the call's budget.
+    pub(crate) async fn classify_query(
         &self,
         query: &str,
         conversation_context: Option<&str>,
-        model: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
     ) -> Result<QueryClassification, Box<dyn std::error::Error + Send + Sync>> {
         let system = match conversation_context {
             Some(ctx) if !ctx.is_empty() => format!(
@@ -332,9 +384,9 @@ impl MemoryExtractor {
             ),
             _ => QUERY_CLASSIFICATION_PROMPT.to_string(),
         };
-        let provider = self.provider_for_model(model.unwrap_or_default())?;
+        let provider = self.provider_for_model(call.model(), call.attempt_timeout())?;
         let response = self
-            .chat_with_provider(provider.as_ref(), &system, query, Some("none"))
+            .chat_with_provider(provider.as_ref(), &system, query, call.reasoning(), capture)
             .await?;
 
         let raw = response.content.unwrap_or_default();
@@ -351,24 +403,35 @@ impl MemoryExtractor {
         Ok(classification)
     }
 
-    /// Summarize a conversation history into a concise paragraph.
-    /// Used to compress older messages in long conversations.
-    /// Optional `model` overrides the default extraction model.
-    pub async fn summarize_conversation(
+    /// Summarize a thread's older ASSISTANT turns into one paragraph.
+    ///
+    /// `turns` carries assistant turns only (ADR 0102). User turns stay
+    /// verbatim in the history block, so nothing the person said passes
+    /// through a model's judgment on its way to the prompt.
+    ///
+    /// The caller caches the result as a `ConversationSummarized` event, so
+    /// this runs on a refresh rather than once per turn. `call` carries the
+    /// resolved *model selection*, which for this purpose is
+    /// `model_conversation_summary` paired with
+    /// `reasoning_conversation_summary`.
+    pub(crate) async fn summarize_conversation(
         &self,
         turns: &str,
-        model: Option<&str>,
+        call: &AuxCall,
+        capture: Option<&crate::engine::AuxCapture>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let system = "Summarize this conversation history for continuity with the ongoing conversation. \
+        let system = "Summarize these ASSISTANT turns for continuity with the ongoing conversation. \
             Focus on: (1) what is being worked on, (2) issues that were RESOLVED — explicitly mark them as fixed/done \
             so they are not revisited, (3) the current state of work at the end of this segment, \
-            (4) any user corrections or preferences expressed. \
+            (4) dead ends and approaches that failed, so they are not retried. \
             CRITICAL: if a problem was reported and then fixed, say it \"was fixed\" — do NOT just describe the problem \
             without its resolution, as that causes the assistant to re-attempt already-completed fixes. \
+            The user's own messages are NOT in this input and are supplied to the model verbatim elsewhere, \
+            so do not try to reconstruct what they asked for. \
             Write concise flowing prose, no bullet points.";
-        let provider = self.provider_for_model(model.unwrap_or_default())?;
+        let provider = self.provider_for_model(call.model(), call.attempt_timeout())?;
         let response = self
-            .chat_with_provider(provider.as_ref(), system, turns, Some("low"))
+            .chat_with_provider(provider.as_ref(), system, turns, call.reasoning(), capture)
             .await?;
         let summary = response.content.unwrap_or_default().trim().to_string();
         Ok(summary)
@@ -469,8 +532,78 @@ fn strip_code_fences(text: &str) -> String {
 }
 
 #[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{aux_captures, setup_test_db, teardown_test_db, ScriptedProvider};
+    use uuid::Uuid;
+
+    fn extractor() -> MemoryExtractor {
+        MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds")
+    }
+
+    /// `chat_with_provider` is the choke point every memory call funnels
+    /// through, so testing it covers extraction, classification and
+    /// summarization at once.
+    #[tokio::test]
+    async fn a_memory_call_records_its_own_purpose_and_usage() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        let capture =
+            crate::engine::AuxCapture::new(&bus, thread_id, crate::engine::ContextPurpose::Memory);
+
+        let provider =
+            ScriptedProvider::new("gemini-3-flash-preview", vec!["[]"]).reporting(1_500, 20);
+        extractor()
+            .chat_with_provider(&provider, "system", "content", Some("none"), Some(&capture))
+            .await
+            .expect("scripted call succeeds");
+
+        let captures = aux_captures(&pool, thread_id, "memory").await;
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0]["producer"], "auxiliary");
+        assert_eq!(captures[0]["model"], "gemini-3-flash-preview");
+        assert_eq!(captures[0]["usage"]["input_tokens"], 1_500);
+        assert_eq!(captures[0]["usage"]["output_tokens"], 20);
+        // The estimate counts both halves of what was sent.
+        assert_eq!(
+            captures[0]["sections"][0]["budget_delta_chars"],
+            ("system".len() + "content".len()) as i64
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Artifact indexing and a thread-less event both reach here with no
+    /// capture. The call must still run; only the bookkeeping is skipped.
+    #[tokio::test]
+    async fn a_memory_call_with_no_thread_records_nothing() {
+        let (pool, db_name) = setup_test_db().await;
+        let thread_id = Uuid::new_v4();
+
+        let provider = ScriptedProvider::new("gemini-3-flash-preview", vec!["[]"]);
+        extractor()
+            .chat_with_provider(&provider, "system", "content", Some("none"), None)
+            .await
+            .expect("scripted call succeeds");
+
+        assert!(aux_captures(&pool, thread_id, "memory").await.is_empty());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any finite attempt cap does for these: they check which provider comes
+    /// back, not how long it waits. The real ones come from
+    /// `engine::aux_purpose::budget_for`.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// A `gpt-*` background-task model routes to OpenAI (with the key attached)
     /// — the model is baked into the returned provider.
@@ -480,7 +613,7 @@ mod tests {
             .expect("extractor builds")
             .with_openai_key(Some("sk-test".into()));
         let provider = ext
-            .provider_for_model("gpt-5.4")
+            .provider_for_model("gpt-5.4", TEST_TIMEOUT)
             .expect("openai provider builds");
         assert_eq!(provider.default_model(), "gpt-5.4");
     }
@@ -491,7 +624,7 @@ mod tests {
     fn provider_for_model_gpt_without_key_errors() {
         let ext =
             MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
-        assert!(ext.provider_for_model("gpt-5.4").is_err());
+        assert!(ext.provider_for_model("gpt-5.4", TEST_TIMEOUT).is_err());
     }
 
     /// Non-`gpt-*` models stay on Vertex even when an OpenAI key is present.
@@ -501,7 +634,7 @@ mod tests {
             .expect("extractor builds")
             .with_openai_key(Some("sk-test".into()));
         let provider = ext
-            .provider_for_model("gemini-3-flash-preview")
+            .provider_for_model("gemini-3-flash-preview", TEST_TIMEOUT)
             .expect("vertex provider builds");
         assert_eq!(provider.default_model(), "gemini-3-flash-preview");
     }
@@ -512,7 +645,9 @@ mod tests {
     fn provider_for_model_default_uses_base_model() {
         let ext =
             MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
-        let provider = ext.provider_for_model("").expect("base provider");
+        let provider = ext
+            .provider_for_model("", TEST_TIMEOUT)
+            .expect("base provider");
         assert_eq!(provider.default_model(), default_extraction_model());
     }
 
@@ -776,7 +911,13 @@ mod tests {
         let content = "Temperature control loop completed. Adjusted 3 heat pumps down by 1°C each. Outside temp 2°C.";
 
         let facts = extractor
-            .extract_facts(content, Some(context), None, None)
+            .extract_facts(
+                content,
+                Some(context),
+                None,
+                &AuxCall::defaults(crate::engine::ContextPurpose::Memory),
+                None,
+            )
             .await
             .expect("extraction should succeed");
 

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
-import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive } from '../../store/store';
+import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
@@ -31,7 +31,8 @@ import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePr
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
-import { focusIfNeeded, composeHandlers } from './promptFocus';
+import { composeHandlers } from './promptFocus';
+import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
 import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
@@ -39,6 +40,7 @@ import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMe
 import { isMobile } from '../../utils/viewport';
 import { prefersReducedMotion } from '../../utils/platform';
 import { createTapGate } from '../../utils/tapGesture';
+import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { errorDetail } from '../../utils/errorDetail';
 import { extractPasteUrl, escapeMarkdownLinkText } from '../../utils/extractPasteUrl';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
@@ -49,7 +51,20 @@ import { computeCaptureGeometry, readDeviceAngle } from './cameraGeometry';
 
 const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
+/** 1x length of the compose-destination row's fade-out, mirroring
+ *  `.input-toggles-wrapper`'s `transition: opacity var(--duration-slow)` in
+ *  chat/input-messages.css. The literal is `--duration-slow` before the
+ *  Animation speed slider scales it, so a timer on it goes through
+ *  `scaledDurationMs`. */
+const TOGGLES_FADE_MS = 300;
+/** Fixed margin so the unmount lands AFTER the fade rather than on its last
+ *  frame. Slack is a safety margin, not animation, so it stays outside the
+ *  scaled call. */
+const TOGGLES_FADE_SLACK_MS = 50;
 const ANSWER_NO_IMAGES_TOAST = 'Answers to user questions are text only.';
+/** Said when Send is pressed while an attached image is still uploading. The
+ *  send is real and queued, so this reports a wait, not a refusal. */
+const UPLOAD_QUEUED_SEND_TOAST = 'Sending once the image finishes uploading…';
 const ANSWER_NO_IMAGES_TOOLTIP = 'Answers are text only';
 /** Tooltip on the prompt row's Cancel while a question card is pending. Nothing
  *  else on screen spells out what the red button does to a pending question: it
@@ -176,10 +191,25 @@ export function PromptInput() {
   //
   // The morph and the answer control are mutually exclusive, so they share one
   // gate instance. The multi-select split-button Submit needs no gate: its
-  // caret menu makes the action deliberate. Each gated button wires the down,
-  // move and cancel handlers inline rather than spreading a shared object,
-  // because `prompt-cancel-tap-gate.test.ts` greps for that wiring.
+  // caret menu makes the action deliberate. Touch activation leaves that
+  // standing, since `touchActivated` fires only where a click would have. Each
+  // gated button wires the down, move and cancel handlers inline rather than
+  // spreading a shared object, because `prompt-cancel-tap-gate.test.ts` greps
+  // for that wiring.
   const morphGate = useMemo(() => createTapGate(), []);
+  /** A discarded tap is the user's press thrown away, so it must never be
+   *  silent: the button reads as dead and nothing says why.
+   *
+   *  Only the composer's own actions report it. A question-card option sits
+   *  inside the transcript scroller. There, discarding a moving touch IS the
+   *  gate doing its job, and a toast on every scroll starting on an option
+   *  would be noise. */
+  function morphTapPassed(): boolean {
+    const moved = morphGate.tapRejection();
+    if (moved === null) return true;
+    showToast(`Tap ignored: it moved ${moved}px and read as a swipe. Try again.`, 'info');
+    return false;
+  }
   // Watch for pending messages from other modules (e.g. new app modal)
   useSignalEffect(() => {
     const msg = pendingChatMessage.value;
@@ -368,6 +398,10 @@ export function PromptInput() {
       // A queued send still flips the button to the optimistic Cancel — settle.
       armCancelSettle();
       queueUploadSend(threadId, { useCodingAgent, context });
+      // The one submit path that used to return with no message. The draft
+      // stays put and the send fires later, which reads exactly like a dead
+      // button. That is the shape this whole change is about, so say it.
+      showToast(UPLOAD_QUEUED_SEND_TOAST, 'info');
       return;
     }
     el.value = '';
@@ -525,7 +559,15 @@ export function PromptInput() {
   useEffect(() => {
     if (!showToggles) {
       setFading(true);
-      const t = setTimeout(() => setFading(false), 300);
+      // Keep the row mounted for the length of its own opacity transition
+      // (`.input-toggles-wrapper`, `var(--duration-slow)`). Scaled by the
+      // animation-speed slider, as that transition is. An unscaled timer
+      // unmounts the row partway through a slowed fade, so the toggles pop
+      // out instead of dissolving.
+      const t = setTimeout(
+        () => setFading(false),
+        scaledDurationMs(TOGGLES_FADE_MS) + TOGGLES_FADE_SLACK_MS,
+      );
       return () => { clearTimeout(t); setFading(false); };
     }
   }, [showToggles]);
@@ -650,6 +692,31 @@ export function PromptInput() {
   // here so the render subscribes to the arm/expire signal transitions; used by
   // both the answer-control Cancel and the morph button below.
   const cancelSettling = isCancelSettling();
+
+  // TOUCH ACTIVATION for the row's constructive actions. The user presses these
+  // with the mobile keyboard up. A tap then blurs the textarea, the keyboard
+  // starts dismissing, and the button moves out from under the finger. WebKit
+  // drops the synthetic click, so the press reads as dead with nothing on
+  // screen to say why. `touchActivated` runs the action inside the gesture
+  // instead, and cancels the click.
+  //
+  // The morph button is ONE node that turns destructive, so the touch path is
+  // enabled only while it reads Send. Every other mode keeps the click path,
+  // which is what stops a tap aborting a live turn a gesture earlier.
+  //
+  // The gate check stays inside the action, so one press is settled once
+  // whichever path fires. Both actions blur on their own (`submit`,
+  // `submitMultiAnswer`): the suppressed click never reaches
+  // `installActionBtnBlurListener`, which listens on `click`.
+  const sendActivate = useTouchActivated(() => {
+    if (!morphTapPassed()) return;
+    if (morphMode === 'send') void submit();
+    else if (morphMode === 'cancel') cancelExchangeForTarget();
+  }, morphMode === 'send');
+  const answerSubmitActivate = useTouchActivated(() => {
+    if (!morphTapPassed()) return;
+    void submit();
+  });
 
   // Release the optimistic canceling flag once the cancel has landed. The set
   // survives component re-renders by design, since the button lives in the
@@ -840,6 +907,7 @@ export function PromptInput() {
       primaryClassName="action-btn action-btn-confirm"
       primaryAriaLabel="Submit answer"
       primaryDisabled={submitMultiDisabled}
+      primaryTouchActivate
       onPrimary={() => void submitMultiAnswer()}
       caretClassName="action-btn action-btn-confirm"
       caretAriaLabel="Cancel this question"
@@ -862,10 +930,11 @@ export function PromptInput() {
       key="answer-lone"
       type="button"
       class="action-btn action-btn-confirm"
-      onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
-      onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
+      onPointerDown={e => morphGate.down(e)}
+      onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
-      onClick={() => { if (!morphGate.isTap()) return; void submit(); }}
+      onTouchEnd={answerSubmitActivate.onTouchEnd}
+      onClick={answerSubmitActivate.onClick}
       aria-label="Submit answer"
       data-tooltip={uploadsBlocking ? 'Send after image upload' : 'Send answer'}
       data-row-item
@@ -883,10 +952,10 @@ export function PromptInput() {
       // just pressed morphed into this Cancel, so a laggy repeat tap must not
       // abort the resuming turn. `cancelExchangeForTarget` belts the same check.
       disabled={cancelSettling}
-      onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
-      onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
+      onPointerDown={e => morphGate.down(e)}
+      onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
-      onClick={() => { if (!morphGate.isTap()) return; cancelExchangeForTarget(); }}
+      onClick={() => { if (!morphTapPassed()) return; cancelExchangeForTarget(); }}
       aria-label="Cancel"
       // A pending question card gets the wording that says what Cancel does to
       // it; a permission card (same button, no typed-text escape) keeps "Stop".
@@ -912,14 +981,11 @@ export function PromptInput() {
         'action-btn send-cancel-morph send-cancel-round'
         + (morphMode === 'placeholder' ? ' morph-placeholder' : '')
       }
-      onPointerDown={e => morphGate.down(e.clientX, e.clientY)}
-      onPointerMove={e => morphGate.move(e.clientX, e.clientY)}
+      onPointerDown={e => morphGate.down(e)}
+      onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
-      onClick={() => {
-        if (!morphGate.isTap()) return;
-        if (morphMode === 'send') void submit();
-        else if (morphMode === 'cancel') cancelExchangeForTarget();
-      }}
+      onTouchEnd={sendActivate.onTouchEnd}
+      onClick={sendActivate.onClick}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
       aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
       tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}

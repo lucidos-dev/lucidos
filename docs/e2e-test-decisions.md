@@ -206,8 +206,11 @@ and lossless.
 - The whole-test `retries: 1` stays — a fresh context is what actually clears
   variant 2 (it also absorbs unrelated Chromium context-init flakes).
 - The WebKit RSS reaper (below) stays as the host-memory safety net.
-- `scripts/e2e-browser.sh` still runs `mobile-webkit` first and phase-splits
-  nav/CC specs — that shrinks variant 2's contention window, harmless to keep.
+- `scripts/e2e-browser.sh` still phase-splits nav/CC specs, which shrinks
+  variant 2's contention window and is harmless to keep. It no longer runs
+  `mobile-webkit` FIRST. See "mobile-webkit runs last, and alone" below: the
+  memory cost outranks the ordering, and the ordering bought less than it
+  looked like it did.
 
 *Spotlight is NOT a usable lever, despite intuition.* The `.metadata_never_index`
 marker is **deprecated and a no-op on macOS 26** (verified 2026-06: a file inside
@@ -411,6 +414,61 @@ the Concerns rollup.
   over-cap WebKit match is killed while an under-cap match, a non-Playwright
   Safari, and a Playwright chromium are all left alone, plus the cap/match knobs
   and the start/stop lifecycle.
+
+### mobile-webkit runs last, and alone
+
+One project costs about **15 GB of macOS VM compressor**. Everything else in the
+suite costs about 0.6 GB between them. That asymmetry, not any test, is what
+decides the run order.
+
+The reaper below cannot see it. `webkit_reaps` was **0** across a climb from
+11.93 GB to 17.27 GB. The reaper caps per-process RSS at 6 GB and no single
+WebContent process comes near that, because the cost is spread over many
+short-lived ones. `kern.memorystatus_vm_pressure_level` is no use either: it
+read normal for the whole climb. Only the compressor moves in time to act on,
+so `run_specs_chunked` and the project loop both read it. Both stop over
+`LUCIDOS_E2E_COMPRESSOR_MAX_GB` (12 GB).
+
+Three levers were tried, in order of cost.
+
+1. **Smaller chunks.** `LUCIDOS_E2E_WEBKIT_CHUNK` went 8 to 3. It bounds the
+   per-chunk delta and it is not enough: a run at 3 still hit the ceiling,
+   because it started from 5.90 GB instead of a cold 1.9 GB.
+2. **A ceiling between chunks.** Stops the loop at a safe boundary rather than
+   riding the climb into a host freeze. This host has no swap, so a harness that
+   keeps going into a rising compressor is a machine lock, not a slow test.
+3. **Its own run**, which is this section. The other two bound the damage; only
+   this one stops the damage landing on somebody else's coverage.
+
+**The compressor does not drain between projects.** It fell 0.55 GB at WebKit
+teardown and then stayed within 0.7 GB of its high-water mark for three more
+hours. So a WebKit run permanently spends the session's budget, and the two
+consequences are separate.
+
+- **Running it last protects everything else.** `scripts/e2e.sh` runs api, wasm
+  and embedder before the browser phase, and the browser phase runs `chromium
+  mobile mobile-webkit`. Two consecutive nightlies died inside mobile-webkit
+  with wasm and embedder never started, which was a coverage hole rather than
+  only a resource cost. Whatever is queued behind the expensive project is what
+  a stop loses, so nothing is.
+- **Running it separately is what helps mobile-webkit itself.** `--no-webkit`
+  (on either script) leaves it out, so it can start from a cold host:
+
+```bash
+./scripts/e2e.sh --no-webkit          # api, wasm, embedder, chromium, mobile
+./scripts/e2e-browser.sh --webkit     # then mobile-webkit, cold
+```
+
+An excluded project is dropped from the per-project table rather than recorded
+green, and `report_webkit_excluded` says so on every exit path. A run with a
+hole in it must not read like a run without one.
+
+**This reversed an earlier deliberate ordering**, which put mobile-webkit first
+to keep its contention-sensitive spawns ahead of two more passes of
+CC-subprocess churn. That reasoning is weaker than it looks. The wedge it
+targeted is fixed at the source, by the explicit `proxy` on the mobile-webkit
+project. The projects run sequentially, so the churn was never concurrent with
+it. And the phase split inside the project remains the real mitigation.
 
 ### Host-load backpressure guard — refuse to launch onto a saturated host
 

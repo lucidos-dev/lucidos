@@ -6,7 +6,11 @@ const getPreferencesMock = vi.fn(async (..._args: unknown[]) => ({
 }));
 const listModelsMock = vi.fn(async () => ({ models: [] as ModelInfo[] }));
 
-vi.mock('../../../api/client', () => ({
+// Spreads the real module first: `loadPreferences` also calls
+// `retryTransientRead`, and a mock that omitted it would silently throw
+// inside the try/catch, masking every assertion below as "stayed at default".
+vi.mock('../../../api/client', async (importActual) => ({
+  ...(await importActual<typeof import('../../../api/client')>()),
   setPreference: (key: string, value: string, deviceId?: string) =>
     setPreferenceMock(key, value, deviceId),
   getPreferences: (deviceId?: string) => getPreferencesMock(deviceId),
@@ -14,7 +18,7 @@ vi.mock('../../../api/client', () => ({
 }));
 
 import { reasoningEffort, currentModel, preferences, chatModels } from '../../../store/store';
-import { setCurrentModel, setReasoningEffort, loadPreferences } from '../../../store/actions/preferences';
+import { setChatModelSelection, setReasoningEffort, loadPreferences } from '../../../store/actions/preferences';
 import { loadChatModels } from '../../../store/actions/models';
 import { DEFAULT_CHAT_MODEL } from '../../../store/models';
 import type { ModelInfo } from '../../../api/types';
@@ -45,8 +49,8 @@ describe('Chat model and reasoning effort persist across restarts', () => {
     reasoningEffort.value = 'high';
   });
 
-  it('setCurrentModel writes the model preference to the API', async () => {
-    await setCurrentModel('claude-sonnet-4-6');
+  it('setChatModelSelection writes the model preference to the API', async () => {
+    await setChatModelSelection({ model: 'claude-sonnet-4-6', reasoningEffort: 'high' });
     expect(currentModel.value).toBe('claude-sonnet-4-6');
     expect(setPreferenceMock).toHaveBeenCalledWith('chat_model', 'claude-sonnet-4-6', undefined);
   });
@@ -115,11 +119,12 @@ describe('Chat model and reasoning effort persist across restarts', () => {
   });
 });
 
-// Changing the model must carry the effort with it, onto the closest tier the
-// NEW model supports. Reported after switching to a local model with the
-// account effort at xhigh: the effort stayed too high for the model, the engine
-// sent a tier the local server had never heard of, and the turn 400'd.
-describe('Changing the model snaps the effort onto what the new model supports', () => {
+// One pick sets the pair, so the effort is the user's own choice rather than a
+// clamp of the previous one. What still clamps is a STORED pair the registry
+// later contradicts, which is the fault reported here: switching to a local
+// model with the account effort at xhigh sent a tier the local server had never
+// heard of, and the turn 400'd.
+describe('The chat model selection is written whole', () => {
   beforeEach(() => {
     setPreferenceMock.mockClear();
     getPreferencesMock.mockClear();
@@ -130,22 +135,23 @@ describe('Changing the model snaps the effort onto what the new model supports',
     reasoningEffort.value = 'high';
   });
 
-  it('setCurrentModel clamps and persists the snapped effort', async () => {
+  it('persists both halves of a pick', async () => {
     chatModels.value = { status: 'loaded', data: [LOCAL_MODEL] };
     reasoningEffort.value = 'xhigh';
 
-    await setCurrentModel('muse-glimmer:30b-mlx');
+    await setChatModelSelection({ model: 'muse-glimmer:30b-mlx', reasoningEffort: 'high' });
 
     expect(currentModel.value).toBe('muse-glimmer:30b-mlx');
     expect(reasoningEffort.value).toBe('high');
     expect(setPreferenceMock).toHaveBeenCalledWith('chat_reasoning_effort', 'high', undefined);
   });
 
-  it('setCurrentModel leaves an effort the new model already supports', async () => {
-    chatModels.value = { status: 'loaded', data: [LOCAL_MODEL] };
+  it('leaves the stored effort alone for a model with no tiers', async () => {
+    // An image model reports `null`. `RoutingProvider::effort_for_model` drops
+    // what the model cannot take, so there is nothing to write.
     reasoningEffort.value = 'medium';
 
-    await setCurrentModel('muse-glimmer:30b-mlx');
+    await setChatModelSelection({ model: 'imagen-4', reasoningEffort: null });
 
     expect(reasoningEffort.value).toBe('medium');
     expect(setPreferenceMock).not.toHaveBeenCalledWith(

@@ -61,17 +61,33 @@ pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
 /// dirty-file detection -- detached HEAD reports false diffs).
 ///
 /// Returns `true` if the repo has uncommitted changes (after any auto-commit).
+///
+/// An unanswerable `git status` also returns `true`, the same tri-state rule
+/// [`worktree_dirtiness`] follows. A `false` here is what lets `apply_change`
+/// reach `ff_main_to`, whose `checkout -f main` discards whatever the repo root
+/// holds uncommitted. `git status` exits non-zero when the path is not a work
+/// tree, and when a filter such as git-crypt blows up on a locked repo. Neither
+/// says there is nothing to lose. Reporting dirty costs the user a retry behind
+/// an accurate refusal.
 pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
     ensure_head_on_main(repo_root).await;
     let output = match git_cmd(&["status", "--porcelain"], repo_root).await {
-        Ok(o) => o,
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            log!(
+                "[GitOps] auto_commit_safe_files_if_dirty: git status exited non-zero at {}: {}. Reporting dirty, never clean",
+                repo_root.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return true;
+        }
         Err(e) => {
             log!(
-                "[GitOps] auto_commit_safe_files_if_dirty: git status failed at {}: {} — treating as clean",
+                "[GitOps] auto_commit_safe_files_if_dirty: git status failed at {}: {}. Reporting dirty, never clean",
                 repo_root.display(),
                 e
             );
-            return false;
+            return true;
         }
     };
     let status = String::from_utf8_lossy(&output.stdout);
@@ -602,13 +618,29 @@ pub(crate) async fn main_history_touches_files(repo_root: &Path, change_files: &
 ///     draft); discarding the change is safe.
 ///
 /// The branch ref is NOT deleted by this function; the caller decides.
+///
+/// A worktree lookup that could not run errors out. Skipping the auto-commit
+/// leaves real edits uncommitted. The `LegitimateNoOp` and `AlreadyApplied`
+/// arms below then let the caller delete the branch and report the change
+/// applied.
 pub(crate) async fn recover_no_commits_branch(
     repo_root: &Path,
     branch_name: &str,
     change_files: &[String],
 ) -> Result<NoCommitsRecovery, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(ref wt) = find_worktree_for_branch(repo_root, branch_name).await {
-        auto_commit_worktree(wt, "Coding agent changes (pre-apply auto-commit)").await;
+    match find_worktree_for_branch(repo_root, branch_name).await {
+        WorktreeLookup::Found(wt) => {
+            auto_commit_worktree(&wt, "Coding agent changes (pre-apply auto-commit)").await;
+        }
+        WorktreeLookup::NotFound => {}
+        WorktreeLookup::Unknown => {
+            return Err(format!(
+                "Could not determine which worktree holds branch {} (git worktree list gave no \
+                 answer), so uncommitted work there cannot be rescued. Try again.",
+                branch_name
+            )
+            .into());
+        }
     }
 
     if has_branch_commits(repo_root, branch_name).await {

@@ -7,7 +7,7 @@ use super::super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKE
 use super::super::git_ops::{
     add_paths_to_worktree_exclude, commit_worktree_or_err, default_local_branch,
     describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
-    is_external_repo_path, main_worktree, proposal_files_for_branch, worktree_add, worktrees_dir,
+    main_worktree, proposal_files_for_branch, worktrees_dir, WorktreeLookup,
 };
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin};
 use super::super::LucidosEngine;
@@ -63,6 +63,63 @@ impl LucidosEngine {
         .await
     }
 
+    /// `thread_summaries.coding_agent_is_external_repo`, failing open to
+    /// `false` on a read error, as this read always has.
+    ///
+    /// Fail-open only mis-routes a legacy external thread whose event carries
+    /// no kind. That lands on the Lucidos repo: today's behavior, where the
+    /// branch is absent and every command fails harmlessly.
+    async fn projection_says_external_repo(&self, thread_id: Uuid) -> bool {
+        match self.is_external_repo_thread(thread_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                log!(
+                    "[Recovery] Failed to check external repo status for thread {}: {}",
+                    thread_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// Propose the stale branch's committed work, returning whether a change
+    /// landed. Thin wrapper so the settle's own body stays one decision per
+    /// line; `propose_branch_changes` above does the work.
+    async fn propose_stale_branch(
+        &self,
+        thread_id: Uuid,
+        branch_name: &str,
+        repo_root: &Path,
+        changed_files: &[String],
+    ) -> bool {
+        match self
+            .propose_branch_changes(
+                thread_id,
+                branch_name,
+                repo_root,
+                changed_files,
+                Some(MessageOrigin::engine(EngineReason::StaleSession)),
+            )
+            .await
+        {
+            Ok(_) => {
+                log!(
+                    "[Recovery] Proposed change from stale session (branch {})",
+                    branch_name
+                );
+                true
+            }
+            Err(e) => {
+                log!(
+                    "[Recovery] Failed to propose change from stale session: {}",
+                    e
+                );
+                false
+            }
+        }
+    }
+
     /// End a stale waiting Claude Code session (no live process) after an engine
     /// restart.
     ///
@@ -75,8 +132,10 @@ impl LucidosEngine {
         discard: bool,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let branch: Option<String> = sqlx::query_scalar(
-            "SELECT payload->>'branch' FROM events \
+        // Branch and kind come from ONE `SessionStarted` row, so the branch and
+        // the repo that owns it can never name different sessions.
+        let session: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT payload->>'branch', payload->>'coding_agent_kind' FROM events \
              WHERE event_type = 'SessionStarted' AND thread_id = $1 \
              ORDER BY sequence DESC LIMIT 1",
         )
@@ -84,8 +143,8 @@ impl LucidosEngine {
         .fetch_optional(self.pool())
         .await?;
 
-        let branch_name = match branch {
-            Some(b) if !b.is_empty() => b,
+        let (branch_name, session_kind) = match session {
+            Some((Some(b), kind)) if !b.is_empty() => (b, kind),
             None => {
                 // This thread never had a Claude Code session. Erroring beats
                 // emitting `SessionEnded`, which would pollute regular chat
@@ -103,7 +162,13 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
                                 has_changes: false,
-                                is_external_repo: false,
+                                // Read back rather than hardcoded: this field
+                                // is authoritative for the projection column,
+                                // so a literal `false` would clear an external
+                                // thread's flag instead of preserving it.
+                                is_external_repo: self
+                                    .projection_says_external_repo(thread_id)
+                                    .await,
                                 requires_restart: false,
                                 cc_session_id: None,
                                 coding_agent,
@@ -127,63 +192,63 @@ impl LucidosEngine {
             branch_name
         );
 
-        let repo_root = main_worktree().await;
+        // Route by the kind this thread's own session recorded. An app thread's
+        // worktree and branch live in the WORKSPACE git. Asking the Lucidos repo
+        // about them left every app thread settling with no Apply card, for work
+        // already committed on its branch.
+        let repo = stale_session_repo(
+            session_kind.as_deref(),
+            self.projection_says_external_repo(thread_id).await,
+            &main_worktree().await,
+            self.workspace_path(),
+        );
+        let is_external = matches!(repo, StaleSessionRepo::External);
 
-        let wt_path = find_worktree_for_branch(&repo_root, &branch_name).await;
-
-        // The removal is `--force`, so it discards whatever is still
-        // uncommitted. That is safe only once the rescue commit has LANDED,
-        // which is why this uses `commit_worktree_or_err` rather than the silent
-        // `auto_commit_worktree`: `git add` and `git commit` fail for ordinary
-        // reasons in a real repo. On a failed rescue we keep the worktree. The
-        // branch is still proposed below, and the cleanup worker owns
-        // reclamation (ADR 0035).
-        if let Some(ref wt) = wt_path {
-            let mut rescued = true;
-            if !discard {
-                match commit_worktree_or_err(wt, "Coding agent changes (auto-committed)").await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        rescued = false;
-                        log!(
-                            "[Recovery] Could not auto-commit {} before ending the stale session: {}. Keeping the worktree so its uncommitted work is not force-removed",
-                            wt.display(),
-                            e
-                        );
-                    }
-                }
+        let mut proposed_change = false;
+        match &repo {
+            StaleSessionRepo::External => {
+                log!(
+                    "[Recovery] External repo branch {}: keeping branch, no change proposed",
+                    branch_name
+                );
             }
-            if rescued {
-                match wt.to_str() {
-                    Some(wt_str) => {
-                        match git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await
-                        {
-                            Ok(o) if o.status.success() => {}
-                            Ok(o) => log!(
-                                "[Recovery] git worktree remove failed for {}: {}",
-                                wt.display(),
-                                String::from_utf8_lossy(&o.stderr).trim()
-                            ),
-                            Err(e) => log!(
-                                "[Recovery] git worktree remove errored for {}: {}",
-                                wt.display(),
-                                e
-                            ),
+            StaleSessionRepo::Owned(repo_root) => {
+                let lookup = find_worktree_for_branch(repo_root, &branch_name).await;
+                settle_stale_worktree(repo_root, &branch_name, thread_id, discard, lookup).await;
+
+                if !discard {
+                    // `Some(files)` only when the branch has commits AND a
+                    // non-empty net diff, so commits that cancel out read as a
+                    // no-op branch.
+                    match proposal_files_for_branch(repo_root, &branch_name).await {
+                        Some(changed_files) => {
+                            proposed_change = self
+                                .propose_stale_branch(
+                                    thread_id,
+                                    &branch_name,
+                                    repo_root,
+                                    &changed_files,
+                                )
+                                .await;
                         }
+                        // Keep the branch. An unexplained `None` (a transient
+                        // git failure, a projection gap) would otherwise strand
+                        // work the user still wants. An orphaned empty branch is
+                        // just a ref, and the cleanup sweep collects it once it
+                        // is fully merged.
+                        None => log!(
+                            "[Recovery] Branch {} has no proposable diff, keeping branch (discard=false)",
+                            branch_name
+                        ),
                     }
-                    None => log!(
-                        "[Recovery] skipped worktree remove (non-UTF8 path): {}",
-                        wt.display()
-                    ),
                 }
             }
         }
 
-        // `Some(files)` only when the branch has commits AND a non-empty net
-        // diff, so commits that cancel out read as a no-op branch.
-        let proposal_files = proposal_files_for_branch(&repo_root, &branch_name).await;
-
-        let mut proposed_change = false;
+        // AFTER the worktree removal above, not before. `discard_change` resets
+        // and cleans the tree it finds, and skips that when the tree is already
+        // gone. Pending rows are DB state, so they clear whichever repo owns the
+        // branch, an external one included.
         if discard {
             log!(
                 "[Recovery] Discarding stale session changes (branch {})",
@@ -191,61 +256,12 @@ impl LucidosEngine {
             );
             self.discard_pending_for_thread(thread_id, actor.clone())
                 .await;
-            if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
+        }
+
+        if let Some(delete_root) = stale_discard_branch_delete_root(discard, &repo, &branch_name) {
+            if let Err(e) = git_cmd(&["branch", "-D", &branch_name], delete_root).await {
                 log!("[Recovery] Failed to delete branch {}: {}", branch_name, e);
             }
-        } else if let Some(changed_files) = proposal_files {
-            let is_external = match self.is_external_repo_thread(thread_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    log!(
-                        "[Recovery] Failed to check external repo status for thread {}: {}",
-                        thread_id,
-                        e
-                    );
-                    false
-                }
-            };
-
-            if is_external {
-                log!(
-                    "[Recovery] External repo branch {} — keeping branch, no change proposed",
-                    branch_name
-                );
-            } else {
-                match self
-                    .propose_branch_changes(
-                        thread_id,
-                        &branch_name,
-                        &repo_root,
-                        &changed_files,
-                        Some(MessageOrigin::engine(EngineReason::StaleSession)),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        proposed_change = true;
-                        log!(
-                            "[Recovery] Proposed change from stale session (branch {})",
-                            branch_name
-                        );
-                    }
-                    Err(e) => log!(
-                        "[Recovery] Failed to propose change from stale session: {}",
-                        e
-                    ),
-                }
-            }
-        } else {
-            // Keep the branch. An unexplained `None` (a transient git failure, a
-            // projection gap) would otherwise `git branch -D` work the user
-            // still wants, and that is unrecoverable. An orphaned empty branch
-            // is just a ref, and the cleanup sweep collects it once it is fully
-            // merged.
-            log!(
-                "[Recovery] recovery: branch {} has no proposable diff — keeping branch (discard=false)",
-                branch_name
-            );
         }
 
         // `SessionEnded` is terminal-only, so mark the orphaned turn as ended
@@ -258,12 +274,16 @@ impl LucidosEngine {
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
                         has_changes: proposed_change,
-                        is_external_repo: false,
+                        // Authoritative for
+                        // `thread_summaries.coding_agent_is_external_repo`, so a
+                        // hardcoded `false` here cleared the flag on an external
+                        // thread's Stop. Derived from the resolved repo instead.
+                        is_external_repo: is_external,
                         requires_restart: false,
                         cc_session_id: None,
                         coding_agent,
                         reason: None,
-                        // The removal above is conditional, so this path may or
+                        // Discard removes the tree above, so this path may or
                         // may not still exist. Recording it either way misleads
                         // the resolver, so leave it None and let the next spawn
                         // look the worktree up itself.
@@ -324,39 +344,17 @@ impl LucidosEngine {
             ws_worktrees_prefix.push(std::path::MAIN_SEPARATOR);
         }
 
-        // Deduplicate by canonical path, so a Lucidos repo that is also
-        // registered as an external repo is not scanned twice.
-        let lucidos_canonical = lucidos_repo_root
-            .canonicalize()
-            .unwrap_or_else(|_| lucidos_repo_root.clone());
-        let mut seen_repo_paths: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::from([lucidos_canonical]);
-        let mut repos_to_scan: Vec<(PathBuf, Option<String>)> =
-            vec![(lucidos_repo_root.clone(), None)];
-        match crate::core::repositories::RepositoryStore::list(self.pool()).await {
-            Ok(repos) => {
-                for repo in repos {
-                    let path = PathBuf::from(&repo.path);
-                    if !path.exists() {
-                        log!(
-                            "[Recovery] Skipping external repo '{}' — path does not exist: {}",
-                            repo.name,
-                            repo.path
-                        );
-                        continue;
-                    }
-                    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-                    if !seen_repo_paths.insert(canonical) {
-                        log!("[Recovery] Skipping external repo '{}' — same path as already-scanned repo", repo.name);
-                        continue;
-                    }
-                    repos_to_scan.push((path, Some(repo.id.to_string())));
-                }
-            }
-            Err(e) => {
+        // A registry read that failed degrades to "no external repos". The two
+        // engine-owned roots are still scanned, so a Lucidos or app thread
+        // recovers even when the registry is unreadable.
+        let external_repos = crate::core::repositories::RepositoryStore::list(self.pool())
+            .await
+            .unwrap_or_else(|e| {
                 log!("[Recovery] Failed to list external repos: {}", e);
-            }
-        }
+                Vec::new()
+            });
+        let repos_to_scan =
+            recovery_repo_roots(&lucidos_repo_root, self.workspace_path(), &external_repos);
 
         // (worktree_path, branch_name, repo_id, repo_root)
         let mut to_recover: Vec<(PathBuf, String, Option<String>, PathBuf)> = Vec::new();
@@ -679,22 +677,33 @@ impl LucidosEngine {
                         // when the git admin is gone.
                         crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path)
                             .await;
-                        match worktree_add(&repo_root, &wt_path, &[branch]).await {
-                            Ok(o) if o.status.success() => {
-                                log!("[Recovery] Created fresh worktree for lost session: {} (branch {})", wt_path.display(), branch);
-                                true
-                            }
-                            Ok(o) => {
+                        // The rebuilt worktree must have the shape the spawn
+                        // path gave it. `Some` is an app thread, and takes the
+                        // sparse cone over its own app folder.
+                        let app_spawn_id = match branch_to_thread.get(branch) {
+                            Some(&tid) => lookup_app_spawn_id(self.pool(), tid).await,
+                            None => None,
+                        };
+                        match recreate_lost_worktree(
+                            &repo_root,
+                            branch,
+                            &wt_path,
+                            app_spawn_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
                                 log!(
-                                    "[Recovery] Failed to create worktree for branch {}: {}",
-                                    branch,
-                                    String::from_utf8_lossy(&o.stderr).trim()
+                                    "[Recovery] Created fresh {} worktree for lost session: {} (branch {})",
+                                    if app_spawn_id.is_some() { "sparse app" } else { "full" },
+                                    wt_path.display(),
+                                    branch
                                 );
-                                false
+                                true
                             }
                             Err(e) => {
                                 log!(
-                                    "[Recovery] git worktree add failed for branch {}: {}",
+                                    "[Recovery] Failed to create worktree for branch {}: {}",
                                     branch,
                                     e
                                 );
@@ -851,7 +860,11 @@ impl LucidosEngine {
                 crate::engine::agent_session::lookup_latest_cc_session_id(self.pool(), thread_id)
                     .await;
 
-            let is_external_repo = is_external_repo_path(&repo_root, &lucidos_repo_root);
+            let is_external_repo = recovery_branch_is_external_repo(
+                &repo_root,
+                &lucidos_repo_root,
+                self.workspace_path(),
+            );
             // Never auto-spawn the agent for a mid-turn crash. Surface the
             // interruption as a synthetic `CodingAgentIdled` carrying
             // `engine_restart_interrupt`, and let the user's Continue re-enter
@@ -959,6 +972,89 @@ impl LucidosEngine {
         .await;
 
         recovering_threads.into_iter().collect()
+    }
+}
+
+/// Commit whatever the dead session left uncommitted, so it reaches the Apply
+/// card. `proposal_files_for_branch` reads committed state only, so an
+/// un-rescued edit is invisible to the proposal.
+///
+/// **The worktree stays.** Removing it here would be a session teardown
+/// reclaiming a worktree, which has exactly one owner (ADR 0035), and nothing
+/// downstream needs it gone. A failed commit is logged and nothing else: the
+/// branch is still proposed from whatever did land.
+pub(crate) async fn rescue_stale_worktree(wt: &Path) {
+    if let Err(e) = commit_worktree_or_err(wt, "Coding agent changes (auto-committed)").await {
+        log!(
+            "[Recovery] Could not auto-commit {} before ending the stale session: {}",
+            wt.display(),
+            e
+        );
+    }
+}
+
+/// Act on a stale session's worktree, given what git said about its branch.
+///
+/// Discard removes the tree, and that removal is what lets the `git branch -D`
+/// downstream run. Otherwise the tree is rescued with a commit and left to the
+/// cleanup worker.
+///
+/// The lookup is a parameter rather than an inner call so a test can drive the
+/// `Unknown` arm against a real repo. Unknown skips both arms: neither a
+/// force-remove nor an auto-commit may run against a tree we could not locate.
+/// The branch-delete gate downstream stays untouched. That delete is authorized
+/// by the user's Discard, and git refuses to delete a branch a worktree holds.
+pub(crate) async fn settle_stale_worktree(
+    repo_root: &Path,
+    branch_name: &str,
+    thread_id: Uuid,
+    discard: bool,
+    lookup: WorktreeLookup,
+) {
+    match lookup {
+        WorktreeLookup::Found(wt) => {
+            if discard {
+                remove_discarded_stale_worktree(repo_root, &wt).await;
+            } else {
+                rescue_stale_worktree(&wt).await;
+            }
+        }
+        WorktreeLookup::NotFound => {}
+        WorktreeLookup::Unknown => log!(
+            "[Recovery] Thread {}: git worktree list gave no answer for branch {}; leaving its \
+             worktree alone rather than removing or committing on a guess",
+            thread_id,
+            branch_name
+        ),
+    }
+}
+
+/// Remove the worktree of a session the user has just DISCARDED.
+///
+/// Load-bearing rather than reclamation: git refuses to delete a branch that a
+/// worktree still has checked out, so the `git branch -D` that follows cannot
+/// run until this does. ADR 0035 names this removal as one the session path
+/// keeps.
+pub(crate) async fn remove_discarded_stale_worktree(repo_root: &Path, wt: &Path) {
+    let Some(wt_str) = wt.to_str() else {
+        log!(
+            "[Recovery] skipped worktree remove (non-UTF8 path): {}",
+            wt.display()
+        );
+        return;
+    };
+    match git_cmd(&["worktree", "remove", "--force", wt_str], repo_root).await {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => log!(
+            "[Recovery] git worktree remove failed for {}: {}",
+            wt.display(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => log!(
+            "[Recovery] git worktree remove errored for {}: {}",
+            wt.display(),
+            e
+        ),
     }
 }
 

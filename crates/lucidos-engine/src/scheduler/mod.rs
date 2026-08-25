@@ -64,6 +64,90 @@ pub(crate) fn trigger_id_to_uuid(trigger_id: &str) -> uuid::Uuid {
 /// Thread Queue's own accounting.
 pub(crate) static ACTIVE_TASK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// What the trigger matcher is handed for one bus event.
+///
+/// The subscriber sees two carriers, and they used to be answered in two
+/// places with two different ideas of depth. One function now decides for
+/// both, which is what makes the answer testable.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TriggerDispatch {
+    pub(crate) event_type: String,
+    /// The *matchable payload*: the same view the event-wait dispatcher
+    /// matches against, so one `condition` cannot mean different things to a
+    /// trigger and to a wait. That parity is what `core::event_subscription`
+    /// exists to hold, and it is what makes `thread_id` a usable `on_event:`
+    /// filter.
+    pub(crate) payload: serde_json::Value,
+    /// The depth to dispatch at, so `MAX_EVENT_TRIGGER_DEPTH` engages.
+    pub(crate) depth: u32,
+    /// The thread the firing event lives on. `None` for a domain event, which
+    /// belongs to no thread.
+    pub(crate) origin_thread_id: Option<uuid::Uuid>,
+}
+
+/// Decide what one bus event gives the trigger matcher, or `None` when it is
+/// not a trigger carrier.
+///
+/// Thread events are gated by a **blocklist**
+/// (`ThreadEvent::is_per_token_streaming`): a workspace can `on_event:` any
+/// persisted `ThreadEvent` by default, and new lifecycle and per-action
+/// variants are triggerable automatically. High-cardinality per-action
+/// variants flow through, scoped by `condition:` filters.
+///
+/// System frames are gated by an **allowlist**,
+/// `core::event_subscription::is_subscribable_system_event`: a domain event,
+/// plus any persisted frame (ADR 0113). The event-wait dispatcher offers from
+/// that same function, which is what invariant I8 requires.
+///
+/// **The depth is the emitting task's, never zero by assumption.** An event
+/// emitted inside a trigger fire is one link along that fire's chain.
+/// Dispatching it at zero disengaged `MAX_EVENT_TRIGGER_DEPTH` for the whole
+/// `BusEvent::Thread` carrier. A trigger subscribed to an event its own run
+/// emits then re-fired without bound. A domain event reads the depth off its
+/// own variant, the persisted value a replay reconstructs.
+pub(crate) fn trigger_dispatch(
+    emitted: &crate::engine::event_bus::EmittedEvent,
+) -> Option<TriggerDispatch> {
+    use crate::core::event_subscription::{
+        is_subscribable_system_event, matchable_system_payload, matchable_thread_payload,
+    };
+    use crate::engine::event_bus::{BusEvent, SystemEvent};
+
+    match &emitted.typed {
+        BusEvent::Thread {
+            thread_id, event, ..
+        } => {
+            if event.is_per_token_streaming() {
+                return None;
+            }
+            Some(TriggerDispatch {
+                event_type: event.event_type().to_string(),
+                payload: matchable_thread_payload(event, *thread_id),
+                depth: emitted.depth,
+                origin_thread_id: Some(*thread_id),
+            })
+        }
+        // A domain event reads its depth off the variant, not off the frame.
+        // That copy is persisted, so a replay reconstructs it. Everything else
+        // about it is the arm below.
+        BusEvent::System(se @ SystemEvent::DomainEvent { depth, .. }) => Some(TriggerDispatch {
+            event_type: se.stored_event_type().to_string(),
+            payload: matchable_system_payload(se),
+            depth: *depth,
+            origin_thread_id: None,
+        }),
+        BusEvent::System(se) if is_subscribable_system_event(se) => Some(TriggerDispatch {
+            // The stored name and the stored payload, so a `condition` reads
+            // the same fields live and on replay.
+            event_type: se.stored_event_type().to_string(),
+            payload: matchable_system_payload(se),
+            depth: emitted.depth,
+            origin_thread_id: None,
+        }),
+        BusEvent::System(_) => None,
+    }
+}
+
 /// Manages all triggers in Lucidos
 pub struct SchedulerManager {
     scheduler: JobScheduler,
@@ -206,8 +290,10 @@ impl SchedulerManager {
         self.scheduler.add(health_job).await?;
         log!("[Scheduler] Registered system task: task_health_monitor");
 
-        // Daily 3am local: disable push on devices not seen in 30 days. Catches
-        // phantom subscriptions left behind by PWA reinstalls whose Apple/Google
+        // Daily 03:00 UTC: disable push on devices not seen in 30 days. UTC
+        // because `Job::new_async` schedules there, and a staleness sweep needs
+        // no local hour (unlike the backup job below). Catches phantom
+        // subscriptions left behind by PWA reinstalls whose Apple/Google
         // endpoint never returned 410 (so the per-fan-out 410 cleanup never ran).
         // Disable-not-delete: zero data loss, fully reversible from Settings, no
         // event spam beyond one DevicePushChanged per actually-flipped row.
@@ -222,17 +308,29 @@ impl SchedulerManager {
         })?;
         self.scheduler.add(prune_job).await?;
         log!(
-            "[Scheduler] Registered system task: disable_push_on_stale_devices (daily 3am, >{}d)",
+            "[Scheduler] Registered system task: disable_push_on_stale_devices (daily 03:00 UTC, >{}d)",
             STALE_DEVICE_DAYS
         );
 
         // Also run once at startup so accumulated stale rows get caught
-        // immediately after deploy without waiting for the first 3am tick.
+        // immediately after deploy without waiting for the first 03:00 tick.
         // Awaited inline (not spawned) so a shutdown mid-prune can't emit
         // DevicePushChanged events into a tearing-down EventBus — the work
         // is bounded (one SELECT plus one UPDATE per stale row).
         disable_push_on_stale_devices(self.engine.clone(), self.pool.clone(), STALE_DEVICE_DAYS)
             .await;
+
+        // Daily 03:10 UTC: drop expired webhook delivery claims. Ten minutes
+        // after the device sweep so two DELETE-heavy jobs do not share a tick.
+        let pool_claims = self.pool.clone();
+        let claims_job = Job::new_async("0 10 3 * * *", move |_uuid, _lock| {
+            let pool = pool_claims.clone();
+            Box::pin(async move {
+                prune_webhook_delivery_claims(pool).await;
+            })
+        })?;
+        self.scheduler.add(claims_job).await?;
+        log!("[Scheduler] Registered system task: prune_webhook_delivery_claims (daily 03:10 UTC)");
 
         let engine_plugin_updates = self.engine.clone();
         let pool_plugin_updates = self.pool.clone();
@@ -722,23 +820,6 @@ impl SchedulerManager {
                                         &trigger_groups,
                                     );
                                 }
-                                SystemEvent::DomainEvent {
-                                    event_type,
-                                    payload,
-                                    depth,
-                                    ..
-                                } => {
-                                    handle_domain_event(
-                                        event_type,
-                                        payload,
-                                        *depth,
-                                        None,
-                                        Some(emitted.event_id),
-                                        &trigger_configs,
-                                        &engine,
-                                    )
-                                    .await;
-                                }
                                 // Re-register the backup cron when the user's
                                 // timezone changes — `Job::new_async_tz` bakes a
                                 // FIXED offset at registration, so the schedule
@@ -774,41 +855,19 @@ impl SchedulerManager {
                                 _ => {}
                             }
                         }
-                        // Forward ThreadEvents to the trigger matcher unless they
-                        // are per-token streaming (see
-                        // `ThreadEvent::is_per_token_streaming`). Blocklist
-                        // semantics — a workspace can `on_event:` any persisted
-                        // ThreadEvent by default; new lifecycle and per-action
-                        // variants are triggerable automatically. High-cardinality
-                        // per-action variants (ToolCalled, CodingAgentToolCalled, …)
-                        // flow through; workspaces scope them with `condition:`
-                        // filters.
-                        if let crate::engine::event_bus::BusEvent::Thread {
-                            thread_id, event, ..
-                        } = &emitted.typed
-                        {
-                            use crate::core::event_subscription::matchable_thread_payload;
-                            if !event.is_per_token_streaming() {
-                                // The same view the event-wait dispatcher
-                                // matches against, so one `condition` cannot
-                                // mean different things to a trigger and to a
-                                // wait: that parity is what
-                                // `core::event_subscription` exists to hold.
-                                // It is also what makes `thread_id` a usable
-                                // `on_event:` filter, and the trigger's own
-                                // Triggering Event block then names the thread.
-                                let payload = matchable_thread_payload(event, *thread_id);
-                                handle_domain_event(
-                                    event.event_type(),
-                                    &payload,
-                                    0, // depth: thread events are top-level — no recursion concern.
-                                    Some(*thread_id),
-                                    Some(emitted.event_id),
-                                    &trigger_configs,
-                                    &engine,
-                                )
-                                .await;
-                            }
+                        // Every trigger carrier, decided in one place. See
+                        // `trigger_dispatch`.
+                        if let Some(dispatch) = trigger_dispatch(&emitted) {
+                            handle_domain_event(
+                                &dispatch.event_type,
+                                &dispatch.payload,
+                                dispatch.depth,
+                                dispatch.origin_thread_id,
+                                Some(emitted.event_id),
+                                &trigger_configs,
+                                &engine,
+                            )
+                            .await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -1173,6 +1232,23 @@ use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
 use plugin_updates::{run_plugin_marketplace_update_check, MARKETPLACE_UPDATE_CHECK_CRON};
 
+/// Drop webhook delivery claims nothing can still be waiting on.
+///
+/// The ledger's horizon IS the largest window a hook may configure, so a claim
+/// this deletes cannot still be deciding a duplicate. Silent by design: the
+/// table is a nonce ledger, and expiring a claim is not a state change anyone
+/// made.
+pub(crate) async fn prune_webhook_delivery_claims(pool: PgPool) {
+    match crate::core::DeliveryLedger::prune(&pool).await {
+        Ok(0) => {}
+        Ok(gone) => log!(
+            "[Scheduler] Pruned {} expired webhook delivery claim(s)",
+            gone
+        ),
+        Err(e) => log!("[Scheduler] prune_webhook_delivery_claims failed: {}", e),
+    }
+}
+
 /// Flip `push_enabled` to false on every device whose `last_seen_at` is older
 /// than `cutoff_days`. Devices already disabled are filtered at the SELECT
 /// layer so a re-run produces no events. Engine-internal: emits `actor: None`.
@@ -1264,10 +1340,219 @@ fn find_matching_script(data_dir: &std::path::Path, trigger_name: &str) -> Optio
 mod tests {
     use super::*;
 
+    use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+
+    /// One broadcast frame, at a stated chain depth.
+    fn emitted(typed: BusEvent, depth: u32) -> EmittedEvent {
+        EmittedEvent {
+            event_id: uuid::Uuid::new_v4(),
+            seq: Some(1),
+            created: chrono::Utc::now(),
+            typed,
+            aggregate: None,
+            depth,
+        }
+    }
+
+    fn thread_frame(thread_id: uuid::Uuid, event: ThreadEvent, depth: u32) -> EmittedEvent {
+        emitted(
+            BusEvent::Thread {
+                thread_id,
+                event,
+                meta: EventMeta::NONE,
+            },
+            depth,
+        )
+    }
+
+    fn response_generated() -> ThreadEvent {
+        ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// The hole Bug 2 lived in. The thread arm passed a literal `0`. A trigger
+    /// fire's own `ResponseGenerated` therefore looked like a top-level event,
+    /// and `MAX_EVENT_TRIGGER_DEPTH` never engaged for the whole carrier.
+    #[test]
+    fn a_thread_event_dispatches_at_the_emitting_runs_depth() {
+        let thread_id = uuid::Uuid::new_v4();
+        let dispatch = trigger_dispatch(&thread_frame(thread_id, response_generated(), 2))
+            .expect("a lifecycle event is a trigger carrier");
+
+        assert_eq!(dispatch.depth, 2, "the fire's depth, not zero");
+        assert_eq!(dispatch.event_type, "ResponseGenerated");
+        assert_eq!(dispatch.origin_thread_id, Some(thread_id));
+        assert_eq!(
+            dispatch.payload.get("thread_id").and_then(|v| v.as_str()),
+            Some(thread_id.to_string().as_str()),
+            "the matchable payload carries thread_id, which is what makes it \
+             a usable on_event filter"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_turn_dispatches_at_zero() {
+        // Nothing outside a trigger fire is a link in anyone's chain, so the
+        // cap must stay out of the way of normal use.
+        let dispatch =
+            trigger_dispatch(&thread_frame(uuid::Uuid::new_v4(), response_generated(), 0))
+                .expect("a lifecycle event is a trigger carrier");
+        assert_eq!(dispatch.depth, 0);
+    }
+
+    #[test]
+    fn per_token_streaming_never_reaches_the_matcher() {
+        assert_eq!(
+            trigger_dispatch(&thread_frame(
+                uuid::Uuid::new_v4(),
+                ThreadEvent::TextStreamed { text: "tok".into() },
+                0,
+            )),
+            None,
+            "the blocklist still gates the thread carrier"
+        );
+    }
+
+    #[test]
+    fn a_domain_event_dispatches_at_its_own_persisted_depth() {
+        // The envelope depth is the emitting task's; the variant's is the one
+        // a replay reconstructs, so the domain carrier keeps reading its own.
+        let frame = emitted(
+            BusEvent::System(SystemEvent::DomainEvent {
+                event_type: "BuildObserved".into(),
+                payload: serde_json::json!({"summary": "green"}),
+                depth: 1,
+                transient: false,
+                actor: None,
+            }),
+            0,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("a domain event is a trigger carrier");
+        assert_eq!(dispatch.depth, 1);
+        assert_eq!(dispatch.event_type, "BuildObserved");
+        assert_eq!(
+            dispatch.origin_thread_id, None,
+            "a domain event belongs to no thread"
+        );
+    }
+
+    /// Invariant I8 over the payload, not just the verdict. Both fan-outs have
+    /// to hand the matcher the same object, or a `condition` matches a wait and
+    /// misses a trigger on the same event.
+    ///
+    /// `actor` is the field that makes the difference visible: the stored
+    /// payload carries it, and the variant's own `payload` does not.
+    #[test]
+    fn a_domain_event_dispatches_the_same_payload_the_wait_matcher_sees() {
+        use crate::core::event_subscription::matchable_system_payload;
+        use crate::engine::thread_events::MessageOrigin;
+
+        let se = SystemEvent::DomainEvent {
+            event_type: "BuildObserved".into(),
+            payload: serde_json::json!({"summary": "green"}),
+            depth: 0,
+            transient: false,
+            actor: Some(MessageOrigin::Device {
+                device_id: "device-1".into(),
+                label: "My MacBook".into(),
+            }),
+        };
+        let dispatch = trigger_dispatch(&emitted(BusEvent::System(se.clone()), 0))
+            .expect("a domain event is a trigger carrier");
+
+        assert_eq!(
+            dispatch.payload,
+            matchable_system_payload(&se),
+            "the trigger matcher reads the stored payload, the same one the \
+             event-wait dispatcher offers"
+        );
+        assert!(
+            dispatch.payload.get("actor").is_some(),
+            "the actor the emit recorded is matchable: {}",
+            dispatch.payload
+        );
+    }
+
+    /// Persisted means triggerable (ADR 0113). `BackupCompleted` has no thread
+    /// event and no domain event beside it, so this arm is the only path to it.
+    #[test]
+    fn a_persisted_system_event_is_a_carrier() {
+        let now = chrono::Utc::now();
+        let frame = emitted(
+            BusEvent::System(SystemEvent::BackupCompleted {
+                filename: "lucidos-backup-2026.tar.zst".into(),
+                size_bytes: 42,
+                started_at: now,
+                finished_at: now,
+            }),
+            0,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("a persisted frame is a trigger carrier");
+        assert_eq!(dispatch.event_type, "BackupCompleted");
+        assert_eq!(
+            dispatch.payload.get("filename").and_then(|v| v.as_str()),
+            Some("lucidos-backup-2026.tar.zst"),
+            "the adjacent-tag envelope is flattened, so a condition names the \
+             event's own field"
+        );
+        assert_eq!(
+            dispatch.origin_thread_id, None,
+            "a system frame belongs to no thread"
+        );
+    }
+
+    /// A trigger's own run emits persisted frames, and a trigger may subscribe
+    /// to one it emits. That chain ends only if the frame keeps the emitting
+    /// task's depth.
+    #[test]
+    fn a_persisted_system_event_dispatches_at_the_emitting_runs_depth() {
+        let frame = emitted(
+            BusEvent::System(SystemEvent::TriggerExecuted {
+                trigger_id: "t-1".into(),
+                payload: serde_json::json!({}),
+            }),
+            2,
+        );
+        let dispatch = trigger_dispatch(&frame).expect("TriggerExecuted is persisted");
+        assert_eq!(dispatch.depth, 2, "the fire's depth, not zero");
+    }
+
+    #[test]
+    fn a_transient_system_event_is_not_a_carrier() {
+        let frame = emitted(
+            BusEvent::System(SystemEvent::BackupProgress {
+                phase: "archiving".into(),
+                progress: 1,
+                total: 3,
+            }),
+            0,
+        );
+        assert_eq!(
+            trigger_dispatch(&frame),
+            None,
+            "a transient frame writes no row, so neither matcher may see it"
+        );
+    }
+
+    /// A private fixture root, removed when the guard drops.
+    ///
+    /// `tempfile`, never a fixed `temp_dir()/lucidos_test_…` name. Several
+    /// worktrees run this suite at once on one machine, and each test here
+    /// used to open with `remove_dir_all` on a path they all shared. That
+    /// deletes a concurrent run's fixture mid-assertion.
+    fn fixture_root() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
     #[test]
     fn find_matching_script_in_triggers() {
-        let dir = std::env::temp_dir().join("lucidos_test_find_script_v2");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = fixture_root();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("triggers/oura-import/scripts")).unwrap();
         std::fs::write(dir.join("triggers/oura-import/scripts/run.py"), "# oura").unwrap();
         std::fs::create_dir_all(dir.join("triggers/google-calendar-sync/scripts")).unwrap();
@@ -1278,32 +1563,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            find_matching_script(&dir, "Oura Data Import"),
+            find_matching_script(dir, "Oura Data Import"),
             Some("triggers/oura-import/scripts/run.py".to_string())
         );
         assert_eq!(
-            find_matching_script(&dir, "Google Calendar sync (script, dynamisk)"),
+            find_matching_script(dir, "Google Calendar sync (script, dynamisk)"),
             Some("triggers/google-calendar-sync/scripts/run.py".to_string())
         );
         // No match — "google" not in trigger name
         assert_eq!(
-            find_matching_script(&dir, "Kalender: 30 min påminnelse (script, dynamisk)"),
+            find_matching_script(dir, "Kalender: 30 min påminnelse (script, dynamisk)"),
             None
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn find_matching_script_no_run_py() {
-        let dir = std::env::temp_dir().join("lucidos_test_find_script_no_py");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = fixture_root();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("oura-import")).unwrap();
         // No run.py in the dir
 
-        assert_eq!(find_matching_script(&dir, "Oura Data Import"), None);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(find_matching_script(dir, "Oura Data Import"), None);
     }
 
     #[test]
@@ -1311,24 +1592,22 @@ mod tests {
         // A trailing dash splits to an empty segment; it must not contribute a
         // "" keyword that matches every trigger name. The real keyword still
         // constrains, and a name without it does not match.
-        let dir = std::env::temp_dir().join("lucidos_test_find_script_trailing_dash");
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = fixture_root();
+        let dir = tmp.path();
         std::fs::create_dir_all(dir.join("triggers/weather-/scripts")).unwrap();
         std::fs::write(dir.join("triggers/weather-/scripts/run.py"), "# w").unwrap();
         assert_eq!(
-            find_matching_script(&dir, "weather report"),
+            find_matching_script(dir, "weather report"),
             Some("triggers/weather-/scripts/run.py".to_string())
         );
-        assert_eq!(find_matching_script(&dir, "unrelated task"), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(find_matching_script(dir, "unrelated task"), None);
 
         // An all-dash dir name yields no keywords and must match nothing
         // (previously ["",""] -> contains("") -> matched everything).
-        let dir2 = std::env::temp_dir().join("lucidos_test_find_script_all_dash");
-        let _ = std::fs::remove_dir_all(&dir2);
+        let tmp2 = fixture_root();
+        let dir2 = tmp2.path();
         std::fs::create_dir_all(dir2.join("triggers/--/scripts")).unwrap();
         std::fs::write(dir2.join("triggers/--/scripts/run.py"), "# x").unwrap();
-        assert_eq!(find_matching_script(&dir2, "literally anything"), None);
-        let _ = std::fs::remove_dir_all(&dir2);
+        assert_eq!(find_matching_script(dir2, "literally anything"), None);
     }
 }

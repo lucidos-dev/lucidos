@@ -172,6 +172,14 @@ pub enum MessageOrigin {
         #[serde(default = "default_thread_direction_parent")]
         direction: ThreadDirection,
     },
+    /// An inbound webhook fired. `name` is what the user called it, so the
+    /// timeline says which hook rather than "API caller".
+    ///
+    /// Mode is Engine: a webhook is neither a person nor an agent, and Engine
+    /// is the existing deterministic, non-human mode. The caller is external
+    /// and unauthenticated until the engine verifies it, so nothing here is
+    /// ever an authorization input.
+    Webhook { webhook_id: String, name: String },
     /// The engine itself initiated this work (recovery, scheduler, retrigger).
     /// Implies `ActorMode::Engine`.
     Engine { reason: EngineReason },
@@ -205,7 +213,7 @@ impl MessageOrigin {
             Self::Device { .. } => ActorMode::Human,
             Self::Api { mode, .. } => *mode,
             Self::Workspace { mode, .. } | Self::ThreadLink { mode, .. } => *mode,
-            Self::Engine { .. } | Self::System => ActorMode::Engine,
+            Self::Webhook { .. } | Self::Engine { .. } | Self::System => ActorMode::Engine,
         }
     }
 

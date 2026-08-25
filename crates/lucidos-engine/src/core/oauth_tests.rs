@@ -2294,3 +2294,215 @@ fn containment_never_stands_in_for_a_granted_scope() {
         vec!["files.content.write".to_string()],
     );
 }
+
+// ---------------------------------------------------------------------------
+// provider_for_url: host classification
+//
+// The caller (`engine/tools/http.rs`) attaches the user's stored bearer token
+// to any URL these tests say `Some` to. A false positive is a credential
+// handed to whoever registered the host, so every arm is pinned from both
+// sides. See the plan doc named on `provider_for_url`.
+// ---------------------------------------------------------------------------
+
+/// Every provider, with the legitimate hosts that must keep working.
+fn legitimate_hosts() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("google", "https://www.googleapis.com/drive/v3/files"),
+        ("google", "https://oauth2.googleapis.com/token"),
+        (
+            "google",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+        ),
+        ("google", "https://accounts.google.com/o/oauth2/v2/auth"),
+        ("microsoft", "https://graph.microsoft.com/v1.0/me"),
+        (
+            "microsoft",
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        ),
+        ("github", "https://api.github.com/user/repos"),
+        (
+            "dropbox",
+            "https://api.dropboxapi.com/2/users/get_space_usage",
+        ),
+        ("dropbox", "https://content.dropboxapi.com/2/files/download"),
+        ("dropbox", "https://www.dropbox.com/oauth2/authorize"),
+        ("spotify", "https://api.spotify.com/v1/me/player"),
+        ("spotify", "https://accounts.spotify.com/api/token"),
+    ]
+}
+
+#[test]
+fn every_legitimate_provider_host_still_classifies() {
+    for (provider, url) in legitimate_hosts() {
+        assert_eq!(
+            provider_for_url(url),
+            Some(provider),
+            "legitimate host stopped classifying: {url}"
+        );
+    }
+}
+
+#[test]
+fn an_attacker_suffix_host_never_classifies() {
+    // The reported exploit: the provider domain is a real prefix of the host,
+    // but the registrable domain belongs to the attacker.
+    for url in [
+        "https://api.github.com.attacker.example/",
+        "https://www.googleapis.com.attacker.example/drive/v3/files",
+        "https://accounts.google.com.attacker.example/",
+        "https://graph.microsoft.com.attacker.example/v1.0/me",
+        "https://login.microsoftonline.com.attacker.example/token",
+        "https://api.dropboxapi.com.attacker.example/2/users",
+        "https://www.dropbox.com.attacker.example/oauth2/authorize",
+        "https://api.spotify.com.attacker.example/v1/me",
+        "https://accounts.spotify.com.attacker.example/api/token",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "attacker suffix classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_lookalike_registrable_domain_never_classifies() {
+    // No dot before the provider domain, so the label boundary is missing and
+    // the whole name is the attacker's to register.
+    for url in [
+        "https://notgithub.com/user/repos",
+        "https://myapi.github.com.evil.test/",
+        "https://evil-googleapis.com/drive/v3/files",
+        "https://notgoogle.com/",
+        "https://fakedropbox.com/oauth2/authorize",
+        "https://xdropboxapi.com/2/users",
+        "https://notapi.spotify.com.evil.test/",
+        "https://evilgraph.microsoft.com.evil.test/",
+    ] {
+        assert_eq!(provider_for_url(url), None, "lookalike classified: {url}");
+    }
+}
+
+#[test]
+fn the_provider_name_in_a_path_or_query_never_classifies() {
+    // The two unanchored arms (`google.com/`, `dropbox.com`) matched anywhere
+    // in the string, so a bare redirect parameter was enough to collect a
+    // bearer. Every provider is checked, not just those two.
+    for url in [
+        "https://evil.example/?next=google.com/",
+        "https://evil.example/google.com/oauth",
+        "https://evil.example/?next=https://www.googleapis.com/drive",
+        "https://evil.example/api.github.com/user",
+        "https://evil.example/?r=api.github.com",
+        "https://evil.example/dropbox.com/files",
+        "https://evil.example/?to=api.dropboxapi.com",
+        "https://evil.example/graph.microsoft.com/v1.0/me",
+        "https://evil.example/?u=api.spotify.com",
+        "https://evil.example/#accounts.spotify.com",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "path or query bait classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_plaintext_http_url_injects_nothing() {
+    // A matched token would otherwise cross the wire in the clear.
+    for (_, https) in legitimate_hosts() {
+        let http = https.replacen("https://", "http://", 1);
+        assert_eq!(
+            provider_for_url(&http),
+            None,
+            "cleartext URL classified: {http}"
+        );
+    }
+}
+
+#[test]
+fn a_non_https_scheme_injects_nothing() {
+    for url in [
+        "ftp://api.github.com/",
+        "file:///api.github.com/",
+        "ws://api.spotify.com/",
+        "HTTP://api.github.com/",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "non-https scheme classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn classification_fails_closed_when_the_host_is_unknown() {
+    // No host to judge means no injection, never a guess.
+    for url in [
+        "",
+        "   ",
+        "not a url",
+        "//api.github.com/",
+        "https:///x",
+        "https://",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "unparseable URL classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn userinfo_cannot_smuggle_a_provider_host() {
+    // `https://api.github.com@evil.example/` has host `evil.example`; the
+    // provider domain sits in the userinfo, where a string match would find it.
+    for url in [
+        "https://api.github.com@evil.example/",
+        "https://www.googleapis.com@evil.example/drive",
+        "https://user:api.spotify.com@evil.example/",
+    ] {
+        assert_eq!(
+            provider_for_url(url),
+            None,
+            "userinfo bait classified: {url}"
+        );
+    }
+}
+
+#[test]
+fn a_unicode_lookalike_host_never_classifies() {
+    // The parser punycodes a non-ASCII host, so a Cyrillic lookalike cannot
+    // compare equal to the ASCII domain.
+    assert_eq!(provider_for_url("https://\u{0430}pi.github.com/"), None);
+    assert_eq!(provider_for_url("https://api.g\u{043e}ogle.com/"), None);
+}
+
+#[test]
+fn host_matching_is_case_insensitive() {
+    assert_eq!(
+        provider_for_url("https://API.GitHub.COM/user"),
+        Some("github")
+    );
+    assert_eq!(
+        provider_for_url("https://WWW.GoogleAPIs.com/drive"),
+        Some("google")
+    );
+}
+
+#[test]
+fn host_is_anchors_on_a_label_boundary() {
+    // The single predicate the whole classifier rests on.
+    assert!(host_is("api.github.com", "api.github.com"));
+    assert!(host_is("sub.api.github.com", "api.github.com"));
+    assert!(!host_is("notgithub.com", "github.com"));
+    assert!(!host_is(
+        "api.github.com.attacker.example",
+        "api.github.com"
+    ));
+    assert!(!host_is("github.com.evil", "github.com"));
+    assert!(!host_is("xgithub.com", "github.com"));
+}

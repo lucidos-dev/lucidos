@@ -1,4 +1,6 @@
-use crate::engine::git_ops::{find_worktree_for_branch, short_thread_id, worktrees_dir};
+use crate::engine::git_ops::{
+    find_worktree_for_branch, short_thread_id, worktrees_dir, WorktreeLookup,
+};
 use std::path::{Path, PathBuf};
 
 /// Lifecycle events that close out a CC turn.
@@ -212,14 +214,25 @@ pub(crate) async fn resolve_worktree_path(
     }
 
     if let Some(branch) = branch_hint {
-        if let Some(path) = find_worktree_for_branch(repo_root, branch).await {
-            log!(
-                "[AgentSession] Resolved worktree path via git worktree list for thread {} branch {}: {}",
+        match find_worktree_for_branch(repo_root, branch).await {
+            WorktreeLookup::Found(path) => {
+                log!(
+                    "[AgentSession] Resolved worktree path via git worktree list for thread {} branch {}: {}",
+                    thread_id,
+                    branch,
+                    path.display()
+                );
+                return path;
+            }
+            WorktreeLookup::NotFound => {}
+            // Same fallback as NotFound, and the log is what tells them apart.
+            // Step 3 below only computes a path, and the caller checks it on
+            // disk before using it, so nothing destructive rides on this.
+            WorktreeLookup::Unknown => log!(
+                "[AgentSession] git worktree list gave no answer for thread {} branch {}; falling back to the deterministic path",
                 thread_id,
-                branch,
-                path.display()
-            );
-            return path;
+                branch
+            ),
         }
     }
 

@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.29.0 — 2026-08-25
+
+### Added
+
+- **Pair a device from Settings > Access.** Scan the QR with the phone camera, or type the one-time code into a box per digit. The desktop app pairs its own window with no terminal, and `lucidos pair --qr` draws the code in the terminal. Paired devices are listed with when each was last seen, and each can be revoked from that row.
+- **The gateway authenticates every network caller.** Engines leave the network, and the engine refuses a page served from a foreign origin.
+- **Webhooks.** Register a hook in Settings > Webhooks and an outside service posts to it. Each delivery is verified against the hook's secret and emits the event pinned to that hook, carrying the named delivery headers in its payload. A resend of the same delivery fires the event once. A `lucidos webhooks` CLI domain covers the same verbs.
+- **Self-curated context, behind the `context_mode_experimental` workspace flag.** A context panel sits at the tail of every round. The model keeps a tool result for another round with `keep_in_context`, releases one it is done with, and writes what a result told it into a scratchpad that survives the sweep. A ledger in the first block says what is held and what has gone.
+- **Cost and token accounting for every model call the workspace makes**, auxiliary calls included. Each capture records which call it was, which model ran it, and what it cost.
+- **A two-step model picker: pick the model, then its reasoning tier.** The same picker serves the chat composer and a coding-agent spawn. The list filters by name and pins to the top of the panel, and a model with no tiers offers no reasoning control.
+- **OpenCode Free**, a keyless provider, off by default.
+- **Field paths in the trigger and event-wait condition language**, so a nested payload field can be matched, plus `$nin`, `$regex` and `$or`. An `event_types` action lists what a workspace can subscribe to, the trigger form offers that list as a dropdown, and an event type the catalog does not hold is refused when a trigger or a wait is created.
+- **A trigger is linkable as `trigger:<id>`**, and the link lands on the trigger's row.
+- **Save a file to the OS downloads folder** from an app or a thread export. The export toast names the folder and can open or share it. On iOS the export shares.
+- **The file tools reach a registered repository.** `read_file`, `glob_files` and `grep_files` take a repo name and work over its tree.
+- **A plugin update keeps a local patch**, and offers that patch upstream with the outcome shown.
+- **The agent's todo notes render in the todo panel.**
+- **`events` resolves one event by its id**, and a tool call's address returns the call together with its result.
+- **A thread image carries a stable `img-<hex>` handle** that tools take by name.
+- **`run_coding_agent`'s model argument is a JSON-schema enum**, so an id the backend does not offer is refused by name.
+
+### Changed
+
+- The update check runs in the gateway and carries the release notes with the announced version. A forced check works when the automatic one is off, and the update offer opens the release it announces.
+- A packaged service that crash-loops says so on the splash screen.
+- Each Settings sub-section is its own view. Paired devices sits with Add a device, and search finds it. Every permission-grant change is audited, and revoke says who it locks out before it does it.
+- Permission grants are seeded per workspace. A workspace reads and writes its own copy, with the machine-wide list as the fallback.
+- Revealing a stored credential runs in two audited steps.
+- A WASM signer is handed header names, not the upstream tokens, and a handshake script runs with a cleared environment.
+- A public hook route id is contained to the gateway's own namespace, and one script-path guard is checked at startup.
+- The header carries the unread total on the brand mark, and the menu says where the notifications live.
+- The file editor stays open after Save and gains a Close button. A fast save goes inert at once and looks it only when slow.
+- A parked thread reads as waiting, and its change is not applicable while it is parked.
+- A user restart auto-resumes app coding-agent threads.
+- A running engine the gateway did not start is adopted rather than reported as never started.
+- System theme follows the OS on resume, on every platform, and an app iframe follows it the way the shell does.
+- The knowhow listing walks one group folder deep.
+- `create_app` refuses an id that is already taken.
+
+### Fixed
+
+- Seven command-guard and permission bypasses are closed, and six paths that carried untrusted input into a sink are cut.
+- An OAuth bearer token reaches only the provider's own hosts, over HTTPS. A host that merely carries a provider's name, in a label, a path or a query, gets nothing, and an address that cannot be parsed gets nothing.
+- A proxy request stays inside the base path the operator configured, on every redirect hop and through every layer of percent-encoding. `proxy_request` is held to the same boundary.
+- A partly-stored Google Drive chunk no longer truncates a backup archive, and a large upload cannot fail on a size field that was too narrow.
+- A cron day-of-week range-with-step token is translated and validated, in a mixed list as well as alone.
+- A truncated model stream retries rather than failing the turn, on Claude, OpenAI and a cut tool-argument stream. An adaptive-thinking model gets its own output ceiling, and a character split across two socket reads survives.
+- `run_bash` waits on the shell rather than on pipe EOF, keeps draining a detached process, and never re-polls a finished reader.
+- A brace glob pattern expands rather than matching nothing.
+- The chat transcript holds the reader's own line through a reveal, a fold, a step-log toggle and a settling turn.
+- Every badge on the header bar is ringed clear of the glyph it rides, and the nav chevrons land on one line across the mobile panes.
+- Send and Submit take the first tap with the keyboard up on a phone.
+- A model alias label no longer goes stale when the generation behind it moves.
+- An MCP server holds a per-server lock, caps its frame size, and reports a failed probe. The dispatch gate asks the registry rather than a snapshot.
+- A pasted screenshot that carries no image bytes is refused before the chip is drawn, and the upload refusal names what was uploaded.
+- Opening a trigger's event-type picker retries a failed list rather than turning the failure into a verdict.
+- The trigger detail page, the app edit form and the group rename field repaint from their own event frames, and a re-read in flight cannot eat the draft typed under it.
+- The mobile connection banner spans the window.
+- A notification tap keeps the window it fronted.
+- One child terminal wakes its parent once, and only the turn a waiter waited for may be evicted.
 ## v0.28.0 — 2026-08-18
 
 ### Added

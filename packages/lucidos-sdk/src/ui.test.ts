@@ -98,28 +98,60 @@ describe('isIOSAgent', () => {
   });
 });
 
-describe('ui.watchPreferences — live theme reaction wiring', () => {
+describe('ui.watchPreferences: live theme reaction wiring', () => {
+  // The iframe half of the host shell's contract, and the same three guards:
+  // the preference follows the OS, the document is visible, and the resolved
+  // value moved. Sampling before re-applying is what keeps a wake that changed
+  // nothing free, since `applyPreferences()` fetches.
   let sseOn: ReturnType<typeof vi.fn>;
   let sseConnect: ReturnType<typeof vi.fn>;
   let getMock: ReturnType<typeof vi.fn>;
   let mqChangeListeners: Array<() => void>;
   let mqQueries: string[];
   let origMatchMedia: unknown;
+  let mqLight: boolean;
+  let attrs: Record<string, string>;
+  let originalGetAttribute: unknown;
+  let originalSetAttribute: unknown;
+
+  function setVisibility(state: 'visible' | 'hidden'): void {
+    (document as { visibilityState: string }).visibilityState = state;
+  }
+
+  /** Bring the frame up on `system`, painted to whatever the OS says now. */
+  async function watchingOnSystem() {
+    const { ui: freshUi } = await import('./ui');
+    await freshUi.applyPreferences();
+    freshUi.watchPreferences();
+    getMock.mockClear();
+    return freshUi;
+  }
 
   beforeEach(() => {
     vi.resetModules();
+    vi.useFakeTimers();
     sseOn = vi.fn();
     sseConnect = vi.fn();
     getMock = vi.fn().mockResolvedValue({ theme: 'system' });
     mqChangeListeners = [];
     mqQueries = [];
+    mqLight = false;
+    setVisibility('visible');
+    attrs = {};
+    const el = document.documentElement as unknown as Record<string, unknown>;
+    originalGetAttribute = el.getAttribute;
+    originalSetAttribute = el.setAttribute;
+    // `applyPreferences` writes the resolved theme through the stub's no-op
+    // `setAttribute`, so record it here: the guard reads the value back.
+    el.getAttribute = (k: string) => attrs[k] ?? null;
+    el.setAttribute = (k: string, v: string) => { attrs[k] = v; };
     vi.doMock('./sse', () => ({ sse: { on: sseOn, connect: sseConnect } }));
     vi.doMock('./preferences', () => ({ preferences: { get: getMock } }));
     origMatchMedia = (globalThis as { matchMedia?: unknown }).matchMedia;
     (globalThis as { matchMedia?: unknown }).matchMedia = (q: string) => {
       mqQueries.push(q);
       return {
-        matches: false,
+        get matches() { return mqLight; },
         addEventListener: (type: string, fn: () => void) => { if (type === 'change') mqChangeListeners.push(fn); },
         removeEventListener: () => {},
       };
@@ -130,6 +162,11 @@ describe('ui.watchPreferences — live theme reaction wiring', () => {
     vi.doUnmock('./sse');
     vi.doUnmock('./preferences');
     (globalThis as { matchMedia?: unknown }).matchMedia = origMatchMedia;
+    const el = document.documentElement as unknown as Record<string, unknown>;
+    el.getAttribute = originalGetAttribute;
+    el.setAttribute = originalSetAttribute;
+    setVisibility('visible');
+    vi.useRealTimers();
   });
 
   it('subscribes to PreferencesChanged and connects SSE', async () => {
@@ -139,19 +176,91 @@ describe('ui.watchPreferences — live theme reaction wiring', () => {
     expect(sseConnect).toHaveBeenCalledTimes(1);
   });
 
-  it('off iOS: attaches a prefers-color-scheme listener that re-applies preferences', async () => {
-    // The node test env's navigator UA carries no iPhone/iPad token, so
-    // isIOSAgent() is false and the OS-appearance listener is installed.
+  it('attaches the OS-appearance listener on every platform, iOS included', async () => {
     const { ui: freshUi } = await import('./ui');
     freshUi.watchPreferences();
     expect(mqQueries).toContain('(prefers-color-scheme: light)');
     expect(mqChangeListeners).toHaveLength(1);
-    // Firing the OS light/dark flip re-applies (applyPreferences fetches prefs).
+  });
+
+  it('re-applies on an OS flip announced while the frame is visible', async () => {
+    await watchingOnSystem();
+
+    mqLight = true;
     mqChangeListeners[0]();
+    vi.advanceTimersByTime(500);
+
     expect(getMock).toHaveBeenCalled();
   });
 
-  it('is idempotent — a second watchPreferences() does not double-subscribe', async () => {
+  it('ignores a flip announced while the frame is hidden', async () => {
+    await watchingOnSystem();
+
+    setVisibility('hidden');
+    mqLight = true;
+    mqChangeListeners[0]();
+    vi.advanceTimersByTime(500);
+
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('repairs on resume a flip that arrived while the frame was hidden', async () => {
+    await watchingOnSystem();
+
+    setVisibility('hidden');
+    mqLight = true;
+    mqChangeListeners[0]();
+    vi.advanceTimersByTime(500);
+    expect(getMock).not.toHaveBeenCalled();
+
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(500);
+
+    expect(getMock).toHaveBeenCalled();
+  });
+
+  it('costs no preferences fetch on a wake that changed nothing', async () => {
+    await watchingOnSystem();
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('pageshow'));
+    vi.advanceTimersByTime(500);
+
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('follows the OS before the first applyPreferences() has resolved', async () => {
+    // An app may call `watchPreferences()` first, or not await the fetch. The
+    // boot script already read the preference out of localStorage, so an OS
+    // flip in that window is not dropped.
+    localStorage.setItem('lucidos-theme', 'system');
+    attrs['data-theme'] = 'dark';
+    const { ui: freshUi } = await import('./ui');
+    freshUi.watchPreferences();
+
+    mqLight = true;
+    mqChangeListeners[0]();
+    vi.advanceTimersByTime(500);
+
+    expect(getMock).toHaveBeenCalled();
+    localStorage.removeItem('lucidos-theme');
+  });
+
+  it('leaves a frame on an explicit theme alone', async () => {
+    getMock.mockResolvedValue({ theme: 'dark' });
+    await watchingOnSystem();
+
+    mqLight = true;
+    mqChangeListeners[0]();
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(500);
+
+    expect(getMock).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent: a second watchPreferences() does not double-subscribe', async () => {
     const { ui: freshUi } = await import('./ui');
     freshUi.watchPreferences();
     freshUi.watchPreferences();
@@ -302,11 +411,18 @@ describe('lucidos.ui.prompt', () => {
 
   // The SDK installs a single `message` listener; replay the host reply by
   // dispatching a synthetic message event with the id the SDK just posted.
+  //
+  // `source` is the stubbed `window.parent`, because the SDK answers only the
+  // window it posted to. A nested iframe inside an app can post to that app's
+  // frame, so a reply from anywhere else is a forgery (see `fromHost`).
   function replyToLastPrompt(value: unknown) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
     globalThis.dispatchEvent(
-      Object.assign(new Event('message'), { data: { type: 'lucidos:ui:prompt:result', id: sent.id, value } }),
+      Object.assign(new Event('message'), {
+        source: (globalThis as { parent?: unknown }).parent,
+        data: { type: 'lucidos:ui:prompt:result', id: sent.id, value },
+      }),
     );
   }
 
@@ -357,12 +473,15 @@ describe('lucidos.ui.previewFile', () => {
     vi.useRealTimers();
   });
 
-  /** Replay the host's answer for the request the SDK just posted. */
+  /** Replay the host's answer for the request the SDK just posted. `source` is
+   *  the stubbed `window.parent`: the SDK answers only the window it posted to
+   *  (see `fromHost`). */
   function replyToLastPreview(reply: { ok: boolean; error?: string }) {
     const calls = postMessage.mock.calls;
     const sent = calls[calls.length - 1][0] as { id: string };
     globalThis.dispatchEvent(
       Object.assign(new Event('message'), {
+        source: (globalThis as { parent?: unknown }).parent,
         data: { type: 'lucidos:ui:preview-file:result', id: sent.id, ...reply },
       }),
     );

@@ -1,6 +1,53 @@
 use super::*;
 use serde_json::json;
 
+/// Drift guard: `RESERVED_TYPE_NAMES` must list every variant.
+///
+/// The truth comes from serde, which defines the wire names, rather than from a
+/// hand-written sample of 85 constructors that can itself go stale. Feed an
+/// internally tagged enum an unknown tag and it names every variant it would
+/// have accepted. That list is what the const has to cover.
+///
+/// A miss means `emit_event` would let an app write a permanent domain row
+/// under that thread-event name.
+#[test]
+fn reserved_type_names_cover_every_variant() {
+    let err = serde_json::from_value::<ThreadEvent>(json!({ "type": "NoSuchVariant" }))
+        .expect_err("an unknown tag must not deserialize")
+        .to_string();
+    let (_, listed) = err
+        .split_once("expected one of ")
+        .expect("serde must name the variants it would have accepted");
+    let variants: Vec<&str> = listed
+        .split(", ")
+        .map(|s| s.trim().trim_matches('`'))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    assert!(
+        variants.len() > 50,
+        "recovered only {} variants, so the parse is wrong, not the const: {err}",
+        variants.len()
+    );
+    for name in &variants {
+        assert!(
+            ThreadEvent::is_reserved_type_name(name),
+            "ThreadEvent::{name} is missing from RESERVED_TYPE_NAMES, so emit_event \
+             would let an app write a domain row under that name"
+        );
+    }
+    for name in ThreadEvent::RESERVED_TYPE_NAMES
+        .iter()
+        .chain(ThreadEvent::LEGACY_TYPE_NAME_ALIASES)
+    {
+        assert!(
+            variants.contains(name),
+            "the deny list carries {name}, which serde no longer accepts. A name \
+             serde has dropped is dead weight, and a stale list hides a real one"
+        );
+    }
+}
+
 #[test]
 fn thread_event_serializes_with_type_tag() {
     let event = ThreadEvent::ToolCalled {
@@ -68,7 +115,10 @@ fn thread_event_type_name_extraction() {
             "ToolResult",
         ),
         (
-            ThreadEvent::TodoListWritten { items: vec![] },
+            ThreadEvent::TodoListWritten {
+                items: vec![],
+                notes: None,
+            },
             "TodoListWritten",
         ),
         (

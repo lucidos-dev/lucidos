@@ -1875,9 +1875,10 @@ build_or_find_engine() {
 # ── swap_ports ──────────────────────────────────────────────────────────
 # Dev runtime topology (ADR 0014 §4 — "one engine serves both gateway-fronted
 # and legacy-direct access, per request"):
-#   • ENGINE_PORT  = VITE_PORT (5173+offset) — the engine binds this DIRECTLY
-#     (network-bound), serving the workspace app at `/` (base `/`). So
-#     `https://localhost:$ENGINE_PORT/` works as before, exactly. This stays
+#   • ENGINE_PORT  = VITE_PORT (5173+offset), the port the engine binds. Under
+#     the gateway it is LOOPBACK-ONLY, so it answers on this machine alone and
+#     the gateway is the only network door (ADR 0094). Legacy direct-engine mode
+#     binds it network-wide, because there the engine IS the front. This stays
 #     PER-WORKSPACE so multiple engines coexist.
 #   • GATEWAY_PORT = a FIXED machine-global port (default 5251 in dev, the
 #     gateway's own DEFAULT_GATEWAY_PORT; override with LUCIDOS_DEV_GATEWAY_PORT;
@@ -2113,8 +2114,9 @@ start_engine() {
 # under a SHARED, machine-global dir ($HOME/.lucidos/gateway) — NOT per-workspace
 # — so every `web-dev.sh` launch accumulates into ONE registry served by ONE
 # gateway, and the picker lists every workspace ever launched (ADR 0014 §10). A
-# workspace's engine still binds its own per-workspace direct port (ENGINE_PORT =
-# VITE_PORT), so `https://localhost:$ENGINE_PORT/` reaches it directly too.
+# workspace's engine binds its own per-workspace port (ENGINE_PORT = VITE_PORT)
+# on LOOPBACK, so only this machine reaches it and every other device goes
+# through the gateway.
 # More workspaces are also created from the picker (the gateway then provisions
 # their Docker Postgres itself). Set LUCIDOS_NO_GATEWAY=1 to fall back to the
 # legacy direct-engine model (engine serves the app at / directly).
@@ -2125,6 +2127,24 @@ start_engine() {
 gateway_data_dir() { echo "${LUCIDOS_GATEWAY_DATA:-$HOME/.lucidos/gateway}"; }
 gateway_pidfile()  { echo "$(gateway_data_dir)/gateway.pid"; }
 gateway_log()      { echo "$(gateway_data_dir)/gateway.log"; }
+
+# `curl` carrying the machine-local credential the gateway's control plane
+# requires. Mirrors `lucidos-local-token`: same header, same path.
+#
+# A loopback address proves nothing to the gateway, because `tailscale serve`
+# proxies remote requests from `127.0.0.1` too. Reading this mode 0600 file is
+# what a remote caller cannot do.
+#
+# A missing file is normal and falls through to a plain `curl`: a workspace can
+# run with no gateway at all, and every caller here already tolerates failure.
+gateway_curl() {
+    local token_file="$HOME/.lucidos/local-token"
+    if [ -r "$token_file" ]; then
+        curl -H "x-lucidos-local-token: $(cat "$token_file")" "$@"
+    else
+        curl "$@"
+    fi
+}
 
 # Stable, filesystem/URL-safe slug from the workspace dir basename — the routing
 # key (/<slug>/). Mirrors gateway::registry::slugify; empty → "workspace".
@@ -2140,10 +2160,9 @@ workspace_slug() {
 # only the runtime fields dir/port are refreshed). A brand-new entry
 # is appended with autostart OFF (manual): an explicit launch starts it this
 # session, but it won't auto-start on a future gateway boot unless the user opts
-# in via the picker toggle. The registry `port` is the engine's DIRECT port
-# (ENGINE_PORT = the user-facing VITE_PORT, ADR 0014 §4): the gateway spawns the
-# engine network-bound there (so `https://localhost:$ENGINE_PORT/` works
-# directly) and proxies `/<slug>/` to it. Sets GATEWAY_WS_ID.
+# in via the picker toggle. The registry `port` is the engine's own port
+# (ENGINE_PORT = VITE_PORT, ADR 0014 §4): the gateway spawns the engine on
+# loopback there and proxies `/<slug>/` to it. Sets GATEWAY_WS_ID.
 seed_gateway_registry() {
     local data reg id name
     data="$(gateway_data_dir)"
@@ -2225,22 +2244,24 @@ start_gateway() {
     LUCIDOS_GATEWAY_PG_CONTAINER="$(shared_pg_container)"
     export LUCIDOS_GATEWAY_PG_CONTAINER
     export LUCIDOS_ENGINE_BIN="$ENGINE_BIN"
-    # Dev: the gateway spawns the engine NETWORK-BOUND on its port (not
-    # loopback-only) so `https://localhost:$ENGINE_PORT/` reaches the app
-    # directly, in addition to `…:$GATEWAY_PORT/<slug>/` through the gateway
-    # (ADR 0014 §4 — loopback-only is the packaged posture, not dev).
-    export LUCIDOS_GATEWAY_ENGINE_LOOPBACK="0"
-    # …and the gateway itself binds all interfaces in dev — the sibling opt-in to
-    # the engine bind above. The gateway defaults to loopback-only (the packaged
-    # security posture; "deployments that intentionally front Lucidos on the
-    # network must opt in explicitly" — crates/lucidos-gateway/src/server.rs).
-    # Dev IS such a deployment: the engines are already all-interfaces and the
-    # user reaches the picker + `/<slug>/` routing from other devices (e.g. an
-    # iOS PWA over Tailscale). Without this opt-in a gateway rebuild+reload comes
-    # up on 127.0.0.1 only and the gateway is unreachable remotely. Packaged
-    # (desktop.rs::spawn_gateway, LUCIDOS_PACKAGED=1) does NOT run start_gateway,
-    # so it stays loopback-only. Defers to ~/.lucidos/network.toml when the user
-    # set an explicit gateway bind there (a specific tailnet IP / loopback).
+    # Nothing sets LUCIDOS_GATEWAY_ENGINE_LOOPBACK here, so the gateway spawns
+    # loopback-only engines in dev exactly as it does packaged. That is the
+    # point: the gateway authenticates every network caller (ADR 0094), and a
+    # network-bound engine port is a way past it. Reaching a workspace from
+    # another device goes through the gateway now, at
+    # `https://<host>:$GATEWAY_PORT/<slug>/`, and pairs. The variable is still
+    # read, so a deployment that needs the old topology can set it to 0.
+    #
+    # The gateway itself binds all interfaces in dev, which is now the only
+    # network door. It defaults to loopback-only (the packaged security posture;
+    # "deployments that intentionally front Lucidos on the network must opt in
+    # explicitly", crates/lucidos-gateway/src/server.rs). Dev IS such a
+    # deployment: the user reaches the picker and `/<slug>/` routing from other
+    # devices, e.g. an iOS PWA over Tailscale. Without this opt-in a gateway
+    # rebuild+reload comes up on 127.0.0.1 only and is unreachable remotely.
+    # Packaged (desktop.rs::spawn_gateway, LUCIDOS_PACKAGED=1) does NOT run
+    # start_gateway, so it stays loopback-only. Defers to ~/.lucidos/network.toml
+    # when the user set an explicit gateway bind there.
     apply_dev_gateway_bind
     # The gateway serves the picker from dist/ and passes LUCIDOS_STATIC_DIR
     # through to the engines it spawns so they serve dist/ too (set by swap_ports;
@@ -2262,7 +2283,7 @@ start_gateway() {
             echo "Reusing existing gateway (PID $existing) on port $GATEWAY_PORT"
             GATEWAY_PID="$existing"; ENGINE_SUPERVISOR_PID=""
             start_caffeinate
-            curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
+            gateway_curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
             wait_for_workspace_health
             return
         fi
@@ -2339,7 +2360,7 @@ start_gateway() {
     # autostart workspaces, but NOT this just-launched one (autostart defaults
     # OFF), so start it explicitly via the control API — same call the reuse path
     # makes, so both paths end with this workspace's engine running.
-    curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
+    gateway_curl -sk -X POST "$PROTO://localhost:$GATEWAY_PORT/~/api/v1/control/workspaces/$GATEWAY_WS_ID/restart" >/dev/null 2>&1 || true
     wait_for_workspace_health
 }
 
@@ -2364,6 +2385,13 @@ start_gateway() {
 running_frontend_workspaces_in_project() (
     shopt -s nullglob
     local project="$1"
+    # Optional pid to ignore. In BUILT mode `start_frontend_built` records the
+    # shared build-watch pid as every workspace's `frontend.pid`, so the marker
+    # alone cannot tell a Vite dev server from the watcher itself. A caller
+    # asking "is a dev server holding node_modules" passes the build-watch pid
+    # and gets the honest answer; every existing caller passes nothing and keeps
+    # the ref-count semantics `teardown_shared_build_watch_if_idle` needs.
+    local exclude_pid="${2:-}"
     local project_real
     project_real="$(cd "$project" 2>/dev/null && pwd -P || true)"
     [ -n "$project_real" ] || return 0
@@ -2374,6 +2402,10 @@ running_frontend_workspaces_in_project() (
         # subshell under the caller's `set -e`.
         pid="$(cat "$pidfile" 2>/dev/null || true)"
         [ -n "$pid" ] || continue
+        # An `if`, not a bare `A && B && continue`: a caller running under
+        # `set -e` aborts the whole subshell on the miss, which reads as "no
+        # frontend is running" and is the wrong answer in the unsafe direction.
+        if [ -n "$exclude_pid" ] && [ "$pid" = "$exclude_pid" ]; then continue; fi
         kill -0 "$pid" 2>/dev/null || continue
         # `lsof -p PID -a -d cwd -Fn` prints `n<path>` for the cwd FD entry.
         vite_cwd="$(lsof -p "$pid" -a -d cwd -Fn 2>/dev/null | awk '/^n/ {print substr($0,2); exit}')"
@@ -2723,7 +2755,13 @@ start_frontend_built() {
         # (not /dev/null) so a build failure is one `tail` away. `exec` makes the
         # tracked pid the node watcher itself, so teardown's `kill` lands on it
         # (firing its SIGTERM handler → kills the in-flight build, no orphan).
-        (cd "$FRONTEND_DIR" && exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
+        # LUCIDOS_CLI_BIN lets the watcher raise a notification when a build
+        # fails, which is the only way a wedged build is visible before somebody
+        # reads the log. Absolute path, the same convention `desktop.rs`
+        # `spawn_gateway` uses. LUCIDOS_WORKSPACE is already exported by
+        # `resolve_workspace`, and the CLI needs both.
+        local cli_bin="${ENGINE_BIN:+${ENGINE_BIN%/*}/lucidos}"
+        (cd "$FRONTEND_DIR" && LUCIDOS_CLI_BIN="$cli_bin" exec node dev-build-watch.mjs) > "$bw_log" 2>&1 &
         BUILD_WATCH_PID=$!
         echo "$BUILD_WATCH_PID" > "$bw_pidfile"
 
@@ -2794,17 +2832,25 @@ show_banner() {
         echo "  Lucidos dev server ready"
     fi
     echo "  Workspace:   $WORKSPACE"
-    # Dev topology (ADR 0014 §4): the engine is reachable DIRECTLY on its port
-    # (app at /), AND through the gateway on GATEWAY_PORT under /<slug>/ (picker
-    # at /~/). Legacy direct-engine mode (no gateway) prints just the engine URL.
-    echo "  Local:       $PROTO://localhost:$ENGINE_PORT/"
-    echo "  Network:     $PROTO://$local_ip:$ENGINE_PORT/"
-    if [ -n "$ts_hostname" ]; then
-        echo "  Tailscale:   $PROTO://$ts_hostname:$ENGINE_PORT/"
-    fi
+    # Dev topology (ADR 0014 §4): the gateway is the only network door, and it
+    # serves the workspace under /<slug>/ with the picker at /~/. The engine it
+    # spawns binds loopback and plain http, so its port answers on this machine
+    # alone. Legacy direct-engine mode (no gateway) prints the engine URLs,
+    # because there the engine IS the front.
     if [ -n "${GATEWAY_MODE:-}" ] && [ -n "${GATEWAY_WS_ID:-}" ]; then
-        echo "  Gateway:     $PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/  (workspace via gateway)"
+        echo "  Local:       $PROTO://localhost:$GATEWAY_PORT/$GATEWAY_WS_ID/"
+        echo "  Network:     $PROTO://$local_ip:$GATEWAY_PORT/$GATEWAY_WS_ID/"
+        if [ -n "$ts_hostname" ]; then
+            echo "  Tailscale:   $PROTO://$ts_hostname:$GATEWAY_PORT/$GATEWAY_WS_ID/"
+        fi
         echo "  Picker:      $PROTO://localhost:$GATEWAY_PORT/~/"
+        echo "  Engine port: http://localhost:$ENGINE_PORT/  (loopback only)"
+    else
+        echo "  Local:       $PROTO://localhost:$ENGINE_PORT/"
+        echo "  Network:     $PROTO://$local_ip:$ENGINE_PORT/"
+        if [ -n "$ts_hostname" ]; then
+            echo "  Tailscale:   $PROTO://$ts_hostname:$ENGINE_PORT/"
+        fi
     fi
     # ADR 0014: the engine serves the built dist/ directly (no Vite in the
     # serving path) in every mode, including tauri-dev (the window loads dist/

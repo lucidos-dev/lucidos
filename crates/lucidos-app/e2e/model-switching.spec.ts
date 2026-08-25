@@ -1,7 +1,7 @@
 import { test, expect, Page } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
-  sendMessage, waitForActionPanel,
+  sendMessage, waitForActionPanel, pickModelPair, openCurrentModelTiers,
 } from './helpers';
 
 /** Send a CC message and wait for session to go idle (Done).
@@ -48,7 +48,7 @@ async function mockActiveSession(page: Page) {
   });
 }
 
-/** Open the CC dropdown and navigate to the Model submenu. */
+/** Open the CC dropdown and navigate to the model-selection list. */
 async function openModelPicker(page: Page) {
   // Wait for the button to have commands loaded (active class) before clicking.
   const cmdBtn = page.locator('.commands-btn-active:visible').first();
@@ -107,6 +107,40 @@ test.describe('Model switching', () => {
     await page.keyboard.press('Escape');
   });
 
+  test('Escape steps back from the tier list without closing the picker', async ({ page }) => {
+    await setupIdleCCThread(page);
+    await mockActiveSession(page);
+
+    const { dropdown } = await openModelPicker(page);
+
+    // Step into a model's tiers. Only a model with tiers shows the disclosure.
+    const withTiers = page.locator('.control-option:visible:has(.control-option-more)').first();
+    await expect(withTiers).toBeVisible({ timeout: 5_000 });
+    const model = await withTiers.getAttribute('data-value');
+    expect(model).toBeTruthy();
+    await withTiers.click();
+    await expect(page.locator(`.control-option[data-value^="${model}|"]:visible`).first())
+      .toBeVisible({ timeout: 5_000 });
+
+    await page.keyboard.press('Escape');
+
+    // Back on the model list, panel still open: the model the user stepped
+    // into must not be lost to one keystroke.
+    await expect(dropdown).toBeVisible();
+    await expect(page.locator(`.control-option[data-value="${model}"]:visible`).first())
+      .toBeVisible({ timeout: 5_000 });
+
+    // A second Escape lands on the command list, matching the picker's own
+    // Back row, so the menu is not lost either.
+    await page.keyboard.press('Escape');
+    await expect(dropdown).toBeVisible();
+    await expect(dropdown.locator('.control-item:visible').filter({ hasText: /^Model/ }).first())
+      .toBeVisible({ timeout: 5_000 });
+
+    await page.keyboard.press('Escape');
+    await expect(dropdown).not.toBeVisible({ timeout: 3_000 });
+  });
+
   test('switching model updates the selection', async ({ page }) => {
     // Setup idle CC thread first (caches commands), then mock active session
     await setupIdleCCThread(page);
@@ -114,26 +148,19 @@ test.describe('Model switching', () => {
 
     const { cmdBtn, dropdown } = await openModelPicker(page);
 
-    // Pick a non-default, non-current option to switch to
+    // Pick a non-default, non-current MODEL, then one of its tiers. Only the
+    // tier commits. Default is skipped because it names an inheritance and
+    // reads back as the model it resolves to.
     const allOptions = page.locator('.control-option:visible');
-    const count = await allOptions.count();
-    expect(count).toBeGreaterThanOrEqual(2);
+    expect(await allOptions.count()).toBeGreaterThanOrEqual(2);
 
-    // Find a specific model to click (skip "Default" since it won't show as current after)
-    let targetIdx = -1;
-    for (let i = 0; i < count; i++) {
-      const text = await allOptions.nth(i).textContent();
-      const isCurrent = await allOptions.nth(i).evaluate(el => el.classList.contains('control-option-current'));
-      if (!isCurrent && !(text ?? '').startsWith('Default')) {
-        targetIdx = i;
-        break;
-      }
-    }
-    expect(targetIdx).toBeGreaterThanOrEqual(0);
-
-    const targetLabelRaw = await allOptions.nth(targetIdx).locator('.control-option-label').textContent();
-    const targetLabel = (targetLabelRaw ?? '').replace(/✓/g, '').trim();
-    await allOptions.nth(targetIdx).click();
+    const target = page.locator(
+      '.control-option:visible:not(.control-option-current):not([data-value="default"])',
+    ).first();
+    await expect(target).toBeVisible({ timeout: 5_000 });
+    const targetModel = await target.getAttribute('data-value');
+    expect(targetModel).toBeTruthy();
+    const targetPair = await pickModelPair(page, targetModel!);
 
     // Re-open to verify selection changed
     await expect(dropdown).not.toBeVisible({ timeout: 3_000 });
@@ -145,13 +172,13 @@ test.describe('Model switching', () => {
     await modelOption2.click();
     await expect(page.locator('.control-option:visible').first()).toBeVisible({ timeout: 5_000 });
 
-    // The selected model should now show as current
-    const currentAfter = page.locator('.control-option-current:visible .control-option-label');
-    await expect(currentAfter.first()).toBeVisible({ timeout: 5_000 });
-    const afterTextRaw = await currentAfter.first().textContent();
-    const afterText = (afterTextRaw ?? '').replace(/✓/g, '').trim();
-    expect(afterText).toBe(targetLabel);
+    // The chosen model is checked on step 1, and its tier one step in.
+    expect(await openCurrentModelTiers(page)).toBe(targetModel);
+    const currentAfter = page.locator('.control-option-current:visible').first();
+    await expect(currentAfter).toBeVisible({ timeout: 5_000 });
+    expect(await currentAfter.getAttribute('data-value')).toBe(targetPair);
 
+    await page.keyboard.press('Escape');
     await page.keyboard.press('Escape');
   });
 });

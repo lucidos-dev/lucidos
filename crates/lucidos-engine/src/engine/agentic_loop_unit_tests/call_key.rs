@@ -6,7 +6,7 @@ mod intent_loop_tools_tests {
     /// when called from execute_intent because the tool wasn't in the tool list.
     #[test]
     fn intent_loop_tools_include_send_notification() {
-        let tools = super::super::build_intent_tools();
+        let tools = super::super::build_intent_tools(&crate::llm::ToolCapabilities::all_open());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
             names.contains(&tn::SEND_NOTIFICATION),
@@ -17,7 +17,7 @@ mod intent_loop_tools_tests {
 
     #[test]
     fn intent_loop_tools_include_notifications() {
-        let tools = super::super::build_intent_tools();
+        let tools = super::super::build_intent_tools(&crate::llm::ToolCapabilities::all_open());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         // The grouped notifications tool (list / mark_read / mark_all_read)
         // replaced the flat read_notifications tool; it must still be present in
@@ -31,7 +31,7 @@ mod intent_loop_tools_tests {
 
     #[test]
     fn intent_loop_tools_exclude_execute_intent() {
-        let tools = super::super::build_intent_tools();
+        let tools = super::super::build_intent_tools(&crate::llm::ToolCapabilities::all_open());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
             !names.contains(&tn::EXECUTE_INTENT),

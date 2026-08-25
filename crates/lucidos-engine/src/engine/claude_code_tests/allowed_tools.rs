@@ -1,22 +1,17 @@
 use super::*;
 
 #[test]
-fn cc_allowed_tools_returns_default_when_user_dir_missing() {
-    assert_eq!(cc_allowed_tools(None), DEFAULT_CC_ALLOWED_TOOLS.join(","));
-}
-
-#[test]
 fn cc_allowed_tools_seeds_empty_default_file_on_first_use() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cc-allowed-tools");
+    let file = GrantFile::CodingAgentTools;
+    let path = dir.path().join(file.file_name());
     assert!(!path.exists());
 
-    let result = cc_allowed_tools(Some(dir.path()));
+    let result = cc_allowed_tools(dir.path());
 
     assert_eq!(result, "", "default allowlist must be empty");
     assert!(path.exists(), "seed file should have been written");
-    let seeded = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(seeded, CC_ALLOWED_TOOLS_HEADER);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), file.header());
 }
 
 /// Codex backend tools (raised by the app-server approval bridge) must never
@@ -41,23 +36,71 @@ fn derive_allow_pattern_codex_tools_have_no_persisted_scopes() {
     }
 }
 
-/// Session scope for codex commands is first-token-scoped, exactly like
-/// Bash — the bare-name fallback would let one "Allow for this thread"
-/// click on `git push` silently auto-approve a later `rm -rf ~/x`.
+/// Session scope for codex commands is head-scoped, exactly like Bash. The
+/// bare-name fallback would let one "Allow for this thread" click on
+/// `git push` silently auto-approve a later `rm -rf ~/x`.
 #[test]
-fn derive_allow_pattern_codex_command_session_is_first_token_scoped() {
+fn derive_allow_pattern_codex_command_session_is_head_scoped() {
     let input = serde_json::json!({ "command": "git push origin main", "cwd": "/wt" });
     assert_eq!(
         derive_allow_pattern("command_execution", &input, AllowScope::Session).as_deref(),
         Some("command_execution(git:*)"),
     );
-    // A DIFFERENT first token must produce a different pattern — that's the
-    // whole point of the scoping.
+    // A DIFFERENT head must produce a different pattern. That is the whole
+    // point of the scoping.
     let rm = serde_json::json!({ "command": "rm -rf /tmp/x" });
     assert_eq!(
         derive_allow_pattern("command_execution", &rm, AllowScope::Session).as_deref(),
         Some("command_execution(rm:*)"),
     );
+}
+
+/// Codex wraps EVERY command it runs as `/bin/zsh -lc '<script>'`. Taking the
+/// first whitespace token therefore derived the same pattern for all of them,
+/// so one session click blanket-approved the rest of the thread.
+#[test]
+fn derive_allow_pattern_codex_command_session_reads_inside_the_wrapper() {
+    let wrapped =
+        |script: &str| serde_json::json!({ "command": format!("/bin/zsh -lc '{script}'") });
+    assert_eq!(
+        derive_allow_pattern(
+            "command_execution",
+            &wrapped("git status --short"),
+            AllowScope::Session
+        )
+        .as_deref(),
+        Some("command_execution(git:*)"),
+    );
+    assert_eq!(
+        derive_allow_pattern(
+            "command_execution",
+            &wrapped("rm -rf /tmp/x"),
+            AllowScope::Session
+        )
+        .as_deref(),
+        Some("command_execution(rm:*)"),
+    );
+    // The same holds for a Claude Code `Bash` command carrying a wrapper.
+    assert_eq!(
+        derive_allow_pattern("Bash", &wrapped("cargo test"), AllowScope::Narrow).as_deref(),
+        Some("Bash(cargo:*)"),
+    );
+}
+
+/// A command running nothing derivable gets NO session pattern. The bare-name
+/// fallback would read one click as a grant for every command in the thread.
+#[test]
+fn derive_allow_pattern_command_with_no_head_has_no_session_pattern() {
+    for command in ["", "   ", "2>/dev/null"] {
+        let input = serde_json::json!({ "command": command });
+        for tool in ["Bash", "command_execution"] {
+            assert_eq!(
+                derive_allow_pattern(tool, &input, AllowScope::Session),
+                None,
+                "{tool} {command:?}"
+            );
+        }
+    }
 }
 
 /// file_change approvals carry no stable identifier (only reason/grant_root)
@@ -100,7 +143,7 @@ fn derive_allow_pattern_skill_broad_returns_bare_tool_name() {
 }
 
 #[test]
-fn derive_allow_pattern_bash_narrow_uses_first_token() {
+fn derive_allow_pattern_bash_narrow_uses_the_command_head() {
     let input = serde_json::json!({ "command": "git status --short" });
     assert_eq!(
         derive_allow_pattern("Bash", &input, AllowScope::Narrow).as_deref(),
@@ -424,75 +467,8 @@ fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
     );
 }
 
-#[test]
-fn append_allowed_tool_pattern_creates_file_with_header() {
-    let dir = tempfile::tempdir().unwrap();
-    append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
-    let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
-    assert!(body.starts_with(CC_ALLOWED_TOOLS_HEADER));
-    assert!(body.trim_end().ends_with("Skill(code-review:*)"));
-}
-
-#[test]
-fn append_allowed_tool_pattern_skips_duplicate() {
-    let dir = tempfile::tempdir().unwrap();
-    append_allowed_tool_pattern(Some(dir.path()), "Skill").unwrap();
-    append_allowed_tool_pattern(Some(dir.path()), "Skill").unwrap();
-    let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
-    assert_eq!(body.matches("Skill\n").count(), 1);
-}
-
-#[test]
-fn append_allowed_tool_pattern_appends_to_existing_file() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("cc-allowed-tools"),
-        "# header\nBash\nRead\n",
-    )
-    .unwrap();
-    append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
-    let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
-    assert_eq!(body, "# header\nBash\nRead\nSkill(code-review:*)\n");
-}
-
-#[test]
-fn append_allowed_tool_pattern_treats_existing_pattern_as_present_even_with_indent() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("cc-allowed-tools"),
-        "# header\n  Skill(code-review:*)  \n",
-    )
-    .unwrap();
-    append_allowed_tool_pattern(Some(dir.path()), "Skill(code-review:*)").unwrap();
-    let body = std::fs::read_to_string(dir.path().join("cc-allowed-tools")).unwrap();
-    assert_eq!(body, "# header\n  Skill(code-review:*)  \n");
-}
-
-#[test]
-fn append_allowed_tool_pattern_no_op_when_user_dir_none() {
-    // Should not panic and should not error.
-    append_allowed_tool_pattern(None, "Bash").unwrap();
-}
-
-#[test]
-fn read_allowed_tools_file_returns_header_when_missing() {
-    let dir = tempfile::tempdir().unwrap();
-    let body = read_allowed_tools_file(dir.path()).unwrap();
-    assert_eq!(body, CC_ALLOWED_TOOLS_HEADER);
-}
-
-#[test]
-fn write_then_read_allowed_tools_file_round_trips() {
-    let dir = tempfile::tempdir().unwrap();
-    let payload = "# notes\nBash\nSkill(meta:*)\n";
-    write_allowed_tools_file(dir.path(), payload).unwrap();
-    assert_eq!(read_allowed_tools_file(dir.path()).unwrap(), payload);
-}
-
-#[test]
-fn default_cc_allowed_tools_is_empty() {
-    assert_eq!(DEFAULT_CC_ALLOWED_TOOLS, &[] as &[&str]);
-}
+// Appending, reading and overwriting the file are covered in `core::grants`,
+// which owns it for all three permission lanes.
 
 #[test]
 fn cc_allowed_tools_parses_user_file_strips_comments_and_blanks() {
@@ -504,7 +480,7 @@ fn cc_allowed_tools_parses_user_file_strips_comments_and_blanks() {
     .unwrap();
 
     assert_eq!(
-        cc_allowed_tools(Some(dir.path())),
+        cc_allowed_tools(dir.path()),
         "Bash,Read,Edit,Skill(superpowers:*)",
     );
 }

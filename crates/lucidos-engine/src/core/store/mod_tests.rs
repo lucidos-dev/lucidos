@@ -462,3 +462,68 @@ async fn omitting_the_thread_filter_returns_every_thread() {
 
     teardown_test_db(&db).await;
 }
+
+/// `distinct_event_types` uses a loose index scan, so it must agree with the
+/// plain `SELECT DISTINCT` it replaced. The fixture covers what the recursive
+/// walk could get wrong: duplicates, a single-row type, and neighbours that
+/// share a prefix.
+#[tokio::test]
+async fn distinct_event_types_matches_select_distinct() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let ts = Utc.timestamp_opt(1_700_000_700, 0).unwrap();
+    let fixture = [
+        "Zebra",
+        "Alpha",
+        "Alpha",
+        "AlphaBeta",
+        "Alpha",
+        "Mid",
+        "Mid",
+        "Zebra",
+    ];
+    for name in fixture {
+        insert_event(&pool, Uuid::new_v4(), name, ts).await;
+    }
+
+    let loose = store
+        .distinct_event_types()
+        .await
+        .expect("distinct_event_types");
+
+    let naive: Vec<String> = sqlx::query_as::<_, (String,)>(
+        "SELECT DISTINCT event_type FROM events ORDER BY event_type",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("select distinct")
+    .into_iter()
+    .map(|r| r.0)
+    .collect();
+
+    assert_eq!(loose, naive, "loose index scan must equal SELECT DISTINCT");
+    assert_eq!(
+        loose,
+        vec!["Alpha", "AlphaBeta", "Mid", "Zebra"],
+        "every distinct name once, alphabetically"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The recursive term terminates on NULL, so an empty table must yield an
+/// empty list rather than one NULL row or a hang.
+#[tokio::test]
+async fn distinct_event_types_returns_empty_on_an_empty_table() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let types = store
+        .distinct_event_types()
+        .await
+        .expect("distinct_event_types");
+    assert!(types.is_empty(), "no events means no types");
+
+    teardown_test_db(&db).await;
+}

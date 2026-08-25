@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { brandBadgeState, brandBadgeTooltip, BrandBadge } from './BrandBadge';
+import { brandBadgeState, brandBadgeTooltip, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
+import { vnodeToText } from '../chat/__tests__/vnodeToText';
+import { crossWorkspaceUnreadTotal, peerWorkspaces } from '../../store/actions/app-badge';
+import type { Notification } from '../../store/types';
 import {
+  unreadNotifications,
   restartRequired,
   engineVersionReady,
   engineVersionPending,
@@ -349,5 +353,78 @@ describe('BrandBadge', () => {
     const toast = toasts.value.find((t) => t.key === BACKGROUND_ACTIVITY_TOAST_KEY);
     expect(toast?.message).toContain('Downloading embedding model');
     expect(toast?.progress).toBeCloseTo(0.25);
+  });
+});
+
+/** The unread count, the mark's SECOND badge and the only in-app mirror of the
+ *  app-icon badge. A separate component from `BrandBadge` on purpose. Folding a
+ *  count into that ladder would hide the rebuild spinner while anything is
+ *  unread, which on a dev workspace is most of the time. */
+describe('UnreadBrandBadge', () => {
+  beforeEach(() => {
+    unreadNotifications.value = { status: 'loaded', data: [] };
+    peerWorkspaces.value = [];
+  });
+
+  function unread(): VNode<{ 'aria-label'?: string }> | undefined {
+    return findByClass(UnreadBrandBadge(), 'brand-unread-badge')[0] as
+      | VNode<{ 'aria-label'?: string }>
+      | undefined;
+  }
+
+  function notes(n: number): Notification[] {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `n${i}`,
+      title: 't',
+      message: 'm',
+      read: false,
+      created_at: '2026-01-01T00:00:00Z',
+    })) as Notification[];
+  }
+
+  it('renders nothing when everything is read', () => {
+    expect(UnreadBrandBadge()).toBeNull();
+  });
+
+  it('shows the same total the app icon carries', () => {
+    unreadNotifications.value = { status: 'loaded', data: notes(2) };
+    expect(unread()).toBeDefined();
+    // The computed is the single source both surfaces read, so asserting the
+    // rendered number IS asserting the icon's.
+    expect(crossWorkspaceUnreadTotal.value).toBe(2);
+  });
+
+  it('coexists with the engine state badge rather than replacing it', () => {
+    // The reported failure this pins: a rebuild that shows no spinner because a
+    // notification happens to be unread.
+    unreadNotifications.value = { status: 'loaded', data: notes(3) };
+    engineBuilding.value = true;
+    expect(findByClass(BrandBadge(), 'brand-badge-spinner'),
+      'the spinner must survive an unread count').toHaveLength(1);
+    expect(unread(), 'and the count must survive the spinner').toBeDefined();
+  });
+
+  it('is purely visual: no name of its own, and no tooltip', () => {
+    // Both would be dead. The badge is `pointer-events: none`, so `useTooltip`
+    // (which walks UP from the hovered element) can never resolve it, and the
+    // hover lands on the mark instead. The MARK speaks the count.
+    unreadNotifications.value = { status: 'loaded', data: notes(3) };
+    const el = unread() as VNode<Record<string, unknown>> | undefined;
+    expect(el?.props['aria-hidden']).toBe('true');
+    expect(el?.props['data-tooltip']).toBeUndefined();
+    expect(el?.props['aria-label']).toBeUndefined();
+  });
+
+  it('phrases the count for the mark to speak, singular and plural', () => {
+    expect(unreadBadgeLabel(0)).toBeNull();
+    expect(unreadBadgeLabel(1)).toBe('1 unread notification');
+    expect(unreadBadgeLabel(4)).toBe('4 unread notifications');
+  });
+
+  it('caps at the same number the menu rows do', () => {
+    // One shared `countLabel`, so the mark and the rows cannot start eliding at
+    // different counts.
+    unreadNotifications.value = { status: 'loaded', data: notes(100) };
+    expect(vnodeToText(UnreadBrandBadge())).toContain('99+');
   });
 });

@@ -4,6 +4,6 @@
    classes land on the same element at the same specificity, so source order is
    the only thing that decides which width wins. See the file's header. */
 @import './chat/prompt-bar-popover.css';
-@import './chat/event-waits.css';
+@import './chat/waiting-indicator.css';
 @import './chat/event-rows.css';
 @import './chat/todo-list.css';

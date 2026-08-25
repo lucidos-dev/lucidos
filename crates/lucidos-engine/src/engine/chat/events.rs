@@ -296,23 +296,37 @@ impl crate::engine::LucidosEngine {
     }
 }
 
+/// The whole text half of an image-description request. Named so
+/// `core::aux_context_backfill` can size a historical call from the same
+/// string the live path sends, instead of a constant that drifts from it.
+pub(crate) const IMAGE_DESCRIPTION_PROMPT: &str = "Describe the image and transcribe ALL visible text exactly as it appears. Include every detail: names, dates, times, numbers, labels, headings. If multiple images, number them.";
+
 /// Generate a brief description of user-attached images using Flash.
 /// Standalone function so it can be spawned into a background task.
+///
+/// `capture` records the call for token accounting. Its request size counts
+/// the encoded image bytes, which is what the provider actually charged for.
 pub(super) async fn describe_images(
     provider: &dyn crate::llm::provider::LlmProvider,
     images: &[crate::api::ChatImage],
+    // The `reasoning_image_description` preference. It used to be `None`, which
+    // `gemini_generation_config` reads as `high`, so a caption was paying for
+    // the model's deepest thinking.
+    reasoning_effort: Option<&str>,
+    capture: Option<&crate::engine::AuxCapture>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use crate::llm::provider::{ContentBlock, Message, MessageContent};
 
     let mut blocks: Vec<ContentBlock> = vec![ContentBlock::Text {
-        text: "Describe the image and transcribe ALL visible text exactly as it appears. Include every detail: names, dates, times, numbers, labels, headings. If multiple images, number them.".to_string(),
+        text: IMAGE_DESCRIPTION_PROMPT.to_string(),
     }];
+    let mut request_chars = IMAGE_DESCRIPTION_PROMPT.chars().count();
     for img in images {
         // Fit each image to the LLM size target (compress only if over) so the
         // description pass can't trip the provider's per-image limit either.
-        blocks.push(super::images::image_content_block(
-            img.clone().fit_for_llm(),
-        ));
+        let fitted = img.clone().fit_for_llm();
+        request_chars += fitted.base64.len();
+        blocks.push(super::images::image_content_block(fitted));
     }
 
     let messages = vec![Message {
@@ -321,8 +335,13 @@ pub(super) async fn describe_images(
     }];
 
     let response = provider
-        .chat(messages, vec![], None, None, None, None)
+        .chat(messages, vec![], None, None, None, reasoning_effort)
         .await?;
+    if let Some(capture) = capture {
+        capture
+            .record(provider.default_model(), request_chars, &response)
+            .await;
+    }
     response
         .content
         .ok_or_else(|| "No description returned".into())
@@ -349,14 +368,18 @@ pub(super) fn format_relative_age(duration: chrono::Duration) -> String {
 /// Emit `ResponseFailed` to close a dangling exchange. Returns `Ok(())` on
 /// successful emit; `Err` only when the bus itself failed.
 ///
-/// **Emit-only contract.** The caller must return `Ok(ProcessResult{
-/// response: String::new(), … })` from its fast-path so the outer
-/// `api::chat` handler does NOT emit a second `ResponseFailed` from its
-/// own `Err`-branch. Returning `Err` here would double-emit because the
-/// terminator has already landed via this function.
-///
 /// Used when a session/thread disappears between the existence check and the
 /// channel send (TOCTOU window in the follow-up fast-paths).
+///
+/// Unanchored on purpose, and the one terminator that stays so. It fires
+/// before this turn has an originating event of its own, closing the exchange
+/// the vanished thread left open. There is nothing to anchor it to.
+///
+/// **Emit-only contract.** The caller still returns `Ok(ProcessResult{
+/// response: String::new(), … })` from its fast-path, because the terminator
+/// has already landed here and the turn has nothing left to do. Nothing
+/// downstream would double-emit now: `process_message_with_steps` settles the
+/// exchange only once one exists, and no caller adds a terminator of its own.
 pub(super) async fn emit_routing_failure(
     bus: &dyn crate::engine::event_bus::EventBusEmitter,
     thread_id: Uuid,

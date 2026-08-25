@@ -1,4 +1,5 @@
 import { errorDetail } from '../utils/errorDetail';
+import type { PluginLocalChangesResult } from '../api/client/apps';
 import type { AnswerKind, EventWaitCancelCause } from './thread-events/thread-event-types';
 
 // --- Async data loading ---
@@ -36,9 +37,13 @@ export function toFailed<T>(error: unknown): Loadable<T> {
  *  visible list stays through the network round-trip and swaps atomically
  *  when fresh data lands — without this, every refetch flashes a spinner. */
 export function setLoadingIfFresh<T>(signal: { value: Loadable<T> }): void {
-  if (signal.value.status !== 'loaded') {
-    signal.value = { status: 'loading' };
-  }
+  signal.value = loadingIfFresh(signal.value);
+}
+
+/** The same rule for a `Loadable` held in component-local `useState`. Pass it
+ *  straight to the setter: `setLoadable(loadingIfFresh)`. */
+export function loadingIfFresh<T>(prev: Loadable<T>): Loadable<T> {
+  return prev.status === 'loaded' ? prev : { status: 'loading' };
 }
 
 // Menu item names (drawer navigation)
@@ -92,14 +97,32 @@ export interface Step {
  *  Rust `ContextRole` enum with `#[serde(rename_all = "snake_case")]`. */
 export type ContextRole = 'system' | 'prior_message' | 'user';
 
-/** One labeled chunk of the LLM's assembled prompt. `char_count` is the
- *  original length; `content` is omitted when the `capture_context`
- *  preference is off (the modal still renders the section with its name and
- *  size, just without the body). */
+/** One labeled chunk of the LLM's assembled prompt. `content` is omitted when
+ *  the `capture_context` preference is off (the modal still renders the
+ *  section with its name and its sizes, just without the body). */
 export interface ContextSection {
   name: string;
   content?: string;
-  char_count: number;
+  /** Chars this section ADDS to the request, beyond what other sections
+   *  already count. Sum it over a capture and you get the budget the request
+   *  spent, which is what `sectionTokenScale` divides the headline by.
+   *
+   *  On most sections nothing else counts their bytes, so the delta happens
+   *  to equal `content_chars`. `Conversation` is where the two part: every
+   *  other section is already concatenated into the first message, so its
+   *  delta is what the tool loop added on top.
+   *
+   *  Mirrors the Rust `budget_delta_chars`. A row stored under the old
+   *  `char_count` name is renamed at the read boundary by the engine
+   *  (`api::threads::events_snapshot`), so it never arrives here. */
+  budget_delta_chars: number;
+  /** True length of this section's own content, whatever `content` shows. A
+   *  dropped body and a head-and-tail truncation both leave it untouched.
+   *
+   *  Absent means the row predates the field, never a zero-size section. Do
+   *  NOT sum it against the headline total: on `Conversation` it counts the
+   *  bundle a second time. */
+  content_chars?: number;
   /** Optional for backward compatibility with snapshots persisted before
    *  role-tagging existed. Default is `'user'` (matches Rust
    *  `default_context_role`). */
@@ -110,7 +133,17 @@ export interface ContextSection {
   group?: string;
 }
 
-/** `cache_*` are Anthropic-only; zero on OpenAI / Gemini. */
+/** Tokens one API call reported.
+ *
+ *  **`input_tokens` is a TOTAL and it CONTAINS the two cache counts.** Both
+ *  providers are normalised to that convention. So the three input fields are a
+ *  total and two of its parts, never three classes to add up. Derive fresh
+ *  input as `Math.max(0, input_tokens - cache_read_tokens -
+ *  cache_creation_tokens)`, the way `ContextCapturePanel` does. Read as
+ *  classes, every cached token counts twice.
+ *
+ *  `cache_creation_tokens` is Anthropic-only, since OpenAI charges nothing for
+ *  a cache write and reports no count. `cache_read_tokens` is set by both. */
 export interface ApiUsage {
   input_tokens: number;
   output_tokens: number;
@@ -118,7 +151,11 @@ export interface ApiUsage {
   cache_creation_tokens: number;
 }
 
-export type ContextProducer = 'main_llm' | 'claude_code' | 'codex';
+/** `auxiliary` is a model call the engine made for itself rather than as an
+ *  agent's turn. The transcript never renders one (`isAuxiliaryCapture` drops
+ *  it from the exchange fold), so it reaches this type only through a raw
+ *  event payload. */
+export type ContextProducer = 'main_llm' | 'claude_code' | 'codex' | 'auxiliary';
 
 /** Mirrors the Rust `ContextCaptured` ThreadEvent. `usage` is absent on
  *  pre-call snapshots and on providers that don't report it (OpenAI,
@@ -173,7 +210,6 @@ export type ResponseEvent =
       full?: string;
       created?: string;
       result?: string;
-      result_images?: string[];
       /** `true` when the source ToolResult event had its `result` field
        *  stripped on the snapshot endpoint (see `strip_tool_result_content`
        *  in `api/threads.rs`). Paired with `result_event_id` so the
@@ -856,9 +892,30 @@ export interface PluginInstallRequest {
   /** Optional post-install instruction text from the manifest. Render as
    *  markdown so the LLM-shippable instructions wrap nicely. */
   setup?: string | null;
+  /** Per-file outcome for every shipped path the user has locally edited. Lets
+   *  the panel say what an update keeps and what it loses BEFORE they confirm.
+   *  Empty for a fresh install and for an untouched plugin. */
+  local_changes?: PluginLocalChange[];
   plugin_id: string;
   plugin_version: string;
   plugin_name: string;
+}
+
+/** What a staged update will do with one locally-edited file.
+ *  - `merged`: the edit and upstream's combine cleanly, and both survive.
+ *  - `conflict`: both changed the same lines. Upstream wins on disk and the
+ *    edit is saved aside, since these files are LLM context and conflict
+ *    markers would be read as instructions.
+ *  - `replaced`: never mergeable (a trigger definition, a binary), so the edit
+ *    is saved aside and upstream lands.
+ *  - `restored`: the user had DELETED the file and upstream still ships it, so
+ *    it comes back. No copy is saved, because a deletion has no content. Its
+ *    own outcome so that `replaced` always implies a saved copy exists. */
+export type PluginLocalChangeOutcome = 'merged' | 'conflict' | 'replaced' | 'restored';
+
+export interface PluginLocalChange {
+  path: string;
+  outcome: PluginLocalChangeOutcome;
 }
 
 /** What a confirmed install actually did, stamped onto the form so the panel
@@ -871,6 +928,9 @@ export interface PluginInstallReceipt {
   at: string;
   summary: string;
   installed_files: string[];
+  /** What the install actually did to the user's local edits. Absent when it
+   *  met none. The engine's answer, not the staged request's guess. */
+  local_changes?: PluginLocalChangesResult;
 }
 
 /** What a confirmed uninstall actually did. Mirrors `PluginInstallReceipt`;

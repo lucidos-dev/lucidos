@@ -1085,6 +1085,44 @@ mod tests {
         );
     }
 
+    /// The whole point of Bug 2's fix, walked end to end with the real pieces.
+    ///
+    /// A trigger subscribed to an event its own run emits is a feedback loop.
+    /// `system-knowhow/triggers.md` states it as an authoring rule, and this is
+    /// the engine backstop under it. Three parts have to agree: the fire runs
+    /// inside `EVENT_TRIGGER_DEPTH.scope(next_depth)`, the events it emits read
+    /// that scope, and the dispatcher decides on what they read.
+    ///
+    /// The loop below drives all three. It used to run forever, because the
+    /// thread-event dispatch hardcoded zero and the scope was never read.
+    #[tokio::test]
+    async fn a_self_subscribed_trigger_stops_at_the_depth_cap() {
+        use crate::scheduler::user_tasks::{current_event_trigger_depth, EVENT_TRIGGER_DEPTH};
+
+        // The first event is emitted by an ordinary turn, outside any fire.
+        let mut observed_depth = current_event_trigger_depth();
+        let mut fires = 0u32;
+
+        while event_trigger_skip_reason(false, observed_depth).is_none() {
+            fires += 1;
+            assert!(
+                fires <= MAX_EVENT_TRIGGER_DEPTH + 1,
+                "the chain must terminate, not run away"
+            );
+            // `handle_domain_event`'s `next_depth`, then the executor's scope.
+            let next_depth = observed_depth + 1;
+            observed_depth = EVENT_TRIGGER_DEPTH
+                .scope(next_depth, async { current_event_trigger_depth() })
+                .await;
+        }
+
+        assert_eq!(
+            fires, MAX_EVENT_TRIGGER_DEPTH,
+            "a self-subscribed trigger gets {} fires and then stops",
+            MAX_EVENT_TRIGGER_DEPTH
+        );
+    }
+
     #[test]
     fn skip_reason_depth_cap_when_not_shutting_down() {
         assert_eq!(

@@ -521,3 +521,389 @@ async fn recover_stuck_skips_session_that_recovered_since_snapshot() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// -- Orphan reconciliation: `running` in the projection, no live session -------
+//
+// The scan above walks `agent_sessions`, so a thread that fell OUT of that map
+// is invisible to it. `settle_orphaned_running` asks the converse question.
+// Every case below pins one of its four exclusions, because a wrong settle
+// aborts work rather than merely delaying a cleanup.
+
+/// Push a thread's `last_activity` back, using the DATABASE clock. Computing
+/// the instant host-side would reintroduce the two-clock bug the sweep's own
+/// SQL exists to avoid (ADR 0053).
+async fn backdate_activity(pool: &sqlx::PgPool, thread_id: Uuid, secs: i64) {
+    sqlx::query(
+        "UPDATE thread_summaries SET last_activity = now() - make_interval(secs => $2) \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .bind(secs)
+    .execute(pool)
+    .await
+    .expect("backdate last_activity");
+}
+
+async fn status_of(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await
+        .expect("status query")
+}
+
+async fn aborted_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ResponseAborted'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("aborted count query")
+}
+
+/// Emit one agent-output event, so the thread carries the orphan pass's
+/// positive fingerprint. Without it, a thread's newest event is its
+/// `SessionStarted`, which reads as "never started producing". The thread is
+/// then spared for a reason unrelated to whichever guard the caller is testing.
+async fn emit_agent_output(bus: &EventBus, thread_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolResult {
+            name: "Bash".into(),
+            result: "ok".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            tool_use_id: "tu-out".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("CodingAgentToolResult emit")
+    .expect("CodingAgentToolResult persisted");
+}
+
+async fn enqueue_pending(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO thread_queue (id, kind, thread_id, request, status) \
+         VALUES ($1, 'coding-agent', $2, '{}'::jsonb, 'queued')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("insert queued entry");
+}
+
+/// A CC thread the projection shows `running`, silent for two hours. The limit
+/// is left at the real 12 minutes so the backdating, not a tiny limit, is what
+/// puts it outside the window.
+const ORPHAN_LIMIT_MS: i64 = super::EXTERNAL_WATCHDOG_LIMIT_MS;
+const TWO_HOURS_SECS: i64 = 2 * 60 * 60;
+
+#[test]
+fn orphans_without_live_session_drops_only_the_live_ones() {
+    let live_id = Uuid::new_v4();
+    let orphan_id = Uuid::new_v4();
+    let live: std::collections::HashSet<Uuid> = [live_id].into_iter().collect();
+
+    let kept = super::orphans_without_live_session(vec![live_id, orphan_id], &live);
+
+    assert_eq!(
+        kept,
+        vec![orphan_id],
+        "a candidate holding a live `agent_sessions` entry must survive the pass \
+         untouched; only the one with no session is an orphan"
+    );
+}
+
+#[tokio::test]
+async fn orphan_pass_settles_a_running_thread_with_no_live_session() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "the seeded session must leave the projection `running`, or this test \
+         proves nothing about the sweep"
+    );
+    emit_agent_output(&bus, thread_id).await;
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+
+    // Empty map: the subprocess died without a terminal, exactly the wedge.
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    ExternalWatchdog::new(
+        sessions,
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_ne!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "a `running` thread with no live session and no activity for two hours must \
+         be settled by the tick, without waiting for Stop or an engine restart"
+    );
+    assert_eq!(
+        aborted_count(&pool, thread_id).await,
+        1,
+        "settling must emit exactly one ResponseAborted, via the same \
+         settle_stuck_running_thread helper Stop and the boot sweep use"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_leaves_a_thread_with_a_live_session_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    // Old in the projection and carrying the fingerprint, but the session is
+    // alive and its heartbeat is fresh, so the stuck scan skips it too. Only
+    // the live-set exclusion can save it here.
+    emit_agent_output(&bus, thread_id).await;
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let (session, _msg_rx) = make_session(now_epoch_millis() - 1000);
+    sessions.lock().await.insert(thread_id, session);
+
+    ExternalWatchdog::new(
+        sessions,
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "a thread whose session is alive must never be settled by the orphan pass, \
+         however stale its projection row looks"
+    );
+    assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_leaves_a_queued_thread_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_agent_output(&bus, thread_id).await;
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+    // Waiting for a capacity slot is not a wedge. A queue can legitimately hold
+    // an entry far longer than the limit, and settling it orphans real work.
+    enqueue_pending(&pool, thread_id).await;
+
+    ExternalWatchdog::new(
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "a thread holding a `queued` thread_queue row is waiting for a slot by \
+         design and must survive the orphan pass"
+    );
+    assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_leaves_a_recently_active_thread_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    // No backdating: this is a thread mid-spawn, whose session has not
+    // registered yet. On a cold worktree that gap is seconds to minutes.
+
+    ExternalWatchdog::new(
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "activity inside the quiet window means the turn is live or still \
+         spawning, so the orphan pass must leave it alone"
+    );
+    assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_leaves_a_question_parked_thread_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAsked {
+            question: "Postgres or SQLite?".into(),
+            options: vec![],
+            multi_select: false,
+            tool_use_id: "tu-park".into(),
+            cc_session_id: "sid-test".into(),
+            worktree_path: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("UserQuestionAsked emit")
+    .expect("UserQuestionAsked persisted");
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+    // No `emit_agent_output` here on purpose: the park must be the newest
+    // event, which is the state the status filter is being tested against.
+
+    ExternalWatchdog::new(
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    // Assert the REASON, not just the outcome. The status filter is the whole
+    // guard here. A park that stopped carrying `waiting_for_user_answer` would
+    // start being settled, and an outcome-only test would still pass on its
+    // way there.
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("waiting_for_user_answer"),
+        "a question park must leave the projection at `waiting_for_user_answer`; \
+         that is what the orphan pass's `status = 'running'` filter relies on"
+    );
+    assert_eq!(
+        aborted_count(&pool, thread_id).await,
+        0,
+        "a thread parked on an unanswered question survives the engine going \
+         quiet; the orphan pass must not kill its card"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_leaves_a_thread_that_never_produced_agent_output_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    // A thread waiting for a capacity slot looks EXACTLY like the wedge on
+    // every negative test: `running`, no live session, `last_activity` as old
+    // as the wait. Both queues can hold one this long, and only one of them is
+    // the `thread_queue` table the guard above checks. The user-slot pool is
+    // in memory, so no SQL exclusion can see it.
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+
+    ExternalWatchdog::new(
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        status_of(&pool, thread_id).await.as_deref(),
+        Some("running"),
+        "the agent produced no output on this thread, so nothing proves a session \
+         ever ran; the orphan pass must leave it for whoever is still holding it"
+    );
+    assert_eq!(aborted_count(&pool, thread_id).await, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn orphan_pass_settles_only_after_the_agents_own_output_goes_quiet() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    // The same thread as the test above, one agent-output event later. That
+    // event is the whole difference between "waiting" and "orphaned", so pin
+    // the pair: without it, the settle test could pass on the strength of the
+    // quiet window alone.
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_agent_output(&bus, thread_id).await;
+    backdate_activity(&pool, thread_id, TWO_HOURS_SECS).await;
+
+    ExternalWatchdog::new(
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        bus.clone(),
+        pool.clone(),
+        ORPHAN_LIMIT_MS,
+        CEILING_MS,
+    )
+    .tick()
+    .await;
+
+    assert_eq!(
+        aborted_count(&pool, thread_id).await,
+        1,
+        "an agent that streamed output and then went silent with no session IS \
+         the wedge, and must settle"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

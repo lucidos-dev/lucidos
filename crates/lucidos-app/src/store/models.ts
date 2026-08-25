@@ -5,8 +5,14 @@ export const DEFAULT_CHAT_MODEL = 'claude-opus-5@default';
 /** Fallback chat model options shown before the DB-backed registry (`/models`)
  *  loads, and used by tests + label lookups. The live picker reads the loaded
  *  registry via `chatModelOptions()` (store/actions/models.ts); this list is the
- *  startup fallback so the picker never renders empty. Keep roughly in sync with
- *  the migration seed in `20260610152555_create_models_registry.sql`. */
+ *  startup fallback so the picker never renders empty.
+ *
+ *  It must hold the ENABLED builtins, not every seeded one. The registry filters
+ *  on `enabled`, so a retired model listed here is offered until `/models`
+ *  lands, then vanishes. Keep it in step with the seeds
+ *  (`20260610152555_create_models_registry.sql` and the later per-family ones)
+ *  MINUS whatever the disable migrations switched off, most recently
+ *  `20260823080956_disable_prior_generation_builtin_models.sql`. */
 export const MODELS = [
   { value: 'claude-fable-5', label: 'Fable 5' },
   { value: 'claude-fable-5[1m]', label: 'Fable 5 (1M)' },
@@ -14,12 +20,6 @@ export const MODELS = [
   { value: 'claude-opus-5@default[1m]', label: 'Opus 5 (1M)' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
   { value: 'claude-sonnet-5[1m]', label: 'Sonnet 5 (1M)' },
-  { value: 'claude-opus-4-8@default', label: 'Opus 4.8' },
-  { value: 'claude-opus-4-8@default[1m]', label: 'Opus 4.8 (1M)' },
-  { value: 'claude-opus-4-7', label: 'Opus 4.7' },
-  { value: 'claude-opus-4-7[1m]', label: 'Opus 4.7 (1M)' },
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { value: 'claude-sonnet-4-6[1m]', label: 'Sonnet 4.6 (1M)' },
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
@@ -27,9 +27,6 @@ export const MODELS = [
   { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
   { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
   { value: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
-  { value: 'gpt-5.5', label: 'GPT-5.5' },
-  { value: 'gpt-5.4', label: 'GPT-5.4' },
-  { value: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
 ];
 
 /** Reasoning effort levels for Claude Code thinking budget. */
@@ -50,9 +47,9 @@ const REASONING_ORDER = REASONING_LEVELS.map(l => l.value);
  *  `supported` is the model's `reasoning_efforts` from the `/models` registry:
  *  the engine's own answer (`llm::reasoning::supported_efforts`), and the same
  *  set `RoutingProvider` clamps the request onto. **Pass it whenever you have
- *  it**, by going through `reasoningLevelsFor` / `clampEffortFor` in
- *  `store/actions/models.ts`, which look it up. Deriving the answer here
- *  independently is what produced the bug this argument exists to close: the
+ *  it**, by going through `lucidosTiers` in `store/modelSelection.ts`, paired
+ *  with the registry lookup in `store/actions/models.ts`. Deriving the answer
+ *  here independently is what produced the bug this argument closes: the
  *  heuristic below matches on the model id's SHAPE, which says nothing about
  *  which server serves the model. A local `muse-glimmer:30b-mlx` matched no
  *  branch, fell through to the Gemini-shaped default, and was offered `max`;

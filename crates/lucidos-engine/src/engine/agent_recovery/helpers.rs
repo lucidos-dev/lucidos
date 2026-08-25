@@ -2,6 +2,7 @@
 //! agent-recovery phases. Re-exported from mod.rs so existing
 //! `agent_recovery::X` paths keep resolving.
 
+use super::super::agent_session::CodingAgentKind;
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::git_cmd;
 use super::super::thread_events::{
@@ -370,6 +371,220 @@ pub(crate) fn orphan_recovery_target(
     branch_to_thread.get(branch_name).copied()
 }
 
+/// Every git repo the orphan-recovery sweep scans, deduplicated by canonical
+/// path. The `String` is the registry id the worktree marker records, and is
+/// `None` for the two repos that are in no registry.
+///
+/// Three sources, in scan order:
+///
+/// * The **Lucidos source repo**: where a `Lucidos`-kind thread works.
+/// * The **workspace repo**: where an `App`-kind thread works. Both its
+///   worktree and its branch belong to the workspace git, which no registry
+///   lists. Omitting it hid every app thread from this sweep, so a user switch
+///   never auto-resumed one
+///   (`docs/plans/2026-08-21-app-threads-never-auto-resume-after-a-user-restart.md`).
+/// * Every **registered external repo**: where an `External`-kind thread works.
+///
+/// Order is load-bearing. The lost-branch fallback takes the first repo whose
+/// refs hold the branch, and a duplicate root would recover one worktree twice.
+/// Either engine-owned root can ALSO sit in the registry, so a registered repo
+/// that canonicalizes onto an earlier entry is dropped and logged.
+///
+/// Pure, so the composition is unit-tested without an engine or a DB.
+pub(crate) fn recovery_repo_roots(
+    lucidos_repo_root: &Path,
+    workspace_root: &Path,
+    external_repos: &[crate::core::repositories::Repository],
+) -> Vec<(PathBuf, Option<String>)> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
+    let mut seen: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::from([canon(lucidos_repo_root)]);
+    let mut roots: Vec<(PathBuf, Option<String>)> = vec![(lucidos_repo_root.to_path_buf(), None)];
+
+    if seen.insert(canon(workspace_root)) {
+        roots.push((workspace_root.to_path_buf(), None));
+    }
+
+    for repo in external_repos {
+        let path = PathBuf::from(&repo.path);
+        if !path.exists() {
+            log!(
+                "[Recovery] Skipping external repo '{}': path does not exist: {}",
+                repo.name,
+                repo.path
+            );
+            continue;
+        }
+        if !seen.insert(canon(&path)) {
+            log!(
+                "[Recovery] Skipping external repo '{}': same path as an already-scanned repo",
+                repo.name
+            );
+            continue;
+        }
+        roots.push((path, Some(repo.id.to_string())));
+    }
+
+    roots
+}
+
+/// The app id an `App`-kind coding-agent thread edits, read from its newest
+/// `SessionStarted`. `None` for every other kind, so a caller branches on
+/// `Some` alone.
+///
+/// Recovery needs it to rebuild a lost worktree the way the spawn path built
+/// it: a sparse cone over `data/apps/<id>/`, never the whole workspace tree.
+/// The newest session decides, because that is the row naming the branch this
+/// sweep is recovering.
+///
+/// A query that could not run answers `None`, which routes to the ordinary
+/// `worktree_add`. That is the safe direction. An over-broad checkout only
+/// wastes disk, where a wrongly-sparse one hides the very files a non-app
+/// thread came to edit.
+pub(crate) async fn lookup_app_spawn_id(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<String> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT payload->>'coding_agent_kind', payload->>'app_id' FROM events \
+         WHERE event_type = 'SessionStarted' AND thread_id = $1 \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!(
+            "[Recovery] app-id lookup for thread {} failed: {}. \
+             A lost worktree would be rebuilt in full rather than sparse",
+            thread_id,
+            e
+        );
+        None
+    });
+    match row {
+        Some((Some(kind), Some(app_id))) if kind == "app" && !app_id.is_empty() => Some(app_id),
+        _ => None,
+    }
+}
+
+/// Rebuild the worktree of a lost coding-agent session at `wt_path`, on the
+/// existing `branch`, in the shape its kind requires.
+///
+/// `app_spawn_id` is [`lookup_app_spawn_id`]'s answer, and it picks the shape.
+/// `Some` builds the sparse cone over `data/apps/<id>/` that the spawn path
+/// builds, so the resumed agent sees its own app and nothing else. A plain
+/// `worktree_add` there would materialise the whole workspace tree, every other
+/// app and every artifact included. `None` takes that full checkout, which is
+/// right for a Lucidos-source or external-repo branch.
+///
+/// Both arms reuse the branch rather than creating one. This runs only when the
+/// branch already exists and carries the session's committed work.
+pub(crate) async fn recreate_lost_worktree(
+    repo_root: &Path,
+    branch: &str,
+    wt_path: &Path,
+    app_spawn_id: Option<&str>,
+) -> Result<(), String> {
+    match app_spawn_id {
+        Some(app_id) => {
+            crate::engine::git_ops::create_sparse_app_worktree(repo_root, app_id, branch, wt_path)
+                .await
+                .map(|_reused_or_created| ())
+        }
+        None => match crate::engine::git_ops::worktree_add(repo_root, wt_path, &[branch]).await {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// True when `repo_root` is a **registered external** repo, rather than one of
+/// the two repos the engine owns. The sweep stamps the answer onto its
+/// `CodingAgentIdled`, so it must agree with a live spawn
+/// (`run_session/run.rs`). An app spawn is never external, and nor is a
+/// Lucidos one.
+///
+/// Derived from the repo root alone, so one rule serves every caller. Asking
+/// only "is this the Lucidos repo?" read a workspace-repo branch as external,
+/// which would strip an app thread of its Apply path.
+pub(crate) fn recovery_branch_is_external_repo(
+    repo_root: &Path,
+    lucidos_repo_root: &Path,
+    workspace_root: &Path,
+) -> bool {
+    crate::engine::git_ops::is_external_repo_path(repo_root, lucidos_repo_root)
+        && crate::engine::git_ops::is_external_repo_path(repo_root, workspace_root)
+}
+
+/// Which git repo holds an ended coding-agent session's branch.
+///
+/// [`stale_session_repo`] derives it from the kind the thread's own
+/// `SessionStarted` recorded, so the branch and the repo that owns it always
+/// come from one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StaleSessionRepo {
+    /// A repo the engine owns and may act in: the workspace git for an `app`
+    /// thread, the Lucidos source repo for a `lucidos` one.
+    Owned(PathBuf),
+    /// A registered external repo. The engine owns no proposal and no branch
+    /// there, so the settle never looks the root up. A root nobody looked up
+    /// can authorize nothing.
+    External,
+}
+
+/// Route a stale coding-agent settle to the repo its branch lives in.
+///
+/// `kind` is `payload->>'coding_agent_kind'` off the newest `SessionStarted`.
+/// A missing or unrecognised value routes to the Lucidos repo, through
+/// [`CodingAgentKind::parse`]: the `app` and `external` kinds postdate the rows
+/// carrying no kind, so such a row really is Lucidos-source.
+///
+/// `projection_says_external` is
+/// `thread_summaries.coding_agent_is_external_repo`. It catches a legacy
+/// external thread whose event predates the kind field. Either signal alone
+/// answers [`StaleSessionRepo::External`], including when the two disagree:
+/// that is the side which touches nothing.
+pub(crate) fn stale_session_repo(
+    kind: Option<&str>,
+    projection_says_external: bool,
+    lucidos_repo_root: &Path,
+    workspace_root: &Path,
+) -> StaleSessionRepo {
+    let kind = kind.map(CodingAgentKind::parse).unwrap_or_default();
+    if projection_says_external || matches!(kind, CodingAgentKind::External) {
+        return StaleSessionRepo::External;
+    }
+    match kind {
+        CodingAgentKind::App => StaleSessionRepo::Owned(workspace_root.to_path_buf()),
+        _ => StaleSessionRepo::Owned(lucidos_repo_root.to_path_buf()),
+    }
+}
+
+/// The repo root a stale settle may run `git branch -D` in, or `None`.
+///
+/// Three facts authorize the delete and nothing less does: the user clicked
+/// Discard, the root came from the thread's own kind, and the engine created
+/// the branch name. `git branch -D` force-deletes unmerged commits, which
+/// `.claude/rules/rust.md` puts in the class no unresolved answer may
+/// authorize.
+///
+/// It hands back the root rather than a bool so an unauthorized caller has no
+/// root to run the command in. Pure, so the gate is exercised without a repo on
+/// disk.
+pub(crate) fn stale_discard_branch_delete_root<'a>(
+    discard: bool,
+    repo: &'a StaleSessionRepo,
+    branch: &str,
+) -> Option<&'a Path> {
+    if !discard || !crate::engine::git_ops::is_coding_agent_branch(branch) {
+        return None;
+    }
+    match repo {
+        StaleSessionRepo::Owned(root) => Some(root.as_path()),
+        StaleSessionRepo::External => None,
+    }
+}
+
 /// Did the most recent **Claude Code** turn for this thread end cleanly?
 ///
 /// Returns `true` iff the latest CC-channel terminal event is
@@ -665,6 +880,338 @@ mod tests {
         assert!(
             recovered.is_none(),
             "dangling HEAD symref is unrecoverable — must NOT guess a SHA"
+        );
+    }
+
+    fn registered_repo(name: &str, path: &Path) -> crate::core::repositories::Repository {
+        crate::core::repositories::Repository {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            description: None,
+            root_commit_sha: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn root_paths(roots: &[(PathBuf, Option<String>)]) -> Vec<PathBuf> {
+        roots.iter().map(|(p, _)| p.clone()).collect()
+    }
+
+    /// The bug this fixes. An app coding-agent thread's worktree and branch
+    /// live in the workspace git, which no registry lists. A sweep over the
+    /// Lucidos repo plus the registered externals never saw one, so a user
+    /// switch fell through to `end_stuck_session` instead of auto-resuming.
+    #[test]
+    fn recovery_repo_roots_scans_the_workspace_repo() {
+        let lucidos = PathBuf::from("/src/lucidos");
+        let workspace = PathBuf::from("/home/u/workspaces/dev");
+
+        let roots = recovery_repo_roots(&lucidos, &workspace, &[]);
+
+        assert_eq!(
+            root_paths(&roots),
+            vec![lucidos, workspace],
+            "the workspace repo must be scanned, after the Lucidos source repo"
+        );
+        assert!(
+            roots.iter().all(|(_, id)| id.is_none()),
+            "neither engine-owned repo is in the registry, so neither carries an id"
+        );
+    }
+
+    /// Order is load-bearing: the lost-branch fallback takes the first repo
+    /// whose refs hold the branch, so the two engine-owned roots come first.
+    #[test]
+    fn recovery_repo_roots_puts_registered_repos_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external-repo");
+        std::fs::create_dir_all(&external).unwrap();
+        let lucidos = PathBuf::from("/src/lucidos");
+        let workspace = PathBuf::from("/home/u/workspaces/dev");
+        let repos = vec![registered_repo("example-repo", &external)];
+
+        let roots = recovery_repo_roots(&lucidos, &workspace, &repos);
+
+        assert_eq!(root_paths(&roots), vec![lucidos, workspace, external]);
+        assert!(
+            roots[2].1.is_some(),
+            "a registered repo carries the id its worktree marker records"
+        );
+    }
+
+    /// A workspace that IS the Lucidos checkout must not be scanned twice. A
+    /// duplicate root recovers one worktree under two entries, which trips the
+    /// duplicate-thread guard on every ordinary boot.
+    #[test]
+    fn recovery_repo_roots_dedupes_a_workspace_inside_the_lucidos_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let both = tmp.path().to_path_buf();
+
+        let roots = recovery_repo_roots(&both, &both, &[]);
+
+        assert_eq!(root_paths(&roots), vec![both]);
+    }
+
+    /// Same dedupe from the other side: a user who also registered their
+    /// workspace as an external repo gets one entry, the workspace's.
+    #[test]
+    fn recovery_repo_roots_dedupes_a_workspace_registered_as_an_external_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let lucidos = PathBuf::from("/src/lucidos");
+        let repos = vec![registered_repo("my-workspace", &workspace)];
+
+        let roots = recovery_repo_roots(&lucidos, &workspace, &repos);
+
+        assert_eq!(root_paths(&roots), vec![lucidos, workspace]);
+        assert!(
+            roots[1].1.is_none(),
+            "the workspace entry wins, so the duplicate registry id is dropped"
+        );
+    }
+
+    /// The dedupe case that predates the workspace entry: a Lucidos checkout
+    /// the user also registered as a repo. Scanning it twice would recover
+    /// every Lucidos-source worktree under two entries.
+    #[test]
+    fn recovery_repo_roots_dedupes_a_registered_lucidos_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lucidos = tmp.path().to_path_buf();
+        let workspace = PathBuf::from("/home/u/workspaces/dev");
+        let repos = vec![registered_repo("Lucidos", &lucidos)];
+
+        let roots = recovery_repo_roots(&lucidos, &workspace, &repos);
+
+        assert_eq!(root_paths(&roots), vec![lucidos, workspace]);
+    }
+
+    /// A registered repo the user has since deleted from disk is skipped. Its
+    /// `git worktree list` would only fail and log.
+    #[test]
+    fn recovery_repo_roots_skips_a_registered_repo_that_is_gone() {
+        let lucidos = PathBuf::from("/src/lucidos");
+        let workspace = PathBuf::from("/home/u/workspaces/dev");
+        let repos = vec![registered_repo(
+            "example-repo",
+            Path::new("/nonexistent/example-repo"),
+        )];
+
+        let roots = recovery_repo_roots(&lucidos, &workspace, &repos);
+
+        assert_eq!(root_paths(&roots), vec![lucidos, workspace]);
+    }
+
+    /// The recovery `CodingAgentIdled` stamps
+    /// `thread_summaries.coding_agent_is_external_repo`, and an app thread that
+    /// wrongly reads external loses its Apply path. Only a registered repo is
+    /// external; neither engine-owned root is.
+    #[test]
+    fn recovery_branch_is_external_repo_excludes_both_engine_owned_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lucidos = tmp.path().join("lucidos");
+        let workspace = tmp.path().join("workspace");
+        let external = tmp.path().join("example-repo");
+        for p in [&lucidos, &workspace, &external] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+
+        assert!(
+            !recovery_branch_is_external_repo(&lucidos, &lucidos, &workspace),
+            "a Lucidos-source branch is not external"
+        );
+        assert!(
+            !recovery_branch_is_external_repo(&workspace, &lucidos, &workspace),
+            "an app branch lives in the workspace repo and is not external"
+        );
+        assert!(
+            recovery_branch_is_external_repo(&external, &lucidos, &workspace),
+            "a registered repo's branch is external"
+        );
+    }
+
+    fn lucidos_root() -> PathBuf {
+        PathBuf::from("/src/lucidos")
+    }
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from("/home/u/workspaces/dev")
+    }
+
+    fn repo_for(kind: Option<&str>, projection_says_external: bool) -> StaleSessionRepo {
+        stale_session_repo(
+            kind,
+            projection_says_external,
+            &lucidos_root(),
+            &workspace_root(),
+        )
+    }
+
+    /// The bug this fixes. An app thread's branch lives in the workspace git.
+    /// A settle that asks the Lucidos repo finds nothing and proposes nothing,
+    /// leaving the user no Apply card for committed work.
+    #[test]
+    fn stale_session_repo_routes_an_app_thread_to_the_workspace_git() {
+        assert_eq!(
+            repo_for(Some("app"), false),
+            StaleSessionRepo::Owned(workspace_root())
+        );
+    }
+
+    /// A `lucidos` thread, an unrecognised kind and a legacy row carrying no
+    /// kind all take the Lucidos repo. The `app` and `external` kinds postdate
+    /// those rows, so a row with no kind really is Lucidos-source.
+    #[test]
+    fn stale_session_repo_routes_every_other_kind_to_the_lucidos_repo() {
+        for kind in [Some("lucidos"), Some("something-new"), None] {
+            assert_eq!(
+                repo_for(kind, false),
+                StaleSessionRepo::Owned(lucidos_root()),
+                "kind {:?} must take the Lucidos repo",
+                kind
+            );
+        }
+    }
+
+    /// Either external signal alone is enough. The event kind covers a modern
+    /// thread; the projection flag covers a legacy one whose `SessionStarted`
+    /// predates the field.
+    #[test]
+    fn stale_session_repo_reads_external_from_either_signal() {
+        assert_eq!(
+            repo_for(Some("external"), false),
+            StaleSessionRepo::External
+        );
+        assert_eq!(repo_for(None, true), StaleSessionRepo::External);
+    }
+
+    /// A disagreement between the two signals resolves to `External`, the only
+    /// answer that touches nothing. Routing a contradiction into an owned repo
+    /// would hand a `git branch -D` a root nobody can vouch for.
+    #[test]
+    fn stale_session_repo_resolves_a_contradiction_to_external() {
+        assert_eq!(repo_for(Some("app"), true), StaleSessionRepo::External);
+    }
+
+    /// `git branch -D` force-deletes unmerged commits, so it needs all three
+    /// facts. Dropping any one leaves the branch, which is recoverable. A wrong
+    /// delete is not.
+    #[test]
+    fn stale_discard_deletes_a_branch_only_on_all_three_facts() {
+        let owned = StaleSessionRepo::Owned(workspace_root());
+        let branch = "lucidos-claude-code-app-habit-tracker-add-streaks-ae6846f4";
+
+        assert_eq!(
+            stale_discard_branch_delete_root(true, &owned, branch),
+            Some(workspace_root().as_path()),
+            "a Discard on an app thread deletes its branch in the workspace git"
+        );
+        assert_eq!(
+            stale_discard_branch_delete_root(false, &owned, branch),
+            None,
+            "an Apply or Stop deletes nothing: only Discard asks for the work to go"
+        );
+        assert_eq!(
+            stale_discard_branch_delete_root(true, &StaleSessionRepo::External, branch),
+            None,
+            "an external root was never resolved, so it authorizes no delete"
+        );
+        assert_eq!(
+            stale_discard_branch_delete_root(true, &owned, "main"),
+            None,
+            "a branch the engine did not create is not this settle's to delete"
+        );
+    }
+
+    /// Build a workspace git holding one app, a sibling app, and an artifact,
+    /// with `branch` created and no worktree on it. That is the state the
+    /// lost-worktree recovery arm rebuilds from.
+    async fn workspace_with_lost_app_branch(workspace: &Path, branch: &str) {
+        init_repo(workspace).await;
+        for dir in [
+            "data/apps/habit-tracker",
+            "data/apps/other",
+            "data/artifacts",
+        ] {
+            tokio::fs::create_dir_all(workspace.join(dir))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            workspace.join("data/apps/habit-tracker/index.html"),
+            "<h1>h</h1>",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(workspace.join("data/apps/other/index.html"), "<h1>o</h1>")
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("data/artifacts/report.md"), "private")
+            .await
+            .unwrap();
+        git_cmd(&["add", "."], workspace).await.unwrap();
+        git_cmd(&["commit", "-m", "scaffold"], workspace)
+            .await
+            .unwrap();
+        git_cmd(&["branch", branch], workspace).await.unwrap();
+    }
+
+    /// An app thread's worktree is a sparse cone over its own app folder. A
+    /// rebuild that materialised the whole workspace tree would show the
+    /// resumed agent every other app and every artifact.
+    #[tokio::test]
+    async fn recreate_lost_worktree_rebuilds_an_app_worktree_sparsely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let branch = "lucidos-claude-code-app-habit-tracker-add-streaks-ae6846f4";
+        workspace_with_lost_app_branch(&workspace, branch).await;
+        let wt = worktrees_dir(&workspace).join("thread-ae6846f4");
+
+        recreate_lost_worktree(&workspace, branch, &wt, Some("habit-tracker"))
+            .await
+            .expect("an app worktree must rebuild on its surviving branch");
+
+        assert!(
+            wt.join("data/apps/habit-tracker/index.html").exists(),
+            "the thread's own app folder must be materialised"
+        );
+        assert!(
+            !wt.join("data/apps/other/index.html").exists(),
+            "a sibling app must stay outside the sparse cone"
+        );
+        assert!(
+            !wt.join("data/artifacts/report.md").exists(),
+            "artifacts must stay outside the sparse cone"
+        );
+    }
+
+    /// Every other kind keeps the full checkout, so a Lucidos-source or
+    /// external-repo thread still finds the files it came to edit.
+    #[tokio::test]
+    async fn recreate_lost_worktree_rebuilds_a_non_app_worktree_in_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let branch = "lucidos-claude-code-repo-fix-oauth-urls-ae6846f4";
+        workspace_with_lost_app_branch(&workspace, branch).await;
+        let wt = worktrees_dir(&workspace).join("thread-ae6846f4");
+
+        recreate_lost_worktree(&workspace, branch, &wt, None)
+            .await
+            .expect("a non-app worktree must rebuild on its surviving branch");
+
+        // `worktree_add` passes `--no-checkout`, so the spawn that follows does
+        // the checkout. Git registering the worktree on our branch, unnarrowed,
+        // is the fact this arm owns.
+        let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), branch);
+        let narrowed = git_cmd(&["config", "--get", "core.sparseCheckout"], &wt)
+            .await
+            .unwrap();
+        assert!(
+            !narrowed.status.success(),
+            "a non-app rebuild must not narrow the checkout"
         );
     }
 

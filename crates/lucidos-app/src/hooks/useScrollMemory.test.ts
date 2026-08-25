@@ -645,6 +645,73 @@ describe('attachScrollMemory teardown', () => {
       }
     });
 
+    /** Claim the open BEFORE the attach, with a target that never renders.
+     *
+     *  The other ordering cannot reach a thread with NO record. A claim
+     *  broadcast only stands down over an armed restore, and a no-record open
+     *  arms none: it decides on the spot and stops restoring. So the attach-time
+     *  branch is the only route the seed's arm and the rescue ever share. */
+    function deadLinkOverNoRecord(el: any) {
+      captureObservers();
+      stopFollowingBottom();
+      setThreadLive(false);
+      scrollToEventAndPulse('never-renders');
+      return attachScrollMemory(el, 'k', {
+        live: transcript,
+        resetOnEmpty: true,
+        // The transcript, which is the one container that records a live edge
+        // and therefore the only one the seed can arm.
+        followsLiveEdge: true,
+      });
+    }
+
+    it('does not reset an armed reader to the top when the link turns out dead', async () => {
+      // The rescue answers for the open it is rescuing, so it re-reads. The
+      // stand-down can ARM this open through the *follow seed*, on a thread whose
+      // record was empty when the attachment read it. Held against that snapshot
+      // the rescue took its reset branch. It hauled an armed reader to the top,
+      // recording the offset over the request the arm had just made.
+      vi.useFakeTimers();
+      try {
+        setFollowLiveEdge(true); // the press that records the seed
+        const el = makeEl(4200, 20000); // the outgoing thread's offset
+        const detach = deadLinkOverNoRecord(el);
+
+        expect(followingLiveEdge.value).toBe(true); // the seed armed, in place
+        await vi.advanceTimersByTimeAsync(4000); // the deep-link's own deadline
+        clearPendingEventScroll();               // it gave up and released
+        await vi.advanceTimersByTimeAsync(600);
+
+        expect(el.scrollTop).toBe(19200); // today's live edge, not the top
+        expect(followingLiveEdge.value).toBe(true);
+        detach();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('still opens an UNARMED reader at the top when the link turns out dead', async () => {
+      // The other half of the re-read, and the reason it is not a blanket
+      // resume. With the seed off there is no request and no record, so the top
+      // is where this thread opens. `.thread-content` is one shared element, so
+      // leaving it is leaving the reader on the outgoing thread's offset.
+      vi.useFakeTimers();
+      try {
+        const el = makeEl(4200, 20000);
+        const detach = deadLinkOverNoRecord(el);
+
+        expect(followingLiveEdge.value).toBe(false);
+        await vi.advanceTimersByTimeAsync(4000);
+        clearPendingEventScroll();
+        await vi.advanceTimersByTimeAsync(600);
+
+        expect(el.scrollTop).toBe(0);
+        detach();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('extends the rescue when a SECOND link is tapped mid-window', async () => {
       // The first link's rescue expires while the second claim is still held,
       // so it declines and leaves nothing behind: a dead second link would

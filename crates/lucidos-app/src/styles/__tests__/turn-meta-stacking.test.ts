@@ -79,8 +79,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf8');
 
 /** The two sheets under scan. Named because the per-field assertions reach for
- *  one of them directly (the chip rule is shared and lives with the initiator,
- *  the turn controls only exist on a response). */
+ *  one of them directly: the chip rule and the turn controls are shared by both
+ *  headers, and both live in the initiator's sheet. */
 const RESPONSE_CSS = read('../chat/response.css');
 const INITIATOR_CSS = read('../chat/input-messages.css');
 
@@ -159,7 +159,9 @@ describe('turn header meta stacking', () => {
 
   it('sizes the turn controls to the row unit', () => {
     // The only field with no margin trick, so it takes the unit as written.
-    expect(effective(rulesTargeting(RESPONSE_CSS, 'response-controls'), 'min-height'))
+    // One rule for both headers: the run is `.turn-controls` on each, and it
+    // lives with the chip it is measured against rather than with a header.
+    expect(effective(rulesTargeting(INITIATOR_CSS, 'turn-controls'), 'min-height'))
       .toBe('var(--turn-header-line)');
   });
 

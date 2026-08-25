@@ -11,6 +11,7 @@
 //!    primitive is CPU-bound and finishes in microseconds. wasmtime allows
 //!    sync imports under async support as long as they don't block.
 
+use crate::api::proxy_wasm_signer::SignerLimits;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -27,12 +28,19 @@ pub struct HostState {
     pub secrets: Vec<Vec<u8>>,
     /// Module name for log prefixing.
     pub module_name: String,
-    /// Sensitive substrings that must be scrubbed from anything the module
-    /// emits through the `log` host import — the resolved secret material (in
-    /// its various encodings) plus the auth-header/token values handed to this
-    /// signer via `prior_layer_outputs`. Without this a buggy/hostile signer
-    /// could `log()` an upstream `script_handshake` auth token into engine logs.
+    /// Sensitive substrings to scrub from anything the module emits through the
+    /// `log` host import: the resolved secret material (in its encodings) plus
+    /// every auth-header value an earlier layer published.
+    ///
+    /// This is the second of two defences, and the narrower one. A signer with
+    /// no `read_prior_headers` grant is not handed those values at all (see
+    /// `proxy_wasm_signer::prepare_prior_outputs`). This list closes the log for
+    /// a signer that IS granted them.
     pub log_redactions: Vec<String>,
+    /// Sandbox resource ceilings for this invocation, attached to the `Store`
+    /// as its `ResourceLimiter`. It lives in the store data because that is
+    /// the only state wasmtime hands back to the limiter callback.
+    pub limits: SignerLimits,
 }
 
 // ---- Pure-Rust primitive helpers (no wasmtime types) -------------------
@@ -399,9 +407,11 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                 Err(_) => return,
             };
             let msg = String::from_utf8_lossy(&bytes);
-            // Scrub secret material before it reaches the log — a signer can
-            // see upstream auth tokens (via prior_layer_outputs) and could echo
-            // them here.
+            // Scrub secret material before it reaches the log. `log` is
+            // deliberately ungated. An ungranted signer is never handed an
+            // upstream auth value, and a granted one cannot print it past this
+            // line. Gating the import would only cost a signer author the one
+            // channel they have for debugging.
             let msg = crate::core::redact_secret_values(&msg, &caller.data().log_redactions);
             let module_name = caller.data().module_name.clone();
             crate::log!("[wasm-signer:{}] {}", module_name, msg);

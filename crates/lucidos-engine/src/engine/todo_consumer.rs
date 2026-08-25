@@ -297,7 +297,7 @@ mod tests {
                 let ev = rx.recv().await.expect("broadcast channel should not close");
                 if let BusEvent::Thread {
                     thread_id: tid,
-                    event: ThreadEvent::TodoListWritten { items },
+                    event: ThreadEvent::TodoListWritten { items, .. },
                     ..
                 } = ev.typed
                 {
@@ -447,7 +447,7 @@ mod tests {
                     handle_event(bus, pool, &ev, false).await;
                     if let BusEvent::Thread {
                         thread_id: tid,
-                        event: ThreadEvent::TodoListWritten { items },
+                        event: ThreadEvent::TodoListWritten { items, .. },
                         ..
                     } = &ev.typed
                     {
@@ -629,7 +629,7 @@ mod tests {
     /// terminator, so its `EventWaitStarted` always sequences above the
     /// terminator, and this consumer can run before the arming happens at all.
     /// Without the registry read the list would settle `Abandoned` while the
-    /// subscription indicator says the thread is watching a build, and
+    /// waiting indicator says the thread is watching a build, and
     /// `Abandoned` is terminal. That is the reported bug arriving through the
     /// fix for it.
     #[tokio::test]

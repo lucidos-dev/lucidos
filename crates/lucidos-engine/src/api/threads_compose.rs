@@ -253,7 +253,7 @@ pub(super) async fn put_compose(
                             crate::core::blobs::BlobError::BadEncoding(_) => {
                                 StatusCode::BAD_REQUEST
                             }
-                            crate::core::blobs::BlobError::UnsupportedMime => {
+                            crate::core::blobs::BlobError::UnsupportedMime(_) => {
                                 StatusCode::UNSUPPORTED_MEDIA_TYPE
                             }
                             crate::core::blobs::BlobError::Io(_) => {

@@ -97,117 +97,21 @@ fn filter_request_headers_drops_stripped_keeps_others() {
 }
 
 // ---- Browser-origin guard ---------------------------------------------
+//
+// The policy and its table of cases live in `api::browser_origin`, which owns
+// them for the whole API surface. Only one thing belongs here: `/proxy/*` still
+// applies the gate itself. That is what keeps a credentialed route closed when
+// `LUCIDOS_PERMISSIVE_CORS` turns the outer layer off.
 
 #[test]
-fn browser_proxy_guard_allows_non_browser_clients() {
+fn a_credentialed_proxy_route_applies_the_same_origin_gate_itself() {
     assert!(browser_proxy_request_allowed(&HeaderMap::new()));
-}
-
-#[test]
-fn browser_proxy_guard_allows_same_origin_browser_requests() {
-    let h = hm(&[
-        ("Host", "localhost:5251"),
-        ("Origin", "http://localhost:5251"),
-        ("Sec-Fetch-Site", "same-origin"),
-    ]);
-    assert!(browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_rejects_cross_site_fetch_metadata() {
-    let h = hm(&[
+    let foreign = hm(&[
         ("Host", "localhost:5251"),
         ("Origin", "https://evil.example"),
         ("Sec-Fetch-Site", "cross-site"),
     ]);
-    assert!(!browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_rejects_foreign_origin_without_fetch_metadata() {
-    // Older browsers may omit Sec-Fetch-* but still send Origin on POSTs.
-    // A hostile page can issue the request even though CORS prevents reading
-    // the response, so Origin must still match Host for credentialed proxy
-    // routes.
-    let h = hm(&[
-        ("Host", "localhost:5251"),
-        ("Origin", "https://evil.example"),
-    ]);
-    assert!(!browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_rejects_same_site_but_not_same_origin() {
-    let h = hm(&[
-        ("Host", "localhost:5251"),
-        ("Origin", "http://localhost:5252"),
-        ("Sec-Fetch-Site", "same-site"),
-    ]);
-    assert!(!browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_allows_http2_same_origin_without_host_header() {
-    // The bug being fixed: a direct-to-engine HTTP/2 request (iOS PWA, no
-    // gateway) carries the authority in the `:authority` pseudo-header, so
-    // there's NO Host header, and no x-forwarded-host either. Sec-Fetch-Site
-    // = same-origin already proves it's safe, so it must be ALLOWED even with
-    // nothing to reconstruct a host from.
-    let h = hm(&[
-        ("Origin", "https://localhost:5174"),
-        ("Sec-Fetch-Site", "same-origin"),
-    ]);
-    assert!(browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_sec_fetch_same_origin_wins_over_mismatched_origin() {
-    // Sec-Fetch-Site is authoritative and unforgeable: when it says
-    // same-origin, the request is allowed even if Origin/Host would NOT match
-    // (behind a reverse proxy the engine's Host is the internal address, so
-    // Origin != Host is normal). No host comparison is performed at all.
-    let h = hm(&[
-        ("Host", "127.0.0.1:51811"),
-        ("Origin", "https://localhost:5251"),
-        ("Sec-Fetch-Site", "same-origin"),
-    ]);
-    assert!(browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn browser_proxy_guard_legacy_allows_origin_matching_host() {
-    // Pre-Fetch-Metadata browser (no Sec-Fetch-*) still sends Origin on a
-    // same-origin POST. Those are HTTP/1.1 with a Host header, so the legacy
-    // Origin == Host comparison allows it.
-    let h = hm(&[
-        ("Host", "localhost:5173"),
-        ("Origin", "http://localhost:5173"),
-    ]);
-    assert!(browser_proxy_request_allowed(&h));
-}
-
-#[test]
-fn origin_authority_matches_host_normalizes_default_ports() {
-    assert!(origin_authority_matches_host(
-        "https://localhost",
-        "localhost:443"
-    ));
-    assert!(origin_authority_matches_host(
-        "https://localhost",
-        "localhost"
-    ));
-    assert!(origin_authority_matches_host(
-        "http://LOCALHOST:80",
-        "localhost:80"
-    ));
-    assert!(origin_authority_matches_host(
-        "http://LOCALHOST:80",
-        "localhost"
-    ));
-    assert!(!origin_authority_matches_host(
-        "https://localhost",
-        "localhost:444"
-    ));
+    assert!(!browser_proxy_request_allowed(&foreign));
 }
 
 // Auth header building (Bearer/ApiKey/Basic) moved to AuthLayer impls
@@ -216,17 +120,17 @@ fn origin_authority_matches_host_normalizes_default_ports() {
 // ---- Path traversal ---------------------------------------------------
 
 #[test]
-fn has_traversal_flags_dot_dot_segments() {
-    assert!(has_traversal("../etc/passwd"));
-    assert!(has_traversal("foo/../bar"));
-    assert!(has_traversal("a/b/../../c"));
-    assert!(has_traversal("/.."));
+fn request_path_has_traversal_flags_dot_dot_segments() {
+    assert!(request_path_has_traversal("../etc/passwd"));
+    assert!(request_path_has_traversal("foo/../bar"));
+    assert!(request_path_has_traversal("a/b/../../c"));
+    assert!(request_path_has_traversal("/.."));
 }
 
 #[test]
-fn has_traversal_flags_backslashes() {
-    assert!(has_traversal("foo\\..\\bar"));
-    assert!(has_traversal("a\\b"));
+fn request_path_has_traversal_flags_backslashes() {
+    assert!(request_path_has_traversal("foo\\..\\bar"));
+    assert!(request_path_has_traversal("a\\b"));
 }
 
 // ---- Redirect helpers --------------------------------------------
@@ -308,12 +212,12 @@ fn is_redirect_status_covers_30x_we_follow() {
 }
 
 #[test]
-fn has_traversal_passes_normal_paths() {
-    assert!(!has_traversal(""));
-    assert!(!has_traversal("/living-room/play"));
-    assert!(!has_traversal("api/v1/items?id=42"));
+fn request_path_has_traversal_passes_normal_paths() {
+    assert!(!request_path_has_traversal(""));
+    assert!(!request_path_has_traversal("/living-room/play"));
+    assert!(!request_path_has_traversal("api/v1/items?id=42"));
     // A literal segment that *contains* `..` but isn't `..` is fine.
-    assert!(!has_traversal("foo..bar"));
+    assert!(!request_path_has_traversal("foo..bar"));
 }
 
 // ---- URL building -----------------------------------------------------
@@ -551,6 +455,60 @@ fn load_config_rejects_script_handshake_with_absolute_path_in_pipeline() {
     )
     .unwrap();
     assert!(load_proxy_config(tmp.path()).is_err());
+}
+
+/// Write an `apis.json` whose single provider runs `script` and load it.
+fn load_config_with_script(script: &str) -> Result<ProxyConfigMap, String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("data/config");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("apis.json"),
+        format!(
+            r#"{{"acme": {{"base_url": "https://x", "auth": {{"pipeline": [
+                {{"type": "script_handshake", "credential": "x", "script": "{script}"}}
+            ]}}}}}}"#
+        ),
+    )
+    .unwrap();
+    load_proxy_config(tmp.path())
+}
+
+/// Regression: the config load and the spawn must refuse the SAME script
+/// paths.
+///
+/// `scripts/auth/a..b.py` is the value that diverged. The load-time guard
+/// rejected only whole `..` segments, so this one loaded cleanly and was then
+/// refused at spawn. The weaker of the two checks was the one running first.
+#[test]
+fn the_config_load_and_the_spawn_guard_refuse_the_same_script_paths() {
+    for script in [
+        "scripts/auth/ok.py",
+        "scripts/auth/a..b.py",
+        "../../../etc/passwd",
+        "/etc/passwd",
+    ] {
+        let refused_at_spawn =
+            crate::api::proxy_script_runner::script_path_rejection(script).is_some();
+        let refused_at_load = load_config_with_script(script).is_err();
+        assert_eq!(
+            refused_at_load, refused_at_spawn,
+            "'{script}' must get the same verdict from both guards"
+        );
+    }
+}
+
+/// A refused config has to say which provider and which value. The operator
+/// meets this as a line in the startup log, with no request to inspect.
+#[test]
+fn a_refused_script_path_names_the_provider_and_the_value() {
+    let err = load_config_with_script("scripts/auth/a..b.py")
+        .expect_err("a '..' substring must be refused");
+    assert!(err.contains("acme"), "names the provider: {err}");
+    assert!(
+        err.contains("scripts/auth/a..b.py"),
+        "names the value: {err}"
+    );
 }
 
 #[test]
@@ -936,7 +894,8 @@ async fn fetch_required_credential_resolves_an_oauth_client_by_name() {
 /// renames the row to `<provider>`. `data/config/` is user data no DB migration
 /// can rewrite, so without this tolerance every request through that API starts
 /// 502ing the moment the engine restarts. Temporary measure
-/// (`credential-oauth-prefix-tolerance`).
+/// registered in `docs/temporary-measures.md` under "`oauth:` prefix stripped
+/// from a caller-supplied credential name".
 #[tokio::test]
 async fn fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name() {
     use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
@@ -1037,4 +996,215 @@ async fn fetch_required_credential_does_not_case_fold_a_non_prefixed_miss() {
 
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+// ---- Upstream base-path containment -----------------------------------
+//
+// A double-encoded path used to escape the operator's `base_url` prefix while
+// staying on the configured origin. The request then reached an endpoint
+// outside the prefix, with the proxy's credentials attached. The mechanism was
+// decode-once (axum) then normalize (url), and the guard here is containment
+// on the parsed path. See the plan doc named on `build_contained_target_url`.
+
+const PREFIXED_BASE: &str = "https://upstream.example/safe-prefix";
+
+#[test]
+fn a_normal_path_stays_contained() {
+    assert_eq!(
+        build_contained_target_url(PREFIXED_BASE, "items/42", None).unwrap(),
+        "https://upstream.example/safe-prefix/items/42"
+    );
+    assert_eq!(
+        build_contained_target_url(PREFIXED_BASE, "/items", Some("limit=10")).unwrap(),
+        "https://upstream.example/safe-prefix/items?limit=10"
+    );
+    // The prefix itself, with and without a trailing slash.
+    assert!(build_contained_target_url(PREFIXED_BASE, "", None).is_ok());
+    assert!(build_contained_target_url(PREFIXED_BASE, "/", None).is_ok());
+}
+
+#[test]
+fn every_dot_segment_spelling_is_refused_by_containment() {
+    // What axum hands the handler after decoding `%252e%252e` once, plus the
+    // mixed and literal forms the URL parser treats the same way.
+    for path in [
+        "%2e%2e/admin",
+        "%2E%2E/admin",
+        ".%2e/admin",
+        "%2e./admin",
+        "../admin",
+        "a/../../admin",
+        "%2e%2e/%2e%2e/etc",
+    ] {
+        let result = build_contained_target_url(PREFIXED_BASE, path, None);
+        assert!(
+            result.is_err(),
+            "path escaped the configured prefix: {path} -> {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dot_segment_that_stays_inside_the_prefix_is_allowed() {
+    // Containment is the property, not a ban on the spelling. `/safe-prefix/a/../b`
+    // normalizes to `/safe-prefix/b`, which never left.
+    assert!(build_contained_target_url(PREFIXED_BASE, "a/%2e%2e/b", None).is_ok());
+}
+
+#[test]
+fn a_prefix_less_base_url_still_forwards_everything() {
+    // No prefix means nothing to escape, so ordinary traffic is untouched.
+    let base = "http://localhost:5005";
+    assert_eq!(
+        build_contained_target_url(base, "living-room/play", None).unwrap(),
+        "http://localhost:5005/living-room/play"
+    );
+    assert!(build_contained_target_url(base, "%2e%2e/anything", None).is_ok());
+}
+
+#[test]
+fn a_sibling_prefix_is_not_containment() {
+    // `/safe-prefix-evil` shares a string prefix but not a segment boundary.
+    let result = build_contained_target_url(PREFIXED_BASE, "%2e%2e/safe-prefix-evil/x", None);
+    assert!(result.is_err(), "sibling prefix accepted: {result:?}");
+}
+
+#[test]
+fn containment_fails_closed_on_an_unparseable_base_url() {
+    assert!(build_contained_target_url("not a url", "/x", None).is_err());
+    assert!(build_contained_target_url("", "/x", None).is_err());
+}
+
+#[test]
+fn the_returned_url_is_the_unmodified_concatenation() {
+    // Signing layers hash the URL they are handed, so an accepted path must
+    // come back byte-identical to what `build_target_url` produced.
+    let path = "items/42";
+    let query = Some("a=1&b=%20");
+    assert_eq!(
+        build_contained_target_url(PREFIXED_BASE, path, query).unwrap(),
+        build_target_url(PREFIXED_BASE, path, query)
+    );
+}
+
+// ---- Encoded dot segments at the edge guard ---------------------------
+
+#[test]
+fn request_path_has_traversal_flags_encoded_dot_segments() {
+    // What the handler sees after axum decodes `%252e%252e` exactly once, and
+    // what the `proxy_request` LLM tool sees with no decode at all.
+    assert!(request_path_has_traversal("%2e%2e/admin"));
+    assert!(request_path_has_traversal("%2E%2E/admin"));
+    assert!(request_path_has_traversal(".%2e/admin"));
+    assert!(request_path_has_traversal("%2e./admin"));
+    assert!(request_path_has_traversal("a/%2e%2e/b"));
+}
+
+#[test]
+fn request_path_has_traversal_leaves_harmless_encodings_alone() {
+    // A single dot segment cannot leave a prefix.
+    assert!(!request_path_has_traversal("./items"));
+    assert!(!request_path_has_traversal("%2e/items"));
+    // Still-encoded input: `%252e%252e` is a literal segment upstream, not a
+    // parent one, so rejecting it here would refuse a legitimate resource name.
+    assert!(!request_path_has_traversal("%252e%252e/admin"));
+    // A segment that merely contains the spelling.
+    assert!(!request_path_has_traversal("foo%2e%2ebar"));
+    assert!(!request_path_has_traversal("%2e%2e%2e"));
+}
+
+#[test]
+fn the_raw_concatenation_really_does_escape_the_prefix() {
+    // The reason containment exists, pinned so the two stay comparable. Nothing
+    // in `build_target_url` is wrong on its own; the escape happens when the
+    // URL parser normalizes what it produced. If this ever stops escaping, the
+    // parser changed and the guard above should be re-read, not deleted.
+    let raw = build_target_url(PREFIXED_BASE, "%2e%2e/admin", None);
+    assert_eq!(raw, "https://upstream.example/safe-prefix/%2e%2e/admin");
+    let parsed = reqwest::Url::parse(&raw).expect("parses");
+    assert_eq!(parsed.path(), "/admin", "the prefix survived normalization");
+    assert_eq!(
+        parsed.host_str(),
+        Some("upstream.example"),
+        "still same origin"
+    );
+}
+
+#[test]
+fn an_encoded_separator_cannot_smuggle_a_parent_segment() {
+    // The URL parser does not treat `%2f` as a separator, so these parse as one
+    // contained segment and would forward verbatim. An upstream that decodes
+    // encoded slashes then reads `../admin` and leaves the prefix anyway.
+    for path in [
+        "%2e%2e%2fadmin",
+        "..%2fadmin",
+        "%2E%2E%2Fadmin",
+        "..%5cadmin",
+        "a/..%2f..%2fadmin",
+        // Nested, for an upstream stack that decodes more than once. Each extra
+        // `%25` is one more layer, so the probe iterates to a fixed point
+        // instead of chasing a depth.
+        "%2e%2e%252fadmin",
+        "%2e%2e%25252fadmin",
+        "..%252fadmin",
+    ] {
+        let result = build_contained_target_url(PREFIXED_BASE, path, None);
+        assert!(
+            result.is_err(),
+            "encoded separator escaped the prefix: {path} -> {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_legitimate_encoded_slash_inside_a_segment_still_forwards() {
+    // The reason the guard checks the decoded READING instead of banning `%2f`.
+    // Some APIs put an encoded path inside one segment.
+    let ok = build_contained_target_url(PREFIXED_BASE, "contents/src%2fmain.rs", None);
+    assert!(ok.is_ok(), "legitimate encoded slash refused: {ok:?}");
+    assert_eq!(
+        ok.unwrap(),
+        "https://upstream.example/safe-prefix/contents/src%2fmain.rs",
+        "an accepted path must forward byte-identical"
+    );
+    // Deep decoding must not turn ordinary content into a false rejection.
+    for path in [
+        "fetch/https%3A%2F%2Fexample.com%2Fa",
+        "report%252e%252epdf",
+        "items/50%25-off",
+        "a..b/c",
+    ] {
+        let result = build_contained_target_url(PREFIXED_BASE, path, None);
+        assert!(
+            result.is_ok(),
+            "ordinary path refused: {path} -> {result:?}"
+        );
+    }
+}
+
+#[test]
+fn decoded_readings_peels_one_layer_per_round_and_terminates() {
+    assert_eq!(
+        decoded_readings("%2e%2e%252fadmin"),
+        vec!["%2e%2e%2fadmin", "%2e%2e/admin"]
+    );
+    assert_eq!(decoded_readings("..%5cadmin"), vec!["../admin"]);
+    // Nothing to decode means no extra probe to run.
+    assert!(decoded_readings("items/42").is_empty());
+}
+
+#[test]
+fn a_same_origin_redirect_is_re_anchored_under_the_prefix() {
+    // Worth pinning, because it is easy to read the redirect loop as an escape.
+    // The loop sets `current_path` from the Location's parsed path with the
+    // leading slash trimmed, then the next hop concatenates it back onto
+    // `base_url`. So `Location: /admin` arrives here as `admin` and resolves to
+    // `/safe-prefix/admin`, which never left. Containment runs per hop anyway,
+    // so the invariant does not rest on that re-anchoring staying this way.
+    let resolved = build_contained_target_url(PREFIXED_BASE, "admin", None);
+    assert_eq!(
+        resolved.unwrap(),
+        "https://upstream.example/safe-prefix/admin"
+    );
+    assert!(build_contained_target_url(PREFIXED_BASE, "safe-prefix/next", None).is_ok());
 }

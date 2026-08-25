@@ -2,8 +2,9 @@
 
 Lucidos is **local-first**: the engine runs on your own machine, and your
 workspace data lives on your filesystem and in a local PostgreSQL database that
-you control. This document explains what is stored locally, when data leaves
-your machine and why, and — importantly — that Lucidos collects **no telemetry**.
+you control. This document explains what is stored locally, and when data leaves
+your machine and why. It also sets out, in full, the one recurring request
+Lucidos makes on its own.
 
 > **Pre-1.0.** Lucidos is pre-1.0 — the newest `v*` tag is the current
 > version. Behaviour can change before 1.0; this document describes the
@@ -15,8 +16,12 @@ your machine and why, and — importantly — that Lucidos collects **no telemet
 - Your workspace — events, threads, messages, memory, artifacts, settings — is
   stored **locally** (filesystem + local Postgres). Lucidos has no server, no
   account, and no cloud sync.
-- **No telemetry.** Lucidos does not collect analytics, usage statistics, or
-  crash reports, and does not phone home.
+- **No analytics, no usage statistics, no crash reports.** Nothing about what
+  you do in Lucidos is collected or sent anywhere.
+- **One recurring request.** Once an hour Lucidos asks `lucidos.dev` whether a
+  newer version is published. It sends your platform, your architecture and the
+  version you run, and nothing else. It is set out in full
+  [below](#update-checks), and you can turn it off.
 - Data leaves your machine **only** when you (or something you set up) invoke a
   feature that talks to a third party — most importantly an **LLM call**, where
   your prompt and its context are sent to the provider you configured.
@@ -110,20 +115,50 @@ behaviour:
   installs (`npm`, `cargo`, …) that reach the package registries those tools
   use.
 
-### Desktop-app update checks
+### Update checks
 
-The macOS desktop app checks **GitHub Releases** for a newer signed build, on
-startup and then periodically, so it can offer the "update available → restart"
-prompt. The request goes to
-`github.com/lucidos-dev/lucidos/releases/latest/download/latest.json` and tells
-GitHub your IP address and the app version you are running, under GitHub's
-privacy policy. It carries no workspace data and no usage information, and there
-is no Lucidos-operated server involved, but it is recurring outbound traffic you
-did not configure, so it is listed here rather than left implied.
+Once an hour the **gateway** asks `lucidos.dev` whether a newer version of
+Lucidos is published, so it can offer you the update. This is the only request
+Lucidos makes on a schedule you did not configure. It is also the only one that
+reaches a server the Lucidos project operates.
 
-This applies to the **`.dmg` desktop app only**. The headless install (the
-`curl … | sh` runtime) has no updater: neither the gateway nor the engine polls
-for releases, and you update it by re-running the installer.
+One request per machine, whatever you are running: the gateway is machine-global
+and every open window reads its one answer. It covers every install, the macOS
+app and the `curl … | sh` runtime alike, on macOS and on Linux.
+
+**What it sends.** Three values, in the URL:
+
+| Value | Example | Why |
+|---|---|---|
+| platform | `macos` | so the answer names a build that exists for you |
+| architecture | `aarch64` | the same |
+| version | `1.2.3` | so the origin can answer an old version correctly |
+
+**What it also reveals.** Like any web request it carries your **IP address**,
+which our CDN (Cloudflare) sees while terminating TLS. An hourly request from
+one address therefore shows that Lucidos was running there. We say so plainly,
+because "platform, architecture and version" alone would be a half-truth.
+
+**What it does not send.** No account, no machine identifier, no workspace name
+or count, no counter, and nothing about what you use Lucidos for. It carries no
+cookie and no credentials, and the client follows no redirect.
+
+**What we do with it.** We read aggregate request counts per platform, so the
+project can tell roughly how many installs exist. We retain no per-request
+identity for this route.
+
+**Nothing installs itself.** The check only tells you a version exists. Taking
+it is your click: the macOS app installs and relaunches, and a headless install
+gives you the exact `install.sh` command to run.
+
+**Turning it off.** Settings > System > Check for updates, or set
+`enabled = false` under `[release_check]` in `~/.lucidos/updates.toml`. The
+gateway re-reads that file on every tick, so it stops at once. **Nothing is sent
+before you answer the first-run notice**, which the workspace picker shows once
+on a fresh install.
+
+**A dev build never checks.** A gateway launched from a source checkout makes no
+request at all, whatever its configuration says.
 
 ### Release notes
 
@@ -154,18 +189,26 @@ install a plugin or add a marketplace yourself.
 
 ## Telemetry: there is none
 
-Lucidos contains **no telemetry**. It does not collect analytics or usage
-statistics, does not send crash or error reports to us or any third party, and
-does not phone home — there is no Lucidos-operated server for it to report to.
-Lucidos originates no network traffic beyond the activity described above:
+Lucidos collects **no telemetry**. It gathers no analytics and no usage
+statistics, and sends no crash or error report to us or to anyone else. It
+records nothing about what you do with it. Lucidos originates no network traffic
+beyond the activity described above:
 
 - LLM, tool, coding-agent and plugin calls. Each one serves a task you
   initiated, or polls a source you configured.
-- The desktop app's update check against GitHub Releases.
+- The gateway's hourly [update check](#update-checks) against `lucidos.dev`,
+  which sends your platform, architecture and version and nothing else. You can
+  turn it off.
 - The *What's New* panel's download of the published changelog, when you open
   it.
 - The service worker's checks against **your own local engine** for a fresh
   frontend build.
+
+The update check is the one item there that reaches a server we operate. It is
+worth being exact about that trade. Until it existed, your privacy here rested
+on our **inability** to see anything: the check went to GitHub, whose logs we
+cannot read. Now it rests on the design above, and on our not looking. That is a
+real change in kind, and we would rather state it than have you find it.
 
 ## Questions and reports
 

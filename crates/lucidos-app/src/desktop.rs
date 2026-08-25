@@ -88,6 +88,46 @@ const STARTUP_LONG_WAIT: Duration = Duration::from_secs(60);
 /// the first status poll can answer.
 const STARTING_LABEL: &str = "Starting Lucidos…";
 
+// ── The service's error log, and what the client reads out of it ────────────
+
+/// The service's stderr, under `<app-data>/logs/`. ONE constant, because the
+/// plist writes this file and [`launch`] reads it back. Two literals would let
+/// the reader drift onto a file nothing writes, and the drift would look
+/// exactly like a service that never failed.
+const SERVICE_ERR_LOG: &str = "engine-service.err.log";
+
+/// The line [`run_service`] writes before it does anything else, once per
+/// launchd start. Counting these is how the client tells a crash loop from a
+/// slow boot: see [`parse_service_boots`].
+const SERVICE_BOOT_MARKER: &str = "[service] boot starting";
+
+/// The token every fatal boot line carries, from either producer. The service
+/// writes `[service] boot failed: …`; the gateway writes
+/// `[gateway] boot failed: …` from its own `main`, into this same file. The
+/// client greps for the shared token rather than for a producer.
+const BOOT_FAILED_MARKER: &str = "boot failed:";
+
+/// How many service starts inside one client wait mean a crash loop rather than
+/// a slow boot. Three is not a guess. A slow boot writes exactly ONE marker for
+/// at least [`ENGINE_HEALTH_TIMEOUT`], because that deadline is what makes the
+/// service exit. Reaching three therefore takes two service exits, which a
+/// boot that is merely slow cannot produce inside one wait.
+const SERVICE_CRASH_LOOP_BOOTS: usize = 3;
+
+/// How often the wait re-reads the error log. Frequent enough that the report
+/// lands within seconds of the failure that earned it, and cheap: a crash loop
+/// appends a few hundred bytes per cycle.
+const SERVICE_LOG_POLL: Duration = Duration::from_secs(2);
+
+/// How much of the log to read back. A crash cycle costs a few hundred bytes,
+/// so this holds thousands of them. The cap exists so a log that grew for other
+/// reasons cannot be pulled into memory whole.
+const SERVICE_LOG_MAX_BYTES: u64 = 512 * 1024;
+
+/// How much of a reason the splash shows. Long enough for a path-bearing
+/// message, short enough that the splash stays a splash.
+const MAX_REASON_CHARS: usize = 240;
+
 /// Which part of [`launch`]'s start-and-navigate loop is currently running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupPhase {
@@ -119,6 +159,18 @@ struct StartupProgress {
     /// The last thing that went wrong, already written as a sentence so it can
     /// be followed by another one. `None` on the ordinary path.
     detail: Option<String>,
+    /// Set once the service has been seen to restart [`SERVICE_CRASH_LOOP_BOOTS`]
+    /// times inside this wait. `None` on the ordinary path, and on a slow one.
+    crash: Option<CrashLoop>,
+}
+
+/// A background service launchd keeps respawning, as the splash needs to
+/// describe it: how many starts, and the reason the last failed one gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrashLoop {
+    boots: usize,
+    reason: Option<String>,
+    log: PathBuf,
 }
 
 impl Default for StartupStatus {
@@ -128,6 +180,7 @@ impl Default for StartupStatus {
                 phase: StartupPhase::EnsuringService,
                 began: Instant::now(),
                 detail: None,
+                crash: None,
             }),
         }
     }
@@ -159,10 +212,29 @@ impl StartupStatus {
         }
     }
 
+    /// Record what the service's error log now says. Below the threshold this
+    /// CLEARS the crash report rather than leaving a stale one: a service that
+    /// came up after two bad starts leaves the splash reading as a wait again.
+    fn note_service_boots(&self, report: &ServiceBootReport, log: &Path) {
+        let crash = (report.boots >= SERVICE_CRASH_LOOP_BOOTS).then(|| CrashLoop {
+            boots: report.boots,
+            reason: report.reason.clone(),
+            log: log.to_path_buf(),
+        });
+        if let Ok(mut p) = self.inner.lock() {
+            p.crash = crash;
+        }
+    }
+
     /// The line to show on the splash right now.
     pub fn label(&self) -> String {
         match self.inner.lock() {
-            Ok(p) => startup_label(p.phase, p.began.elapsed(), p.detail.as_deref()),
+            Ok(p) => startup_label(
+                p.phase,
+                p.began.elapsed(),
+                p.detail.as_deref(),
+                p.crash.as_ref(),
+            ),
             // A poisoned lock says nothing useful about the start, and the
             // splash must still say something.
             Err(_) => STARTING_LABEL.to_string(),
@@ -173,13 +245,23 @@ impl StartupStatus {
 /// The splash's line for a given phase, elapsed time and last failure. Pure, so
 /// the wording is pinned by tests rather than assembled in the poll loop.
 ///
-/// Two rules shape it. A start under [`STARTUP_QUIET_PERIOD`] says only
+/// Three rules shape it. A start under [`STARTUP_QUIET_PERIOD`] says only
 /// [`STARTING_LABEL`], so the overwhelming majority of launches gain no
-/// diagnostic. Past that it names what is being waited on and counts. A number
-/// that moves is what tells a waiting user it is working, not wedged.
-fn startup_label(phase: StartupPhase, elapsed: Duration, detail: Option<&str>) -> String {
+/// diagnostic. A crash loop then wins over everything else, because a counter
+/// that will never resolve is worse than no counter. Otherwise it names what is
+/// being waited on and counts. A number that moves is what tells a waiting user
+/// it is working, not wedged.
+fn startup_label(
+    phase: StartupPhase,
+    elapsed: Duration,
+    detail: Option<&str>,
+    crash: Option<&CrashLoop>,
+) -> String {
     if elapsed < STARTUP_QUIET_PERIOD {
         return STARTING_LABEL.to_string();
+    }
+    if let Some(crash) = crash {
+        return crash_loop_label(crash);
     }
     if let Some(detail) = detail {
         return format!("{detail} Retrying…");
@@ -196,6 +278,41 @@ fn startup_label(phase: StartupPhase, elapsed: Duration, detail: Option<&str>) -
     }
 }
 
+/// What the splash says about a service launchd keeps respawning. Three lines,
+/// mirroring what the headless installer prints on the same condition
+/// (`install.sh`, the `LUCIDOS_HEALTH_TIMEOUT` arm): what happened, why, and
+/// where to read more.
+///
+/// It carries NO elapsed counter, which is the point. It also promises no
+/// resolution and declares no dead end: the loop does keep retrying, and a
+/// reinstall or a repaired bundle still recovers the window.
+fn crash_loop_label(crash: &CrashLoop) -> String {
+    // STARTS, not failures, because starts are what the log counts. The newest
+    // one is still in flight when this is read, so "it failed N times" would
+    // claim one failure that has not happened.
+    let mut lines = vec![format!(
+        "The background service is not starting. It has started {} times without coming up.",
+        crash.boots
+    )];
+    if let Some(reason) = &crash.reason {
+        lines.push(truncate_reason(reason));
+    }
+    lines.push(format!(
+        "Lucidos keeps trying. Log: {}",
+        crash.log.display()
+    ));
+    lines.join("\n")
+}
+
+/// A reason cut to [`MAX_REASON_CHARS`], on a character boundary. A staging
+/// failure names a path, and a path can be arbitrarily long.
+fn truncate_reason(reason: &str) -> String {
+    match reason.char_indices().nth(MAX_REASON_CHARS) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason.to_string(),
+    }
+}
+
 /// A wait as the splash spells it: `12s`, `1m 05s`. Seconds are zero-padded past
 /// the first minute so the line does not change width every tick.
 fn humanize_wait(elapsed: Duration) -> String {
@@ -204,6 +321,109 @@ fn humanize_wait(elapsed: Duration) -> String {
         format!("{secs}s")
     } else {
         format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// What the service's error log says about the boots since the client started
+/// waiting.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ServiceBootReport {
+    /// How many times the service process has started.
+    boots: usize,
+    /// What the last FAILED start gave as its reason.
+    reason: Option<String>,
+}
+
+/// Read the service's error log from where the client found it.
+///
+/// The offset is taken once, when the wait begins, and never advanced. The
+/// report is cumulative ("it has failed N times since you started waiting"), so
+/// every read covers the same window. Taking the offset at all is what keeps a
+/// previous session's crashes out of this session's count.
+struct ServiceLogTail {
+    path: PathBuf,
+    from: u64,
+}
+
+impl ServiceLogTail {
+    /// Start watching `path` from its current end. A missing file is the
+    /// ordinary first-run case and starts at zero.
+    fn start(path: &Path) -> Self {
+        let from = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        Self {
+            path: path.to_path_buf(),
+            from,
+        }
+    }
+
+    /// Re-read the window and parse it. An unreadable log yields an empty
+    /// report, which reads as "no evidence of a crash loop" and leaves the
+    /// ordinary wait label in place.
+    fn read(&self) -> ServiceBootReport {
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return ServiceBootReport::default();
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        // A log that shrank was rotated or deleted under us, so the recorded
+        // offset points past the end. Read the whole of what is there instead
+        // of nothing.
+        let from = if len < self.from { 0 } else { self.from };
+        if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(from)).is_err() {
+            return ServiceBootReport::default();
+        }
+        // Bytes, then a LOSSY decode. `read_to_string` refuses the whole read on
+        // any invalid UTF-8, and two ordinary things produce some: the byte cap
+        // can land mid-character, and every child the service spawns shares this
+        // stderr. Either would silently turn the crash-loop report off, which is
+        // the failure this whole path exists to end.
+        let mut window = Vec::new();
+        if std::io::Read::by_ref(&mut file)
+            .take(SERVICE_LOG_MAX_BYTES)
+            .read_to_end(&mut window)
+            .is_err()
+        {
+            return ServiceBootReport::default();
+        }
+        parse_service_boots(&String::from_utf8_lossy(&window))
+    }
+}
+
+/// Count the service's starts in `window`, and pull the reason out of the last
+/// one that failed. Pure, so the whole contract with the log is unit-tested.
+///
+/// The reason is the FIRST [`BOOT_FAILED_MARKER`] line of that start, not the
+/// last. Both producers write into this one file. The gateway dies before the
+/// service notices, so the first line is the gateway's precise, path-bearing
+/// reason, and anything after it summarises the same event.
+fn parse_service_boots(window: &str) -> ServiceBootReport {
+    let mut boots = 0usize;
+    // The reason of the start being read. Reset at each marker, so a start that
+    // recovered does not inherit the previous start's complaint.
+    let mut current: Option<String> = None;
+    let mut last_failed: Option<String> = None;
+
+    for line in window.lines() {
+        if line.contains(SERVICE_BOOT_MARKER) {
+            boots += 1;
+            current = None;
+            continue;
+        }
+        // Before the first marker is the tail of a start that began before this
+        // wait did. It is not ours to report.
+        if boots == 0 || current.is_some() {
+            continue;
+        }
+        if let Some((_, reason)) = line.split_once(BOOT_FAILED_MARKER) {
+            let reason = reason.trim();
+            if !reason.is_empty() {
+                current = Some(reason.to_string());
+                last_failed = current.clone();
+            }
+        }
+    }
+    ServiceBootReport {
+        boots,
+        reason: last_failed,
     }
 }
 
@@ -717,7 +937,17 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         //
         // Each step also tells `StartupStatus` where it is, the only thing the
         // splash on the other side of the IPC bridge can read.
+        //
+        // The wait ALSO reads the service's error log back. Its fatal boot
+        // checks are correct to be fatal. But launchd's `KeepAlive` turns one
+        // into a silent respawn loop. Without this read-back the splash counts
+        // up forever at a condition that will never clear.
         let status = handle.state::<StartupStatus>();
+        let tail = ServiceLogTail::start(&app_data.join("logs").join(SERVICE_ERR_LOG));
+        let watch = ServiceWatch {
+            tail: &tail,
+            status: &status,
+        };
         loop {
             status.enter(StartupPhase::EnsuringService);
             match ensure_service_installed_and_running(&app_data) {
@@ -729,7 +959,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
                 }
             }
             status.enter(StartupPhase::WaitingForGateway);
-            if wait_for_health(port, HEALTH_ENSURE_CYCLE) {
+            if wait_for_health(port, HEALTH_ENSURE_CYCLE, &watch) {
                 break;
             }
             eprintln!(
@@ -769,14 +999,34 @@ fn navigate_main_window(app: &AppHandle, url: String) {
     }
 }
 
+/// The client's read-back of the service log, and where its verdict lands.
+/// Passed as one thing so the wait cannot be given a tail without a status to
+/// tell about it.
+struct ServiceWatch<'a> {
+    tail: &'a ServiceLogTail,
+    status: &'a StartupStatus,
+}
+
 /// Block until the gateway health endpoint answers 200, or the deadline passes.
 /// The gateway serves health behind the sigil namespace (`/~/api/v1/health`,
 /// ADR 0014) — a bare `/api/v1/health` would be resolved as a workspace slug.
-fn wait_for_health(port: u16, timeout: Duration) -> bool {
+///
+/// It re-reads the service's error log as it waits, on its own slower cadence.
+/// Doing that HERE rather than between cycles is what puts the report on the
+/// splash seconds after the failure that earned it. A crash loop cycles every
+/// `ThrottleInterval` (10s), well inside one [`HEALTH_ENSURE_CYCLE`].
+fn wait_for_health(port: u16, timeout: Duration, watch: &ServiceWatch) -> bool {
     let deadline = Instant::now() + timeout;
+    let mut next_read = Instant::now();
     while Instant::now() < deadline {
         if http_ok(port, "/~/api/v1/health") {
             return true;
+        }
+        if Instant::now() >= next_read {
+            next_read = Instant::now() + SERVICE_LOG_POLL;
+            watch
+                .status
+                .note_service_boots(&watch.tail.read(), &watch.tail.path);
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -844,6 +1094,16 @@ fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> Gat
 
 // ── Service role: the launchd entry point ───────────────────────────────────
 
+/// Record why this service start failed, and hand back the exit code. Every
+/// fatal arm of [`run_service`] goes through here, so the line carries
+/// [`BOOT_FAILED_MARKER`] and the client can find it. Returning the code keeps
+/// the marker and the exit on one statement, which is what stops a new arm
+/// exiting silently.
+fn service_boot_failed(reason: impl std::fmt::Display) -> i32 {
+    eprintln!("[service] {BOOT_FAILED_MARKER} {reason}");
+    1
+}
+
 /// Headless launchd entry point (`Lucidos --service`). Boots the standalone
 /// gateway on the stable port and supervises it, never touching AppKit/Tauri
 /// (so no window, no dock icon). Returns the process exit code:
@@ -851,6 +1111,11 @@ fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> Gat
 ///    gateway exited and launchd's `KeepAlive` should respawn us.
 ///  * non-zero — boot failed; launchd respawns after `ThrottleInterval`.
 pub fn run_service() -> i32 {
+    // Before the work, and before anything that can fail. The client counts
+    // these markers in the error log, so one has to be written per launchd
+    // start whatever the start goes on to do.
+    eprintln!("{SERVICE_BOOT_MARKER} (pid {})", std::process::id());
+
     // FIRST, before anything else in the process. Everything below inherits
     // what we set here: the gateway, every workspace engine, every coding
     // agent. See `shell_env` for what launchd leaves out and why.
@@ -865,47 +1130,43 @@ pub fn run_service() -> i32 {
 
     let app_data = match app_data_dir_from_env() {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("[service] cannot resolve app_data_dir: {e}");
-            return 1;
-        }
+        Err(e) => return service_boot_failed(format!("cannot resolve app_data_dir: {e}")),
     };
     let resources = match resource_dir_from_exe() {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("[service] cannot resolve resource dir: {e}");
-            return 1;
-        }
+        Err(e) => return service_boot_failed(format!("cannot resolve resource dir: {e}")),
     };
     let port = resolve_engine_port(&app_data);
 
     let mut svc = match spawn_gateway(&resources, &app_data, port) {
         Ok(svc) => svc,
         Err(e) => {
-            eprintln!("[service] failed to start workspace gateway: {e}");
-            return 1;
+            return service_boot_failed(format!("could not start the workspace gateway: {e}"))
         }
     };
     match await_gateway_start(port, ENGINE_HEALTH_TIMEOUT, &mut svc.gateway) {
         GatewayStart::Healthy => {}
         GatewayStart::ChildExited => {
             // Say WHICH of the two ways the start failed. The gateway logs its
-            // own reason to the same file, immediately above this line. Naming
-            // the exit points the reader at it, not at a timeout that never
-            // ran.
-            eprintln!(
-                "[service] the gateway exited before answering on port {port}; see its error above"
-            );
+            // own reason to the same file, immediately above this line, and the
+            // client's parser prefers that one. Naming the exit points a human
+            // reader at it too, rather than at a timeout that never ran.
+            let outcome = service_boot_failed(format!(
+                "the gateway exited before answering on port {port}; see its own reason above"
+            ));
             svc.shutdown(&resources, &app_data);
-            return 1;
+            return outcome;
         }
         GatewayStart::TimedOut => {
-            eprintln!(
-                "[service] gateway did not become healthy on port {port} within {}s",
+            // The other half, and the one a genuinely slow machine reaches:
+            // still alive, still not answering. The wording is what lets the
+            // splash say which of the two it is looking at.
+            let outcome = service_boot_failed(format!(
+                "the gateway did not become healthy on port {port} within {}s",
                 ENGINE_HEALTH_TIMEOUT.as_secs()
-            );
+            ));
             svc.shutdown(&resources, &app_data);
-            return 1;
+            return outcome;
         }
     }
     eprintln!("[service] gateway healthy on port {port}; supervising");
@@ -1029,7 +1290,7 @@ fn xml_escape(p: &Path) -> String {
 fn desired_service_plist(exe: &Path, app_data: &Path) -> String {
     let logs = app_data.join("logs");
     let out = logs.join("engine-service.out.log");
-    let err = logs.join("engine-service.err.log");
+    let err = logs.join(SERVICE_ERR_LOG);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1819,12 +2080,29 @@ fn http_ok(port: u16, path: &str) -> bool {
 
 /// Like [`http_ok`] but returns the response body on a 200 (else `None`). The
 /// desktop client deliberately has no reqwest dependency, so this minimal raw
-/// HTTP/1.0 GET is reused for the dock-badge poll's small JSON read.
-#[cfg(target_os = "macos")]
-fn http_get_body(port: u16, path: &str) -> Option<String> {
+/// HTTP/1.0 request serves both the dock-badge poll and the pairing mint.
+///
+/// It attaches the machine-local token, which is how this process proves it is
+/// local. That is the whole reason the calls come through here rather than
+/// through the page: a browser cannot read a mode 0600 file, and a loopback
+/// peer address proves nothing, since `tailscale serve` proxies remote requests
+/// from that same address.
+pub(crate) fn gateway_body(port: u16, method: &str, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let credential = match lucidos_local_token::read() {
+        Some(token) => format!("{}: {token}\r\n", lucidos_local_token::HEADER_LOCAL_TOKEN),
+        None => String::new(),
+    };
+    // A bodyless POST still needs a length, or the server waits for one.
+    let length = if method == "GET" {
+        String::new()
+    } else {
+        "Content-Length: 0\r\n".to_string()
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n{credential}{length}Connection: close\r\n\r\n"
+    );
     stream.write_all(req.as_bytes()).ok()?;
     let mut buf = String::new();
     let _ = stream.read_to_string(&mut buf);
@@ -1847,7 +2125,7 @@ fn http_get_body(port: u16, path: &str) -> Option<String> {
 /// a flicker where a stale tick overwrites a freshly nudged value.
 #[cfg(target_os = "macos")]
 fn fetch_unread_total(port: u16) -> Option<u64> {
-    let body = http_get_body(port, "/~/api/v1/control/unread-total")?;
+    let body = gateway_body(port, "GET", "/~/api/v1/control/unread-total")?;
     parse_unread_total(&body)
 }
 
@@ -1916,7 +2194,7 @@ mod tests {
                 Duration::ZERO,
                 STARTUP_QUIET_PERIOD - Duration::from_millis(1),
             ] {
-                assert_eq!(startup_label(phase, elapsed, None), STARTING_LABEL);
+                assert_eq!(startup_label(phase, elapsed, None, None), STARTING_LABEL);
             }
         }
         // Even a failure stays quiet while the start is still young: the loop
@@ -1926,7 +2204,8 @@ mod tests {
             startup_label(
                 StartupPhase::WaitingForGateway,
                 Duration::from_secs(1),
-                Some("Could not start the background service: nope.")
+                Some("Could not start the background service: nope."),
+                None
             ),
             STARTING_LABEL
         );
@@ -1940,16 +2219,23 @@ mod tests {
             StartupPhase::WaitingForGateway,
             Duration::from_secs(12),
             None,
+            None,
         );
         let at_13s = startup_label(
             StartupPhase::WaitingForGateway,
             Duration::from_secs(13),
             None,
+            None,
         );
         assert_eq!(at_12s, "Waiting for the background service… (12s)");
         assert_ne!(at_12s, at_13s, "the line must change as the wait runs");
         assert_eq!(
-            startup_label(StartupPhase::EnsuringService, Duration::from_secs(12), None),
+            startup_label(
+                StartupPhase::EnsuringService,
+                Duration::from_secs(12),
+                None,
+                None
+            ),
             "Starting the background service…"
         );
     }
@@ -1960,6 +2246,7 @@ mod tests {
             StartupPhase::WaitingForGateway,
             Duration::from_secs(95),
             None,
+            None,
         );
         assert_eq!(
             label,
@@ -1967,13 +2254,17 @@ mod tests {
              restart."
         );
         // The boundary belongs to the long form, not the short one.
-        assert!(
-            startup_label(StartupPhase::WaitingForGateway, STARTUP_LONG_WAIT, None)
-                .contains("after a restart")
-        );
+        assert!(startup_label(
+            StartupPhase::WaitingForGateway,
+            STARTUP_LONG_WAIT,
+            None,
+            None
+        )
+        .contains("after a restart"));
         assert!(!startup_label(
             StartupPhase::WaitingForGateway,
             STARTUP_LONG_WAIT - Duration::from_secs(1),
+            None,
             None
         )
         .contains("after a restart"));
@@ -1987,7 +2278,8 @@ mod tests {
             startup_label(
                 StartupPhase::WaitingForGateway,
                 Duration::from_secs(30),
-                Some("Could not start the background service: launchctl bootstrap failed.")
+                Some("Could not start the background service: launchctl bootstrap failed."),
+                None
             ),
             "Could not start the background service: launchctl bootstrap failed. Retrying…"
         );
@@ -2048,6 +2340,284 @@ mod tests {
         aged(&status, Duration::from_secs(20));
 
         assert_eq!(status.label(), "Waiting for the background service… (20s)");
+    }
+
+    // ── Telling a crash loop from a slow boot ────────────────────────────────
+
+    /// One launchd start of a service whose gateway fails a staging check. The
+    /// gateway's own line lands first, because it dies before the service can
+    /// notice, and both go to this one file.
+    fn crashing_boot(pid: u32) -> String {
+        format!(
+            "{SERVICE_BOOT_MARKER} (pid {pid})\n\
+             [gateway] boot failed: LUCIDOS_STATIC_DIR is set to /R/frontend but its index.html \
+             is missing\n\
+             [service] {BOOT_FAILED_MARKER} the gateway exited before answering on port 5252; \
+             see its own reason above\n"
+        )
+    }
+
+    #[test]
+    fn the_gateways_own_reason_wins_over_the_services_summary() {
+        // Both lines describe one event, and only the first names the path. A
+        // parser that took the LAST match would show the useless half.
+        let report = parse_service_boots(&crashing_boot(101));
+        assert_eq!(report.boots, 1);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("LUCIDOS_STATIC_DIR is set to /R/frontend but its index.html is missing")
+        );
+    }
+
+    #[test]
+    fn a_service_that_fails_before_the_gateway_still_reports() {
+        let window = format!(
+            "{SERVICE_BOOT_MARKER} (pid 7)\n\
+             [service] {BOOT_FAILED_MARKER} cannot resolve resource dir: not a bundle\n"
+        );
+        let report = parse_service_boots(&window);
+        assert_eq!(report.boots, 1);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("cannot resolve resource dir: not a bundle")
+        );
+    }
+
+    #[test]
+    fn starts_are_counted_and_the_newest_reason_kept() {
+        let window = format!(
+            "{}{}{}",
+            crashing_boot(1),
+            crashing_boot(2),
+            crashing_boot(3).replace("/R/frontend", "/R2/frontend")
+        );
+        let report = parse_service_boots(&window);
+        assert_eq!(report.boots, 3);
+        assert!(report.reason.unwrap().contains("/R2/frontend"));
+    }
+
+    #[test]
+    fn a_log_that_starts_mid_failure_reports_only_what_it_watched() {
+        // The client records the log's length when it starts waiting, so the
+        // window can open inside a previous start. That start is not ours to
+        // count, and its reason is not ours to show.
+        let window = format!(
+            "[gateway] boot failed: a reason from before the client opened\n\
+             [service] {BOOT_FAILED_MARKER} an old summary\n\
+             {SERVICE_BOOT_MARKER} (pid 9)\n"
+        );
+        let report = parse_service_boots(&window);
+        assert_eq!(report.boots, 1);
+        assert_eq!(report.reason, None, "the previous start is not ours");
+    }
+
+    #[test]
+    fn a_start_that_recovered_leaves_no_reason_behind() {
+        let window = format!("{}{SERVICE_BOOT_MARKER} (pid 2)\n", crashing_boot(1));
+        let report = parse_service_boots(&window);
+        assert_eq!(report.boots, 2);
+        // The FIRST start failed and the second is still running, so there IS a
+        // reason to show. What must not happen is the count stalling at one.
+        assert!(report.reason.is_some());
+    }
+
+    #[test]
+    fn a_healthy_log_says_nothing() {
+        let window = format!(
+            "{SERVICE_BOOT_MARKER} (pid 4)\n[service] gateway healthy on port 5252; supervising\n"
+        );
+        assert_eq!(
+            parse_service_boots(&window),
+            ServiceBootReport {
+                boots: 1,
+                reason: None
+            }
+        );
+        assert_eq!(parse_service_boots(""), ServiceBootReport::default());
+    }
+
+    #[test]
+    fn a_log_with_a_bad_byte_in_it_is_still_read() {
+        // The service's children share this stderr, and the read is byte-capped,
+        // so the window can hold something that is not valid UTF-8. A strict
+        // decode would refuse the whole read and turn the report off silently.
+        let dir = std::env::temp_dir().join(format!("lucidos-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SERVICE_ERR_LOG);
+        let mut bytes = format!("{SERVICE_BOOT_MARKER} (pid 1)\n").into_bytes();
+        bytes.extend_from_slice(&[0xff, 0xfe]); // a child's non-UTF-8 output
+        bytes.extend_from_slice(b"\n[service] boot failed: no engine binary\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Watching starts at zero here, because the file did not exist yet.
+        let tail = ServiceLogTail {
+            path: path.clone(),
+            from: 0,
+        };
+        assert_eq!(
+            tail.read(),
+            ServiceBootReport {
+                boots: 1,
+                reason: Some("no engine binary".to_string())
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_absent_log_reads_as_no_evidence() {
+        let tail = ServiceLogTail::start(Path::new("/no/such/engine-service.err.log"));
+        assert_eq!(tail.from, 0);
+        assert_eq!(tail.read(), ServiceBootReport::default());
+    }
+
+    /// The report the splash gets after `boots` starts, with the log where a
+    /// packaged install keeps it.
+    fn crash(boots: usize, reason: Option<&str>) -> CrashLoop {
+        CrashLoop {
+            boots,
+            reason: reason.map(str::to_string),
+            log: PathBuf::from("/Users/me/Library/Application Support/com.lucidos.app/logs")
+                .join(SERVICE_ERR_LOG),
+        }
+    }
+
+    #[test]
+    fn a_crash_loop_stops_the_clock_and_says_why() {
+        let label = startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(300),
+            None,
+            Some(&crash(
+                4,
+                Some("LUCIDOS_ENGINE_BIN does not exist: /R/lucidos-engine"),
+            )),
+        );
+        assert_eq!(
+            label,
+            "The background service is not starting. It has started 4 times without coming up.\n\
+             LUCIDOS_ENGINE_BIN does not exist: /R/lucidos-engine\n\
+             Lucidos keeps trying. Log: /Users/me/Library/Application Support/com.lucidos.app/\
+             logs/engine-service.err.log"
+        );
+        // The counter is gone. That is the whole point: it was counting toward
+        // a condition that will never clear.
+        assert!(!label.contains("Waiting for the background service"));
+        assert!(!label.contains("5m 00s"));
+    }
+
+    #[test]
+    fn a_crash_loop_with_no_reason_still_names_the_log() {
+        let label = startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(300),
+            None,
+            Some(&crash(3, None)),
+        );
+        assert_eq!(label.lines().count(), 2);
+        assert!(label.ends_with("logs/engine-service.err.log"));
+    }
+
+    #[test]
+    fn a_crash_loop_outranks_an_ensure_failure_but_not_the_quiet_period() {
+        let detail = Some("Could not start the background service: nope.");
+        assert!(startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(300),
+            detail,
+            Some(&crash(3, Some("boom"))),
+        )
+        .starts_with("The background service is not starting."));
+        // Three starts cannot happen inside the quiet period, but the ordering
+        // is stated here rather than left to arithmetic.
+        assert_eq!(
+            startup_label(
+                StartupPhase::WaitingForGateway,
+                Duration::from_secs(1),
+                detail,
+                Some(&crash(3, Some("boom"))),
+            ),
+            STARTING_LABEL
+        );
+    }
+
+    #[test]
+    fn a_slow_boot_is_left_alone() {
+        // The invariant that matters most here. A cold-machine Postgres initdb
+        // writes ONE boot marker and keeps working. The splash must go on
+        // counting rather than accusing it of failing.
+        let status = StartupStatus::default();
+        let log = Path::new("/tmp/does-not-matter.log");
+        for boots in [0usize, 1, SERVICE_CRASH_LOOP_BOOTS - 1] {
+            status.note_service_boots(
+                &ServiceBootReport {
+                    boots,
+                    reason: Some("the gateway did not become healthy within 120s".to_string()),
+                },
+                log,
+            );
+            status.enter(StartupPhase::WaitingForGateway);
+            aged(&status, Duration::from_secs(95));
+            assert!(
+                status
+                    .label()
+                    .starts_with("Waiting for the background service…"),
+                "{boots} starts must still read as a wait"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_that_comes_up_late_drops_the_crash_report() {
+        // note_service_boots CLEARS below the threshold. Without that, a service
+        // that finally started would leave the accusation on screen.
+        let status = StartupStatus::default();
+        let log = Path::new("/tmp/does-not-matter.log");
+        let failing = ServiceBootReport {
+            boots: SERVICE_CRASH_LOOP_BOOTS,
+            reason: Some("boom".to_string()),
+        };
+        status.enter(StartupPhase::WaitingForGateway);
+        status.note_service_boots(&failing, log);
+        aged(&status, Duration::from_secs(95));
+        assert!(status
+            .label()
+            .starts_with("The background service is not starting."));
+
+        status.note_service_boots(&ServiceBootReport::default(), log);
+        assert!(status
+            .label()
+            .starts_with("Waiting for the background service…"));
+    }
+
+    #[test]
+    fn a_long_reason_is_cut_on_a_character_boundary() {
+        let long = "é".repeat(MAX_REASON_CHARS + 40);
+        let cut = truncate_reason(&long);
+        assert_eq!(cut.chars().count(), MAX_REASON_CHARS + 1);
+        assert!(cut.ends_with('…'));
+        assert_eq!(truncate_reason("short"), "short");
+    }
+
+    #[test]
+    fn the_client_greps_for_the_marker_the_gateway_actually_writes() {
+        // `lucidos-app` cannot link `lucidos-gateway` (ADR 0014 §1), so the
+        // contract between the two is this file's text. Read it rather than
+        // trusting a comment: a reworded gateway line would otherwise take the
+        // splash's reason away with nothing going red.
+        let gateway_main = include_str!("../../lucidos-gateway/src/main.rs");
+        assert!(
+            gateway_main.contains(&format!("[gateway] {BOOT_FAILED_MARKER}")),
+            "lucidos-gateway must still stamp `[gateway] {BOOT_FAILED_MARKER}` on a fatal boot"
+        );
+    }
+
+    #[test]
+    fn the_reader_and_the_plist_name_one_file() {
+        let app_data = Path::new("/Users/me/Library/Application Support/com.lucidos.app");
+        let plist = desired_service_plist(Path::new("/Applications/Lucidos.app"), app_data);
+        let read_back = app_data.join("logs").join(SERVICE_ERR_LOG);
+        assert!(plist.contains(&xml_escape(&read_back)));
     }
 
     #[test]

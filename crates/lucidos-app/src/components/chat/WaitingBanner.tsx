@@ -4,10 +4,10 @@ import { resolveThreadActions, type TaggedAction } from '../../store/actions/thr
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
 
-/** The close-set kinds the banner renders. Discard-draft (a compose-draft
- *  action resolved by the close-cascade shortcut, not the banner) and the
- *  Pin/Unpin toggle (rendered by PromptInput's section buttons) are excluded —
- *  they come from the same selector but live in a different slot. */
+/** The close-set kinds the banner renders. Two other kinds come from the same
+ *  selector and live elsewhere, so both are excluded. Discard-draft is a
+ *  compose-draft action the close-cascade shortcut resolves. Pin/Unpin is
+ *  `PinThreadButton`, in the thread header. */
 const BANNER_CLOSE_KINDS: ReadonlySet<string> = new Set(['discard', 'apply', 'archive']);
 
 type WaitingState =
@@ -103,21 +103,19 @@ interface BannerSlots {
    *  naturally). */
   liftable: ComponentChildren | null;
   /** Action buttons that always render on the bottom row, anchored to the
-   *  right. PromptInput renders sectionButtons (Pin / ✓ Pinned) just before
-   *  these — never inside the lift sub-row, so the bottom row stays
-   *  [icons][Pin][Discard][Apply] when there is room for it. */
+   *  right. PromptInput places them after the liftable slot and before the
+   *  send control, never inside the lift sub-row. So the bottom row reads
+   *  [icons][Diff][actions][Send] whenever there is room for it. */
   primary: ComponentChildren;
 }
 
 /** Splits the banner's buttons into liftable + primary slots so the caller
  *  (PromptInput) can decide whether to render them as one row or stack the
- *  liftable slot above the row that holds the icons. PromptInput owns where
- *  Pin / ✓ Pinned goes (always in the bottom row, before the action buttons),
- *  so getBannerSlots only worries about the action-side layout. Diff is ALWAYS
- *  its own standalone button in the liftable slot — never folded into the
- *  Apply/Discard cluster — so when there's room [Pin][Diff][Discard][Apply]
- *  sit together, and when there isn't only Diff hops to a row above while
- *  [Pin][Discard][Apply] stay on the bottom. */
+ *  liftable slot above the row that holds the icons. Diff is ALWAYS its own
+ *  standalone button in the liftable slot, never folded into the Apply/Discard
+ *  cluster. So [Diff][Discard][Apply] sit together when there is room. When
+ *  there is not, only Diff hops to a row above and [Discard][Apply] stay on
+ *  the bottom. */
 export function getBannerSlots(state: BannerState): BannerSlots {
   if (state.type === 'applying') {
     return {

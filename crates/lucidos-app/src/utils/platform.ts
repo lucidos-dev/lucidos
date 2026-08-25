@@ -134,6 +134,53 @@ export function isStandalone(): boolean { return _isStandalone; }
 const _isIOSPwa = _isIOS && _isStandalone;
 export function isIOSPwa(): boolean { return _isIOSPwa; }
 
+/** What a client can do with the system pasteboard.
+ *
+ *  Two abilities, not one: `writeText` is widely available and `readText` is
+ *  not, and a surface offering Paste where nothing can read is a control that
+ *  fails on tap. Neither exists off a secure origin, which is exactly the
+ *  plain-http LAN case. */
+export interface ClipboardAbilities {
+  copy: boolean;
+  paste: boolean;
+}
+
+/** Pure {@link clipboardAbilities}, so both answers are testable without a
+ *  browser. Takes the clipboard rather than reading `navigator`. */
+export function clipboardAbilitiesOf(clipboard: Partial<Clipboard> | undefined): ClipboardAbilities {
+  return {
+    copy: typeof clipboard?.writeText === 'function',
+    paste: typeof clipboard?.readText === 'function',
+  };
+}
+
+/** Live-wired {@link clipboardAbilitiesOf} for this client. */
+export function clipboardAbilities(): ClipboardAbilities {
+  return clipboardAbilitiesOf(typeof navigator === 'undefined' ? undefined : navigator.clipboard);
+}
+
+/** Pure {@link cameraIsAvailable}: can `getUserMedia` open a camera here?
+ *
+ *  Both halves are needed, and the second is the one that bites. `mediaDevices`
+ *  is absent outside a secure context, but a browser can also expose it and
+ *  refuse, so the context is checked in its own right. A LAN origin over plain
+ *  http is exactly that case, and a Scan button there fails on tap. */
+export function cameraIsAvailableIn(env: {
+  mediaDevices: { getUserMedia?: unknown } | undefined;
+  secureContext: boolean;
+}): boolean {
+  return env.secureContext && typeof env.mediaDevices?.getUserMedia === 'function';
+}
+
+/** Live-wired {@link cameraIsAvailableIn} for this client. */
+export function cameraIsAvailable(): boolean {
+  if (typeof navigator === 'undefined' || typeof window === 'undefined') return false;
+  return cameraIsAvailableIn({
+    mediaDevices: navigator.mediaDevices,
+    secureContext: window.isSecureContext === true,
+  });
+}
+
 /** Check if user prefers reduced motion */
 export function prefersReducedMotion(): boolean {
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;

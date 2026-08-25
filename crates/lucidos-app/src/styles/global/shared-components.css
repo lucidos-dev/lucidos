@@ -24,7 +24,7 @@
  *
  * Rules here reference design tokens defined in `base.css` (`:root` + theme
  * blocks) for the host and in `sdk_iframe.css` for the iframe; every token used
- * below is defined in BOTH, so the classes resolve identically in either host.
+ * below is defined in BOTH, or carries a `var()` fallback for the iframe.
  */
 
 /* Global heading styles — matches chat message heading appearance */
@@ -800,6 +800,11 @@ html:not([data-theme="light"]) .action-btn-confirm {
  * `border` (not just background) makes the empty track visible against panes
  * that share `--bg-secondary`, so a tiny fill (3%) still reads against a
  * full-width 100% reference. */
+/* `overflow: hidden` is load-bearing, not tidiness: a caller may set a fill
+   width above 100%, and the clip is what keeps it inside the rounded track.
+   The LLM Context Viewer does exactly that for a capture whose usage exceeds
+   its recorded context window, where the percentage is deliberately unclamped
+   (`utils/formatTokens.ts :: contextPercent`). */
 .progress-bar {
     height: 0.375rem;
     background: var(--bg-secondary);
@@ -835,4 +840,127 @@ html:not([data-theme="light"]) .action-btn-confirm {
     color: var(--text-muted);
     font-size: var(--font-size-md);
     line-height: 1.5;
+}
+
+/* Global tooltip: JS-positioned, appended to body, shared rather than host
+ * chrome. One implementation drives it in both hosts, installTooltips() in
+ * packages/lucidos-sdk/src/tooltip.ts. The host calls it through the useTooltip
+ * hook, and the SDK bundle calls it on load inside an app iframe. So these
+ * rules live here rather than in base.css, and there is one copy.
+ * Pinned by styles/__tests__/tooltip-single-source.test.ts. */
+#tooltip {
+    position: fixed;
+    z-index: var(--z-tooltip);
+    max-width: 30rem;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.625rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    font-weight: 400;
+    font-style: normal;
+    line-height: 1.4;
+    text-align: left;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: normal;
+    word-wrap: break-word;
+    pointer-events: none;
+    opacity: 0;
+    display: none;
+    transition: opacity var(--duration-fast);
+    box-shadow: var(--shadow-sm);
+}
+
+#tooltip-arrow {
+    position: absolute;
+    top: -0.3125rem;
+    width: 0.625rem;
+    height: 0.625rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-right: none;
+    border-bottom: none;
+    transform: translateX(-0.3125rem) rotate(45deg);
+}
+
+#tooltip.above #tooltip-arrow {
+    top: auto;
+    bottom: -0.3125rem;
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-top: none;
+}
+
+#tooltip-title {
+    font-weight: 600;
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+#tooltip-title:empty {
+    display: none;
+}
+
+#tooltip-text {
+    position: relative;
+    white-space: pre-line;
+}
+
+/* Structured two-column label/value tooltip (e.g. thread drawer rows). The dim
+   label sits in the left column, the bright value right-aligned in the right.
+   `display: contents` lets each .tt-row's children join the parent grid, so the
+   columns stay aligned across every row. */
+#tooltip-text.tooltip-rows {
+    display: grid;
+    grid-template-columns: auto auto;
+    column-gap: 1.5rem;
+    row-gap: 0.25rem;
+    white-space: nowrap;
+}
+
+#tooltip-text.tooltip-rows .tt-row {
+    display: contents;
+}
+
+#tooltip-text.tooltip-rows .tt-label {
+    color: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-value {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    justify-self: end;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+#tooltip-text.tooltip-rows .tt-dot {
+    flex: none;
+    width: 0.4rem;
+    height: 0.4rem;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+#tooltip-text.tooltip-rows .tt-dot-running { background: var(--accent); }
+#tooltip-text.tooltip-rows .tt-dot-changes { background: var(--accent-green); }
+/* Neutral state, not a caution. Mirrors .thread-info-dot-waiting. The fallback
+   carries the app iframe: --accent-notable is host-only on purpose (see the
+   engine's sdk_iframe.css), so an app renders the muted dot instead. */
+#tooltip-text.tooltip-rows .tt-dot-waiting { background: var(--accent-notable, var(--text-muted)); }
+#tooltip-text.tooltip-rows .tt-dot-failed { background: var(--accent-red); }
+
+/* Narrow viewport: keep the box inside the screen. The JS clamp pins the left
+   edge, so a box wider than the viewport still overruns the right one. An app
+   iframe never loads mobile.css, so this cap belongs beside the rule it
+   overrides. */
+@media (max-width: 600px) {
+    #tooltip {
+        max-width: calc(100vw - 2rem);
+    }
 }

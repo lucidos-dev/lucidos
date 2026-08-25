@@ -366,7 +366,7 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
           .lucidos.ui.toast('fullscreen toast');
       });
 
-      await expect(page.locator('.toast-container .toast-message')).toContainText('fullscreen toast');
+      await expect(page.locator('.toast-container .toast-body')).toContainText('fullscreen toast');
     });
   });
 

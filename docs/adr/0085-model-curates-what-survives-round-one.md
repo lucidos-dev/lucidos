@@ -1,7 +1,14 @@
 # 0085: The model curates what survives round 1, and the harness drops nothing that has no way back
 
-- **Status**: Accepted
+- **Status**: Superseded by
+  [ADR 0109](0109-model-writes-notes-and-sees-its-own-context.md)
 - **Date**: 2026-08-17
+
+The preference survives and so does the experiment. What 0109 replaces is the
+mechanism. The ledger becomes a context panel carrying size, age and percent of
+budget. The model gains a scratchpad to write into, and `keep_in_context`
+becomes a pin the trimmer honours. `dismiss_from_context`, the assembled body
+region and the arrival window all go. Read 0109 for what the mode does today.
 
 ## Context
 
@@ -364,3 +371,127 @@ The `prompt-cache-first-of-turn-miss` investigation in
 `docs/temporary-measures.md` carries the remaining boundary question. ADR 0088
 retires the ~9,200 unmatched tools tokens as an arithmetic artifact, and leaves
 the investigation the larger fact: 58.6% of boundaries read nothing at all.
+
+## Amendment, 2026-08-20: the model releases every body, and the engine releases none
+
+ADR 0087's first arm measured the lean arm costing 22% MORE than the control.
+The cause was position, not volume. The mode dropped memory recall from 63% of
+the way back, so the 28,453 tokens behind it were re-created to save 1,365.
+
+Two design errors sat under that. The engine dropped what the model had not
+chosen, on a round number, and it kept what the model HAD chosen: a
+`load_knowhow` body persisted for the life of the thread. Section ordering then
+put the drop in front of everything durable.
+
+The fix reverses both, and `docs/plans/2026-08-20-model-curated-context-mode.md`
+is its record. Everything droppable becomes a *body* with a *handle*. The bodies
+move behind a cache seam at the end of the user message. A *context ledger* in
+front of them names the way back to each. Nothing leaves on a schedule.
+
+### What it changes above
+
+**Decision 2 retires.** No section leaves on a round number. Round 1 and round
+30 carry the same set, less whatever the model released.
+
+**Decision 4 retires with it.** Memory recall is a body the model releases, not
+a first-call-only fetch. It runs per turn as it always did, and each run has its
+own address. Releasing a recall therefore stops it being re-read for the rest of
+that turn, and the next turn recalls afresh.
+
+**"The pinned `load_knowhow` result stays as it is" reverses.** It was the one
+thing the model chose and could not un-choose. Its body is now a body like any
+other, addressed by its `load_knowhow` call. The model releases it when the
+phase it was fetched for is over.
+
+**Decision 3 is untouched**, and is the one thing still on the engine's
+schedule. The previous turn's tool pairs go at the boundary, as they always did.
+
+**Decision 9 earns a second job.** A live tool result states its own address.
+`dismiss_from_context` now takes that address to stub the result mid-turn. That
+makes decision 8's "the only way to evict something inside a turn" true rather
+than aspirational.
+
+**Decisions 1, 5, 6, 7 and 10 through 14 stand unchanged.** Decision 5 is
+stricter now rather than looser. Its recovery table is rendered into the ledger
+as well as the prompt, and a test resolves every row's tool against the live
+registry.
+
+## Amendment, 2026-08-21: a body is dismissed by default, and the model keeps what it wants
+
+The amendment above shipped in full and the mode is inert. ADR 0087's pilot run
+`901db33b487047a697db3625d8c84021` recorded one `ContextDismissed` across eleven
+lean threads, and `repeat_recoveries` of 0 on all 22. Per round the two arms
+were within 1.7% of each other, at $1.083 against $1.102.
+
+The mechanism worked and the incentive did not. Releasing a body gives the model
+nothing it can see, and holding one costs it nothing it feels. So the default
+wins every time, and opt-in curation does not happen.
+
+The fix inverts the default, and
+`docs/plans/2026-08-21-persist-on-demand-context-mode.md` is its record. An
+assembled body rides the round it arrives on and then leaves. It stays only if
+the model says `keep_in_context`. The ledger still names the way back to
+everything, so nothing becomes unreachable.
+
+### What it changes above
+
+**Decision 1 keeps the pen and loses the monopoly.** The model still curates,
+and curation is now an override rather than the whole channel. The engine states
+a default, and one call per body overrides it.
+
+**A fixed engine rule is back, and it is not decision 2's.** That rule dropped
+two named sections on a round number, and it dropped what the model had never
+chosen. This one runs at the round 1 boundary and drops the unkept set. The
+difference is that asking is now one call, and every unkept body has a row in
+the ledger naming what fetches it back.
+
+**Decision 4 stays retired.** Memory recall still runs per turn, and each run is
+a body with its own address. The inversion changes when that body leaves, not
+how often the recall happens.
+
+**Decision 3 is untouched**, and still owns the previous turn's tool pairs.
+
+**Decision 5 is what makes the inversion safe.** Under an opt-in default a
+missing recovery route cost only what the model chose to release. It now costs
+whatever the model failed to keep, which is most of the set. The recovery table
+and its live-registry test move from a guard to the load-bearing part.
+
+**Decision 9's second job stands, and gains a limit.** A live `tool_result` is
+still stubbed in place by `dismiss_from_context`. It is the one home the
+inversion does NOT reach: it stays opt-out.
+
+The arithmetic permits the aggressive rule and the semantics refuse it. Stubbing
+an old result beats holding it whenever the stub is under 8% of the body, and a
+real stub is near 1%. But a tool result is work the model deliberately asked
+for, usually in the middle of using it. A re-fetch costs a whole round, where an
+assembled body was pushed at the model unasked.
+
+**Decision 14 stands, and now covers the keep.** Nothing forces a note, nothing
+checks for one, and nothing forces a keep either. A model that keeps everything
+pays roughly what the mode cost before. A model that keeps nothing and needed
+something pays a recovery round, which `repeat_recoveries` counts.
+
+### What it costs, honestly
+
+The do-nothing outcome moves from 3.0% of the request to about 24%: memory and
+history at 6.5%, knowhow at 14.9%, and the prior turn's tool pairs at 3.0%.
+Realized over a thread it is `24% x (R-1)/R`, so about 22% at ten rounds and 12%
+at two. The ceiling is unchanged at roughly 53%, and reaching it still needs
+`dismiss_from_context` for the live results.
+
+Those shares come from 47,482 `ContextCaptured` payloads in one workspace, on
+Anthropic only. They are a measurement of one tree of threads rather than a
+constant.
+
+## Amendment: the v3 default is on probation
+
+The first eval run at the context ceiling, `07e4aa2ef0bc4317952150e4e363f433`,
+recorded zero `ContextKept` and zero `ContextDismissed` calls in 206 rounds.
+[ADR 0103](0103-context-trim-passes-and-the-persist-on-demand-verdict.md) audits
+why, fixes the blind trimmer that destroyed the lean arm's context, and sets out
+the cache arithmetic against persist-on-demand.
+
+That arithmetic says a wrong drop costs about 32 rounds of the saving it bought.
+So the model must be right about 97% of its drops to break even. The default is
+not flipped here. The next run holds every other variable and answers whether
+the model curates at all once the trimmer stops erasing its context.

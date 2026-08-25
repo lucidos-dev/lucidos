@@ -4,6 +4,7 @@ import { formatShortDate } from '../../utils/formatTime';
 import { getCredentialValue } from '../../api/client';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
+import { copyToClipboard } from '../../utils/clipboard';
 
 interface Props {
   credential: CredentialInfo;
@@ -85,8 +86,7 @@ async function copyCredential(id: string, target: CopyTarget) {
       showToast(`No ${target.label} found`, 'error');
       return;
     }
-    await navigator.clipboard.writeText(value);
-    showToast(`${target.label} copied`);
+    copyToClipboard(value, `${target.label} copied`);
   } catch (e) {
     showToast(`Failed to copy: ${errorDetail(e)}`, 'error');
   }

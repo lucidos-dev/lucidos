@@ -240,6 +240,13 @@ impl LucidosEngine {
         self.user_dir.as_deref()
     }
 
+    /// Where this workspace keeps its permission grants (ADR 0095). Always
+    /// resolvable, unlike [`Self::user_dir`]: a workspace path is what the
+    /// engine is started with.
+    pub fn grants_dir(&self) -> PathBuf {
+        crate::core::grants_dir(&self.workspace_path)
+    }
+
     /// Get a human-readable workspace name (last path component, or full path if root)
     pub fn workspace_name(&self) -> String {
         self.workspace_path
@@ -395,7 +402,8 @@ impl LucidosEngine {
     }
 
     /// Which provider backends are actually configured (`vertex`/`anthropic`/
-    /// `openai`/`openrouter`/`xai`/`local`), or `None` to mean "don't filter" (mock /
+    /// `openai`/`openrouter`/`xai`/`opencode-free`/`local`), or `None` to mean
+    /// "don't filter" (mock /
     /// no routing). Reflects a runtime swap (reads the live provider). Surfaced
     /// by `/health` as `configured_providers` so the frontend filters the model
     /// picker to providers the user has set up.
@@ -768,5 +776,27 @@ mod normalize_data_path_tests {
             normalize_data_path(".lucidosrc").unwrap(),
             "artifacts/.lucidosrc"
         );
+    }
+
+    /// The security property behind putting grants in `.lucidos/` rather than
+    /// `data/config/` (ADR 0095): the agent's own file tools cannot address a
+    /// grant file, so it cannot rewrite the permissions gating it.
+    ///
+    /// Asserted over `GrantFile::ALL` rather than string literals, so renaming
+    /// a grant file cannot quietly drop the coverage.
+    #[test]
+    fn the_file_tools_cannot_address_a_permission_grant_file() {
+        for file in crate::core::GrantFile::ALL {
+            for path in [
+                format!(".lucidos/{}", file.file_name()),
+                format!("data/.lucidos/{}", file.file_name()),
+            ] {
+                assert!(
+                    normalize_data_path(&path).is_err(),
+                    "{path} must be unreachable: a permission file the agent can \
+                     rewrite is not a permission file"
+                );
+            }
+        }
     }
 }

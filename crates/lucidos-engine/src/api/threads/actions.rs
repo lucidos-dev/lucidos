@@ -281,18 +281,23 @@ pub(in crate::api) async fn suggest_title(
         )
     })?;
 
-    let title_model = crate::core::PreferenceStore::get(&state.pool, crate::core::PREF_MODEL_TITLE)
+    let call = crate::engine::title_call(&state.pool, extractor)
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let provider = extractor.provider_for_model(&title_model).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to build title provider: {}", e),
-        )
-    })?;
-    let title = crate::engine::generate_thread_title(provider.as_ref(), &summary, None)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build title provider: {}", e),
+            )
+        })?;
+    // A suggestion costs the same tokens an automatic title does, so it is
+    // captured the same way. An unparseable id anchors nothing, and the call
+    // goes ahead uncaptured rather than being refused over bookkeeping.
+    let capture = crate::engine::AuxCapture::for_thread(
+        &state.engine.event_bus,
+        uuid::Uuid::parse_str(thread_id).ok(),
+        crate::engine::ContextPurpose::Title,
+    );
+    let title = crate::engine::generate_thread_title(&call, &summary, None, capture.as_ref())
         .await
         .map_err(|e| {
             log!("[API] Failed to generate title suggestion: {}", e);

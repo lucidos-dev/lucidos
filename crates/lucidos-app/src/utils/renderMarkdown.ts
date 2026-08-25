@@ -1,5 +1,6 @@
 import { marked } from 'marked';
 import type { Tokens } from 'marked';
+import DOMPurify from 'dompurify';
 import { lucidos } from '@lucidos/sdk';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
 import { addMarkdownParseMs } from './renderPhaseTimers';
@@ -110,284 +111,116 @@ function postprocessCopyBlocks(html: string, encodedTexts: Map<number, string>):
   });
 }
 
-// Escape the HTML elements that survive marked processing. Raw HTML in
-// markdown source passes through marked unescaped and renders as real
-// elements.
-//
-// `animate` / `animateTransform` / `set` are here rather than in the
-// URL-attribute filter because they reach a URL by INDIRECTION: `<animate
-// attributeName="href" values="javascript:...">` animates a sibling `<a>`'s
-// href, and a name-based attribute filter cannot see it. Escaping the element
-// is the only check that holds.
-const DANGEROUS_TAG =
-  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|animate|animateTransform|set)(\s[^>]*)?>/gi;
-/** An attribute NAME that carries executable script. */
-const EVENT_HANDLER_NAME = /^on[a-z0-9_-]+$/i;
+// Raw HTML in markdown source passes through marked unescaped. So the string
+// reaching the sanitizer mixes the renderer's own markup with whatever the
+// author typed. DOMPurify parses that with the browser's own HTML parser and
+// keeps an allowlist of elements and attributes. Nothing here re-implements
+// that judgment; the two pieces below only add policy DOMPurify has no knob for.
+
+/** Tags rewritten to visible text BEFORE the parser sees them.
+ *
+ *  DOMPurify deletes these silently. A chat transcript that quietly loses what
+ *  the model wrote is the worse default, so they are escaped instead.
+ *
+ *  The pass cannot create markup: escaping only turns `<`, `>`, `&` and `"`
+ *  into entities. A tag it misses is still removed by DOMPurify. So this is a
+ *  rendering choice, and the security decision stays DOMPurify's.
+ *
+ *  It runs before the parse rather than after. An unclosed `<iframe>` swallows
+ *  the rest of the document as raw text, and no hook on the parsed tree can
+ *  give that back.
+ *
+ *  `animate` / `animateTransform` / `set` reach a URL by INDIRECTION, which a
+ *  name-based attribute filter cannot see: `<animate attributeName="href"
+ *  values="javascript:...">` animates a sibling `<a>`'s href.
+ *
+ *  `title`, `desc` and the MathML text elements stay out: each is real markup
+ *  inside `<svg>` or `<math>`, which this regex cannot see. */
+const ESCAPE_TO_TEXT_TAG =
+  /<(\/?)(iframe|script|style|object|embed|applet|base|meta|link|xmp|plaintext|noscript|noembed|noframes|animate|animateTransform|set)([\s/][^>]*)?>/gi;
+
 /** The attribute NAMES whose value is fetched or navigated as a URL.
  *
- *  `xlink:href` is the SVG spelling of `href` and navigates identically, and
- *  `action` / `formaction` submit to their value. Only a dangerous SCHEME is
- *  ever stripped, so widening the name list cannot touch an ordinary link. */
-const URL_ATTR_NAME =
-  /^(href|xlink:href|src|srcset|action|formaction|poster|background|ping|data)$/i;
+ *  DOMPurify checks the scheme of the attributes it knows carry one. But its
+ *  `DATA_URI_TAGS` lets `data:` through on `<img>` and friends, and offers no
+ *  negative form. The hook below closes that. It reads the value the DOM
+ *  already decoded, so an entity-obfuscated scheme is plain text by the time it
+ *  is compared. */
+const URL_ATTRIBUTES = [
+  'href', 'xlink:href', 'src', 'srcset', 'action',
+  'formaction', 'poster', 'background', 'ping', 'data',
+];
 
-function entityCodePoint(code: number): string | null {
-  if (!Number.isInteger(code) || code < 0 || code > 0x10ffff) return null;
-  return String.fromCodePoint(code);
-}
-
-function decodeHtmlEntitiesForScheme(value: string): string {
-  return value.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z][a-z0-9]+);?/gi, (match, entity: string) => {
-    const e = entity.toLowerCase();
-    if (e.startsWith('#x')) {
-      const code = Number.parseInt(e.slice(2), 16);
-      return entityCodePoint(code) ?? match;
-    }
-    if (e.startsWith('#')) {
-      const code = Number.parseInt(e.slice(1), 10);
-      return entityCodePoint(code) ?? match;
-    }
-    switch (e) {
-      case 'colon': return ':';
-      case 'tab': return '\t';
-      case 'newline': return '\n';
-      case 'amp': return '&';
-      default: return match;
-    }
-  });
-}
-
-function isDangerousUrlAttrValue(rawValue: string): boolean {
-  const unquoted = (rawValue.startsWith('"') && rawValue.endsWith('"'))
-    || (rawValue.startsWith("'") && rawValue.endsWith("'"))
-    ? rawValue.slice(1, -1)
-    : rawValue;
-  const normalized = decodeHtmlEntitiesForScheme(unquoted)
-    .trimStart()
-    .replace(/[\u0000-\u0020]+/g, '')
-    .toLowerCase();
-  return normalized.startsWith('javascript:') || normalized.startsWith('data:');
-}
-
-/** ASCII whitespace, per the HTML spec's definition. Module scope rather than a
- *  closure: this is called for every character of every tag on every
- *  cache-missing render. */
-function isHtmlSpace(c: string): boolean {
-  return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f';
-}
-
-/** End index (exclusive) of the comment that opens at `start` (`<!--`).
+/** Strip `javascript:` and `data:` from every URL-bearing attribute.
  *
- *  Searched from `start + 2`, not past the whole `<!--`, because `<!-->` and
- *  `<!--->` are COMPLETE empty comments. Starting later would miss their
- *  terminator and swallow the rest of the document unscrubbed. Both spec
- *  terminators are accepted, earliest wins, for the same reason. An
- *  unterminated comment runs to the end, as it does in the browser. */
-function commentEnd(html: string, start: number): number {
-  const from = start + 2;
-  const plain = html.indexOf('-->', from);
-  const bang = html.indexOf('--!>', from);
-  if (plain === -1 && bang === -1) return html.length;
-  if (bang === -1 || (plain !== -1 && plain <= bang)) return plain + 3;
-  return bang + 4;
-}
-
-/** End index (exclusive) of the tag that opens at `start`, quote-aware.
- *
- *  Quote-aware rather than "up to the first `>`", and that is load-bearing: an
- *  attribute value may itself contain `>` (`<a title="x>" href="javascript:...">`),
- *  so stopping early would leave the `href` outside the tag and unscrubbed.
- *
- *  A quote counts ONLY where a value is expected, directly after `=`. Treat
- *  every quote as a delimiter and an apostrophe in `<h2 id=it's>` opens one
- *  that never closes: the tag runs to the end of the document and the
- *  attribute walk scrubs plain prose. Comments are the other such door, and
- *  [`commentEnd`] handles them before this is reached.
- *
- *  Returns `html.length` for a tag that never closes, so the caller treats the
- *  whole remainder as markup and scrubs it: the scan fails CLOSED. */
-function tagEnd(html: string, start: number): number {
-  let i = start + 1;
-  let quote = '';
-  let valueExpected = false;
-  while (i < html.length) {
-    const ch = html[i];
-    if (quote) {
-      if (ch === quote) quote = '';
-    } else if (valueExpected && (ch === '"' || ch === "'")) {
-      quote = ch;
-      valueExpected = false;
-    } else if (ch === '>') {
-      return i + 1;
-    } else if (ch === '=') {
-      valueExpected = true;
-    } else if (!isHtmlSpace(ch)) {
-      valueExpected = false;
+ *  Registered through `installUrlSchemeHook` below, never at module scope. */
+function stripDangerousUrlSchemes(node: Node): void {
+  const el = node as Element;
+  if (typeof el.getAttribute !== 'function') return;
+  for (const name of URL_ATTRIBUTES) {
+    const value = el.getAttribute(name);
+    if (value === null) continue;
+    // Control characters are stripped the way a URL parser skips them, so
+    // `java\tscript:` is caught with the plain spelling.
+    const scheme = value.replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+    if (scheme.startsWith('javascript:') || scheme.startsWith('data:')) {
+      el.removeAttribute(name);
     }
-    i++;
   }
-  return html.length;
 }
 
-/** Drop the script-bearing and dangerous-URL attributes from one tag, keeping
- *  every other byte of it exactly as it was.
+let urlSchemeHookInstalled = false;
+
+/** Register the URL-scheme hook, once.
  *
- *  Walks the tag's attributes rather than pattern-matching `\s+name=value`
- *  over the text, because that shape also occurs in two places it must NOT be
- *  removed from: an attribute VALUE (`data-copy-text="... on_event=X"`) and
- *  ordinary PROSE ("Set online=yes in the config"). Nothing marks such a loss,
- *  so the reader sees a mangled sentence with no sign anything was dropped.
- *
- *  Deletions are spliced out of the ORIGINAL text rather than re-emitted from
- *  parsed parts, so attribute quoting, spacing and order survive untouched and
- *  this can only ever remove. */
-function scrubTagAttributes(tag: string): string {
-  // Char tests, not regex literals: a literal in a loop body allocates a fresh
-  // RegExp per iteration, and this walks every character of every tag on every
-  // cache-missing render.
-  const isSpace = isHtmlSpace;
-  const endsName = (c: string): boolean => isSpace(c) || c === '=' || c === '/' || c === '>';
-
-  // Past `<`, an optional `/`, and the tag name. Anything before the first
-  // whitespace is the name, never an attribute.
-  let i = 1;
-  while (i < tag.length && !isSpace(tag[i]) && tag[i] !== '/' && tag[i] !== '>') i++;
-
-  const drop: Array<[number, number]> = [];
-  while (i < tag.length) {
-    let nameStart = i;
-    while (nameStart < tag.length && isSpace(tag[nameStart])) nameStart++;
-    if (nameStart >= tag.length) break;
-    if (tag[nameStart] === '>' || tag[nameStart] === '/') { i = nameStart + 1; continue; }
-
-    let nameEnd = nameStart;
-    while (nameEnd < tag.length && !endsName(tag[nameEnd])) nameEnd++;
-    const name = tag.slice(nameStart, nameEnd);
-    if (!name) { i = nameStart + 1; continue; }
-
-    // An `=` (with optional surrounding whitespace) means a value follows;
-    // otherwise this is a bare boolean attribute and ends at the name.
-    let cursor = nameEnd;
-    while (cursor < tag.length && isSpace(tag[cursor])) cursor++;
-    let value = '';
-    let attrEnd = nameEnd;
-    if (tag[cursor] === '=') {
-      cursor++;
-      while (cursor < tag.length && isSpace(tag[cursor])) cursor++;
-      const q = tag[cursor];
-      if (q === '"' || q === "'") {
-        const close = tag.indexOf(q, cursor + 1);
-        // An unterminated quote runs to the end of the tag, which the tag scan
-        // already extended to the end of the input. Same fail-closed direction.
-        attrEnd = close === -1 ? tag.length : close + 1;
-      } else {
-        attrEnd = cursor;
-        while (attrEnd < tag.length && !isSpace(tag[attrEnd]) && tag[attrEnd] !== '>') attrEnd++;
-      }
-      value = tag.slice(cursor, attrEnd);
-    }
-
-    if (EVENT_HANDLER_NAME.test(name)
-      || (URL_ATTR_NAME.test(name) && isDangerousUrlAttrValue(value))) {
-      // Take the leading whitespace with it so removing an attribute never
-      // leaves a double space behind.
-      let from = nameStart;
-      while (from > 0 && isSpace(tag[from - 1])) from--;
-      drop.push([from, attrEnd]);
-    }
-    i = attrEnd > nameStart ? attrEnd : nameStart + 1;
-  }
-
-  if (drop.length === 0) return tag;
-  let out = '';
-  let pos = 0;
-  for (const [from, to] of drop) {
-    out += tag.slice(pos, from);
-    pos = to;
-  }
-  return out + tag.slice(pos);
+ *  It is registered on first use, not at module scope. With no DOM, DOMPurify's
+ *  export carries no `addHook` at all, so a module-scope call throws at IMPORT
+ *  time. That breaks every module that merely imports this one, including the
+ *  many that never render markdown. */
+function installUrlSchemeHook(): void {
+  if (urlSchemeHookInstalled) return;
+  DOMPurify.addHook('afterSanitizeAttributes', stripDangerousUrlSchemes);
+  urlSchemeHookInstalled = true;
 }
+
+/** DOMPurify's default scheme list plus the five Lucidos schemes.
+ *
+ *  Each of the five is claimed by an extractor that runs AFTER sanitization:
+ *  `thread:` below in this file, and `app:`, `trigger:`, `repo:` and `file:` in
+ *  `linkifyPaths`. Stripping one here would break every such link, because the
+ *  extractor would find no href left to read. */
+const ALLOWED_URI_REGEXP =
+  /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|thread|app|trigger|repo|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+
+const PURIFY_CONFIG = {
+  // `inlineLinkKeepRenderer` emits `target="_blank"`, which the default
+  // attribute allowlist drops.
+  ADD_ATTR: ['target'],
+  // Paired with `ESCAPE_TO_TEXT_TAG`, so a tag the escape pass misses is still
+  // removed. `style` and `animateTransform` are the two DOMPurify would
+  // otherwise keep. `animate` and `set` are already in its SVG denylist, and
+  // stay listed so this policy does not rest on that default.
+  FORBID_TAGS: ['style', 'animate', 'animateTransform', 'set'],
+  ALLOWED_URI_REGEXP,
+};
 
 /** Neutralize the raw HTML that marked passes through, without touching the
- *  text around it. Escapes the tags that can never be safe, then drops
- *  script-bearing / dangerous-URL attributes from the tags that remain. */
-function sanitizeHtmlFragments(html: string): string {
-  // The dangerous-tag pass runs first and rewrites those tags into escaped
-  // TEXT, so the tag walk below never sees them and their attributes stay
-  // visible as the text they have become.
-  const escaped = html.replace(DANGEROUS_TAG, (match) => escapeHtmlAttr(match));
-  let out = '';
-  let i = 0;
-  while (i < escaped.length) {
-    const lt = escaped.indexOf('<', i);
-    if (lt === -1) {
-      out += escaped.slice(i);
-      break;
-    }
-    out += escaped.slice(i, lt);
-    // A comment BOUNDS differently from a tag (an apostrophe in it is not an
-    // attribute quote), so its extent is measured separately. It is still
-    // scrubbed. Inside RCDATA (`<textarea>`, `<title>`) a `<!--` is plain text
-    // to the browser while this scan reads it as a comment. An unterminated
-    // one would hand back every following byte with its handlers intact.
-    const end = escaped.startsWith('<!--', lt) ? commentEnd(escaped, lt) : tagEnd(escaped, lt);
-    const tag = escaped.slice(lt, end);
-    out += scrubTagAttributes(tag);
-    i = end;
-
-    // A raw-text / RCDATA element stops the browser tokenizing tags until its
-    // own end tag, so everything between is TEXT whatever it looks like. Keep
-    // walking as if it were markup and the models diverge: in
-    // `<textarea><a title="</textarea><img src=x onerror=...>` the browser
-    // ends the textarea and the img is live, while the scan reads one `<a>`
-    // whose `title` value swallows it.
-    //
-    // BOUNDING the region at the end tag realigns the two models. The content
-    // is then scrubbed rather than copied: `title` is RCDATA in HTML but
-    // ordinary markup inside `<svg>` / `<math>`, and this walk does not track
-    // foreign content. Nothing skips the scrub.
-    const raw = rawTextTagName(tag);
-    if (raw) {
-      // No end tag means the element runs to EOF, which is what the browser
-      // does with it too.
-      const close = closeTagIndex(escaped, raw, i);
-      out += sanitizeHtmlFragments(escaped.slice(i, close));
-      i = close;
-    }
-  }
-  return out;
-}
-
-/** Elements whose content the HTML parser reads as text rather than markup, and
- *  that are NOT already escaped by [`DANGEROUS_TAG`] (`script`, `style`,
- *  `iframe`, `noembed` and friends never reach the walk as tags). */
-const RAW_TEXT_TAGS = new Set(['textarea', 'title', 'xmp', 'noscript', 'plaintext']);
-
-/** The lower-cased name of `tag` when it is a raw-text START tag, else null. */
-function rawTextTagName(tag: string): string | null {
-  if (!tag.startsWith('<') || tag.startsWith('</') || tag.startsWith('<!')) return null;
-  let i = 1;
-  while (i < tag.length && !isHtmlSpace(tag[i]) && tag[i] !== '/' && tag[i] !== '>') i++;
-  const name = tag.slice(1, i).toLowerCase();
-  return RAW_TEXT_TAGS.has(name) ? name : null;
-}
-
-/** Index of the `</name` end tag at or after `from`, or `html.length`.
+ *  text around it.
  *
- *  Matched the way the tokenizer does: the name is case-insensitive and must be
- *  followed by whitespace, `/` or `>`, so `</textareax>` does not close a
- *  `<textarea>`. `plaintext` has no end tag at all and correctly runs to EOF. */
-function closeTagIndex(html: string, name: string, from: number): number {
-  const needle = `</${name}`;
-  const hay = html.toLowerCase();
-  let at = from;
-  for (;;) {
-    const found = hay.indexOf(needle, at);
-    if (found === -1) return html.length;
-    const after = html[found + needle.length];
-    if (after === undefined || isHtmlSpace(after) || after === '/' || after === '>') return found;
-    at = found + needle.length;
+ *  Exported for the one caller that drives `marked` itself instead of going
+ *  through the helpers below: `components/files/RenderedDiff.tsx` parses token
+ *  by token so it can mark each block, and owes its output the same scrub. Any
+ *  new `marked.parse*` call site owes it too. */
+export function sanitizeHtmlFragments(html: string): string {
+  // With no DOM, DOMPurify's export carries no `sanitize`, so the call below
+  // would die on a bare TypeError. Say what is actually wrong instead.
+  if (!DOMPurify.isSupported) {
+    throw new Error(
+      'sanitizeHtmlFragments needs a DOM: add "// @vitest-environment jsdom" to this test file',
+    );
   }
+  installUrlSchemeHook();
+  return DOMPurify.sanitize(html.replace(ESCAPE_TO_TEXT_TAG, escapeHtmlAttr), PURIFY_CONFIG);
 }
 
 /** At or above this many columns a table stacks into labeled cards on a phone
@@ -407,9 +240,9 @@ const BODY_CELL = /<td\b([^>]*)>([\s\S]*?)<\/td>/g;
  *  marked wrote as `&amp;lt;` then survives as the four characters the author
  *  typed, instead of collapsing into a `<`.
  *
- *  Deliberately NOT `decodeHtmlEntitiesForScheme` above, despite the overlap.
- *  That one leaves `lt` / `gt` / `quot` alone, which is what a header needs.
- *  Widening it would change what the `javascript:` / `data:` guard sees. */
+ *  Nothing security-sensitive reads this. It runs on a header cell that is
+ *  already sanitized, and its output goes straight back into an attribute
+ *  through `escapeHtmlAttr`. */
 function decodeMarkedTextEscapes(s: string): string {
   return s
     .replace(/&lt;/g, '<')

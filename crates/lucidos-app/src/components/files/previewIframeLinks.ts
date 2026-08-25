@@ -30,6 +30,7 @@ import {
   extractAppIdFromHref,
   extractNavTargetFromHref,
   extractLocalFileTarget,
+  extractTriggerIdFromHref,
   hasUrlScheme,
 } from '../../utils/linkifyPaths';
 import { openFilePreview, openUrl, openLocalFile } from '../../store/actions/artifacts';
@@ -69,6 +70,7 @@ export type PreviewLinkAction =
   | { kind: 'fragment'; id: string }
   | { kind: 'thread'; workspace: string | undefined; threadId: string }
   | { kind: 'app'; appId: string }
+  | { kind: 'trigger'; triggerId: string }
   | { kind: 'nav'; target: string }
   | { kind: 'local-file'; target: string }
   | { kind: 'file'; path: string }
@@ -208,6 +210,10 @@ export function classifyPreviewLink(
 
   const appId = extractAppIdFromHref(href);
   if (appId) return { kind: 'app', appId };
+  // `trigger:` is a scheme, so without this arm the guard below hands it back
+  // to the browser and the link dead-ends. Same shape as the `repo:` arm.
+  const triggerId = extractTriggerIdFromHref(href);
+  if (triggerId) return { kind: 'trigger', triggerId };
   const navTarget = extractNavTargetFromHref(href);
   if (navTarget) return { kind: 'nav', target: navTarget };
   const localFile = extractLocalFileTarget(href);
@@ -284,6 +290,12 @@ function runPreviewLinkAction(action: PreviewLinkAction, doc: Document): void {
       return;
     case 'app':
       void openAppById(action.appId, 'a file preview');
+      return;
+    case 'trigger':
+      handleNavigationRequest(
+        { target: 'trigger', id: action.triggerId },
+        { source: 'a file preview' },
+      );
       return;
     case 'nav':
       handleNavigationRequest({ target: action.target });

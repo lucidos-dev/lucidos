@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "reverse proxy".
+description: Use when the user wants to reach Lucidos from a phone, tablet or another machine. Covers "remote access", "Mobile Access", "Expose", "tailscale serve", "tailscale funnel", "expose a webhook". Also "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert".
 ---
 
 # Remote Access & HTTPS
@@ -43,11 +43,12 @@ Read **both** columns that matter:
 | `100.x.y.z:5251` | bound to the tailnet address specifically. |
 
 Expect several rows: one `lucidos-gateway` per install, plus one
-`lucidos-engine` per running workspace on its own port. On a packaged install
-the engines are loopback-only and the gateway is the sole network-facing
-surface; on a dev checkout the engines can be network-facing too. Either way the
-**gateway** port is the one to hand a remote device, because it routes to every
-workspace by slug.
+`lucidos-engine` per running workspace on its own port. **Every engine should
+read `127.0.0.1`**, packaged and dev alike. The gateway is the only
+network-facing surface, because it is the only one that authenticates its
+callers. An engine row on `*:` or a `100.x` address is a workspace reachable
+with no credential, and means something set `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0`.
+Hand a remote device the **gateway** port: it routes to every workspace by slug.
 
 ### Step 2: which port speaks TLS
 
@@ -82,16 +83,108 @@ Probe the **MagicDNS name**, not `127.0.0.1`. A cert can be valid for
 `localhost` and useless for `mymac.tailnet-name.ts.net`, and loopback probes
 will never reveal that.
 
-## Never expose Lucidos to the open internet
+## Devices pair before Lucidos answers them
 
-Lucidos has **no inbound API authentication**. Anything that can reach the port
-acts as the user, with full access to every workspace, every credential, and
-every coding-agent capability. So:
+**The gateway authenticates every caller that reaches it over the network.** An
+unpaired device is answered with a pairing screen, at the address it asked for.
+So reaching the port is no longer the same as being the user.
 
-- Use `tailscale serve` (tailnet-private), **never `tailscale funnel`** (public).
+**The desktop app pairs itself.** Open it and you are in. Its Rust side reads
+the machine-local token, which a browser cannot, so it mints a code and spends
+it without asking. That is the first device on a fresh install, and it takes no
+terminal.
+
+Any paired device can then let the next one in. **Settings → Access → Add a
+device** mints a code and draws a QR the phone can scan.
+
+A terminal does the same, and is the fallback when nothing is paired at all:
+
+```bash
+lucidos pair            # prints a code; type it into the device
+lucidos pair --qr       # draws it as a QR the phone can scan
+```
+
+`lucidos` is on no `PATH`. A desktop install keeps it inside the app bundle, at
+`Lucidos.app/Contents/Resources/lucidos`. A headless install keeps it under the
+install prefix, in `runtime/current/`.
+
+The code works once and expires in five minutes. A device stays paired until
+you revoke it, and until nothing else: there is no idle timeout and no absolute
+one. An expiry would cut off only the devices you forgot, since a credential in
+use never goes stale. Revoking answers the device you know you lost.
+
+**Devices says when it last saw each one**, to the nearest day. That is what
+tells a phone in daily use from a laptop you sold, so read it before you
+revoke. The browser's cookie carries its own window, refreshed on each day a
+device is seen, so an active device never reaches it. That window is a
+convenience: the gateway never reads it, and age is not an input to the auth
+decision.
+
+Four things about it are worth knowing, because each surprises people:
+
+- **A browser pairs even on that machine.** Proving you are local means reading
+  a file only your user can read, and a browser cannot read files. So Safari on
+  the host pairs exactly like a phone does. Two things never pair, because both
+  attach that proof themselves: the CLI, and the desktop app's own Rust side.
+- **Being on the tailnet is not what authorizes you.** Auth reads no Tailscale
+  header and works the same over `tailscale serve`, mkcert, or a plain LAN
+  address. The tailnet is transport.
+- **A workspace's own engine port is not a way in.** Engines bind loopback, so
+  only this machine reaches one. Every other device goes through the gateway at
+  `/<slug>/` and pairs. A bookmark straight at an engine port stops resolving
+  from elsewhere, which is the point: it was a way around pairing.
+- **Apps in an *app UI* iframe still act with your authority**, exactly as they
+  did before. They are served same-origin and share the browser's session. An
+  app cannot copy the credential off the machine, but it can still call the API
+  as you.
+
+### Still do not put Lucidos on the open internet
+
+Authentication raises the floor; it does not make a public origin a good idea.
+
+- Use `tailscale serve` (tailnet-private), **never `tailscale funnel`** on the
+  gateway's own port.
 - No router port-forward, no public reverse proxy, no ngrok-style tunnel.
-- The tailnet is the authentication boundary. Devices join the tailnet; that is
-  how they are authorized.
+- Keep the tailnet as the outer boundary, with pairing as the inner one.
+
+### The one exception: a webhook's own socket
+
+A *webhook* is the single surface meant to be reached by someone who will never
+join your tailnet. GitHub cannot pair. So webhook deliveries answer on their
+own port, the *hook socket*, and that port is the only thing you point
+`tailscale funnel` at (ADR 0097).
+
+**The isolation is structural, not a rule to follow.** Funnel maps a *port*,
+never a path, so "expose only the webhooks" is not something it can express.
+The hook socket has exactly one route, `POST /<slug>/<webhook-id>`, and answers
+404 to everything else, a wrong method included. A public caller therefore
+reaches no control plane and no workspace, whatever it asks for. Pointing funnel
+at the gateway's own port would put both one auth bug away from the internet.
+
+The hook port is the gateway's plus ten: **5261** in dev, **5262** packaged.
+`LUCIDOS_HOOK_PORT` overrides it, and `0` switches the socket off entirely.
+
+```bash
+tailscale funnel --bg 5262   # packaged: publish ONLY the hook socket
+tailscale funnel status      # what is public right now
+tailscale funnel off         # stop publishing
+```
+
+`tailscale funnel --help` is the authority for the installed version, exactly as
+`serve --help` is below. Deliveries then arrive at
+`https://<machine>.<tailnet>.ts.net/<slug>/<webhook-id>`.
+
+**A public port is not an open door.** Every delivery still authenticates, by
+bearer token or by the sender's own signature. Each webhook emits one pinned
+event, fixed when you created it. Create one with `lucidos webhooks create`;
+`system-knowhow/lucidos-cli.md` covers the tokens and the GitHub, Slack and
+Stripe signature shapes.
+
+**A sender out there will resend.** GitHub retries a slow response, Stripe
+retries for days, and by default each arrival emits again. `--dedupe` names the
+header carrying the sender's delivery id and collapses the repeat. The CLI page
+covers it, along with the `--headers` allow-list that puts a chosen request
+header in the payload.
 
 ## Why HTTPS matters, and when it does not
 
@@ -357,7 +450,10 @@ true before the second buys anything:
 | 1. The machine running Lucidos | Is the engine's machine on a tailnet? | `detected_tailscale_ip` from `GET /api/v1/network-config` in any browser; the fuller `get_connect_info` probe on the packaged desktop app |
 | 2. This device | Has the device reading the page joined that tailnet? | The address this device was served on |
 
-All three sections render **everywhere**, phone browsers and the installed PWA
+**Add a device is not one of the two questions**, it is the action they lead
+to: pairing a new device at one of those addresses. See its own section below.
+
+Every section renders **everywhere**, phone browsers and the installed PWA
 included, Connect URLs among them. What varies by platform is how much each can
 say, never whether it appears. Only the **actions** are gated: Sign in to
 Tailscale and Expose are native commands with no HTTP equivalent, so they exist
@@ -444,6 +540,149 @@ and it is the one row that survives the packaged default.
 The bind weighed is the one belonging to whichever process served the page.
 Behind the gateway that is `gateway_bind`. On a direct engine port the origin is
 the engine, which follows the gateway only while `[engine] inherit` is on.
+
+### Add a device
+
+Under Connect URLs, and the thing you DO with one of those addresses. It mints
+a *pairing code* and draws it as a QR, so a phone scans rather than typing
+eight digits. Whoever is reading the page is already paired, which is what
+makes the offer safe: a paired device holds full authority and may enrol
+another.
+
+**A live code is shown as the three ways to use it**, one card each: scan the
+QR, type the digits, open the address. Scanning is the point, so the QR is the
+big card and the two fallbacks stack beside it. The digits are always there, so
+a failed scan is never a dead end, and they are set large enough to read across
+a desk.
+
+They are alternatives, not steps. Every card after the first says "Or", since a
+row of imperatives reads as a checklist of three things to do. The two fallbacks
+carry a Copy button, hidden where the browser exposes no clipboard (a plain-HTTP
+LAN address is not a secure context).
+
+The address card is text, never a link. It is meant for the other device, and
+following it here would spend a single-use code on a device already paired.
+
+**The QR encodes `<reachable-origin>/~/?pair=<code>`.** Scanning it opens the
+picker, whose pairing screen reads the parameter, fills the code in and strips
+it from the address bar. A code works once and expires, so a URL still carrying
+one is a URL that will stop working: a reload, a bookmark or a shared link must
+not keep it.
+
+On a phone the scan lands somewhere else, and § A phone installs before it pairs
+says why.
+
+**The address is the hard part.** The machine minting a code is usually reading
+this page over loopback, and a QR aimed at `127.0.0.1` helps nobody. So the
+section takes the same derivation the Tailscale row above uses: the verified
+`serve` origin, else the MagicDNS name, else the tailnet address, and only
+while something is listening on it. Then the LAN address, on the packaged
+desktop app where one can be detected. With none of those it mints the code and
+says there is no QR, rather than encoding an address that cannot work.
+
+**The expiry is a live countdown**, not a sentence claiming five minutes an
+hour after the fact. It sits above the cards with the New code button, since it
+is true of the code rather than of one way to spend it. Single use is not
+repeated there: it is a fact nobody has to act on, and the line is re-read every
+second.
+
+Once a code expires the cards go, leaving the countdown's verdict and the
+button. Every card is an instruction to use a code that no longer works, and
+the button is the way out of that state.
+
+**Nothing here mints a code by itself.** A phone that installs Lucidos and comes
+back to scan again may find the code expired, and the reader presses the button
+for another. The section used to replace an expired code on its own, which read
+as the page undoing the press the reader had just made. See ADR 0098.
+
+The section is gated on `/~/…` reaching the gateway, which is true exactly
+while the page is served under `/<slug>/`. A page served straight off an engine
+port resolves that path against the engine and gets a 404, so it says to run
+`lucidos pair` instead. It never hides: the heading is a Search Everywhere
+destination, and an absent section drops that hit at the top of the page.
+
+### A phone installs before it pairs
+
+**On iOS the home-screen app is a different device from Safari.** It gets its
+own storage container, so the credential cookie taken in a Safari tab never
+reaches it. iOS also cannot route a scanned link into an installed web app, so
+the Camera app always hands it to Safari. Pairing the tab therefore enrols the
+wrong thing and leaves the app locked out. Android does not have this problem,
+because an installed PWA captures links inside its own scope.
+
+So the pairing screen shows a phone browser the **install steps** rather than
+the code form. Add Lucidos to the home screen and open it: the code rode into
+the manifest's `start_url`, and the app spends it on sight with nothing typed.
+Somebody who wants the browser paired anyway taps **Pair this browser instead**.
+
+**That code is fixed at install time, and it still lasts five minutes.** An
+install slower than that opens on the pairing screen with the code refused, and
+the two routes below are how it recovers. A fresh code on the host does not
+reach it: the app's launch URL was written when it was installed.
+
+**An app already on the home screen cannot be reached that way**, since its
+launch URL is fixed. Two ways across for that case, both on the pairing screen
+inside the app:
+
+- **Paste code.** The browser screen offers Copy, and the pasteboard is shared.
+- **Scan QR.** The app opens its own camera and reads the QR off the host's
+  screen. It appears on a phone over HTTPS, where a camera can be opened at all.
+  An expired code leaves no QR to read, so the host makes a fresh one first.
+
+Typing the eight digits still works everywhere, and is what a desktop browser
+does.
+
+### The list of devices lives in Settings → Devices
+
+Access adds a device. **Settings → Devices** is where every device is listed,
+and where **Revoke** is. One row per device, carrying both of the things you
+can do to one:
+
+| Action | Reach | What it does |
+|---|---|---|
+| **Revoke** | the whole machine | Stops this device reaching Lucidos, on every workspace. |
+| **Remove** | this workspace | Forgets its push subscription and its preferences here, and leaves it paired. |
+
+They are two buttons because they answer different questions, and they used to
+be two lists for the same reason. That was the problem: the same phone appeared
+under **Paired devices** and again under **Devices**, with different names, and
+neither row knew about the other. Both now key on the id the gateway minted
+when the device paired, so there is one device and one row.
+
+A row can be missing either half, and neither is an error. A device paired from
+another workspace holds nothing here yet, and its row says **Not set up in this
+workspace**. It keeps a push toggle, switched off and disabled, because push
+hangs off the engine row it does not have yet. A browser on a direct engine port
+never went through the gateway, so it has nothing to revoke. With no gateway at
+all the pairing column is dropped rather than guessed at, and Search withholds
+the **Revoke** hit on such a page.
+
+The row states the present and never a history it cannot see. Nothing there
+claims a device has never opened this workspace, because a missing engine row
+does not prove that. **Remove** deletes the row of a device sitting right in
+front of you. And a device that paired before its two ids were unified keeps
+them apart until it next loads the page.
+
+### What a device is called
+
+Each half carries its own name, and the row prefers the one you can edit.
+
+The pairing screen offers a name it reads off the browser, such as `Chrome on
+Mac` or `Safari on iPhone`. The person at the device may overwrite it, and that
+typed name wins: whoever is holding the device is being more specific than
+whoever minted the code. So `lucidos pair --label` is a fallback. It applies
+when the field is left empty, and the CLI says as much when it prints the code.
+An unrecognised browser suggests nothing and leaves the field blank, which is
+what keeps the fallback reachable. With neither, the device is listed as
+"Paired device".
+
+That pairing name is fixed: revoke and pair again to change it. The name on the
+**Devices** row is not. Click it and type, and that is what the row shows from
+then on. A device with no engine row yet shows its pairing name instead.
+
+A device with neither is listed as `device-` plus the first eight characters of
+its id, which is what an actor chip calls it too. The whole id is never the
+heading: it is unreadable, and at that length it wraps onto a second line.
 
 ### The tailnet-status endpoint
 
@@ -615,6 +854,9 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 
 - Machine-global config lives in `~/.lucidos/network.toml`:
   `[gateway] bind = "loopback" | "all" | "<IP>"` plus `[engine] inherit`.
+- **`[engine] inherit` reaches a directly-launched engine, not one the gateway
+  spawned.** A gateway-spawned engine is pinned to loopback whatever the file
+  says, since the gateway is the only door that authenticates.
 - Edit it from the **workspace picker → Settings → Network access** (the
   gateway bind), or per workspace in **Settings → Access → Network access** (the
   engine bind, when `inherit` is off).
@@ -661,6 +903,8 @@ not that an interface is missing).
   web push. Worth offering proactively, because it is the payoff for setting up
   TLS and most users do not know to ask. Add the workspace URL
   (`https://<host>/<slug>/`) rather than the root if they live in one workspace.
+  The home-screen app pairs separately from Safari: see § A phone installs
+  before it pairs.
 - **The URL to hand over.** The gateway root 307-redirects to the sole workspace
   or to the picker (`/~/`). A direct workspace link is
   `https://mymac.tailnet-name.ts.net/<slug>/`. Settings → Access prints exactly

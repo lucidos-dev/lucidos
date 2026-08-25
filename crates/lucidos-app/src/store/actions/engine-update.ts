@@ -521,6 +521,11 @@ export interface FrontendUpdateStrandedPayload {
   /** Whether that path lies inside a coding-agent worktree — the known cause,
    *  and the one with a specific fix, so it gets a specific message. */
   served_in_worktree: boolean;
+  /** What the build-watch last said went wrong, when it said anything. Absent
+   *  for a healthy build, and on any stack whose watcher predates the status
+   *  file it reads. Present, it is the actual answer to "why did nothing
+   *  appear", so it replaces the guess. */
+  build_error?: string;
   /** Engine wall-clock (ms) at emit time. Drives the freshness gate. */
   sent_at_ms: number;
 }
@@ -589,13 +594,30 @@ export function handleFrontendUpdateDeferred(payload: FrontendUpdateDeferredPayl
  *
  *  Same freshness gate as the deferred hint: a late SSE-queue flush arriving after
  *  the stack was already fixed shouldn't raise a now-false alarm. */
+/** Pure: what to tell the user about a stranded frontend Apply.
+ *
+ *  Three cases, and the order matters. A worktree-pinned stack is permanent and
+ *  keeps its own advice. A reported build failure is the actual answer, so it
+ *  replaces the guess rather than being appended to it. Everything else keeps
+ *  the recoverable wording, which must not claim the change is lost.
+ *
+ *  Exported so all three are testable without a toast. */
+export function strandedMessage(payload: FrontendUpdateStrandedPayload): string {
+  if (payload.served_in_worktree) {
+    return `Frontend change applied but it will not appear: the engine is serving a coding-agent worktree (${payload.served_dir}), which the build-watch never rebuilds. Relaunch the stack from the real checkout.`;
+  }
+  const failure = payload.build_error?.trim();
+  if (failure) {
+    return `Frontend change applied but the build is failing, so nothing new is being served: ${failure}`;
+  }
+  return `Frontend change applied but not served yet. ${payload.served_dir} hasn't rebuilt. It will appear on its own if the build lands; if it doesn't, check the build-watch.`;
+}
+
 export function handleFrontendUpdateStranded(payload: FrontendUpdateStrandedPayload): void {
   if (Date.now() - payload.sent_at_ms > DEFERRED_HINT_STALE_AFTER_MS) {
     return;
   }
-  const message = payload.served_in_worktree
-    ? `Frontend change applied but it will not appear: the engine is serving a coding-agent worktree (${payload.served_dir}), which the build-watch never rebuilds. Relaunch the stack from the real checkout.`
-    : `Frontend change applied but not served yet — ${payload.served_dir} hasn't rebuilt. It will appear on its own if the build lands; if it doesn't, check the build-watch.`;
+  const message = strandedMessage(payload);
   showToast(message, 'warning', {
     key: FRONTEND_UPDATE_STRANDED_TOAST_KEY,
     noAutofocus: true,

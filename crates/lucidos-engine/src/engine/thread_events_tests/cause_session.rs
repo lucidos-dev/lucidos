@@ -158,10 +158,15 @@ fn session_ended_reason_serialization() {
 /// `RecoveryAfterRestart` is `failed` with EVERY actor, device included, since
 /// the boot floor's promise-withdrawal exists precisely to un-promise the
 /// resume.
+///
+/// The verdicts are bare literals, and the assertion at the end is what keeps
+/// them that way. A `coding_agent_proposed` branch here would produce a status
+/// nothing preserves, so the dying turn's trailing drain overwrites it. See
+/// `docs/plans/2026-08-22-a-restart-verdict-survives-a-pending-change.md`.
 #[test]
 fn abort_status_verdict_keys_on_cause_and_actor() {
-    const PAUSED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END";
-    const FAILED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END";
+    const PAUSED: &str = "'paused'";
+    const FAILED: &str = "'failed'";
     const SETTLED: &str = crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE;
 
     let device = MessageOrigin::Device {
@@ -199,6 +204,14 @@ fn abort_status_verdict_keys_on_cause_and_actor() {
             cause.status_sql(actor),
             expected,
             "{:?} with actor {:?} maps to the wrong thread_summaries.status fragment",
+            cause,
+            actor
+        );
+        assert!(
+            !cause.status_sql(actor).contains("waiting"),
+            "{:?} with actor {:?}: an abort must not write 'waiting'. Nothing \
+             preserves it, so the dying turn's drain overwrites it with \
+             'running'. A pending change is the reader's business.",
             cause,
             actor
         );

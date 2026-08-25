@@ -25,7 +25,7 @@
 //! and it would be invisible: the user would see an idle thread that happens to
 //! come back to life later. An *event wait* is already the engine's answer to "re-open
 //! this thread when X happens". Arming one reuses its one-shot gate, its
-//! explicit deadline, its caps, the subscription indicator the user can see,
+//! explicit deadline, its caps, the waiting indicator the user can see,
 //! and the boot rebuild that survives a restart. Nothing here is new machinery;
 //! it is the existing machinery, armed by the engine instead of by the model.
 //!
@@ -77,7 +77,7 @@ const DEADLINE_MARGIN: Duration = Duration::minutes(5);
 /// namespace of ours).
 const ENGINE_TOOL_USE_PREFIX: &str = "engine:bg-task-wait";
 
-/// What the user reads in the subscription indicator. Engine-authored, so it
+/// What the user reads in the waiting indicator. Engine-authored, so it
 /// says who armed it: a subscription the user did not see the agent ask for is
 /// otherwise indistinguishable from one it did.
 const ARMED_REASON: &str = "Watching background work started in this thread, so the thread \
@@ -291,6 +291,7 @@ pub(super) fn plan_wait<'a>(
 /// of them.
 fn wait_covers_task(on: &[EventSubscription], task_id: &str, thread_id: Uuid) -> bool {
     let payload = crate::core::event_subscription::matchable_payload(
+        BACKGROUND_BASH_COMPLETED,
         serde_json::json!({ "task_id": task_id }),
         Some(thread_id),
     );

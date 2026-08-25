@@ -73,12 +73,15 @@ describe('threadInfoRows', () => {
     expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });
 
-  it('lets a proposed change win over a live event wait', () => {
+  // The wait wins. A parked thread wakes and may commit again, so its change is
+  // not ready in the sense the old label promised, and Apply is withheld.
+  it('lets a live event wait win over a proposed change', () => {
     const rows = threadInfoRows(
       { ...base, liveEventWaitCount: 1, codingAgentProposed: true } as ThreadMeta,
       'idle',
     );
-    expect(byLabel(rows, 'Status')?.value).toBe('Changes ready');
+    expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
+    expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });
 
   it('lets the thread\'s own running state win over active children', () => {

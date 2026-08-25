@@ -1,13 +1,13 @@
 import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth } from '../store';
 import type { CodingAgent } from '../../api/types';
 import { toFailed } from '../types';
-import { getPreferences, setPreference, isTransientFetchError } from '../../api/client';
+import { getPreferences, setPreference, isTransientFetchError, retryTransientRead } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { REASONING_LEVELS, DEFAULT_CHAT_MODEL } from '../models';
 import { clampEffortFor } from './models';
-import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
+import { isIOSPwa, isTauri } from '../../utils/platform';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor, windowReadyToShow } from '../../utils/tauri';
 import { pushTrafficLightOffset } from './trafficLights';
@@ -18,7 +18,8 @@ import {
 } from '../../utils/styleOverrides';
 
 import {
-  DEFAULT_FONT_FAMILY, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS, THEMES, THEME_BG,
+  DEFAULT_FONT_FAMILY, DEFAULT_THEME, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
+  SYSTEM_THEME_SETTLE_MS, THEMES, THEME_BG,
   UI_SCALE_DEFAULT, clampUiScale, fontFeaturesFor, parseUiScale, resolveTheme,
   type FontFamily, type ThemePref,
 } from '@lucidos/appearance';
@@ -48,12 +49,11 @@ export type ImageModel = 'auto' | 'imagen-4' | 'gpt-image-1' | 'gpt-image-1.5' |
 const loadedFonts = new Set<string>();
 
 let systemThemeQuery: MediaQueryList | null = null;
-// Seeded so loadPreferences can skip a no-op applyTheme when unchanged.
+let systemThemeSettleTimer: number | null = null;
+// Seeded so loadPreferences can skip a no-op applyTheme when unchanged. The
+// matching module-init install of the OS listener sits beside
+// `syncSystemThemeListener`, which cannot run before its own constants exist.
 let lastAppliedTheme: Theme = currentTheme();
-// Module-init install: loadPreferences skips applyTheme when the stored
-// theme already matches lastAppliedTheme, so without this call a user with
-// `system` set would never get the OS-change listener attached.
-syncSystemThemeListener(lastAppliedTheme);
 
 // --- Generic helpers ---
 
@@ -301,11 +301,15 @@ export function setUiScale(scale: number): Promise<void> {
 
 // --- Theme ---
 
+/** Whether the OS is asking for light right now. The one read point, so a
+ *  breadcrumb can never record a different sample than the one that painted. */
+function osPrefersLight(): boolean {
+  return window.matchMedia('(prefers-color-scheme: light)').matches;
+}
+
 export function applyTheme(theme: Theme): void {
-  const resolved = resolveTheme(
-    theme,
-    window.matchMedia('(prefers-color-scheme: light)').matches,
-  );
+  const prefersLight = osPrefersLight();
+  const resolved = resolveTheme(theme, prefersLight);
   const bg = THEME_BG[resolved];
   // Theme-flash telemetry — index.html installs __themeLogEvt as a fetch shim
   // that POSTs to /api/v1/internal/client-log (engine.log breadcrumbs).
@@ -316,7 +320,7 @@ export function applyTheme(theme: Theme): void {
       input: theme,
       resolved,
       priorDataTheme: document.documentElement.getAttribute('data-theme'),
-      mqLight: window.matchMedia('(prefers-color-scheme: light)').matches,
+      mqLight: prefersLight,
     });
   }
   localStorage.setItem('lucidos-theme', theme);
@@ -359,23 +363,91 @@ export function applyTheme(theme: Theme): void {
   reapplyStyleOverrides();
 }
 
-// iOS WKWebView fires prefers-color-scheme change events with wrong values
-// at random moments (telemetry-confirmed: 24+ flashes in one session), so the
-// listener is skipped there and `system` mode resolves once per page load.
+// --- Following the OS under a `system` preference ---
+//
+// Two things go wrong if `system` is resolved only from the media query's
+// `change` event, and the guards below answer one each.
+//
+// Backgrounding an iOS app makes UIKit flip its trait collection to the
+// opposite appearance and straight back, to render both app-switcher snapshots
+// (rdar://7213631). WKWebView passes each flip into the page as a real media
+// query change. Acting on one paints an appearance that existed for the
+// snapshot alone. That is the light flash telemetry caught 24+ times in one
+// session, and it is why this listener was once skipped on iOS entirely.
+//
+// The event can also simply never arrive. An installed iOS PWA is resumed
+// rather than reloaded. A frozen desktop tab runs no JavaScript, and a sleeping
+// machine wakes into an appearance nobody announced.
+
+/** The three events one iOS wake delivers together, per
+ *  `docs/plans/2026-08-03-ios-pwa-resume-storm-and-durable-compose-drafts.md`.
+ *  Each schedules the same settle timer, so a wake costs one read.
+ *
+ *  Deliberately NOT `onPageWake` (`utils/pageVisit.ts`), which fires only when
+ *  a hide preceded. A window that merely lost focus never went hidden, so a Mac
+ *  that slept through the flip would get nothing back. That is one of the two
+ *  cases this exists for. */
+const SYSTEM_THEME_RESUME_EVENTS: ReadonlyArray<readonly [EventTarget, string]> = [
+  [document, 'visibilitychange'],
+  [window, 'focus'],
+  [window, 'pageshow'],
+];
+
+/** Re-resolve `system` and apply it, if all three guards pass: the preference
+ *  still follows the OS, the user is actually looking at the page, and the
+ *  resolved value is not the one already painted.
+ *
+ *  The visibility guard is what makes the media-query listener safe on iOS: a
+ *  snapshot-pass flip arrives while the app is backgrounded, so it is dropped
+ *  rather than painted. */
+function refreshSystemTheme(): void {
+  if (currentTheme() !== 'system') return;
+  if (document.visibilityState !== 'visible') return;
+  const resolved = resolveTheme('system', osPrefersLight());
+  if (document.documentElement.getAttribute('data-theme') === resolved) return;
+  applyTheme('system');
+}
+
+/** Arm one shared settle timer, which re-READS the OS when it fires. Nothing
+ *  ever applies the value an event carried: a flip that raced the visibility
+ *  guard has been corrected by the time this samples.
+ *
+ *  An already-armed timer is left alone rather than pushed back. A burst then
+ *  resolves one settle delay after its first event, not after its last. */
+function scheduleSystemThemeRefresh(): void {
+  if (systemThemeSettleTimer !== null) return;
+  systemThemeSettleTimer = window.setTimeout(() => {
+    systemThemeSettleTimer = null;
+    refreshSystemTheme();
+  }, SYSTEM_THEME_SETTLE_MS);
+}
+
+/** Subscribe to the OS appearance while the preference is `system`, and to
+ *  nothing at all otherwise. Called from every `applyTheme`, so it tears the
+ *  previous registration down first and is safe to run repeatedly. */
 function syncSystemThemeListener(theme: Theme): void {
-  if (systemThemeQuery) {
-    systemThemeQuery.removeEventListener('change', onSystemThemeChange);
-    systemThemeQuery = null;
+  systemThemeQuery?.removeEventListener('change', scheduleSystemThemeRefresh);
+  systemThemeQuery = null;
+  for (const [target, type] of SYSTEM_THEME_RESUME_EVENTS) {
+    target.removeEventListener(type, scheduleSystemThemeRefresh);
   }
-  if (theme === 'system' && !isIOS()) {
-    systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
-    systemThemeQuery.addEventListener('change', onSystemThemeChange);
+  if (systemThemeSettleTimer !== null) {
+    clearTimeout(systemThemeSettleTimer);
+    systemThemeSettleTimer = null;
+  }
+  if (theme !== 'system') return;
+
+  systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
+  systemThemeQuery.addEventListener('change', scheduleSystemThemeRefresh);
+  for (const [target, type] of SYSTEM_THEME_RESUME_EVENTS) {
+    target.addEventListener(type, scheduleSystemThemeRefresh);
   }
 }
 
-function onSystemThemeChange(): void {
-  applyTheme('system');
-}
+// Module-init install. loadPreferences skips applyTheme when the stored theme
+// already matches lastAppliedTheme. Without this call a user on `system` would
+// never get the OS listener attached.
+syncSystemThemeListener(lastAppliedTheme);
 
 /** The device's theme, defaulting to `system` (follow the OS light/dark
  *  setting). A device that has explicitly picked light or dark keeps its pick:
@@ -604,13 +676,17 @@ export function currentChatReasoningEffort(): string {
   return currentPreference('chat_reasoning_effort', REASONING_VALUES, 'high');
 }
 
-export async function setCurrentModel(model: string): Promise<void> {
-  const oldEffort = reasoningEffort.value;
-  const clamped = clampEffortFor(oldEffort, model);
-  await savePreference('chat_model', model, () => { currentModel.value = model; });
-  if (clamped !== oldEffort) {
-    await setReasoningEffort(clamped);
-  }
+/** Persist the chat *model selection*, both halves.
+ *
+ *  One pick sets the pair, so the effort is the user's own choice rather than a
+ *  clamp of the previous one. A model with no tiers reports `null` and leaves
+ *  the stored effort alone, which nothing acts on: the picker clamps for
+ *  display and `RoutingProvider::effort_for_model` clamps the request. */
+export async function setChatModelSelection(
+  patch: { model: string; reasoningEffort: string | null },
+): Promise<void> {
+  await savePreference('chat_model', patch.model, () => { currentModel.value = patch.model; });
+  if (patch.reasoningEffort !== null) await setReasoningEffort(patch.reasoningEffort);
 }
 
 export function setReasoningEffort(effort: string): Promise<void> {
@@ -711,7 +787,20 @@ export function setTimezone(timezone: string): Promise<void> {
 
 // --- Load all preferences ---
 
+// Monotonic token per call, same idea as `fetchAttemptSeq` in
+// thread-loading.ts. A resume can now call this while an SSE-triggered
+// refetch is still pending, so two independent GETs can be in flight.
+//
+// Sharing one in-flight PROMISE would be the wrong fix here. WebKit can
+// leave a fetch hanging across an iOS suspension, with nothing to await
+// ever settling. The resume that exists to recover from exactly that
+// would then be stuck behind it forever. So every call issues its own
+// fetch. Only the newest ISSUED call's outcome is applied. An older one
+// landing after a newer one was issued is silently discarded.
+let preferencesLoadSeq = 0;
+
 export async function loadPreferences(): Promise<void> {
+  const mySeq = ++preferencesLoadSeq;
   // Only flip to 'loading' on the first fetch — refetches (e.g. after an SSE
   // PreferencesChanged) keep showing existing data through the network round
   // trip and swap atomically when the response lands. Without this guard,
@@ -721,7 +810,15 @@ export async function loadPreferences(): Promise<void> {
     preferences.value = { status: 'loading' };
   }
   try {
-    const res = await getPreferences(getDeviceId());
+    // Retry a transient rejection before flipping to `failed`, same as
+    // `loadRepositories` (repositoriesLoader.ts). Nothing re-triggers this
+    // load once it fails (SSE only re-fires an already-`loaded` value): a
+    // single cancelled startup fetch would otherwise paint every setting at
+    // its default for the rest of the page load.
+    const res = await retryTransientRead(() => getPreferences(getDeviceId()));
+    // A newer call was issued while this one was in flight: its outcome
+    // wins, so applying this stale one would overwrite fresher data.
+    if (mySeq !== preferencesLoadSeq) return;
     preferences.value = { status: 'loaded', data: res.preferences };
     applyUiScale(currentUiScale());
     const t = currentTheme();
@@ -735,6 +832,7 @@ export async function loadPreferences(): Promise<void> {
     // is allowed to override, so the overrides go on top of them.
     applyStyleOverridesFromPreferences();
   } catch (e) {
+    if (mySeq !== preferencesLoadSeq) return;
     preferences.value = toFailed(e);
   }
 }
@@ -765,6 +863,20 @@ export function currentLocalBaseUrl(): string {
 
 export function setLocalBaseUrl(url: string): Promise<void> {
   return savePreference('local_base_url', url.trim());
+}
+
+// --- OpenCode Free (keyless) ---
+
+/** Whether the keyless OpenCode Free tier is on. Off by default: only an
+ *  explicit `'true'` opts in, because turning it on sends prompts anonymously
+ *  to a third-party relay. */
+export function currentOpenCodeFreeEnabled(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['opencode_free_enabled'] === 'true';
+}
+
+export function setOpenCodeFreeEnabled(enabled: boolean): Promise<void> {
+  return savePreference('opencode_free_enabled', enabled ? 'true' : 'false');
 }
 
 // --- Capture context ---
@@ -868,34 +980,83 @@ export function setMobileHeaderSticky(enabled: boolean): Promise<void> {
 
 // --- Background model ---
 
-/** Background model preference keys — stored in the DB, read by the engine. */
+/** Background model preference keys, stored in the DB and read by the engine.
+ *  Each is half of a *model selection*; the paired `reasoning_*` key below
+ *  carries the effort. The engine resolves the pair per `ContextPurpose` in
+ *  `engine::aux_purpose`. */
 export type BackgroundModelKey =
   | 'model_title'
   | 'model_image_description'
   | 'model_memory'
+  | 'model_conversation_summary'
   | 'model_command_judge';
+
+/** The reasoning half of each background *model selection*. */
+export type BackgroundReasoningKey =
+  | 'reasoning_title'
+  | 'reasoning_image_description'
+  | 'reasoning_memory'
+  | 'reasoning_conversation_summary'
+  | 'reasoning_command_judge';
 
 /** Default model for the command-guard judge (Haiku, per ADR 0002). Mirrors the
  *  backend `DEFAULT_COMMAND_JUDGE_MODEL` in `core/preferences.rs`. */
 export const DEFAULT_COMMAND_JUDGE_MODEL = 'claude-haiku-4-5';
 
-/** Per-key default shown when the preference is unset — most background tasks
- *  default to Gemini Flash; the command-guard judge defaults to Haiku. */
+/** Per-key default shown when the preference is unset. Most background tasks
+ *  default to Gemini Flash; the command-guard judge defaults to Haiku. The
+ *  conversation summary inherits the memory model until it is set, matching
+ *  `aux_purpose`'s `model_fallback_key`. */
 const BACKGROUND_MODEL_DEFAULTS: Record<BackgroundModelKey, string> = {
   model_title: 'gemini-3-flash-preview',
   model_image_description: 'gemini-3-flash-preview',
   model_memory: 'gemini-3-flash-preview',
+  model_conversation_summary: 'gemini-3-flash-preview',
   model_command_judge: DEFAULT_COMMAND_JUDGE_MODEL,
 };
 
+/** Per-key effort default. Each mirrors the one `engine::aux_purpose` applies,
+ *  and each is the literal its call site hardcoded before the preference
+ *  existed. The summary keeps `low` (ADR 0102's measurements say output length
+ *  does not track it), and the rest spend nothing on deliberation. */
+const BACKGROUND_REASONING_DEFAULTS: Record<BackgroundReasoningKey, string> = {
+  reasoning_title: 'none',
+  reasoning_image_description: 'none',
+  reasoning_memory: 'none',
+  reasoning_conversation_summary: 'low',
+  reasoning_command_judge: 'none',
+};
+
 export function currentBackgroundModel(key: BackgroundModelKey): string {
-  const fallback = BACKGROUND_MODEL_DEFAULTS[key];
+  const fallback = key === 'model_conversation_summary'
+    // Split out of `model_memory`, so an unset value follows whatever the user
+    // pinned there. The engine resolves the same fallback.
+    ? currentBackgroundModel('model_memory')
+    : BACKGROUND_MODEL_DEFAULTS[key];
   if (preferences.value.status !== 'loaded') return fallback;
   return preferences.value.data[key] || fallback;
 }
 
-export function setBackgroundModel(key: BackgroundModelKey, model: string): Promise<void> {
-  return savePreference(key, model);
+export function currentBackgroundReasoning(key: BackgroundReasoningKey): string {
+  const fallback = BACKGROUND_REASONING_DEFAULTS[key];
+  if (preferences.value.status !== 'loaded') return fallback;
+  return preferences.value.data[key] || fallback;
+}
+
+/** Persist one background *model selection*, both halves.
+ *
+ *  Two writes, not one: `PUT /api/v1/preferences` takes a single key, and the
+ *  pair is deliberately two keys (ADR 0107). A failure between them leaves a
+ *  stale effort beside the new model, which nothing acts on: the picker clamps
+ *  for display and `RoutingProvider::effort_for_model` clamps the request. The
+ *  failed write toasts, so the user is not left guessing. */
+export async function saveModelSelection(
+  modelKey: BackgroundModelKey,
+  reasoningKey: BackgroundReasoningKey,
+  patch: { model: string; reasoningEffort: string | null },
+): Promise<void> {
+  await savePreference(modelKey, patch.model);
+  if (patch.reasoningEffort !== null) await savePreference(reasoningKey, patch.reasoningEffort);
 }
 
 // --- Compose destination (coding-agent chip + hand-off hint) ---

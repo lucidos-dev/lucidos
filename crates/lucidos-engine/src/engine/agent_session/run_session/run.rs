@@ -618,7 +618,7 @@ impl LucidosEngine {
             log!("[AgentSession] Resuming session for thread {}", thread_id);
         }
         let agent_cancel = tokio_util::sync::CancellationToken::new();
-        let allowed_tools = crate::engine::claude_code::cc_allowed_tools(self.user_dir());
+        let allowed_tools = crate::engine::claude_code::cc_allowed_tools(&self.grants_dir());
         // User-managed env vars injected into the coding-agent subprocess
         // alongside the CRED_*/OAUTH_* the script path already gets. Applied
         // first in `apply_lucidos_env`, so engine-owned vars still win.
@@ -1570,7 +1570,17 @@ impl LucidosEngine {
                                 ))
                                 .or_else(|| normalized_model.clone())
                                 .unwrap_or_default();
-                            let context_window = self.context_window_for(&snapshot_model);
+                            // The backend's own window wins, because this
+                            // capture REPORTS a call the engine did not make.
+                            // `context_window_for` answers for a Lucidos
+                            // request, where 1M mode is gated on our `[1m]`
+                            // suffix. A coding agent picks its own mode, so a
+                            // bare Sonnet 5 id really does run 1M there.
+                            let context_window = crate::runtime::coding_agent_context_window(
+                                coding_agent,
+                                &snapshot_model,
+                            )
+                            .unwrap_or_else(|| self.context_window_for(&snapshot_model));
                             // Anthropic reports `input_tokens` as the
                             // uncached portion only. `ApiUsage.input_tokens`
                             // stores the TOTAL prompt size, the same
@@ -1603,6 +1613,10 @@ impl LucidosEngine {
                                             estimated_total_tokens,
                                             usage: Some(usage),
                                             trimmed: false,
+                                            // This path never runs the trimmer, so no pass can have fired.
+                                            trim_passes: Vec::new(),
+                                            purpose: crate::engine::ContextPurpose::Turn,
+                                            reconstructed: false,
                                         },
                                         meta: meta.clone(),
                                     },

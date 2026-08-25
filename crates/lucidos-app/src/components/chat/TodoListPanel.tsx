@@ -9,14 +9,38 @@ import { Overlay } from '../shared/Overlay';
 
 export function todoListIndicatorBody({
   items,
+  notes,
   onClick,
   buttonRef,
 }: {
   items: TodoItem[] | null;
+  notes?: string | null;
   onClick: () => void;
   buttonRef?: Ref<HTMLButtonElement>;
 }) {
-  if (items === null || items.length === 0) return null;
+  // *Todo notes* can outlive the items: under ADR 0085's context mode an agent
+  // that finished its plan still writes `todos: []` with a pointer worth
+  // keeping. Hiding the indicator there would make the block the whole mode
+  // rests on the one thing the user cannot see.
+  if (items === null) return null;
+  if (items.length === 0) {
+    if (!notes) return null;
+    return (
+      <button
+        type="button"
+        class="icon-btn header-icon"
+        data-role="todo-indicator"
+        data-state="idle"
+        data-tooltip="Notes kept"
+        aria-label="Todo list: no items, notes kept. Click to expand."
+        onClick={onClick}
+        data-row-item
+        ref={buttonRef}
+      >
+        <TodoListIcon />
+      </button>
+    );
+  }
   const total = items.length;
   const completed = items.filter((i) => i.status === 'completed').length;
   const waiting = items.filter((i) => i.status === 'waiting').length;
@@ -81,7 +105,7 @@ export function todoListIndicatorBody({
 
 /** One marker glyph per status, all from the same geometric-circle family so
  *  the 1rem marker column reads as one column. `waiting`'s clock face echoes
- *  the *subscription indicator*'s own clock icon beside it in the prompt bar:
+ *  the *waiting indicator*'s own clock icon beside it in the prompt bar:
  *  both say the same thing, that something else will wake this. */
 const TODO_MARKER: Record<TodoStatus, string> = {
   pending: '○',
@@ -105,9 +129,11 @@ const TODO_STATUS_TAG: Partial<Record<TodoStatus, string>> = {
  *  itself, which is what `useAnchoredPosition` measures and positions. */
 export function todoListPanelBody({
   items,
+  notes,
   onClose,
 }: {
   items: TodoItem[];
+  notes?: string | null;
   onClose: () => void;
 }) {
   return (
@@ -124,6 +150,16 @@ export function todoListPanelBody({
         </button>
       </div>
       <div class="prompt-bar-popover-body">
+        {/* The agent's own *todo notes*, above the list because they are what
+            it kept rather than what it planned. Rendered only when there are
+            any, which under ADR 0085's context mode is most lists and
+            otherwise none: the panel is unchanged for a list without them. */}
+        {notes ? (
+          <div class="todo-panel-notes" data-role="todo-notes">
+            <span class="todo-panel-notes-label">Notes</span>
+            <p class="todo-panel-notes-body">{notes}</p>
+          </div>
+        ) : null}
         <ul class="todo-panel-list">
           {items.map((item, idx) => {
             const tag = TODO_STATUS_TAG[item.status];
@@ -175,14 +211,17 @@ export function TodoListIndicator() {
   const panelRef = useRef<HTMLDivElement>(null);
 
   const id = focusedThreadId.value;
-  const items = id ? threadMap.value.get(id)?.meta.latestTodoList ?? null : null;
-  const isOpen = open.value && !!items && items.length > 0;
+  const meta = id ? threadMap.value.get(id)?.meta : undefined;
+  const items = meta?.latestTodoList ?? null;
+  const notes = meta?.latestTodoNotes ?? null;
+  const isOpen = open.value && !!items && (items.length > 0 || !!notes);
   const pos = useAnchoredPosition(isOpen ? anchorEl : null, panelRef, '.thread-pane');
 
   return (
     <>
       {todoListIndicatorBody({
         items,
+        notes,
         onClick: () => (open.value = !open.value),
         buttonRef: setAnchorEl,
       })}
@@ -199,7 +238,7 @@ export function TodoListIndicator() {
         portal
         panelClass="prompt-bar-popover todo-panel"
         // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
-        // the hook clamped this panel's position into (see EventWaitPanel).
+        // the hook clamped this panel's position into (see WaitingPanel).
         panelStyle={pos
           ? {
               top: `${pos.top}px`,
@@ -212,7 +251,9 @@ export function TodoListIndicator() {
         dataRole="todo-panel"
         panelRef={panelRef}
       >
-        {items && items.length > 0 && todoListPanelBody({ items, onClose: () => (open.value = false) })}
+        {items &&
+          (items.length > 0 || notes) &&
+          todoListPanelBody({ items, notes, onClose: () => (open.value = false) })}
       </Overlay>
     </>
   );

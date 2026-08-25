@@ -5,9 +5,8 @@ import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
 
-const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false, isIOSPwa: false }));
+const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false }));
 vi.mock('../../utils/platform', () => ({
-  isIOS: () => platformMocks.isIOS,
   isTauri: () => platformMocks.isTauri,
   isIOSPwa: () => platformMocks.isIOSPwa,
 }));
@@ -291,6 +290,141 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
   });
 });
 
+/**
+ * `loadPreferences` used to have neither a transient retry nor a re-trigger.
+ * A single cancelled startup fetch (an iOS PWA suspend, or the gateway
+ * lazy-starting the engine) left it on `failed` for the whole page load.
+ * Settings then showed every stored value as its default. Same fix as
+ * `loadRepositories` (repositoriesLoader.test.ts): one retry on a transient
+ * rejection, a real verdict still surfaces immediately.
+ */
+describe('loadPreferences: transient failures retry, real ones surface', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('retries once when the browser cancels the fetch mid-flight', async () => {
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockRejectedValueOnce(new DOMException('Fetch is aborted', 'AbortError'))
+      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+
+    await loadPreferences();
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
+    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+  });
+
+  it('retries once when our own deadline fires (engine still booting)', async () => {
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockRejectedValueOnce(new DOMException('Request timed out', 'TimeoutError'))
+      .mockResolvedValueOnce({ preferences: {} });
+
+    await loadPreferences();
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
+    expect(preferences.value.status).toBe('loaded');
+  });
+
+  it('does NOT retry a real backend failure, and keeps the engine reason', async () => {
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockRejectedValue(new ApiError(500, 'Failed to load preferences: DB error'));
+
+    await loadPreferences();
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(1);
+    expect(preferences.value).toMatchObject({
+      status: 'failed',
+      error: 'Failed to load preferences: DB error',
+    });
+  });
+
+  it('parks on failed when both attempts are cancelled', async () => {
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockRejectedValue(new DOMException('Fetch is aborted', 'AbortError'));
+
+    await loadPreferences();
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
+    expect(preferences.value.status).toBe('failed');
+  });
+});
+
+/**
+ * A resume can call `loadPreferences` while an SSE-triggered refetch is
+ * still in flight, so two independent GETs can be outstanding at once.
+ * Sharing one in-flight promise would be the wrong fix (see the
+ * `preferencesLoadSeq` comment in preferences.ts): WebKit can leave a
+ * fetch hanging forever across an iOS suspend, and a caller sharing that
+ * promise would then be stuck behind it. Each call issues its own fetch
+ * instead, and only the newest ISSUED call's outcome is ever applied.
+ */
+describe('loadPreferences: a stale response cannot overwrite a fresher one', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('both calls issue their own fetch rather than sharing one', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+
+    await Promise.all([loadPreferences(), loadPreferences()]);
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
+  });
+
+  it('an older response landing after a newer one is discarded', async () => {
+    let resolveOlder!: (v: { preferences: Record<string, string> }) => void;
+    const older = new Promise<{ preferences: Record<string, string> }>(r => { resolveOlder = r; });
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockReturnValueOnce(older)
+      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+
+    const first = loadPreferences();
+    const second = loadPreferences();
+    // The newer call settles FIRST; the older one resolves after it, which
+    // is the exact reordering that would overwrite fresh data unguarded.
+    await second;
+    resolveOlder({ preferences: { theme: 'light' } });
+    await first;
+
+    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+  });
+
+  it('a stale failure does not regress an already-loaded newer result', async () => {
+    let rejectOlder!: (e: unknown) => void;
+    const older = new Promise<{ preferences: Record<string, string> }>((_r, rej) => { rejectOlder = rej; });
+    vi.spyOn(apiClient, 'getPreferences')
+      .mockReturnValueOnce(older)
+      .mockResolvedValueOnce({ preferences: { theme: 'dark' } });
+
+    const first = loadPreferences();
+    const second = loadPreferences();
+    await second;
+    rejectOlder(new ApiError(500, 'stale failure'));
+    await first;
+
+    expect(preferences.value).toEqual({ status: 'loaded', data: { theme: 'dark' } });
+  });
+
+  it('a later call still starts a fresh fetch once the first has settled', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+
+    await loadPreferences();
+    await loadPreferences();
+
+    expect(apiClient.getPreferences).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia flash)', () => {
   // Background: iOS WKWebView's matchMedia for prefers-color-scheme returns
   // wrong synchronous values at random points post-FOUC. Re-applying 'system'
@@ -336,49 +470,177 @@ describe('loadPreferences — skip re-apply when theme unchanged (iOS matchMedia
   });
 });
 
-describe("applyTheme('system') — matchMedia change listener gating", () => {
+describe("applyTheme('system'): following the OS", () => {
+  // Three guards decide whether a re-resolve paints: the preference still
+  // follows the OS, the document is visible, and the value actually changed.
+  // The visibility guard is what makes the media-query listener safe on iOS.
+  // Backgrounding there flips the trait collection twice for the app-switcher
+  // snapshots (rdar://7213631), and each flip reaches the page as a real event.
   let originalMatchMedia: typeof window.matchMedia;
-  let listeners: Array<(e: { matches: boolean }) => void>;
+  let originalSetAttribute: unknown;
+  let originalGetAttribute: unknown;
+  let mqListeners: Array<() => void>;
   let mqLight: boolean;
+  /** Every `data-theme` value written since this case started. The guard being
+   *  tested reads the attribute back, so the stub has to round-trip it. */
+  let painted: string[];
+  let attrs: Record<string, string>;
+
+  function setVisibility(state: 'visible' | 'hidden'): void {
+    (document as { visibilityState: string }).visibilityState = state;
+  }
+
+  /** Fire the media query's `change`, as WKWebView does per trait flip. */
+  function fireMediaQueryChange(): void {
+    for (const fn of [...mqListeners]) fn();
+  }
 
   beforeEach(() => {
-    platformMocks.isIOS = false;
-    listeners = [];
+    vi.useFakeTimers();
+    localStorage.clear();
+    preferences.value = { status: 'loaded', data: { theme: 'system' } };
+    setVisibility('visible');
+    mqListeners = [];
     mqLight = false;
+    painted = [];
+    attrs = {};
+    const el = document.documentElement as unknown as Record<string, unknown>;
+    originalSetAttribute = el.setAttribute;
+    originalGetAttribute = el.getAttribute;
+    el.setAttribute = (k: string, v: string) => {
+      attrs[k] = v;
+      if (k === 'data-theme') painted.push(v);
+    };
+    el.getAttribute = (k: string) => attrs[k] ?? null;
     originalMatchMedia = window.matchMedia;
     (window as any).matchMedia = () => ({
       get matches() { return mqLight; },
-      addEventListener: (_t: string, fn: (e: { matches: boolean }) => void) => {
-        listeners.push(fn);
-      },
-      removeEventListener: (_t: string, fn: (e: { matches: boolean }) => void) => {
-        const i = listeners.indexOf(fn);
-        if (i >= 0) listeners.splice(i, 1);
+      addEventListener: (_t: string, fn: () => void) => { mqListeners.push(fn); },
+      removeEventListener: (_t: string, fn: () => void) => {
+        const i = mqListeners.indexOf(fn);
+        if (i >= 0) mqListeners.splice(i, 1);
       },
     });
   });
 
   afterEach(() => {
+    setVisibility('visible');
+    // Leave no listener behind pointing at this block's mocked media query.
+    applyTheme('dark');
     (window as any).matchMedia = originalMatchMedia;
-    platformMocks.isIOS = false;
+    const el = document.documentElement as unknown as Record<string, unknown>;
+    el.setAttribute = originalSetAttribute;
+    el.getAttribute = originalGetAttribute;
+    vi.useRealTimers();
   });
 
-  it('off iOS: subscribes to prefers-color-scheme change events and re-applies theme', () => {
+  it('subscribes on every platform, iOS included', () => {
     applyTheme('system');
-    expect(listeners).toHaveLength(1);
+    expect(mqListeners).toHaveLength(1);
+  });
 
-    const setAttrSpy = vi.spyOn(document.documentElement, 'setAttribute');
+  it('applies an OS flip announced while the page is visible', () => {
+    applyTheme('system');
+    painted = [];
+
     mqLight = true;
-    for (const fn of listeners) fn({ matches: true });
+    fireMediaQueryChange();
+    vi.advanceTimersByTime(500);
 
-    const themeWrites = setAttrSpy.mock.calls.filter((c) => c[0] === 'data-theme');
-    expect(themeWrites.length).toBeGreaterThan(0);
+    expect(painted).toEqual(['light']);
   });
 
-  it('on iOS: skips the listener entirely (WKWebView fires wrong values)', () => {
-    platformMocks.isIOS = true;
+  it('ignores a flip announced while the page is hidden', () => {
     applyTheme('system');
-    expect(listeners).toHaveLength(0);
+    painted = [];
+
+    setVisibility('hidden');
+    mqLight = true;
+    fireMediaQueryChange();
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual([]);
+  });
+
+  it('re-reads at settle time rather than trusting the event that woke it', () => {
+    // The snapshot pass flips the trait collection and flips it straight back.
+    // A flip that raced the visibility guard must not survive to paint.
+    applyTheme('system');
+    painted = [];
+
+    mqLight = true;
+    fireMediaQueryChange();
+    mqLight = false;
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual([]);
+  });
+
+  it('repairs on resume a flip that arrived while the page was hidden', () => {
+    applyTheme('system');
+    painted = [];
+
+    setVisibility('hidden');
+    mqLight = true;
+    fireMediaQueryChange();
+    vi.advanceTimersByTime(500);
+    expect(painted).toEqual([]);
+
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual(['light']);
+  });
+
+  it('costs one apply per wake, however many resume events it delivers', () => {
+    applyTheme('system');
+    painted = [];
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+    window.dispatchEvent(new Event('pageshow'));
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual(['light']);
+  });
+
+  it('writes nothing when the OS still says what is already painted', () => {
+    applyTheme('system');
+    painted = [];
+
+    document.dispatchEvent(new Event('visibilitychange'));
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual([]);
+  });
+
+  it('leaves an explicit light or dark preference alone', () => {
+    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
+    applyTheme('dark');
+    expect(mqListeners).toHaveLength(0);
+    painted = [];
+
+    mqLight = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('focus'));
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual([]);
+  });
+
+  it('drops a pending refresh when the user picks an explicit theme', () => {
+    applyTheme('system');
+    mqLight = true;
+    fireMediaQueryChange();
+
+    preferences.value = { status: 'loaded', data: { theme: 'dark' } };
+    applyTheme('dark');
+    painted = [];
+    vi.advanceTimersByTime(500);
+
+    expect(painted).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR, REAL_THREAD_NAV } from './helpers';
+import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, openThreadDrawer, waitForVisibleInput, ensureOnThreadPane, userMessageBody, USER_MSG_SELECTOR, focusedThreadId, clickThreadRow } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
 test.describe('Page reload preserves state', () => {
@@ -15,11 +15,11 @@ test.describe('Page reload preserves state', () => {
     await sendMessage(page, `Say exactly: "reload ${msg}"`);
     await waitForResponse(page);
 
-    // Open drawer and get the thread ID before reload
-    await openThreadDrawer(page);
-    const threadNav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
-    await expect(threadNav).toBeVisible({ timeout: 15_000 });
-    const threadId = await threadNav.getAttribute('data-thread-nav');
+    // The thread THIS test just sent into, by identity. Not the drawer's first
+    // row: `clearAllThreads` truncates only the projection, so an earlier
+    // spec's live coding-agent session re-inserts its row above ours. See
+    // `focusedThreadId`.
+    const threadId = await focusedThreadId(page);
 
     // Reload the page
     await page.reload();
@@ -28,9 +28,7 @@ test.describe('Page reload preserves state', () => {
 
     // Open drawer and click the thread to re-focus it
     await openThreadDrawer(page);
-    const reloadedThread = page.locator(`[data-thread-nav="${threadId}"]:visible`).first();
-    await expect(reloadedThread).toBeVisible({ timeout: 10_000 });
-    await reloadedThread.click();
+    await clickThreadRow(page, threadId);
     await ensureOnThreadPane(page);
     // Wait for the thread content to load after clicking
     await expect(userMessageBody(page)).toBeVisible({ timeout: 10_000 });
@@ -71,11 +69,8 @@ test.describe('Page reload preserves state', () => {
     await sendMessage(page, `Say exactly: "${msg}"`);
     await waitForResponse(page);
 
-    // Capture thread ID before reload
-    await openThreadDrawer(page);
-    const threadNav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
-    await expect(threadNav).toBeVisible({ timeout: 15_000 });
-    const threadId = await threadNav.getAttribute('data-thread-nav');
+    // Capture the thread id before reload, by identity. See `focusedThreadId`.
+    const threadId = await focusedThreadId(page);
 
     // Reload — focusedThreadId is restored from localStorage
     await page.reload();
@@ -92,9 +87,7 @@ test.describe('Page reload preserves state', () => {
     }, USER_MSG_SELECTOR);
     if (!hasMessages) {
       await openThreadDrawer(page);
-      const thread = page.locator(`[data-thread-nav="${threadId}"]:visible`).first();
-      await expect(thread).toBeVisible({ timeout: 10_000 });
-      await thread.click();
+      await clickThreadRow(page, threadId);
     }
 
     // Wait for a physically visible prompt input (dual-layout safe)

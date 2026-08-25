@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog } from '../store';
-import type { App } from '../types';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
+import type { App, PluginInstallRequest, PluginInstallReceipt } from '../types';
 
 // Mock loader functions to prevent API calls
 vi.mock('./apps', () => ({ loadApps: vi.fn() }));
-vi.mock('./triggers', () => ({ loadTriggers: vi.fn() }));
-vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn() }));
+vi.mock('./triggers', () => ({ loadTriggers: vi.fn(), loadHistoricalTriggers: vi.fn() }));
+vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn(), invalidateFilePreview: vi.fn() }));
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
@@ -37,8 +37,8 @@ vi.mock('./pinnedApps', async (importOriginal) => ({
 
 import { processSSEForReferences } from './entityReferences';
 import { loadApps } from './apps';
-import { loadTriggers } from './triggers';
-import { loadArtifacts } from './artifacts';
+import { loadTriggers, loadHistoricalTriggers } from './triggers';
+import { loadArtifacts, invalidateFilePreview } from './artifacts';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
@@ -257,6 +257,42 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
       expect(loadArtifacts).toHaveBeenCalledTimes(3);
     });
+
+    // `artifact_path` is relative to `artifacts/`; the preview addresses a file
+    // the data-relative way. Hand it the bare path and it matches nothing, so
+    // an agent overwriting the open file would never refresh it.
+    it('offers the preview the data-relative path, not the bare artifact path', () => {
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
+      expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/clips/demo.mp4');
+    });
+
+    // The list gate and the preview are independent. A preview can be open on
+    // a file this device never listed. A `not-loaded` cache must not swallow
+    // the one signal that file has to re-read.
+    it('still offers the preview its path when the artifacts cache is not-loaded', () => {
+      artifacts.value = { status: 'not-loaded' };
+      processSSEForReferences('ArtifactUpdated', { artifact_path: 'clips/demo.mp4', commit: 'c' });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+      expect(invalidateFilePreview).toHaveBeenCalledWith('artifacts/clips/demo.mp4');
+    });
+
+    // `loadArtifacts` writes `toFailed` on error, which discards the loaded
+    // list. Gating the retry on `loaded` therefore latched: one timed-out
+    // refresh and no later event could get the cache back, short of a reload.
+    it('retries after a failed load, so one bad fetch does not latch', () => {
+      artifacts.value = { status: 'failed', error: 'Request timed out after 10000ms' };
+      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c' });
+      expect(loadArtifacts).toHaveBeenCalledTimes(1);
+    });
+
+    // A burst of events must not stampede parallel fetches whose completion
+    // order decides which one wins.
+    it('does not pile on while a load is already in flight', () => {
+      artifacts.value = { status: 'loading' };
+      processSSEForReferences('ArtifactCreated', { artifact_path: 'a.md', commit: 'c' });
+      expect(loadArtifacts).not.toHaveBeenCalled();
+    });
   });
 
   // ── PluginMarketplace* (the live marketplace list) ───────────────────────
@@ -392,6 +428,134 @@ describe('processSSEForReferences', () => {
         event: { type: 'ThreadTitleGenerated' },
       });
       expect(getRecents()[0].title).toBe('Original');
+    });
+  });
+
+  // ── Surfaces that fetch their own data (ADR 0118) ────────────────────────
+
+  describe('version counters for the pages that fetch their own data', () => {
+    it('bumps mcpServersVersion for every McpServer frame', () => {
+      const before = mcpServersVersion.value;
+      for (const type of [
+        'McpServerRegistered',
+        'McpServerUpdated',
+        'McpServerRemoved',
+        'McpServerDisabledToolsChanged',
+      ]) {
+        processSSEForReferences(type, {});
+      }
+      expect(mcpServersVersion.value).toBe(before + 4);
+    });
+
+    it('bumps webhooksVersion for every Webhook frame', () => {
+      const before = webhooksVersion.value;
+      for (const type of ['WebhookCreated', 'WebhookUpdated', 'WebhookDeleted']) {
+        processSSEForReferences(type, {});
+      }
+      expect(webhooksVersion.value).toBe(before + 3);
+    });
+
+    it('bumps permissionGrantsVersion when a grant file changes', () => {
+      const before = permissionGrantsVersion.value;
+      processSSEForReferences('PermissionGrantsChanged', { grant_file: 'cc-allowed-tools' });
+      expect(permissionGrantsVersion.value).toBe(before + 1);
+    });
+
+    it('leaves the counters alone for an unrelated frame', () => {
+      const before = [mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value];
+      processSSEForReferences('AppCreated', { app_id: 'x' });
+      expect([mcpServersVersion.value, webhooksVersion.value, permissionGrantsVersion.value])
+        .toEqual(before);
+    });
+  });
+
+  describe('a plugin request panel a peer resolved', () => {
+    const request: PluginInstallRequest = {
+      install_id: 'staged-1',
+      plugin_id: 'habit-tracker',
+      plugin_version: '1.0.0',
+      plugin_name: 'Habit Tracker',
+      source: 'https://example.com/example-repo',
+      source_type: 'git',
+      manifest: {},
+      files: [],
+      overwrites: [],
+    };
+    const receipt: PluginInstallReceipt = {
+      at: '2026-01-01T00:00:00Z',
+      summary: 'installed',
+      installed_files: [],
+    };
+
+    function openInstallPanel(installed?: PluginInstallReceipt): void {
+      panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request, installed } };
+    }
+
+    it('closes when the peer confirmed, and the id is inside the manifest', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginInstalled', { manifest: { id: 'habit-tracker' } });
+      expect(panelOverlay.value).toBeNull();
+    });
+
+    it('closes when the peer cancelled', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginInstallCanceled', { id: 'habit-tracker' });
+      expect(panelOverlay.value).toBeNull();
+    });
+
+    it('leaves a panel for a different plugin alone', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginInstallCanceled', { id: 'demo-director' });
+      expect(panelOverlay.value).not.toBeNull();
+    });
+
+    it('leaves the panel alone when THIS device is the actor', () => {
+      // The engine emits before it answers the confirm POST, so this frame can
+      // arrive while the panel is still pending. Closing on it would beat
+      // `markPluginInstalled` to the overlay and lose the receipt.
+      openInstallPanel();
+      processSSEForReferences('PluginInstalled', {
+        manifest: { id: 'habit-tracker' },
+        actor: { kind: 'device', device_id: 'this-device' },
+      });
+      expect(panelOverlay.value).not.toBeNull();
+    });
+
+    it('closes when another device is the actor', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginInstalled', {
+        manifest: { id: 'habit-tracker' },
+        actor: { kind: 'device', device_id: 'some-other-device' },
+      });
+      expect(panelOverlay.value).toBeNull();
+    });
+
+    it('leaves a receipt standing, actor or not', () => {
+      openInstallPanel(receipt);
+      processSSEForReferences('PluginInstalled', { manifest: { id: 'habit-tracker' } });
+      // A receipt is a `plugin-install` form too, so the id still matches. It
+      // survives because the panel it would replace has already been resolved.
+      expect(panelOverlay.value).not.toBeNull();
+    });
+
+    it('does not mistake an uninstall frame for the install panel', () => {
+      openInstallPanel();
+      processSSEForReferences('PluginUninstalled', { id: 'habit-tracker' });
+      expect(panelOverlay.value).not.toBeNull();
+    });
+  });
+
+  describe('historical triggers', () => {
+    it('reloads the historical registry when a trigger is deleted', () => {
+      // A deleted trigger JOINS that registry, and it backs the thread
+      // filter's trigger options. Nothing else reloads it.
+      processSSEForReferences('TriggerDeleted', { trigger_id: 'gone' });
+      expect(loadHistoricalTriggers).toHaveBeenCalled();
+    });
+
+    it('leaves it alone for an update, which cannot change membership', () => {
+      processSSEForReferences('TriggerUpdated', { trigger_id: 'still-here' });
+      expect(loadHistoricalTriggers).not.toHaveBeenCalled();
     });
   });
 
@@ -595,11 +759,19 @@ describe('processSSEForReferences', () => {
       expect(loadArtifacts).toHaveBeenCalledTimes(3);
     });
 
-    it('ignores non-artifacts paths', () => {
+    it('leaves the artifacts LIST alone for a non-artifacts path', () => {
       artifacts.value = { status: 'loaded', data: [] };
       processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
       processSSEForReferences('DataFileEdited', { path: 'apps/foo/manifest.json', operations_count: 1 });
       expect(loadArtifacts).not.toHaveBeenCalled();
+    });
+
+    // The preview reaches wider than the list. A `config/` or `knowhow/` write
+    // changes no artifact list, and may still be the file on screen.
+    it('offers the preview every data path, artifacts or not', () => {
+      artifacts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('DataFileWritten', { path: 'config/apis.json' });
+      expect(invalidateFilePreview).toHaveBeenCalledWith('config/apis.json');
     });
 
     it('does not reload when artifacts cache is not-loaded', () => {
@@ -630,6 +802,7 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('DeviceRenamed', { device_id: 'd1', name: 'phone' });
       processSSEForReferences('DevicePushChanged', { device_id: 'd1', push_enabled: true });
       processSSEForReferences('DeviceDeleted', { device_id: 'd1' });
+      processSSEForReferences('DeviceHandedOver', { device_id: 'd2', old_device_id: 'd1' });
       expect(loadDevices).not.toHaveBeenCalled();
     });
 
@@ -639,7 +812,10 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('DeviceRenamed', { device_id: 'd1', name: 'phone' });
       processSSEForReferences('DevicePushChanged', { device_id: 'd1', push_enabled: true });
       processSSEForReferences('DeviceDeleted', { device_id: 'd1' });
-      expect(loadDevices).toHaveBeenCalledTimes(4);
+      // A hand-over renames the row every open page is keyed on, so it is the
+      // one Device event a stale list cannot survive.
+      processSSEForReferences('DeviceHandedOver', { device_id: 'd2', old_device_id: 'd1' });
+      expect(loadDevices).toHaveBeenCalledTimes(5);
     });
   });
 });

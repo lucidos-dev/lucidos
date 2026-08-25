@@ -37,6 +37,7 @@ fn notification_created_skips_none_fields_in_sse() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert!(
@@ -71,6 +72,7 @@ fn notification_created_carries_thread_id_in_sse() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(
@@ -435,6 +437,7 @@ fn transient_domain_event_sse_json_uses_inner_event_type() {
             actor: None,
         }),
         aggregate: None,
+        depth: 0,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -506,6 +509,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
                 meta: EventMeta::NONE,
             },
             aggregate: None,
+            depth: 0,
         });
     }
 

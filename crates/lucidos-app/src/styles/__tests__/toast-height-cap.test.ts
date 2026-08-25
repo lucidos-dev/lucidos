@@ -88,19 +88,22 @@ describe('a long toast body cannot swallow the viewport', () => {
   });
 
   it('scrolls the overflow inside the message, leaving [Open] and the X reachable', () => {
-    const message = block(componentsCss, '.toast-message {');
-    expect(decl(message, 'overflow-y')).toBe('auto');
-    // Without these the flex item takes its content height and overflows the
-    // capped body, so the cap would clip the message instead of scrolling it:
-    // `min-height: 0` lets the box shrink, `align-self: stretch` overrides
-    // .toast-body's `align-items: flex-start` so it takes the shrunk height.
-    expect(decl(message, 'min-height')).toBe('0');
-    expect(decl(message, 'align-self')).toBe('stretch');
-    // The body must be able to shrink below its content in .toast's column, or
-    // there is no capped height for the message to stretch into.
+    // Everything after line 1. This is the box the cap makes scroll.
+    const sections = block(componentsCss, '.toast-sections {');
+    expect(decl(sections, 'overflow-y')).toBe('auto');
+    // Without this the flex item takes its content height and overflows the
+    // capped column, so the cap would clip the sections instead of scrolling
+    // them: `min-height: 0` is what lets the box shrink to the room it has.
+    expect(decl(sections, 'min-height')).toBe('0');
+    // Line 1 scrolls too, for the message that is ALL line 1: a section-less
+    // body has nothing in the box above, so a long one would be clipped.
+    const heading = block(componentsCss, '.toast-heading {');
+    expect(decl(heading, 'overflow-y')).toBe('auto');
+    // The column must be able to shrink below its content inside .toast, or
+    // there is no capped height for either box to scroll in.
     expect(decl(block(componentsCss, '.toast-body {'), 'min-height')).toBe('0');
     // The actions row and the absolutely-positioned close X are siblings of the
-    // scrolling message, not inside it, so a clamped toast still offers its
+    // scrolling column, not inside it, so a clamped toast still offers its
     // action without the user scrolling to find it.
     const toast = block(componentsCss, '.toast {');
     expect(decl(toast, 'display')).toBe('flex');
@@ -108,7 +111,51 @@ describe('a long toast body cannot swallow the viewport', () => {
   });
 
   /**
-   * The scroll container may not be an ancestor of the mini-spinner.
+   * The scroll box starts BELOW the close X, so no scrollbar runs under it.
+   *
+   * A scrollbar is drawn at its own box's right edge. The close X owns the
+   * top-right corner, so a scroll box reaching up beside it would put the
+   * scrollbar under the glyph. The heading is what holds them apart: it is at
+   * least as tall as the button, and reserves as much on the right.
+   *
+   * One token carries all three, which is the assertion. A literal restated
+   * here would keep passing while the button grew out from under it.
+   */
+  it('floors the heading at the close button, and sizes the button from it', () => {
+    const heading = block(componentsCss, '.toast-heading {');
+    expect(decl(heading, 'min-height')).toBe('var(--toast-close-size)');
+    expect(decl(heading, 'margin-right')).toBe('var(--toast-close-size)');
+
+    const close = block(componentsCss, '.toast-close {');
+    expect(decl(close, 'width')).toBe('var(--toast-close-size)');
+    expect(decl(close, 'height')).toBe('var(--toast-close-size)');
+  });
+
+  /**
+   * The scroll box reserves nothing on its right, so its scrollbar lands in the
+   * card's right rail instead of inside the text column.
+   *
+   * That was the reported look. The scroll lived in a box the close X's gutter
+   * had already narrowed, so the bar sat mid-card with the X beyond it. Its
+   * `--bg-primary` track then read as a black slot cut through the message.
+   */
+  it('runs the scroll box to the toast content edge', () => {
+    for (const sheet of [componentsCss, mobileCss]) {
+      const offenders = rulesTargeting(sheet, 'toast-sections')
+        .filter((rule) =>
+          ['padding-right', 'margin-right', 'padding', 'margin', 'border-right', 'width']
+            .some((p) => rule.props.has(p)),
+        );
+
+      expect(
+        offenders.map((r) => `${r.atRules} ${r.selector} { ${r.body} }`),
+        'a right-hand reserve pulls the scrollbar back inside the text column',
+      ).toEqual([]);
+    }
+  });
+
+  /**
+   * No scroll container may be an ancestor of the mini-spinner.
    *
    * A scroll container clips its own painted overflow on both axes, and the
    * spinner rotates via `transform`, so at 45° it paints ~√2 outside its square
@@ -116,13 +163,19 @@ describe('a long toast body cannot swallow the viewport', () => {
    * patched with `.toast-body:has(.mini-spinner) { overflow: visible }`, written
    * when a spinning toast was always one line. It then switched the scroll off
    * for EVERY spinning toast, so the build toast's commit list was clipped at
-   * the cap with no way to reach the rest (reported 2026-08-11).
+   * the cap with no way to reach the rest.
    *
-   * Scanned rather than measured, for the same reason as the cap above: the
-   * failure is a property of the rule, and reproducing it needs a spinning
-   * toast whose body happens to be long.
+   * The icon is out of the flow now, which settles it structurally: it is a
+   * child of `.toast`, and `.toast` clips rather than scrolls. Both halves are
+   * asserted, since an icon put back in the flow would land in a scroll box.
    */
-  it('does not let a spinner switch the toast scroll off', () => {
+  it('keeps the spinner out of every scroll box', () => {
+    const icon = block(componentsCss, '.toast-icon {');
+    expect(decl(icon, 'position')).toBe('absolute');
+    // Over the gutter .toast-body pads out for it, so a clickable toast has no
+    // dead spot where the icon covers the message.
+    expect(decl(icon, 'pointer-events')).toBe('none');
+
     for (const sheet of [componentsCss, mobileCss]) {
       const offenders = [...rulesTargeting(sheet, 'toast-body'), ...rulesTargeting(sheet, 'toast')]
         .filter((rule) => ['overflow', 'overflow-y'].some((p) => rule.props.has(p)))
@@ -130,7 +183,7 @@ describe('a long toast body cannot swallow the viewport', () => {
 
       expect(
         offenders.map((r) => `${r.atRules} ${r.selector} { ${r.body} }`),
-        'an ancestor of .toast-message owns a scroll the spinner would then have to switch off',
+        'an ancestor of the icon owns a scroll the spinner would then have to switch off',
       ).toEqual([]);
     }
   });

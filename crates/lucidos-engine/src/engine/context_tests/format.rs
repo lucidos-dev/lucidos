@@ -357,3 +357,42 @@ fn trim_history_from_oldest_preserves_newest() {
         "should have trimmed old message 1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `format_image_refs`: how a history annotation addresses a message's images
+// ---------------------------------------------------------------------------
+
+/// A user image is addressed twice: by the position it has today, and by the
+/// stable handle the model can note. Both, because `thread:N` is what every
+/// existing thread and habit already uses.
+#[test]
+fn one_user_image_carries_its_handle_beside_its_position() {
+    let refs = format_image_refs(4, 1, &["img-0123456789abcdef".to_string()]);
+    assert_eq!(refs, "thread:5, img-0123456789abcdef");
+}
+
+/// A message with several images states every handle, in the same order as
+/// the range, so the model can tell which is which.
+#[test]
+fn every_image_in_a_message_states_its_own_handle() {
+    let handles = vec![
+        "img-aaaaaaaaaaaaaaaa".to_string(),
+        "img-bbbbbbbbbbbbbbbb".to_string(),
+        "img-cccccccccccccccc".to_string(),
+    ];
+    let refs = format_image_refs(4, 3, &handles);
+    assert_eq!(
+        refs,
+        "thread:5-thread:7, img-aaaaaaaaaaaaaaaa img-bbbbbbbbbbbbbbbb img-cccccccccccccccc"
+    );
+}
+
+/// With no handle to state, the annotation is byte-identical to what it was
+/// before handles existed. That is the generated-image case:
+/// `SessionMessage.images` can hold an artifact path the image walker never
+/// saw. A handle derived from one would name nothing.
+#[test]
+fn an_image_with_no_stateable_handle_is_addressed_exactly_as_before() {
+    assert_eq!(format_image_refs(1, 1, &[]), "thread:2");
+    assert_eq!(format_image_refs(1, 2, &[]), "thread:2-thread:3");
+}

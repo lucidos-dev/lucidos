@@ -8,7 +8,12 @@
 //! - [`context_sections`] — per-turn context-section builders.
 //! - [`titles`] — title-emit orchestration.
 //! - [`context_build`] — pure capture-section / loaded-knowhow helpers.
+//! - [`context_mode`]: the self-curated context mode, in one place.
+//! - [`working_understanding`]: the model's own document, parsed out of its
+//!   reply and rendered back at the tail of every round.
 //! - [`turn_clock`]: the turn's time context, split across the two prompt tiers.
+//! - [`turn_tail`]: the engine build state and the client URL, split the same
+//!   way, plus the struct carrying all three tail blocks.
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin, TriggerInvocation};
 use crate::engine::types::*;
@@ -19,12 +24,16 @@ use uuid::Uuid;
 use super::process_helpers::TriggerContext;
 
 mod context_build;
+pub(crate) mod context_mode;
+pub(crate) mod context_panel;
 mod context_sections;
 mod history;
 mod run;
 mod system_prompt;
 mod titles;
 mod turn_clock;
+mod turn_tail;
+pub(crate) mod working_understanding;
 // `pub(super)` so the per-trigger knowhow listing in `chat::process_helpers`
 // can share this module's routing-description ceiling.
 pub(super) mod workspace_payload;
@@ -37,6 +46,8 @@ pub(super) mod workspace_payload;
 pub(crate) use context_build::{build_capture_sections, build_loaded_knowhow_block};
 #[cfg(test)]
 pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, REPEATED_ACTION_RULE};
+#[cfg(test)]
+pub(crate) use turn_tail::TurnTail;
 
 /// A turn's exchange-starter event that the CALLER already persisted, so
 /// `process_message_with_steps_internal` must not emit its own
@@ -275,3 +286,11 @@ impl LucidosEngine {
 #[cfg(test)]
 #[path = "../process_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "history_tests.rs"]
+mod history_tests;
+
+#[cfg(test)]
+#[path = "context_release_tests.rs"]
+mod context_release_tests;

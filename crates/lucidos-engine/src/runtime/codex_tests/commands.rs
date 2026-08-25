@@ -479,27 +479,73 @@ fn codex_command_definitions_shape() {
     let effort_options = arr[1]["params"][0]["options"]
         .as_array()
         .expect("effort options");
-    let max = effort_options
-        .iter()
-        .find(|o| o["value"] == "max")
-        .expect("Max must be in the Codex effort picker metadata");
-    let supported_models: std::collections::HashSet<&str> = max["supported_models"]
-        .as_array()
-        .expect("Max must declare its supported models")
-        .iter()
-        .map(|m| m.as_str().expect("model id"))
-        .collect();
-    assert_eq!(
-        supported_models,
-        std::collections::HashSet::from(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",]),
-        "Max is supported by exactly the three GPT-5.6 Codex models"
+    assert!(
+        effort_options.iter().any(|o| o["value"] == "max"),
+        "Max must be in the Codex effort picker"
     );
     assert!(
         effort_options
             .iter()
-            .filter(|o| o["value"] != "max")
             .all(|o| o.get("supported_models").is_none()),
-        "low through xhigh remain universal"
+        "the matrix is transposed onto the model rows; the wire carries no \
+         effort-to-models list"
+    );
+}
+
+/// The transpose. The JSON declares which models accept `max`; the wire says
+/// which efforts each model offers. Both must describe the same matrix.
+#[test]
+fn each_codex_model_row_carries_the_efforts_it_accepts() {
+    let defs = codex_command_definitions();
+    let options = defs.as_array().expect("array")[0]["params"][0]["options"]
+        .as_array()
+        .expect("options")
+        .clone();
+    let efforts_of = |model: &str| -> Vec<String> {
+        options
+            .iter()
+            .find(|o| o["value"] == model)
+            .unwrap_or_else(|| panic!("{model} must be offered"))["reasoning_efforts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{model} must declare its tiers"))
+            .iter()
+            .map(|e| e.as_str().expect("tier").to_string())
+            .collect()
+    };
+    for sixer in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        assert!(
+            efforts_of(sixer).contains(&"max".to_string()),
+            "{sixer} accepts max"
+        );
+    }
+    for earlier in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"] {
+        assert!(
+            !efforts_of(earlier).contains(&"max".to_string()),
+            "{earlier} does not accept max"
+        );
+    }
+    // The sentinel resolves to whatever the user's Codex config picks, so it
+    // can only be offered the tiers every model takes.
+    assert!(!efforts_of("default").contains(&"max".to_string()));
+    assert!(efforts_of("default").contains(&"high".to_string()));
+}
+
+/// The JSON keeps the effort-to-models shape upstream announces. A model row
+/// that grew a `reasoning_efforts` key would be the drift the transpose exists
+/// to prevent.
+#[test]
+fn the_codex_menu_json_still_declares_the_matrix_on_the_effort_rows() {
+    assert!(
+        codex_model_options()
+            .iter()
+            .all(|m| m.supported_models.is_none()),
+        "a model row must not declare compatibility; the effort rows do"
+    );
+    assert!(
+        codex_reasoning_effort_options()
+            .iter()
+            .any(|e| e.supported_models.is_some()),
+        "at least one effort must still name its models, or the matrix is gone"
     );
 }
 

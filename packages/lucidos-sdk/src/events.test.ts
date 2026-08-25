@@ -22,6 +22,7 @@ describe('buildEventQueryString', () => {
       before_event_id: '11111111-1111-4111-8111-111111111111',
       after_event_id: '22222222-2222-4222-8222-222222222222',
       thread_id: '33333333-3333-4333-8333-333333333333',
+      event_id: '44444444-4444-4444-8444-444444444444',
     };
     const got = new URLSearchParams(buildEventQueryString(params));
     for (const [key, value] of Object.entries(params)) {
@@ -45,6 +46,7 @@ describe('buildEventQueryString', () => {
     expect(got.get('limit')).toBe('200');
     expect(got.has('after_event_id')).toBe(false);
     expect(got.has('thread_id')).toBe(false);
+    expect(got.has('event_id')).toBe(false);
     expect(got.has('since')).toBe(false);
     expect(got.has('until')).toBe(false);
   });

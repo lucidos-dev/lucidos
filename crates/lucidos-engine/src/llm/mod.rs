@@ -31,7 +31,7 @@ pub use openai::{
 pub use provider::{ContentBlock, LlmProvider, Message, MessageContent, TokenCallback, ToolCall};
 pub use provider_build::{
     boot_without_provider_enabled, build_active_provider, ProviderBuildContext,
-    ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES,
+    ProviderBuildOutcome, PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,
 };
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 // `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and
@@ -40,8 +40,8 @@ pub use provider_selection::{select_provider, ProviderSelection, ProviderSelecti
 pub use reasoning::{supported_efforts, EFFORT_LADDER};
 pub use routing::RoutingProvider;
 pub use tools::{
-    get_default_tools, get_image_generation_tool, get_navigate_ui_tool, get_notification_tool,
-    get_save_thread_image_tool, get_view_image_tool,
+    chat_tail_tools, get_default_tools, get_image_generation_tool, get_navigate_ui_tool,
+    get_notification_tool, get_save_thread_image_tool, get_view_image_tool, ToolCapabilities,
 };
 pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
 pub use vertex::VertexProvider;
@@ -58,6 +58,11 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// shared by the LLM provider (`provider_build`) and the builtin `xai` proxy
 /// (`api::proxy_builtin`).
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
+
+/// OpenCode's Zen relay, whose free tier answers anonymously. The one base URL
+/// reached with no credential: the relay rejects an unrecognized bearer, so the
+/// provider is built with an empty key and sends no `Authorization` header.
+pub const OPENCODE_FREE_BASE_URL: &str = "https://opencode.ai/zen/v1";
 
 /// Direct Anthropic API root (`{base}/messages`). Single home shared by the
 /// LLM provider (`anthropic::chat`) and the builtin `anthropic` proxy
@@ -105,6 +110,9 @@ pub fn is_transient_error(err: &str) -> bool {
     lower.contains("error sending request")
         || lower.contains("connection reset")
         || lower.contains("connection closed")
+        // The provider hung up mid-stream, before it said why it stopped.
+        // Raised by `parse_claude_stream` when the stream carried no output.
+        || lower.contains("stream truncated")
         || lower.contains("broken pipe")
         || lower.contains("timed out")
         || lower.contains("temporarily unavailable")
@@ -261,6 +269,48 @@ pub(crate) fn clamp_provider_token_count(n: u64, source: &str) -> u32 {
     }
 }
 
+/// Append an SSE byte chunk to `out`, holding back a character the transport
+/// split in two.
+///
+/// `bytes_stream` yields whatever the socket read, so a multi-byte character
+/// can straddle two chunks. Decoding each chunk alone replaces both halves with
+/// U+FFFD, which silently corrupts the model's text. Complete characters go to
+/// `out` and the incomplete tail waits in `carry` for the next chunk. A byte
+/// that can never start a character is replaced, as `from_utf8_lossy` would.
+pub(crate) fn push_utf8_chunk(carry: &mut Vec<u8>, chunk: &[u8], out: &mut String) {
+    carry.extend_from_slice(chunk);
+    loop {
+        let (valid, bad_len) = match std::str::from_utf8(carry.as_slice()) {
+            // The whole buffer decoded, which is the common case. Push the
+            // `&str` already in hand rather than re-scanning the same bytes.
+            Ok(decoded) => {
+                out.push_str(decoded);
+                carry.clear();
+                return;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // `from_utf8` validated this prefix, so the conversion below
+                // borrows it and replaces nothing.
+                out.push_str(&String::from_utf8_lossy(&carry[..valid]));
+                (valid, e.error_len())
+            }
+        };
+        match bad_len {
+            // Bytes no character can start with: replace them and carry on.
+            Some(bad) => {
+                out.push(char::REPLACEMENT_CHARACTER);
+                carry.drain(..valid + bad);
+            }
+            // A character the next chunk finishes.
+            None => {
+                carry.drain(..valid);
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +370,11 @@ mod tests {
         assert!(is_transient_error("rate limit exceeded"));
         assert!(is_transient_error("HTTP 529 overloaded"));
         assert!(is_transient_error("HTTP 503 service unavailable"));
+        // A stream the provider cut before its stop reason. Transient, so a
+        // trigger that hits it twice notifies once.
+        assert!(is_transient_error(
+            "Claude stream truncated: Vertex closed the stream before message_delta"
+        ));
         assert!(!is_transient_error("invalid JSON"));
         assert!(!is_transient_error("authentication failed"));
     }
@@ -408,6 +463,34 @@ mod tests {
             StreamSend::Got(_) => panic!("black-hole endpoint must not return a response"),
             StreamSend::Retry => panic!("attempt > MAX_RETRIES must Fail, not Retry"),
         }
+    }
+
+    /// A character split across two reads must arrive whole. Decoding each
+    /// chunk on its own yields two U+FFFD instead, which corrupts model text
+    /// and any file written from a tool argument.
+    #[test]
+    fn a_character_split_across_two_chunks_survives() {
+        let text = "hei på deg 😀 日本語";
+        let bytes = text.as_bytes();
+        for split in 1..bytes.len() {
+            let mut carry = Vec::new();
+            let mut out = String::new();
+            push_utf8_chunk(&mut carry, &bytes[..split], &mut out);
+            push_utf8_chunk(&mut carry, &bytes[split..], &mut out);
+            assert_eq!(out, text, "split at byte {split}");
+            assert!(carry.is_empty(), "nothing held back, split at byte {split}");
+        }
+    }
+
+    /// A byte no character can start with still becomes the replacement, so a
+    /// genuinely broken stream reads as it did before.
+    #[test]
+    fn an_invalid_byte_still_becomes_the_replacement_character() {
+        let mut carry = Vec::new();
+        let mut out = String::new();
+        push_utf8_chunk(&mut carry, b"a\xffb", &mut out);
+        assert_eq!(out, "a\u{fffd}b");
+        assert!(carry.is_empty());
     }
 
     #[test]

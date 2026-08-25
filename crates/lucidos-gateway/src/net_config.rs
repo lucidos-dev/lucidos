@@ -200,6 +200,19 @@ pub fn serves_tls(cert: Option<&str>, key: Option<&str>) -> bool {
     matches!((cert, key), (Some(c), Some(k)) if !c.trim().is_empty() && !k.trim().is_empty())
 }
 
+/// [`serves_tls`] reading `LUCIDOS_TLS_CERT` / `LUCIDOS_TLS_KEY` from the
+/// process environment: does THIS gateway serve TLS on its own port?
+///
+/// Every site that asks goes through here, so the listener and the cookie's
+/// `Secure` flag cannot answer it differently. Mirrors the engine's
+/// `net_config::tls_scheme`, which is the same wrapper over the same rule.
+pub fn serves_tls_from_env() -> bool {
+    serves_tls(
+        std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
+        std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
+    )
+}
+
 /// Validate a user-supplied bind value for the control endpoint (server-side
 /// mirror of the picker's client-side validation).
 pub fn validate_bind_input(value: &str) -> Result<(), String> {
@@ -428,22 +441,109 @@ mod tests {
         assert_eq!(parse_network_toml("garbage = = ="), NetworkToml::default());
     }
 
+    /// Every cert/key pair the two mirrored copies must agree on, and the
+    /// verdict. ADR 0014 §1 forbids the gateway linking engine code, so this
+    /// table is the whole sync mechanism: it is the same table the engine's
+    /// `tls_scheme_from_requires_both_nonempty` asserts, and a row added
+    /// there is added here in the same change.
+    const TLS_RULE_TABLE: &[(Option<&str>, Option<&str>, bool)] = &[
+        (Some("/c.pem"), Some("/k.pem"), true),
+        // A cert alone is NOT TLS: the engine needs both, so it serves http.
+        (Some("/c.pem"), None, false),
+        (None, Some("/k.pem"), false),
+        (None, None, false),
+        // Set-but-empty, or whitespace, is how a launch script spells "unset".
+        (Some(""), Some("/k.pem"), false),
+        (Some("/c.pem"), Some("  "), false),
+        // BOTH empty is the reported one. `export LUCIDOS_TLS_CERT="$UNSET"`
+        // produces it, and so does `scripts/lib/service_test.sh`.
+        (Some(""), Some(""), false),
+        (Some("   "), Some("   "), false),
+    ];
+
     /// The gateway's copy of the scheme rule must agree with the engine's
     /// `tls_scheme_from` in every case, including the two that used to differ
     /// here: a cert with no key, and a set-but-empty value. Disagreeing means
     /// the gateway proxies https to an engine serving http.
     #[test]
     fn serves_tls_requires_both_cert_and_key_non_empty() {
-        assert!(serves_tls(Some("/c.pem"), Some("/k.pem")));
-        // A cert alone is NOT TLS: the engine needs both, so it would serve http.
-        assert!(!serves_tls(Some("/c.pem"), None));
-        assert!(!serves_tls(None, Some("/k.pem")));
-        assert!(!serves_tls(None, None));
-        // Set-but-empty (or whitespace) is how a script spells "unset".
-        assert!(!serves_tls(Some(""), Some("/k.pem")));
-        assert!(!serves_tls(Some("/c.pem"), Some("  ")));
+        for (cert, key, expected) in TLS_RULE_TABLE {
+            assert_eq!(
+                serves_tls(*cert, *key),
+                *expected,
+                "cert {cert:?} + key {key:?} must resolve to serves_tls={expected}"
+            );
+        }
         // The two literals the caller picks between are the ones a peer speaks.
         assert_eq!((SCHEME_HTTP, SCHEME_HTTPS), ("http", "https"));
+    }
+
+    /// The env wrapper must read the two names the rest of Lucidos writes, and
+    /// must answer them through [`serves_tls`]. A typo in either name would
+    /// otherwise put the gateway on http forever, silently.
+    #[test]
+    fn serves_tls_from_env_reads_the_two_tls_names() {
+        // These two names are process-global, and a dev shell really does
+        // export them, so put back whatever was there.
+        let restore = |name: &str, was: Option<std::ffi::OsString>| match was {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        let had_cert = std::env::var_os("LUCIDOS_TLS_CERT");
+        let had_key = std::env::var_os("LUCIDOS_TLS_KEY");
+
+        for (cert, key, expected) in TLS_RULE_TABLE {
+            restore("LUCIDOS_TLS_CERT", cert.map(Into::into));
+            restore("LUCIDOS_TLS_KEY", key.map(Into::into));
+            assert_eq!(
+                serves_tls_from_env(),
+                *expected,
+                "env cert {cert:?} + key {key:?} must resolve to {expected}"
+            );
+        }
+
+        restore("LUCIDOS_TLS_CERT", had_cert);
+        restore("LUCIDOS_TLS_KEY", had_key);
+    }
+
+    /// `var_os` answers "is this name set", which is a different question from
+    /// "does this process serve TLS". Reaching for it is how both gateway
+    /// sites drifted from the rule, so no site outside this module may.
+    #[test]
+    fn no_gateway_site_asks_whether_a_tls_name_is_merely_set() {
+        // Reads the directory rather than naming files, so a module added
+        // later is covered without anyone remembering to list it. A hand-kept
+        // list that silently stops covering a file is the same as no list.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut scanned: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&src).expect("the gateway's own src directory") {
+            let path = entry.expect("a readable directory entry").path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // This module owns the rule, so it is the one place that may name
+            // the variables. Everything else asks it.
+            if !name.ends_with(".rs") || name == "net_config.rs" {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            for var in ["LUCIDOS_TLS_CERT", "LUCIDOS_TLS_KEY"] {
+                assert!(
+                    !source.contains(&format!("var_os(\"{var}\")")),
+                    "{name} asks whether {var} is set; ask serves_tls_from_env instead"
+                );
+            }
+            scanned.push(name);
+        }
+        // A scan that read the wrong tree, or nothing, must fail rather than
+        // pass vacuously.
+        for expected in ["server.rs", "stack.rs", "auth_api.rs"] {
+            assert!(
+                scanned.iter().any(|n| n == expected),
+                "the scan never reached {expected}; it saw {scanned:?}"
+            );
+        }
     }
 
     #[test]

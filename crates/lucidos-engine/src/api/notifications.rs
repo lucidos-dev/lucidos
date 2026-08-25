@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::scheduler::notifications::Tap;
+use crate::scheduler::notifications::{default_tap, Tap};
 use crate::scheduler::{NotificationStore, PushSubscriptionStore};
 
 /// Body for `POST /api/v1/notifications` — used by the `lucidos notify` CLI
@@ -22,8 +22,8 @@ pub(super) struct CreateNotificationRequest {
     /// land. Ignored without `thread_id`.
     #[serde(default)]
     pub event_id: Option<String>,
-    /// Structured tap behavior — see [`Tap`]. Absent / null defaults to
-    /// `Tap::Modal`. The serde decode rejects the old string forms
+    /// Structured tap behavior, see [`Tap`]. Absent or null takes
+    /// [`default_tap`]. The serde decode rejects the old string forms
     /// ("modal" / "open_app" / "open_thread" / "none") so out-of-date scripts
     /// fail loudly with a 400 instead of silently routing to the inbox.
     #[serde(default)]
@@ -59,10 +59,14 @@ pub(super) async fn create_notification(
     let link_event_id = super::parse_optional_uuid_trimmed(body.event_id.as_deref())
         .map_err(|raw| ApiError::bad_request(format!("invalid event_id: {raw}")))?;
 
-    // Structured tap — `to.target`-specific required fields (e.g. `app_id`
-    // for `target=app`) are enforced by the page-side router, not here.
-    // The serde decode above already rejected malformed shapes with 400.
-    let tap = body.tap.unwrap_or_default();
+    // Structured tap. `to.target`-specific required fields (e.g. `app_id` for
+    // `target=app`) are enforced by the page-side router, not here. The serde
+    // decode above already rejected malformed shapes with 400. Omitting it
+    // takes the derived default: the source event when this notification names
+    // one, the card otherwise.
+    let tap = body
+        .tap
+        .unwrap_or_else(|| default_tap(link_thread_id, link_event_id));
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 

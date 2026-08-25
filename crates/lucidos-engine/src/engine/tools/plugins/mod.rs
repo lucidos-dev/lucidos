@@ -6,6 +6,7 @@
 //!
 //! - [`source`] — install-source detection + fetching.
 //! - [`registry`] — installed-plugin projection / query / update-check.
+//! - [`merge`]: three-way merge of an update against the user's local edits.
 //! - [`marketplaces`]: the single write path for the marketplace registry,
 //!   shared with `api::plugins` and announcing every mutation.
 //!
@@ -26,13 +27,24 @@ use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
 
 pub(crate) mod marketplaces;
+mod merge;
 mod registry;
 mod source;
 
+use merge::{LocalChangeOutcome, MergePlan, ResolvedChange};
 use registry::{
-    check_plugin_updates_impl, fetch_remote_manifest, latest_install, resolve_plugin_query,
+    check_plugin_updates_impl, fetch_remote_manifest, latest_install, project_baselines,
+    resolve_plugin_query, PluginBaseline,
 };
-use source::{copy_atomic, detect_source, fetch_source, SourceType};
+use source::{
+    copy_atomic, detect_source, fetch_source, git_file_mode, write_atomic, write_atomic_like,
+    SourceType,
+};
+
+/// Every installed plugin's merge baseline, keyed by plugin id. Resolved before
+/// the blocking fetch and handed into it, since the staged plugin's id is only
+/// known once its manifest parses inside that task.
+type PluginBaselines = std::collections::BTreeMap<String, PluginBaseline>;
 
 // Named by other modules via the `plugins::` path (`engine::tools::files`
 // routes plugin-owned deletes here), so it stays a re-export.
@@ -98,6 +110,10 @@ pub struct PendingInstall {
     /// empty. On confirm, a non-`None` value spawns a Lucidos Agent thread to
     /// walk the user through the author's setup instructions.
     pub(crate) setup: Option<String>,
+    /// What this install would do to files the user has locally edited, decided
+    /// at staging time so the confirm panel can state it per file. Empty for a
+    /// fresh install and for an untouched plugin.
+    pub(crate) merge: MergePlan,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -238,8 +254,19 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     let workspace = engine.workspace_path.clone();
     let pending = engine.pending_installs.clone();
     let source = source_str.to_string();
+    // Read every plugin's merge baseline up front. The staged plugin's id
+    // appears only when the fetched manifest parses, inside the blocking task.
+    // So it cannot look up its own baseline from in there. A read failure
+    // degrades to no baselines, which is today's plain overwrite.
+    let baselines = match project_baselines(&engine.pool).await {
+        Ok(b) => b,
+        Err(e) => {
+            log!(@Plugins, "read merge baselines failed (updates will overwrite local edits): {}", e);
+            PluginBaselines::new()
+        }
+    };
     match tokio::task::spawn_blocking(move || {
-        prepare_install_request(&workspace, &pending, &source)
+        prepare_install_request(&workspace, &pending, &source, &baselines)
     })
     .await
     {
@@ -301,6 +328,7 @@ pub(crate) fn prepare_install_request(
     workspace_path: &Path,
     pending_installs: &std::sync::Arc<PendingInstallsMap>,
     source_str: &str,
+    baselines: &PluginBaselines,
 ) -> String {
     let source = match detect_source(source_str) {
         Ok(s) => s,
@@ -324,6 +352,14 @@ pub(crate) fn prepare_install_request(
     // pending entry that decides whether confirm spawns a setup thread.
     let setup = normalize_setup(manifest.setup.as_deref());
 
+    // An update over a plugin the user has edited: work out per file whether
+    // their edit merges, conflicts, or is simply lost, so the panel can say so
+    // before they confirm. A fresh install has no baseline and no plan.
+    let merge = match baselines.get(&manifest.id) {
+        Some(baseline) => merge::plan_local_changes(workspace_path, baseline, &planned),
+        None => MergePlan::default(),
+    };
+
     let preview = serde_json::json!({
         "install_id": install_id,
         "source": source_str,
@@ -334,6 +370,7 @@ pub(crate) fn prepare_install_request(
             .map(|p| p.data_relative.clone())
             .collect::<Vec<_>>(),
         "overwrites": overwrites,
+        "local_changes": merge.preview_json(),
         "setup": setup,
         "plugin_id": manifest.id,
         "plugin_version": manifest.version,
@@ -349,6 +386,7 @@ pub(crate) fn prepare_install_request(
         plugin_version: manifest.version.clone(),
         plugin_name: manifest.name.clone(),
         setup,
+        merge,
         created_at: chrono::Utc::now(),
     };
 
@@ -759,6 +797,78 @@ pub(crate) async fn uninstall_with_bus(
     })
 }
 
+/// What a confirmed install does with the user's local edits: the merged bytes
+/// to put on disk, the saved-aside copies to commit, and the per-outcome lists
+/// to report. Default (every list empty) is a fresh install, or an update over
+/// a plugin nobody has edited, and behaves exactly as the flow always has.
+#[derive(Default)]
+pub(crate) struct LocalChangeWrites {
+    /// Merged content replacing upstream's on disk. The install commit still
+    /// records upstream's bytes for these paths, so the next update's merge
+    /// base stays pristine.
+    merged: Vec<(String, Vec<u8>)>,
+    /// `data/`-relative copies of discarded edits, written before the
+    /// overwrite and committed with the merge.
+    saved_aside: Vec<String>,
+    conflicted: Vec<String>,
+    replaced: Vec<String>,
+    /// Files the user had deleted, which upstream still ships and so come
+    /// back. Kept apart from `replaced`: there is no saved copy for these, and
+    /// lumping them in would make `saved_aside` look short by that many.
+    restored: Vec<String>,
+}
+
+impl LocalChangeWrites {
+    fn from_resolved(resolved: &[ResolvedChange<'_>], saved_aside: Vec<String>) -> Self {
+        let mut writes = Self {
+            saved_aside,
+            ..Default::default()
+        };
+        for change in resolved {
+            let path = change.data_relative().to_string();
+            match change.outcome {
+                LocalChangeOutcome::Merged => match change.merged_bytes() {
+                    Some(bytes) => writes.merged.push((path, bytes.to_vec())),
+                    // Unreachable: a `Merged` outcome always carries its bytes.
+                    // Degrading to `replaced` keeps the report honest rather
+                    // than claiming a merge that never happened.
+                    None => writes.replaced.push(path),
+                },
+                LocalChangeOutcome::Conflict => writes.conflicted.push(path),
+                LocalChangeOutcome::Replaced => writes.replaced.push(path),
+                LocalChangeOutcome::Restored => writes.restored.push(path),
+            }
+        }
+        writes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.merged.is_empty()
+            && self.conflicted.is_empty()
+            && self.replaced.is_empty()
+            && self.restored.is_empty()
+    }
+
+    fn merged_paths(&self) -> Vec<String> {
+        self.merged.iter().map(|(p, _)| p.clone()).collect()
+    }
+}
+
+/// What an update did to the user's local edits, for the confirm response and
+/// the `PluginLocalChangesMerged` event. `None` when the install met none.
+pub struct LocalChangeReport {
+    pub merged: Vec<String>,
+    pub conflicted: Vec<String>,
+    pub replaced: Vec<String>,
+    /// Files the user had deleted that upstream still ships, so they returned.
+    /// Nothing is saved aside for these: a deletion has no content to keep.
+    pub restored: Vec<String>,
+    /// `data/`-relative copies of every edit the update discarded.
+    pub saved_paths: Vec<String>,
+    /// The commit holding the merged working tree plus those copies.
+    pub commit: Option<String>,
+}
+
 /// Outcome of a confirmed install: install summary text plus the `data/`-
 /// relative paths that were written. Confirm endpoints use the file list to
 /// decide whether to trigger a `reload_proxy_modules` (any path under
@@ -766,6 +876,8 @@ pub(crate) async fn uninstall_with_bus(
 pub struct ConfirmedInstall {
     pub summary: String,
     pub installed_files: Vec<String>,
+    /// Set when the install met local edits to the files it ships.
+    pub local_changes: Option<LocalChangeReport>,
     /// The Lucidos Agent thread spawned to walk the user through the plugin's
     /// `setup` instructions, when the manifest carried any. `None` for plugins
     /// with no setup field. The frontend navigates the user to this thread so
@@ -979,6 +1091,7 @@ async fn delete_plugin_triggers(
 pub async fn confirm_pending_install(
     engine: &LucidosEngine,
     install_id: &str,
+    keep_local_changes: bool,
     actor: Option<MessageOrigin>,
 ) -> Result<ConfirmedInstall, String> {
     let pending = {
@@ -1017,19 +1130,59 @@ pub async fn confirm_pending_install(
     let setup_thread_id =
         setup_is_new(pending.setup.as_deref(), prior_setup.as_deref()).then(uuid::Uuid::new_v4);
 
-    let (summary, installed_files) = {
+    let (summary, installed_files, local_changes) = {
         let _repo_guard = engine.lock_workspace_repo().await;
-        install_from_unpacked_with_bus(
+
+        // The panel stated an outcome per edited file. If one of those files
+        // moved since, the staged plan describes content that no longer
+        // exists, and writing it would clobber the newer edit unseen.
+        if let Some(path) = pending.merge.detect_drift(&engine.workspace_path) {
+            return Err(format!(
+                "'{}' changed after you reviewed this update. Run the update \
+                 again to see what it would do now.",
+                path
+            ));
+        }
+        let resolved = pending.merge.resolve(keep_local_changes);
+        // Before a single byte is overwritten, so a failure past this point
+        // cannot take the user's work with it.
+        let saved_aside = merge::save_discarded(
+            &engine.workspace_path,
+            &pending.plugin_id,
+            &pending.plugin_version,
+            &resolved,
+        )?;
+        let writes = LocalChangeWrites::from_resolved(&resolved, saved_aside);
+        // Built before the writer consumes `writes`; the commit sha is the one
+        // field only the writer can supply, so it is filled in afterwards.
+        let mut report = (!writes.is_empty()).then(|| LocalChangeReport {
+            merged: writes.merged_paths(),
+            conflicted: writes.conflicted.clone(),
+            replaced: writes.replaced.clone(),
+            restored: writes.restored.clone(),
+            saved_paths: writes.saved_aside.clone(),
+            commit: None,
+        });
+
+        let write = install_from_unpacked_with_bus(
             &engine.workspace_path,
             &engine.event_bus,
             &pending.plugin_root,
-            pending.source_type,
-            true,
-            actor.clone(),
-            setup_thread_id,
+            InstallContext {
+                actor: actor.clone(),
+                setup_thread_id,
+                local: writes,
+                ..InstallContext::plain(pending.source_type, true)
+            },
         )
-        .await?
+        .await?;
+        if let Some(report) = report.as_mut() {
+            report.commit = write.local_changes_commit.clone();
+        }
+        (write.summary, write.installed_files, report)
     };
+
+    announce_local_changes(engine, &pending, local_changes.as_ref(), actor.clone()).await;
 
     reload_auth_modules_if_needed(engine, &installed_files).await;
 
@@ -1051,8 +1204,197 @@ pub async fn confirm_pending_install(
     Ok(ConfirmedInstall {
         summary,
         installed_files,
+        local_changes,
         setup_thread_id,
     })
+}
+
+/// Announce what the update did to the user's local edits.
+///
+/// Two emits, because they answer different questions.
+/// `PluginLocalChangesMerged` records the decision, which nothing on disk holds
+/// once the commits exist. `ArtifactCreated` per saved copy is what makes those
+/// copies show up in the Files list without a reload.
+///
+/// Best-effort: the plugin is installed and the copies are on disk by now, so a
+/// failed emit is logged rather than failing the install.
+async fn announce_local_changes(
+    engine: &LucidosEngine,
+    pending: &PendingInstall,
+    report: Option<&LocalChangeReport>,
+    actor: Option<MessageOrigin>,
+) {
+    let Some(report) = report else {
+        return;
+    };
+    engine
+        .event_bus
+        .emit_or_log(
+            BusEvent::System(SystemEvent::PluginLocalChangesMerged {
+                id: pending.plugin_id.clone(),
+                version: pending.plugin_version.clone(),
+                merged: report.merged.clone(),
+                conflicted: report.conflicted.clone(),
+                replaced: report.replaced.clone(),
+                restored: report.restored.clone(),
+                saved_paths: report.saved_paths.clone(),
+                commit: report.commit.clone(),
+                actor: actor.clone(),
+            }),
+            "[Plugins] PluginLocalChangesMerged",
+        )
+        .await;
+
+    let Some(commit) = report.commit.clone() else {
+        return;
+    };
+    for path in &report.saved_paths {
+        let Some(artifact_path) = path.strip_prefix("artifacts/") else {
+            continue;
+        };
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::ArtifactCreated {
+                    artifact_path: artifact_path.to_string(),
+                    commit: commit.clone(),
+                    source: Some("plugin_update".to_string()),
+                }),
+                "[Plugins] ArtifactCreated",
+            )
+            .await;
+    }
+}
+
+/// The result of offering a local patch upstream: where the patch was written,
+/// and the thread that will take it from there.
+pub struct ProposedUpstream {
+    /// `data/`-relative path of the generated patch.
+    pub patch_path: String,
+    pub thread_id: uuid::Uuid,
+}
+
+/// Offer the user's local patch to the plugin's author.
+///
+/// The engine's whole job is to produce the patch and hand it to an agent. It
+/// derives the diff from the install commit to the working tree, writes it as
+/// an artifact, and spawns a thread. It knows nothing about GitHub: no
+/// credentials, no fork, no API call. The procedure lives in
+/// `system-knowhow/plugins.md`, which the spawned thread reads, mirroring how
+/// `plugin-setup` works for install.
+pub async fn propose_local_patch_upstream(
+    engine: &LucidosEngine,
+    query: &str,
+    actor: Option<MessageOrigin>,
+) -> Result<ProposedUpstream, String> {
+    let id = resolve_plugin_query(&engine.pool, query).await?;
+    let installed = match latest_install(&engine.pool, &id).await {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return Err(format!("plugin '{}' is not currently installed", id)),
+        Err(e) => return Err(format!("read install record: {}", e)),
+    };
+    let commit = installed
+        .commit()
+        .ok_or_else(|| {
+            format!(
+                "plugin '{}' was installed before Lucidos recorded a baseline, so there is \
+                 nothing to diff your changes against",
+                id
+            )
+        })?
+        .to_string();
+    let version = installed.version().unwrap_or("unknown").to_string();
+    let plugin_name = installed.name().unwrap_or(&id).to_string();
+    let baseline = PluginBaseline {
+        commit,
+        files: installed.files(),
+    };
+
+    let patch = merge::local_patch(&engine.workspace_path, &baseline).ok_or_else(|| {
+        format!(
+            "'{}' has no local changes to propose (nothing differs from v{})",
+            plugin_name, version
+        )
+    })?;
+
+    let patch_path = format!(
+        "{}/{}/proposed-v{}.patch",
+        merge::SAVED_CHANGES_ROOT,
+        id,
+        version
+    );
+    let commit_sha = {
+        let _repo_guard = engine.lock_workspace_repo().await;
+        write_atomic(
+            patch.as_bytes(),
+            &engine.workspace_path.join(DATA_DIR).join(&patch_path),
+        )?;
+        crate::core::commit_data_paths_added(
+            &engine.workspace_path,
+            std::slice::from_ref(&patch_path),
+            &format!("Patch to propose upstream: {} v{}", id, version),
+        )
+        .map_err(|e| format!("commit proposed patch: {}", e))?
+    };
+
+    if let Some(artifact_path) = patch_path.strip_prefix("artifacts/") {
+        engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::artifact_change(
+                    false,
+                    artifact_path.to_string(),
+                    commit_sha,
+                    Some("plugin_upstream_patch".to_string()),
+                )),
+                "[Plugins] ArtifactCreated",
+            )
+            .await;
+    }
+
+    let thread_id = uuid::Uuid::new_v4();
+    engine
+        .thread_queue
+        .submit(
+            build_upstream_patch_thread_request(thread_id, &plugin_name, &patch_path),
+            actor,
+            None,
+        )
+        .await;
+
+    Ok(ProposedUpstream {
+        patch_path,
+        thread_id,
+    })
+}
+
+/// The Thread Queue request for an upstream-patch thread. A `SubThread` for the
+/// same two reasons as the setup thread. Its `prepare` step emits the seeding
+/// `MessageReceived` eagerly, so the frontend can navigate into a real thread.
+/// And it sidesteps the origin/mode validation an `AgentChat` would hit.
+///
+/// The seed is one user-facing line naming the plugin and the patch. How to
+/// actually open the pull request lives in `system-knowhow/plugins.md`, which
+/// keeps procedure out of the prompt.
+fn build_upstream_patch_thread_request(
+    thread_id: uuid::Uuid,
+    plugin_name: &str,
+    patch_path: &str,
+) -> crate::engine::thread_queue::ThreadQueueRequest {
+    crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+        prompt: format!(
+            "Propose my local changes to the {plugin_name} plugin upstream. \
+             The patch is at data/{patch_path}."
+        ),
+        child_thread_id: thread_id,
+        parent_thread_id: None,
+        spawning_event_id: None,
+        title: Some(format!("Propose {plugin_name} patch upstream")),
+        model: None,
+        reasoning_effort: None,
+        pre_emitted_origin: None,
+        origin: None,
+    }
 }
 
 /// Spawn a Lucidos Agent thread that walks the user through completing a
@@ -1219,24 +1561,66 @@ fn validate_plugin_triggers_event_driven(planned: &[PlannedFile]) -> Result<(), 
     Ok(())
 }
 
+/// Everything about one install write except the content itself: where it came
+/// from, who asked for it, and what to do with the user's local edits.
+pub(crate) struct InstallContext {
+    pub(crate) source_type: SourceType,
+    /// The user already saw the overwrite list in the panel, so a confirm
+    /// passes `true`. A caller that has not shown one passes `false` and gets
+    /// an error naming the paths instead.
+    pub(crate) overwrite: bool,
+    /// The device that clicked Confirm, stamped onto `PluginInstalled`.
+    pub(crate) actor: Option<MessageOrigin>,
+    /// The setup thread spawned for this install, recorded in the
+    /// `PluginInstalled` payload so the Plugins panel card's Setup-to-Open
+    /// state survives reloads. `None` when the plugin shipped no `setup`.
+    pub(crate) setup_thread_id: Option<uuid::Uuid>,
+    /// What to do with files the user has locally edited. Default (all empty)
+    /// writes every path straight from the staged tree, as a fresh install and
+    /// every pre-merge caller always did.
+    pub(crate) local: LocalChangeWrites,
+}
+
+impl InstallContext {
+    /// An install with no local edits to weigh, and nobody to attribute it to.
+    pub(crate) fn plain(source_type: SourceType, overwrite: bool) -> Self {
+        Self {
+            source_type,
+            overwrite,
+            actor: None,
+            setup_thread_id: None,
+            local: LocalChangeWrites::default(),
+        }
+    }
+}
+
+/// What the writer did, for the confirm endpoint to report on.
+#[derive(Debug)]
+pub(crate) struct InstallWrite {
+    pub(crate) summary: String,
+    /// Every `data/`-relative path written. The confirm uses it verbatim (no
+    /// re-walk) for the auto-reload decision and the HTTP response.
+    pub(crate) installed_files: Vec<String>,
+    /// The second commit, recording the merged working tree plus any
+    /// saved-aside copies. `None` when the install met no local edits.
+    pub(crate) local_changes_commit: Option<String>,
+}
+
 /// Install a plugin from an already-unpacked directory. Pure orchestration:
 /// takes the workspace path and an event bus, so tests can inject a mock.
-/// Returns the one-line install summary plus the `data/`-relative paths that
-/// were written; the confirm endpoint uses the file list verbatim (no
-/// re-walk) for the auto-reload decision and the HTTP response.
 pub(crate) async fn install_from_unpacked_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,
     plugin_root: &Path,
-    source_type: SourceType,
-    overwrite: bool,
-    actor: Option<MessageOrigin>,
-    // The setup thread spawned for this install, recorded in the
-    // `PluginInstalled` payload so the Plugins panel card's Setup→Open state
-    // survives reloads. `None` when the plugin shipped no `setup` field, or
-    // for the silent background auto-update path (no user is watching).
-    setup_thread_id: Option<uuid::Uuid>,
-) -> Result<(String, Vec<String>), String> {
+    ctx: InstallContext,
+) -> Result<InstallWrite, String> {
+    let InstallContext {
+        source_type,
+        overwrite,
+        actor,
+        setup_thread_id,
+        local,
+    } = ctx;
     let (manifest, planned) = validate_tree(plugin_root).map_err(|e| e.to_string())?;
     let data_dir = workspace_path.join(DATA_DIR);
 
@@ -1264,7 +1648,18 @@ pub(crate) async fn install_from_unpacked_with_bus(
     } in &planned
     {
         let dst = data_dir.join(data_relative);
-        copy_atomic(source, &dst).map_err(|e| {
+        let merged = local
+            .merged
+            .iter()
+            .find(|(path, _)| path == data_relative)
+            .map(|(_, bytes)| bytes);
+        let write = match merged {
+            // Mode taken from the shipped file, so a merged path ends up
+            // exactly as the plain copy below would have left it.
+            Some(bytes) => write_atomic_like(bytes, &dst, source),
+            None => copy_atomic(source, &dst),
+        };
+        write.map_err(|e| {
             format!(
                 "extract failed at {} (some files may have already been written): {}",
                 data_relative, e
@@ -1286,12 +1681,55 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // modified it (the Plugins-list "Modified" badge). Recorded in the
     // `PluginInstalled` payload below; an update re-commits and re-stamps it, so
     // the badge resets. See `registry::plugin_modification_status`.
-    let install_commit = crate::core::commit_data_paths_added(
+    //
+    // A merged path is recorded from UPSTREAM's bytes, not from the working
+    // tree. The install commit is then a byte-exact copy of the shipped
+    // version, whatever the merge put on disk. That keeps the next update's
+    // merge base honest. Record the merge here instead, and the following
+    // update reads the user's patch as upstream's own content, finds no local
+    // modification, and drops it.
+    let upstream_bytes = |data_relative: &String| -> Result<(String, Vec<u8>, u32), String> {
+        let pf = planned
+            .iter()
+            .find(|pf| &pf.data_relative == data_relative)
+            .ok_or_else(|| format!("merged path {} is not in the install plan", data_relative))?;
+        let bytes = std::fs::read(&pf.source)
+            .map_err(|e| format!("read shipped {}: {}", data_relative, e))?;
+        Ok((data_relative.clone(), bytes, git_file_mode(&pf.source)))
+    };
+    let pristine: Vec<(String, Vec<u8>, u32)> = local
+        .merged
+        .iter()
+        .map(|(path, _)| upstream_bytes(path))
+        .collect::<Result<_, _>>()?;
+
+    let install_commit = crate::core::commit_data_paths_with_overrides(
         workspace_path,
         &installed_files,
+        &pristine,
         &format!("Install plugin: {} v{}", manifest.id, manifest.version),
     )
     .map_err(|e| format!("commit installed plugin files: {}", e))?;
+
+    // Second commit: the merged working tree and the saved-aside copies, so
+    // `git status` is clean and the kept patch has a commit of its own.
+    let mut local_paths = local.merged_paths();
+    local_paths.extend(local.saved_aside.iter().cloned());
+    let local_changes_commit = if local_paths.is_empty() {
+        None
+    } else {
+        Some(
+            crate::core::commit_data_paths_added(
+                workspace_path,
+                &local_paths,
+                &format!(
+                    "Keep local changes to plugin: {} v{}",
+                    manifest.id, manifest.version
+                ),
+            )
+            .map_err(|e| format!("commit kept local plugin changes: {}", e))?,
+        )
+    };
 
     let installed_at = chrono::Utc::now().to_rfc3339();
     let from = manifest
@@ -1336,7 +1774,11 @@ pub(crate) async fn install_from_unpacked_with_bus(
         manifest.version,
         installed_files.len()
     );
-    Ok((result, installed_files))
+    Ok(InstallWrite {
+        summary: result,
+        installed_files,
+        local_changes_commit,
+    })
 }
 
 fn short_source(source: &str) -> String {

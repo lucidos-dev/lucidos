@@ -56,6 +56,12 @@ mod repo_files_test;
 #[path = "api_support/file_edit_test.rs"]
 mod file_edit_test;
 
+#[path = "api_support/data_range_test.rs"]
+mod data_range_test;
+
+#[path = "api_support/data_mount_test.rs"]
+mod data_mount_test;
+
 #[path = "api_support/event_wait_test.rs"]
 mod event_wait_test;
 
@@ -116,6 +122,9 @@ mod script_trigger_in_place_test;
 #[path = "api_support/trigger_run_test.rs"]
 mod trigger_run_test;
 
+#[path = "api_support/trigger_event_type_test.rs"]
+mod trigger_event_type_test;
+
 #[path = "api_support/command_safety_test.rs"]
 mod command_safety_test;
 
@@ -160,3 +169,6 @@ mod frontend_preview_test;
 
 #[path = "api_support/mcp_servers_test.rs"]
 mod mcp_servers_test;
+
+#[path = "api_support/webhook_delivery_test.rs"]
+mod webhook_delivery_test;

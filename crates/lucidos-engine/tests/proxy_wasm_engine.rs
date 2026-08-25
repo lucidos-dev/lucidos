@@ -298,6 +298,95 @@ const LOOP_FOREVER_WAT: &str = r#"
     (i64.const 0)))
 "#;
 
+/// Declares far more initial linear memory than the sandbox allows: 1000 pages
+/// is ~64 MiB against a 16 MiB ceiling. Instantiation must refuse it, so the
+/// host never reserves the memory in the first place.
+const OVERSIZED_MEMORY_WAT: &str = r#"
+(module
+  (memory (export "memory") 1000)
+  (func (export "sign") (param i32 i32) (result i64)
+    (i64.const 0)))
+"#;
+
+/// Grows linear memory in a loop, 1 MiB at a time. The execution budget cannot
+/// stop this before the host is out of memory, because epoch interruption caps
+/// CPU rather than resident memory. Only the store's memory ceiling can.
+const MEMORY_BOMB_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "sign") (param i32 i32) (result i64)
+    (loop $l
+      (drop (memory.grow (i32.const 16)))
+      (br $l))
+    (i64.const 0)))
+"#;
+
+/// Declares two tables against a per-store ceiling of one. The element ceiling
+/// is per table, so a module that multiplies tables multiplies the ceiling.
+/// wasmtime refuses this itself, which is the object-count half of the sandbox.
+const TWO_TABLES_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (table 1 funcref)
+  (table 1 funcref)
+  (func (export "sign") (param i32 i32) (result i64)
+    (i64.const 0)))
+"#;
+
+/// Scans its own input for a `~` (byte 0x7E) and reports whether it found one,
+/// via `x-saw: yes` or `x-saw: no`.
+///
+/// This is how a test asks the SANDBOX what it received, instead of asking the
+/// host what it meant to send. In the `SignInput` these tests build, `~` occurs
+/// in exactly one place: the upstream header value a signer may read only with
+/// the `read_prior_headers` grant.
+const TILDE_SCAN_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "{\"add_headers\":[[\"x-saw\",\"yes\"]]}")
+  (data (i32.const 1536) "{\"add_headers\":[[\"x-saw\",\"no\"]]}")
+  (func (export "sign") (param $ptr i32) (param $len i32) (result i64)
+    (local $i i32)
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $scan
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (if (i32.eq
+              (i32.load8_u (i32.add (local.get $ptr) (local.get $i)))
+              (i32.const 126))
+          (then (return (i64.or
+                          (i64.shl (i64.const 1024) (i64.const 32))
+                          (i64.const 33)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $scan)))
+    (i64.or (i64.shl (i64.const 1536) (i64.const 32)) (i64.const 32))))
+"#;
+
+fn signer_layer(name: &str, wat_src: &str, engine: &Arc<Engine>) -> WasmSignerLayer {
+    WasmSignerLayer::new(
+        name.into(),
+        compile_wat(name, wat_src, engine),
+        engine.clone(),
+        Arc::new(MapResolver(HashMap::new())),
+        vec![],
+        vec![],
+    )
+}
+
+/// The sandbox kill left the process healthy: a good signer on the SAME engine
+/// still signs. An abort or an OOM would have taken this down with it.
+async fn assert_engine_still_serves(engine: &Arc<Engine>) {
+    let layer = signer_layer("echo", ECHO_WAT, engine);
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let m = layer
+        .apply(&input)
+        .await
+        .expect("the engine must still serve a healthy signer after a sandbox kill");
+    assert_eq!(m.add_headers[0].1, "ok");
+}
+
 // ── proxy_wasm_signer::tests::wasm_signer_layer_* (Engine-creating) ────
 // Real-artifact variants moved to crates/lucidos-e2e/tests/wasm_signers.rs
 // (run via ./scripts/e2e-wasm.sh).
@@ -305,10 +394,7 @@ const LOOP_FOREVER_WAT: &str = r#"
 #[tokio::test]
 async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let module = compile_wat("echo", ECHO_WAT, &engine);
-    let resolver = Arc::new(MapResolver(HashMap::new()));
-
-    let layer = WasmSignerLayer::new("echo".into(), module, engine, resolver, vec![], vec![]);
+    let layer = signer_layer("echo", ECHO_WAT, &engine);
 
     let body = bytes::Bytes::new();
     let prior = HashMap::new();
@@ -330,10 +416,8 @@ async fn wasm_signer_layer_runs_echo_signer_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let module = compile_wat("runaway", LOOP_FOREVER_WAT, &engine);
-    let resolver = Arc::new(MapResolver(HashMap::new()));
-    let layer = WasmSignerLayer::new("runaway".into(), module, engine, resolver, vec![], vec![])
-        .with_budget(Duration::from_millis(150));
+    let layer =
+        signer_layer("runaway", LOOP_FOREVER_WAT, &engine).with_budget(Duration::from_millis(150));
 
     let body = bytes::Bytes::new();
     let prior = HashMap::new();
@@ -355,6 +439,94 @@ async fn wasm_signer_layer_kills_a_runaway_looping_signer() {
         elapsed < Duration::from_secs(10),
         "budget should trip promptly; took {elapsed:?}"
     );
+}
+
+/// A module declaring an oversized initial memory is refused at instantiation.
+/// The 502 names the signer and the limit, and the engine keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_signer_layer_rejects_a_module_declaring_oversized_memory() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer("greedy-init", OVERSIZED_MEMORY_WAT, &engine);
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let err = layer
+        .apply(&input)
+        .await
+        .expect_err("an oversized initial memory must be refused, not instantiated");
+
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        err.1.contains("greedy-init") && err.1.contains("linear-memory limit of 16 MiB"),
+        "error must name the signer and the memory limit; got: {}",
+        err.1
+    );
+
+    assert_engine_still_serves(&engine).await;
+}
+
+/// A `memory.grow` loop is killed by the memory ceiling, not by the CPU budget.
+/// It must die well inside the default budget, and say memory rather than
+/// budget, so the two sandbox failure modes stay distinguishable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_signer_layer_kills_a_memory_growing_signer() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer("memory-bomb", MEMORY_BOMB_WAT, &engine);
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(20), layer.apply(&input)).await;
+    let elapsed = started.elapsed();
+
+    let result = outcome.expect("apply() must return: a memory bomb must not hang the task");
+    let err = result.expect_err("a signer growing memory without bound must be rejected");
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        err.1.contains("memory-bomb") && err.1.contains("linear-memory limit"),
+        "error must name the signer and the memory limit; got: {}",
+        err.1
+    );
+    assert!(
+        !err.1.contains("execution budget"),
+        "the memory cap must be the reported cause, not the CPU budget; got: {}",
+        err.1
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the memory cap must trip long before the 5s CPU budget; took {elapsed:?}"
+    );
+
+    assert_engine_still_serves(&engine).await;
+}
+
+/// An object-count cap reads like every other sandbox refusal: a 502 naming the
+/// signer, and an engine that keeps serving. wasmtime states this limit in its
+/// own words, so the message is asserted loosely rather than on its exact text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wasm_signer_layer_rejects_a_module_declaring_two_tables() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer("table-splitter", TWO_TABLES_WAT, &engine);
+
+    let body = bytes::Bytes::new();
+    let prior = HashMap::new();
+    let input = make_layer_input(&body, &prior);
+    let err = layer
+        .apply(&input)
+        .await
+        .expect_err("a module over the table-count cap must be refused");
+
+    assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+    assert!(
+        err.1.contains("table-splitter") && err.1.contains("limit"),
+        "error must name the signer and a limit; got: {}",
+        err.1
+    );
+
+    assert_engine_still_serves(&engine).await;
 }
 
 #[tokio::test]
@@ -397,13 +569,118 @@ async fn wasm_signer_layer_rejects_raw_body_request_when_body_exceeds_1mb() {
     assert!(err.1.contains("requires raw body"));
 }
 
+// ── prior_layer_outputs least privilege ─────────────────────────────────
+
+fn signer_layer_with_caps(
+    name: &str,
+    wat_src: &str,
+    engine: &Arc<Engine>,
+    declared: Vec<String>,
+    granted: Vec<String>,
+) -> WasmSignerLayer {
+    let bytes = wat::parse_str(wat_src).unwrap();
+    let module = Module::new(engine, &bytes).unwrap();
+    let compiled = Arc::new(CompiledModule {
+        name: name.into(),
+        module,
+        manifest: WasmManifest {
+            secret_handles: vec![],
+            body_mode: BodyMode::Either,
+            capabilities: declared,
+        },
+    });
+    WasmSignerLayer::new(
+        name.into(),
+        compiled,
+        engine.clone(),
+        Arc::new(MapResolver(HashMap::new())),
+        vec![],
+        granted,
+    )
+}
+
+/// An upstream `script_handshake` output whose token carries the `~` the scan
+/// module looks for.
+fn prior_with_upstream_token() -> HashMap<String, serde_json::Value> {
+    let mut prior = HashMap::new();
+    prior.insert(
+        "script_handshake".to_string(),
+        serde_json::json!({ "headers": { "authorization": "Bearer up~stream" } }),
+    );
+    prior
+}
+
+/// Run the scan module against that upstream token and return what it saw.
+async fn what_the_sandbox_saw(layer: &WasmSignerLayer) -> String {
+    let body = bytes::Bytes::new();
+    let prior = prior_with_upstream_token();
+    let input = make_layer_input(&body, &prior);
+    let m = layer.apply(&input).await.expect("apply should succeed");
+    m.add_headers
+        .first()
+        .map(|(_, v)| v.clone())
+        .expect("the scan module always returns one header")
+}
+
+#[tokio::test]
+async fn a_signer_without_the_grant_never_receives_an_upstream_header_value() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer_with_caps("scan", TILDE_SCAN_WAT, &engine, vec![], vec![]);
+    assert_eq!(
+        what_the_sandbox_saw(&layer).await,
+        "no",
+        "the module found the upstream token inside its own linear memory"
+    );
+}
+
+#[tokio::test]
+async fn a_signer_with_both_halves_of_the_grant_receives_the_value() {
+    // The control for the test above: it proves the scan module can find the
+    // needle at all, so a "no" there is withholding rather than a dead scanner.
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let cap = vec![CAP_READ_PRIOR_HEADERS.to_string()];
+    let layer = signer_layer_with_caps("scan", TILDE_SCAN_WAT, &engine, cap.clone(), cap);
+    assert_eq!(what_the_sandbox_saw(&layer).await, "yes");
+}
+
+#[tokio::test]
+async fn a_manifest_declaration_alone_does_not_hand_over_the_value() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer_with_caps(
+        "scan",
+        TILDE_SCAN_WAT,
+        &engine,
+        vec![CAP_READ_PRIOR_HEADERS.to_string()],
+        vec![],
+    );
+    assert_eq!(
+        what_the_sandbox_saw(&layer).await,
+        "no",
+        "a module must not grant itself a capability by declaring it"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_grant_alone_does_not_hand_over_the_value() {
+    let engine = Arc::new(build_wasmtime_engine().unwrap());
+    let layer = signer_layer_with_caps(
+        "scan",
+        TILDE_SCAN_WAT,
+        &engine,
+        vec![],
+        vec![CAP_READ_PRIOR_HEADERS.to_string()],
+    );
+    assert_eq!(
+        what_the_sandbox_saw(&layer).await,
+        "no",
+        "a blanket provider grant must not reach a module that never asked"
+    );
+}
+
 #[tokio::test]
 async fn wasm_signer_layer_rejects_replace_body_without_capability_grant() {
     let engine = Arc::new(build_wasmtime_engine().unwrap());
-    let module = compile_wat("rb", REPLACE_BODY_WAT, &engine);
-    let resolver = Arc::new(MapResolver(HashMap::new()));
-
-    let layer = WasmSignerLayer::new("rb".into(), module, engine, resolver, vec![], vec![]);
+    let layer = signer_layer("rb", REPLACE_BODY_WAT, &engine);
 
     let body = bytes::Bytes::new();
     let prior = HashMap::new();

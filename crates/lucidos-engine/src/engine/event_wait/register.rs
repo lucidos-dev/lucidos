@@ -8,7 +8,7 @@
 //!
 //! # Four refusals, three of them caps
 //!
-//! * **The subscribability gate** (S3), via `validate_awaitable_event_type`.
+//! * **The subscribability gate** (S3), via `validate_subscribable_event_type`.
 //! * **The consecutive-subscription cap** (S8): 10 registrations with no human
 //!   message in between. Catches a thread awaiting an event kind its own
 //!   re-entry emits, two threads ping-ponging, and a model simply stuck.
@@ -23,7 +23,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::LiveWait;
-use crate::core::event_subscription::{validate_awaitable_event_type, EventSubscription};
+use crate::core::event_subscription::{
+    validate_subscribable_event_type, EventSubscription, SubscriptionSurface,
+};
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::LucidosEngine;
 
@@ -120,6 +122,19 @@ impl LucidosEngine {
             Ok(on) => on,
             Err(msg) => return AwaitEventOutcome::Refused(msg),
         };
+        // The half of validation that needs the event store. Refusing here
+        // costs the model one turn. The alternative is an armed wait that
+        // cannot match, silent until the deadline up to 24h later.
+        let warnings = match crate::core::event_subscription::check_subscriptions(
+            &self.pool,
+            &on,
+            SubscriptionSurface::Wait,
+        )
+        .await
+        {
+            Ok(warnings) => warnings,
+            Err(msg) => return AwaitEventOutcome::Refused(format!("Error: {msg}")),
+        };
         let timeout_secs = match parse_timeout_secs(args) {
             Ok(secs) => secs,
             Err(msg) => return AwaitEventOutcome::Refused(msg),
@@ -133,7 +148,7 @@ impl LucidosEngine {
             return AwaitEventOutcome::Refused(
                 "Error: `reason` is required. One short line saying what you are waiting \
                  for and why, in the user's language. The user reads it in the \
-                 subscription indicator, and it is how they tell a sleeping thread from \
+                 waiting indicator, and it is how they tell a sleeping thread from \
                  a stalled one."
                     .to_string(),
             );
@@ -169,7 +184,11 @@ impl LucidosEngine {
             ));
         }
 
-        AwaitEventOutcome::Registered(registered_tool_result_text(&wait, lookback.as_ref()))
+        AwaitEventOutcome::Registered(registered_tool_result_text(
+            &wait,
+            lookback.as_ref(),
+            &warnings,
+        ))
     }
 
     /// Read the watermark and build the [`LiveWait`]. Nothing is emitted or
@@ -412,7 +431,7 @@ impl LucidosEngine {
     /// domain event nobody has emitted yet, but worth saying out loud so the
     /// model does not watch for 24 hours for a typo.
     pub(crate) async fn event_type_seen_before(&self, event_type: &str) -> bool {
-        event_type_ever_emitted(&self.pool, event_type).await
+        crate::core::event_subscription::event_type_ever_emitted(&self.pool, event_type).await
     }
 }
 
@@ -428,9 +447,13 @@ impl LucidosEngine {
 /// of this result the model has to act on within this turn: the subscription
 /// watches forward, so a match from before it was armed will never be delivered
 /// and reading past it is how the 2026-08-06 change went unapplied.
+/// A `warnings` entry leads the result, ahead of even the lookback. It names a
+/// type nobody here has emitted, so it is the one line that says this wait may
+/// be watching for nothing.
 pub(super) fn registered_tool_result_text(
     wait: &LiveWait,
     lookback: Option<&crate::engine::event_wait::ArmingLookback>,
+    warnings: &[String],
 ) -> String {
     let subscribed = format!(
         "Subscribed to {}. Nothing is blocking: finish this turn and end your response \
@@ -438,10 +461,14 @@ pub(super) fn registered_tool_result_text(
          deadline you set. Do not call await_event again for this.",
         describe_subscriptions(&wait.on),
     );
-    match lookback.filter(|l| !l.is_empty()) {
+    let body = match lookback.filter(|l| !l.is_empty()) {
         None => subscribed,
         Some(found) => format!("{}\n\n{subscribed}", arming_lookback_notice(found)),
+    };
+    if warnings.is_empty() {
+        return body;
     }
+    format!("WARNING: {}\n\n{body}", warnings.join("\nWARNING: "))
 }
 
 /// The report itself: what already happened, how long ago, and what the model
@@ -590,23 +617,14 @@ pub(crate) async fn consecutive_subscriptions(
     Ok(count)
 }
 
-/// Has this workspace ever emitted an event by this name?
-///
-/// **An unreadable store answers "seen", which suppresses the note.** The note
-/// is advisory, and a false alarm claiming a real event type has never been
-/// emitted would mislead the model worse than saying nothing.
-pub(crate) async fn event_type_ever_emitted(pool: &sqlx::PgPool, event_type: &str) -> bool {
-    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM events WHERE event_type = $1)")
-        .bind(event_type)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(true)
-}
-
 /// Parse and validate the `on:` array. Every entry is checked against the
 /// shared subscribability gate, and the first failure refuses the whole call:
 /// a partially-registered wait would watch for less than the model asked for
 /// while reading as a success.
+///
+/// This is the structural half only. The half that needs the event store runs
+/// in [`crate::core::event_subscription::check_subscriptions`],
+/// which the caller runs next.
 fn parse_subscriptions(args: &Value) -> Result<Vec<EventSubscription>, String> {
     let Some(entries) = args.get("on").and_then(|v| v.as_array()) else {
         return Err(
@@ -633,7 +651,8 @@ fn parse_subscriptions(args: &Value) -> Result<Vec<EventSubscription>, String> {
                 "Error: `on` entry {entry} has no usable `event_type`."
             ));
         };
-        validate_awaitable_event_type(&sub.event_type).map_err(|e| format!("Error: {e}"))?;
+        validate_subscribable_event_type(&sub.event_type, SubscriptionSurface::Wait)
+            .map_err(|e| format!("Error: {e}"))?;
         subs.push(sub);
     }
     Ok(subs)

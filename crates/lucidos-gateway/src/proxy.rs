@@ -99,12 +99,23 @@ pub async fn proxy(
     //     guard uses `Sec-Fetch-Site`, not a reconstructed host — but it is still
     //     stripped so a forged value can't pass through to an upstream that trusts
     //     it for URL generation / host-based authz.
+    //   - `x-lucidos-device-id` is re-injected from the AUTHENTICATED device, and
+    //     only when there is one. The engine keys push, preferences and actor
+    //     attribution on it, so a forged value would let a caller act as any
+    //     device. `enforce` stamps the extension; a client cannot.
+    let authenticated_device = req
+        .extensions()
+        .get::<crate::auth::AuthenticatedDevice>()
+        .cloned();
     let mut builder = client.request(method.clone(), &url);
     for (name, value) in req.headers() {
         if name == header::HOST
             || name == header::CONTENT_LENGTH
             || name.as_str().eq_ignore_ascii_case("x-forwarded-prefix")
             || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
+            || name
+                .as_str()
+                .eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
             || is_hop_by_hop(name)
         {
             continue;
@@ -113,6 +124,9 @@ pub async fn proxy(
     }
     let forwarded_prefix = format!("/{slug}/");
     builder = builder.header("x-forwarded-prefix", &forwarded_prefix);
+    if let Some(crate::auth::AuthenticatedDevice(id)) = authenticated_device {
+        builder = builder.header(crate::stack::HEADER_DEVICE_ID, id);
+    }
 
     // Stream the request body straight through — never buffer it (a 100 MB
     // `PUT /data/*` upload must not sit in gateway memory).
@@ -878,6 +892,72 @@ mod proxy_tests {
         assert!(
             !got.contains("evil.example"),
             "the forged forwarded-host value must not reach the upstream; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_the_authenticated_device_id() {
+        // The engine keys push, per-device preferences and actor attribution on
+        // this header, so it must carry the device the gateway authenticated.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let mut req = request("GET", "/dev/", Body::empty());
+        req.extensions_mut()
+            .insert(crate::auth::AuthenticatedDevice("device-1".into()));
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            got.contains("x-lucidos-device-id: device-1"),
+            "the authenticated device id must reach the engine; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_spoofed_device_id() {
+        // A client-chosen device id would let any paired caller act as any other
+        // device. The gateway's own value is the only one allowed through.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let mut req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/dev/")
+            .header("x-lucidos-device-id", "someone-elses-device")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(crate::auth::AuthenticatedDevice("device-1".into()));
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            got.contains("x-lucidos-device-id: device-1"),
+            "the gateway's own device id must be forwarded; upstream saw:\n{got}"
+        );
+        assert!(
+            !got.contains("someone-elses-device"),
+            "a client-spoofed device id must be stripped; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_no_device_id_without_an_authenticated_one() {
+        // A local process holds no device row, so it must not be handed one.
+        // With no extension the header is stripped and nothing replaces it.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/dev/")
+            .header("x-lucidos-device-id", "unproven-device")
+            .body(Body::empty())
+            .unwrap();
+        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            !got.contains("x-lucidos-device-id"),
+            "no authenticated device means no forwarded id; upstream saw:\n{got}"
         );
     }
 

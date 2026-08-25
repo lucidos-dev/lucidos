@@ -1,4 +1,5 @@
 use super::LucidosEngine;
+use crate::core::grants::{self, GrantFile};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::types::CcCommandsInfo;
 use std::collections::HashMap;
@@ -22,13 +23,6 @@ pub(crate) fn lookup_repo_commands_in_cache(
 ) -> CcCommandsInfo {
     cache.get(repo_path).cloned().unwrap_or_default()
 }
-
-// Empty by default: a fresh install grants nothing implicitly. Users build
-// their allowlist via the per-prompt "Always allow" buttons (which append to
-// `~/.lucidos/cc-allowed-tools`) or by editing the file directly via the
-// settings UI. Editing this list only affects fresh installs — existing users
-// keep whatever they already wrote to the file.
-const DEFAULT_CC_ALLOWED_TOOLS: &[&str] = &[];
 
 // Tools whose bare entry in `--allowedTools` cannot be respected by CC.
 // Two reasons a tool ends up here:
@@ -88,13 +82,9 @@ const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 // `SESSION_ALLOW_INEFFECTIVE` constants in `PermissionCard.tsx`.
 const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
 
-const CC_ALLOWED_TOOLS_FILE: &str = "cc-allowed-tools";
-const CC_ALLOWED_TOOLS_HEADER: &str =
-    "# One pattern per line. Lines starting with '#' are ignored.\n";
-
 /// Where a granted "Always allow" click is remembered.
 ///
-///   * `Narrow` / `Broad` — persisted to `~/.lucidos/cc-allowed-tools` and
+///   * `Narrow` / `Broad`: persisted to this workspace's `cc-allowed-tools` and
 ///     handed to CC via `--allowedTools` on every spawn. Survives engine
 ///     restart, but only takes effect for tools/paths CC actually respects.
 ///   * `Session` — cached on `PermissionState::session_allows`, scoped to one
@@ -206,6 +196,13 @@ pub(crate) fn derive_allow_pattern(
             if tool_name == "file_change" {
                 return None;
             }
+            // A command whose head does not resolve gets NO session pattern.
+            // The bare-name fallback below would read one click on an
+            // unreadable command as a grant for every command in the thread.
+            // That is the shape `file_change` above is denied.
+            if matches!(tool_name, "Bash" | "command_execution") {
+                return narrow_subscope(tool_name, input);
+            }
             if let Some(narrow) = narrow_subscope(tool_name, input) {
                 return Some(narrow);
             }
@@ -259,119 +256,51 @@ fn narrow_subscope(tool_name: &str, input: &serde_json::Value) -> Option<String>
             }
             Some(format!("Skill({}:*)", plugin))
         }
-        // Codex's command approvals carry a `command` field too — same
-        // first-token scoping as Bash, so a session grant on `git push`
-        // covers `git …` but NOT a later `rm -rf …`. Only the Session scope
-        // ever reaches this arm (Narrow returns None for Codex backend
-        // tools — nothing reads a persisted pattern for them).
+        // Codex's command approvals carry a `command` field too, and get the
+        // same head scoping as Bash: a grant on `git push` covers `git …` but
+        // NOT a later `rm -rf …`. Only the Session scope reaches this arm for
+        // Codex (Narrow returns None for its backend tools, since nothing
+        // reads a persisted pattern for them).
+        //
+        // The head comes from the command guard, not from the first
+        // whitespace token. Codex wraps EVERY command as
+        // `/bin/zsh -lc '<script>'`, so the raw first token names the same
+        // shell every time. One "Allow for this thread" click then blanket
+        // approved every later Codex command. `first_command_token` unwraps
+        // the wrapper, skips privilege prefixes and `VAR=value`, and takes the
+        // basename, which is what the card's own label shows.
         "Bash" | "command_execution" => {
             let command = input.get("command").and_then(|v| v.as_str())?;
-            let first = command.split_whitespace().next()?;
-            if first.is_empty() {
-                return None;
-            }
-            Some(format!("{}({}:*)", tool_name, first))
+            let head = crate::engine::command_guard::first_command_token(command)?;
+            Some(format!("{}({}:*)", tool_name, head))
         }
         _ => None,
     }
 }
 
-/// Append `pattern` to `<user_dir>/cc-allowed-tools` if not already present.
-/// Creates the file (with the header comment) if it doesn't exist. Atomic
-/// write via tmp + rename. No-op when `user_dir` is `None`.
-pub(crate) fn append_allowed_tool_pattern(
-    user_dir: Option<&Path>,
-    pattern: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let Some(dir) = user_dir else {
-        return Ok(());
-    };
-    let path = dir.join(CC_ALLOWED_TOOLS_FILE);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CC_ALLOWED_TOOLS_HEADER.to_string(),
-        Err(e) => return Err(e.into()),
-    };
-    if existing
-        .lines()
-        .map(str::trim)
-        .any(|l| !l.is_empty() && !l.starts_with('#') && l == pattern)
-    {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(pattern);
-    next.push('\n');
-    write_allowed_tools_file(dir, &next)
-}
-
-/// Read the raw contents of `<user_dir>/cc-allowed-tools`. Returns the seeded
-/// header for a missing file (mirrors what `cc_allowed_tools` would produce)
-/// so the settings UI shows something coherent even before the first prompt.
-pub(crate) fn read_allowed_tools_file(
-    user_dir: &Path,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let path = user_dir.join(CC_ALLOWED_TOOLS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(CC_ALLOWED_TOOLS_HEADER.to_string())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Atomically write the raw contents of `<user_dir>/cc-allowed-tools`.
-pub(crate) fn write_allowed_tools_file(
-    user_dir: &Path,
-    contents: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::create_dir_all(user_dir)?;
-    let path = user_dir.join(CC_ALLOWED_TOOLS_FILE);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
 /// Resolve the comma-separated tool allowlist for `claude --allowedTools`.
 ///
-/// Reads `<user_dir>/cc-allowed-tools` if present (one entry per line, blank
-/// lines and `#` comments ignored). On first call, seeds the file with the
-/// header comment so the user has something to discover and edit. Falls back
-/// to the empty default if `user_dir` is `None` or any IO fails.
-pub(crate) fn cc_allowed_tools(user_dir: Option<&Path>) -> String {
-    let default = || DEFAULT_CC_ALLOWED_TOOLS.join(",");
-    let Some(dir) = user_dir else {
-        return default();
-    };
-    let path = dir.join(CC_ALLOWED_TOOLS_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => contents
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect::<Vec<_>>()
-            .join(","),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Err(e) = std::fs::create_dir_all(dir)
-                .and_then(|_| std::fs::write(&path, CC_ALLOWED_TOOLS_HEADER))
-            {
-                log!("[ClaudeCode] Failed to seed {}: {}", path.display(), e);
-            }
-            default()
-        }
-        Err(e) => {
-            log!(
-                "[ClaudeCode] Failed to read {}: {} — using compiled default",
-                path.display(),
-                e
-            );
-            default()
-        }
+/// Reads [`GrantFile::CodingAgentTools`] out of this workspace's grants dir
+/// (ADR 0095). On first use it seeds the file with its header, so the user has
+/// something to discover and edit before ever clicking "Always allow".
+pub(crate) fn cc_allowed_tools(dir: &Path) -> String {
+    let file = GrantFile::CodingAgentTools;
+    if !grants::exists(dir, file) {
+        seed_allowed_tools_file(dir);
+    }
+    grants::patterns(dir, file).join(",")
+}
+
+/// Write the instructional header into a not-yet-existing allowlist file.
+/// Best-effort: a failure costs discoverability, never a spawn.
+fn seed_allowed_tools_file(dir: &Path) {
+    let file = GrantFile::CodingAgentTools;
+    if let Err(e) = grants::write_raw(dir, file, file.header()) {
+        log!(
+            "[ClaudeCode] Failed to seed {}: {}",
+            dir.join(file.file_name()).display(),
+            e
+        );
     }
 }
 
@@ -507,6 +436,11 @@ pub(crate) struct SpawnAgentThreadParams {
     pub app_id: Option<String>,
     /// Backend to launch for this coding-agent thread.
     pub coding_agent: crate::runtime::CodingAgent,
+    /// Model the session runs on, validated against `coding_agent`'s own picker
+    /// at the tool boundary. `None` inherits the backend default.
+    pub model: Option<String>,
+    /// Thinking budget for the session. `None` inherits the backend default.
+    pub reasoning_effort: Option<String>,
     /// Who launched this thread, stamped on its first `MessageReceived` for the
     /// message route popover. Independent of `parent_thread_id` above: a
     /// `relation: "top"` spawn records its spawning thread here while carrying no
@@ -599,9 +533,18 @@ pub enum SettleTerminal {
 
 /// Emit the terminal event for a thread the projection still considers
 /// `running` but with no live agent session or in-process loop behind it.
-/// Every caller is a user button. `terminal` says which of the two things that
-/// button did, per [`SettleTerminal`]. The user's actor flows onto either
-/// event so the chip reads "You".
+/// `terminal` says which of the two shapes to emit, per [`SettleTerminal`].
+///
+/// Callers come in two kinds, and `actor` is what tells them apart. A **user
+/// button** (Stop, or cancelling a question) passes the clicking device, so the
+/// chip reads "You". An **engine sweep** passes `MessageOrigin::system()`: the
+/// boot floor `settle_orphaned_running_coding_agent_threads`, and the external
+/// watchdog's orphan reconciliation pass on its 30s tick.
+///
+/// A sweep caller must keep passing the system actor. `AbortCause::StaleSettle`
+/// deliberately carries a user actor when a button exposed the stuck row, and
+/// `switch_was_user_initiated` reads actor plus cause together. Stamping a
+/// device on an automatic settle would push it toward the switch fingerprint.
 ///
 /// `StuckProjection` emits `ResponseAborted { StaleSettle }`, so the summary
 /// reads "Settled stuck response" rather than "Paused by restart" or "Response

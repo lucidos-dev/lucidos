@@ -232,13 +232,17 @@ impl EventStore {
             .filter_map(|id| uuid::Uuid::parse_str(id).ok())
             .collect();
 
+        // No SQL LIMIT: the cut belongs after the score sort below. An
+        // unordered `LIMIT` here returns an arbitrary slice of the candidates,
+        // so the best-scoring thread is dropped whenever Postgres did not
+        // happen to return it. `thread_uuids` is already bounded by the
+        // caller's SEMANTIC_CANDIDATE_LIMIT.
         let sql = format!(
-            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[]) LIMIT $2",
+            "SELECT {} FROM thread_summaries t WHERE t.thread_id = ANY($1::uuid[])",
             THREAD_COLS.as_str(),
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
             .bind(&thread_uuids)
-            .bind(limit)
             .fetch_all(&self.pool)
             .await?;
 
@@ -255,6 +259,7 @@ impl EventStore {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        results.truncate(limit.max(0) as usize);
         Ok(results)
     }
 }

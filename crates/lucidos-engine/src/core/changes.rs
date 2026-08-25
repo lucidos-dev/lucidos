@@ -30,16 +30,22 @@ pub struct Change {
     /// completion. The frontend reads this to surface a confirm-before-Apply
     /// warning so the user knows they're about to land partial changes.
     pub incomplete: bool,
-    /// `true` when the originating thread is mid-turn — `Running` or
-    /// `WaitingForUserAnswer`, the two states where `available_thread_actions`
-    /// withholds Apply. Applying then races the session's next proposal (real
-    /// thread 76b4ee76). NOT a DB column — populated by `enrich_thread_active`
-    /// at serialize time (defaults to `false` for direct DB loads). The
-    /// frontend disables Apply for these and Apply All filters them out; the
-    /// per-change Apply endpoint already 409s via `guard_change_action`.
+    /// `true` when the originating thread has not finished with this change, so
+    /// `available_thread_actions` withholds Apply. Two ways to be unsettled, and
+    /// applying under either races what the session does next (real thread
+    /// 76b4ee76):
+    ///
+    /// - **mid-turn**, `Running` or `WaitingForUserAnswer`;
+    /// - **parked**, holding a live event wait or an active sub-thread. It wakes
+    ///   on the delivery and commits on to the same branch (ADR 0106).
+    ///
+    /// NOT a DB column: populated by `enrich_thread_unsettled` at serialize time
+    /// (defaults to `false` for direct DB loads). The frontend disables Apply for
+    /// these and the bulk paths filter them out; the per-change Apply endpoint
+    /// already 409s via `guard_change_action`.
     #[sqlx(default)]
     #[serde(default)]
-    pub thread_active: bool,
+    pub thread_unsettled: bool,
 }
 
 /// One thread's contribution to the current restart-required toast: the
@@ -73,12 +79,22 @@ pub async fn enrich_thread_titles(
 /// be withheld (mirrors the `live` clause in `available_thread_actions`).
 const LIVE_THREAD_STATUSES: [&str; 2] = ["running", "waiting_for_user_answer"];
 
-/// Of the given thread ids, return the subset whose `thread_summaries.status`
-/// is mid-turn (`running` / `waiting_for_user_answer`). Single batch query.
-/// Apply All filters its batch with this so it never applies a change whose
-/// session is still working — the gate the per-change endpoint already enforces
-/// via `guard_change_action`.
-pub async fn live_thread_ids(
+/// The parked half of the same question, mirroring `will_resume` in
+/// `available_thread_actions`: a thread watching an event, or waiting on a
+/// sub-thread, is `idle` but will wake and may commit again (ADR 0106).
+const PARKED_THREAD_SQL: &str = "live_event_wait_count > 0 OR active_children_count > 0";
+
+/// Of the given thread ids, return the subset that has not finished with its
+/// change: mid-turn, or parked on an event wait or a sub-thread. One batch
+/// query. The bulk paths filter their batch with this, so they never resolve a
+/// change whose session is still going. That is the gate the per-change
+/// endpoint enforces via `guard_change_action`.
+///
+/// This is the SQL mirror of `available_thread_actions`'s `live || will_resume`,
+/// and the two must agree. This one drives the bulk paths and the
+/// `thread_unsettled` flag the UI disables its buttons on. That one drives the
+/// per-thread actions and the per-change guard.
+pub async fn unsettled_thread_ids(
     pool: &PgPool,
     thread_ids: impl Iterator<Item = Uuid>,
 ) -> Result<std::collections::HashSet<Uuid>, sqlx::Error> {
@@ -86,10 +102,10 @@ pub async fn live_thread_ids(
     if ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
+    let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT thread_id FROM thread_summaries \
-         WHERE thread_id = ANY($1) AND status = ANY($2)",
-    )
+         WHERE thread_id = ANY($1) AND (status = ANY($2) OR {PARKED_THREAD_SQL})"
+    ))
     .bind(&ids)
     .bind(&LIVE_THREAD_STATUSES[..])
     .fetch_all(pool)
@@ -97,19 +113,19 @@ pub async fn live_thread_ids(
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Return the subset of `changes` whose thread is NOT mid-turn — the ones
-/// Apply All / Discard All may act on. Filters out Running /
-/// WaitingForUserAnswer threads: the per-change endpoints already 409 those via
-/// `guard_change_action`, and acting on them in bulk would merge (or delete the
-/// worktree of) a branch the coding agent is still working on. One batch query.
-pub async fn drop_live_thread_changes(
+/// Return the subset of `changes` whose thread has settled: the ones Apply All
+/// and Discard All may act on. Acting on the rest in bulk would merge, or delete
+/// the worktree of, a branch the coding agent is still working on. The
+/// per-change endpoints 409 that same hazard via `guard_change_action`, so the
+/// bulk paths cannot become the quiet way around it. One batch query.
+pub async fn drop_unsettled_thread_changes(
     pool: &PgPool,
     changes: Vec<Change>,
 ) -> Result<Vec<Change>, sqlx::Error> {
-    let live = live_thread_ids(pool, changes.iter().filter_map(|c| c.thread_id)).await?;
+    let unsettled = unsettled_thread_ids(pool, changes.iter().filter_map(|c| c.thread_id)).await?;
     Ok(changes
         .into_iter()
-        .filter(|c| !c.thread_id.is_some_and(|tid| live.contains(&tid)))
+        .filter(|c| !c.thread_id.is_some_and(|tid| unsettled.contains(&tid)))
         .collect())
 }
 
@@ -139,15 +155,15 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Set `thread_active` on each pending Change by batch-loading thread run-state.
+/// Set `thread_unsettled` on each pending Change by batch-loading thread state.
 /// Applied changes are left alone (their thread state no longer gates Apply).
 /// Single batch query, no N+1 — the serialize-time companion to
 /// `enrich_thread_titles`.
-pub async fn enrich_thread_active(
+pub async fn enrich_thread_unsettled(
     pool: &PgPool,
     changes: &mut [Change],
 ) -> Result<(), sqlx::Error> {
-    let live = live_thread_ids(
+    let unsettled = unsettled_thread_ids(
         pool,
         changes
             .iter()
@@ -155,12 +171,12 @@ pub async fn enrich_thread_active(
             .filter_map(|c| c.thread_id),
     )
     .await?;
-    if live.is_empty() {
+    if unsettled.is_empty() {
         return Ok(());
     }
     for change in changes.iter_mut() {
         if let Some(tid) = change.thread_id {
-            change.thread_active = change.status == "pending" && live.contains(&tid);
+            change.thread_unsettled = change.status == "pending" && unsettled.contains(&tid);
         }
     }
     Ok(())
@@ -255,7 +271,7 @@ mod tests {
             thread_title: None,
             commits: vec![],
             incomplete: false,
-            thread_active: false,
+            thread_unsettled: false,
         }
     }
 
@@ -271,12 +287,12 @@ mod tests {
         .expect("insert thread_summary with status");
     }
 
-    /// `enrich_thread_active` flags a pending change whose thread is mid-turn
+    /// `enrich_thread_unsettled` flags a pending change whose thread is mid-turn
     /// (`running` / `waiting_for_user_answer`), leaves idle-thread changes
     /// false, and never flags an already-applied change (its thread state no
     /// longer gates Apply).
     #[tokio::test]
-    async fn enrich_thread_active_flags_only_live_pending() {
+    async fn enrich_thread_unsettled_flags_only_live_pending() {
         let (pool, db) = setup_test_db().await;
 
         let running = Uuid::new_v4();
@@ -300,21 +316,75 @@ mod tests {
             },
         ];
 
-        enrich_thread_active(&pool, &mut changes)
+        enrich_thread_unsettled(&pool, &mut changes)
             .await
             .expect("enrich");
 
-        assert!(changes[0].thread_active, "running thread blocks apply");
+        assert!(changes[0].thread_unsettled, "running thread blocks apply");
         assert!(
-            changes[1].thread_active,
+            changes[1].thread_unsettled,
             "waiting-for-answer thread blocks apply"
         );
-        assert!(!changes[2].thread_active, "idle thread allows apply");
-        assert!(!changes[3].thread_active, "no thread_id stays false");
+        assert!(!changes[2].thread_unsettled, "idle thread allows apply");
+        assert!(!changes[3].thread_unsettled, "no thread_id stays false");
         assert!(
-            !changes[4].thread_active,
+            !changes[4].thread_unsettled,
             "already-applied change is never flagged even if its thread is running"
         );
+
+        teardown_test_db(&db).await;
+    }
+
+    /// A parked thread is `idle`. The status list alone would let its change
+    /// through Apply All, and leave the button live in the Changes view. Both
+    /// waiting causes count, matching `available_thread_actions` (ADR 0106).
+    #[tokio::test]
+    async fn a_parked_thread_is_unsettled_even_though_its_status_is_idle() {
+        let (pool, db) = setup_test_db().await;
+
+        let watching = Uuid::new_v4();
+        let with_child = Uuid::new_v4();
+        let settled = Uuid::new_v4();
+        for tid in [watching, with_child, settled] {
+            insert_thread_summary_with_status(&pool, tid, "idle").await;
+        }
+        sqlx::query("UPDATE thread_summaries SET live_event_wait_count = 1 WHERE thread_id = $1")
+            .bind(watching)
+            .execute(&pool)
+            .await
+            .expect("arm a wait");
+        sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+            .bind(with_child)
+            .execute(&pool)
+            .await
+            .expect("give it a child");
+
+        let mut changes = vec![
+            make_change(Some(watching)),
+            make_change(Some(with_child)),
+            make_change(Some(settled)),
+        ];
+        enrich_thread_unsettled(&pool, &mut changes)
+            .await
+            .expect("enrich");
+
+        assert!(
+            changes[0].thread_unsettled,
+            "a live event wait blocks apply"
+        );
+        assert!(changes[1].thread_unsettled, "an active child blocks apply");
+        assert!(
+            !changes[2].thread_unsettled,
+            "a settled idle thread still allows apply"
+        );
+
+        // The bulk paths read the same predicate, so Apply All drops the two
+        // parked ones and keeps the settled one.
+        let kept = drop_unsettled_thread_changes(&pool, changes)
+            .await
+            .expect("filter");
+        assert_eq!(kept.len(), 1, "only the settled thread's change survives");
+        assert_eq!(kept[0].thread_id, Some(settled));
 
         teardown_test_db(&db).await;
     }

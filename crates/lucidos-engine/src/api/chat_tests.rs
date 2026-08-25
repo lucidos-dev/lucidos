@@ -389,6 +389,15 @@ fn base_req(mode: ActorMode) -> ChatRequest {
     }
 }
 
+/// The status `validate_mode_and_spawn` refused with. It returns an `ApiError`,
+/// which carries a message and so is not comparable; every refusal below cares
+/// only about the status.
+fn spawn_refusal(request: &ChatRequest) -> StatusCode {
+    validate_mode_and_spawn(request)
+        .expect_err("expected a refusal")
+        .status
+}
+
 #[test]
 fn human_mode_with_no_spawn_context_is_valid() {
     let req = base_req(ActorMode::Human);
@@ -401,14 +410,14 @@ fn human_mode_with_no_spawn_context_is_valid() {
 fn human_mode_with_parent_thread_id_returns_400() {
     let mut req = base_req(ActorMode::Human);
     req.parent_thread_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
 fn human_mode_with_spawning_event_id_returns_400() {
     let mut req = base_req(ActorMode::Human);
     req.spawning_event_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -426,13 +435,13 @@ fn agent_mode_with_parent_and_spawning_event_is_valid() {
 #[test]
 fn agent_mode_without_parent_thread_id_returns_400() {
     let req = base_req(ActorMode::Agent);
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
 fn engine_mode_without_parent_thread_id_returns_400() {
     let req = base_req(ActorMode::Engine);
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -446,7 +455,7 @@ fn engine_mode_with_caller_workspace_is_valid() {
 fn invalid_parent_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.parent_thread_id = Some("not-a-uuid".into());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -454,7 +463,7 @@ fn invalid_spawning_event_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.parent_thread_id = Some(Uuid::new_v4().to_string());
     req.spawning_event_id = Some("not-a-uuid".into());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -496,7 +505,7 @@ fn caller_workspace_with_parent_thread_id_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.caller_workspace = Some("dev".into());
     req.parent_thread_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -504,7 +513,7 @@ fn caller_workspace_with_spawning_event_id_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.caller_workspace = Some("dev".into());
     req.spawning_event_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -513,14 +522,14 @@ fn caller_thread_id_without_caller_workspace_returns_400() {
     // an orphan caller id is a malformed request, not a silent drop.
     let mut req = base_req(ActorMode::Human);
     req.caller_thread_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
 fn caller_event_id_without_caller_workspace_returns_400() {
     let mut req = base_req(ActorMode::Human);
     req.caller_event_id = Some(Uuid::new_v4().to_string());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -528,7 +537,7 @@ fn caller_thread_id_invalid_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.caller_workspace = Some("dev".into());
     req.caller_thread_id = Some("not-a-uuid".into());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -536,7 +545,7 @@ fn caller_event_id_invalid_uuid_returns_400() {
     let mut req = base_req(ActorMode::Agent);
     req.caller_workspace = Some("dev".into());
     req.caller_event_id = Some("not-a-uuid".into());
-    assert_eq!(validate_mode_and_spawn(&req), Err(StatusCode::BAD_REQUEST));
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -557,6 +566,79 @@ fn caller_workspace_with_all_three_fields_is_valid() {
     req.caller_thread_id = Some(Uuid::new_v4().to_string());
     req.caller_event_id = Some(Uuid::new_v4().to_string());
     assert!(validate_mode_and_spawn(&req).is_ok());
+}
+
+// ── the self-parent refusal ──────────────────────────────────────────
+//
+// A row whose `parent_thread_id` is its own `thread_id` is a one-node cycle
+// in the thread family. `POST /api/v1/chat/stream` is the one write path that
+// could produce it: Agent mode has to supply a parent, and nothing said the
+// parent must differ from the target.
+
+#[test]
+fn a_thread_may_not_be_its_own_parent() {
+    let tid = Uuid::new_v4();
+    let mut req = base_req(ActorMode::Agent);
+    req.thread_id = Some(tid.to_string());
+    req.parent_thread_id = Some(tid.to_string());
+
+    let err = validate_mode_and_spawn(&req).expect_err("self-parent must be refused");
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("parent_thread_id"),
+        "names the offending field: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("own parent"),
+        "names the problem, not just the status: {}",
+        err.message
+    );
+}
+
+#[test]
+fn the_self_parent_check_compares_uuids_not_strings() {
+    // Same id, different spelling. A string compare would let this through
+    // and write the poison row.
+    let tid = Uuid::new_v4();
+    let mut req = base_req(ActorMode::Agent);
+    req.thread_id = Some(tid.to_string().to_uppercase());
+    req.parent_thread_id = Some(tid.to_string());
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn a_parent_that_differs_from_the_target_is_still_accepted() {
+    // The ordinary spawn: `lucidos spawn-thread --relation child` sends a
+    // fresh target id plus the caller's id as parent.
+    let tid = Uuid::new_v4();
+    let parent = Uuid::new_v4();
+    let mut req = base_req(ActorMode::Agent);
+    req.thread_id = Some(tid.to_string());
+    req.parent_thread_id = Some(parent.to_string());
+
+    let v = validate_mode_and_spawn(&req).unwrap();
+    assert_eq!(v.thread_id, Some(tid));
+    assert_eq!(v.parent_thread_id, Some(parent));
+}
+
+#[test]
+fn a_target_with_no_parent_is_not_read_as_self_parented() {
+    // Both `None` compare equal, so the guard has to test for a parent
+    // first. Without that, every plain human send would 400.
+    let mut req = base_req(ActorMode::Human);
+    req.thread_id = None;
+    req.parent_thread_id = None;
+    assert!(validate_mode_and_spawn(&req).is_ok());
+}
+
+#[test]
+fn a_malformed_target_thread_id_is_still_a_400() {
+    // The validator parses `thread_id` now, so it owns this refusal that
+    // the handlers used to make on their own.
+    let mut req = base_req(ActorMode::Human);
+    req.thread_id = Some("not-a-uuid".into());
+    assert_eq!(spawn_refusal(&req), StatusCode::BAD_REQUEST);
 }
 
 // -- validate_thread_continuity ---------------------------------------

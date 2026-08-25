@@ -45,7 +45,7 @@ export interface ThreadSummary {
    *  a row whose events were never loaded. */
   live_event_wait_count: number;
   /** The same waits the count counts, spelled out. This is the whole content of
-   *  the subscription indicator, and carrying it here is what lets a snapshot
+   *  the waiting indicator, and carrying it here is what lets a snapshot
    *  correct it. The client used to build the list ONLY by folding a thread's
    *  own `EventWait*` events. One missed `EventWaitDelivered` then left a
    *  resolved wait on screen with a live countdown, permanently.

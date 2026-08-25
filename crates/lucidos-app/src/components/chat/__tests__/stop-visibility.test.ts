@@ -130,7 +130,7 @@ beforeEach(() => {
 describe('the Stop control appears only while a turn is in flight', () => {
   it('draws no Stop on an idle thread that is holding live subscriptions', () => {
     // The reported shape. The thread is asleep on purpose: it reads as Waiting
-    // in the drawer and its subscription indicator lists what it watches. None
+    // in the drawer and its waiting indicator lists what it watches. None
     // of that is a turn, and Stop no longer ends a subscription, so a Stop here
     // would be a red button that does nothing.
     focus(makeThread('t-idle', 'idle', {

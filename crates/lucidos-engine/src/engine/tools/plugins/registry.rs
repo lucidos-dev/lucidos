@@ -124,6 +124,48 @@ pub(crate) async fn latest_install(
         .map(|payload| InstalledRecord { payload }))
 }
 
+/// What a merge needs to know about the version a plugin is currently on: the
+/// install commit whose tree holds the shipped bytes, and the paths that version
+/// shipped. The *merge base* side of a three-way merge comes from here.
+///
+/// Only plugins with a recorded commit appear. A legacy row without one has no
+/// baseline, so its files are plainly replaced. That matches how the Modified
+/// badge already reads such a row as unmodified.
+#[derive(Debug, Clone)]
+pub(crate) struct PluginBaseline {
+    pub(crate) commit: String,
+    pub(crate) files: Vec<String>,
+}
+
+/// Every installed plugin's [`PluginBaseline`], keyed by canonical plugin id.
+///
+/// Read whole rather than per id because the install path cannot name the id
+/// yet: it only learns it when the fetched `manifest.toml` parses, which happens
+/// inside the blocking task that this must be handed to. One projection scan is
+/// the same cost the Plugins panel already pays per load.
+pub(crate) async fn project_baselines(
+    pool: &sqlx::PgPool,
+) -> Result<
+    std::collections::BTreeMap<String, PluginBaseline>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    Ok(project_installs(pool)
+        .await?
+        .into_iter()
+        .filter_map(|(id, payload)| {
+            let rec = InstalledRecord { payload };
+            let commit = rec.commit()?.to_string();
+            Some((
+                id,
+                PluginBaseline {
+                    commit,
+                    files: rec.files(),
+                },
+            ))
+        })
+        .collect())
+}
+
 pub(crate) struct InstalledRecord {
     payload: serde_json::Value,
 }
@@ -478,17 +520,31 @@ pub(crate) fn plugin_modification_status(
     workspace_path: &Path,
     record: &InstalledRecord,
 ) -> ModificationStatus {
-    let unmodified = ModificationStatus::default();
     let Some(commit_sha) = record.commit() else {
-        return unmodified;
+        return ModificationStatus::default();
     };
-    let files = record.files();
+    modification_status_for(workspace_path, commit_sha, &record.files())
+}
+
+/// [`plugin_modification_status`] over a baseline the caller already resolved.
+/// The install path reaches for this form: it holds a [`PluginBaseline`] read
+/// before the blocking fetch, and has no `InstalledRecord` in hand.
+///
+/// One body serves both, so the merge planner and the badge cannot drift on
+/// what "modified" means. That is why the planner consumes this instead of
+/// re-deriving its own diff.
+pub(crate) fn modification_status_for(
+    workspace_path: &Path,
+    commit_sha: &str,
+    files: &[String],
+) -> ModificationStatus {
+    let unmodified = ModificationStatus::default();
 
     // Partition recorded files by how each content type must be compared.
     let mut app_dirs: BTreeSet<String> = BTreeSet::new();
     let mut flat_files: Vec<String> = Vec::new();
     let mut trigger_files: Vec<String> = Vec::new();
-    for f in &files {
+    for f in files {
         if let Some(rest) = f.strip_prefix("apps/") {
             if let Some(seg) = rest.split('/').next().filter(|s| !s.is_empty()) {
                 app_dirs.insert(format!("apps/{}", seg));

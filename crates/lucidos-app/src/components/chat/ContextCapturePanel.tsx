@@ -51,7 +51,7 @@ function ContextSectionRow({ section, tokens }: { section: ContextSection; token
         <ContextChevron open={open} />
         <span class="context-section-name">{section.name}</span>
         <span class="context-section-chars">
-          {formatChars(section.char_count)} · ≈{formatTokens(tokens(section.char_count))}
+          {formatChars(section.budget_delta_chars)} · ≈{formatTokens(tokens(section.budget_delta_chars))}
         </span>
       </button>
       {open && section.content !== undefined && (
@@ -68,7 +68,7 @@ function ContextSectionRow({ section, tokens }: { section: ContextSection; token
 
 function ContextInnerGroup({ group, tokens }: { group: InnerGroup; tokens: TokenScale }) {
   const [open, setOpen] = useState(true);
-  const totalChars = group.sections.reduce((a, s) => a + s.char_count, 0);
+  const totalChars = group.sections.reduce((a, s) => a + s.budget_delta_chars, 0);
   return (
     <div class="context-inner-group">
       <button class="context-inner-header" onClick={() => setOpen(!open)} aria-expanded={open}>
@@ -92,7 +92,7 @@ function ContextRoleGroup({ role, tokens }: { role: RoleGroup; tokens: TokenScal
   const [open, setOpen] = useState(true);
   const totalChars = role.innerGroups
     .flatMap(ig => ig.sections)
-    .reduce((a, s) => a + s.char_count, 0);
+    .reduce((a, s) => a + s.budget_delta_chars, 0);
   return (
     <div class="context-role">
       <button class="context-role-header" onClick={() => setOpen(!open)} aria-expanded={open}>
@@ -181,7 +181,7 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     <>
       <div class="step-detail-context-meta">
         <code>{hydrated.model || '(unknown model)'}</code>
-        <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : hydrated.producer === 'codex' ? 'Codex' : 'Main LLM'}</span>
+        <span> · {hydrated.producer === 'claude_code' ? 'Claude Code' : hydrated.producer === 'codex' ? 'Codex' : hydrated.producer === 'auxiliary' ? 'Auxiliary' : 'Main LLM'}</span>
         <span> · {hydrated.tools.length} tools</span>
         {hydrated.legacy && <span class="context-legacy-badge" data-tooltip="Synthesized from legacy events">legacy capture</span>}
       </div>
@@ -217,6 +217,10 @@ export function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
           {snap.trimmed && <span class="context-budget-trimmed">trimmed</span>}
         </div>
         <div class="progress-bar">
+          {/* `pct` is unclamped, so a capture over its window sets a width
+              above 100%. The track clips it (`.progress-bar` is
+              `overflow: hidden`), which is all a bar can say: the reading
+              above is what reports the overshoot. */}
           <div class="progress-bar-fill" style={`width: ${pct}%`} />
         </div>
       </div>

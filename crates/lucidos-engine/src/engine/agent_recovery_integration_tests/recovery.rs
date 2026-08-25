@@ -895,13 +895,19 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         label: "My iPhone".into(),
     };
 
-    // Three threads interrupted by the same switch: one this boot resumed, one it
-    // silently declined (over the chat cap / a failed resume / a skipped branch),
-    // and one that was archived while its turn was in flight.
+    // Four threads interrupted by the same switch. One this boot resumed. One it
+    // silently declined, over the chat cap or on a failed resume. One archived
+    // while its turn was in flight. One carrying a pending change.
+    //
+    // The fourth is here because the floor is scoped `status = 'paused'`. An
+    // abort used to defer to a pending change and write `'waiting'`, and such a
+    // thread could not be selected at all. So a promise nobody kept was never
+    // withdrawn on it, and its Continue button never came back.
     let resumed = Uuid::new_v4();
     let declined = Uuid::new_v4();
     let archived = Uuid::new_v4();
-    for thread_id in [resumed, declined, archived] {
+    let with_change = Uuid::new_v4();
+    for thread_id in [resumed, declined, archived, with_change] {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
@@ -922,6 +928,50 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         .await
         .expect("emit succeeds")
         .expect("event persisted");
+
+        if thread_id == with_change {
+            let cc_meta = EventMeta {
+                channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            };
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::SessionStarted {
+                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                    session_id: "cc-session".into(),
+                    branch: "claude-code/fix".into(),
+                    repo_id: None,
+                    coding_agent_kind: Default::default(),
+                    coding_agent_folder: String::new(),
+                    app_id: None,
+                },
+                meta: cc_meta.clone(),
+            })
+            .await
+            .expect("emit succeeds")
+            .expect("event persisted");
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::ChangeProposed {
+                    change_id: "c-1".into(),
+                    description: Some("Fix".into()),
+                    files: vec!["src/main.rs".into()],
+                    requires_restart: false,
+                    origin: None,
+                    commit_sha: None,
+                    branch_name: "claude-code/fix".into(),
+                    repo_root: "/tmp".into(),
+                    hardened: false,
+                    incomplete: false,
+                    path: String::new(),
+                    diff: String::new(),
+                },
+                meta: cc_meta,
+            })
+            .await
+            .expect("emit succeeds")
+            .expect("event persisted");
+        }
 
         bus.emit(BusEvent::Thread {
             thread_id,
@@ -969,8 +1019,9 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
 
     // Every thread carries the switch fingerprint (device actor + engine
     // shutdown), so every one reads `paused`: nothing has gone wrong yet, the
-    // engine just went away and promised to come back.
-    for thread_id in [resumed, declined, archived] {
+    // engine just went away and promised to come back. Including the one with a
+    // change pending, which is what makes it reachable below.
+    for thread_id in [resumed, declined, archived, with_change] {
         assert_eq!(
             status_of(thread_id).await,
             "paused",
@@ -1013,6 +1064,12 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         "an archived thread is selected by NEITHER resume drain, so the floor is \
          its only chance: excluding it here is a permanent dead end"
     );
+    assert_eq!(
+        withdrawals(with_change).await,
+        1,
+        "a pending change does not exempt a thread from the floor. It used to, \
+         by keeping the row off 'paused', which is the one status this selects."
+    );
 
     // The withdrawal has to be VISIBLE, not just recorded. `recovery_after_restart`
     // is not the switch fingerprint (which needs `engine_shutdown` AND a device),
@@ -1020,7 +1077,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     // dot, a slot in the needs-attention count, and the Continue button the
     // withdrawal exists to hand back. Leaving these two on the reassuring pause
     // glyph is exactly the state the user reported.
-    for thread_id in [declined, archived] {
+    for thread_id in [declined, archived, with_change] {
         assert_eq!(
             status_of(thread_id).await,
             "failed",
@@ -1040,7 +1097,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
     // Asserted as "no boundary on this thread says system", not merely "the
     // withdrawal says device", because the recurrence is always a NEW emit site
     // appearing beside the fixed ones.
-    for thread_id in [declined, archived] {
+    for thread_id in [declined, archived, with_change] {
         let actors: Vec<Option<String>> = sqlx::query_scalar(
             "SELECT payload->'actor'->>'kind' FROM events \
              WHERE aggregate_id = $1 AND event_type = 'ResponseAborted' \
@@ -1521,6 +1578,308 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
         branch_awaits_recovery(&branch, &std::collections::HashSet::new(), false),
         "the reported failure: recovery must not skip this branch, or no resume \
          is actuated and the boot floor withdraws the promise the user was shown"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Regression for the reported bug: a user switch left an **app** coding-agent
+/// thread on "Response interrupted" with a manual Continue, instead of
+/// resuming it.
+///
+/// The cause was upstream of every read below. `recover_orphaned_worktrees`
+/// scanned the Lucidos repo and the registered externals only. An app thread's
+/// worktree and branch belong to the workspace git, which no registry lists, so
+/// the sweep never saw the branch. The reads never ran and the thread fell
+/// through to `end_stuck_session`. The repo list is unit-tested in
+/// `agent_recovery::helpers`. This test pins the DB half for the app shape, so
+/// a later kind filter on any of these three cannot quietly undo the fix.
+///
+/// Seeded from the reported thread's real event sequence, trailing events
+/// included. Claude Code answered the pending permission prompt and streamed a
+/// final newline AFTER the teardown abort. Neither may retire the turn or
+/// consume the switch fingerprint.
+#[tokio::test]
+async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
+    use crate::engine::agent_recovery::{
+        lookup_app_spawn_id, switch_was_user_initiated, BRANCH_CLASSIFICATION_SQL,
+    };
+    use crate::engine::thread_events::{AbortCause, MessageOrigin};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let app_id = "habit-tracker";
+    let branch = format!("lucidos-claude-code-app-{app_id}-add-streaks-{thread_id}");
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: String::new(),
+            branch: branch.clone(),
+            repo_id: None,
+            coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
+            coding_agent_folder: format!("/home/u/workspaces/dev/data/apps/{app_id}"),
+            app_id: Some(app_id.to_string()),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // The switch teardown boundary: device actor plus EngineShutdown.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::EngineShutdown,
+        },
+        meta: EventMeta {
+            actor: Some(MessageOrigin::Device {
+                device_id: "d1".into(),
+                label: "My MacBook".into(),
+            }),
+            ..cc_meta.clone()
+        },
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // The dying subprocess's trailing output, which really does land after the
+    // boundary: the rejected permission prompt, then a last streamed newline.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolResult {
+            name: String::new(),
+            result: "The user doesn't want to proceed with this tool use.".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            tool_use_id: "toolu_1".into(),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentTextStreamed {
+            text: "\n\n".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Read 1: the branch must classify `running`, or the sweep never opens the
+    // turn and the resume gate is never consulted.
+    let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
+        .fetch_all(&pool)
+        .await
+        .expect("branch classification query");
+    let status = rows
+        .into_iter()
+        .find(|(b, _)| *b == branch)
+        .map(|(_, s)| s)
+        .expect("the app branch is classified");
+    assert_eq!(
+        status, "running",
+        "neither trailing event is a turn terminal, so the app thread's turn is \
+         still in flight when the next engine boots"
+    );
+
+    // Read 2: the switch fingerprint, which decides resume against Continue.
+    assert!(
+        switch_was_user_initiated(&pool, thread_id).await,
+        "the teardown abort carries a device actor and EngineShutdown, so this \
+         app thread is owed an auto-resume rather than a Continue button"
+    );
+
+    // Read 3: the app id, which decides the shape of a rebuilt worktree.
+    assert_eq!(
+        lookup_app_spawn_id(&pool, thread_id).await.as_deref(),
+        Some(app_id),
+        "an app thread's lost worktree must rebuild as a sparse cone over its \
+         own app folder, never as the whole workspace tree"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The same lookup for the other two kinds. `None` routes a rebuild to the
+/// ordinary full `worktree_add`, which is what a Lucidos-source or
+/// external-repo branch needs.
+#[tokio::test]
+async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
+    use crate::engine::agent_recovery::lookup_app_spawn_id;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: String::new(),
+            branch: format!("lucidos-claude-code-repo-fix-oauth-urls-{thread_id}"),
+            repo_id: None,
+            coding_agent_kind: crate::engine::agent_session::CodingAgentKind::Lucidos,
+            coding_agent_folder: String::new(),
+            app_id: None,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    assert_eq!(
+        lookup_app_spawn_id(&pool, thread_id).await,
+        None,
+        "a Lucidos-source thread has no app folder to narrow a rebuild to"
+    );
+    assert_eq!(
+        lookup_app_spawn_id(&pool, Uuid::new_v4()).await,
+        None,
+        "a thread with no SessionStarted at all answers None, not a panic"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The other half of the resume contract, for the app shape. A crash emits no
+/// teardown boundary, so the thread keeps the manual Continue affordance and is
+/// never auto-resumed. Work that killed the engine must not loop (ADR 0045).
+///
+/// Scanning the workspace repo is what first brings app threads under these
+/// gates. So the crash case needs pinning at the same moment the switch case
+/// starts working.
+#[tokio::test]
+async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
+    use crate::engine::agent_recovery::switch_was_user_initiated;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    // Identical to the switch seed minus the teardown abort: a crash gets no
+    // chance to emit one, and that absence is the whole fingerprint.
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: String::new(),
+            branch: format!("lucidos-claude-code-app-habit-tracker-add-streaks-{thread_id}"),
+            repo_id: None,
+            coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
+            coding_agent_folder: "/home/u/workspaces/dev/data/apps/habit-tracker".into(),
+            app_id: Some("habit-tracker".into()),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentTextStreamed {
+            text: "mid-turn when the engine died".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    assert!(
+        !switch_was_user_initiated(&pool, thread_id).await,
+        "no teardown boundary means no user switch, so an app thread that \
+         crashed the engine gets Continue rather than an auto-resume"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An app thread parked on an unanswered question is a stable checkpoint, not
+/// an interrupted turn. Recovery must preserve it across either restart cause:
+/// no abort, no idle, worktree intact, so the card on screen stays answerable.
+#[tokio::test]
+async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
+    use crate::engine::agent_recovery::thread_has_unanswered_question;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "sid-app-park".into(),
+            branch: format!("lucidos-claude-code-app-habit-tracker-add-streaks-{thread_id}"),
+            repo_id: None,
+            coding_agent_kind: crate::engine::agent_session::CodingAgentKind::App,
+            coding_agent_folder: "/home/u/workspaces/dev/data/apps/habit-tracker".into(),
+            app_id: Some("habit-tracker".into()),
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: "toolu_q1".into(),
+            cc_session_id: "sid-app-park".into(),
+            question: "Border or background?".into(),
+            options: Vec::new(),
+            worktree_path: None,
+            multi_select: false,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    assert!(
+        thread_has_unanswered_question(&pool, thread_id).await,
+        "the question is still the newest thing on the thread, so recovery must \
+         preserve the app thread rather than abort or idle it"
     );
 
     pool.close().await;

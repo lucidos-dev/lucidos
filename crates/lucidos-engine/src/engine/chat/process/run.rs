@@ -5,7 +5,7 @@
 //! (`titles`, `history`, `system_prompt`, `context_sections`); this file wires
 //! them together exactly as the original single function did.
 
-use crate::core::{PreferenceStore, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY};
+use crate::core::PreferenceStore;
 use crate::engine::agentic_loop::{
     cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
 };
@@ -15,10 +15,7 @@ use crate::engine::context::{
 use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
-use crate::llm::{
-    get_default_tools, get_image_generation_tool, get_notification_tool,
-    get_save_thread_image_tool, get_view_image_tool, Message,
-};
+use crate::llm::{chat_tail_tools, get_default_tools, get_notification_tool, Message};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -26,10 +23,18 @@ use uuid::Uuid;
 use super::super::events::{describe_images, emit_routing_failure, make_message_received};
 use super::super::images::build_user_content_with_images;
 use super::super::process_helpers::{
-    build_trigger_started_event, classify_or_fallback, TriggerContext,
+    build_trigger_started_event, classify_or_fallback, pinned_classification, TriggerContext,
 };
 use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
 use super::PreEmittedOrigin;
+
+/// How many times a follow-up alternates between "take the thread" and
+/// "inject into whoever holds it" before falling back to the queue.
+///
+/// Two, because only one interleaving needs a retry: admission refused, then
+/// the holder's turn ended before the inject landed. The queue below is the
+/// backstop for anything stranger, and it has its own timeout.
+const ADMISSION_ATTEMPTS: u32 = 2;
 
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
@@ -137,6 +142,31 @@ struct SetupCancel {
 }
 
 impl LucidosEngine {
+    /// Settle this turn's exchange as failed, then hand the error back so the
+    /// caller can `return Err(..)` in one line.
+    ///
+    /// Idempotent: the gate skips the emit when a terminator already landed
+    /// for `anchor`. A turn is finished either way by the time this returns,
+    /// which is the promise `process_message_with_steps` makes to its callers.
+    async fn fail_turn(
+        &self,
+        thread_id: Uuid,
+        anchor: Uuid,
+        channel: Option<EventChannel>,
+        error: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Box<dyn std::error::Error + Send + Sync> {
+        crate::engine::agentic_loop::ensure_failure_terminator_emitted(
+            &self.event_bus,
+            &self.pool,
+            thread_id,
+            anchor,
+            channel,
+            &error.to_string(),
+        )
+        .await;
+        error
+    }
+
     /// Internal: Process a message with optional trigger context
     // Same wide signature as `process_message_with_steps` plus trigger context.
     #[allow(clippy::too_many_arguments)]
@@ -211,6 +241,21 @@ impl LucidosEngine {
             None
         };
 
+        // Generate a per-request ID for ProcessResult tracking
+        let request_id = Uuid::new_v4();
+        // A new thread is one where the caller didn't supply a thread_id
+        // (backwards compat: if no thread_id, use request_id).
+        // The frontend now always sends thread_id, but scheduled tasks and
+        // tool-invoked CC may still omit it.
+        //
+        // Resolved BEFORE the image-description spawn below, which needs the
+        // real id to attach its `ContextCaptured` to. A first message with an
+        // image supplies no thread id, so reading the option down there would
+        // leave the commonest description call unaccounted.
+        let is_new_thread = thread_id.is_none();
+        let thread_id = thread_id.unwrap_or(request_id);
+        let thread_id_str = thread_id.to_string();
+
         // Spawn Flash image description in background (don't block main LLM flow).
         // Returns `(description, model)` so the agentic loop can emit
         // `ImageDescribed { model, .. }` with the actual model that produced
@@ -220,29 +265,46 @@ impl LucidosEngine {
             (user_images, &self.extractor)
         {
             if !imgs.is_empty() {
-                let img_desc_model = PreferenceStore::get(&self.pool, PREF_MODEL_IMAGE_DESCRIPTION)
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                match extractor.provider_for_model(&img_desc_model) {
+                let purpose = crate::engine::ContextPurpose::ImageDescribe;
+                let call = crate::engine::aux_purpose::AuxCall::resolve(&self.pool, purpose).await;
+                match extractor.provider_for_model(call.model(), call.attempt_timeout()) {
                     Ok(provider) => {
                         // Resolve the model name we'll record on the event. The
                         // pref string wins when set; otherwise fall back to the
                         // provider's default (which is the model the call actually
                         // hits via `provider_for_model`'s "" / "default" branch).
                         let recorded_model =
-                            if img_desc_model.is_empty() || img_desc_model == "default" {
+                            if crate::engine::aux_purpose::is_extractor_default(call.model()) {
                                 provider.default_model().to_string()
                             } else {
-                                img_desc_model
+                                call.model().to_string()
                             };
+                        let effort = call.reasoning().map(str::to_string);
+                        let deadline = call.deadline();
                         let imgs: Vec<crate::api::ChatImage> = imgs.to_vec();
+                        let capture =
+                            crate::engine::AuxCapture::new(&self.event_bus, thread_id, purpose);
                         Some(tokio::spawn(async move {
-                            match describe_images(provider.as_ref(), &imgs).await {
-                                Ok(desc) => Some((desc, recorded_model)),
-                                Err(e) => {
+                            // Under the purpose's whole-call deadline. The task
+                            // is detached, so nothing else would ever stop it.
+                            let described = tokio::time::timeout(
+                                deadline,
+                                describe_images(
+                                    provider.as_ref(),
+                                    &imgs,
+                                    effort.as_deref(),
+                                    Some(&capture),
+                                ),
+                            )
+                            .await;
+                            match described {
+                                Ok(Ok(desc)) => Some((desc, recorded_model)),
+                                Ok(Err(e)) => {
                                     log!("[Chat] Image description failed: {}", e);
+                                    None
+                                }
+                                Err(_) => {
+                                    log!("[Chat] Image description timed out ({:?})", deadline);
                                     None
                                 }
                             }
@@ -259,16 +321,6 @@ impl LucidosEngine {
         } else {
             None
         };
-
-        // Generate a per-request ID for ProcessResult tracking
-        let request_id = Uuid::new_v4();
-        // A new thread is one where the caller didn't supply a thread_id
-        // (backwards compat: if no thread_id, use request_id).
-        // The frontend now always sends thread_id, but scheduled tasks and
-        // tool-invoked CC may still omit it.
-        let is_new_thread = thread_id.is_none();
-        let thread_id = thread_id.unwrap_or(request_id);
-        let thread_id_str = thread_id.to_string();
 
         // AskUserQuestion free-form path: if the thread is currently waiting
         // on a `UserQuestionAsked` and the user typed instead of clicking an
@@ -650,56 +702,61 @@ impl LucidosEngine {
             }
         }
 
-        // Fast-path for non-CC follow-ups: if the thread already has an active
-        // agentic loop, inject the message (with images) mid-flight instead of
-        // blocking in register_thread_queued for up to 60s. This mirrors the CC
-        // fast-path above but uses injection_tx instead of msg_tx.
+        // The Lucidos Agent's half of interrupt-and-redirect. An injected
+        // prompt is only READ between loop iterations. A turn inside a long
+        // tool call therefore sits on it for as long as that call runs. One
+        // tool yields early (`bash_output(wait_secs=…)` parks on
+        // `injection_notify`), and nothing else does, so an urgent follow-up
+        // cannot rely on the soft path.
         //
-        // An event-wait delivery takes this path like any other follow-up, and
-        // that is load-bearing rather than incidental. It used to be barred:
-        // an attached wake's prompt was the empty string (the payload lived in
-        // a `ToolResult` the running turn never rebuilt), so it was pushed into
-        // the 60 s queue instead, where the stuck-turn backstop evicted the
-        // running turn to let it in. That is the 2026-08-06 abort. A wake now
-        // carries real prose, so it injects.
-        if use_coding_agent != Some(true) && !is_new_thread {
-            let has_active = {
-                let threads = self.active_threads.lock().unwrap();
-                threads.contains_key(&thread_id)
-            };
+        // Cancel WITHOUT injecting, then fall through to the queue.
+        // `register_thread_queued` waits for this turn to release the handle,
+        // so the follow-up runs as the next turn. The interrupted turn's
+        // Canceled terminal is sequenced first, matching the coding-agent
+        // lane. Injecting first would race the loop's own drain. A prompt
+        // consumed by the dying turn's final iteration is neither answered nor
+        // left for the orphan chain.
+        if urgent && use_coding_agent != Some(true) && !is_new_thread {
+            let preempted = self.cancel_thread_for_followup(thread_id, origin.clone());
+            log!(
+                "[Chat] Urgent follow-up preempting the live turn on thread {} (preempted={})",
+                thread_id,
+                preempted
+            );
+        }
 
-            // The Lucidos Agent's half of interrupt-and-redirect. An injected
-            // prompt is only READ between loop iterations, so a turn inside a
-            // long tool call sits on it for as long as that call runs. One tool
-            // yields early (`bash_output(wait_secs=…)` parks on
-            // `injection_notify`), and nothing else does, so an urgent
-            // follow-up cannot rely on the soft path.
-            //
-            // Cancel WITHOUT injecting, then fall through to the slow path.
-            // `register_thread_queued` waits for this turn to release the
-            // handle, so the follow-up runs as the next turn with the
-            // interrupted turn's Canceled terminal sequenced first, matching
-            // the coding-agent lane. Injecting first would race the loop's own
-            // drain: a prompt consumed by the dying turn's final iteration is
-            // neither answered nor left for the orphan chain.
-            if urgent && has_active {
-                let preempted = self.cancel_thread_for_followup(thread_id, origin.clone());
-                log!(
-                    "[Chat] Urgent follow-up preempting the live turn on thread {} (preempted={})",
-                    thread_id,
-                    preempted
-                );
-            } else if has_active {
+        // Single-flight admission for the Lucidos Agent lane.
+        //
+        // `try_register_thread` asks whether a turn is already live here, and
+        // installs this turn's handle, under one lock. Two wakes for one
+        // logical event therefore cannot both come back owning the thread. A
+        // refusal means a turn IS live, so the message is injected into it
+        // instead of queued behind it: one paid model call for one event.
+        //
+        // An event-wait delivery coalesces like any other follow-up, and that
+        // is load-bearing rather than incidental. It used to be barred. An
+        // attached wake's prompt was the empty string, its payload living in a
+        // `ToolResult` the running turn never rebuilt. So it went into the
+        // queue, where the stuck-turn backstop evicted the running turn to let
+        // it in. A wake now carries real prose, so it injects.
+        let mut admitted: Option<crate::engine::ThreadRegistration> = None;
+        if use_coding_agent != Some(true) && !is_new_thread && !urgent {
+            for attempt in 1..=ADMISSION_ATTEMPTS {
+                if let Some(registration) = self.try_register_thread(thread_id) {
+                    admitted = Some(registration);
+                    break;
+                }
                 // Emit MessageReceived FIRST — same ordering guarantee as the CC
                 // fast-path. The agentic loop emits UserPromptInjected when it
                 // picks up the injection; without this ordering, UserPromptInjected
                 // can race ahead and create a duplicate exchange boundary.
                 //
                 // Skip the emit whenever the caller already persisted the
-                // event. Only an ENGINE WAKE also changes how the input is
-                // projected (see `PreEmittedOrigin::inject_kind` and the
-                // `InjectedPromptKind` docs). A pre-emitted user message still
-                // injects as `UserText`, so the loop acknowledges it with a
+                // event, this loop's own earlier pass included. Only an ENGINE
+                // WAKE also changes how the input is projected (see
+                // `PreEmittedOrigin::inject_kind` and the `InjectedPromptKind`
+                // docs). A pre-emitted user message still injects as
+                // `UserText`, so the loop acknowledges it with a
                 // `UserPromptInjected`.
                 use crate::engine::thread_events::EventMeta;
                 let inject_kind = if let Some(pre) = pre_emitted_origin {
@@ -758,7 +815,10 @@ impl LucidosEngine {
                 };
 
                 if injected {
-                    log!("[Chat] Follow-up injected into active thread {} (bypassed register_thread_queued)", thread_id);
+                    log!(
+                        "[Chat] Follow-up coalesced into the live turn on thread {}",
+                        thread_id
+                    );
                     // This path returns to the HTTP caller right here, so the
                     // injected message never reaches `run_agentic_loop`'s
                     // post-first-call emit — the handle would just be dropped.
@@ -796,16 +856,16 @@ impl LucidosEngine {
                     });
                 }
 
-                // Injection failed — the agentic loop completed (and dropped its
-                // injection receiver) between the has_active check and the send.
-                // Fall through to the slow path so register_thread_queued can
-                // start a fresh loop for this message. The slow path uses
-                // `pre_emitted_origin` (set above whether MessageReceived was
-                // freshly emitted OR the caller passed it for a child-wake) so
-                // it doesn't double-emit a starter event.
+                // Refused admission AND unable to inject: the live turn dropped
+                // its injection receiver between the two. Ask again, since the
+                // thread it holds is about to be free. The retry is bounded, so
+                // a handle whose receiver is gone but whose guard has not
+                // dropped yet cannot spin here.
                 log!(
-                    "[Chat] Follow-up injection lost the race for thread {} — falling back to slow path",
-                    thread_id
+                    "[Chat] Thread {} neither admitted nor injectable (attempt {} of {})",
+                    thread_id,
+                    attempt,
+                    ADMISSION_ATTEMPTS
                 );
             }
         }
@@ -816,7 +876,10 @@ impl LucidosEngine {
         // normal path drops it explicitly via `finalize_turn_and_drain_injections`
         // (remove-then-drain, see below), and the error/panic paths fall back to
         // its Drop impl.
-        let (cancel_token, mut injection_rx, guard) = self.register_thread_queued(thread_id).await;
+        let (cancel_token, mut injection_rx, guard) = match admitted {
+            Some(registration) => registration,
+            None => self.register_thread_queued(thread_id).await,
+        };
 
         // Trigger-driven runs hand the scheduler's per-trigger cancel down here.
         // Forward it onto the per-thread token so deleting/disabling/updating the
@@ -917,17 +980,35 @@ impl LucidosEngine {
         // `engine::in_flight_request_event_id`.
         self.set_thread_request_event_id(thread_id, guard.generation(), origin_id);
 
-        self.maybe_emit_titles(
-            thread_id,
-            &thread_id_str,
-            title,
-            is_trigger,
-            is_new_thread,
-            &trigger,
-            user_message,
-            user_images,
-        )
-        .await?;
+        // Hoisted above the first fallible exit that can now terminate the
+        // turn: `fail_turn` stamps it on the terminator it emits.
+        let response_channel: Option<EventChannel> = if is_trigger {
+            Some(EventChannel::Trigger)
+        } else {
+            None
+        };
+
+        // An exchange exists from here on, so EVERY error exit below settles
+        // it. There are three (this one, the coding-agent branch, and the
+        // capture-context read) plus the post-loop net. That completeness is
+        // what lets this function's callers drop their own terminators.
+        if let Err(e) = self
+            .maybe_emit_titles(
+                thread_id,
+                &thread_id_str,
+                title,
+                is_trigger,
+                is_new_thread,
+                &trigger,
+                user_message,
+                user_images,
+            )
+            .await
+        {
+            return Err(self
+                .fail_turn(thread_id, origin_id, response_channel, e)
+                .await);
+        }
 
         // `_guard` MUST stay alive across this await so cancel_thread lands
         // on the per-thread cancel_token (see process_cc.rs module doc).
@@ -942,7 +1023,10 @@ impl LucidosEngine {
             let skip_coalesce = mode == ActorMode::Agent
                 && parent_thread_id.is_some()
                 && spawning_event_id.is_some();
-            return self
+            // Returns straight out, so the post-loop net below never sees it.
+            // The branch emits its own terminator on most failures; the gate
+            // in `fail_turn` makes this a no-op whenever it did.
+            let cc_result = self
                 .run_cc_chat_branch(
                     thread_id,
                     request_id,
@@ -960,6 +1044,12 @@ impl LucidosEngine {
                     skip_coalesce,
                 )
                 .await;
+            return match cc_result {
+                Err(e) => Err(self
+                    .fail_turn(thread_id, origin_id, response_channel, e)
+                    .await),
+                ok => ok,
+            };
         }
 
         // ── Turn setup ──────────────────────────────────────────────────────
@@ -979,11 +1069,6 @@ impl LucidosEngine {
         // writes anything. The exit routes through `cancel_during_setup`, which
         // emits the terminator AND runs the shared turn tail, so a follow-up
         // typed during the setup is still recovered and re-submitted.
-        let response_channel: Option<EventChannel> = if is_trigger {
-            Some(EventChannel::Trigger)
-        } else {
-            None
-        };
         let cancel_exit = SetupCancel {
             thread_id,
             request_id,
@@ -1012,12 +1097,15 @@ impl LucidosEngine {
         let user_language = self.user_language.read().await.clone();
         let user_profile = self.user_profile.snapshot().await;
 
-        // Read memory model preference once for use in summarization and classification
-        let memory_model_pref = PreferenceStore::get(&self.pool, PREF_MODEL_MEMORY)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        // The memory *model selection*, read once for the classification call
+        // below. History summarisation resolves its own
+        // (`ContextPurpose::ConversationSummary`), which is why this no longer
+        // travels into `load_chat_history`.
+        let memory_call = crate::engine::aux_purpose::AuxCall::resolve(
+            &self.pool,
+            crate::engine::ContextPurpose::Memory,
+        )
+        .await;
 
         // This turn's clock. Every reading the model sees derives from it,
         // never from `Utc::now()`. The message array is rebuilt from events on
@@ -1029,6 +1117,22 @@ impl LucidosEngine {
         // `super::turn_clock`.
         let turn_started_at = self.turn_started_at(thread_id).await;
 
+        // This workspace's tool gates, read once and handed to every consumer:
+        // the tools array, the prompt's images clause, and its intent listing.
+        // A function of workspace configuration alone, so every thread here
+        // sees the same array and they share one cache entry (ADR 0088).
+        let Some(capabilities) = until_canceled(&cancel_token, self.read_turn_capabilities()).await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        };
+
+        // ADR 0085's context mode, off the capability read above. The tools
+        // array, the system prompt and this turn's payload then answer from one
+        // snapshot. `super::context_mode` owns everything it changes.
+        let context_mode = super::context_mode::ContextMode::from_capabilities(&capabilities.gates);
+
         // Resume tool blocks + conversation history + per-thread loaded
         // knowhow, all derived from a single events fetch (see
         // `load_chat_history`).
@@ -1039,8 +1143,8 @@ impl LucidosEngine {
                 is_new_thread,
                 thread_id,
                 user_message,
-                &memory_model_pref,
                 turn_started_at,
+                context_mode,
             ),
         )
         .await
@@ -1050,7 +1154,7 @@ impl LucidosEngine {
                 .await);
         };
         let super::history::ChatHistoryLoad {
-            resume_tool_blocks,
+            mut resume_tool_blocks,
             loaded_knowhow_docs,
             mut history_context,
             conversation_summary,
@@ -1065,33 +1169,41 @@ impl LucidosEngine {
         // Memory indexing is handled by the EventBus memory consumer —
         // it reacts to persisted MessageReceived/ResponseGenerated events.
 
-        let classification = {
-            if let Some(ref extractor) = self.extractor {
-                let ctx = if conversation_summary.is_empty() {
-                    None
-                } else {
-                    Some(conversation_summary.as_str())
-                };
-                // The single slowest step of the setup on a warm thread: a
-                // full LLM round-trip before any of the turn's own events exist.
-                let Some(classification) = until_canceled(
-                    &cancel_token,
-                    classify_or_fallback(extractor.classify_query(
-                        user_message,
-                        ctx,
-                        Some(&memory_model_pref),
-                    )),
-                )
-                .await
-                else {
-                    return Ok(self
-                        .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
-                        .await);
-                };
-                classification
+        // A pinned classification answers before the extractor is consulted,
+        // so the LLM call never happens. Off unless
+        // `LUCIDOS_FORCE_QUERY_CLASSIFICATION` is set, which leaves every
+        // ordinary turn on the path below.
+        let classification = if let Some(pinned) = pinned_classification() {
+            pinned
+        } else if let Some(ref extractor) = self.extractor {
+            let ctx = if conversation_summary.is_empty() {
+                None
             } else {
-                crate::memory::QueryClassification::default()
-            }
+                Some(conversation_summary.as_str())
+            };
+            // The single slowest step of the setup on a warm thread: a
+            // full LLM round-trip before any of the turn's own events exist.
+            let capture = crate::engine::AuxCapture::new(
+                &self.event_bus,
+                thread_id,
+                crate::engine::ContextPurpose::Memory,
+            );
+            let Some(classification) = until_canceled(
+                &cancel_token,
+                classify_or_fallback(
+                    extractor.classify_query(user_message, ctx, &memory_call, Some(&capture)),
+                    memory_call.deadline(),
+                ),
+            )
+            .await
+            else {
+                return Ok(self
+                    .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                    .await);
+            };
+            classification
+        } else {
+            crate::memory::QueryClassification::default()
         };
 
         // Retrieve relevant context from memory (skipped if classification says not needed)
@@ -1107,7 +1219,9 @@ impl LucidosEngine {
                 .await);
         };
 
-        // Emit MemoryRecalled step so the frontend can show it
+        // Emit MemoryRecalled so the frontend can show the step. ADR 0109 ends
+        // the assembled body region, so nothing reads the id back any more: the
+        // recall rides in the message on both arms.
         if classification.needs_memory {
             self.event_bus
                 .emit_or_log(
@@ -1132,15 +1246,75 @@ impl LucidosEngine {
         // the backstop under a running loop.
         let max_tool_calls = crate::core::PreferenceStore::max_tool_calls(&self.pool).await;
 
-        let Some((system_prompt, missing_pref_keys, image_provider_available)) = until_canceled(
+        // Decision 3: the tool pairs are what the turn boundary drops. They
+        // still accumulate inside the turn, which the loop does below; what
+        // goes is the rebuilt tail of the turn that ENDED. That tail sits at
+        // messages[0] and rotates wholesale at every boundary, so dropping it
+        // removes the mutation rather than shrinking it.
+        //
+        // A loaded knowhow doc survives this. Its body rides in the
+        // `[LOADED KNOWHOW]` block on both arms.
+        if context_mode.is_on() {
+            resume_tool_blocks.clear();
+        }
+
+        // The thread's checklist, read once per turn. Under the mode it rides
+        // inside the working understanding at the tail, so the loop needs the
+        // snapshot it starts from. Only read when the mode is on, so an off
+        // workspace pays no query for it.
+        let todo_snapshot = if context_mode.is_on() {
+            match crate::engine::tools::todo::latest_todo_list(&self.pool, thread_id).await {
+                Ok(found) => found,
+                Err(e) => {
+                    // Not a reason to fail the turn. The list is the model's
+                    // own memo, so the honest degradation is a turn without
+                    // it: that costs a re-derivation, never correctness.
+                    log!(
+                        "[Chat] todo list read failed for thread {}: {}. This turn carries no checklist",
+                        thread_id,
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let todo_seed: Vec<crate::engine::thread_events::TodoItem> = todo_snapshot
+            .as_ref()
+            .map(|list| list.items.clone())
+            .unwrap_or_default();
+        let todo_notes_seed: Option<String> =
+            todo_snapshot.as_ref().and_then(|list| list.notes.clone());
+
+        // The working understanding, read once and rendered at the tail of
+        // every round. Same degradation as the checklist: a read that fails
+        // costs the turn its notes, never its correctness.
+        let document = if context_mode.is_on() {
+            match super::working_understanding::latest_document(&self.pool, thread_id).await {
+                Ok(found) => found.unwrap_or_default(),
+                Err(e) => {
+                    log!(
+                        "[Chat] working understanding read failed for thread {}: {}. This turn carries none",
+                        thread_id,
+                        e
+                    );
+                    Default::default()
+                }
+            }
+        } else {
+            Default::default()
+        };
+
+        let Some((system_prompt, missing_pref_keys)) = until_canceled(
             &cancel_token,
             self.build_chat_system_prompt(
                 &user_timezone,
                 &user_language,
                 device_id,
-                is_trigger,
                 &trigger,
                 max_tool_calls,
+                &capabilities,
             ),
         )
         .await
@@ -1186,21 +1360,17 @@ impl LucidosEngine {
             thread_depth_context,
         } = context_sections;
 
-        let mut tools = get_default_tools();
+        let mut tools = get_default_tools(&capabilities.gates);
         tools.push(get_notification_tool());
         // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
         // any other manifest-declared LLM tools — single source of truth.
         tools.extend(crate::capability_manifest::llm_tools());
-        tools.push(crate::llm::get_navigate_ui_tool());
         // manage_models / manage_repositories are now manifest-built grouped tools
         // contributed by llm_tools() above (no longer spliced here).
-        tools.push(get_save_thread_image_tool());
-        // view_image re-loads an earlier thread image into vision — it needs no
-        // image *generation* provider, so it's always available (unlike generate_image).
-        tools.push(get_view_image_tool());
-        if image_provider_available {
-            tools.push(get_image_generation_tool());
-        }
+        //
+        // navigate_ui, save_thread_image, view_image and generate_image, each
+        // with its gate declared beside it in `llm::tools::CHAT_TAIL`.
+        tools.extend(chat_tail_tools(&capabilities.gates));
         // MCP server management is the grouped `mcp` manifest tool (spliced via
         // llm_tools() above). Discovered tools from running MCP servers are added
         // separately below.
@@ -1238,12 +1408,39 @@ impl LucidosEngine {
         // branch (or left empty for triggers / new threads). Build the block
         // here so its byte size counts against fixed_size below — knowhow
         // bodies can be large and were previously un-budgeted.
+        //
+        // ADR 0109 ends the assembled body region, so a knowhow doc rides in
+        // this block in both arms. What the mode changes is the live tool
+        // results, which is where the bytes actually are.
         let loaded_knowhow_block = build_loaded_knowhow_block(&loaded_knowhow_docs);
 
         // Built here for the same reason: it is unconditional, so it belongs in
         // `fixed_size` rather than in the formatting slack.
         let current_time_block =
             super::turn_clock::current_time_block(turn_started_at, &user_timezone);
+
+        // The two other readings the cached system block must not hold. Each is
+        // read ONCE here, so every round of this turn sends the same bytes and
+        // the message prefix stays cacheable (`super::turn_tail`).
+        //
+        // Raced against the token like every other setup read, and this one
+        // has to be: `version_status` forks git probes that take tens of
+        // seconds on a saturated host, and a Stop pressed during one would
+        // otherwise wait it out.
+        let Some(engine_build_block) = until_canceled(&cancel_token, async {
+            if crate::paths::has_lucidos_source() {
+                super::turn_tail::engine_build_block(&self.version_status().await)
+            } else {
+                String::new()
+            }
+        })
+        .await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        };
+        let client_url_block = super::turn_tail::client_url_block(&self.client_url());
 
         // Trim expendable context sections if the initial message would exceed budget
         let fixed_size = profile_context.len()
@@ -1256,6 +1453,8 @@ impl LucidosEngine {
             + file_context_section.len()
             + url_context_section.len()
             + loaded_knowhow_block.as_deref().map_or(0, str::len)
+            + engine_build_block.len()
+            + client_url_block.len()
             + current_time_block.len()
             + user_message.len()
             + 500; // 500 for formatting
@@ -1264,7 +1463,7 @@ impl LucidosEngine {
         if expendable_size > expendable_budget {
             log!("[Chat] Initial context ({}KB) exceeds message budget ({}KB, prompt overhead {}KB), trimming",
                 (fixed_size + expendable_size) / 1024, message_budget / 1024, prompt_overhead / 1024);
-            let excess = expendable_size - expendable_budget;
+            let mut excess = expendable_size - expendable_budget;
             // Trim memory first (most expendable), then history from oldest (start)
             if memory_context.len() >= excess {
                 // `len - excess` is a raw byte offset that can land mid-UTF-8
@@ -1275,13 +1474,23 @@ impl LucidosEngine {
                 if let Some(pos) = memory_context.rfind('\n') {
                     memory_context.truncate(pos);
                 }
+                excess = 0;
             } else {
-                let remaining = excess - memory_context.len();
+                excess -= memory_context.len();
                 memory_context.clear();
-                // Trim oldest history first — preserves recent messages
-                trim_history_from_oldest(&mut history_context, remaining);
+            }
+            if excess > 0 {
+                // Oldest history goes first, so recent turns survive. The budget
+                // floor, not a curation decision: it fires only when the turn
+                // would not fit at all, and both arms have always applied it.
+                trim_history_from_oldest(&mut history_context, excess);
             }
         }
+
+        // ADR 0109 ends the assembled body region. Memory, the history and the
+        // knowhow docs ride in block 0 in both arms, exactly as the control arm
+        // sends them. What the mode curates is the live tool results, which are
+        // 33.1% of the bill against the region's 16.3%.
 
         // Build user message from contextual sections
         let mut user_message_parts: Vec<&str> = Vec::new();
@@ -1361,8 +1570,14 @@ impl LucidosEngine {
         }
         let request_line = format!("Request: {}", user_message);
         user_message_parts.push(&request_line);
-        // Last, so the clock sits in the message tier tail rather than at the
-        // front of the cached system block.
+        // Last, so every per-turn reading sits in the message tier tail rather
+        // than at the front of the cached system block. `super::turn_tail` and
+        // `super::turn_clock` own the rule; the system prose points at each of
+        // these blocks by name.
+        if !engine_build_block.is_empty() {
+            user_message_parts.push(&engine_build_block);
+        }
+        user_message_parts.push(&client_url_block);
         user_message_parts.push(&current_time_block);
 
         // Attached images ride inline as base64 image blocks on the user message
@@ -1370,9 +1585,9 @@ impl LucidosEngine {
         // turn. No on-disk path annotation: the chat `read_file` tool is rooted at
         // `data/artifacts/`, so a `.lucidos/tmp/images/…` hint only sent the model
         // chasing a path it can't reach ("the bot can't see my attached image").
-        let user_message_text = user_message_parts.join("\n\n");
+        let user_message_text = user_message_parts.join(super::context_mode::PART_SEPARATOR);
 
-        // Section *shape* (name + char_count) is always built so the
+        // Section *shape* (name + the two sizes) is always built so the
         // modal can render the breakdown; only the body is gated by
         // `capture_context`. Body cap (8 KB) prevents a 100 KB system
         // prompt from bloating every events row. The actual assembly —
@@ -1380,7 +1595,17 @@ impl LucidosEngine {
         // per-loaded-knowhow and per-resume-tool-pair rows — lives in
         // `build_capture_sections` so it can be unit-tested without
         // standing up a full engine.
-        let capture_body = PreferenceStore::capture_context(&self.pool).await?;
+        // A section that became a body reports through the region's own rows
+        // instead, so it is passed as empty here. Two rows for one body would
+        // double its size in the viewer's budget bar and in the eval's read.
+        let capture_body = match PreferenceStore::capture_context(&self.pool).await {
+            Ok(body) => body,
+            Err(e) => {
+                return Err(self
+                    .fail_turn(thread_id, origin_id, response_channel, e.into())
+                    .await)
+            }
+        };
         let capture_sections = build_capture_sections(
             &system_prompt,
             &profile_context,
@@ -1398,7 +1623,11 @@ impl LucidosEngine {
             &setup_reminder,
             &thread_depth_context,
             user_message,
-            &current_time_block,
+            &super::turn_tail::TurnTail {
+                engine_build: &engine_build_block,
+                client_url: &client_url_block,
+                current_time: &current_time_block,
+            },
             &loaded_knowhow_docs,
             &resume_tool_blocks,
             capture_body,
@@ -1464,6 +1693,13 @@ impl LucidosEngine {
                 },
                 &trigger_side_effect_grant,
                 max_tool_calls,
+                super::context_mode::CuratedTurn {
+                    mode: context_mode,
+                    schedule: capabilities.schedule,
+                    document,
+                    todo: todo_seed,
+                    todo_notes: todo_notes_seed,
+                },
             )
             .await;
 

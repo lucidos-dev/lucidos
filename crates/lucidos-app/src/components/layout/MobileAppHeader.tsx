@@ -28,7 +28,8 @@ export interface MobilePaneConfig {
 }
 
 /** Single source of truth pairing every MobileView with its Header and Pane.
- *  Defined AFTER the header/pane components below — hoisted by JS. */
+ *  It sits ABOVE the header components it names; a function declaration
+ *  hoists, so the references resolve. */
 export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
   threads: { Header: MobileThreadsHeader, Pane: MobileThreadsPane },
   thread:  { Header: MobileThreadHeader,  Pane: ThreadPane },
@@ -168,8 +169,9 @@ function MobileThreadHeader() {
  *  The title is the cluster's one shrinking member, so a long one ellipsises
  *  between the chevrons rather than pushing either into an edge control. With
  *  no title the cluster is just the two chevrons, in the same places. What
- *  makes the fixed span possible is `ContentHeaderActions` always collapsing to
- *  the overflow menu plus the bell: a trailing cluster of constant width.
+ *  makes the fixed span possible is `ContentHeaderActions` collapsing to a
+ *  single control plus the bell: a trailing cluster bounded at two icon boxes,
+ *  whether that control is the ⋯ trigger or a view's one context action.
  *
  *  That span is around a dozen characters, so a destination WE name renders its
  *  authored short form (`SettingsNavItem.short`) rather than ellipsising a name

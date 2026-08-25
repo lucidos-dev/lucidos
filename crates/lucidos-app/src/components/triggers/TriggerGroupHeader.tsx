@@ -3,6 +3,7 @@ import type { TriggerGroup } from '../../store/types';
 import { collapsedTriggerGroupIds, toggleTriggerGroupCollapsed } from '../../store/store';
 import { deleteTriggerGroup, renameTriggerGroup } from '../../store/actions/triggerGroups';
 import { EditIcon, TrashIcon } from '../shared/icons';
+import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 interface Props {
   group: TriggerGroup;
@@ -33,14 +34,22 @@ export function TriggerGroupHeader({ group }: Props) {
     if (!editing) inputRef.current?.blur();
   }, [editing]);
 
+  // While not editing, the field mirrors the served name. Without this a
+  // `TriggerGroupRenamed` frame from another device leaves the old name behind
+  // the rename button, and the next tap offers it back for editing. It also
+  // resets the draft on every close, so an abandoned edit, an empty one and a
+  // failed rename all settle on the stored name. Same shape as
+  // ThreadTitleEditor (ADR 0118).
+  useEffect(() => {
+    if (!editing) setDraft(group.name);
+  }, [group.name, editing]);
+
   async function commit() {
     if (renamingRef.current) return;
     const trimmed = draft.trim();
-    if (!trimmed) { setEditing(false); setDraft(group.name); return; }
-    if (trimmed === group.name) { setEditing(false); return; }
+    if (!trimmed || trimmed === group.name) { setEditing(false); return; }
     renamingRef.current = true;
-    const ok = await renameTriggerGroup(group.id, trimmed);
-    if (!ok) setDraft(group.name);
+    await renameTriggerGroup(group.id, trimmed);
     setEditing(false);
   }
 
@@ -70,6 +79,7 @@ export function TriggerGroupHeader({ group }: Props) {
             class="trigger-group-name-input"
             type="text"
             value={draft}
+            {...PROSE_TEXT_ATTRS}
             tabIndex={editing ? 0 : -1}
             // Transparent and pointer-inert is not hidden: without this every
             // heading would offer a screen reader a textbox that does nothing,
@@ -86,7 +96,7 @@ export function TriggerGroupHeader({ group }: Props) {
             onBlur={editing ? commit : undefined}
             onKeyDown={e => {
               if (e.key === 'Enter') void commit();
-              else if (e.key === 'Escape') { setDraft(group.name); setEditing(false); }
+              else if (e.key === 'Escape') setEditing(false);
             }}
           />
         </span>

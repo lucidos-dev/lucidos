@@ -8,8 +8,8 @@ import {
   engineVersion,
   latestEngineVersion,
   latestTauriAppNotes,
-  latestTauriAppVersion,
   lucidosRelease,
+  releaseCheck,
   lucidosReleaseDirty,
   restartRequired,
   serviceWorkerBuildId,
@@ -21,16 +21,25 @@ import {
   workspacePath,
 } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
-import { checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
+import {
+  canInstallUpdateHere,
+  checkAppUpdateViaClient,
+  installAppUpdate,
+  packagedUpdateVersion,
+  refreshReleaseCheck,
+} from '../../store/actions/app-update';
+import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
-import { openSettingsSubview } from '../../store/actions/menu';
+import { openSettingsSubview, openWhatsNew } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
 import { formatBuildId } from '../../utils/buildId';
 import { clientVersionLabel } from '../../utils/clientVersion';
 import { isNewerVersion } from '../../utils/version';
+import { copyToClipboard } from '../../utils/clipboard';
 import { formatShortTime } from '../../utils/formatTime';
 import { connectionNotice } from '../../utils/connectionNotice';
+import { errorDetail } from '../../utils/errorDetail';
 import { BackupSection } from './BackupSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
@@ -39,6 +48,7 @@ import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
 import { restartControlHome } from './restartControl';
+import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
@@ -90,7 +100,6 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const releaseDirty = lucidosReleaseDirty.value;
   const engineVer = engineVersion.value;
   const latestEngineVer = latestEngineVersion.value;
-  const latestTauriVer = latestTauriAppVersion.value;
   const restart = restartRequired.value;
   const update = updateAvailable.value;
   // Overview owns the restart control only in dev, where it genuinely rebuilds.
@@ -119,39 +128,58 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
     refreshClient();
   }, []);
 
-  /** Update now if one is known, otherwise re-check on demand. The on-demand
-   *  path matters because the automatic checks are periodic (an hourly poll, plus
-   *  mount and window-resume rechecks): without it the only way to ask "is there
-   *  something newer?" right now was to quit and relaunch. */
+  /** Update now if one is known, otherwise ask for a check on demand.
+   *
+   *  The on-demand path matters because the gateway's own poll is periodic:
+   *  without it the only way to ask "is there something newer?" right now was to
+   *  quit and relaunch.
+   *
+   *  The gateway owns the check (ADR 0108) and this forces it to poll. The
+   *  client's own updater is the fallback, taken only where the gateway
+   *  announces nothing at all, which means one too old to carry the field. */
   const handleAppUpdate = useCallback(async () => {
-    if (packagedUpdateVersion()) {
+    if (canInstallUpdateHere()) {
       await installAppUpdate();
       return;
     }
-    await checkForAppUpdate();
+    if (releaseCheck.value) await refreshReleaseCheck(true);
+    else await checkAppUpdateViaClient();
     // Runs on USER intent, so unlike the background poll this reports both
     // outcomes rather than staying silent.
     if (appUpdateCheckError.value) {
       showToast(`Couldn't check for updates: ${appUpdateCheckError.value}`, 'error');
-    } else if (!latestTauriAppVersion.value) {
+    } else if (!packagedUpdateVersion()) {
       showToast('Lucidos is up to date', 'success');
     }
   }, []);
 
-  const copyApiUrl = useCallback(() => {
-    navigator.clipboard.writeText(getApiUrl()).then(
-      () => showToast('Copied to clipboard', 'success'),
-      () => showToast('Failed to copy', 'error'),
-    );
+  /** Turn the machine-global release check off or back on. Writes
+   *  `~/.lucidos/updates.toml` through the gateway, which re-reads it on every
+   *  tick, so the change binds without a restart. */
+  const setReleaseCheckEnabled = useCallback(async (enabled: boolean) => {
+    try {
+      releaseCheck.value = await setReleaseCheckConfig({ enabled });
+    } catch (e) {
+      showToast(`Couldn't save the update-check setting: ${errorDetail(e)}`, 'error');
+    }
   }, []);
+
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
   const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
   // Shared with the Lucidos menu's identity row, which names the same thing.
   const clientVersion = clientVersionLabel();
-  // One derivation, shared with the button's action so the label and what the
-  // click does can never disagree.
-  const tauriHasUpdate = !!packagedUpdateVersion();
+  // Both shared with the button's action, so the label and what the click does
+  // can never disagree.
+  const offeredVersion = packagedUpdateVersion();
+  const canInstallHere = canInstallUpdateHere();
+  const tauriHasUpdate = !!offeredVersion;
+  const check = releaseCheck.value;
+  // How this install takes an update, as the gateway read it from its own
+  // executable path. A headless install gets a command to copy; a bundle is
+  // installed by the client, and only a client can do it.
+  const offer = check?.latest ?? null;
+  const updateCommand = offer?.install === 'installer-rerun' ? offer.command : null;
   // An update in flight OWNS this control: the same derivation the progress
   // dialog renders, so the persistent surface and the transient one can never
   // disagree about what the update is doing. Terminal frames clear the signal,
@@ -159,7 +187,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const updateRun = appUpdateProgress.value;
   const updateNarration = updateRun ? appUpdateNarration(updateRun) : null;
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
-  const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
+  const clientBehindLabel = tauriClientVersion ? ` (latest: ${offeredVersion})` : ' (update available)';
 
   function renderPanel() {
     switch (panel) {
@@ -206,7 +234,7 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             )}
             <div class="system-info-row">
               <span class="system-info-label">API</span>
-              <button class="system-info-value system-info-long system-api-url accent-link" onClick={copyApiUrl}>
+              <button class="system-info-value system-info-long system-api-url accent-link" onClick={() => copyToClipboard(getApiUrl())}>
                 {getApiUrl()}
               </button>
             </div>
@@ -307,22 +335,43 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             </div>
           ) : tauriHasUpdate && (
             <div class="system-notice">
-              Lucidos {latestTauriVer} is available - update and restart to install
+              {canInstallHere
+                ? `Lucidos ${offeredVersion} is available - update and restart to install`
+                : `Lucidos ${offeredVersion} is available`}
               {/* What is in it, before deciding to take it. The notes come from
                   the update manifest, so What's New shows THAT release above the
                   installed history; rendered only when the manifest carried
-                  them, so the link never opens onto nothing. */}
+                  them, so the link never opens onto nothing. It names the
+                  version, which is what opens the panel on it rather than on the
+                  release already running. */}
               {latestTauriAppNotes.value && (
                 <>
                   {' '}
                   <button
                     class="accent-link"
-                    onClick={() => openSettingsSubview('whats-new')}
+                    onClick={() => openWhatsNew(offeredVersion)}
                   >
                     What's new
                   </button>
                 </>
               )}
+            </div>
+          )}
+          {/* A headless install updates by re-running the installer, so the
+              answer is a command rather than a button. The gateway composes it
+              from the live instance, so the slug and the prefix are this
+              install's own. It never runs it: on macOS `launchctl bootout`
+              tears down the job's whole process group, so a spawned installer
+              would kill itself mid-replace (ADR 0108). */}
+          {updateCommand && (
+            <div class="system-notice">
+              Re-run the installer to update:
+              {' '}
+              <code>{updateCommand}</code>
+              {' '}
+              <button class="accent-link" onClick={() => copyToClipboard(updateCommand)}>
+                Copy
+              </button>
             </div>
           )}
           {/* A check that FAILED must not look like "you are up to date". */}
@@ -338,13 +387,13 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             {/* While a run is live this button must not offer to start another —
                 it reports the phase instead, and turns into the same Cancel the
                 toast offers for exactly as long as one is honest. */}
-            {tauriClientVersion && (updateNarration
+            {(tauriClientVersion || check) && (updateNarration
               ? (updateNarration.cancellable
                   ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
                   : <button class="action-btn" disabled>Updating…</button>)
               : (
                 <button class="action-btn" onClick={handleAppUpdate}>
-                  {tauriHasUpdate ? 'Update & Restart' : 'Check for Updates'}
+                  {canInstallHere ? 'Update & Restart' : 'Check for Updates'}
                 </button>
               ))}
             {ownsRestart && (
@@ -353,6 +402,44 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
               </button>
             )}
           </div>
+          {/* The off switch for the machine's release check, beside the thing it
+              governs rather than buried. Rendered only where the check can
+              actually run, so a dev gateway shows no knob for a poll it will
+              never make. */}
+          {check?.supported && (
+            <div class="settings-row" data-search-anchor="system:update-check">
+              <span class="settings-row-label">
+                Check for updates
+                <Explainer title="Check for updates">
+                  <p>
+                    Once an hour Lucidos asks <code>lucidos.dev</code> whether a newer
+                    version is published. One request per machine, from the gateway,
+                    however many windows you have open.
+                  </p>
+                  <p>
+                    It sends your platform, your architecture and the version you run.
+                    It also carries your IP address, as any web request does. Nothing
+                    else is sent, nothing identifies you, and nothing installs itself.
+                  </p>
+                  <p>
+                    Turn it off and Lucidos stops asking. You can still check by hand
+                    with the button above.
+                  </p>
+                </Explainer>
+              </span>
+              <label class="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={check.enabled}
+                  onChange={(e) => {
+                    const on = (e.currentTarget as HTMLInputElement).checked;
+                    void setReleaseCheckEnabled(on);
+                  }}
+                />
+                <span class="toggle-slider" />
+              </label>
+            </div>
+          )}
         </div>
       </>
     );

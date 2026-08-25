@@ -102,6 +102,47 @@
     }
 }
 
+/* Four boxes here can hold focus without being something the user presses, and
+   none of them paints a ring for it. Same call .thread-content
+   (chat/input-messages.css) and .content-pane-body (panels/shell.css) make, and
+   their comments carry the longer form.
+
+   The progress dialog's body takes focus on purpose, so a modal with no Cancel
+   cannot leave the keyboard behind it (ProgressDialog.tsx). The other three
+   carry tabIndex={-1} at their render site, because Chrome promotes an
+   overflowing scroller with no focusable child to a Tab stop and each sits
+   inside a surface whose own Tab cycle cannot name it. A click can still land
+   focus on one, which is what this rule covers there.
+
+   Controls inside these boxes keep their own rings, the toast's buttons
+   included. */
+.confirm-details:focus,
+.confirm-details:focus-visible,
+.progress-dialog-body:focus,
+.progress-dialog-body:focus-visible,
+.toast-heading:focus,
+.toast-heading:focus-visible,
+.toast-sections:focus,
+.toast-sections:focus-visible {
+    outline: none;
+}
+
+/* The file preview's body is the exception, and it earns a ring. Nothing traps
+   Tab in that modal, so a keyboard user reaches the body deliberately and
+   scrolls the file with it (FilePreviewModal.tsx). A stop a sighted keyboard
+   user cannot see is worse than the browser's default ring, so it wears ours.
+
+   Drawn INSET, for the reason .list-row-add-card:focus-visible is: the body is
+   full-bleed and .file-preview-modal clips, so an outward band would lose its
+   sides. :focus-visible only, so a click on the preview paints nothing. The
+   transparent outline is the forced-colors fallback, where box-shadow is
+   stripped, and takes the matching negative offset. */
+.file-preview-modal-body:focus-visible {
+    outline: 0.125rem solid transparent;
+    outline-offset: -0.125rem;
+    box-shadow: inset var(--focus-ring);
+}
+
 /* Confirm dialog */
 .confirm-dialog {
     background: var(--bg-secondary);
@@ -463,6 +504,19 @@
 }
 
 .toast {
+    /* The card's own padding, named because the out-of-flow icon and close X
+       are both placed ON it. A literal restated in those two rules is a value
+       that silently stops matching the day this padding is retuned. */
+    --toast-pad-y: 0.5rem;
+    --toast-pad-x: 0.875rem;
+    /* The close X's box: an .icon-btn, so a 0.875rem glyph in 0.25rem of
+       padding. .toast-heading reserves this much on the right AND is at least
+       this tall, which is what keeps the scroll box under it clear of the
+       button. */
+    --toast-close-size: 1.375rem;
+    /* The category icon's box. It is out of flow, so .toast-body pays for it as
+       left padding rather than as a flex sibling. */
+    --toast-icon-size: 1.125rem;
     /* Elevated surface: in DARK mode the fill sits one step above the app
        background (--bg-tertiary, not the near-canvas --bg-secondary) and rides
        the deeper --shadow-md, so the toast clearly floats above the chrome
@@ -474,11 +528,11 @@
     background: var(--bg-tertiary);
     border: 0.15625rem solid var(--border-color);
     border-radius: 0.375rem;
-    padding: 0.5rem 0.875rem;
+    padding: var(--toast-pad-y) var(--toast-pad-x);
     min-height: 2.5rem;
-    /* Cap height; the body scrolls inside (see .toast-body) and the actions row
-       + close X are siblings of it, so [Open] stays reachable without scrolling
-       to find it.
+    /* Cap height; the message scrolls inside (see .toast-sections) and the
+       actions row + close X are outside every scroll box, so [Open] stays
+       reachable without scrolling to find it.
 
        A toast is a SUMMARY with somewhere to go, never the place a long body is
        read: for a notification the full text is one [Open] away in the content
@@ -521,55 +575,89 @@
     overflow: hidden;
 }
 
-/* NOT the scroll container: `.toast-message` below is (see the comment there).
-   The body stays `overflow: visible` so the mini-spinner, which rotates via CSS
-   transform and at 45° paints ~√2 outside its square layout box, can bleed that
-   excess into the toast's 0.5rem padding instead of being clipped. */
+/* The message column: the heading that stays, and the sections that scroll
+   under it. NOT a scroll container itself, and not an ancestor of the icon.
+   The two boxes inside it own every scroll the toast has, so no rule here has
+   to be switched off for the spinner.
+
+   `min-height: 0` lets the column shrink under .toast's cap. That shrink is
+   what gives the boxes inside it a bounded height to scroll in; without it they
+   grow to their content and the cap just clips them.
+
+   The left padding is the gutter the out-of-flow icon sits in. */
 .toast-body {
     display: flex;
-    align-items: flex-start;
+    flex-direction: column;
     gap: 0.5rem;
     min-height: 0;
-    /* Reserve room for the absolute-positioned close-X (top-right of .toast).
-       Kept on the body, not the whole .toast, so .toast-actions sits flush
-       to the toast's natural horizontal padding on both sides. */
-    padding-right: 1.375rem;
+    padding-left: calc(var(--toast-icon-size) + 0.5rem);
 }
 
+/* Out of the flow, so no scroll container can ever contain it. A scroll
+   container clips its own painted overflow on both axes, and the mini-spinner
+   rotates via CSS transform: at 45° it reports a box ~41% wider than its layout
+   box, so a scrolling ancestor sheared its corners. That was patched once with
+   a `:has(.mini-spinner)` rule that switched the scroll off instead, which then
+   clipped every spinning toast that grew a body
+   (docs/plans/2026-08-11-build-toast-scrolls-and-describes-the-build.md).
+   Absolute, the question cannot come back.
+
+   It sits on the toast's own padding, so it lines up with the first line the
+   way the old flex row's `flex-start` did. Click-through, so the gutter it
+   occupies is not a dead spot on a clickable toast. */
 .toast-icon {
-    width: 1.125rem;
-    height: 1.125rem;
-    flex-shrink: 0;
+    position: absolute;
+    top: var(--toast-pad-y);
+    left: var(--toast-pad-x);
+    width: var(--toast-icon-size);
+    height: var(--toast-icon-size);
+    pointer-events: none;
     /* Per-type category colour (set as --toast-accent on the .toast-{type}
-       ancestor below) — drives the icon AND the border so they always match. */
+       ancestor below), which drives the icon AND the border so they always
+       match. */
     color: var(--toast-accent);
 }
 
-/* The toast's scroll container, so a body taller than the 14rem cap on `.toast`
-   can be read to its last line instead of being clipped by that element's
-   `overflow: hidden`.
+/* Line 1 of the message, and the one part that does NOT scroll: it names what
+   the toast is about, so it has to survive a scroll to the last bullet.
 
-   The scroll starts HERE rather than on `.toast-body` because the spinner is
-   the message's SIBLING, and a scroll container clips its own painted overflow
-   on both axes: with the body scrolling, the mini-spinner's rotated corners
-   were sheared off. That was patched with a `.toast-body:has(.mini-spinner)
-   { overflow: visible }` rule written when a spinning toast was always one
-   line, which then silently switched the scroll off for every spinning toast
-   that grew a body: the build toast's commit list was unreachable below the cap
-   (reported 2026-08-11). Scrolling the message instead leaves the spinner
-   outside the container entirely, so there is nothing to switch off.
+   Two jobs beyond that, both carried by --toast-close-size. Reserving that much
+   on the right keeps the text clear of the close X. Being at least that TALL is
+   what puts .toast-sections BELOW the button rather than beside it, and a
+   scroll box reaching up beside the X would draw its scrollbar under the glyph.
 
-   `align-self: stretch` overrides `.toast-body`'s `align-items: flex-start`, so
-   this box takes the body's own (shrunk-to-cap) height and scrolls inside it,
-   rather than growing to its content and overflowing. `min-height: 0` is what
-   lets that shrink happen at all. */
-.toast-message {
-    flex: 1;
-    min-width: 0;
-    align-self: stretch;
+   It is a scroll box itself for the one case with nothing under it: a message
+   with no sections is all heading, and a long one has to scroll rather than be
+   clipped at the cap. A one-line heading is already at its floor, so it cannot
+   shrink and never shows a bar. */
+.toast-heading {
+    flex: 0 1 auto;
+    min-height: var(--toast-close-size);
+    margin-right: var(--toast-close-size);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+/* Everything after line 1, and the toast's main scroll box: a message taller
+   than the 14rem cap is read to its last line here instead of being clipped by
+   .toast's `overflow: hidden`.
+
+   It reserves NOTHING on the right, which is the point. The box runs to the
+   toast's content edge, so its scrollbar sits in the card's right rail level
+   with the close glyph, rather than inside the text column with the X beyond
+   it. The heading above is what makes that safe: it clears the button, and this
+   box starts below it. */
+.toast-sections {
+    flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
+}
+
+/* The gap to the heading is the column's own, so the first section drops the
+   margin it uses to separate itself from the section above. */
+.toast-sections > .toast-section:first-child {
+    margin-top: 0;
 }
 
 .toast-clickable {
@@ -588,7 +676,7 @@
 /* Linkified URLs inside a toast message (heading, section titles, bullets).
    `overflow-wrap: anywhere` lets a long URL break within the toast instead of
    overflowing its fixed max-width. */
-.toast-message a,
+.toast-heading a,
 .toast-section-title a,
 .toast-bullets a {
     color: var(--accent);
@@ -599,7 +687,7 @@
 }
 
 @media (hover: hover) {
-    .toast-message a:hover,
+    .toast-heading a:hover,
     .toast-section-title a:hover,
     .toast-bullets a:hover {
         text-decoration-color: var(--accent);
@@ -626,11 +714,11 @@
    update's download). Uses the shared .progress-bar track and sits between the
    message and the actions in the toast's flex column. `flex-shrink: 0` keeps the
    thin track from being squeezed away when a long message fills the capped
-   height; the right margin mirrors .toast-body's reservation for the
-   absolutely-positioned close-X so the bar ends level with the text above it. */
+   height. It runs the full content width, level with the scrolling message
+   above and the actions row below: only the heading reserves the close-X
+   gutter, because only the heading is beside the button. */
 .toast-progress {
     flex-shrink: 0;
-    margin-right: 1.375rem;
 }
 
 /* Layout comes from `.button-group` (shared-components.css), which wraps the
@@ -640,11 +728,22 @@
     justify-content: flex-end;
 }
 
+/* Sized from --toast-close-size rather than left to .icon-btn's padding, so the
+   token the heading reserves and floors against IS this button's box, not a
+   guess at it.
+
+   Inset by the toast's padding less the .icon-btn padding the glyph sits in, so
+   the GLYPH's right edge lands on the toast's content edge. That is the card's
+   right rail: .toast-sections ends there too, which is where its scrollbar is
+   drawn. The button's own box overhangs into the padding, where nothing else
+   is. */
 .toast-close {
     position: absolute;
-    top: 0.5rem;
-    /* Mirrors the Dismiss action's gap from the toast's left padding. */
-    right: 0.625rem;
+    top: var(--toast-pad-y);
+    right: calc(var(--toast-pad-x) - 0.25rem);
+    width: var(--toast-close-size);
+    height: var(--toast-close-size);
+    justify-content: center;
     margin: 0;
 }
 

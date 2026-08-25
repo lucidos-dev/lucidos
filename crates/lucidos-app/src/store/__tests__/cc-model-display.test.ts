@@ -203,13 +203,13 @@ describe('displayModelName', () => {
     expect(displayModelName('some-custom-model')).toBe('some-custom-model');
   });
 
-  it('maps CC short aliases (and their 1M variants) to versioned labels', () => {
-    expect(displayModelName('opus')).toBe('Opus 4.6');
-    expect(displayModelName('opus[1m]')).toBe('Opus 4.6 (1M)');
-    // `sonnet` is CC's always-latest alias, so its label stays version-free and
-    // mirrors the picker row: a stored alias does not record which Sonnet ran.
-    // `sonnet[1m]` is retired from the picker but keeps the label older threads
-    // were pinned under.
+  it('maps CC short aliases (and their 1M variants) to their picker labels', () => {
+    // `opus` and `sonnet` are CC's own always-latest aliases, so their labels
+    // stay version-free and mirror the picker rows: a stored alias does not
+    // record which generation ran. `sonnet[1m]` is retired from the picker
+    // but keeps the label older threads were pinned under.
+    expect(displayModelName('opus')).toBe('Opus (latest)');
+    expect(displayModelName('opus[1m]')).toBe('Opus (latest, 1M)');
     expect(displayModelName('sonnet')).toBe('Sonnet (latest)');
     expect(displayModelName('sonnet[1m]')).toBe('Sonnet 4.6 (1M)');
     expect(displayModelName('haiku')).toBe('Haiku 4.5');

@@ -252,17 +252,48 @@ fn join_human(items: &[&str]) -> String {
     }
 }
 
+/// True when `host` is `domain` itself, or a subdomain of it.
+///
+/// Anchored at a label boundary, which is the whole point. `notgithub.com`
+/// strips to `not`, which does not end in a dot, and
+/// `api.github.com.attacker.example` does not end with the domain at all. A
+/// bare `contains` admits both. The caller attaches the user's bearer token to
+/// whatever this says yes to, so never loosen it.
+fn host_is(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
 /// Determine the provider name from an API URL.
+///
+/// Classification reads the parsed HOST, never the URL string. Substring
+/// matching let `https://api.github.com.attacker.example/` read as GitHub, and
+/// the caller then sent the user's real GitHub token to the attacker. Two arms
+/// carried no host anchor at all, so they also matched inside a path or query,
+/// and `https://evil.example/?next=google.com/` collected a Google bearer.
+///
+/// Fails closed. An unparseable URL, a URL with no host, and any scheme other
+/// than `https` all return `None`, so a token cannot leave over cleartext.
+///
+/// See `docs/plans/2026-08-25-oauth-host-classification-and-proxy-prefix-containment.md`.
 pub fn provider_for_url(url: &str) -> Option<&'static str> {
-    if url.contains(".googleapis.com") || url.contains("google.com/") {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+
+    if host_is(&host, "googleapis.com") || host_is(&host, "google.com") {
         Some("google")
-    } else if url.contains("graph.microsoft.com") || url.contains("login.microsoftonline.com") {
+    } else if host_is(&host, "graph.microsoft.com") || host_is(&host, "login.microsoftonline.com") {
         Some("microsoft")
-    } else if url.contains("api.github.com") {
+    } else if host_is(&host, "api.github.com") {
         Some("github")
-    } else if url.contains("dropboxapi.com") || url.contains("dropbox.com") {
+    } else if host_is(&host, "dropboxapi.com") || host_is(&host, "dropbox.com") {
         Some("dropbox")
-    } else if url.contains("api.spotify.com") || url.contains("accounts.spotify.com") {
+    } else if host_is(&host, "api.spotify.com") || host_is(&host, "accounts.spotify.com") {
         Some("spotify")
     } else {
         None

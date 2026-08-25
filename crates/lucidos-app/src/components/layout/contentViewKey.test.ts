@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { contentViewKey, inlineFormKey } from './contentViewKey';
+import { contentViewKey, inlineFormKey, settingsViewKey } from './contentViewKey';
 import type { InlineForm } from '../../store/store';
 
 // The content pane's one answer to "has this pane navigated". Two consumers key
@@ -19,45 +19,79 @@ const emailRequest = {
 
 describe('contentViewKey', () => {
   it('falls back to the active menu item when no overlay is showing', () => {
-    expect(contentViewKey('triggers', null)).toBe('triggers');
+    expect(contentViewKey('triggers', null, 'main')).toBe('triggers');
   });
 
   it('is null when there is nothing to key on', () => {
     // No view to remember a scroll for, and none arriving to cover.
-    expect(contentViewKey(null, null)).toBeNull();
+    expect(contentViewKey(null, null, 'main')).toBeNull();
   });
 
   it('lets an overlay win over the menu item behind it', () => {
-    expect(contentViewKey('files', { type: 'file-preview', path: 'notes.md' })).toBe('file:notes.md');
+    expect(contentViewKey('files', { type: 'file-preview', path: 'notes.md' }, 'main')).toBe('file:notes.md');
+  });
+
+  it('separates two Settings sub-sections', () => {
+    // The regression this guards, and the reason the sub-section is in the key
+    // at all: `activeMenuItem` is `'settings'` for all twenty of them, so all
+    // twenty shared one remembered offset. Opening What's New from an update
+    // offer restored wherever the reader last parked on Models.
+    expect(contentViewKey('settings', null, 'whats-new'))
+      .not.toBe(contentViewKey('settings', null, 'models'));
+  });
+
+  it('separates a Settings sub-section from the Settings home list', () => {
+    // Tapping a category off a scrolled home list is the same bug from the
+    // other side: the category opened at the list's offset.
+    expect(contentViewKey('settings', null, 'main'))
+      .not.toBe(contentViewKey('settings', null, 'whats-new'));
+  });
+
+  it('keeps a Settings sub-section stable across a re-render', () => {
+    expect(contentViewKey('settings', null, 'whats-new'))
+      .toBe(contentViewKey('settings', null, 'whats-new'));
+  });
+
+  it('ignores the sub-section for any other menu item', () => {
+    // `settingsSubview` is a live signal that outlives a visit to Settings, so
+    // a stale value must not re-key an unrelated view.
+    expect(contentViewKey('triggers', null, 'whats-new')).toBe('triggers');
+  });
+
+  it('lets an overlay win over a Settings sub-section too', () => {
+    // A file preview opened from Settings is the preview, not the sub-section
+    // it was opened from.
+    expect(contentViewKey('settings', { type: 'file-preview', path: 'notes.md' }, 'whats-new'))
+      .toBe('file:notes.md');
   });
 
   it('separates two previews of different things', () => {
-    const a = contentViewKey(null, { type: 'file-preview', path: 'a.md' });
-    const b = contentViewKey(null, { type: 'file-preview', path: 'b.md' });
+    const a = contentViewKey(null, { type: 'file-preview', path: 'a.md' }, 'main');
+    const b = contentViewKey(null, { type: 'file-preview', path: 'b.md' }, 'main');
     expect(a).not.toBe(b);
-    expect(contentViewKey(null, { type: 'url-preview', url: 'https://example.com/1' }))
-      .not.toBe(contentViewKey(null, { type: 'url-preview', url: 'https://example.com/2' }));
+    expect(contentViewKey(null, { type: 'url-preview', url: 'https://example.com/1' }, 'main'))
+      .not.toBe(contentViewKey(null, { type: 'url-preview', url: 'https://example.com/2' }, 'main'));
   });
 
   it('separates two inline forms of the same type', () => {
     // The regression this guards: `overlay.type` is `'form'` for every inline
     // form, so a Back/Forward walk from one trigger's form to another's read as
     // no navigation at all.
-    const a = contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'alpha' } });
-    const b = contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'beta' } });
+    const a = contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'alpha' } }, 'main');
+    const b = contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'beta' } }, 'main');
     expect(a).not.toBe(b);
   });
 
   it('separates two inline forms of different types', () => {
-    const a = contentViewKey(null, { type: 'form', form: { type: 'new-app' } });
-    const b = contentViewKey(null, { type: 'form', form: { type: 'app-edit', appId: 'alpha' } });
+    const a = contentViewKey(null, { type: 'form', form: { type: 'new-app' } }, 'main');
+    const b = contentViewKey(null, { type: 'form', form: { type: 'app-edit', appId: 'alpha' } }, 'main');
     expect(a).not.toBe(b);
   });
 
   it('keeps the same form stable across a re-render', () => {
     // The other half of the contract: an unchanged view must NOT re-key, or the
     // pane would re-cover and reset its scroll on every unrelated signal write.
-    const key = () => contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'alpha' } });
+    const key = () => contentViewKey(null, { type: 'form', form: { type: 'trigger', triggerId: 'alpha' } }, 'main');
     expect(key()).toBe(key());
   });
 
@@ -68,8 +102,16 @@ describe('contentViewKey', () => {
     // apart either, the body being `overflow: hidden` under an app.
     const app = { id: 'alpha', name: 'Alpha' } as never;
     const other = { id: 'beta', name: 'Beta' } as never;
-    expect(contentViewKey(null, { type: 'app-ui', app })).toBe('app-ui');
-    expect(contentViewKey(null, { type: 'app-ui', app: other })).toBe('app-ui');
+    expect(contentViewKey(null, { type: 'app-ui', app }, 'main')).toBe('app-ui');
+    expect(contentViewKey(null, { type: 'app-ui', app: other }, 'main')).toBe('app-ui');
+  });
+});
+
+describe('settingsViewKey', () => {
+  it('is what contentViewKey answers for that sub-section', () => {
+    // The deep link that drops a sub-section's remembered scroll addresses it by
+    // this function, so the two must name the same view.
+    expect(contentViewKey('settings', null, 'whats-new')).toBe(settingsViewKey('whats-new'));
   });
 });
 

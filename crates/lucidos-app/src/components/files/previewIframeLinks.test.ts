@@ -150,6 +150,22 @@ describe('classifyPreviewLink', () => {
     });
   });
 
+  it('routes a trigger href', () => {
+    // `trigger:` is a scheme. Without its own arm the scheme bail-out below
+    // hands it to the browser, and a report citing a trigger dead-ends.
+    expect(classifyPreviewLink('trigger:3f9b21c4-0a7e', ctx())).toEqual({
+      kind: 'trigger',
+      triggerId: '3f9b21c4-0a7e',
+    });
+  });
+
+  it('keeps the triggers PANEL on the nav arm', () => {
+    expect(classifyPreviewLink('triggers', ctx())).toEqual({
+      kind: 'nav',
+      target: 'triggers',
+    });
+  });
+
   it('routes an absolute filesystem path to the OS opener', () => {
     expect(classifyPreviewLink('/Applications/Thing.app', ctx())).toEqual({
       kind: 'local-file',

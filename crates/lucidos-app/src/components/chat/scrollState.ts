@@ -155,6 +155,27 @@ function cancelScrollAnim() {
  *  claim the transcript's next 64ms of scroll events. */
 let _navScrollAt = -Infinity;
 let _navScrollEl: HTMLElement | null = null;
+/** WHICH KIND of write our own last one was. Every one of them marks a
+ *  navigation, so the mobile header, the render-window expansion and the mobile
+ *  scroll indicator all stand down for it. What the kind adds is what a consumer
+ *  may do INSTEAD of acting on the scroll:
+ *
+ *  - `placement`: the app took the reader somewhere they asked to go, a chevron
+ *    tap, a deep link or a saved-position restore. The mobile header reveals for
+ *    one, because `.chat-exchange`'s `scroll-margin-top` clears a VISIBLE header
+ *    and a half-hidden one would cover the landing.
+ *  - `held`: the app is keeping a rider on the live edge (`markHeldScroll`). The
+ *    header reveals for these too, and the platform-scroll correction must NOT
+ *    read one as somebody placing the reader: see `isPlacementScroll`.
+ *  - `anchor`: the app moved the container to keep the reader on the SAME
+ *    content while the layout changed under them (`markAnchorScroll`). Nobody
+ *    has been taken anywhere, so the chrome must stay exactly where the reader
+ *    left it.
+ *
+ *  One field rather than a flag per consumer, so a write carrying two kinds at
+ *  once is not expressible. */
+type NavScrollKind = 'placement' | 'held' | 'anchor';
+let _navScrollKind: NavScrollKind = 'placement';
 
 /** How long after a navigation's last write its scroll event may still arrive.
  *  A `scrollTop` write does not dispatch its event synchronously: the browser
@@ -180,7 +201,57 @@ function nowMs(): number {
 export function markNavigationScroll(el: HTMLElement, top: number) {
   _navScrollAt = nowMs();
   _navScrollEl = el;
+  // A PLACEMENT unless `markHeldScroll` or `markAnchorScroll` says otherwise
+  // once this returns. Reset here rather than left alone, so the kind always
+  // describes the write being recorded rather than the one before it.
+  _navScrollKind = 'placement';
   el.scrollTop = top;
+}
+
+/** Write `top` and record it as the app HOLDING the reader on the content they
+ *  were already reading, while the layout changed under them. Two writers, and
+ *  they are the same act either side of the DOM/layout line:
+ *  `withScrollAnchor`'s reveal correction and `restoreAfterReflow`'s pane-resize
+ *  correction.
+ *
+ *  It marks a navigation, like every other write here. That is what stops the
+ *  render-window expansion reading a correction landing near the top as a
+ *  request for older turns.
+ *
+ *  It is NOT a placement, and that half is the mobile bug it was added for. The
+ *  correction can move the container hundreds of pixels while the reader's eye
+ *  stays on one line. The hide-on-scroll header turned that delta into sliding
+ *  chrome, so the reader's own line went behind a header and a thread title.
+ *  See `isAnchorScroll`. */
+export function markAnchorScroll(el: HTMLElement, top: number): void {
+  markNavigationScroll(el, top);
+  _navScrollKind = 'anchor';
+  for (const listener of _anchorScrollListeners) listener(el);
+}
+
+/* ── Telling a DELTA consumer the offset was re-based ────────────────────────
+ *  `isAnchorScroll` answers a scroll event, and only one arriving inside
+ *  `NAV_SCROLL_EVENT_WINDOW_MS`. That is enough for a consumer reading a
+ *  POSITION: a late event finds the container settled and reads the same answer
+ *  either way.
+ *
+ *  It is not enough for one reading a DELTA. The mobile hide-on-scroll header
+ *  is the one, and it turns every unattributed pixel into chrome sliding. A
+ *  correction moves the container hundreds of pixels at once, and a late event
+ *  hands the header the whole jump.
+ *
+ *  Whether the event is late is a race, and a large programmatic jump loses it
+ *  on WebKit under load. So a delta consumer is told SYNCHRONOUSLY, at the
+ *  write, and re-takes its baseline there. The event then carries a delta of
+ *  zero whenever it lands, and the window stops deciding anything. */
+const _anchorScrollListeners = new Set<(el: HTMLElement) => void>();
+
+/** Subscribe to the re-base above; returns the unsubscribe. Fires with the
+ *  container AFTER the write, so a listener reading `scrollTop` sees where the
+ *  browser actually settled it. */
+export function onAnchorScroll(listener: (el: HTMLElement) => void): () => void {
+  _anchorScrollListeners.add(listener);
+  return () => { _anchorScrollListeners.delete(listener); };
 }
 
 /** Record that the app just REVEALED something, so the scroll the platform is
@@ -229,6 +300,48 @@ export function isNavigationScroll(el?: HTMLElement | null): boolean {
   // write to some other container is not an answer. A caller that names none
   // (the mobile header, which follows whichever pane is active) takes any.
   return !el || _navScrollEl === el;
+}
+
+/** Did one of our own PLACEMENTS produce this scroll event: a write that put the
+ *  reader somewhere on purpose, rather than the ride holding them where they
+ *  already were?
+ *
+ *  The narrow half of `isNavigationScroll`, and the one the platform-scroll
+ *  correction asks. It has to be the narrow one, because held writes mark a
+ *  navigation as well, and a settling transcript takes one every growth round.
+ *  The wide predicate is therefore true almost continuously on exactly the
+ *  threads the correction exists for.
+ *
+ *  A held write's OWN event lands on the stamp, and `isWhereWeHeldIt` excludes
+ *  it a term earlier. So a scroll that is NOT on the stamp cannot be that
+ *  write's event, and the clock has nothing to add. Only a placement leaves the
+ *  reader somewhere the correction must not undo. */
+function isPlacementScroll(el: HTMLElement): boolean {
+  return _navScrollKind !== 'held' && isNavigationScroll(el);
+}
+
+/** Was this scroll event the app holding the reader on their own content, i.e.
+ *  a `markAnchorScroll` write? Read by the mobile hide-on-scroll header, which
+ *  reveals itself for every other navigation and must not for this one.
+ *
+ *  Takes no element by default, matching the header: it follows whichever pane
+ *  is active rather than one container. */
+export function isAnchorScroll(el?: HTMLElement | null): boolean {
+  return _navScrollKind === 'anchor' && isNavigationScroll(el);
+}
+
+/** Is a navigation OTHER than the caller's own anchor correction driving `el`?
+ *
+ *  `withScrollAnchor`'s next-frame re-assert asks it. Its own write marks a
+ *  navigation, so the plain predicate would stand the re-check down for the
+ *  very write it exists to re-assert.
+ *
+ *  A live tween counts whatever the last write said. It is going where the
+ *  reader asked more recently, and a pre-tween offset re-asserted against it is
+ *  a frame of jitter for nothing. */
+export function isOtherNavigationScroll(el: HTMLElement): boolean {
+  if (_scrollAnimRaf !== null) return true;
+  return _navScrollKind !== 'anchor' && isNavigationScroll(el);
 }
 
 /* ── The standing request to ride the live edge ──────────────────────────────
@@ -669,9 +782,14 @@ function holdPosition(el: HTMLElement | null) {
 /** Write `top` and record it as OURS, so the scroll event it fires a frame later
  *  cannot be read as the reader taking over. Goes through `markNavigationScroll`
  *  like every other write the app makes, so the mobile header and the
- *  render-window expansion keep standing down for it too. */
+ *  render-window expansion keep standing down for it too.
+ *
+ *  And says which KIND of write it was, since a held write is not a PLACEMENT.
+ *  This is the only place `_navScrollKind` is set to `held`. See
+ *  `isPlacementScroll` for what turns on the distinction. */
 function markHeldScroll(el: HTMLElement, top: number) {
   markNavigationScroll(el, top);
+  _navScrollKind = 'held';
   holdPosition(el);
 }
 
@@ -2724,7 +2842,10 @@ export function makeScrollObservers(el: HTMLElement) {
     if (!child || child.isConnected === false) return;
     const shift = (child.getBoundingClientRect().top - viewportTop()) - anchorRelTop;
     if (shift === 0) return;
-    el.scrollTop = el.scrollTop + shift;
+    // An ANCHOR write, which is what keeps the mobile header still across it.
+    // Unmarked, a wide reflow slid the chrome by its own delta and covered the
+    // line this exists to hold. Same act as `withScrollAnchor`'s correction.
+    markAnchorScroll(el, el.scrollTop + shift);
     // The app holding the reader on the same content, not the reader taking
     // over. The growth branch usually re-stamps a line later, but not while it
     // stands down for a tween or a pending landing. See `carryHeldScroll`.
@@ -2811,12 +2932,18 @@ export function makeScrollObservers(el: HTMLElement) {
       // the ride. Without this term the correction writes the reader back to the
       // bottom on the navigation's own trailing scroll event.
       //
-      // `isNavigationScroll` is the module's existing answer to exactly this
-      // question, window and all. It is asked HERE rather than inside
-      // `keepTheLiveEdge`, because only a scroll event can be attributed to a
-      // write. The box-change caller has none, and re-marks itself every growth
-      // round, so asking there would stand the branch down for our own writes.
-      else if (!atEdge && tookOver && !gesture && !isNavigationScroll(el)) keepTheLiveEdge();
+      // `isPlacementScroll` is the module's answer to exactly this question,
+      // window and all. It is asked HERE rather than inside `keepTheLiveEdge`,
+      // because only a scroll event can be attributed to a write. The box-change
+      // caller has none, and re-marks itself every growth round, so asking there
+      // would stand the branch down for our own writes.
+      //
+      // A PLACEMENT and not any navigation, which is the narrower of the two.
+      // The ride's own held writes mark a navigation too, for the mobile
+      // header's sake. So the wide predicate is true for most of a settling
+      // transcript. Read through it, one unattributed scroll clears both
+      // readings `keepTheLiveEdge` has and the ride can never write again.
+      else if (!atEdge && tookOver && !gesture && !isPlacementScroll(el)) keepTheLiveEdge();
     } else if (tookOver && landingInFlight()) {
       cancelLanding();
     }

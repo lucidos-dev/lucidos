@@ -58,8 +58,18 @@ fn summary_excludes_content() {
     assert!(!json.contains("content"));
 }
 
+/// The ids a listing produced, sorted, so a test states the whole set rather
+/// than sampling it.
+fn listed_ids(summaries: &[KnowhowSummary]) -> Vec<String> {
+    let mut ids: Vec<String> = summaries.iter().map(|s| s.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+/// A top-level root lists a file at the root and a file one group folder in.
+/// Anything deeper is a reference belonging to a doc, so it takes no row.
 #[test]
-fn load_summaries_discovers_files_in_subdirectories() {
+fn top_level_root_lists_files_and_one_group_deep() {
     let tmp = tempfile::tempdir().unwrap();
     let kh = tmp.path().join("knowhow");
 
@@ -75,25 +85,32 @@ fn load_summaries_discovers_files_in_subdirectories() {
         "Deep content.",
     );
 
-    let summaries = KnowhowStore::load_summaries(&kh);
-    let ids: Vec<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+    let summaries = KnowhowStore::load_summaries(&kh, KnowhowListDepth::FilesAndGroups);
+    assert_eq!(
+        listed_ids(&summaries),
+        vec!["lucidos/nested".to_string(), "top".to_string()],
+        "a file two folders in is a reference, not a doc"
+    );
+}
 
-    assert!(
-        ids.contains(&"top"),
-        "should find top-level file, got: {:?}",
-        ids
+/// Listing changed; resolution did not. A reference below the listing depth
+/// loads by its full id, through the plain loader and through the fallback.
+#[test]
+fn a_reference_below_the_listing_depth_still_loads_by_its_full_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let kh = tmp.path().join("knowhow");
+
+    write_knowhow_file(
+        &kh.join("lucidos").join("deep").join("deep-file.md"),
+        "Deep",
+        "Deep content.",
     );
-    assert!(
-        ids.iter().any(|id| id.contains("nested")),
-        "should find nested file, got: {:?}",
-        ids
-    );
-    assert!(
-        ids.iter().any(|id| id.contains("deep-file")),
-        "should find deeply nested file, got: {:?}",
-        ids
-    );
-    assert_eq!(summaries.len(), 3);
+
+    let direct = KnowhowStore::load(&kh, "lucidos/deep/deep-file");
+    assert_eq!(direct.map(|kh| kh.name), Some("Deep".to_string()));
+
+    let fallback = KnowhowStore::load_with_fallback(&dirs(None, &kh), "lucidos/deep/deep-file");
+    assert_eq!(fallback.map(|kh| kh.name), Some("Deep".to_string()));
 }
 
 #[test]
@@ -107,7 +124,7 @@ fn load_by_id_finds_file_in_subdirectory() {
         "Nested doc content.",
     );
 
-    let summaries = KnowhowStore::load_summaries(&kh);
+    let summaries = KnowhowStore::load_summaries(&kh, KnowhowListDepth::FilesAndGroups);
     assert_eq!(summaries.len(), 1);
     let id = &summaries[0].id;
 
@@ -127,7 +144,7 @@ fn load_summary_has_description() {
         "This is the first paragraph.",
     );
 
-    let summaries = KnowhowStore::load_summaries(&kh);
+    let summaries = KnowhowStore::load_summaries(&kh, KnowhowListDepth::FilesAndGroups);
     assert_eq!(summaries.len(), 1);
     assert_eq!(
         summaries[0].description,
@@ -147,7 +164,7 @@ fn load_summary_uses_frontmatter_description() {
     )
     .unwrap();
 
-    let summaries = KnowhowStore::load_summaries(&kh);
+    let summaries = KnowhowStore::load_summaries(&kh, KnowhowListDepth::FilesAndGroups);
     assert_eq!(summaries.len(), 1);
     assert_eq!(
         summaries[0].description,
@@ -233,6 +250,45 @@ fn load_merged_summaries_local_overrides_shared() {
         gc.name.contains("local"),
         "local should override shared, got: {}",
         gc.name
+    );
+}
+
+/// The six group-folder docs a live workspace routes to. They are files in the
+/// TOP-LEVEL root, one group folder deep, so the root cannot be tightened to
+/// depth 1 without losing them. Two are named after an app and after the
+/// trigger namespace, and are neither app-scoped nor trigger-scoped.
+#[test]
+fn group_folder_docs_in_the_top_level_root_stay_listed() {
+    const DOCS: [&str; 6] = [
+        "lucidos-ops/release-process",
+        "lucidos-ops/nightly-pipeline",
+        "lucidos-ops/nightly-release-prep",
+        "lucidos-ops/applying-changes",
+        "demo-director/v8-handoff",
+        "triggers/notify-on-idle-trigger-design",
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local");
+    for id in DOCS {
+        write_knowhow_file(&local.join(format!("{}.md", id)), id, "Body.");
+    }
+    write_knowhow_file(
+        &local.join("lucidos-ops/release-process/phase-table.md"),
+        "Phase Table",
+        "Body.",
+    );
+
+    let listed = listed_ids(&KnowhowStore::load_merged_summaries(&dirs(None, &local)));
+    for id in DOCS {
+        assert!(
+            listed.contains(&id.to_string()),
+            "'{id}' must stay listed, got: {listed:?}"
+        );
+    }
+    assert!(
+        !listed.contains(&"lucidos-ops/release-process/phase-table".to_string()),
+        "a doc's reference must take no row of its own, got: {listed:?}"
     );
 }
 
@@ -477,6 +533,44 @@ fn load_with_fallback_loads_app_scoped_knowhow() {
     assert_eq!(kh.name, "Foo Bar");
 }
 
+/// An app is already the group, so a folder in its knowhow dir holds one
+/// doc's references. They take no row, and the doc still loads them by id.
+#[test]
+fn app_scoped_root_lists_only_its_own_top_level_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let apps = tmp.path().join("apps");
+    let kh_dir = apps.join("habit-tracker").join("knowhow");
+
+    write_knowhow_file(&kh_dir.join("reach-metrics.md"), "Reach Metrics", "Body.");
+    write_knowhow_file(
+        &kh_dir.join("reach-metrics").join("field-table.md"),
+        "Field Table",
+        "Body.",
+    );
+
+    let listed: Vec<String> = KnowhowStore::load_app_summaries(&apps)
+        .into_iter()
+        .map(|(app_id, s)| format!("{}/{}", app_id, s.id))
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["habit-tracker/reach-metrics".to_string()],
+        "a folder under an app's knowhow dir holds references"
+    );
+
+    let reference = KnowhowStore::load_with_fallback(
+        &dirs_with_apps(None, &local, &apps),
+        "habit-tracker/reach-metrics/field-table",
+    );
+    assert_eq!(
+        reference.map(|kh| kh.name),
+        Some("Field Table".to_string()),
+        "the doc must still be able to load its own reference"
+    );
+}
+
 #[test]
 fn load_with_fallback_prefers_local_over_app_scoped() {
     // If a top-level knowhow file shares the same id-shape as an app-scoped
@@ -642,6 +736,41 @@ fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
     assert!(ids.contains(&"rollback"));
     let orch = summaries.iter().find(|s| s.id == "orchestration").unwrap();
     assert_eq!(orch.name, "Orchestration");
+}
+
+/// A trigger is already the group, so a folder in its knowhow dir holds one
+/// doc's references. They take no row, and the doc still loads them by id.
+#[test]
+fn trigger_scoped_root_lists_only_its_own_top_level_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let triggers = tmp.path().join("triggers");
+    let kh_dir = triggers.join("nightly-build").join("knowhow");
+
+    write_knowhow_file(&kh_dir.join("orchestration.md"), "Orchestration", "Body.");
+    write_knowhow_file(
+        &kh_dir.join("orchestration").join("phase-table.md"),
+        "Phase Table",
+        "Body.",
+    );
+
+    let summaries = KnowhowStore::load_trigger_summaries(&triggers, "nightly-build");
+    assert_eq!(
+        listed_ids(&summaries),
+        vec!["orchestration".to_string()],
+        "a folder under a trigger's knowhow dir holds references"
+    );
+
+    let reference = KnowhowStore::load_with_fallback(
+        &dirs_with_triggers(&local, &triggers),
+        "triggers/nightly-build/orchestration/phase-table",
+    );
+    assert_eq!(
+        reference.map(|kh| kh.name),
+        Some("Phase Table".to_string()),
+        "the doc must still be able to load its own reference"
+    );
 }
 
 #[test]

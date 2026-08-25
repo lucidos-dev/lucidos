@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
-import { repoDiff, repoPending, filePreviewSource, diffSideBySide, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import { repoDiff, repoPending, filePreviewSource, diffSideBySide, openImagePopup, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
@@ -19,6 +19,7 @@ import { ChangesFileList } from './RepoFilesView';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
+import { withPreviewRevision } from './previewRevision';
 
 interface Props {
   /** The parsed `repo:` locator the panel overlay holds. Its per-mode qualifier
@@ -121,6 +122,10 @@ function RepoFilePreview({ locator, layout }: Props) {
   // same leaves render in the app-facing preview modal, whose surface default is
   // not this one (see `previewGitRef`).
   const gitRef = previewGitRef(locator, repoPending.value?.branch_name ?? null);
+  // What the header's Refresh button moves. Read here rather than in the leaves
+  // below, which also render in the file preview modal: that surface is not the
+  // content pane this revision speaks for, and has no Refresh button of its own.
+  const revision = openFilePreviewRevision.value;
 
   // After a reload, the panel overlay re-hydrates from nav history but the
   // repoDiff/repoSelectedChangeId backing state does not. If the URL carries
@@ -154,7 +159,7 @@ function RepoFilePreview({ locator, layout }: Props) {
       // Files view. Added files default to this (their diff is all additions);
       // see diffWholeFileEffective.
       case 'whole-file':
-        return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} gitRef={gitRef} />;
+        return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} gitRef={gitRef} revision={revision} />;
       case 'no-end-state':
         return <div class="empty-state">File is deleted in this change, so there is no end state to show</div>;
       case 'rendered-markdown':
@@ -166,7 +171,7 @@ function RepoFilePreview({ locator, layout }: Props) {
     }
   }
 
-  return <RepoFileContent repoId={repoId} path={path} gitRef={gitRef} />;
+  return <RepoFileContent repoId={repoId} path={path} gitRef={gitRef} revision={revision} />;
 }
 
 interface RepoFileContentProps {
@@ -179,6 +184,12 @@ interface RepoFileContentProps {
    *  the Files panel is not bound to (the app-facing file preview modal), where
    *  the bound repository's branch would fetch the wrong revision or 404. */
   gitRef: string | null;
+  /** Cache-buster for the header's Refresh button, 0 when it has never been
+   *  pressed on this file. A repo file is read at a git ref, so nothing else
+   *  moves it: no SSE event names a `repo:` path, and an edit inside a clone
+   *  announces nothing. Omitted by the file preview modal, which has no
+   *  Refresh button and re-fetches by remounting. */
+  revision?: number;
 }
 
 /** Dispatches a repo file to the right preview. Binary-media files (images,
@@ -192,18 +203,21 @@ interface RepoFileContentProps {
  *  without navigating to the Files panel (see `FilePreviewModal`). It is the
  *  content alone: the panel's chrome (the changed-files sidebar, the diff modes)
  *  stays with `RepoFilePreviewWithSidebar`. */
-export function RepoFileContent({ repoId, path, changeId, gitRef }: RepoFileContentProps) {
+export function RepoFileContent({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps) {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   if (previewMediaKind(ext) !== 'text') {
-    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} ext={ext} />;
+    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} ext={ext} />;
   }
-  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} />;
+  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} />;
 }
 
 /** Binary-media preview. Builds the file URL (same change-vs-branch ref logic as
  *  RepoFileText) and renders it without fetching the bytes as text. */
-function RepoFileMedia({ repoId, path, changeId, gitRef, ext }: RepoFileContentProps & { ext: string }) {
-  const url = changeId ? changeFileUrl(changeId, path) : repoFileUrl(repoId, path, gitRef ?? undefined);
+function RepoFileMedia({ repoId, path, changeId, gitRef, revision, ext }: RepoFileContentProps & { ext: string }) {
+  const url = withPreviewRevision(
+    changeId ? changeFileUrl(changeId, path) : repoFileUrl(repoId, path, gitRef ?? undefined),
+    revision ?? 0,
+  );
   const kind = previewMediaKind(ext);
 
   if (kind === 'image') {
@@ -214,15 +228,20 @@ function RepoFileMedia({ repoId, path, changeId, gitRef, ext }: RepoFileContentP
   return <audio src={url} controls style="width:100%;" />;
 }
 
-function RepoFileText({ repoId, path, changeId, gitRef }: RepoFileContentProps) {
+function RepoFileText({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps) {
   // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
   // the correct ref for both pending (branch) and applied (post_merge_sha). Without
   // one (external-repo CC), fall back to the branch ref. Mirrors RenderedDiff.
+  //
+  // `revision` is in the deps rather than in the URL: re-running the fetch is
+  // the whole job here, and the engine answers `Cache-Control: no-cache`, so a
+  // plain re-request already revalidates. The media branch above cache-busts
+  // instead, because an element keeps its bytes until its `src` changes.
   const { loadable, showLoading } = useLoadableFetch<string>(
     () => changeId
       ? getChangeFileContent(changeId, path)
       : getRepoFileContent(repoId, path, gitRef ?? undefined),
-    [repoId, path, changeId, gitRef],
+    [repoId, path, changeId, gitRef, revision],
   );
 
   const ext = path.split('.').pop()?.toLowerCase() || '';

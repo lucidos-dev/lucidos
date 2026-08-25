@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+#[derive(Debug)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
     pub message: String,

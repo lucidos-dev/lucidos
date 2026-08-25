@@ -18,6 +18,28 @@ async fn unknown_route_returns_non_json() {
     );
 }
 
+/// Regression (ADR 0116): the bare `POST /api/v1/chat` is gone.
+///
+/// It reached the same mutation as `/chat/stream` while skipping the
+/// subprocess gate, the continuity lock and Thread Queue admission, and its
+/// event carried no actor. A body that `/chat/stream` would accept must find
+/// no route here, so a re-registration cannot land quietly.
+#[tokio::test]
+async fn the_legacy_bare_chat_route_is_gone() {
+    let client = http_client();
+    let resp = client
+        .post(format!("{}/api/v1/chat", base_url()))
+        .json(&serde_json::json!({ "message": "hi", "mode": "human" }))
+        .send()
+        .await
+        .expect("Request failed");
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "POST /api/v1/chat must not route anywhere"
+    );
+}
+
 #[tokio::test]
 async fn malformed_chat_body_returns_error() {
     let client = http_client();

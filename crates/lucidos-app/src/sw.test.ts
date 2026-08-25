@@ -132,7 +132,7 @@ describe('Service Worker fetch handler', () => {
   });
 
   it('POST to /api/v1/foo: does NOT call respondWith (browser handles natively, avoids iOS body-clone bug)', () => {
-    const event = makeEvent('https://example.com/api/v1/chat', 'POST');
+    const event = makeEvent('https://example.com/api/v1/chat/stream', 'POST');
     handlers.fetch(event);
     expect(event.respondWith).not.toHaveBeenCalled();
   });
@@ -495,6 +495,43 @@ describe('Service Worker fetch handler — navigation shell (network-first)', ()
     expect(sw.mockCache.put).not.toHaveBeenCalled();
     expect(response).toBe(splash);
   });
+
+  it('built: an unpaired navigation shows the pairing screen and never pins it as the shell', async () => {
+    // The pairing screen is an ordinary 200, so only the marker tells it apart
+    // from the app. Caching it would outlive the pairing it exists for: the
+    // next offline launch would open on a form the device no longer needs.
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    const cached = new Response('<!doctype html>good shell');
+    sw.cacheStore.set('https://example.com/', cached);
+    const pairing = new Response('<!doctype html>pair this device', {
+      status: 200,
+      headers: { 'x-lucidos-pairing': '1' },
+    });
+    sw.mockFetch.mockResolvedValue(pairing);
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(response).toBe(pairing);
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+  });
+
+  it('built: a redirected navigation hands the browser a real redirect, not the cached shell', async () => {
+    // Replaying a followed response for a navigation throws, and the cached
+    // shell would boot an app whose every call fails. The gateway no longer
+    // 3xxs an unpaired navigation, so this guards whatever else might.
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.cacheStore.set('https://example.com/', new Response('<!doctype html>good shell'));
+    const followed = new Response('<!doctype html>somewhere else', { status: 200 });
+    Object.defineProperty(followed, 'redirected', { value: true });
+    Object.defineProperty(followed, 'url', { value: 'https://example.com/~/' });
+    sw.mockFetch.mockResolvedValue(followed);
+    const event = makeEvent('https://example.com/', 'GET', 'navigate');
+    sw.handlers.fetch(event);
+    const response = await event.respondWith.mock.calls[0][0];
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toBe('https://example.com/~/');
+  });
 });
 
 // install precaches the shell (built mode) so an OFFLINE first navigation still
@@ -519,6 +556,22 @@ describe('Service Worker install handler — shell precache', () => {
     );
     expect(sw.mockCache.put).toHaveBeenCalledTimes(1);
     expect((sw.mockCache.put.mock.calls[0][0] as { url: string }).url).toBe('https://example.com/');
+  });
+
+  it('built: installing while unpaired does NOT freeze the pairing screen in as the offline shell', async () => {
+    // Nothing evicts a bad precache until the build id moves, so this one has
+    // to be refused at the door rather than corrected later.
+    const sw = loadSw({ buildId: STAMPED_BUILD });
+    sw.mockFetch.mockResolvedValue(
+      new Response('<!doctype html>pair this device', {
+        status: 200,
+        headers: { 'x-lucidos-pairing': '1' },
+      }),
+    );
+    const event = makeInstallEvent();
+    sw.handlers.install(event);
+    await Promise.all(event.waiting);
+    expect(sw.mockCache.put).not.toHaveBeenCalled();
   });
 
   it('built: a failed precache fetch does not throw or cache (best-effort)', async () => {

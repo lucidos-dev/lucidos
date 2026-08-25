@@ -19,6 +19,10 @@ pub struct RoutingProvider {
     openrouter: Option<Arc<OpenAiProvider>>,
     /// xAI, an [`OpenAiProvider`] pointed at `api.x.ai/v1`, serving Grok.
     xai: Option<Arc<OpenAiProvider>>,
+    /// OpenCode's keyless free tier, an [`OpenAiProvider`] pointed at
+    /// `opencode.ai/zen/v1` with no credential. Present only when the user
+    /// turned it on.
+    opencode_free: Option<Arc<OpenAiProvider>>,
     /// A generic OpenAI-compatible local server — an [`OpenAiProvider`] pointed
     /// at the configured local base URL (default Ollama).
     local: Option<Arc<OpenAiProvider>>,
@@ -34,6 +38,7 @@ impl RoutingProvider {
         anthropic: Option<AnthropicProvider>,
         openrouter: Option<OpenAiProvider>,
         xai: Option<OpenAiProvider>,
+        opencode_free: Option<OpenAiProvider>,
         local: Option<OpenAiProvider>,
         registry: ModelRegistry,
         default_model: String,
@@ -44,6 +49,7 @@ impl RoutingProvider {
             anthropic: anthropic.map(Arc::new),
             openrouter: openrouter.map(Arc::new),
             xai: xai.map(Arc::new),
+            opencode_free: opencode_free.map(Arc::new),
             local: local.map(Arc::new),
             registry,
             default_model,
@@ -102,6 +108,9 @@ impl RoutingProvider {
             }),
             ProviderKind::XAi => self.xai.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "xAI model requested but no xAI credential is configured (Settings → Models → Providers) and LUCIDOS_XAI_API_KEY is not set".into()
+            }),
+            ProviderKind::OpenCodeFree => self.opencode_free.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
+                "Free model requested but the keyless OpenCode Free tier is turned off (Settings → Models → Providers)".into()
             }),
             ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)".into()
@@ -166,6 +175,9 @@ impl LlmProvider for RoutingProvider {
         if self.xai.is_some() {
             kinds.push(ProviderKind::XAi);
         }
+        if self.opencode_free.is_some() {
+            kinds.push(ProviderKind::OpenCodeFree);
+        }
         if self.local.is_some() {
             kinds.push(ProviderKind::Local);
         }
@@ -203,6 +215,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             registry,
             "claude-opus-5@default".to_string(),
         )
@@ -224,6 +237,10 @@ mod tests {
             // Grok through OpenRouter is a different row on a different
             // backend, and must keep resolving there.
             ("x-ai/grok-4.6", ProviderKind::OpenRouter),
+            // The free tier splits per model: Ox Alpha keeps `max`, and every
+            // other free id snaps to the conservative ceiling.
+            ("x-preview-f-free", ProviderKind::OpenCodeFree),
+            ("laguna-s-2.1-free", ProviderKind::OpenCodeFree),
         ]);
         for (model, expected) in [
             ("claude-opus-5@default", "max"),
@@ -234,6 +251,8 @@ mod tests {
             ("z-ai/glm-5.2", "high"),
             ("grok-4.6", "high"),
             ("x-ai/grok-4.6", "high"),
+            ("x-preview-f-free", "max"),
+            ("laguna-s-2.1-free", "high"),
         ] {
             assert_eq!(
                 router.effort_for_model(model, Some("max")),
@@ -259,6 +278,21 @@ mod tests {
                 assert_ne!(sent, Some("xhigh"), "{model} asked for {effort}");
             }
         }
+    }
+
+    /// With the free tier off, its models are neither offered nor silently
+    /// routed somewhere else. The picker filters on `configured_providers`, and
+    /// a turn that gets through anyway is told where the switch is.
+    #[test]
+    fn a_free_model_is_hidden_and_actionable_while_the_tier_is_off() {
+        let router = router(&[("laguna-s-2.1-free", ProviderKind::OpenCodeFree)]);
+        assert_eq!(router.configured_providers(), Some(Vec::new()));
+        let Err(err) = router.provider_for_model("laguna-s-2.1-free") else {
+            panic!("the tier is off, so there is no provider to route to");
+        };
+        let err = err.to_string();
+        assert!(err.contains("OpenCode Free"), "{err}");
+        assert!(err.contains("Settings → Models → Providers"), "{err}");
     }
 
     /// A model with no registry row falls back to the same prefix heuristic

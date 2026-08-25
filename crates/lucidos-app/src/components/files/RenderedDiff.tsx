@@ -5,6 +5,7 @@ import type { Token, Tokens } from 'marked';
 // escapeHtmlAttr is a DOM-free escaper; importing it also runs markedConfig's
 // marked.use(...) side effects (previously a bare side-effect import).
 import { escapeHtmlAttr } from '../../utils/markedConfig';
+import { sanitizeHtmlFragments } from '../../utils/renderMarkdown';
 import type { DiffFile } from '../../store/store';
 import { getChangeFileContent, getRepoFileContent } from '../../api/client';
 import type { Loadable } from '../../store/types';
@@ -241,7 +242,12 @@ export function renderDiffMarked(
   // Trailing omitted content below the last change.
   flushGap();
 
-  return parts.join('');
+  // `gfm: true` passes raw HTML in the source straight through, and this string
+  // goes into `dangerouslySetInnerHTML` on the host origin. A repo file is not
+  // trusted input, so scrub it exactly as `renderMarkdown` does. Scrub the
+  // joined document rather than each part: an element opened in one part and
+  // closed in another is only well formed once the parts are back together.
+  return sanitizeHtmlFragments(parts.join(''));
 }
 
 export function deletionRuns(file: DiffFile): DeletionRun[] {

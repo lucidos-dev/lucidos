@@ -410,23 +410,50 @@ export function changeActions(changeId?: string, suppress?: boolean, reserveWhil
   );
 }
 
-/** Shared header click handler for InitiatorPanel and ResponsePanel. It toggles
- *  the panel's collapsed state, ignoring clicks that originated on a button or
- *  link inside the header. */
-function handlePanelHeaderClick(e: MouseEvent, onToggle?: () => void): void {
-  if (!onToggle) return;
-  if ((e.target as HTMLElement).closest('button, a')) return;
-  onToggle();
-}
-
 /** Shown in place of a collapsed panel's body, so a folded turn never reads as
- *  an empty row. A muted "⋯", rendered as an accent stub bubble for user
- *  messages. Clicking it expands the panel. */
-function CollapsedIndicator({ bubble = false, onToggle }: { bubble?: boolean; onToggle?: () => void }) {
+ *  an empty row. A muted "⋯" on the turn's own left column, whichever panel is
+ *  folded. Clicking it expands that panel. */
+function CollapsedIndicator({ onToggle }: { onToggle?: () => void }) {
   return (
-    <div class={`turn-collapsed${bubble ? ' turn-collapsed-bubble' : ''}`} onClick={onToggle}>
+    <div class="turn-collapsed" onClick={onToggle}>
       <span class="turn-collapsed-dots" aria-label="Collapsed — click to expand">⋯</span>
     </div>
+  );
+}
+
+/** The turn's fold, as an icon button. Both headers render this one control, so
+ *  a reader folds a user message the way they fold the reply under it.
+ *
+ *  It is the third of the response header's three `turnControls`, and the
+ *  initiator header's only one. Everything a reader keys off is therefore
+ *  shared: the glyph that turns around, the label naming the turn, and the
+ *  `.turn-control-collapse` class the brightness rule excludes by name
+ *  (styles/chat/input-messages.css).
+ *
+ *  `collapsible` is false on a panel with no body to fold. Disabling it matters
+ *  on the response header, whose panel is often only a status line while the
+ *  turn is in flight: an enabled control there takes the fold, holds it, and
+ *  folds the turn as its first content arrives.
+ *
+ *  One object rather than two positional booleans and a callback: adjacent
+ *  same-typed arguments mis-order with no type error. */
+function collapseControl(
+  { collapsed, collapsible, onToggle }: { collapsed: boolean; collapsible: boolean; onToggle: () => void },
+): ComponentChildren {
+  const label = collapsed ? 'Expand this turn' : 'Collapse this turn';
+  return (
+    <button
+      type="button"
+      class="icon-btn turn-control-collapse"
+      data-role="toggle-collapsed"
+      disabled={!collapsible}
+      aria-pressed={collapsed}
+      aria-label={label}
+      data-tooltip={label}
+      onClick={onToggle}
+    >
+      <CollapseTurnIcon collapsed={collapsed} />
+    </button>
   );
 }
 
@@ -466,12 +493,26 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
   // button ("Change applied" → origin info). Plain summaries stay a <div>.
   const summaryLinks = chromeless && !!onActorClick;
 
+  // The turn's fold. Rendered only where there is a body to fold, which is the
+  // one way it departs from the response header's run of three: this panel's
+  // body comes from its event rather than streaming in, so a control that is
+  // dead now stays dead. The run keeps a disabled one instead, since two of its
+  // three are transcript-wide and a hole in it shows.
+  //
+  // ONE slot: immediately right of the actor chip, where the response header
+  // keeps its run. Both chipless turns are exempt from the fold, so the slot
+  // is never a bare row lead. `canCollapseInitiator` in `ChatExchange` is what
+  // drops it, for a user message and for a change turn.
+  const collapse = collapsible && onToggle
+    ? <span class="turn-controls">{collapseControl({ collapsed, collapsible, onToggle })}</span>
+    : null;
+
   return (
     <div class={`initiator-panel initiator-panel-${initiator.variant}${accentClass}${bubble ? ' initiator-panel-bubble' : ''}${collapsed ? ' initiator-panel-collapsed' : ''}`}>
-      <div
-        class={`initiator-header${collapsible ? ' initiator-header-clickable' : ''}`}
-        onClick={(e) => handlePanelHeaderClick(e, onToggle)}
-      >
+      {/* The row is inert, like the response header's: the control owns folding.
+          A row that swallowed a click announced it with nothing but a cursor,
+          and it fired for any click that missed the chip. */}
+      <div class="initiator-header">
         {!chromeless && (onActorClick ? (
           <button
             type="button"
@@ -486,9 +527,11 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
             <ActorChipBody initiator={initiator} />
           </span>
         ))}
+        {collapse}
         {/* Status (question/permission resolution) + timestamp, grouped right.
-            Chromeless turns have no actor chip — the timestamp is the popover
-            trigger; it's a <button> so it's excluded from the collapse click. */}
+            That order is the response header's, read across: controls, then
+            meta. Chromeless turns have no actor chip, so the timestamp is the
+            popover trigger. */}
         <span class="initiator-meta">
           {initiator.status}
           {chromeless && onActorClick ? (
@@ -517,7 +560,7 @@ export function InitiatorPanel({ initiator, timestamp, onActorClick, actions, co
           {bubble ? <div class="user-bubble">{initiator.details}</div> : initiator.details}
         </div>
       )}
-      {hasBody && collapsed && <CollapsedIndicator bubble={bubble} onToggle={onToggle} />}
+      {hasBody && collapsed && <CollapsedIndicator onToggle={onToggle} />}
       {actions && !collapsed && <div class="initiator-footer">{actions}</div>}
     </div>
   );
@@ -574,16 +617,13 @@ interface TurnControlsProps {
  *  transcript. A turn with no steps is still a place to set how turns read.
  *  Rendering them conditionally leaves holes in a column of identical headers.
  *
- *  The third folds THIS turn to its `⋯` stub, and is the only one whose effect
- *  stops at the turn it sits on. Its LABEL is what says so. The run stays
- *  evenly spaced (styles/chat/response.css): a 2+1 break reads as "two things
- *  and a stray" rather than as a scope split. It is also the only one stating
- *  its state in its GLYPH rather than its brightness. `CollapseTurnIcon` and
- *  `FullResponseIcon` carry the long form.
- *
- *  Each is a `<button>`, which keeps a click off the initiator header's
- *  collapse handler: `handlePanelHeaderClick` ignores anything inside a
- *  `button, a`. */
+ *  The third is `collapseControl`, the same control the initiator header
+ *  carries, and the only one whose effect stops at the turn it sits on. Its
+ *  LABEL is what says so. The run stays evenly spaced
+ *  (`.turn-controls`, styles/chat/input-messages.css): a 2+1 break reads as
+ *  "two things and a stray" rather than as a scope split. It is also the only
+ *  one stating its state in its GLYPH rather than its brightness.
+ *  `CollapseTurnIcon` and `FullResponseIcon` carry the long form. */
 export function turnControls({
   detailsOn, stepsOn, collapsed, collapsible, onToggleDetails, onToggleSteps, onToggleCollapsed,
 }: TurnControlsProps): ComponentChildren {
@@ -593,9 +633,8 @@ export function turnControls({
   // first of the two.
   const detailsLabel = detailsOn ? 'Show the latest answer only' : 'Show the full response';
   const stepsLabel = stepsOn ? 'Hide steps' : 'Show steps';
-  const collapseLabel = collapsed ? 'Expand this turn' : 'Collapse this turn';
   return (
-    <span class="response-controls">
+    <span class="turn-controls">
       <button
         type="button"
         class="icon-btn"
@@ -618,18 +657,7 @@ export function turnControls({
       >
         <StepLogIcon />
       </button>
-      <button
-        type="button"
-        class="icon-btn response-control-turn"
-        data-role="toggle-collapsed"
-        disabled={!collapsible}
-        aria-pressed={collapsed}
-        aria-label={collapseLabel}
-        data-tooltip={collapseLabel}
-        onClick={onToggleCollapsed}
-      >
-        <CollapseTurnIcon collapsed={collapsed} />
-      </button>
+      {collapseControl({ collapsed, collapsible, onToggle: onToggleCollapsed })}
     </span>
   );
 }
@@ -652,10 +680,10 @@ interface ResponsePanelProps {
 
 /** The response half of a turn.
  *
- *  Its header is NOT a click target, unlike the initiator panel's: folding this
- *  turn is the third turn control's job. A whole row that silently swallowed a
- *  click announced nothing, and it sat under three buttons that each mean
- *  something else. */
+ *  Its header is NOT a click target: folding this turn is the third turn
+ *  control's job. A whole row that silently swallowed a click announced
+ *  nothing, and it sat under three buttons that each mean something else. Both
+ *  turn headers read that way now. */
 export function ResponsePanel({
   executor, onExecutorClick, controls, status, timestamp, collapsed, onToggle, hasBody, children,
 }: ResponsePanelProps) {
@@ -920,7 +948,7 @@ export function EventWaitRow({ event }: { event: Extract<ResponseEvent, { type: 
 }
 
 /** The row's markup, hookless so it stays a pure function of its state (same
- *  split as `eventWaitIndicatorBody` next door). There is no jsdom in the test
+ *  split as `waitingIndicatorBody` next door). There is no jsdom in the test
  *  infra, so a component carrying a hook cannot be invoked as a plain function.
  *  The tests drive this instead. */
 export function eventWaitRowBody({
@@ -995,7 +1023,7 @@ function subscriptionFacts(subscriptions: string[]): EventRowFact[] {
 /** When an unresolved wait gives up, as a fact rather than a countdown.
  *
  *  Deliberately not ticking. ADR 0047 puts the live countdown on the
- *  subscription indicator and keeps the transcript record LIGHTER. A per-second
+ *  waiting indicator and keeps the transcript record LIGHTER. A per-second
  *  span here would re-render inside `ChatExchange`, the component the whole
  *  store is shaped around not re-rendering. The panel's own countdown keeps its
  *  interval, being one open popover rather than one row per wait.

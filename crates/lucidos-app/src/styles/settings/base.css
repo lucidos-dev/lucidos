@@ -368,17 +368,29 @@ html[data-theme="light"] .settings-option.active {
     line-height: 1.4;
 }
 
-/* One row in the Settings → Models manager list. */
+/* One row in the Settings → Models manager list.
+
+   The row WRAPS rather than squeezing its text. A model is identified by its
+   name and its id, so a row that clips either identifies nothing: at phone
+   width the info column was the only flexible child against a provider chip, a
+   "not set up" chip and the builtin marker, and both lines ellipsized. Below
+   the info column's 14rem basis the metadata cluster drops to its own line and
+   the name gets the full width. */
 .model-manager-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.5rem;
     padding: 0.375rem 0;
     border-bottom: 1px solid var(--border-color);
 }
 
+.model-manager-row .toggle-switch {
+    flex-shrink: 0;
+}
+
 .model-manager-row .model-manager-info {
-    flex: 1;
+    flex: 1 1 14rem;
     min-width: 0;
 }
 
@@ -387,19 +399,30 @@ html[data-theme="light"] .settings-option.active {
     font-weight: 500;
     line-height: 1.2;
     color: var(--text-primary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
 }
 
+/* `anywhere` rather than `break-word`: a model id is one long unbroken token
+   (`nemotron-3.5-lightning-free`), and only `anywhere` lets it break mid-token
+   AND counts that break when the flex line is measured. */
 .model-manager-row .model-manager-id {
     font-family: var(--font-mono, monospace);
     font-size: var(--font-size-sm);
     line-height: 1.2;
     color: var(--text-muted);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
+}
+
+/* The chips and the builtin marker or Delete button travel as ONE unit. As
+   separate row children they wrap one at a time, stranding "not set up" on a
+   line of its own under its own provider chip. */
+.model-manager-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    margin-left: auto;
 }
 
 /* Provider chip (vertex / anthropic / openai) on a model manager row. */
@@ -411,6 +434,44 @@ html[data-theme="light"] .settings-option.active {
     border-radius: 0.25rem;
     padding: 0.0625rem 0.3125rem;
     color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+/* A bare text button carrying a chevron, opening a group of rows below it. Two
+   settings pages use it: an MCP row's tool list, and the switched-off models at
+   the end of the Models list. Lives here rather than beside either one, because
+   this file is where the settings-wide classes are (.settings-section-title,
+   .settings-text-input, .model-provider-badge). */
+.settings-disclosure-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin-top: var(--space-sm);
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    /* No `font` shorthand: base.css already hands a button the inherited
+       family, and the shorthand would reset font-feature-settings with it
+       (.claude/rules/frontend-css.md). Only the size differs from the body. */
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+@media (hover: hover) {
+    .settings-disclosure-toggle:hover {
+        color: var(--text-primary);
+    }
+}
+
+.settings-disclosure-toggle:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+    border-radius: 0.25rem;
+}
+
+.settings-disclosure-toggle svg {
+    flex-shrink: 0;
 }
 
 /* Shown next to the provider chip when that backend isn't configured, so the
@@ -419,4 +480,170 @@ html[data-theme="light"] .settings-option.active {
     color: var(--text-muted);
     border-style: dashed;
     text-transform: none;
+}
+
+/* ── Settings → Access → Add a device ──────────────────────────────────────
+   A live pairing code, as the three ways to use it: scan the QR, type the
+   digits, open the address. The QR is the point of the section, so it is the
+   big card and the two fallbacks stack beside it. Above them sit the countdown
+   and the button that replaces the code. */
+
+.add-device {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    /* The Connect URLs rows above sit at .list-row's --space-lg gutter. This
+       block stands in for a row, so it keeps that edge rather than opening a
+       second one halfway down the page. */
+    padding: var(--space-sm) var(--space-lg);
+    /* The whole group is a QR, eight digits and one address. Past this width it
+       stops laying anything out and just spreads the cards over the pane. The
+       cap is on the block rather than on the cards, so the New code button lands
+       on the same right edge the cards do. */
+    max-width: 44rem;
+}
+
+/* What is true of the CODE, rather than of one way to spend it. */
+.add-device-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-md);
+}
+
+/* Tabular figures: the seconds tick once a second, and proportional digits
+   would shuffle the whole line sideways on every one of them. */
+.add-device-expiry {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.add-device-cards {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: var(--space-md);
+}
+
+/* The two fallbacks, stacked in the space the QR leaves. They share that column
+   evenly, so each rests against the QR's own height. */
+.add-device-alts {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    flex: 1 1 16rem;
+    min-width: 0;
+}
+
+.add-device-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    /* Internal card padding, not the pane gutter: the raised surface is the
+       card, and .add-device above already holds the shared left edge. */
+    padding: var(--space-md);
+    background: var(--bg-tertiary);
+    border-radius: 0.5rem;
+    min-width: 0;
+    /* Inside the stack this divides the column's height. The zero basis is what
+       makes the split EVEN: from their own heights the two fallbacks would only
+       share the surplus, and land as different-sized cards. */
+    flex: 1 1 0;
+}
+
+/* The QR asks for its own width and keeps it. It may still SHRINK, which is
+   what carries it onto a phone: the image caps at the card and stays square. */
+.add-device-card-qr {
+    flex: 0 1 auto;
+}
+
+/* A container, so the digits below can size against this card rather than
+   against the root. See .add-device-code for what that buys. */
+.add-device-card-code {
+    container-type: inline-size;
+}
+
+/* The caption row. Its floor is the action button's own height, so a caption
+   with a button beside it sits at the same height as one without. That is what
+   keeps the QR's caption level with the code's. */
+.add-device-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    min-height: 1.5rem;
+}
+
+/* Free to wrap, and to shrink. It never does at a workable width: the caption
+   is a few short words against a card of 16rem or more. At the top of the UI
+   scale on a phone it must, though, or a nowrapped caption holds the row open
+   and pushes its own Copy button off the card. */
+.add-device-card-label {
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    min-width: 0;
+}
+
+/* The QR is a server-rendered SVG in an `img`, sized here rather than in the
+   markup so it scales with the UI. It carries its own white field: a scanner
+   wants dark modules on a light one, whatever the app's theme is. The padding
+   extends that field past the code's own quiet zone, so a dark surface never
+   crowds the edge. */
+.add-device-qr {
+    width: 15rem;
+    /* Never wider than the card, and square whatever that leaves: a narrow pane
+       shrinks the QR rather than pushing it off the edge. */
+    max-width: 100%;
+    height: auto;
+    aspect-ratio: 1;
+    padding: 0.5rem;
+    background: #fff;
+    border-radius: 0.375rem;
+    /* A vector at one unit per module. Without this the browser smooths the
+       squares and a marginal camera loses the small ones. */
+    image-rendering: pixelated;
+}
+
+/* The digits, for the scan that did not work. Read across a desk, so they get
+   the display step, and monospaced with a little tracking so 0 and 8 stay
+   apart.
+
+   Capped against the card's own width, the same way the pairing screen caps its
+   code boxes, so eight digits fit a phone at every UI scale. Eight of them need
+   5.5em, and the rem arm alone would keep growing with the root while the card
+   could not: the pane has no horizontal scroll and a code has nowhere to break,
+   so the overflow is CLIPPED, taking the first and last digit with it. */
+.add-device-code {
+    font-family: var(--font-mono, monospace);
+    font-size: min(var(--font-size-display), 17cqi);
+    letter-spacing: 0.1em;
+    color: var(--text-primary);
+    text-align: center;
+    /* Centred both ways in the space under the caption: the auto block margins
+       do the vertical half, `text-align` the horizontal. The negative inline end
+       cancels the tracking CSS adds AFTER the last digit, which would otherwise
+       sit the row half a space left of centre. */
+    margin-block: auto;
+    margin-inline-end: -0.1em;
+}
+
+/* A pairing URL carries no spaces, so it has nowhere to break: without
+   `anywhere` it sets one unbreakable line and pushes the card past the pane. */
+.add-device-url {
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-xs);
+    line-height: 1.5;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+    margin: auto 0;
+}
+
+/* Shown in place of the two address cards when no reachable origin was found. */
+.add-device-note {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
 }

@@ -259,8 +259,8 @@ fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_js
 ///      subprocess so it doesn't leak in `running_sessions` until engine
 ///      restart — but ONLY when `is_agent_running_for` is true. We do not
 ///      run `stop_agent`'s no-live fallback (`end_stale_waiting_session`),
-///      which performs heavy, blocking git teardown (auto-commit +
-///      `worktree remove --force` + branch diff + propose) per descendant
+///      which performs heavy, blocking git teardown (auto-commit + branch
+///      diff + propose) per descendant
 ///      inside this request; on a stale-waiting CC family that serialized
 ///      teardown is what made a big archive take ~60s, time the client out,
 ///      and provoke a duplicate-cascade retry. The `ThreadArchived` emit
@@ -390,8 +390,8 @@ pub(in crate::api) async fn archive_thread(
         // `running_sessions` until engine restart. We deliberately gate on a
         // live session and do NOT fall through to `stop_agent`'s no-live
         // path: that path runs `end_stale_waiting_session`, which auto-commits
-        // the worktree, `git worktree remove --force`s it, recomputes the
-        // branch diff, and tries to propose a change — heavy, blocking git I/O.
+        // the worktree, recomputes the branch diff, and tries to propose a
+        // change. That is heavy, blocking git I/O.
         // The archive loop runs this per descendant, serialized inside the one
         // HTTP request, so a stale-waiting CC family (the post-restart shape,
         // no live subprocess) took ~1s × N to archive — a big 8-track family

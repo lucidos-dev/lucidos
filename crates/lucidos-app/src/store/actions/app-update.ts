@@ -1,8 +1,9 @@
-import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateProgress } from '../store';
-import { openSettingsSubview } from './menu';
+import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateProgress, releaseCheck } from '../store';
+import { openWhatsNew, openSettingsSubview } from './menu';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
 import { errorDetail } from '../../utils/errorDetail';
+import { requestUpdateCheck } from '../../api/client/control';
 import {
   checkAppUpdate,
   installAppUpdateAndRestart,
@@ -11,25 +12,6 @@ import {
   type AppUpdateOffer,
   type AppUpdateProgress,
 } from '../../utils/tauri';
-
-/** How often the packaged client re-checks for an app update. The client is
- *  long-resident (the window can be closed while it stays alive in the menu bar),
- *  so a launch-only check would miss an update published mid-session.
- *
- *  An hour, not the 6h this used to be: releases can land minutes apart, and a
- *  client launched shortly before one spent most of a working day claiming to be
- *  current. That is exactly what happened on 2026-07-31. A 0.18.0 client started
- *  at 08:54, 0.18.1 was published at 09:16 and 0.18.2 at 10:22, and the next
- *  unattended check was not due until 14:54. */
-const APP_UPDATE_POLL_MS = 60 * 60 * 1000; // 1h
-
-/** Floor between two RESUME-triggered checks. `focus` / `visibilitychange` fire
- *  on every window switch, and each check is a network round-trip to the release
- *  host, so an unthrottled per-resume check would hammer it to say nothing new.
- *  Five minutes is long enough that flicking between windows costs nothing, and
- *  short enough that coming back to a client left running resolves before the
- *  user could notice the wait. */
-const APP_UPDATE_RESUME_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
 /** ONE key for every packaged-update TOAST: the "Lucidos <v> available" offer,
  *  and a failure. Keyed, so a failure replaces the offer in place rather than
@@ -40,51 +22,57 @@ const APP_UPDATE_RESUME_MIN_INTERVAL_MS = 5 * 60 * 1000;
  *  (docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md). */
 const UPDATE_TOAST_KEY = 'app-update-available';
 
-let pollTimer: ReturnType<typeof setInterval> | null = null;
 let installing = false;
-/** When the last check actually reached the network (`null` before the first).
- *  Process-lifetime, deliberately NOT reset by {@link stopAppUpdateChecks}: it
- *  records when we last asked the release host, which a remount does not undo.
- *  Read only by {@link recheckAppUpdateOnResume}; the interval keeps its own
- *  fixed cadence. */
-let lastCheckStartedAt: number | null = null;
 /** Unsubscribe for the progress event, or `null` when not subscribed. */
 let unlistenProgress: (() => void) | null = null;
-/** Guards the async gap in {@link subscribeToAppUpdateProgress} so remounting
+/** Guards the async gap in {@link startAppUpdateProgress} so remounting
  *  (reload, workspace switch, restart-reconnect) can't register a second
  *  listener while the first `listen` call is still in flight. */
 let subscribing = false;
-/** Whether {@link latestTauriAppVersion} currently holds a value THIS module
- *  wrote. Gates the clear-on-no-update path so the updater never wipes a value
- *  it did not put there: in a Tauri DEV client `check_app_update` is a no-op
- *  returning null, which is indistinguishable from "up to date" — and blindly
- *  assigning that null would clobber the version `connection.ts` reads from the
- *  engine's `/health`, which is the only source dev has. The two would then
- *  fight on every poll. */
-let updaterOwnsLatestVersion = false;
+/** The version this window has already toasted about, so a repeat refresh does
+ *  not raise a second offer for the same release. The same dedupe the plugin
+ *  marketplace scan keeps in `plugin-update-notice.json`, one layer up. */
+let lastOfferedVersion: string | null = null;
+/** Whether {@link latestTauriAppVersion} holds a value the CLIENT check wrote.
+ *
+ *  Gates the clear-on-no-update path so the client check never wipes a value it
+ *  did not put there. In a Tauri dev client `check_app_update` returns null,
+ *  which is indistinguishable from "up to date". Assigning that null would
+ *  clobber the version `connection.ts` reads from the engine's `/health`. */
+let clientOwnsLatestVersion = false;
 
-/** Surface the "Lucidos <v> available → Update & restart" offer. Extracted so
- *  the cancel path can put it straight back: abandoning a download abandons the
- *  attempt, not the update, and dropping the user back to no affordance at all
- *  would strand them until the next poll. */
-function offerAppUpdate(version: string): void {
+/** Surface the "Lucidos <v> available" offer.
+ *
+ *  The install action appears only where an install is possible: a Tauri client
+ *  fronting a `desktop-app` install. A browser or PWA session can install
+ *  nothing, so it gets the version and no button. A headless install gets a
+ *  route to the command instead, which lives in Settings, System.
+ *
+ *  Extracted so the cancel path can put the offer straight back: abandoning a
+ *  download abandons the attempt, not the update. */
+function offerAppUpdate(version: string, install?: string | null): void {
+  // One derivation of what this session can do about the offer. Two spreads
+  // that both wrote `action` could not express that.
+  const action = isTauri() && install !== 'installer-rerun'
+    ? { label: 'Update & restart', onClick: () => { void installAppUpdate(); } }
+    : install === 'installer-rerun'
+      ? { label: 'How to update', onClick: () => { openSettingsSubview('system'); } }
+      : null;
   showToast(`Lucidos ${version} available`, 'info', {
     key: UPDATE_TOAST_KEY,
-    action: {
-      label: 'Update & restart',
-      onClick: () => { void installAppUpdate(); },
-    },
+    ...(action ? { action } : {}),
     // "What is in it?" is the question an update offer raises, and answering it
-    // is not the same click as taking the update. Rendered only when the
-    // manifest actually carried notes, so the control never opens onto nothing.
-    // Reads the signal at call time rather than taking a parameter, because the
-    // cancel path re-offers with only a version in hand and the notes it should
-    // show are the same ones.
+    // is not the same click as taking the update. Rendered only when notes are
+    // known, so the control never opens onto nothing. The gateway carries none,
+    // so this is the client-check path's affordance.
+    //
+    // It NAMES the version, which is what makes the panel open on it. Left
+    // unnamed, What's New falls back to expanding the release already running.
     ...(latestTauriAppNotes.value
       ? {
           secondaryAction: {
             label: "What's new",
-            onClick: () => { openSettingsSubview('whats-new'); },
+            onClick: () => { openWhatsNew(version); },
           },
         }
       : {}),
@@ -103,8 +91,8 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
     installing = false;
     // Nothing was written to disk, so the update is still available — re-offer it
     // rather than leaving the user with a silently vanished toast.
-    const version = frame.version ?? latestTauriAppVersion.value;
-    if (version) offerAppUpdate(version);
+    const version = frame.version ?? packagedUpdateVersion();
+    if (version) offerAppUpdate(version, releaseCheck.value?.latest?.install ?? null);
     else removeToast(UPDATE_TOAST_KEY);
     return;
   }
@@ -142,12 +130,18 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
 }
 
 /** Subscribe to the Rust updater's progress stream. Idempotent across remounts;
- *  Tauri-only.
+ *  Tauri-only. Carries no timer: the CHECK lives in the gateway (ADR 0108) and
+ *  this is only the narration for an install the user started.
  *
  *  Best-effort (frontend.md carve-out): this runs at startup without user intent,
  *  and a failed subscription costs the narration, not the update — the install
  *  action's own error toast and Settings → System still report outcomes. It
  *  leaves itself unsubscribed on failure, so the next mount retries. */
+export function startAppUpdateProgress(): void {
+  if (!isTauri()) return;
+  void subscribeToAppUpdateProgress();
+}
+
 async function subscribeToAppUpdateProgress(): Promise<void> {
   if (unlistenProgress || subscribing) return;
   subscribing = true;
@@ -163,96 +157,129 @@ async function subscribeToAppUpdateProgress(): Promise<void> {
   }
 }
 
-/** Check for a newer packaged build and, if one exists, surface the in-app
- *  "Update & restart" toast inside the workspace. Tauri-only — a plain browser /
- *  mobile PWA / dev build can't update the desktop app, so this is a no-op there.
+/** Drop the progress subscription (startup cleanup). */
+export function stopAppUpdateProgress(): void {
+  if (unlistenProgress) {
+    unlistenProgress();
+    unlistenProgress = null;
+  }
+}
+
+/** Ask the GATEWAY whether a newer Lucidos is published, and record the answer.
  *
- *  The outcome is also RECORDED, not just toasted: {@link latestTauriAppVersion}
- *  and {@link appUpdateCheckError} drive the persistent Settings → System surface.
- *  A toast is transient and dismissable, so it cannot be the only way to reach an
- *  update — and a check that fails must be visible somewhere rather than dying in
- *  a `console.warn` nobody reads (the failure mode that made a stranded install
- *  indistinguishable from an up-to-date one).
+ *  The check itself lives in the gateway (ADR 0108), so this is a loopback read
+ *  rather than a poll of the release host. The gateway asks lucidos.dev only
+ *  when its own answer is stale, and concurrent callers coalesce there, so N
+ *  open windows still cost one outbound request.
  *
- *  Still no error TOAST: this runs on a timer without user intent (frontend.md's
- *  best-effort carve-out). The user-facing failure surfaces are the System page
- *  and the install action's own toast, which does run on user intent. */
-export async function checkForAppUpdate(): Promise<void> {
-  if (!isTauri()) return;
-  // An update already running owns the shared toast key and has a far more
-  // specific answer to "is there an update?" than a fresh poll would — re-running
-  // one here would overwrite the live narration with a stale offer.
+ *  Best-effort on the background path (frontend.md carve-out): it runs on mount
+ *  and on resume without user intent, so a transport failure is a
+ *  `console.warn`. A FORCED call is the Settings button, which the user clicked
+ *  and is owed an answer to, so that one records the failure.
+ *
+ *  `force` is that button asking for a poll now. */
+export async function refreshReleaseCheck(force = false): Promise<void> {
+  try {
+    releaseCheck.value = await requestUpdateCheck(force);
+  } catch (e) {
+    // No gateway (a direct engine port), an older one with no such route, or a
+    // transient blip. Leaves the last known answer standing and the next resume
+    // retries. Settings → System falls back to the client check while the
+    // gateway announces nothing at all.
+    console.warn('[app-update] gateway release check unavailable; retried on next resume', e);
+    if (force) appUpdateCheckError.value = errorDetail(e);
+    return;
+  }
+  // A poll that FAILED must never read as "you are up to date", so the
+  // gateway's own verdict drives the persistent Settings notice. Cleared by
+  // the same field on the next success.
+  appUpdateCheckError.value = releaseCheck.value.last_error;
+  const latest = releaseCheck.value.latest;
+  // The notes travel with the version, so the "What's new" link and the panel's
+  // Available row cannot end up describing a different release. The origin may
+  // carry none, and then there is simply no link.
+  latestTauriAppNotes.value = latest?.notes ?? null;
+  if (!latest) return;
+  if (lastOfferedVersion === latest.version) return;
+  // An update already running owns the shared toast key, and its narration is
+  // a far more specific answer than a fresh offer would be.
   if (appUpdateProgress.value) return;
-  // Stamped after the guards, never before: a call that returned without asking
-  // the release host anything must not make the resume throttle think it did.
-  lastCheckStartedAt = Date.now();
+  lastOfferedVersion = latest.version;
+  offerAppUpdate(latest.version, latest.install);
+}
+
+/** Ask the Tauri updater directly. The ADR 0105 degradation for a gateway too
+ *  old to announce a release: the client is newer than the machine's gateway
+ *  right after an update, and this keeps Settings → System working meanwhile.
+ *
+ *  User-initiated only, and on no timer. The outcome is recorded so the
+ *  persistent Settings surface can report a failed check rather than let it look
+ *  like "you are up to date". */
+export async function checkAppUpdateViaClient(): Promise<void> {
+  if (!isTauri()) return;
+  if (appUpdateProgress.value) return;
   let offer: AppUpdateOffer | null;
   try {
     offer = await checkAppUpdate();
   } catch (e) {
-    // Recorded for Settings → System; the next poll retries. Through
-    // `errorDetail` because the rejection is no longer always Rust's own error
-    // string: an unreadable IPC payload arrives as an Error, and `String` would
-    // put its "Error: " prefix in front of the reason on the System page.
+    // Through `errorDetail` because the rejection is no longer always Rust's own
+    // error string: an unreadable IPC payload arrives as an Error, and `String`
+    // would put its "Error: " prefix in front of the reason on the System page.
     appUpdateCheckError.value = errorDetail(e);
-    console.warn('[app-update] update check failed; will retry next poll', e);
     return;
   }
   appUpdateCheckError.value = null;
-  // The packaged updater is the authoritative source of "latest available" for a
-  // packaged client. The engine's `/health` field cannot be: it is read from a
-  // repo checkout, so every packaged install reports `'unknown'` (which
-  // connection.ts now discards). Clear only what we ourselves set — see
-  // {@link updaterOwnsLatestVersion}.
-  //
   // The notes travel WITH the version, written and cleared on the same branches,
-  // so the two can never end up describing different releases: a stale note
-  // beside a fresh version would tell the user what a different update contains.
+  // so the two can never end up describing different releases. Clear only what
+  // this path set, see {@link clientOwnsLatestVersion}.
   if (offer) {
     latestTauriAppVersion.value = offer.version;
     latestTauriAppNotes.value = offer.notes;
-    updaterOwnsLatestVersion = true;
-  } else if (updaterOwnsLatestVersion) {
+    clientOwnsLatestVersion = true;
+    offerAppUpdate(offer.version, 'desktop-app');
+  } else if (clientOwnsLatestVersion) {
     latestTauriAppVersion.value = null;
     latestTauriAppNotes.value = null;
-    updaterOwnsLatestVersion = false;
+    clientOwnsLatestVersion = false;
   }
-  if (!offer) return;
-  offerAppUpdate(offer.version);
 }
 
-/** Re-check for a packaged update because the user came BACK to the client
- *  (window focus / `visibilitychange` / `pageshow`), throttled to at most one
- *  network round-trip per {@link APP_UPDATE_RESUME_MIN_INTERVAL_MS}.
+/** The newer version available to install, or `null`.
  *
- *  Every other update surface already reconciles on resume (the service worker,
- *  the frontend `BUILD_ID`, the engine build state, the unread set); the packaged
- *  updater was the one that did not, so a client left running past a release kept
- *  reporting itself current until the interval came round. That is what stranded a
- *  0.18.0 client on 2026-07-31 for six hours with 0.18.2 already published.
+ *  One derivation of "is there an update?", shared by the notice, the button
+ *  label and the button's action, so the three cannot drift apart. It reads the
+ *  signals at call time, so calling it during render subscribes the caller.
  *
- *  Deliberately does NOT restart the interval: the two are independent safety
- *  nets, and rescheduling on every window switch would let a busy user's timer
- *  never fire at all. */
-export async function recheckAppUpdateOnResume(): Promise<void> {
-  if (!isTauri()) return;
-  if (
-    lastCheckStartedAt !== null &&
-    Date.now() - lastCheckStartedAt < APP_UPDATE_RESUME_MIN_INTERVAL_MS
-  ) {
-    return;
-  }
-  await checkForAppUpdate();
-}
-
-/** The newer packaged version available to install, or `null`. Single derivation
- *  of "is there an update?" — the notice, the button label, and the button's
- *  action all ask this one question, so they cannot drift apart. Reads the signal
- *  at call time, so calling it during render subscribes the caller normally. */
+ *  The gateway's answer wins where there is one, because it covers every install
+ *  shape. The fallback covers two cases. A dev client reads
+ *  `latestTauriAppVersion` from the engine's `/health`, and a client on an older
+ *  gateway reads its own Tauri check. */
 export function packagedUpdateVersion(): string | null {
+  const announced = releaseCheck.value?.latest;
+  if (announced) return announced.version;
   const latest = latestTauriAppVersion.value;
   const current = window.__LUCIDOS_APP_VERSION__;
   return latest && current && isNewerVersion(latest, current) ? latest : null;
+}
+
+/** Can THIS session install the offered update itself?
+ *
+ *  An offer exists for every install shape, but only a Tauri client fronting a
+ *  bundle can act on one. A browser or PWA session has no IPC to invoke, and a
+ *  headless install is updated by re-running `install.sh`. Both would otherwise
+ *  reach the Tauri updater through a button labelled "Check for Updates".
+ *
+ *  One derivation, shared by the button's label and by what its click does.
+ *
+ *  It SUBTRACTS `installer-rerun` rather than requiring `desktop-app`, and the
+ *  asymmetry is deliberate. `install` describes the GATEWAY's own layout, while
+ *  `isTauri()` is what answers "can this session install". A Tauri client is a
+ *  bundle by construction. Requiring `desktop-app` would only withhold a working
+ *  button: from a layout the gateway failed to recognise, and from a dev client
+ *  with no `latest`. See `docs/code-review-priors.md`. */
+export function canInstallUpdateHere(): boolean {
+  if (!packagedUpdateVersion() || !isTauri()) return false;
+  return releaseCheck.value?.latest?.install !== 'installer-rerun';
 }
 
 /** Install the available packaged update and restart the whole stack. This runs on
@@ -268,7 +295,7 @@ export async function installAppUpdate(): Promise<void> {
   installing = true;
   // React on the CLICK, not on the first event: the IPC hop plus the updater's own
   // network check take long enough that the button would otherwise look dead.
-  handleAppUpdateProgress({ version: latestTauriAppVersion.value, phase: 'checking' });
+  handleAppUpdateProgress({ version: packagedUpdateVersion(), phase: 'checking' });
   try {
     await installAppUpdateAndRestart();
     // Reached only if the command resolved WITHOUT restarting — a cancel (whose
@@ -292,40 +319,5 @@ export async function installAppUpdate(): Promise<void> {
       appUpdateProgress.value = null;
       showToast(`Update failed: ${errorDetail(e)}`, 'error', { key: UPDATE_TOAST_KEY });
     }
-  }
-}
-
-/** Start the periodic packaged app-update check (immediately + every
- *  {@link APP_UPDATE_POLL_MS}) and subscribe to the updater's progress stream.
- *  Tauri-only.
- *
- *  The immediate check runs on EVERY call, not just the first. The client process
- *  is long-resident while the workspace app remounts (reload, workspace switch,
- *  restart-reconnect), and the previous "return early if the timer exists" guard
- *  meant only the very first mount of a process ever checked. With an hours-long
- *  interval behind it, an update published mid-session stayed invisible until the
- *  app was fully quit. Only the TIMER and the SUBSCRIPTION are idempotent, so
- *  remounting cannot stack intervals or listeners.
- *
- *  The third net is {@link recheckAppUpdateOnResume}, wired to window focus in
- *  `hooks/useStartup.ts`: a client that neither remounts nor waits out the
- *  interval still notices a release the moment the user comes back to it. */
-export function startAppUpdateChecks(): void {
-  if (!isTauri()) return;
-  void subscribeToAppUpdateProgress();
-  void checkForAppUpdate();
-  if (pollTimer !== null) return;
-  pollTimer = setInterval(() => { void checkForAppUpdate(); }, APP_UPDATE_POLL_MS);
-}
-
-/** Stop the periodic check and drop the progress subscription (startup cleanup). */
-export function stopAppUpdateChecks(): void {
-  if (pollTimer !== null) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
-  if (unlistenProgress) {
-    unlistenProgress();
-    unlistenProgress = null;
   }
 }

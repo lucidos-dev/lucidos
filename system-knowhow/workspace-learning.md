@@ -42,6 +42,8 @@ Window: last **N days** (default 7; user may say "last 30 days" or "since last r
 
 **Pagination is an anti-pattern here.** The whole point of count-first-then-sample is that you never need to enumerate every event of every type — clustering is the goal, exhaustion is not.
 
+**To re-read ONE event, pass its `event_id`** rather than searching for it again. It takes the `evt-<32 hex>` address a tool result states, and a bare uuid. It is a primary-key read, so it is exact and cheap. A tool call's address returns the pair, call then result, because the result is the half that left context. It still honours `byte_limit`, which matters when that result is multi-megabyte. An address that matches nothing errors, so a stale pointer never reads as an empty window.
+
 Friction signals to pull:
 
 | Signal | Event types |

@@ -15,8 +15,8 @@ import type { ThreadAggregate, ThreadState } from './thread-meta';
  *  synthetic MessageReceived events. No signal dependencies. Memoized per
  *  thread via `groupIntoExchangesCached` — a streaming token extends the
  *  fold instead of re-sorting and re-walking the whole event history every
- *  frame. The pending-message path bypasses the cache (it folds an augmented
- *  COPY of the events map, so the cache never sees synthetic seqs). */
+ *  frame. A synthetic seq never enters the cache. The fast path appends to the
+ *  cached fold; the fallback folds an augmented COPY of the events map. */
 export function computeExchanges(thread: ThreadState): Exchange[] {
   if (thread.pendingUserMessages.length === 0) {
     return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events), thread.events);
@@ -197,7 +197,7 @@ function dividerStillAwaitsUser(exchange: Exchange): boolean {
  *  **The bar for the explicit list is that NOTHING which reads an exchange's
  *  steps may depend on the event.** Membership drops it out of `steps`
  *  entirely. `CodingAgentSettingsChanged` stays OUT for exactly that reason: it
- *  draws nothing, but `ccFieldFromExchange` (exchange.ts) reads it out of the
+ *  draws nothing, but `extractResponseField` (exchange.ts) reads it out of the
  *  steps for the model and effort the response header reports. Whether
  *  `BackgroundBash*` belong here is open; `thread-flows-event-wait.test.ts`
  *  pins `BackgroundBashStarted` as a step of the turn that spawned it. */
@@ -210,6 +210,24 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // worktree_cleanup.rs, but not `Thread`-prefixed and with no render case.
   'WorktreeCleaned',
 ]);
+
+/** True for a `ContextCaptured` recording an *auxiliary model call* rather
+ *  than an agent's turn: a thread title, an image description, a memory call,
+ *  an image generation.
+ *
+ *  These belong to no exchange and are dropped from the fold. A capture binds
+ *  to the step it follows (`bindSnapshotToStep`). A memory classification
+ *  landing mid-turn would therefore replace that step's context chip with the
+ *  classifier's own few hundred tokens. The rows stay in the event log, which
+ *  is where token accounting reads them.
+ *
+ *  Absent `purpose` means `turn`, so every row written before the field
+ *  existed reads as one. */
+export function isAuxiliaryCapture(event: { type: string }): boolean {
+  if (event.type !== 'ContextCaptured') return false;
+  const purpose = (event as { purpose?: string }).purpose;
+  return purpose !== undefined && purpose !== 'turn';
+}
 
 /** True if the thread contains at least one event that could contribute to
  *  rendered content. Used to distinguish a legitimately empty thread (only
@@ -637,8 +655,9 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
   // exchange. Do not split at those aborts: supersededAbortIndices in
   // exchangeStatus deflates the verdict to the later success.
   //
-  // Single forward pass: record request_event_ids of every later resolving
-  // terminal first, then mark aborts that match.
+  // Two passes: record the request_event_id of every resolving terminal, then
+  // mark the aborts that match one. Position is deliberately not compared, so a
+  // terminal BEFORE the abort suppresses it too.
   const resolvedReqIds = new Set<string>();
   for (const { event } of sorted) {
     if (event.type !== 'ResponseGenerated' && event.type !== 'ResponseFailed') continue;
@@ -740,6 +759,7 @@ function foldEvent(
   // through the single `state.current = current` sync below.
   const step = (): void => {
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
+    if (isAuxiliaryCapture(event)) return;
 
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
     // Remember the active chat turn's req_id (see `lastChatTurnReqId`) so the
@@ -1147,10 +1167,13 @@ export function handleEvent(
     // flows through this branch; live SSE updates it incrementally.
     if (event.type === 'TodoListWritten') {
       thread.meta.latestTodoList = event.items;
+      // Replaced with the items, never merged: `todo_write` is
+      // replace-whole-list and the notes are part of that list.
+      thread.meta.latestTodoNotes = event.notes ?? null;
       metaChanged = true;
     }
     // Project the thread's live *event waits* into meta, the same way and for
-    // the same reason as the Todo list above: the subscription indicator is
+    // the same reason as the Todo list above: the waiting indicator is
     // always mounted, so re-deriving this per render would walk the events Map
     // on every flush. Replay rebuilds the identical set because every
     // EventWait* flows through here in order.

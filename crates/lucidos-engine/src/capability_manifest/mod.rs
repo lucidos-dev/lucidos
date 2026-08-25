@@ -513,7 +513,8 @@ const TRIGGER_ON_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{...}}].",
+    description:
+        "Event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{\"a.b\":\"c\"}}].",
 };
 const TRIGGER_PAUSED_ARG: Arg = Arg {
     name: "paused",
@@ -591,7 +592,7 @@ const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "name": {"type":"string","description":"Short and descriptive."},
   "run": {"type":"object","description":"{ type: 'intent', intent: '…' } in the user's voice with the procedure left to knowhow, or { type: 'script', path: 'name/run.py' }."},
   "cron": {"description":"6 fields in the USER'S LOCAL TIME (second minute hour day-of-month month day-of-week); '0 0 8 * * *' is 8am daily. Fields AND within one expression, expressions OR across the array. A string, an array, or null.","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1},{"type":"null"}]},
-  "on": {"description":"Each { event_type: 'X', condition?: {…} }, operators $eq/$ne/$lt/$lte/$gt/$gte/$in. A string, an array, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
+  "on": {"description":"Each { event_type: 'X', condition?: {…} }, operators $eq/$ne/$lt/$lte/$gt/$gte/$in/$nin/$regex plus $or. A condition key is a field path: 'workflow_run.event'. A string, an array, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
   "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for standalone."},
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
   "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
@@ -1034,8 +1035,9 @@ const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
   "payload": {"type":"object","description":"REQUIRED. Enough context to understand what happened.","properties":{"summary":{"type":"string","description":"What happened, in one line."}},"required":["summary"]}
 }"#;
 const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
+  "event_id": {"type":"string","description":"One event by id: the 'evt-<32 hex>' a tool result ends with, or a bare uuid. A tool call's address returns the pair, call then result. Errors if nothing matches."},
   "event_type": {"type":"string","description":"Omitting it queries all, worth avoiding on a busy workspace."},
-  "thread_id": {"type":"string","description":"One thread only: how you read a past conversation, with event_type 'MessageReceived'."},
+  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Read it back with event_type 'MessageReceived'."},
   "since": {"type":"string","description":"After this RFC 3339 timestamp."},
   "until": {"type":"string","description":"Before this RFC 3339 timestamp."},
   "limit": {"type":"integer","description":"1-200, default 50. Raise only to fully enumerate a small type."},
@@ -1089,6 +1091,21 @@ const EVENTS_OPS: &[Operation] = &[
         mutating: false,
         llm_alias: Some("count_events"),
         llm_schema: Some(EVENTS_COUNT_LLM_SCHEMA),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "event_types",
+        summary: "Which event types exist here: {engine, workspace, retired}. Read a name off 'engine' before subscribing.",
+        method: Method::Get,
+        path: "/events/types",
+        args: &[],
+        cli_name: "event-types",
+        sdk_name: "eventTypes",
+        mutating: false,
+        llm_alias: Some("list_event_types"),
+        llm_schema: Some("{}"),
         llm: None,
         cli: None,
         sdk: None,
@@ -1181,6 +1198,7 @@ const MODEL_PROVIDER_ENUM: &[&str] = &[
     "openai",
     "openrouter",
     "xai",
+    "opencode-free",
     "local",
 ];
 
@@ -2275,6 +2293,178 @@ const PLUGINS_DOMAIN: Domain = Domain {
     llm_aliases: &[],
 };
 
+// ---------------------------------------------------------------------------
+// webhooks: inbound endpoints the user points a third party at. `llm: false` is
+// the load-bearing flag, and it follows the side-effect-grant precedent where
+// `create_trigger` deliberately cannot set the grant. An agent must not be able
+// to widen its own authority. A webhook opens a publicly reachable door that
+// emits a pinned event, so only the user creates one.
+//
+// `sdk: false` for the same reason, one layer out: an app iframe runs with the
+// user's authority, and this is not a capability an app should reach.
+// ---------------------------------------------------------------------------
+
+/// The webhook id, as a path segment.
+const WEBHOOK_ID_ARG: Arg = Arg {
+    name: "id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Path,
+    description: "Webhook UUID, as shown by `list`.",
+};
+
+/// Deduping, off unless the hook asks for it.
+const WEBHOOK_DEDUPE_ARG: Arg = Arg {
+    name: "dedupe",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.",
+};
+
+/// Request headers copied into the event payload, under `headers`.
+const WEBHOOK_HEADERS_ARG: Arg = Arg {
+    name: "headers",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Header names to copy into the event payload under `headers`, as a JSON array (e.g. [\"X-GitHub-Event\"]). A condition then reads `headers.X-GitHub-Event`. An allow-list: `Authorization` and the hook's own signature header are refused, because the events table is append-only.",
+};
+
+const WEBHOOKS_OPS: &[Operation] = &[
+    Operation {
+        action: "list",
+        summary: "Every webhook: id, name, pinned event type, whether it is signed and enabled, and the path a sender posts to.",
+        method: Method::Get,
+        path: "/webhooks",
+        args: &[],
+        cli_name: "list",
+        sdk_name: "list",
+        mutating: false,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "create",
+        summary: "Create a webhook. An unsigned one prints its token ONCE, since only the digest is stored. A SIGNED one gets no token: a sender like GitHub cannot present one.",
+        method: Method::Post,
+        path: "/webhooks",
+        args: &[
+            Arg {
+                name: "name",
+                ty: ArgType::Str,
+                enum_values: &[],
+                required: true,
+                loc: ArgIn::Body,
+                description: "What to call this webhook in the list.",
+            },
+            Arg {
+                name: "event_type",
+                ty: ArgType::Str,
+                enum_values: &[],
+                required: true,
+                loc: ArgIn::Body,
+                description: "The domain event every delivery emits, PascalCase past tense (e.g. 'DeployFinished'). Pinned: a caller cannot change it.",
+            },
+            Arg {
+                name: "hmac",
+                ty: ArgType::Json,
+                enum_values: &[],
+                required: false,
+                loc: ArgIn::Body,
+                description: "Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here.",
+            },
+            WEBHOOK_DEDUPE_ARG,
+            WEBHOOK_HEADERS_ARG,
+        ],
+        cli_name: "create",
+        sdk_name: "create",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "update",
+        summary: "Rename a webhook, repin its event type, or switch it off. Omitted fields keep their stored value.",
+        method: Method::Put,
+        path: "/webhooks/:id",
+        args: &[
+            WEBHOOK_ID_ARG,
+            Arg {
+                name: "name",
+                ty: ArgType::Str,
+                enum_values: &[],
+                required: false,
+                loc: ArgIn::Body,
+                description: "New name.",
+            },
+            Arg {
+                name: "event_type",
+                ty: ArgType::Str,
+                enum_values: &[],
+                required: false,
+                loc: ArgIn::Body,
+                description: "New pinned event type.",
+            },
+            Arg {
+                name: "enabled",
+                ty: ArgType::Bool,
+                enum_values: &[],
+                required: false,
+                loc: ArgIn::Body,
+                description: "false stops the endpoint accepting deliveries, without deleting it.",
+            },
+            WEBHOOK_DEDUPE_ARG,
+            WEBHOOK_HEADERS_ARG,
+        ],
+        cli_name: "update",
+        sdk_name: "update",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "delete",
+        summary: "Delete a webhook. Its URL answers nothing from then on.",
+        method: Method::Delete,
+        path: "/webhooks/:id",
+        args: &[WEBHOOK_ID_ARG],
+        cli_name: "delete",
+        sdk_name: "delete",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const WEBHOOKS_DOMAIN: Domain = Domain {
+    name: "webhooks",
+    tool_name: "webhooks",
+    tool_summary:
+        "Inbound webhooks: endpoints a third party posts to, each emitting one pinned domain event.",
+    // Deliberately not an agent capability. See the note above this block.
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: WEBHOOKS_OPS,
+    llm_aliases: &[],
+};
+
 const DOMAINS: &[Domain] = &[
     Domain {
         name: "notifications",
@@ -2301,6 +2491,7 @@ const DOMAINS: &[Domain] = &[
     REPOSITORIES_DOMAIN,
     MCP_DOMAIN,
     PLUGINS_DOMAIN,
+    WEBHOOKS_DOMAIN,
 ];
 
 /// The full manifest.
@@ -2624,6 +2815,44 @@ mod tests {
         }
     }
 
+    /// No agent surface reaches webhooks, in any shape.
+    ///
+    /// The side-effect-grant precedent: an agent must not widen its own
+    /// authority, and a webhook is a publicly reachable door emitting a pinned
+    /// event. The manifest is the single source for every generated surface, so
+    /// the flags here are what actually enforce it.
+    #[test]
+    fn no_agent_surface_can_create_a_webhook() {
+        let webhooks = domains().iter().find(|d| d.name == "webhooks").unwrap();
+        assert!(!webhooks.llm, "webhooks must not be an LLM tool");
+        assert!(!webhooks.sdk, "an app must not manage webhooks");
+        assert!(webhooks.cli, "the user's own CLI is the point");
+        assert!(
+            webhooks.actions().is_empty(),
+            "an llm: false domain must contribute no actions to any tool schema"
+        );
+        assert!(
+            webhooks.llm_aliases.is_empty(),
+            "an alias would resolve a flat tool name back to this domain"
+        );
+        for op in webhooks.operations {
+            assert!(!op.on_llm(webhooks), "'{}' reached the LLM", op.action);
+            assert!(!op.on_sdk(webhooks), "'{}' reached the SDK", op.action);
+            assert!(
+                op.llm_alias.is_none(),
+                "'{}' carries a flat LLM tool name",
+                op.action
+            );
+        }
+        let cli_ops: Vec<&str> = webhooks
+            .operations
+            .iter()
+            .filter(|o| o.on_cli(webhooks))
+            .map(|o| o.cli_name)
+            .collect();
+        assert_eq!(cli_ops, vec!["list", "create", "update", "delete"]);
+    }
+
     /// Each operation's `llm_alias` (when present) must resolve back to its
     /// domain via `domain_for_tool`, and map to the operation's action via
     /// `legacy_tool_for_action` — the round-trip the grouped handlers rely on.
@@ -2798,10 +3027,17 @@ mod tests {
     fn phase5b_domains_declared() {
         // events — grouped LLM tool only (rich hand-written CLI stays).
         let events = domains().iter().find(|d| d.name == "events").unwrap();
-        assert_eq!(events.actions(), vec!["emit", "query", "count"]);
+        assert_eq!(
+            events.actions(),
+            vec!["emit", "query", "count", "event_types"]
+        );
         assert!(events.llm && !events.cli && !events.sdk);
         assert_eq!(domain_for_tool("emit_event").unwrap().name, "events");
         assert_eq!(events.legacy_tool_for_action("count"), Some("count_events"));
+        assert_eq!(
+            events.legacy_tool_for_action("event_types"),
+            Some("list_event_types")
+        );
 
         // changes — grouped LLM tool only (hand-written CLI stays).
         let changes = domains().iter().find(|d| d.name == "changes").unwrap();

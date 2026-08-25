@@ -40,6 +40,11 @@
 //!   a `reasoning_effort` on the same wire format, but which level names it
 //!   validates is unverified here, so it takes the conservative set: the clamp
 //!   only ever narrows, and an unsupported level is what earns a 400.
+//! - **OpenCode Free**: measured per model rather than assumed, because the
+//!   relay passes the level through to whoever serves it. Ox Alpha rejects
+//!   `none`, `medium` and `xhigh` with a 400; the other seeded ids accept the
+//!   conservative set. The matrix is in
+//!   `docs/plans/2026-08-22-keyless-opencode-free-provider.md`.
 
 use crate::llm::anthropic_wire::requires_adaptive_thinking;
 use crate::llm::model_registry::ProviderKind;
@@ -64,6 +69,14 @@ const THROUGH_XHIGH: &[&str] = &["none", "low", "medium", "high", "xhigh"];
 /// Gemini, OpenRouter, xAI and local servers: nothing above `high` is distinct
 /// (Gemini) or universally accepted (the OpenAI-compatible third parties).
 const THROUGH_HIGH: &[&str] = &["none", "low", "medium", "high"];
+/// Ox Alpha on the keyless free tier: the only three levels it accepts. It
+/// always reasons, so `none` is a 400 rather than a way to switch thinking off.
+/// `medium` and `xhigh` are not in its vocabulary at all.
+const LOW_HIGH_MAX: &[&str] = &["low", "high", "max"];
+
+/// The one free-tier id whose accepted levels are [`LOW_HIGH_MAX`]. Every other
+/// seeded free model takes [`THROUGH_HIGH`].
+const OX_ALPHA_FREE: &str = "x-preview-f-free";
 
 /// The tiers `model` supports when served by `provider`.
 ///
@@ -85,6 +98,13 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
                 ALL_TIERS
             } else {
                 THROUGH_XHIGH
+            }
+        }
+        ProviderKind::OpenCodeFree => {
+            if model == OX_ALPHA_FREE {
+                LOW_HIGH_MAX
+            } else {
+                THROUGH_HIGH
             }
         }
         ProviderKind::OpenRouter | ProviderKind::XAi | ProviderKind::Local => THROUGH_HIGH,
@@ -149,7 +169,13 @@ mod tests {
     /// invented a tier would make "closest" meaningless.
     #[test]
     fn every_set_is_an_ordered_subset_of_the_ladder() {
-        for set in [ALL_TIERS, NO_XHIGH, THROUGH_XHIGH, THROUGH_HIGH] {
+        for set in [
+            ALL_TIERS,
+            NO_XHIGH,
+            THROUGH_XHIGH,
+            THROUGH_HIGH,
+            LOW_HIGH_MAX,
+        ] {
             assert!(!set.is_empty());
             let rungs: Vec<usize> = set
                 .iter()
@@ -257,6 +283,45 @@ mod tests {
         }
     }
 
+    /// The free tier is the one provider whose accepted levels differ per
+    /// model, so every seeded id is pinned against what the relay answered.
+    /// Ox Alpha rejects `none`, `medium` and `xhigh`; the rest take the
+    /// conservative set.
+    #[test]
+    fn the_free_tier_offers_only_levels_its_models_accept() {
+        assert_eq!(
+            supported_efforts(ProviderKind::OpenCodeFree, OX_ALPHA_FREE),
+            LOW_HIGH_MAX
+        );
+        for model in [
+            "laguna-s-2.1-free",
+            "nemotron-3.5-lightning-free",
+            "nemotron-3-ultra-free",
+            "muse-spark-1.2-contributor-free",
+            "hy3-free",
+        ] {
+            assert_eq!(
+                supported_efforts(ProviderKind::OpenCodeFree, model),
+                THROUGH_HIGH,
+                "{model}"
+            );
+        }
+        // Nothing the caller can ask for reaches a level the model 400s on.
+        for effort in EFFORT_LADDER {
+            let sent = clamp_effort(effort, ProviderKind::OpenCodeFree, OX_ALPHA_FREE);
+            assert!(
+                matches!(sent, Some("low") | Some("high") | Some("max")),
+                "Ox Alpha asked for {effort} and would be sent {sent:?}"
+            );
+        }
+        // `max` is the one level hy3 rejects, and the conservative set has
+        // already excluded it.
+        assert_eq!(
+            clamp_effort("max", ProviderKind::OpenCodeFree, "hy3-free"),
+            Some("high")
+        );
+    }
+
     /// The exact turn that failed on 2026-08-12: the account effort was
     /// `xhigh`, the picker snapped it to `max`, and the wire layer sent
     /// `xhigh`. Both inputs must now land on `high`, which the local server
@@ -325,8 +390,9 @@ mod tests {
     /// Guessing the top tier would make a typo silently buy the most expensive
     /// reasoning the model has, and an arbitrary string genuinely reaches here:
     /// only the `preferences` LLM tool validates against the ladder, while
-    /// `PUT /preferences` and `POST /chat/stream` do not. Dropping hands the
-    /// decision to the provider's own default, as `validate_codex_effort` does.
+    /// `PUT /api/v1/preferences` and `POST /api/v1/chat/stream` do not.
+    /// Dropping hands the decision to the provider's own default, as
+    /// `validate_codex_effort` does.
     #[test]
     fn a_value_off_the_ladder_is_dropped_rather_than_guessed() {
         for (provider, model) in [

@@ -140,6 +140,8 @@ Marketplace HTTP surface:
 - `GET /api/v1/plugins/installed` -> `{ plugins }` from the `PluginInstalled` projection (no marketplace scan). Each row carries `id`, `name`, `version`, `source?`, `app_id?`, `content` (the shipped content-dir kinds), `files` (every installed `data/`-relative path), and `modified` + `modified_paths` (see "Local modifications" below). Backs the Plugins panel's installed-plugins view (the default **Installed only** filter) so it works offline and lists plugins whose marketplace was removed.
 - `POST /api/v1/plugins/install-request` with `{ "source": "..." }` -> stage an install request payload for the existing confirmation panel.
 - `POST /api/v1/plugins/uninstall-request` with `{ "id": "..." }` -> stage an uninstall request payload (resolves the plugin id, partitions its files into present/missing) for the uninstall confirmation panel. The button counterpart of the `uninstall_plugin` LLM tool.
+- `POST /api/v1/plugins/install/:install_id/confirm[?keep_local_changes=false]` -> write the staged files. The optional flag is the panel's keep control; absent means keep. The response adds `local_changes` (`merged` / `conflicted` / `replaced` / `saved_paths`) whenever the install met a locally-edited file.
+- `POST /api/v1/plugins/propose-upstream` with `{ "id": "..." }` -> `{ patch_path, thread_id }`. Derives the plugin's local patch, writes it under `data/artifacts/`, and spawns a thread to take it to the author. See "Proposing your patch upstream" below.
 
 Marketplace LLM surface:
 
@@ -436,7 +438,7 @@ What this means for plugin authors:
 
 A plugin's shipped content lives under `data/` like any other artifact, so the user (or the Lucidos Agent, or a coding-agent thread) can edit it after install. When that happens the Plugins list shows a **Modified** badge on the plugin's row, and updating the plugin warns that the update will overwrite the local changes.
 
-This state is **derived on read, never stored** — there is no "PluginModified" event. The engine diffs the plugin's current on-disk content against the install commit (`payload.data.manifest.commit`) and returns `modified` + `modified_paths` on the installed summary / catalog row (`registry::plugin_modification_status`). Because it is a pure function of git + disk, it **self-heals**: revert an edit and the badge clears; update the plugin and the new install commit becomes the baseline, so the badge resets.
+This state is **derived on read, never stored**: there is no "PluginModified" event. The engine diffs the plugin's on-disk content against the install commit (`payload.data.manifest.commit`). It returns `modified` + `modified_paths` on the installed summary and catalog row (`registry::plugin_modification_status`). Being a pure function of git plus disk, it **self-heals**: revert an edit and the badge clears. An update re-stamps the baseline, so the badge clears there too, unless the update kept a patch. A kept patch is still a local change, so the badge correctly stays on.
 
 What counts as a modification, per content type:
 
@@ -444,11 +446,56 @@ What counts as a modification, per content type:
 - **Knowhow / scripts / auth-modules**: an edit or delete of a file the plugin *recorded*. A brand-new file you drop into `knowhow/` (etc.) is *not* attributed to a plugin — those roots are shared by the user and other content.
 - **Triggers** (`triggers/<slug>/trigger.toml`): a change to the trigger's *definition*. `trigger.toml` is a gitignored, re-serialized projection (ADR 0019), so it is compared semantically (ignoring `slug` / `plugin_id` / `group_id`), not byte-for-byte — re-serialization after install never counts as a modification.
 
-Deferred (not built yet, but the recorded paths are the breadcrumb for them): preserving a local patch across an update (a 3-way merge) and proposing it upstream as a PR to the plugin repo.
+### An update keeps your changes
+
+An update used to overwrite every file the plugin ships, so a local edit was lost. It is three-way merged instead. The three inputs are all in hand at staging time. **Base** is the file at the install commit, **ours** is what is on disk, and **theirs** is the staged new version (`plugins::merge`).
+
+The staged install panel lists the outcome for each edited file **before** you confirm:
+
+| Outcome | What the confirm does |
+|---|---|
+| `merged` | Writes the merged content. Your edit and upstream's both survive. |
+| `conflict` | Both sides changed the same lines. Writes upstream's version, and saves yours aside. |
+| `replaced` | Never mergeable: a trigger definition, a binary, or a file over 1 MB. Writes upstream's version, and saves yours aside. |
+| `restored` | You had deleted the file and the new version still ships it, so it comes back. Nothing is saved aside, because a deletion has no content to keep. |
+
+The panel also carries one **Keep my local changes** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
+
+**A discarded edit is never simply deleted.** Before anything is overwritten, the engine writes your version and a `.patch` of it under `data/artifacts/plugin-local-changes/<plugin-id>/v<version>/`, with a `README.md` explaining the folder. That root is git-tracked and never auto-deleted. A clean merge saves nothing, because your edit survives in the file itself.
+
+Installing one version twice is allowed, so a second save of the same version lands in `v<version>-2` rather than replacing the first. The engine never writes over a folder it already saved edits into.
+
+**Why a conflict does not get conflict markers.** These files are LLM context: `knowhow/*.md` is loaded into the agent's prompt as instructions. A file containing `<<<<<<<` is not a broken file you notice, it is a corrupted instruction the engine acts on. So upstream's coherent version wins on disk, and yours is preserved beside it.
+
+**`trigger.toml` is never text-merged.** It is a re-serialized projection the engine rewrites after every install, so its bytes never match what the plugin shipped. Merging it would report a conflict for every plugin trigger on every update. A changed trigger definition reports as `replaced`, and the shipped definition wins.
+
+**The install commit stays a pristine copy of what the plugin shipped.** A merged path is recorded from upstream's bytes, not from the working tree (`core::commit_data_paths_with_overrides`). A second commit then records the merged tree plus any saved-aside copies. That is what lets a patch carry forward indefinitely. Record the merge in the install commit instead, and the *next* update reads your patch as upstream's own content. It then finds no local modification, and drops it.
+
+### Proposing your patch upstream
+
+Whenever the Modified badge is up, the Plugins row offers **Propose upstream**. The install receipt offers it too, right after an update that kept a patch. `POST /api/v1/plugins/propose-upstream` with `{ "id": "<plugin-id>" }` does three things and stops:
+
+1. Derives the diff from the install commit to the working tree, over the plugin's edited paths. Since the install commit is pristine, this is a patch against the version you are actually on.
+2. Writes it to `data/artifacts/plugin-local-changes/<plugin-id>/proposed-v<version>.patch`, commits it, and emits `ArtifactCreated`.
+3. Spawns a Lucidos Agent thread seeded with the plugin name and the patch path, returning its `thread_id` so the caller can navigate there.
+
+**The engine performs no GitHub operation.** No credentials, no fork, no API call. The spawned thread does that work, following the procedure below.
+
+#### Procedure for the spawned thread
+
+You have been asked to propose a user's local plugin changes to the plugin's author. Work in this order:
+
+1. Read the patch named in the seed. It is a unified diff against the version the user has installed, with paths relative to the workspace repo root.
+2. Find the plugin's upstream repo. `plugins(action="check_updates", id="<plugin-id>")` reports the recorded `source`, which is the manifest's git URL.
+3. Read the change and judge whether it is upstreamable. A fix for a bug every user of the plugin hits is. Something specific to this user's setup, or carrying private data, is not: say so plainly and stop.
+4. Ask the user to confirm before anything leaves the workspace, and agree the PR title and body with them.
+5. Clone the source repo, apply the patch to the plugin's subdirectory, and open the pull request with `gh`. Report the URL back.
+
+Never push to the upstream repo directly, and never open a PR without the user's confirmation in step 4.
 
 ## Events emitted
 
-Two `SystemEvent` variants (`engine/event_bus.rs:244-261`). Both carry `actor: Option<MessageOrigin>`. Both have `aggregate()` returning `"plugin"`. The `aggregate_id` is the plugin's `id` field.
+Three `SystemEvent` variants for the install lifecycle, plus the two cancel-audit ones. All carry `actor: Option<MessageOrigin>`, all have `aggregate()` returning `"plugin"`, and the `aggregate_id` is the plugin's `id` field.
 
 ### `PluginInstalled`
 
@@ -479,6 +526,25 @@ The two outer wrappers come from how Lucidos persists `SystemEvent`: serde's `ta
 `source_type` is `"git"` for both plain git URLs and GitHub tree URLs, `"archive"` for `.lucidos-plugin` installs. `files` is the same list at the top level (`payload.data.files`) and inside the nested `manifest` blob (`payload.data.manifest.files`) -- the nested copy is what `latest_install` reads when looking up "what files belong to this plugin?" for the uninstall guide. `commit` (at `payload.data.manifest.commit`) is the workspace-repo sha of the "Install plugin: ..." commit -- the baseline the Modified badge diffs against (see "Local modifications" below). Legacy rows installed before this field was recorded simply never show as modified.
 
 > **Historical bug, fixed.** Earlier `InstalledRecord::source()` read `payload.manifest.source` -- two layers too shallow -- and silently returned `None`, surfacing as the misleading `"installed manifest is missing 'source' -- cannot fetch latest"` error from `check_plugin_updates` even when the source was recorded. The matching `aggregate_id()` derivation read `manifest.id` (also too shallow), which made every PluginInstalled row land with `aggregate_id = "unknown"` and broke `latest_install(pool, &id)` lookups. Both are fixed; the e2e tests in `engine/tools/plugins.rs` (the `e2e_*` cases) lock the round-trip in. Plugins installed before the fix may still have `aggregate_id = "unknown"` in the events table; reinstall to refresh.
+
+### `PluginLocalChangesMerged`
+
+Emitted right after the `PluginInstalled` it belongs to, and only when the install met at least one locally-edited file:
+
+```json
+{
+  "id": "email-triage",
+  "version": "0.3.0",
+  "merged": ["knowhow/email-triage.md"],
+  "conflicted": ["apps/email-triage/index.html"],
+  "replaced": ["triggers/email-triage/trigger.toml"],
+  "saved_paths": ["artifacts/plugin-local-changes/email-triage/v0.3.0/apps/email-triage/index.html"],
+  "commit": "<sha of the keep-local-changes commit>",
+  "actor": { ... }
+}
+```
+
+This one IS stored, unlike the Modified badge beside it, and the difference is the point. The badge is a pure function of git plus disk, so it can always be recomputed. A merge is not: once the two commits are written, nothing on disk says which files merged and which lost. `saved_paths` names the copies of every discarded edit, each with a `.patch` sibling.
 
 ### `PluginUninstalled`
 

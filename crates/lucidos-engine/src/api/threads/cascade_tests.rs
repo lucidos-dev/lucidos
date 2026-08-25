@@ -105,13 +105,60 @@ async fn spawn_idle_parent(bus: &EventBus) -> Uuid {
     parent_id
 }
 
+/// Put a parent back to idle after a child of its finished.
+///
+/// A child terminal wakes its parent into `running`
+/// (`event_bus/parent_callback.rs`), which is the parent's reaction turn. In
+/// production that turn ends and settles the row. Nothing drains the callback
+/// channel here, so a fixture that wants a quiescent family has to end it
+/// itself. Skip this and the parent is a blocking descendant, which is the
+/// right answer to the wrong question: these tests are about descendants.
+///
+/// The terminal has to match the parent's own kind, since only
+/// `CodingAgentIdled` settles a coding-agent row.
+async fn settle_after_child_completion(bus: &EventBus, pool: &PgPool, parent_id: Uuid) {
+    let is_cc: bool =
+        sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
+            .bind(parent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let event = if is_cc {
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some(format!("test-session-{}", parent_id)),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+        }
+    } else {
+        ThreadEvent::ResponseGenerated {
+            text: "reacted to the child".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        }
+    };
+    bus.emit(BusEvent::Thread {
+        thread_id: parent_id,
+        event,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
 /// Spawn a CC child of `parent_id`. `bring_to_idle` controls whether the
 /// child is left in Running (true = emit `CodingAgentIdled` so the
 /// projection drops status to idle). CC is used because it reaches every
 /// state the cascade gate reads, pending changes included. A chat child
 /// holds `archive_state='inbox'` on its own terminal event too, covered by
 /// `archive_cascade_carries_an_idle_chat_child`.
-async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uuid {
+async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_idle: bool) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -173,6 +220,7 @@ async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uu
         })
         .await
         .unwrap();
+        settle_after_child_completion(bus, pool, parent_id).await;
     }
     // `bring_to_idle=false` leaves the row at status='running',
     // archive_state='inbox' — the exact "blocking" combo per
@@ -185,7 +233,12 @@ async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uu
 /// Spawn a CC child of `parent_id`, bring its session to Idle. Drop a
 /// `ChangeProposed` if `with_pending_changes` so the row exits Idle into
 /// Waiting + coding_agent_proposed=true.
-async fn spawn_cc_child(bus: &EventBus, parent_id: Uuid, with_pending_changes: bool) -> Uuid {
+async fn spawn_cc_child(
+    bus: &EventBus,
+    pool: &PgPool,
+    parent_id: Uuid,
+    with_pending_changes: bool,
+) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -263,13 +316,14 @@ async fn spawn_cc_child(bus: &EventBus, parent_id: Uuid, with_pending_changes: b
         .await
         .unwrap();
     }
+    settle_after_child_completion(bus, pool, parent_id).await;
     child_id
 }
 
 /// Spawn an agent-driven chat child of `parent_id` and finish it. Its
 /// `ResponseGenerated` leaves the row at `archive_state='inbox'`, which is
 /// the state the cascade then has to carry.
-async fn spawn_idle_chat_child(bus: &EventBus, parent_id: Uuid) -> Uuid {
+async fn spawn_idle_chat_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -305,6 +359,7 @@ async fn spawn_idle_chat_child(bus: &EventBus, parent_id: Uuid) -> Uuid {
     })
     .await
     .unwrap();
+    settle_after_child_completion(bus, pool, parent_id).await;
     child_id
 }
 
@@ -360,7 +415,7 @@ async fn archive_cascade_carries_an_idle_chat_child() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let child_id = spawn_idle_chat_child(&bus, parent_id).await;
+    let child_id = spawn_idle_chat_child(&bus, &pool, parent_id).await;
 
     let child_section: String =
         sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
@@ -393,9 +448,9 @@ async fn archive_with_idle_descendants_archives_all() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let child_a = spawn_child(&bus, parent_id, true).await;
-    let child_b = spawn_child(&bus, parent_id, true).await;
-    let grandchild = spawn_child(&bus, child_a, true).await;
+    let child_a = spawn_child(&bus, &pool, parent_id, true).await;
+    let child_b = spawn_child(&bus, &pool, parent_id, true).await;
+    let grandchild = spawn_child(&bus, &pool, child_a, true).await;
 
     let family = load_family(&pool, parent_id).await;
     assert_eq!(family.len(), 4, "parent + 2 children + 1 grandchild");
@@ -428,7 +483,7 @@ async fn archive_rejects_when_descendant_running() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let running_child = spawn_child(&bus, parent_id, false).await; // status='running'
+    let running_child = spawn_child(&bus, &pool, parent_id, false).await; // status='running'
 
     let family = load_family(&pool, parent_id).await;
     let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
@@ -452,7 +507,7 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let cc_child = spawn_cc_child(&bus, parent_id, true).await;
+    let cc_child = spawn_cc_child(&bus, &pool, parent_id, true).await;
 
     let family = load_family(&pool, parent_id).await;
     let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
@@ -612,8 +667,8 @@ async fn archive_skips_already_archived_descendants() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let live_child = spawn_child(&bus, parent_id, true).await;
-    let archived_child = spawn_child(&bus, parent_id, true).await;
+    let live_child = spawn_child(&bus, &pool, parent_id, true).await;
+    let archived_child = spawn_child(&bus, &pool, parent_id, true).await;
     archive_via_event(&bus, archived_child).await;
 
     let family = load_family(&pool, parent_id).await;
@@ -788,6 +843,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     })
     .await
     .unwrap();
+    settle_after_child_completion(&bus, &pool, parent_id).await;
 
     // Precondition 1: the cascade gate must NOT block this thread.
     // status=idle + section=inbox passes `is_blocking`, so the orphaned

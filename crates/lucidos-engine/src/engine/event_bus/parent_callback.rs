@@ -28,6 +28,31 @@ type ChildSummaryRow = (
     Option<bool>,
 );
 
+/// What a wake changed on the parent's row, so a caller that then fails to
+/// drive a turn can put it back exactly.
+///
+/// `revived_at` is a fencing token, not bookkeeping. The rollback matches on
+/// it. Any revive landing between the wake and the failure re-stamps the row,
+/// so the rollback then no-ops instead of settling a live turn.
+/// Both previous values are carried so the rollback is a true restore. Keeping
+/// the new stamp would sort the thread by a revive that was undone. It would
+/// also break the fence for a second wake unwinding behind this one.
+///
+/// **Known bound: two failed wakes unwinding OLDEST first do not fully
+/// settle.** The older rollback no-ops, its stamp being gone, and the newer
+/// one restores `running`. Reaching it needs two children of one parent
+/// finishing together AND both callbacks failing. That means shutdown in
+/// practice, and `main.rs`'s boot reset clears an orphaned `running` on the
+/// way back up. Closing it properly means asking whether a turn is really in
+/// flight, which only the engine can answer: the bus cannot see
+/// `active_threads`.
+pub(super) struct ParentWake {
+    pub(super) prev_status: String,
+    /// Nullable: a thread that has never been revived carries no stamp.
+    pub(super) prev_revived_at: Option<chrono::DateTime<Utc>>,
+    pub(super) revived_at: chrono::DateTime<Utc>,
+}
+
 impl EventBus {
     /// Send a ChildrenCountChanged transient event to the parent thread's SSE channel.
     /// `aggregate` carries any other projection changes (e.g. archive_state) the
@@ -49,6 +74,7 @@ impl EventBus {
                 meta: EventMeta::default(),
             },
             aggregate,
+            depth: crate::scheduler::user_tasks::current_event_trigger_depth(),
         });
     }
 
@@ -74,7 +100,15 @@ impl EventBus {
     /// Handle parent notification when a child thread emits a terminal event.
     /// Decrements the parent's `active_children_count` and, for completion events,
     /// sends a callback message with results.
-    pub(super) async fn notify_parent_if_child(&self, child_thread_id: Uuid, event: &ThreadEvent) {
+    ///
+    /// `terminal_event_id` is `event`'s own row id. It travels to the parent on
+    /// the [`ParentCallback`], where the stand-down gate needs it.
+    pub(super) async fn notify_parent_if_child(
+        &self,
+        child_thread_id: Uuid,
+        terminal_event_id: Uuid,
+        event: &ThreadEvent,
+    ) {
         // Cancel = user-driven, terminal. Abort splits on `AbortCause::is_transient`:
         // EngineShutdown / RecoveryAfterRestart are mid-retry (no decrement, no
         // callback — the resumed child's eventual idle would be orphaned);
@@ -240,9 +274,14 @@ impl EventBus {
         // `should_decrement && !should_callback` paths (CC terminal abort,
         // non-CC ResponseAborted/SessionEnded) used to land here only for
         // the decrement; the in-tx reconcile + in-tx broadcast now cover it.
-        if should_callback {
-            self.update_parent_after_child_terminal(parent_id).await;
-        }
+        // Held for the rest of the function: every path below that gives up on
+        // driving a turn hands it to `undo_parent_wake`, so the parent is not
+        // left reading "Requesting" against nothing.
+        let wake = if should_callback {
+            self.update_parent_after_child_terminal(parent_id).await
+        } else {
+            None
+        };
 
         if clear_callback_for_terminal_abort {
             self.clear_pending_parent_callback(child_thread_id).await;
@@ -411,6 +450,7 @@ impl EventBus {
                      skipping wake-up kick — see notify_parent_if_child error path.",
                     parent_id
                 );
+                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
                 return;
             }
             Err(e) => {
@@ -423,6 +463,7 @@ impl EventBus {
                     parent_id,
                     e
                 );
+                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
                 return;
             }
         };
@@ -462,32 +503,85 @@ impl EventBus {
                     e
                 );
             }
+            Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
             return;
         };
-        self.send_parent_callback(
+        // The wake promised a turn. If the channel is gone (its receiver dies
+        // only as the engine goes down) nothing will drive one, so put the
+        // status back. The card stays: `refire_unprocessed_child_completions`
+        // re-drives this wake on the next boot, and a rollback that writes no
+        // event leaves that sweep's selection intact.
+        if !self.send_parent_callback(
             parent_id,
             child_thread_id,
             emit_result.event_id,
+            Some(terminal_event_id),
             parent_is_cc,
-        );
+        ) {
+            Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+        }
     }
 
-    /// Surface the parent to inbox on a child completion that warrants user
-    /// attention (`should_callback`), then broadcast the parent's updated
-    /// aggregate so subscribers pick up the archive flip in the same
-    /// envelope as any other counter changes from the in-tx reconcile.
+    /// Mark the parent awake on a child completion that warrants user
+    /// attention (`should_callback`): inbox, `running`, then one aggregate
+    /// broadcast carrying both plus any counter change from the in-tx
+    /// reconcile.
     ///
-    /// Counter mutation (`active_children_count`) used to live here too as
-    /// `GREATEST(0, active_children_count - 1)`, but that double-decremented
-    /// the parent when the in-tx `reconcile_parent_active_children_count`
-    /// had already recomputed the column from ground truth. The reconcile
-    /// in `update_thread_projection` is now the sole writer; this function
-    /// only handles the archive flip + the SSE rebroadcast.
-    async fn update_parent_after_child_terminal(&self, parent_id: Uuid) {
-        let row: Option<(i64, i64)> = match sqlx::query_as(
-            "UPDATE thread_summaries SET archive_state = $2 \
-             WHERE thread_id = $1 \
-             RETURNING active_children_count::bigint, total_children_count::bigint",
+    /// **`running` is what makes the wake visible.** A user message flips the
+    /// thread the instant it persists, so its exchange opens and reads
+    /// "Requesting" through the turn setup. Leaving the parent `idle` until
+    /// the turn's first activity event reads as a thread that never woke.
+    ///
+    /// The flip belongs here, not in the `ChildThreadCompleted` projection
+    /// arm, because this runs under the gate that decides a card is owed. So
+    /// `status_transitions()` still omits the event: that table mirrors
+    /// `update_thread_projection`, and this write is not in it.
+    ///
+    /// **`waiting_for_user_answer` is preserved**, the one status a wake must
+    /// not touch. `is_attention_needing` returns TRUE on it before any other
+    /// test, so overwriting it darkens the badge on a parent whose question is
+    /// still unanswered. `main.rs`'s boot reset scopes itself the same way.
+    ///
+    /// `active_children_count` is NOT written here. The in-tx
+    /// `reconcile_parent_active_children_count` recomputes it from ground
+    /// truth and is its sole writer; a second decrement here double-counts.
+    ///
+    /// Returns what it changed, so a caller that then fails to drive a turn
+    /// can put it back. `None` means the parent's row is gone, so the UPDATE
+    /// matched nothing and there is nothing to undo. Rationale and invariants:
+    /// `docs/plans/2026-08-19-waking-a-parent-starts-its-exchange.md`.
+    pub(super) async fn update_parent_after_child_terminal(
+        &self,
+        parent_id: Uuid,
+    ) -> Option<ParentWake> {
+        // The self-join reads the pre-UPDATE row in the same statement, so the
+        // rollback value cannot be a second query racing the write.
+        //
+        // `FOR UPDATE` is load-bearing, not decoration. Two children of one
+        // parent can finish at once. Under READ COMMITTED the second statement
+        // blocks on the row lock at the UPDATE, while its `prev` scan keeps the
+        // older snapshot. It would capture `idle` instead of the `running` the
+        // first wake committed. A rollback would then settle a parent whose
+        // other callback is still in flight. Locking in the scan makes the
+        // capture wait for the same serialization the write does.
+        type WakeRow = (
+            i64,
+            i64,
+            String,
+            Option<chrono::DateTime<Utc>>,
+            chrono::DateTime<Utc>,
+        );
+        let row: Option<WakeRow> = match sqlx::query_as(
+            "UPDATE thread_summaries t \
+             SET archive_state = $2, \
+                 status = CASE WHEN t.status = 'waiting_for_user_answer' \
+                               THEN t.status ELSE 'running' END, \
+                 last_revived_at = NOW() \
+             FROM (SELECT thread_id, status, last_revived_at \
+                   FROM thread_summaries WHERE thread_id = $1 FOR UPDATE) prev \
+             WHERE t.thread_id = prev.thread_id \
+             RETURNING t.active_children_count::bigint, t.total_children_count::bigint, \
+                       prev.status, prev.last_revived_at, t.last_revived_at",
         )
         .bind(parent_id)
         .bind(ArchiveState::Inbox.as_str())
@@ -501,10 +595,12 @@ impl EventBus {
                     parent_id,
                     e
                 );
-                return;
+                return None;
             }
         };
-        let Some((active, total)) = row else { return };
+        // `None` here is the missing-parent-row case: nothing was written, so
+        // there is no wake to report and nothing for a caller to undo.
+        let (active, total, prev_status, prev_revived_at, revived_at) = row?;
         let aggregate =
             match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id).await {
                 Ok(agg) => agg,
@@ -518,6 +614,58 @@ impl EventBus {
                 }
             };
         self.send_children_count_event(parent_id, active, total, aggregate);
+        Some(ParentWake {
+            prev_status,
+            prev_revived_at,
+            revived_at,
+        })
+    }
+
+    /// Roll the wake back on a path that gave up before any turn was driven.
+    /// Left alone, the parent spins "Requesting" against nothing until the
+    /// next boot reset.
+    ///
+    /// **A plain UPDATE, never `settle_stuck_running_thread`.**
+    /// `refire_unprocessed_child_completions` selects on the card being the
+    /// thread's LAST event. A terminal emitted after it would take the parent
+    /// out of that sweep and strand the wake for good. Writing no event keeps
+    /// the retry intact, which is what makes this safe on the shutdown path,
+    /// where the card DID persist.
+    ///
+    /// Restores the previous status rather than assuming `idle`: a parent
+    /// already mid-turn when its child finished must not be settled by a
+    /// rollback. `last_revived_at` is the fencing token for the same reason,
+    /// and goes back with it, so two wakes unwind in any order. See
+    /// `ParentWake`.
+    ///
+    /// Takes the pool rather than `&self`, for the reason
+    /// `authorize_child_follow_up` does: the whole thing is one guarded query,
+    /// so it is directly testable without standing up a bus.
+    pub(super) async fn undo_parent_wake(
+        pool: &sqlx::PgPool,
+        parent_id: Uuid,
+        wake: Option<&ParentWake>,
+    ) {
+        // No wake to undo: `should_callback` was false, the parent's row is
+        // gone, or the write itself failed.
+        let Some(wake) = wake else { return };
+        if let Err(e) = sqlx::query(
+            "UPDATE thread_summaries SET status = $2, last_revived_at = $3 \
+             WHERE thread_id = $1 AND last_revived_at = $4",
+        )
+        .bind(parent_id)
+        .bind(&wake.prev_status)
+        .bind(wake.prev_revived_at)
+        .bind(wake.revived_at)
+        .execute(pool)
+        .await
+        {
+            crate::log!(
+                "[FanOut] Failed to undo the wake for parent {} after a lost card: {}",
+                parent_id,
+                e
+            );
+        }
     }
 
     /// Settle the child's `parent_callback_pending` marker on a decrement-only
@@ -633,7 +781,24 @@ impl EventBus {
                 parent_id,
                 event_id
             );
-            self.send_parent_callback(parent_id, child_id, event_id, parent_is_coding_agent);
+            // Wake the parent here too, exactly as the live fan-in does. A
+            // re-fired wake runs the same turn with the same setup cost, so
+            // without this the recovered parent reads "Done" for that whole
+            // window: the very gap this path is re-firing to close.
+            let wake = self.update_parent_after_child_terminal(parent_id).await;
+            // No terminal id: this sweep reads the completion card, and the
+            // child terminal behind it is not recorded on the row. The gate
+            // abstains, which is the fail-open side.
+            if !self.send_parent_callback(
+                parent_id,
+                child_id,
+                event_id,
+                None,
+                parent_is_coding_agent,
+            ) {
+                Self::undo_parent_wake(&self.pool, parent_id, wake.as_ref()).await;
+                continue;
+            }
             refired += 1;
         }
         if refired > 0 {
@@ -645,17 +810,22 @@ impl EventBus {
         refired
     }
 
+    /// Hand the wake to the listener task. Returns whether it was accepted, so
+    /// a caller that already marked the parent awake can roll that back when
+    /// no turn will follow.
     fn send_parent_callback(
         &self,
         parent_thread_id: Uuid,
         child_thread_id: Uuid,
         child_completed_event_id: Uuid,
+        child_terminal_event_id: Option<Uuid>,
         parent_is_coding_agent: bool,
-    ) {
+    ) -> bool {
         if let Err(e) = self.parent_callback_tx.send(ParentCallback {
             parent_thread_id,
             child_thread_id,
             child_completed_event_id,
+            child_terminal_event_id,
             parent_is_coding_agent,
         }) {
             crate::log!(
@@ -663,6 +833,8 @@ impl EventBus {
                 child_thread_id,
                 e
             );
+            return false;
         }
+        true
     }
 }

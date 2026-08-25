@@ -423,6 +423,58 @@
     font-size: var(--font-size-md);
 }
 
+/* Local changes an update is about to touch. Neutral surface rather than the
+   overwrite section's red edge: most rows here are a merge that KEEPS the
+   user's work, so a warning colour would misread the common case. */
+.plugin-install-local-changes {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--border-color));
+}
+
+.plugin-install-note {
+    margin: 0 0 var(--space-sm);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.plugin-install-file-merged,
+.plugin-install-file-conflict,
+.plugin-install-file-replaced {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--space-sm);
+}
+
+.plugin-install-outcome {
+    font-family: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.plugin-install-file-merged .plugin-install-outcome {
+    color: var(--accent-green);
+}
+
+.plugin-install-file-conflict .plugin-install-outcome,
+.plugin-install-file-replaced .plugin-install-outcome {
+    color: var(--accent-yellow);
+}
+
+.plugin-install-keep-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.plugin-install-keep-toggle input {
+    margin: 0;
+    flex-shrink: 0;
+}
+
 .plugin-install-empty {
     margin: 0;
     color: var(--text-muted);
