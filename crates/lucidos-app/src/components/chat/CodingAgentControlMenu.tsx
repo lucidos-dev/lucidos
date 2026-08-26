@@ -222,7 +222,7 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
           }
         }
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         // Retry both views: iOS PWA HTTP/2 connections go stale after
         // backgrounding and the first wake fetch rejects with
         // TypeError("Load failed"). The threadId guard in the empty-response
@@ -231,7 +231,9 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
           retryCountRef.current++;
           retryTimerRef.current = window.setTimeout(loadCommands, RETRY_DELAY_MS);
         } else {
-          showToast('Failed to load coding-agent commands', 'error');
+          // The reason, not a bare generic: this fires only after every retry
+          // is spent, so it is the one report the user gets.
+          showToast(`Failed to load coding-agent commands: ${errorDetail(err)}`, 'error');
         }
       });
   }

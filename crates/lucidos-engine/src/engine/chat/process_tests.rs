@@ -95,6 +95,7 @@ fn trigger_context_has_no_preload_fields() {
         invocation: TriggerInvocation::Schedule,
         go_to_review: false,
         side_effect_grant: vec![],
+        queue_entry_id: uuid::Uuid::new_v4(),
     };
 }
 

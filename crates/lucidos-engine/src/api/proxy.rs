@@ -88,39 +88,125 @@ static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|
         .expect("failed to build proxy reqwest client")
 });
 
-/// Load proxy config from `<workspace>/data/config/apis.json`.
-/// Missing file → empty map (no proxies configured).
+/// One `apis.json` entry the engine refuses to serve, and why.
 ///
-/// Called once at startup (`main.rs`), where a returned `Err` stops the engine,
-/// and again per request through `resolve_proxy_target`. The startup call makes
-/// a refused config a boot failure naming the value. Without it the operator
-/// meets a 500, the first time somebody uses that one proxy.
-pub fn load_proxy_config(workspace_path: &FsPath) -> Result<ProxyConfigMap, String> {
+/// `provider` is `None` when the file itself is the problem, so there is
+/// no entry to name. Modelling that as an option rather than a sentinel
+/// name keeps a real provider called "apis.json" from impersonating it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RejectedProvider {
+    pub provider: Option<String>,
+    pub reason: String,
+}
+
+impl RejectedProvider {
+    /// How this reads to a person: the provider name, or the config path
+    /// when the file itself is what failed. Used by the startup log and the
+    /// boot notification. `thread-sync.ts` mirrors the same fallback for the
+    /// `provider: null` it receives on the wire.
+    pub fn label(&self) -> &str {
+        self.provider.as_deref().unwrap_or(PROXY_CONFIG_REL_PATH)
+    }
+}
+
+/// What `apis.json` yielded: the providers the engine will serve, and the
+/// entries it refuses.
+///
+/// Both halves matter, and neither is an error. A refused entry is a
+/// configuration mistake the user can fix, reported by name, while every
+/// other entry keeps working.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyConfigLoad {
+    pub providers: ProxyConfigMap,
+    pub rejected: Vec<RejectedProvider>,
+}
+
+impl ProxyConfigLoad {
+    /// The reason this name is refused, if it is. A file-level rejection
+    /// answers for EVERY name: an unreadable file may have overridden a
+    /// builtin, and routing that traffic to the builtin instead would be a
+    /// silent change of backend.
+    pub fn rejection_for(&self, name: &str) -> Option<&RejectedProvider> {
+        self.rejected
+            .iter()
+            .find(|r| r.provider.is_none() || r.provider.as_deref() == Some(name))
+    }
+}
+
+/// Load proxy config from `<workspace>/data/config/apis.json`.
+/// Missing file means no proxies are configured, and yields an empty load.
+///
+/// **Never fails.** One malformed entry used to fail the whole file, and
+/// `main.rs` turned that into a boot abort. So a single bad provider took a
+/// workspace offline until somebody edited JSON by hand. Every entry is now
+/// parsed on its own: the good ones load, the bad ones come back in
+/// `rejected` with a reason, and the caller decides how loudly to say so.
+/// See `docs/plans/2026-08-26-apis-json-must-not-kill-the-engine-boot.md`.
+pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
     let path = workspace_path.join(PROXY_CONFIG_REL_PATH);
     if !path.exists() {
-        return Ok(ProxyConfigMap::new());
+        return ProxyConfigLoad::default();
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let configs: ProxyConfigMap = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-    // Walk the pipeline of every provider and validate any ScriptHandshake
-    // layer's script path, before the engine can be tricked into running an
-    // out-of-workspace file. The rule itself lives with the spawn, in
+    let file_level = |reason: String| ProxyConfigLoad {
+        providers: ProxyConfigMap::new(),
+        rejected: vec![RejectedProvider {
+            provider: None,
+            reason,
+        }],
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return file_level(format!("could not be read: {e}")),
+    };
+    // Deserialize the outer object only, so one unparseable entry costs
+    // nothing but itself. A root that is not an object has no entries to
+    // salvage and is reported whole.
+    let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(&content) {
+        Ok(m) => m,
+        Err(e) => return file_level(format!("is not usable: {e}")),
+    };
+
+    let mut load = ProxyConfigLoad::default();
+    for (name, entry) in raw {
+        match parse_provider(&name, &entry) {
+            Ok(cfg) => {
+                load.providers.insert(name, cfg);
+            }
+            Err(reason) => load.rejected.push(RejectedProvider {
+                provider: Some(name),
+                reason,
+            }),
+        }
+    }
+    // Stable order so a log line, an event payload and a test all read the
+    // same way regardless of the hash map's iteration order.
+    load.rejected.sort_by(|a, b| a.provider.cmp(&b.provider));
+    load
+}
+
+/// One provider's entry, or the reason the engine will not serve it.
+fn parse_provider(name: &str, entry: &serde_json::Value) -> Result<ProxyConfig, String> {
+    let cfg: ProxyConfig = serde_json::from_value(entry.clone()).map_err(|e| {
+        // A legacy `auth` block reaching here is one the startup migration
+        // could not rewrite. Serde's "missing field `pipeline`" says nothing
+        // a user can act on, and the translator's own words do.
+        entry
+            .get("auth")
+            .and_then(|auth| super::proxy_migration::legacy_rejection(name, auth))
+            .unwrap_or_else(|| format!("provider '{name}': {e}"))
+    })?;
+    // Walk the pipeline and validate any ScriptHandshake layer's script
+    // path, before the engine can be tricked into running an out-of-workspace
+    // file. The rule itself lives with the spawn, in
     // `proxy_script_runner::script_path_rejection`, so the two cannot disagree.
-    for (name, cfg) in &configs {
-        let Some(pipeline_cfg) = cfg.auth.as_ref() else {
-            continue;
-        };
-        for layer in &pipeline_cfg.pipeline {
-            if let LayerConfig::ScriptHandshake { script, .. } = layer {
-                if let Some(reason) = super::proxy_script_runner::script_path_rejection(script) {
-                    return Err(format!("proxy '{}' {}", name, reason));
-                }
+    for layer in cfg.auth.iter().flat_map(|p| &p.pipeline) {
+        if let LayerConfig::ScriptHandshake { script, .. } = layer {
+            if let Some(reason) = super::proxy_script_runner::script_path_rejection(script) {
+                return Err(format!("proxy '{name}' {reason}"));
             }
         }
     }
-    Ok(configs)
+    Ok(cfg)
 }
 
 /// Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
@@ -377,9 +463,24 @@ pub(crate) async fn resolve_proxy_target(
     workspace_path: &FsPath,
     name: &str,
 ) -> Result<ProxyConfig, (StatusCode, String)> {
-    let configs =
-        load_proxy_config(workspace_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    configs.get(name).cloned().ok_or((
+    let load = load_proxy_config(workspace_path);
+    if let Some(cfg) = load.providers.get(name) {
+        return Ok(cfg.clone());
+    }
+    // A refused entry is NOT "not configured", and the difference decides
+    // where the request goes. Only a 404 falls through to the builtin
+    // provider of the same name. Answering 404 here would quietly send this
+    // traffic to a different backend than the one that was configured.
+    if let Some(rejected) = load.rejection_for(name) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "proxy '{}' is configured but unusable: {}",
+                name, rejected.reason
+            ),
+        ));
+    }
+    Err((
         StatusCode::NOT_FOUND,
         format!("proxy '{}' is not configured", name),
     ))

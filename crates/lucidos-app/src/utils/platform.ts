@@ -20,11 +20,18 @@ export function registrationUserAgent(rawUa: string, isDesktopApp: boolean): str
   return isDesktopApp ? `${rawUa} ${DESKTOP_APP_UA_TOKEN}` : rawUa;
 }
 
-/** A REGISTERED device's stored user-agent as a short human label ("Safari on
- *  iOS"), for a device row and for any prose that has to name a device the user
- *  is not holding. Lives here beside {@link isMobileDeviceUserAgent} because both
- *  read the same stored string, and a store action naming a device must not have
- *  to import from a settings component to do it. */
+/** A REGISTERED device's stored user-agent as a short human label, e.g.
+ *  "Safari/604.1 on iOS". For a device row, and for any prose naming a device
+ *  the user is not holding.
+ *
+ *  Lives beside {@link isMobileDeviceUserAgent}: both read the same stored
+ *  string. A store action naming a device should not import from a settings
+ *  component.
+ *
+ *  The browser token is the LEFTMOST match, not the most specific one. So a
+ *  Chromium fork reports the engine it carries: Edge and Opera read as Chrome,
+ *  and iOS Chrome reads as Safari. `suggestDeviceLabel` (utils/deviceLabel.ts)
+ *  is the version that tells the forks apart, for the name offered at pairing. */
 export function describeDeviceUserAgent(ua: string | null | undefined): string {
   if (!ua) return 'Unknown device';
   const browser = ua.match(/(?:Chrome|Firefox|Safari|Edge|Opera)\/[\d.]+/)?.[0]

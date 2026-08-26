@@ -14,6 +14,11 @@ export class SwipeTouch {
   private _tracking = false;
   private _direction: 'horizontal' | 'vertical' | null = null;
   private _dx = 0;
+  /** Which way the finger was going when the direction locked. Frozen there,
+   *  because the threshold compensation below is one fixed offset for the whole
+   *  gesture. Re-reading the sign per frame flips the offset the moment the
+   *  finger drags back past its start, which reports +7 for a 1px move LEFT. */
+  private _lockSign = 0;
 
   /** Record start of a new touch. */
   start(x: number, y: number): void {
@@ -23,6 +28,7 @@ export class SwipeTouch {
     this._tracking = true;
     this._direction = null;
     this._dx = 0;
+    this._lockSign = 0;
   }
 
   /** Process a touch move. Returns the horizontal delta (px) if tracking
@@ -36,13 +42,16 @@ export class SwipeTouch {
     if (this._direction === null) {
       if (Math.abs(dx) < LOCK_THRESHOLD && Math.abs(dy) < LOCK_THRESHOLD) return null;
       this._direction = Math.abs(dx) >= Math.abs(dy) ? 'horizontal' : 'vertical';
+      // A horizontal lock needs `|dx| >= |dy|` and one of them past the
+      // threshold, so `|dx| >= LOCK_THRESHOLD` here and the sign is decided.
+      this._lockSign = Math.sign(dx);
     }
 
     if (this._direction === 'vertical') return null;
 
     // Subtract the lock threshold so visible drag starts from 0 instead of
     // jumping ±LOCK_THRESHOLD on the first frame after lock.
-    const adjusted = dx - Math.sign(dx) * LOCK_THRESHOLD;
+    const adjusted = dx - this._lockSign * LOCK_THRESHOLD;
     this._dx = adjusted;
     return adjusted;
   }
@@ -79,5 +88,6 @@ export class SwipeTouch {
     this._tracking = false;
     this._direction = null;
     this._dx = 0;
+    this._lockSign = 0;
   }
 }

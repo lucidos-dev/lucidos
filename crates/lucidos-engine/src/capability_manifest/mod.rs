@@ -1976,16 +1976,22 @@ const TQ_ENTRY_ID_ARG: Arg = Arg {
 
 // Mirrors the flat update_thread_queue_policy schema (cap_schema + overflow).
 // Every field optional — the handler merges the patch with the live policy.
+//
+// Descriptions stay at what the field NAME does not already say: this schema is
+// always-loaded context, billed on every request of every thread, and it sits
+// close to its per-tool ceiling. The full semantics of each cap live in
+// `system-knowhow/thread-queue.md` § Capacity policy.
 const TQ_POLICY_LLM_SCHEMA: &str = r#"{
-  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Every kind, background and user work alike."},
+  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Background and user work alike."},
   "max_concurrent_event_trigger": {"type":"integer","minimum":0},
   "max_concurrent_cron": {"type":"integer","minimum":0},
-  "max_concurrent_sub_thread": {"type":"integer","minimum":0,"description":"Agent-spawned sub-thread chats."},
+  "max_concurrent_sub_thread": {"type":"integer","minimum":0},
   "max_concurrent_coding_agent": {"type":"integer","minimum":0},
-  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"Runs of one trigger; 1 preserves strict per-trigger FIFO."},
-  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Backlog for one trigger before overflow applies."},
-  "reserved_background": {"type":"integer","minimum":0,"description":"Slots background work reclaims ahead of user work; 0 is pure user priority."},
-  "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"],"description":"On reaching max_queued_per_trigger."}
+  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"1 keeps per-trigger FIFO."},
+  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Backlog before overflow applies."},
+  "reserved_background": {"type":"integer","minimum":0,"description":"Reclaimed ahead of user work; 0 is pure user priority."},
+  "max_event_trigger_depth": {"type":"integer","minimum":1,"description":"Trigger fires one event chain may make."},
+  "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"]}
 }"#;
 
 const THREAD_QUEUE_OPS: &[Operation] = &[

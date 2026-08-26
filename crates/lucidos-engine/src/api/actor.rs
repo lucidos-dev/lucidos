@@ -46,17 +46,45 @@
 //! than an authorization one.
 //!
 //! Now each spawn gets its own **thread-bound origin token**, minted by
-//! [`mint_agent_origin_token`] and shaped `"<thread-id>.<mac>"` (or
-//! `"-.<mac>"` for a thread-less spawn), where the MAC is over the prefix under
-//! a per-startup secret. [`subprocess_origin`] recomputes and verifies it, and
-//! the **prefix is the source thread id**. There is no second input left to
-//! disagree with the token, so there is no claim left to forge: a subprocess
-//! can only present the token it was handed, and that token names exactly one
-//! thread. The old header is gone.
+//! [`mint_agent_origin_token`] and shaped `"<thread>@<depth>@<trigger>.<mac>"`,
+//! where the MAC is over the whole prefix under a per-startup secret. A `-`
+//! stands in for a thread or a trigger the spawn does not carry.
+//! [`subprocess_origin`] recomputes and verifies it, and the **prefix is the
+//! source thread id**. There is no second input left to disagree with the
+//! token, so there is no claim left to forge: a subprocess can only present the
+//! token it was handed, and that token names exactly one thread. The old header
+//! is gone.
+//!
+//! ## The prefix also carries the event-trigger chain depth
+//!
+//! A script trigger's `lucidos events emit` arrives on an axum request task,
+//! which shares nothing with the fire that spawned the script. Without a carry
+//! the emit stamps depth 0, restarting the chain, and a script trigger
+//! subscribed to the event its own script emits never stops.
+//!
+//! The depth rides the same signed prefix, so it is authenticated rather than
+//! claimed: a caller cannot declare a lower depth to escape the cap. The token
+//! value is opaque to every client. The CLI, the Python shim and a coding-agent
+//! session all copy the env var into the header without reading it. So widening
+//! it needs no change outside this file.
 //!
 //! A token that does not verify is [`SubprocessOrigin::NotSubprocess`], never a
 //! subprocess with weaker attribution. The failure is a downgrade in
 //! attribution, never an upgrade in reach.
+//!
+//! ## The prefix also carries the emitting trigger
+//!
+//! The third field is `emitting_trigger_id`: which trigger's fire this
+//! subprocess *is*. `ACTIVE_TRIGGER_ID` marks a fire's emits, and that
+//! task-local stops at a `fork`. So a trigger's script emitting through the
+//! `lucidos` CLI could still wake the trigger that ran it. Signing the claim
+//! authenticates it the way the source thread id already is. An app through
+//! the SDK holds no minted token, so it can state no claim at all.
+//!
+//! The claim covers the fire, never what the fire hands off. A coding-agent
+//! spawn is where the two fields part: it carries the depth and passes `None`
+//! for the trigger. ADR 0137 holds that rule and its reasoning, ADR 0138 the
+//! depth.
 
 use super::hex;
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
@@ -110,11 +138,18 @@ pub const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 /// `caller_thread_id` default.
 pub const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 
-/// Token prefix standing in for "this subprocess has no thread context"
-/// (scheduled scripts). Not a valid uuid, so it can never collide with a real
-/// thread id, and it is signed like any other prefix so a thread-less token
-/// cannot be edited into a thread-bound one.
-const NO_THREAD_PREFIX: &str = "-";
+/// Prefix field standing in for a claim this subprocess does not carry. That
+/// is no thread context (a scheduled script), or no emitting trigger (any
+/// spawn outside a fire). Not a valid uuid, so it cannot collide with a real
+/// thread id. It is signed with the rest of the prefix, so an absent claim
+/// cannot be edited into a present one.
+const ABSENT_SEGMENT: &str = "-";
+
+/// Separates the three prefix fields: thread, chain depth, emitting trigger.
+///
+/// Not `.`, which [`subprocess_origin`] already splits the MAC on, and not a
+/// character a uuid can contain, so the fields can never be ambiguous.
+const FIELD_SEPARATOR: char = '@';
 
 /// Per-startup HMAC key. `OnceLock::set` is first-writer-wins, which matches
 /// the production invariant (engine startup writes once); test harnesses
@@ -143,27 +178,54 @@ fn origin_mac(prefix: &str) -> Option<hmac::Hmac<sha2::Sha256>> {
 }
 
 /// Mint a thread-bound origin token for a subprocess spawned on behalf of
-/// `thread_id` (or with no thread context). `None` before the secret is
-/// installed.
+/// `thread_id` (or with no thread context), carrying `emitting_trigger_id` when
+/// the spawn IS a trigger's fire. `None` before the secret is installed.
 ///
 /// The **only** place a token is constructed. Every subprocess surface reaches
 /// it through [`subprocess_origin_env_vars`], so a new one cannot ship with an
 /// unbound token.
-pub fn mint_agent_origin_token(thread_id: Option<Uuid>) -> Option<String> {
+///
+/// Pass the trigger only where the marker should travel. A spawn that starts a
+/// new thread passes `None`, see the module docs.
+pub fn mint_agent_origin_token(
+    thread_id: Option<Uuid>,
+    chain_depth: u32,
+    emitting_trigger_id: Option<&str>,
+) -> Option<String> {
     use hmac::Mac;
-    let prefix = match thread_id {
+    let thread = match thread_id {
         Some(tid) => tid.to_string(),
-        None => NO_THREAD_PREFIX.to_string(),
+        None => ABSENT_SEGMENT.to_string(),
     };
+    // The token ends up in an HTTP header, so a field that is not visible
+    // ASCII would break the request. Drop the claim instead: fail open.
+    let trigger = match emitting_trigger_id.filter(|id| is_header_safe_field(id)) {
+        Some(id) => id.to_string(),
+        None => {
+            // Say so. A silently dropped claim looks exactly like a trigger
+            // that woke itself for some other reason.
+            if let Some(dropped) = emitting_trigger_id {
+                log!("[Origin] Trigger id is not header-safe, minting with no claim: {dropped:?}");
+            }
+            ABSENT_SEGMENT.to_string()
+        }
+    };
+    let prefix = format!("{thread}{FIELD_SEPARATOR}{chain_depth}{FIELD_SEPARATOR}{trigger}");
     let mac = hex::hex_lower(&origin_mac(&prefix)?.finalize().into_bytes());
     Some(format!("{prefix}.{mac}"))
+}
+
+/// Non-empty, and every byte visible ASCII with no space. A trigger id is a
+/// uuid today, so this only guards against a future id shape.
+fn is_header_safe_field(field: &str) -> bool {
+    !field.is_empty() && field.bytes().all(|b| (b'!'..=b'~').contains(&b))
 }
 
 /// Outcome of subprocess-origin detection. The two-variant shape forces
 /// callers to spell out "is this a subprocess" rather than overload an
 /// `Option<Option<Uuid>>` whose inner `None` is "subprocess without source
 /// thread" — readers don't have to translate nested `Option`s back to prose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubprocessOrigin {
     /// Request did not present a valid origin token. Fall through to the
     /// regular device/api resolution.
@@ -171,7 +233,20 @@ pub enum SubprocessOrigin {
     /// Request came from a Lucidos-spawned subprocess. `source_thread_id`
     /// is the spawning thread when known (CC always; Lucidos LLM tools when
     /// the tool invocation has thread context).
-    Subprocess { source_thread_id: Option<Uuid> },
+    Subprocess {
+        source_thread_id: Option<Uuid>,
+        /// Event-trigger chain depth of the work that spawned this subprocess,
+        /// so an emit it makes stays on that chain. 0 for anything outside a
+        /// trigger fire, which is most subprocesses.
+        chain_depth: u32,
+        /// The trigger whose fire this subprocess is, when it is one. Read off
+        /// the signed prefix, so it is authenticated. See the module docs.
+        ///
+        /// A caller holding no minted token claims nothing, and suppresses
+        /// nobody. That is the fail-open direction, and it is why the claim
+        /// rides the token instead of a header a forger could set.
+        emitting_trigger_id: Option<String>,
+    },
 }
 
 /// Detect a request from a Lucidos-spawned subprocess by verifying the
@@ -194,7 +269,7 @@ pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
         return SubprocessOrigin::NotSubprocess;
     };
     // `rsplit_once` rather than `split_once`: the MAC is hex and carries no
-    // dot, so the LAST dot is the separator even if a future prefix grows one.
+    // dot, so the LAST dot is the separator even when a trigger id carries one.
     let Some((prefix, presented_mac)) = presented.rsplit_once('.') else {
         return SubprocessOrigin::NotSubprocess;
     };
@@ -207,17 +282,35 @@ pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
     if hmac::Mac::verify_slice(mac, &presented_bytes).is_err() {
         return SubprocessOrigin::NotSubprocess;
     }
-    if prefix == NO_THREAD_PREFIX {
+    // Every field is inside the MAC, so what follows splits authenticated text
+    // rather than a claim. The trigger is last, so `splitn` keeps a trigger id
+    // holding a separator intact.
+    //
+    // The secret is per-startup, so a verified prefix was minted by this
+    // process and always has all three fields. Each malformed arm below is
+    // therefore unreachable, and refusing is the right answer if it ever is.
+    let mut fields = prefix.splitn(3, FIELD_SEPARATOR);
+    let (Some(thread), Some(depth), Some(trigger)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    let Ok(chain_depth) = depth.parse::<u32>() else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    let emitting_trigger_id = (trigger != ABSENT_SEGMENT).then(|| trigger.to_string());
+    if thread == ABSENT_SEGMENT {
         return SubprocessOrigin::Subprocess {
             source_thread_id: None,
+            chain_depth,
+            emitting_trigger_id,
         };
     }
-    // A verified prefix that is not the sentinel was minted from a `Uuid`, so
-    // this parse only fails if the secret leaked, in which case refusing is
-    // the right answer anyway.
-    match Uuid::parse_str(prefix) {
+    // A verified thread field other than the sentinel was minted from a `Uuid`.
+    match Uuid::parse_str(thread) {
         Ok(tid) => SubprocessOrigin::Subprocess {
             source_thread_id: Some(tid),
+            chain_depth,
+            emitting_trigger_id,
         },
         Err(_) => SubprocessOrigin::NotSubprocess,
     }
@@ -242,9 +335,18 @@ pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
 /// for the subprocess-side consumers that read it directly (the Python shim,
 /// the Codex MCP child config, `lucidos spawn-thread`). The engine itself never
 /// reads it back off a request.
-pub fn subprocess_origin_env_vars(thread_id: Option<Uuid>) -> Vec<(&'static str, String)> {
+///
+/// `emitting_trigger_id` travels only where the spawn IS a trigger's fire, and
+/// never where the fire hands work off. `chain_depth` is the opposite: it
+/// reaches handed-off work too. Each caller states both, and the module docs
+/// give the rule.
+pub fn subprocess_origin_env_vars(
+    thread_id: Option<Uuid>,
+    chain_depth: u32,
+    emitting_trigger_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
     let mut vars = Vec::with_capacity(2);
-    if let Some(token) = mint_agent_origin_token(thread_id) {
+    if let Some(token) = mint_agent_origin_token(thread_id, chain_depth, emitting_trigger_id) {
         vars.push((ENV_AGENT_ORIGIN_TOKEN, token));
     }
     if let Some(tid) = thread_id {
@@ -353,7 +455,10 @@ pub fn build_message_origin(
     // never stamps as Human. Cross-workspace `caller` still wins (different
     // channel, different actor model).
     if caller.is_none() {
-        if let SubprocessOrigin::Subprocess { source_thread_id } = subprocess_origin(headers) {
+        if let SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } = subprocess_origin(headers)
+        {
             return Some(MessageOrigin::Api {
                 user_agent,
                 mode: ActorMode::Agent,

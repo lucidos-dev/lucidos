@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { credentials, preferences } from '../../store/store';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import {
@@ -6,6 +6,7 @@ import {
   setLocalBaseUrl,
   DEFAULT_LOCAL_BASE_URL,
 } from '../../store/actions/preferences';
+import { useServerBackedField } from '../../hooks/useServerBackedField';
 import { findProviderCredential } from './providerCredential';
 import { ProviderBlock } from './ProviderBlock';
 
@@ -29,11 +30,23 @@ export function LocalProviderSettings() {
   const existing = findProviderCredential(credLoadable, LOCAL_SERVICE);
 
   const saved = currentLocalBaseUrl();
-  const [url, setUrl] = useState(saved);
-  // Re-sync the field when the persisted value changes (async load / after save).
+  // Server-backed: untouched it renders the stored preference, so the late
+  // preferences load and a `PreferencesChanged` frame both repaint it. Touched
+  // it holds the draft. The re-sync effect this replaces wiped whatever the
+  // user was typing whenever the agent or another device wrote the preference
+  // (ADR 0118).
+  const [url, setUrl] = useServerBackedField(saved);
+  // Re-arm once our own save lands. The hook goes untouched only when its
+  // setter is handed the served value. The two other callers close on save, so
+  // neither needs this. This page stays mounted. Without it the field ignores
+  // every later frame, and Save offers to write the stale draft back.
+  //
+  // Trimmed on both sides, because `setLocalBaseUrl` stores `url.trim()`. A
+  // padded paste would otherwise save and never re-arm. Same test the Save
+  // button disables on, so the two agree on what counts as saved.
   useEffect(() => {
-    setUrl(saved);
-  }, [saved]);
+    if (url.trim() === saved.trim()) setUrl(saved);
+  }, [saved, url]);
 
   const [secret, setSecret] = useState('');
   const [savingUrl, setSavingUrl] = useState(false);

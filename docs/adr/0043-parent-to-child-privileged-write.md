@@ -162,9 +162,10 @@ second reclaimer.
 The deferral above was gated on one thing: the caller thread being
 authenticated rather than header-asserted. It is. The subprocess origin token is
 now **thread-bound** (`docs/glossary.md` § thread-bound origin token): the engine
-mints one per spawn, shaped `"<thread-id>.<mac>"`, and the token's own prefix is
-the source thread. The separate `x-lucidos-source-thread-id` header, which any
-subprocess could set to any value, is gone.
+mints one per spawn, and the token's signed prefix names the source thread. The
+separate `x-lucidos-source-thread-id` header, which any subprocess could set to
+any value, is gone. The prefix has grown two more signed fields since, so the
+glossary holds the shape rather than this line.
 
 Three consequences for this ADR:
 

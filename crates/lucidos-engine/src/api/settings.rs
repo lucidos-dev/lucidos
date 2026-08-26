@@ -994,10 +994,11 @@ const SERVE_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How long an answer is reused before the probes run again.
 ///
 /// The endpoint needs no auth, like every other one here, and each miss costs a
-/// resolver thread plus an outbound TLS connection. `magic_dns_name` ABANDONS
-/// its worker at the deadline rather than joining it. So a caller in a loop
-/// retires threads slower than it creates them, and an app iframe with a
-/// polling bug is enough. This caps that at one probe per window.
+/// resolver thread plus one outbound TLS connection per [`SERVE_PORTS`] entry.
+/// `magic_dns_name` ABANDONS its worker at the deadline rather than joining it.
+/// So a caller in a loop retires threads slower than it creates them, and an
+/// app iframe with a polling bug is enough. This caps that at one sweep per
+/// window.
 ///
 /// Short on purpose. The Access page refetches right after an Expose run, and
 /// that run takes far longer than this, so the refetch still sees the new URL.
@@ -1025,9 +1026,10 @@ pub(super) struct TailnetStatusResponse {
     /// `None` when MagicDNS is off, a per-tailnet setting that does not mean
     /// the machine is offline.
     magic_dns_name: Option<String>,
-    /// The `https://<name>/<slug>/` URL, set **only** once a request to it was
-    /// answered by this very engine. See [`get_tailnet_status`] for why a
-    /// listener on 443 is not enough to publish it.
+    /// The `https://<name>[:<port>]/<slug>/` URL, set **only** once a request
+    /// to it was answered by this very engine. The port is present whenever the
+    /// serve route is not on 443. See [`get_tailnet_status`] for why a listener
+    /// is not enough to publish it.
     workspace_serve_url: Option<String>,
 }
 
@@ -1035,10 +1037,14 @@ pub(super) struct TailnetStatusResponse {
 /// reaches THIS workspace over the tailnet.
 ///
 /// **The URL is verified end to end, never inferred from a listener.** A TCP
-/// probe of 443 proves that something serves HTTPS and says nothing about
-/// which gateway. `system-knowhow/remote-access.md` documents a two-gateway
-/// install: 443 fronts the packaged gateway, and the dev one takes 8443. So a
-/// live 443 can belong to a gateway that never heard of this slug.
+/// probe proves that something serves HTTPS and says nothing about which
+/// gateway. `system-knowhow/remote-access.md` documents a two-gateway install,
+/// where 443 fronts the packaged gateway and the dev one takes another port.
+/// So a live 443 can belong to a gateway that never heard of this slug.
+///
+/// **Every port Serve can bind is a candidate**, for the same reason. The
+/// second gateway cannot have 443, so probing it alone would hide the only
+/// address that gateway has a real certificate for.
 ///
 /// Publishing that URL would hand the user a link to somebody else's
 /// workspace. So we fetch our own `health` through the candidate URL and
@@ -1101,7 +1107,29 @@ fn lock_tailnet_cache(
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// The candidate URL, if this engine is what answers at it.
+/// The HTTPS ports `tailscale serve` will bind, in preference order.
+///
+/// Probed rather than assumed. A machine running two gateways can give only one
+/// of them 443, so the other's serve route lives on a port nothing tells us.
+/// Assuming 443 hid that gateway's only trusted-certificate address. On an iOS
+/// home-screen app that address is what makes a pairing survive a relaunch.
+const SERVE_PORTS: [u16; 3] = [443, 8443, 10000];
+
+/// Pure: the URL a serve route on `port` would publish for this workspace.
+///
+/// 443 keeps the bare form, because that is the address a person retypes and
+/// every existing install already prints.
+fn serve_candidate_url(magic_dns_name: &str, slug: &str, port: u16) -> String {
+    match port {
+        443 => format!("https://{magic_dns_name}/{slug}/"),
+        p => format!("https://{magic_dns_name}:{p}/{slug}/"),
+    }
+}
+
+/// The first candidate URL this engine itself answers at, or `None`.
+///
+/// Every port is probed at once, so the wait is one round trip rather than one
+/// per candidate, and the preference order decides ties.
 ///
 /// `https` is hardcoded here, and that is not the intra-host scheme question
 /// `.claude/rules/rust.md` governs. This is the tailnet endpoint `tailscale
@@ -1114,7 +1142,6 @@ async fn verified_workspace_serve_url(
     slug: &str,
     state: &AppState,
 ) -> Option<String> {
-    let url = format!("https://{magic_dns_name}/{slug}/");
     let client = reqwest::Client::builder()
         .timeout(SERVE_VERIFY_TIMEOUT)
         // A system proxy has no business intercepting a tailnet hop, and would
@@ -1126,6 +1153,27 @@ async fn verified_workspace_serve_url(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
+    let own_path = state.workspace_path.to_string_lossy().into_owned();
+    let probe = |port| {
+        let url = serve_candidate_url(magic_dns_name, slug, port);
+        let client = &client;
+        let own_path = &own_path;
+        async move { serve_url_reaches_us(client, url, own_path).await }
+    };
+    let (first, second, third) = tokio::join!(
+        probe(SERVE_PORTS[0]),
+        probe(SERVE_PORTS[1]),
+        probe(SERVE_PORTS[2])
+    );
+    [first, second, third].into_iter().flatten().next()
+}
+
+/// `url` back, once this engine has answered its own `health` through it.
+async fn serve_url_reaches_us(
+    client: &reqwest::Client,
+    url: String,
+    own_workspace_path: &str,
+) -> Option<String> {
     let response = client
         .get(format!("{url}api/v1/health"))
         .send()
@@ -1135,8 +1183,7 @@ async fn verified_workspace_serve_url(
         return None;
     }
     let body = response.text().await.ok()?;
-    let own_path = state.workspace_path.to_string_lossy();
-    health_names_this_workspace(&body, &own_path).then_some(url)
+    health_names_this_workspace(&body, own_workspace_path).then_some(url)
 }
 
 /// Pure: does this `health` body prove the probe reached THIS engine?
@@ -1768,6 +1815,39 @@ mod tailnet_status_tests {
         // accept the very case the test above rejects.
         let body = health_body("/Users/me/other-checkout/workspaces/dev");
         assert!(!health_names_this_workspace(&body, "dev"));
+    }
+
+    #[test]
+    fn a_serve_route_off_443_carries_its_port_into_the_url() {
+        // The second gateway on a machine cannot have 443, so its serve route
+        // is on another port. Dropping that port published an address that
+        // reaches the OTHER gateway, or nothing at all.
+        assert_eq!(
+            serve_candidate_url("mymac.tailnet-name.ts.net", "dev", 10000),
+            "https://mymac.tailnet-name.ts.net:10000/dev/"
+        );
+        assert_eq!(
+            serve_candidate_url("mymac.tailnet-name.ts.net", "dev", 8443),
+            "https://mymac.tailnet-name.ts.net:8443/dev/"
+        );
+    }
+
+    #[test]
+    fn the_443_url_keeps_the_bare_form_it_always_had() {
+        // What every single-gateway install already prints, and what a person
+        // retypes. An explicit `:443` would be correct and uglier.
+        assert_eq!(
+            serve_candidate_url("mymac.tailnet-name.ts.net", "dev", 443),
+            "https://mymac.tailnet-name.ts.net/dev/"
+        );
+    }
+
+    #[test]
+    fn every_port_tailscale_serve_can_bind_is_a_candidate() {
+        // Serve accepts exactly these three. Leaving one out makes a live route
+        // invisible, which is the bug: Connect URLs fell back to the raw
+        // gateway port while a verified route answered on 10000.
+        assert_eq!(SERVE_PORTS, [443, 8443, 10000]);
     }
 
     #[test]

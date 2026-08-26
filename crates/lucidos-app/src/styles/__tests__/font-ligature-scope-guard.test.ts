@@ -75,8 +75,12 @@ describe('a `font` shorthand does not silently re-enable ligatures', () => {
   //
   // The fix at each site is `font-feature-settings: inherit`, which is what the
   // author meant by `font: inherit` anyway. This guard keeps the next one honest.
+  // `components` is here because a stylesheet colocated with its component is
+  // still a stylesheet. SearchEverywhere.css sat outside the walk and carried
+  // exactly the defect this guard exists for.
   const CSS_ROOTS = [
     'crates/lucidos-app/src/styles',
+    'crates/lucidos-app/src/components',
     'crates/lucidos-engine/src/api',
   ] as const;
 

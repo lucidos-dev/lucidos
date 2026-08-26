@@ -102,6 +102,15 @@ event IS the policy). Defaults in parentheses:
   `drop-oldest` drops the trigger's oldest waiting fire + notifies;
   `pause-trigger` pauses the trigger + notifies (its queued fires wait for a
   manual resume).
+- `max_event_trigger_depth` (5): how many trigger fires one event *chain* may
+  make (A fires B, B's event fires C, …). Past it the event is still stored and
+  still reaches SSE, it just fires no further triggers. The user gets a
+  notification naming the trigger that did not fire. This is the recursion
+  backstop under the authoring rule in `system-knowhow/triggers.md`; raise it
+  when a chain is legitimately longer. A spawn does NOT consume a hop: a fire's
+  sub-thread, coding agent or script runs at the fire's own depth, and carries
+  it into everything they emit. Must be ≥ 1 (0 would stop every event trigger
+  from ever firing).
 
 **Cron coalescing (cron kind only).** A cron fire carries no distinct payload
 (`Cron { trigger_id }` and nothing else), so a cron trigger never needs more than
@@ -126,7 +135,8 @@ the flag.
 
 Concurrency caps of **0 mean "hold"** — admission pauses and the queue
 accumulates (e.g. `max_concurrent_total: 0` freezes all work — including new
-user responses). `max_queued_per_trigger` must be ≥ 1.
+user responses). `max_queued_per_trigger` and `max_event_trigger_depth` must
+both be ≥ 1.
 
 ## Ordering
 
@@ -152,23 +162,43 @@ requeue do not silently fall back to Claude Code. Both spawn kinds
 spawn that waited behind capacity or was re-fired after a restart still names
 its *spawning thread* in the message route popover. It is separate from
 `parent_thread_id` because a *top-thread* has an origin and no callback linkage;
-entries queued before the field existed simply carry none. On engine restart:
+entries queued before the field existed simply carry none. Every spawn kind
+also persists its **event-trigger chain depth**. A fire's spawned work therefore
+runs at the fire's depth, whether it was admitted at once, drained after a wait,
+or re-fired after a restart. Rows written before the field carry 0, which is
+what they meant. On engine restart:
 
 - `queued` entries are reloaded as-is.
-- `admitted` entries are work that died with the old process: trigger fires
-  **re-queue and re-fire** (same re-execution semantics as missed-cron
-  catch-up); sub-thread / coding-agent spawns whose thread already
-  materialized are handed off to thread-level recovery (CC auto-resume / chat
-  settle) instead of re-spawning a duplicate.
+- `admitted` entries are work the old process had already started, and **one
+  rule covers all four kinds** (ADR 0133). An entry whose bound thread still
+  exists is **handed off** to thread-level recovery (CC auto-resume / chat
+  settle), never re-run. An entry that bound no thread **re-queues and
+  re-fires**. A trigger fire binds its thread as soon as it creates one, so a
+  fire that parked on a question is never run twice. A fire that died before
+  creating one ran nothing, so it is still owed. A **script** fire creates no
+  thread at all and therefore always re-runs, which is the same crash contract
+  as before.
 - **Cron recovery is idempotent.** Duplicate cron rows for one trigger (left by
   a restart storm) collapse to a single entry on reload — the oldest is kept and
   re-queued, the rest emit `ThreadQueueDropped` (reason "coalesced on recovery")
   to clear their projection rows. So repeated reboots can never re-stack a cron
-  backlog.
+  backlog. A row that hands off does not take that slot: it already ran, so a
+  sibling row that never ran still gets its turn.
 
 **User-initiated** slots are in-memory only — they are NOT persisted and NOT
 re-fired. A dead response is simply gone on restart (the person re-sends if they
 want); the pool count resets to its live background occupancy.
+
+The queue also keeps an in-memory binding from a thread to its chain depth,
+which is how a coding-agent session's events stay on the chain: they are emitted
+from tasks no task-local reaches. It is a cache, not state. Each binding is
+owned by its queue entry, so one entry completing never takes a sibling's. What
+survives a restart is the depth on the row's request, and a re-queued entry
+binds again when it is admitted. The binding is dropped when the entry completes, so a later
+user *Continue* on the same thread starts a fresh chain at 0. Work **handed off**
+at boot leaves no binding at all, and resumes at 0: nothing would ever clear one,
+and the resume is gated on cause, so a crashed loop cannot restart itself into a
+fresh budget.
 
 Draining starts after the scheduler has replayed trigger configs, so paused /
 deleted triggers are honored from the first admission decision.
@@ -193,8 +223,15 @@ prioritized; cancel it from the chat, not here.
   capacity" notification (10-minute cooldown), not one per queued entry.
 - A per-trigger queue overflow → notification naming what was dropped (or
   that the trigger was paused).
+- An event chain reaches `max_event_trigger_depth` and a real trigger would
+  have fired → "`<trigger>` did not fire". It names the event, the depth and
+  the ceiling (10-minute cooldown per trigger). This one taps to the
+  notification itself rather than the panel: the answer is usually to
+  restructure the chain or raise the ceiling, not to look at the backlog.
+  Nothing is reported when no trigger matched, so a deep event nobody
+  subscribes to stays silent.
 
-Every Thread Queue notification taps through to the **Thread Queue** panel
+Every other Thread Queue notification taps through to the **Thread Queue** panel
 (`Tap::Navigate { target: thread-queue }`) so the user lands on the backlog
 they're being told about.
 

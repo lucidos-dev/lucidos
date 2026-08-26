@@ -237,10 +237,11 @@ fn policy_config<'a>(
     windows: &'a [tauri::utils::config::WindowConfig],
     label: &str,
 ) -> Option<&'a tauri::utils::config::WindowConfig> {
-    windows
-        .iter()
-        .find(|w| w.label == label)
-        .or_else(|| windows.iter().find(|w| w.label == crate::MAIN_WINDOW_LABEL))
+    windows.iter().find(|w| w.label == label).or_else(|| {
+        windows
+            .iter()
+            .find(|w| w.label == crate::app_window::MAIN_WINDOW_LABEL)
+    })
 }
 
 /// The LOGICAL minimum size `tauri.conf.json` declares, or `None` when it
@@ -251,7 +252,10 @@ fn policy_config<'a>(
 /// minimum as corruption. A window the user could legitimately drag that small
 /// would then be snapped to the default size on its next restore.
 pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
-    let config = policy_config(&app.config().app.windows, crate::MAIN_WINDOW_LABEL)?;
+    let config = policy_config(
+        &app.config().app.windows,
+        crate::app_window::MAIN_WINDOW_LABEL,
+    )?;
     Some((config.min_width?, config.min_height?))
 }
 
@@ -263,8 +267,12 @@ pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 ///
 /// Every failure here is a no-op with a log line: a client that cannot read its
 /// own monitors must still come up.
+///
+/// By window, not webview window, per ADR 0140. Every read and every correction
+/// here is a window operation. Both callers run before their window is on
+/// screen, so no preview can be attached yet.
 pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
-    let Some(window) = app.get_webview_window(label) else {
+    let Some(window) = app.get_window(label) else {
         return;
     };
     // `window_state_flags` restores FULLSCREEN as well, and a fullscreen window

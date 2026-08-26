@@ -1,0 +1,62 @@
+<svg class="lx-diagram" viewBox="0 0 1200 700" role="img"
+     aria-labelledby="t-bus d-bus" xmlns="http://www.w3.org/2000/svg">
+  <title id="t-bus">Inside the engine: the event bus</title>
+  <desc id="d-bus">Everything that happens is emitted onto one bus: the chat agent, coding agents, triggers, and apps. The bus writes the event to Postgres first, then hands it to consumers: clients over SSE, the memory index, waiting threads, and the thread queue.</desc>
+  <defs>
+    <marker id="lx-arrow-bus" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-ink-soft)"/>
+    </marker>
+    <marker id="lx-arrow-b-bus" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-blue)"/>
+    </marker>
+    <marker id="lx-arrow-a-bus" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-aqua)"/>
+    </marker>
+  </defs>
+  <text x="50" y="32" text-anchor="start" font-size="15" font-weight="700" fill="var(--lx-blue)" letter-spacing="2.5">EMITS</text>
+  <text x="1150" y="32" text-anchor="end" font-size="15" font-weight="700" fill="var(--lx-aqua)" letter-spacing="2.5">HEARS</text>
+  <rect x="50" y="56" width="288" height="96" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="194.0" y="98" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Chat agent</text>
+  <text x="194.0" y="128" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">your turns</text>
+  <path d="M 338 104.0 L 462 104.0" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-bus)"/>
+  <rect x="50" y="172" width="288" height="96" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="194.0" y="214" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Coding agents</text>
+  <text x="194.0" y="244" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">Claude Code, Codex</text>
+  <path d="M 338 220.0 L 462 220.0" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-bus)"/>
+  <rect x="50" y="288" width="288" height="96" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="194.0" y="330" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Triggers</text>
+  <text x="194.0" y="360" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">schedule or event</text>
+  <path d="M 338 336.0 L 462 336.0" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-bus)"/>
+  <rect x="50" y="404" width="288" height="96" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="194.0" y="446" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Apps and API</text>
+  <text x="194.0" y="476" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">through the SDK</text>
+  <path d="M 338 452.0 L 462 452.0" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-bus)"/>
+  <rect x="468" y="56" width="200" height="444" rx="100" fill="none" stroke="var(--lx-ink)" stroke-width="3.5" />
+  <text x="568.0" y="262" text-anchor="middle" font-size="30" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Event</text>
+  <text x="568.0" y="302" text-anchor="middle" font-size="30" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">bus</text>
+  <rect x="848" y="56" width="288" height="96" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" />
+  <text x="992.0" y="98" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Your clients</text>
+  <text x="992.0" y="128" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">live, over SSE</text>
+  <path d="M 674 104.0 L 848 104.0" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-bus)"/>
+  <rect x="848" y="172" width="288" height="96" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" />
+  <text x="992.0" y="214" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Memory</text>
+  <text x="992.0" y="244" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">indexed for recall</text>
+  <path d="M 674 220.0 L 848 220.0" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-bus)"/>
+  <rect x="848" y="288" width="288" height="96" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" />
+  <text x="992.0" y="330" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Event waits</text>
+  <text x="992.0" y="360" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">a thread wakes</text>
+  <path d="M 674 336.0 L 848 336.0" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-bus)"/>
+  <rect x="848" y="404" width="288" height="96" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" />
+  <text x="992.0" y="446" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Thread queue</text>
+  <text x="992.0" y="476" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">what runs next</text>
+  <path d="M 674 452.0 L 848 452.0" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-bus)"/>
+  <rect x="372" y="580" width="392" height="92" rx="14" fill="none" stroke="var(--lx-ink)" stroke-width="3" />
+  <text x="568.0" y="622" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Postgres</text>
+  <text x="568.0" y="652" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">every event, kept</text>
+  <path d="M 568.0 500 L 568.0 580" fill="none" stroke="var(--lx-ink-soft)" stroke-width="3" marker-end="url(#lx-arrow-bus)"/>
+  <text x="694.0" y="548" text-anchor="start" font-size="19" font-weight="500" fill="var(--lx-ink-soft)" letter-spacing="0">written first</text>
+
+</svg>

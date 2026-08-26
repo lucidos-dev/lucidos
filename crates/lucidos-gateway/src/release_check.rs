@@ -4,11 +4,11 @@
 //! supervises every workspace. A webview timer polled once per open window, and
 //! a headless install polled not at all.
 //!
-//! Three gates stand in front of the request, and all three must pass. The
-//! deployment must be installed rather than a source checkout, the
-//! machine-global `~/.lucidos/updates.toml` must have the check enabled, and the
-//! first-run notice must be acknowledged. The first is fail closed: it refuses
-//! whenever it cannot prove the opposite.
+//! Two gates stand in front of the request, and both must pass. The deployment
+//! must be installed rather than a source checkout, and the machine-global
+//! `~/.lucidos/updates.toml` must have the check enabled. The first is fail
+//! closed: it refuses whenever it cannot prove the opposite. The second defaults
+//! on, because the check is functional rather than telemetry (ADR 0139).
 //!
 //! The request carries platform, arch and version. It also carries the caller's
 //! IP, as any HTTP request does, and `PRIVACY.md` says so.
@@ -50,17 +50,11 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 pub struct UpdatesToml {
     /// `[release_check] enabled`. Default true.
     pub enabled: bool,
-    /// `[release_check] notice_acknowledged`. Default false, so a fresh install
-    /// polls nothing until the user has seen the first-run notice.
-    pub notice_acknowledged: bool,
 }
 
 impl Default for UpdatesToml {
     fn default() -> Self {
-        UpdatesToml {
-            enabled: true,
-            notice_acknowledged: false,
-        }
+        UpdatesToml { enabled: true }
     }
 }
 
@@ -69,12 +63,13 @@ struct RawUpdatesToml {
     release_check: Option<RawReleaseCheck>,
 }
 
+/// No `deny_unknown_fields`, deliberately. A file written before ADR 0139 still
+/// carries `notice_acknowledged`, and it must parse with its `enabled` honoured
+/// rather than fall back to the defaults.
 #[derive(Deserialize)]
 struct RawReleaseCheck {
     #[serde(default = "default_true")]
     enabled: bool,
-    #[serde(default)]
-    notice_acknowledged: bool,
 }
 
 fn default_true() -> bool {
@@ -102,7 +97,6 @@ pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
         Ok(raw) => match raw.release_check {
             Some(rc) => UpdatesToml {
                 enabled: rc.enabled,
-                notice_acknowledged: rc.notice_acknowledged,
             },
             None => UpdatesToml::default(),
         },
@@ -119,21 +113,20 @@ pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
 /// drops them.
 pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
     format!(
-        "# Lucidos update check (ADR 0108).\n\
+        "# Lucidos update check (ADR 0108, ADR 0139).\n\
          #\n\
          # Once an hour the gateway asks lucidos.dev whether a newer Lucidos is\n\
          # published. The request carries your platform, your architecture and\n\
          # the version you run. It also carries your IP address, as any web\n\
          # request does. Nothing else is sent, and nothing installs itself.\n\
          #\n\
-         # enabled              false stops the check entirely.\n\
-         # notice_acknowledged  set once you have seen the first-run notice.\n\
-         #                      No check runs before then.\n\
+         # enabled  false stops the automatic check. It is on by default, and\n\
+         #          the same switch lives in Settings, System. You can still\n\
+         #          check by hand there while it is off.\n\
          \n\
          [release_check]\n\
-         enabled = {}\n\
-         notice_acknowledged = {}\n",
-        cfg.enabled, cfg.notice_acknowledged
+         enabled = {}\n",
+        cfg.enabled
     )
 }
 
@@ -454,47 +447,31 @@ impl ReleaseCheck {
 
     /// Apply a partial change, re-reading the file immediately first.
     ///
-    /// Only the fields asked for move. This file is machine-global and every
+    /// The partial shape is ADR 0132's: this file is machine-global and every
     /// gateway on the machine writes it, unlike the paired-device store beside
-    /// it. Take the whole preference, change one field, hand the struct back,
-    /// and the OTHER field goes back as it stood at the read. That undoes what
-    /// a second gateway wrote in between.
-    ///
-    /// Not a lock, and it does not claim to be one. It shrinks the window to
-    /// the read and rename below, where it used to span an HTTP handler. Both
-    /// writers here are a person clicking something, so that is the whole of
-    /// the problem in practice.
-    pub fn update_config(
-        &self,
-        enabled: Option<bool>,
-        notice_acknowledged: Option<bool>,
-    ) -> std::io::Result<()> {
+    /// it. `None` carries the stored value through instead of erroring, so a
+    /// body that names no field settles rather than failing. It still rewrites
+    /// the file, and it still creates one that was never written.
+    pub fn update_config(&self, enabled: Option<bool>) -> std::io::Result<()> {
         let mut cfg = read_updates_toml(self.config_path.as_deref());
         if let Some(v) = enabled {
             cfg.enabled = v;
         }
-        if let Some(v) = notice_acknowledged {
-            cfg.notice_acknowledged = v;
-        }
         write_updates_toml(self.config_path.as_deref(), &cfg)
     }
 
-    /// May a request go out right now? Every gate, in one place.
+    /// May a request go out right now? Both gates, in one place.
     ///
     /// The deployment gate is absolute: a dev build never polls, whatever is
-    /// asked of it. The two preference gates cover the AUTOMATIC check only,
-    /// and `force` is the Settings button, where the click is itself consent
-    /// for that one request. Being able to ask by hand is what makes turning
-    /// the check off safe, and Settings says so.
+    /// asked of it. The preference covers the AUTOMATIC check only, and `force`
+    /// is the Settings button, where the click is itself the request. Being
+    /// able to ask by hand is what makes turning the check off safe, and
+    /// Settings says so.
     fn may_poll(&self, force: bool) -> bool {
         if !self.supported {
             return false;
         }
-        if force {
-            return true;
-        }
-        let cfg = self.config();
-        cfg.enabled && cfg.notice_acknowledged
+        force || self.config().enabled
     }
 
     /// Has enough time passed since the last attempt?
@@ -596,7 +573,6 @@ impl ReleaseCheck {
         });
         json!({
             "enabled": cfg.enabled,
-            "notice_acknowledged": cfg.notice_acknowledged,
             "supported": self.supported,
             "current_version": self.current_version,
             "checked_at": st.checked_at.map(|t| t.to_rfc3339()),

@@ -1518,3 +1518,15 @@ html[data-theme="dark"] .split-button.open::before {
 .system-attention-badge-slot::before {
     content: '\2060';
 }
+
+/* An inline markdown image opens the image popup, which is where it can be
+   zoomed past the 24rem cap `shared-components.css` puts on it in a transcript.
+   The click is delegated from the one global handler, over the same selector
+   (`store/imagePopup.ts`), so cursor and behaviour cover the same set.
+
+   HOST ONLY, even though the wrapper it sizes is a shared, app-facing class.
+   An app iframe has no popup to open, so a zoom cursor there would advertise
+   something that cannot happen. */
+.markdown-content .image-scroll-wrapper > img {
+    cursor: zoom-in;
+}

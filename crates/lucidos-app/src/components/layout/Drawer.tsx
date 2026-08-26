@@ -3,6 +3,7 @@ import { useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
+import { revealContentPane } from '../../store/actions/pane';
 import { inAppBrowserAvailable } from '../../store/actions/preferences';
 import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
@@ -158,7 +159,7 @@ export function Drawer() {
             class="drawer-item"
             onClick={() => {
               openAppById(p.appId).catch((err) => {
-                showToast(`Failed to open app: ${errorDetail(err)}`, 'error');
+                showToast(`Failed to open app "${p.appName}": ${errorDetail(err)}`, 'error');
               });
               closeDrawer();
             }}
@@ -192,6 +193,11 @@ export function Drawer() {
             onClick={() => {
               if (panelOverlay.value?.type !== 'url-preview') {
                 openUrl('https://www.google.com');
+              } else {
+                // Already the mounted panel, so `openUrl`'s own reveal never
+                // runs. Without this the tap only shuts the drawer, and a
+                // mobile user stays on the thread pane looking at nothing.
+                revealContentPane();
               }
               closeDrawer();
             }}

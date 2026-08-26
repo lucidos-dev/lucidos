@@ -13,7 +13,7 @@
  *
  * An iOS PWA used to lag whenever a long-running CC subprocess
  * streamed ~70 events/min — the wide `threadMap` fire cascaded global
- * re-renders. See `~/.claude/plans/generic-sparking-garden.md`.
+ * re-renders.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { effect } from '@preact/signals';

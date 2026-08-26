@@ -432,29 +432,6 @@
   font-size: var(--font-size-lg);
 }
 
-/* The release check's first-run notice (ADR 0108). Same neutral raised surface
-   as the confirm popovers, since it states a fact and asks a question rather
-   than reporting a failure. */
-.ws-picker-notice {
-  background: rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 0.625rem;
-  padding: 0.75rem 0.875rem;
-  margin-bottom: 1rem;
-}
-
-.ws-picker-notice-text {
-  margin: 0 0 0.75rem;
-  font-size: var(--font-size-md);
-  line-height: 1.5;
-  opacity: 0.9;
-}
-
-.ws-picker-notice-actions {
-  display: flex;
-  gap: 0.5rem;
-}
-
 /* ── Loading skeleton ────────────────────────────────────────────────────────
    The list placeholder renders the real `.ws-picker-row`/`.ws-picker-open`
    markup via the shared self-skeletonizing primitives (Skeleton.tsx → `.sk-bar`
@@ -502,6 +479,10 @@
 :root {
   --ws-picker-dot-size: 0.625rem;
   --ws-picker-row-gap: 0.75rem;
+  /* The name's line-height, named because the dot derives its offset from it:
+     the dot sits on the name's FIRST line, and a copy of this number there
+     would drift the moment the name is retuned. */
+  --ws-picker-name-line-height: 1.25;
   /* The gap between the row and the fault note under it. Its own quantity
      rather than the row gap above, which is a column gap between three cells on
      one line and reads as a chasm when spent vertically. */
@@ -513,22 +494,18 @@
   --ws-picker-fault-color: #ff7b72;
 }
 
-/* The whole row opens the workspace. Fixed three-cell layout (dot · name ·
-   actions): the name grows and ellipsizes, so its length can never reshape the
-   row, and every workspace renders identically regardless of name.
+/* The whole row opens the workspace. It stacks at most two boxes: the row line,
+   and an unhealthy row's fault note under it.
 
-   It WRAPS, for one child only: an unhealthy row's fault note, which is the
-   last child and claims a full line, so it falls under the three cells instead
-   of squeezing them. Nothing else in the row can reach a second line (the name
-   ellipsizes, the actions are fixed-width), so every other row is laid out
-   exactly as before. */
+   Keep it a COLUMN, never one wrapping flex line. A wrapping line collects its
+   items by HYPOTHETICAL size, which is content size before any shrinking. An
+   ellipsis and a `min-width: 0` therefore buy nothing at that stage, and a long
+   workspace name or a long `/slug/` address pushes the play and ⋯ buttons onto a
+   line of their own. Only the note may take a second line, so it gets its own
+   box and the three cells keep theirs. */
 .ws-picker-open {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  /* Column gap only: the one thing that wraps here brings its own top margin,
-     and a row gap this wide under a single line reads as a hole. */
-  gap: 0 var(--ws-picker-row-gap);
+  flex-direction: column;
   padding: 0.625rem 0.625rem 0.625rem 0.75rem;
   border-radius: 0.625rem;
   cursor: pointer;
@@ -540,12 +517,34 @@
   outline: none;
 }
 
+/* The row's three cells (dot · name · actions), on one line and staying there.
+   It never wraps, so the name grows and ellipsizes and every workspace renders
+   identically regardless of how long it is called. */
+.ws-picker-line {
+  display: flex;
+  align-items: center;
+  gap: var(--ws-picker-row-gap);
+}
+
 .ws-picker-dot {
   flex: 0 0 auto;
   width: var(--ws-picker-dot-size);
   height: var(--ws-picker-dot-size);
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.45);
+}
+
+/* In a PICKER row, the dot sits on the name's first line rather than centred on
+   the cell: a wrapped name with the address under it is three lines deep, and a
+   centred dot lands beside line two, reading as a mark on that line.
+   Scoped to the row line, because the in-app workspace switcher wears this same
+   class (WorkspaceSwitcher.tsx) and its rows are a single centred line, which a
+   first-line offset would knock askew. */
+.ws-picker-line .ws-picker-dot {
+  align-self: flex-start;
+  margin-top: calc(
+    (var(--font-size-xl) * var(--ws-picker-name-line-height) - var(--ws-picker-dot-size)) / 2
+  );
 }
 .ws-picker-dot-healthy { background: #56d364; box-shadow: 0 0 0.5rem rgba(86, 211, 100, 0.7); }
 .ws-picker-dot-booting { background: #e3b341; animation: ws-dot-pulse 1.2s ease-in-out infinite; }
@@ -555,17 +554,17 @@
   box-shadow: 0 0 0.5rem color-mix(in srgb, var(--ws-picker-fault-color) 70%, transparent);
 }
 
-/* Why the dot is red, in words, on the row it belongs to. A full-width flex item
-   so it takes its own line under the row (see .ws-picker-open), indented to the
-   name column: the dot's width plus the gap after it, derived rather than
-   guessed, so it starts where the workspace name starts.
+/* Why the dot is red, in words, on the row it belongs to. The second box in the
+   row's column (see .ws-picker-open), so it sits under the line rather than
+   inside it. It indents to the name column, which is the dot's width plus the
+   gap after it: derived rather than guessed, so it starts where the workspace
+   name starts.
 
    It wraps rather than truncating. This is the gateway's own error text and its
    length is not ours to predict, and a reason the user can only half-read is not
    a reason. Quieter than the name above it and in the fault's own coral, so the
    pairing with the dot is obvious without the row shouting. */
 .ws-picker-row-note {
-  flex: 1 0 100%;
   margin: var(--ws-picker-note-gap) 0 0;
   padding-left: calc(var(--ws-picker-dot-size) + var(--ws-picker-row-gap));
   font-size: var(--font-size-sm);
@@ -578,28 +577,41 @@
   50% { opacity: 0.35; }
 }
 
-.ws-picker-name {
+/* Name over address, as one cell. They identify the same workspace, so they
+   stack rather than compete for the row's one horizontal budget: side by side,
+   a long name and a long address each ellipsised the other down to about half,
+   and two rows differing only in their tail read as the same row. */
+.ws-picker-id {
   flex: 1 1 auto;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The name is spelled WHOLE, however long, over as many lines as that needs.
+   It is the only thing telling two workspaces apart, and two names can share
+   every character up to their last word, so an ellipsis renders them the same
+   row. The row's height therefore follows the name, and not the reverse. */
+.ws-picker-name {
   font-weight: 600;
   font-size: var(--font-size-xl);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.25;
+  /* A workspace name can be one long unbroken token, which no soft break point
+     would let wrap. */
+  overflow-wrap: anywhere;
 }
 
 /* The workspace address (`/slug/`), shown only when it would otherwise surprise:
    a rename moved the name off its address, or two rows share a name. Quiet and
-   monospaced so it reads as the path it is, and never competes with the name. */
+   monospaced so it reads as the path it is, and under the name rather than
+   beside it, since in both of those cases it is what tells two rows apart and
+   must be readable whole. */
 .ws-picker-address {
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
+  line-height: 1.4;
   color: rgba(255, 255, 255, 0.6);
+  overflow-wrap: anywhere;
 }
 
 /* Per-workspace unread-notification count. Sits between the (flex-grow) name and

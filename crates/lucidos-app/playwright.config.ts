@@ -5,17 +5,26 @@ import { resolve } from 'path';
 const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`);
 const portsFile = resolve(WORKSPACE, '.lucidos/ports');
 
-function readPort(): number {
+// The workspace records both halves of its own address. The protocol is the
+// half that gets forgotten. `detect_tls` (scripts/lib/workspace.sh) serves
+// plain HTTP on a machine with no `.certs/`. A hardcoded https:// baseURL then
+// fails every spec on its first request, with a TLS record error that reads
+// like a broken server. Later lines win, since detect_tls appends.
+function readAddress(): { port: number; proto: string } {
   if (!existsSync(portsFile)) {
     throw new Error(`Ports file not found: ${portsFile}. Start the workspace first: ./scripts/web-dev.sh -w ${WORKSPACE} -b`);
   }
   const content = readFileSync(portsFile, 'utf-8');
   const match = content.match(/VITE_PORT=(\d+)/);
   if (!match) throw new Error(`VITE_PORT not found in ${portsFile}`);
-  return parseInt(match[1], 10);
+  const protos = [...content.matchAll(/^PROTO=(\w+)$/gm)];
+  return {
+    port: parseInt(match[1], 10),
+    proto: protos.length ? protos[protos.length - 1][1] : 'https',
+  };
 }
 
-const port = readPort();
+const { port, proto } = readAddress();
 
 export default defineConfig({
   testDir: './e2e',
@@ -31,7 +40,7 @@ export default defineConfig({
   workers: 1,
   reporter: 'list',
   use: {
-    baseURL: `https://localhost:${port}`,
+    baseURL: `${proto}://localhost:${port}`,
     ignoreHTTPSErrors: true,
     headless: !process.env.HEADED,
     viewport: { width: 1280, height: 800 },

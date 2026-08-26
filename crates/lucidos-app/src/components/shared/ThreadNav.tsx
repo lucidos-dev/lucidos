@@ -76,12 +76,3 @@ export function ThreadForwardButton({ showTooltip }: Props) {
     />
   );
 }
-
-export function ThreadNav({ showTooltip }: Props) {
-  return (
-    <>
-      <ThreadBackButton showTooltip={showTooltip} />
-      <ThreadForwardButton showTooltip={showTooltip} />
-    </>
-  );
-}

@@ -27,59 +27,55 @@
     font-variant-numeric: tabular-nums;
 }
 
+/* The whole row is the hit target, and ScaleModal.tsx maps the pointer onto it
+   itself. So the thumb below is sized to be read, not to be caught. */
 .scale-modal-slider {
+    position: relative;
     width: 100%;
-    /* Tall element = large touch zone; track is rendered via pseudo-element so
-       it stays visually thin. Without this, the slider's native hit area is
-       just the 4px track plus the small thumb — unusable on iOS. */
     height: 2.75em;
-    -webkit-appearance: none;
-    appearance: none;
-    background: transparent;
     outline: none;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
-    /* Allow horizontal drag; block scroll/pinch while interacting with slider */
-    touch-action: pan-x;
+    -webkit-user-select: none;
+    user-select: none;
+    /* `none`, never `pan-x`: `pan-x` hands the horizontal gesture back to the
+       browser, which can claim a drag halfway through and fire pointercancel. */
+    touch-action: none;
 }
 
-.scale-modal-slider:focus,
-.scale-modal-slider:focus-visible {
-    outline: none;
-    box-shadow: none;
-}
-
-.scale-modal-slider::-webkit-slider-runnable-track {
+.scale-modal-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
     height: 0.25em;
+    margin-top: -0.125em;
     background: var(--border-color);
     border-radius: 0.125em;
 }
 
-.scale-modal-slider::-moz-range-track {
-    height: 0.25em;
-    background: var(--border-color);
-    border-radius: 0.125em;
-    border: none;
-}
-
-.scale-modal-slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 1.5em;
-    height: 1.5em;
+/* Placed from the same inset span the pointer is read against
+   (`scaleSlider.ts`), so the thumb stays under the finger at both ends. */
+.scale-modal-thumb {
+    --scale-slider-thumb: 1.25em;
+    position: absolute;
+    top: 50%;
+    left: calc(
+        var(--scale-slider-thumb) / 2
+        + var(--scale-slider-fraction, 0) * (100% - var(--scale-slider-thumb))
+    );
+    width: var(--scale-slider-thumb);
+    height: var(--scale-slider-thumb);
+    margin: calc(var(--scale-slider-thumb) / -2) 0 0 calc(var(--scale-slider-thumb) / -2);
     border-radius: 50%;
     background: var(--accent);
-    cursor: pointer;
-    /* Center thumb on track: -(thumb-height - track-height) / 2 */
-    margin-top: -0.625em;
 }
 
-.scale-modal-slider::-moz-range-thumb {
-    width: 1.5em;
-    height: 1.5em;
-    border-radius: 50%;
-    background: var(--accent);
-    border: none;
-    cursor: pointer;
+/* The ring lands on the thumb, not on the row: the row is an invisible 2.75em
+   band, so a ring around it reads as a stray box. Same move as .toggle-switch,
+   which rings its visible pill rather than its hidden input. */
+.scale-modal-slider:focus-visible .scale-modal-thumb {
+    box-shadow: var(--focus-ring);
 }
 
 .scale-modal-range {

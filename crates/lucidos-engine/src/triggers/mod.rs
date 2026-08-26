@@ -29,8 +29,14 @@ use std::collections::HashMap;
 ///
 /// Returns configs for triggers where:
 /// 1. The trigger is not paused
-/// 2. At least one of `trigger.on[*].event_type` matches `event_type`, AND
+/// 2. Its id is not `emitting_trigger_id`
+/// 3. At least one of `trigger.on[*].event_type` matches `event_type`, AND
 ///    that entry's condition (if any) evaluates true against `payload`.
+///
+/// `emitting_trigger_id` is the trigger whose fire emitted this event, if any.
+/// It never matches its own event, at any depth. `None` suppresses nobody,
+/// which is the direction to fail in: an extra wake, never a missing one. See
+/// `docs/adr/0137-a-trigger-never-wakes-itself.md`.
 ///
 /// Conditions are scoped to each subscription, so a single trigger can listen
 /// for multiple events with different payload shapes without one filter
@@ -49,10 +55,25 @@ pub fn find_matching_event_triggers(
     configs: &HashMap<String, TriggerConfig>,
     event_type: &str,
     payload: &serde_json::Value,
+    emitting_trigger_id: Option<&str>,
 ) -> Vec<TriggerConfig> {
     configs
         .values()
         .filter(|t| !t.paused && EventSubscription::any_matches(&t.on, event_type, payload))
+        // Second, so the log names only triggers that really would have woken.
+        // The depth cap and the shutdown gate both log their suppressions, and
+        // a silent one here reads as a trigger that never matched.
+        .filter(|t| {
+            let is_own_fire = Some(t.id.as_str()) == emitting_trigger_id;
+            if is_own_fire {
+                crate::log!(
+                    "[Triggers] Not waking '{}' on {}: its own fire emitted it",
+                    t.name,
+                    event_type
+                );
+            }
+            !is_own_fire
+        })
         .cloned()
         .collect()
 }
@@ -93,6 +114,17 @@ mod tests {
         }
     }
 
+    /// The matcher for an event no trigger emitted, which is what an ordinary
+    /// user turn produces. The self-exclusion tests below name an emitter and
+    /// so call the real function.
+    fn matching(
+        configs: &HashMap<String, TriggerConfig>,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> Vec<TriggerConfig> {
+        find_matching_event_triggers(configs, event_type, payload, None)
+    }
+
     /// I8: the trigger dispatch path must return the same verdict as the shared
     /// predicate for every (subscription, event) pair, so the event-wait
     /// dispatcher and this one cannot disagree. The table is owned by
@@ -116,7 +148,7 @@ mod tests {
                 ),
             );
             let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
-            let hit = !find_matching_event_triggers(&configs, event_type, &payload).is_empty();
+            let hit = !matching(&configs, event_type, &payload).is_empty();
             assert_eq!(
                 hit, *expected,
                 "trigger dispatch disagrees with EventSubscription::matches for \
@@ -164,14 +196,14 @@ mod tests {
             ),
         );
 
-        let hit = find_matching_event_triggers(
+        let hit = matching(
             &configs,
             "CodingAgentIdled",
             &matchable_thread_payload(&idle, watched),
         );
         assert_eq!(hit.len(), 1, "the watched thread's idle must fire it");
 
-        let miss = find_matching_event_triggers(
+        let miss = matching(
             &configs,
             "CodingAgentIdled",
             &matchable_thread_payload(&idle, other),
@@ -190,7 +222,7 @@ mod tests {
             make_event_trigger("t1", vec![sub("SlideTextEdited", None)]),
         );
 
-        let matches = find_matching_event_triggers(&configs, "SlideTextEdited", &json!({}));
+        let matches = matching(&configs, "SlideTextEdited", &json!({}));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "t1");
     }
@@ -203,7 +235,7 @@ mod tests {
             make_event_trigger("t1", vec![sub("SlideTextEdited", None)]),
         );
 
-        let matches = find_matching_event_triggers(&configs, "OtherEvent", &json!({}));
+        let matches = matching(&configs, "OtherEvent", &json!({}));
         assert!(matches.is_empty());
     }
 
@@ -214,7 +246,7 @@ mod tests {
         trigger.paused = true;
         configs.insert("t1".into(), trigger);
 
-        let matches = find_matching_event_triggers(&configs, "SlideTextEdited", &json!({}));
+        let matches = matching(&configs, "SlideTextEdited", &json!({}));
         assert!(matches.is_empty());
     }
 
@@ -232,12 +264,10 @@ mod tests {
             ),
         );
 
-        let matches =
-            find_matching_event_triggers(&configs, "SleepImported", &json!({"sleep_score": 55}));
+        let matches = matching(&configs, "SleepImported", &json!({"sleep_score": 55}));
         assert_eq!(matches.len(), 1);
 
-        let matches =
-            find_matching_event_triggers(&configs, "SleepImported", &json!({"sleep_score": 85}));
+        let matches = matching(&configs, "SleepImported", &json!({"sleep_score": 85}));
         assert!(matches.is_empty());
     }
 
@@ -257,7 +287,7 @@ mod tests {
             make_event_trigger("t3", vec![sub("OtherEvent", None)]),
         );
 
-        let matches = find_matching_event_triggers(&configs, "DataImported", &json!({}));
+        let matches = matching(&configs, "DataImported", &json!({}));
         assert_eq!(matches.len(), 2);
     }
 
@@ -287,7 +317,7 @@ mod tests {
         };
         configs.insert("cron-only".into(), cron_trigger);
 
-        let matches = find_matching_event_triggers(&configs, "SlideTextEdited", &json!({}));
+        let matches = matching(&configs, "SlideTextEdited", &json!({}));
         assert!(matches.is_empty());
     }
 
@@ -302,15 +332,9 @@ mod tests {
             ),
         );
 
-        assert_eq!(
-            find_matching_event_triggers(&configs, "OuraSleepImported", &json!({})).len(),
-            1
-        );
-        assert_eq!(
-            find_matching_event_triggers(&configs, "EmailReceived", &json!({})).len(),
-            1
-        );
-        assert!(find_matching_event_triggers(&configs, "OtherEvent", &json!({})).is_empty());
+        assert_eq!(matching(&configs, "OuraSleepImported", &json!({})).len(), 1);
+        assert_eq!(matching(&configs, "EmailReceived", &json!({})).len(), 1);
+        assert!(matching(&configs, "OtherEvent", &json!({})).is_empty());
     }
 
     #[test]
@@ -334,23 +358,77 @@ mod tests {
         );
 
         assert_eq!(
-            find_matching_event_triggers(
-                &configs,
-                "OuraSleepImported",
-                &json!({"sleep_score": 55}),
-            )
-            .len(),
+            matching(&configs, "OuraSleepImported", &json!({"sleep_score": 55}),).len(),
             1
         );
-        assert!(find_matching_event_triggers(
-            &configs,
-            "OuraSleepImported",
-            &json!({"sleep_score": 90}),
-        )
-        .is_empty());
+        assert!(matching(&configs, "OuraSleepImported", &json!({"sleep_score": 90}),).is_empty());
         assert_eq!(
-            find_matching_event_triggers(&configs, "EmailReceived", &json!({"from": "a@b"})).len(),
+            matching(&configs, "EmailReceived", &json!({"from": "a@b"})).len(),
             1
         );
+    }
+
+    /// Two triggers, both subscribed to `TriggerCompleted`, which is what an
+    /// idle detector's broad subscription looks like.
+    fn two_idle_detectors() -> HashMap<String, TriggerConfig> {
+        let mut configs = HashMap::new();
+        for id in ["idle", "sibling"] {
+            configs.insert(
+                id.into(),
+                make_event_trigger(id, vec![sub("TriggerCompleted", None)]),
+            );
+        }
+        configs
+    }
+
+    /// The invariant: a trigger is never woken by an event its own fire
+    /// emitted. Broad-subscribe plus a cheap internal gate is the right shape
+    /// for an idle detector. `TriggerCompleted` is one of the terminator events
+    /// it has to watch, and being a trigger is what makes it emit that event.
+    /// So the engine holds the rule, not the author.
+    #[test]
+    fn a_trigger_is_not_woken_by_its_own_completion() {
+        let configs = two_idle_detectors();
+        let matches =
+            find_matching_event_triggers(&configs, "TriggerCompleted", &json!({}), Some("idle"));
+        let ids: Vec<&str> = matches.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["sibling"], "only the other trigger wakes");
+    }
+
+    /// The other half, and the failure that would be worse than the noise: an
+    /// idle detector that stops seeing other triggers finish never registers
+    /// the workspace as idle.
+    #[test]
+    fn a_trigger_is_still_woken_by_another_triggers_completion() {
+        let configs = two_idle_detectors();
+        let matches =
+            find_matching_event_triggers(&configs, "TriggerCompleted", &json!({}), Some("sibling"));
+        let ids: Vec<&str> = matches.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["idle"],
+            "the sibling's fire still wakes the idle detector"
+        );
+    }
+
+    /// Fail-open. An unstamped frame suppresses nobody, which covers an
+    /// ordinary user turn, an HTTP handler, and work a fire handed off to a
+    /// fresh task. The last one is deliberate: a trigger waiting on a
+    /// coding-agent session it started must still fire.
+    #[test]
+    fn an_event_no_trigger_emitted_wakes_every_subscriber() {
+        let configs = two_idle_detectors();
+        let matches = find_matching_event_triggers(&configs, "TriggerCompleted", &json!({}), None);
+        assert_eq!(matches.len(), 2, "no marker, no suppression");
+    }
+
+    /// An id that matches no trigger drops nobody either. A deleted trigger's
+    /// last event is the concrete case.
+    #[test]
+    fn an_unknown_emitter_suppresses_nobody() {
+        let configs = two_idle_detectors();
+        let matches =
+            find_matching_event_triggers(&configs, "TriggerCompleted", &json!({}), Some("gone"));
+        assert_eq!(matches.len(), 2);
     }
 }

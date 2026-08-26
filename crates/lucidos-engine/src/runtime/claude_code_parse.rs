@@ -46,6 +46,71 @@ impl CcStreamState {
     }
 }
 
+/// Render a CC tool result's `content` field as the string the step shows.
+///
+/// CC sends `content` either as a plain string or as an ARRAY of blocks, and
+/// reading it with `as_str()` alone dropped every array to `""`. That blanked
+/// 1,530 steps in 30 days on one workspace: subagent reports (`Agent`),
+/// `ToolSearch` results, and image reads. Measurements and the four observed
+/// shapes are in
+/// `docs/plans/2026-08-26-cc-tool-results-and-showing-the-user-an-image.md`.
+///
+/// Both call sites below resolve `content` through here, because the bug
+/// existed in each of them and was fixed in neither.
+fn tool_result_content(content: Option<&serde_json::Value>) -> String {
+    match content {
+        // Absent is the one shape that IS empty. Everything present renders.
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .map(describe_content_block)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // A lone block sent unwrapped. It must take the SAME path a wrapped
+        // one does, or an unwrapped image would spill base64 the array form
+        // is careful to label.
+        Some(obj) if obj.get("type").is_some() => describe_content_block(obj),
+        // A shape CC has never sent, carrying no block type to dispatch on.
+        // Its JSON beats dropping it, and the 200-char cap in
+        // `run_session/run.rs` bounds what that can cost.
+        Some(other) => other.to_string(),
+    }
+}
+
+/// One block of an array-shaped tool result, as a short line of text.
+///
+/// Only `text` yields its content. An image yields a label instead: one
+/// full-page screenshot is hundreds of KB of base64, which would ride the event
+/// payload and every SSE frame carrying it. Any other type yields a label too,
+/// naming itself, so the next block type CC invents is visible rather than
+/// silent. That default is the whole point: silence is the defect.
+///
+/// A block reduces to a LABEL, never to nothing. The one way to get the empty
+/// string back is a `text` block whose text really is empty, which is content
+/// rather than a gap.
+fn describe_content_block(block: &serde_json::Value) -> String {
+    // A bare string element carries its own text and has no `type` to read.
+    if let Some(s) = block.as_str() {
+        return s.to_string();
+    }
+    let kind = block
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match (kind, block.get("text").and_then(|v| v.as_str())) {
+        // `text` is the one block readable as-is, and only when it has one.
+        // Missing its text takes the label path below instead.
+        ("text", Some(t)) => t.to_string(),
+        // A `tool_reference` names its subject, and that name is the only
+        // part a reader can act on.
+        _ => match block.get("tool_name").and_then(|v| v.as_str()) {
+            Some(name) => format!("[{kind}: {name}]"),
+            None => format!("[{kind}]"),
+        },
+    }
+}
+
 /// Parse a single JSON line from Claude Code's stream output.
 /// Returns all recognized events from the line. An assistant message with
 /// multiple content blocks (text + tool_use) produces multiple events.
@@ -241,11 +306,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             events
         }
         "tool_result" => {
-            let content = val
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
+            let content = tool_result_content(val.get("content"));
             let is_error = val
                 .get("is_error")
                 .and_then(|v| v.as_bool())
@@ -272,11 +333,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             {
                 for block in content {
                     if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                        let output = block
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let output = tool_result_content(block.get("content"));
                         let is_error = block
                             .get("is_error")
                             .and_then(|v| v.as_bool())

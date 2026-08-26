@@ -14,6 +14,14 @@ interface Props {
   layout: 'desktop' | 'mobile';
 }
 
+/** The box the native preview must fill, in the shape both panel commands take
+ *  (`PreviewRect` in panel_preview.rs). One place, so create and resize cannot measure
+ *  the container differently. */
+function panelRect(el: HTMLElement) {
+  const rect = el.getBoundingClientRect();
+  return { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+}
+
 export function UrlPreviewInline({ url, layout }: Props) {
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const containerRef = useRef<HTMLDivElement>(null);
@@ -31,14 +39,10 @@ export function UrlPreviewInline({ url, layout }: Props) {
   const createWebview = useCallback(async (targetUrl: string) => {
     const el = containerRef.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
     try {
       await invoke('create_panel_webview', {
         url: targetUrl,
-        x: rect.left,
-        y: rect.top,
-        width: rect.width,
-        height: rect.height,
+        rect: panelRect(el),
         viewportHeight: window.innerHeight,
       });
       webviewCreated.current = true;
@@ -51,13 +55,9 @@ export function UrlPreviewInline({ url, layout }: Props) {
   const updateBounds = useCallback(async () => {
     const el = containerRef.current;
     if (!el || !webviewCreated.current) return;
-    const rect = el.getBoundingClientRect();
     try {
       await invoke('set_panel_webview_bounds', {
-        x: rect.left,
-        y: rect.top,
-        width: rect.width,
-        height: rect.height,
+        rect: panelRect(el),
         viewportHeight: window.innerHeight,
       });
     } catch { /* webview may have been closed */ }

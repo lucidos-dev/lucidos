@@ -69,6 +69,10 @@ import type { EmbeddingModelStatus } from '../../api/types';
  *  tap can dismiss the toast it just acted on. */
 const BACKUP_FAILED_TOAST_KEY = 'backup-failed';
 
+/** Keyed for the same reason: the engine re-announces its refused `apis.json`
+ *  entries on every boot, and a reconnecting client must not stack them. */
+const PROXY_CONFIG_REJECTED_TOAST_KEY = 'proxy-config-rejected';
+
 /** The nil UUID the engine stamps on a thread-less `NavigationRequested`. The
  *  SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs) emits it, being
  *  user-initiated and bound to no thread. */
@@ -1108,6 +1112,34 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
         },
       });
       backupStatusVersion.value++;
+      break;
+    }
+
+    case 'ProxyConfigRejected': {
+      // The engine booted with entries in `apis.json` it will not serve, so
+      // those proxies 502 when an app or a thread reaches for one.
+      //
+      // This toast is the fast half, not the guaranteed one. The engine emits
+      // it before binding its HTTP port. An ordinary boot therefore reaches no
+      // subscriber, and only the notification beside it lands. What this
+      // catches is the reconnecting page: a restart the user is watching.
+      const rejected = Array.isArray(data.rejected) ? data.rejected : [];
+      if (rejected.length === 0) break;
+      const detail = rejected
+        .map((r) => {
+          const entry = r as { provider?: string | null; reason?: string };
+          // A null provider is the file itself: unreadable, so no entry to
+          // name. Same label the engine logs, so the two read as one refusal.
+          return `${entry.provider ?? 'data/config/apis.json'}: ${entry.reason ?? 'unusable'}`;
+        })
+        .join('; ');
+      showToast(`Proxy config problem, ${detail}`, 'error', {
+        key: PROXY_CONFIG_REJECTED_TOAST_KEY,
+        // The only moment this frame can arrive is just after a restart, which
+        // is exactly when `workspaceUnavailable()` suppresses a toast. Without
+        // the opt-in the one case it serves is the one case it is dropped in.
+        showWhileUnavailable: true,
+      });
       break;
     }
 

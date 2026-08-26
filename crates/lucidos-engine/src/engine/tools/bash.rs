@@ -286,7 +286,7 @@ impl LucidosEngine {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
+        let env_vars = self.build_tool_env_vars(thread_id).await;
 
         // `pipefail` shell — see `core::shell`. A `cmd | tee log` would
         // otherwise report tee's 0 and hide the real failure.
@@ -402,7 +402,7 @@ impl LucidosEngine {
             .unwrap_or(BG_DEFAULT_TIMEOUT_SECS)
             .min(BG_MAX_TIMEOUT_SECS);
 
-        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
+        let env_vars = self.build_tool_env_vars(thread_id).await;
         let safe_command = redact_postgres_secrets(command);
         log!(
             "[BashBg] Spawning: {}",

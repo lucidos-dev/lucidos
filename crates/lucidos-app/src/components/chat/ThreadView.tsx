@@ -14,8 +14,8 @@ import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, deepLinkRenderAll } from './scrollState';
-import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, deepLinkRenderAll } from './scrollState';
+import { INITIAL_WINDOW, MAX_FILL_EXPANSIONS, canSeedRenderWindow, computeRenderFromIndex, hasMoreAbove, expandRenderCount, exchangeRenderCost, seedRenderCount, windowNeedsFill, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
 import { useScrollMemory, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
@@ -47,6 +47,48 @@ let lastRevealedThread: string | null = null;
 // ThreadView. `Infinity` = render all (set by a deep-link). Session-scoped; one
 // small int per visited thread.
 const renderCountByThread = new Map<string, number>();
+
+/** Fill rounds spent per thread, beside the window they grew. Module-scoped for
+ *  the same reason that Map is: the window survives a switch-away-and-back, so a
+ *  per-mount counter would hand every revisit a fresh `MAX_FILL_EXPANSIONS` and
+ *  compound the cost the cap exists to bound. */
+const fillRoundsByThread = new Map<string, number>();
+
+/** Scroll metrics captured just before a window grow, so the anchor effect can
+ *  restore `scrollTop` by the height added. */
+type PendingExpand = { prevScrollHeight: number; prevScrollTop: number } | null;
+
+/** This thread's window right now: the stored count, or the seed until one is
+ *  stored. Three callers read it and must agree: the render, the scroll-up
+ *  expansion and the fill. */
+function currentRenderCount(threadId: string, costs: readonly number[]): number {
+    return renderCountByThread.get(threadId) ?? seedRenderCount(costs);
+}
+
+/** Grow this thread's window by one budgeted step, holding the reader on the
+ *  content they were looking at. Two callers, differing only in what asks: the
+ *  scroll-up expansion and the fill.
+ *
+ *  Prepending older exchanges grows the list upward, so it captures the metrics
+ *  the anchor effect needs. That effect is keyed on `renderFromIndex`, which is
+ *  why the anchor is armed only when the count ACTUALLY grows. A no-op grow
+ *  would leave the ref set, and the re-entrancy guard both callers share would
+ *  then wedge every later expansion. Reports whether it grew. */
+function growRenderWindow(
+    el: HTMLElement,
+    threadId: string,
+    costs: readonly number[],
+    current: number,
+    pending: { current: PendingExpand },
+    bump: () => void,
+): boolean {
+    const next = expandRenderCount(costs, current);
+    if (next === current) return false;
+    pending.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
+    renderCountByThread.set(threadId, next);
+    bump();
+    return true;
+}
 
 /** Escalating retry delays for the empty-thread safety retry. */
 const EMPTY_THREAD_RETRY_DELAYS = [500, 2000, 5000];
@@ -267,7 +309,7 @@ export function ThreadView() {
     // no longer fire `threadMap`, so `eventCount` (read from `threadMap`) can't
     // be the only stream-aware dep. Reading the bump here both subscribes
     // ThreadView to this thread's stream activity AND invalidates the memo on
-    // every event arrival. See `~/.claude/plans/generic-sparking-garden.md`.
+    // every event arrival.
     const eventsBump = threadId ? getThreadEventsBump(threadId) : 0;
     // Time the grouping fold (the suspected O(n) cost behind both "clicking into
     // a thread" and "answering a question" lag — both re-run computeExchanges).
@@ -388,13 +430,18 @@ export function ThreadView() {
     // render count lives in a module Map (`renderCountByThread`) so it SURVIVES a
     // switch-away-and-back — otherwise returning to a thread you'd scrolled up in
     // would re-window to the tail and useScrollMemory couldn't restore your spot.
-    // A new thread starts at INITIAL_WINDOW (so its first render is already
-    // windowed — never a one-off full render). A notification deep-link forces the
-    // full list (so a windowed-out target can render); the persist effect below
-    // keeps it full afterward so clearing the claim doesn't snap the user back.
+    // A new thread starts at the SEEDED window: the newest exchanges fitting the
+    // step budget, capped at INITIAL_WINDOW. Its first render is already windowed,
+    // never a one-off full render. A notification deep-link forces the full list
+    // instead, so a windowed-out target can render. The persist effect below then
+    // keeps it full, so clearing the claim doesn't snap the user back.
     // See threadWindow.ts + scrollState.deepLinkRenderAll.
     const [, bumpWin] = useState(0);
-    let renderCount = threadId ? (renderCountByThread.get(threadId) ?? INITIAL_WINDOW) : INITIAL_WINDOW;
+    // Re-render after a window write. `bumpWin` is stable, so an effect holding
+    // an older copy of this still reaches the current component.
+    const bumpWindow = () => bumpWin(n => n + 1);
+    const exchangeCosts = useMemo(() => exchanges.map(exchangeRenderCost), [exchanges]);
+    let renderCount = threadId ? currentRenderCount(threadId, exchangeCosts) : INITIAL_WINDOW;
     if (deepLinkRenderAll.value) renderCount = Infinity;
     const renderFromIndex = computeRenderFromIndex(exchanges.length, renderCount);
 
@@ -407,14 +454,34 @@ export function ThreadView() {
         }
     }, [threadId, deepLinkRenderAll.value]);
 
-    // Latest exchange count for the scroll handler (avoids re-attaching the
-    // listener on every streaming append).
-    const exchangesLenRef = useRef(0);
-    exchangesLenRef.current = exchanges.length;
-    // Scroll metrics captured just before a window grow, so the layout effect
-    // below can restore scrollTop and keep the viewport anchored (prepending
-    // older exchanges grows the content upward).
-    const pendingExpandRef = useRef<{ prevScrollHeight: number; prevScrollTop: number } | null>(null);
+    // Fix the window once the event load settles, so later renders read a stored
+    // value instead of re-deriving one. The seed is a function of the exchange
+    // costs, and a live turn's cost grows with every streamed step. A derived
+    // window would therefore push older turns off the top while the reader
+    // watches. Write-once: the entry only ever grows afterwards, from the
+    // scroll-up expansion, the chevron's render-all, or the effect above.
+    //
+    // `canSeedRenderWindow` is what keeps that write-once off a fragment. A
+    // LAYOUT effect, so this stores the seed before the browser paints the
+    // render that computed it. A plain effect runs after paint, leaving a gap
+    // where a streamed step could re-derive a different window first.
+    const canSeedWindow = canSeedRenderWindow({
+        hasExchanges: exchanges.length > 0,
+        eventsLoaded,
+        eventsLoadFailed,
+    });
+    useLayoutEffect(() => {
+        if (threadId && canSeedWindow && !renderCountByThread.has(threadId)) {
+            renderCountByThread.set(threadId, seedRenderCount(exchangeCosts));
+        }
+    }, [threadId, canSeedWindow]);
+
+    // Latest exchange costs for the scroll handler and the up-chevron, so neither
+    // re-attaches on every streaming append. Their length is the exchange count.
+    const exchangeCostsRef = useRef<number[]>([]);
+    exchangeCostsRef.current = exchangeCosts;
+    // Armed by `growRenderWindow`, consumed by the anchor effect below.
+    const pendingExpandRef = useRef<PendingExpand>(null);
     // Set by the up-chevron when it renders the full thread before scrolling to
     // the genuine top — consumed by the layout effect that performs the jump once
     // the expanded list commits. See onScrollUp below.
@@ -781,20 +848,10 @@ export function ThreadView() {
             // an expansion mid-glide would re-anchor the viewport and stall it.
             if (isNavigationScroll(el)) return;
             if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
-            const total = exchangesLenRef.current;
-            const current = renderCountByThread.get(threadId) ?? INITIAL_WINDOW;
-            if (!hasMoreAbove(total, current)) return;
-            const next = expandRenderCount(total, current);
-            // Only arm the anchor when the count actually grows — guarantees
-            // renderFromIndex changes, so the keyed layout effect runs and clears
-            // pendingExpandRef. Without this, a no-op expansion would leave the
-            // ref set and the re-entrancy guard above would wedge all future
-            // expansion. (next === current can't happen given hasMoreAbove today,
-            // but make the invariant explicit rather than implicit.)
-            if (next === current) return;
-            pendingExpandRef.current = { prevScrollHeight: el.scrollHeight, prevScrollTop: el.scrollTop };
-            renderCountByThread.set(threadId, next);
-            bumpWin(n => n + 1);
+            const costs = exchangeCostsRef.current;
+            const current = currentRenderCount(threadId, costs);
+            if (!hasMoreAbove(costs.length, current)) return;
+            growRenderWindow(el, threadId, costs, current, pendingExpandRef, bumpWindow);
         };
         el.addEventListener('scroll', onScroll, { passive: true });
         return () => el.removeEventListener('scroll', onScroll);
@@ -820,6 +877,65 @@ export function ThreadView() {
         pendingScrollTopRef.current = false;
         scrollToTop();
     }, [renderFromIndex]);
+
+    // The window must leave the reader able to REACH what it left out, and one
+    // shorter than the pane does not. The scroll-up expansion above is the only
+    // way older exchanges enter it, and only a scroll event fires that. So the
+    // transcript freezes on the seed, with the up chevron as the sole way out.
+    // That is the reported "an old thread opens on one card and will not
+    // scroll". `windowNeedsFill` carries why the seed cannot prevent it.
+    //
+    // The grow goes through the same anchored primitive the scroll-up takes, so
+    // a fill lands the reader on the content they were already looking at. On
+    // the open that content is the tail, so the thread opens at its end with a
+    // full pane. A later fill, when a pane resize leaves the transcript short
+    // again, holds them still instead of dropping them into an older turn.
+    const fillWindow = () => {
+        const el = areaRef.current;
+        if (!el || !threadId || !canSeedWindow) return;
+        // The re-entrancy guard the scroll-up shares: one grow is in flight
+        // until the anchor effect lands it, and its metrics describe the DOM as
+        // it stands now.
+        if (pendingExpandRef.current) return;
+        // Cheapest question first. It is pure arithmetic, and it rejects every
+        // thread already rendered whole, which is most of them. The reads below
+        // force a layout, so they must not run on a thread that cannot fill.
+        const costs = exchangeCostsRef.current;
+        const current = currentRenderCount(threadId, costs);
+        if (!hasMoreAbove(costs.length, current)) return;
+        const rounds = fillRoundsByThread.get(threadId) ?? 0;
+        if (rounds >= MAX_FILL_EXPANSIONS) return;
+        // A transcript laid out at 0x0 answers every geometric question wrongly.
+        // A collapsed desktop split gives one, so this is an ordinary state
+        // rather than a corner. The observer below is what brings the
+        // measurement back once such a pane is revealed.
+        if (!isElementVisible(el)) return;
+        if (!windowNeedsFill(el, costs.length, current)) return;
+        // Counted only when it actually grew, so a no-op cannot spend a round.
+        if (growRenderWindow(el, threadId, costs, current, pendingExpandRef, bumpWindow)) {
+            fillRoundsByThread.set(threadId, rounds + 1);
+        }
+    };
+    // Held in a ref so the observer effect below can stay keyed on the thread
+    // alone while still calling THIS render's closure.
+    const fillWindowRef = useRef(fillWindow);
+    fillWindowRef.current = fillWindow;
+
+    // Measure after every commit that can change the answer. A grow changes
+    // `renderFromIndex`, so the rounds run off these deps.
+    useLayoutEffect(() => { fillWindowRef.current(); },
+        [threadId, canSeedWindow, renderFromIndex, exchanges.length]);
+
+    // And measure again when the pane's own BOX changes, which is the one
+    // trigger the deps above cannot see. Keyed on the thread alone, so a
+    // streaming append does not churn the observer.
+    useLayoutEffect(() => {
+        const el = areaRef.current;
+        if (!el || !threadId) return;
+        const observer = new ResizeObserver(() => fillWindowRef.current());
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, [threadId]);
 
     if (!threadId) return null;
 
@@ -927,14 +1043,15 @@ export function ThreadView() {
                     showUp={isNotAtTop || hasMoreAbove(exchanges.length, renderCount)}
                     showDown={isUp}
                     onScrollUp={() => {
-                        const current = threadId ? (renderCountByThread.get(threadId) ?? INITIAL_WINDOW) : INITIAL_WINDOW;
                         // Windowed thread with older exchanges still above the
                         // rendered tail: render the FULL thread first, then jump to
                         // the true top once it commits (see the layout effect above).
                         // Without render-all the top of the rendered tail isn't the
                         // top of the thread, and the scroll-up window-expand re-anchors
                         // the viewport partway (the "needed N clicks" bug).
-                        if (threadId && scrollToTopNeedsRenderAll(exchangesLenRef.current, current)) {
+                        // `renderCount` is this render's effective window, so a
+                        // deep-link render-all already answers false here.
+                        if (threadId && scrollToTopNeedsRenderAll(exchanges.length, renderCount)) {
                             pendingScrollTopRef.current = true;
                             renderCountByThread.set(threadId, Infinity);
                             bumpWin(n => n + 1);

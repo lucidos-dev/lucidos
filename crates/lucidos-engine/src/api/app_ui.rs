@@ -1,3 +1,30 @@
+/// One `<script>` block: the opening tag, then its body up to `</script>`.
+/// Both HTML rewrites below split on this, so it is defined once.
+static SCRIPT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?si)(<script[\s][^>]*>|<script>)(.*?</script>)")
+        .expect("app html script-block regex must compile")
+});
+
+/// Apply `rewrite` to every part of `html` outside a `<script>` body: the markup
+/// between script blocks, and each opening `<script …>` tag's own attributes.
+///
+/// A script body passes through verbatim, so an inline-JS string literal such as
+/// `src="${var}"` is never rewritten. The opening tag still is, so an external
+/// `<script src="app.js">` resolves.
+fn rewrite_outside_script_bodies(html: &str, rewrite: impl Fn(&str) -> String) -> String {
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut last_end = 0;
+    for caps in SCRIPT_RE.captures_iter(html) {
+        let full = caps.get(0).expect("capture group 0 always matches");
+        out.push_str(&rewrite(&html[last_end..full.start()]));
+        out.push_str(&rewrite(&caps[1]));
+        out.push_str(&caps[2]);
+        last_end = full.end();
+    }
+    out.push_str(&rewrite(&html[last_end..]));
+    out
+}
+
 /// Append `?thread_id=<id>` to every relative `src` / `href` in the served
 /// HTML when previewing an app from an *app coding-agent thread*'s worktree.
 /// Without this, sub-resources (CSS, JS, images, fonts) resolve via the
@@ -28,10 +55,6 @@ pub(super) fn rescope_app_html(html: &str, prefix: &str) -> String {
     // root-absolute path (which keeps its own leading `/`).
     let slug = prefix.trim_end_matches('/');
 
-    static SCRIPT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?si)(<script[\s][^>]*>|<script>)(.*?</script>)")
-            .expect("app rescope script regex must compile")
-    });
     static ATTR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r#"(?i)((?:src|href)\s*=\s*")(/(?:api/v1/|app/|data/|assets/|icons/|splash/|favicon|manifest\.json|sw\.js)[^"]*)"#,
@@ -39,58 +62,27 @@ pub(super) fn rescope_app_html(html: &str, prefix: &str) -> String {
         .expect("app rescope attr regex must compile")
     });
 
-    let rescope_attrs = |fragment: &str| -> String {
+    rewrite_outside_script_bodies(html, |fragment| {
         ATTR_RE
             .replace_all(fragment, |caps: &regex::Captures| {
                 format!("{}{}{}", &caps[1], slug, &caps[2])
             })
             .into_owned()
-    };
-
-    let mut out = String::with_capacity(html.len() + 16);
-    let mut last_end = 0;
-    for caps in SCRIPT_RE.captures_iter(html) {
-        let full = caps.get(0).unwrap();
-        out.push_str(&rescope_attrs(&html[last_end..full.start()]));
-        out.push_str(&rescope_attrs(&caps[1])); // opening <script ...> attrs
-        out.push_str(&caps[2]); // body + </script> left verbatim
-        last_end = full.end();
-    }
-    out.push_str(&rescope_attrs(&html[last_end..]));
-    out
+    })
 }
 
-/// Append a query string (e.g. `?thread_id=abc123`) to relative src/href attributes in HTML.
-/// Only rewrites in markup — skips `<script>` block *bodies* where template literals like
-/// `src="${var}"` would be incorrectly rewritten. The opening `<script>` tag's own attributes
-/// (e.g. `<script src="script.js">`) ARE rewritten so external scripts resolve correctly.
+/// Append a query string (e.g. `?thread_id=abc123`) to relative src/href
+/// attributes in HTML. Script bodies are skipped; see
+/// [`rewrite_outside_script_bodies`].
 fn append_query_to_relative_paths(html: &str, suffix: &str) -> String {
-    static SCRIPT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?si)(<script[\s][^>]*>|<script>)(.*?</script>)").unwrap()
-    });
     static ATTR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"((?:src|href)\s*=\s*")([^"/][^"]*)"#).unwrap()
+        regex::Regex::new(r#"((?:src|href)\s*=\s*")([^"/][^"]*)"#)
+            .expect("app thread-id attr regex must compile")
     });
 
-    let mut result = String::with_capacity(html.len());
-    let mut last_end = 0;
-
-    for caps in SCRIPT_RE.captures_iter(html) {
-        let full = caps.get(0).unwrap();
-        let opening_tag = &caps[1];
-        let body_and_close = &caps[2];
-
-        let before = &html[last_end..full.start()];
-        result.push_str(&append_suffix_to_attrs(before, suffix, &ATTR_RE));
-        result.push_str(&append_suffix_to_attrs(opening_tag, suffix, &ATTR_RE));
-        result.push_str(body_and_close);
-        last_end = full.end();
-    }
-
-    let after = &html[last_end..];
-    result.push_str(&append_suffix_to_attrs(after, suffix, &ATTR_RE));
-
-    result
+    rewrite_outside_script_bodies(html, |fragment| {
+        append_suffix_to_attrs(fragment, suffix, &ATTR_RE)
+    })
 }
 
 /// Append a query suffix to relative src/href attributes in an HTML fragment.

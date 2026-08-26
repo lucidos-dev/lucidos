@@ -17,6 +17,15 @@ import { sniffImageBytes, imageRejectionMessage } from '../../utils/imageBytes';
 
 const PLUGIN_EXT = '.lucidos-plugin';
 
+/** Why an upload failed, for the toast and the pending-upload row.
+ *  Deliberately not `utils/errorDetail`: that one reads `Error.message`, and an
+ *  `ApiError` carries the engine's sentence in `reason` instead. */
+function uploadFailureReason(err: unknown): string {
+  if (err instanceof ApiError) return err.reason;
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
 export async function attachImageToActiveDraft(source: File): Promise<void> {
   const threadId = ensureFocusedComposeThread();
 
@@ -101,12 +110,7 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
       detachPendingUpload(threadId, localId);
     });
   } catch (err) {
-    const reason =
-      err instanceof ApiError
-        ? err.reason
-        : err instanceof Error
-        ? err.message
-        : String(err);
+    const reason = uploadFailureReason(err);
     patchPendingUpload(threadId, localId, { status: 'failed', error: reason });
     showToast(`Image upload failed: ${reason}`, 'error');
   }
@@ -142,13 +146,7 @@ export async function uploadAndInstallPluginArchive(file: File): Promise<void> {
   try {
     ({ path } = await uploadPluginArchive(file));
   } catch (err) {
-    const reason =
-      err instanceof ApiError
-        ? err.reason
-        : err instanceof Error
-        ? err.message
-        : String(err);
-    showToast(`Plugin upload failed: ${reason}`, 'error');
+    showToast(`Plugin upload failed: ${uploadFailureReason(err)}`, 'error');
     return;
   }
   await sendMessage(`Install the plugin at ${path}`);

@@ -23,6 +23,12 @@
 # launchd (that's the GUI client), so running the inner binary directly with
 # --service pollutes nothing.
 #
+# NOT runnable from a coding-agent worktree. The bundled engine lands in the
+# worktree's own target/, and the gateway refuses an engine binary inside one
+# (ADR 0021), by design and with no opt-out. The build succeeds and the gateway
+# then declines to boot, so run this from the real checkout or let the nightly
+# do it. Roughly 25 wasted minutes if you find out the hard way.
+#
 # macOS-only + heavy: building the .app is a full release engine+gateway build +
 # a relocatable PostgreSQL download + a frontend build + `cargo tauri build`. So
 # this is a STANDALONE script, NOT part of the default ./scripts/e2e.sh run; the
@@ -257,6 +263,21 @@ log "PASS: workspace app shell served with slug base href"
 [ -f "$APP_DATA/pgdata/PG_VERSION" ] \
     || fail "embedded Postgres cluster not provisioned (no pgdata/PG_VERSION)"
 log "PASS: embedded Postgres cluster on disk"
+
+# ── 7b. The workspace publishes .lucidos/ports, so it is addressable by name ──
+# The only thing `lucidos spawn-thread --to <ws>` and the engine's
+# workspace_resolver read. Nothing wrote it on a packaged install until ADR 0136,
+# so every cross-workspace spawn failed with "no .lucidos/ports". PROTO matters
+# just as much: a packaged engine serves plain http behind the gateway, and a
+# missing line defaults the resolver to https, which dies with "record overflow".
+PORTS_FILE="$APP_DATA/workspaces/$SLUG/.lucidos/ports"
+[ -f "$PORTS_FILE" ] \
+    || fail "workspace '$SLUG' published no .lucidos/ports (cross-workspace spawns cannot resolve it)"
+grep -qx "API_PORT=[0-9][0-9]*" "$PORTS_FILE" \
+    || fail "$PORTS_FILE has no API_PORT= line: $(cat "$PORTS_FILE")"
+grep -qx "PROTO=http" "$PORTS_FILE" \
+    || fail "a packaged engine serves http, but $PORTS_FILE says: $(cat "$PORTS_FILE")"
+log "PASS: workspace published .lucidos/ports with API_PORT + PROTO=http"
 
 # ── 8. Notification/app-shell serving chain through the gateway ───────────────
 # These are the packaged surfaces dev e2e never exercises from a staged bundle:

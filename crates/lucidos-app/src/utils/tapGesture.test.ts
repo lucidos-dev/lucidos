@@ -165,7 +165,7 @@ describe('createTapGate reports the press it discarded', () => {
  *  keyboard up. Nothing on screen said why, because the click WebKit dropped
  *  never reached the handler that would have toasted. */
 /** A clock the test moves by hand, plus a countable event. */
-function harness(opts: { enabled?: () => boolean } = {}) {
+function harness(opts: { enabled?: () => boolean; gate?: { pass(): boolean; spend(): void } } = {}) {
   let t = 1_000;
   const action = vi.fn();
   const handlers = touchActivated(action, { ...opts, now: () => t });
@@ -239,71 +239,32 @@ describe('touchActivated', () => {
   });
 });
 
-/** A touchend carrying where the finger lifted, against a 40x40 button whose
- *  top-left sits at (100, 200). */
-function liftAt(x: number, y: number) {
-  return {
-    preventDefault: vi.fn(),
-    changedTouches: [{ clientX: x, clientY: y }],
-    currentTarget: { getBoundingClientRect: () => ({ left: 100, right: 140, top: 200, bottom: 240 }) },
-  };
-}
-
-/** A `touchend` is dispatched to the element the touch STARTED on, wherever it
- *  ends. So a press that slid off the button reaches the handler looking like a
- *  tap. Touch activation stands in for the click, so it must reject exactly
- *  what the click would have rejected. Found twice in review, once here and
- *  once by Codex, against the multi-select Submit, which carries no tap gate. */
-describe('touchActivated only fires where a click would have', () => {
-  it('runs the action when the finger lifted on the button', () => {
-    const action = vi.fn();
-    const handlers = touchActivated(action);
-    handlers.onTouchEnd(liftAt(120, 220));
+/** The bug reported a THIRD time, after touch activation had landed and then
+ *  been retuned: the composer's Send still did nothing on a phone with the
+ *  keyboard up, wherever the finger pressed, until the keyboard was dismissed.
+ *
+ *  Both of the touch path's tests so far asked whether the finger was still on
+ *  the button at the lift. Both cost a coordinate comparison across the span of
+ *  a press, and the visual viewport settles under a stationary finger while the
+ *  keyboard is up. Screen space did not escape that. Each shipped as a SILENT
+ *  decline onto a click iOS was not going to send.
+ *
+ *  So the touch path now takes every press. These cases pin that, because it is
+ *  the only path there is on the device that reported this. */
+describe('touchActivated takes every press it is given', () => {
+  it('runs the action however far the finger travelled', () => {
+    // A press that slid off a constructive button now fires it. That is the
+    // trade: the alternative measured something the platform corrupts, and paid
+    // for a wrong answer with a dead button nobody could diagnose.
+    const { action, handlers, touch } = harness();
+    handlers.onTouchEnd(touch);
     expect(action).toHaveBeenCalledTimes(1);
   });
 
-  it('runs it at the very edge of the button', () => {
-    const action = vi.fn();
-    const handlers = touchActivated(action);
-    handlers.onTouchEnd(liftAt(140, 240));
-    expect(action).toHaveBeenCalledTimes(1);
-  });
-
-  it('declines a press that slid off before lifting', () => {
-    // A scroll that began on the button. The finger left, so no click would
-    // have fired, and the touch path must not submit on its own.
-    const action = vi.fn();
-    const handlers = touchActivated(action);
-    const lift = liftAt(120, 400);
-    handlers.onTouchEnd(lift);
-    expect(action).not.toHaveBeenCalled();
-  });
-
-  it('leaves the click alive after declining, rather than cancelling it', () => {
-    // Nothing was activated, so nothing may be suppressed. A cancelled default
-    // here would silently kill a click the browser was right to send.
-    const action = vi.fn();
-    const handlers = touchActivated(action);
-    const lift = liftAt(400, 220);
-    handlers.onTouchEnd(lift);
-    expect(lift.preventDefault).not.toHaveBeenCalled();
-    handlers.onClick();
-    expect(action).toHaveBeenCalledTimes(1);
-  });
-
-  it('runs the action when the event cannot say where the finger was', () => {
-    // Mirrors the gate treating a click with no press behind it as a tap. A
-    // real browser always fills both fields; a synthetic dispatch may not.
+  it('runs the action when the event carries no coordinates at all', () => {
     const action = vi.fn();
     const handlers = touchActivated(action);
     handlers.onTouchEnd({ preventDefault: vi.fn() });
-    expect(action).toHaveBeenCalledTimes(1);
-  });
-
-  it('runs the action when the target is gone but a point is given', () => {
-    const action = vi.fn();
-    const handlers = touchActivated(action);
-    handlers.onTouchEnd({ preventDefault: vi.fn(), changedTouches: [{ clientX: 1, clientY: 2 }], currentTarget: null });
     expect(action).toHaveBeenCalledTimes(1);
   });
 
@@ -318,25 +279,79 @@ describe('touchActivated only fires where a click would have', () => {
     handlers.onClick();
     expect(action).toHaveBeenCalledTimes(1);
   });
+});
 
-  it('lets a gate rejection kill both paths, from one settle', () => {
-    // How the two compose: the gate check lives inside the action, so one
-    // press is settled once whichever path fires. A scroll that starts on the
-    // button must send nothing and report once.
+/** Where the scroll-vs-tap gate lives now. What it catches is the `click` iOS
+ *  fires after a touch that was starting a scroll, so it belongs to the click
+ *  path. In front of BOTH paths it also vetoed the touch path, on the same
+ *  measurement described above, which turned the dead button into a toast. */
+describe('the tap gate guards the click path alone', () => {
+  /** A gate wired the way `morphActivationGate` wires it, plus a report spy. */
+  function gated() {
     const gate = createTapGate();
-    const sent = vi.fn();
     const reported = vi.fn();
-    const handlers = touchActivated(() => {
-      const moved = gate.tapRejection();
-      if (moved !== null) { reported(moved); return; }
-      sent();
-    });
+    const activation = {
+      pass: () => {
+        const moved = gate.tapRejection();
+        if (moved === null) return true;
+        reported(moved);
+        return false;
+      },
+      spend: () => gate.cancel(),
+    };
+    return { gate, reported, activation };
+  }
+
+  it('serves a moved press on touchend, and reports nothing', () => {
+    const { gate, reported, activation } = gated();
+    const { action, handlers, touch } = harness({ gate: activation });
     gate.down(at(100, 200));
     gate.move(at(100, 240));
-    handlers.onTouchEnd({ preventDefault: vi.fn() });
+    handlers.onTouchEnd(touch);
+    expect(action).toHaveBeenCalledTimes(1);
+    expect(reported).not.toHaveBeenCalled();
+  });
+
+  it('refuses the same moved press when it arrives as a click, and reports once', () => {
+    const { gate, reported, activation } = gated();
+    const { action, handlers } = harness({ gate: activation });
+    gate.down(at(100, 200));
+    gate.move(at(100, 240));
     handlers.onClick();
-    expect(sent).not.toHaveBeenCalled();
+    expect(action).not.toHaveBeenCalled();
     expect(reported).toHaveBeenCalledTimes(1);
     expect(reported).toHaveBeenCalledWith(40);
+  });
+
+  it('spends the press the touch path served, so it cannot rule on the next one', () => {
+    // The gate holds ONE press. An unspent one would veto the next activation
+    // arriving with no press of its own, such as a keyboard Enter on the same
+    // button.
+    const { gate, reported, activation } = gated();
+    const { action, handlers, touch, advance } = harness({ gate: activation });
+    gate.down(at(100, 200));
+    gate.move(at(100, 240));
+    handlers.onTouchEnd(touch);
+    advance(5_000);
+    handlers.onClick();
+    expect(action).toHaveBeenCalledTimes(2);
+    expect(reported).not.toHaveBeenCalled();
+  });
+
+  it('does not let a twin click rule on the press the touch path spent', () => {
+    // The twin check runs before the gate, so a browser that dispatches the
+    // suppressed click anyway does not reach it at all.
+    const asked = vi.fn(() => true);
+    const { handlers, touch, advance } = harness({ gate: { pass: asked, spend: () => {} } });
+    handlers.onTouchEnd(touch);
+    advance(50);
+    handlers.onClick();
+    expect(asked).not.toHaveBeenCalled();
+  });
+
+  it('activates on a click with no gate configured', () => {
+    const { action, handlers } = harness();
+    handlers.onClick();
+    expect(action).toHaveBeenCalledTimes(1);
   });
 });

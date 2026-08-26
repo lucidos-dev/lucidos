@@ -10,6 +10,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
  *
  * And it is EXCLUSIVE. Two modals at once is not a state that exists, so a
  * precedence picks one rather than leaving it to whichever wrote last.
+ *
+ * The version below is a fixed synthetic value, deliberately not a real
+ * release, so it can never collide with the `RELEASE` file being shipped.
  */
 
 const mockCancelAppUpdate = vi.fn();
@@ -64,7 +67,7 @@ describe('activeProgressDialog', () => {
   });
 
   it('follows a live packaged-update frame, and closes when the run ends', () => {
-    appUpdateProgress.value = { version: '0.31.0', phase: 'downloading', downloaded: 50, total: 200 };
+    appUpdateProgress.value = { version: '9.9.9', phase: 'downloading', downloaded: 50, total: 200 };
     const dialog = activeProgressDialog.value;
     expect(dialog.title).toBe('Updating Lucidos');
     expect(dialog.progress).toBeCloseTo(0.25);
@@ -74,13 +77,13 @@ describe('activeProgressDialog', () => {
   });
 
   it('wires the update Cancel to the Rust command', () => {
-    appUpdateProgress.value = { version: '0.31.0', phase: 'downloading', downloaded: 1, total: 2 };
+    appUpdateProgress.value = { version: '9.9.9', phase: 'downloading', downloaded: 1, total: 2 };
     activeProgressDialog.value.cancel!.onClick();
     expect(mockCancelAppUpdate).toHaveBeenCalledTimes(1);
   });
 
   it('gives the restart precedence, so two flows cannot both claim the screen', () => {
-    appUpdateProgress.value = { version: '0.31.0', phase: 'installing' };
+    appUpdateProgress.value = { version: '9.9.9', phase: 'installing' };
     engineRestarting.value = true;
     expect(activeProgressDialog.value.title).toBe('Restarting engine');
   });

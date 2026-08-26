@@ -103,6 +103,9 @@ pub(crate) fn coding_agent_spawn_params(
     resolve_images: impl FnOnce(&[String]) -> Option<Vec<crate::api::ChatImage>>,
 ) -> Option<(Uuid, crate::engine::claude_code::SpawnAgentThreadParams)> {
     let ThreadQueueRequest::CodingAgent {
+        // The queue scopes the execution at this depth; the spawn params
+        // carry none.
+        depth: _,
         prompt,
         cc_thread_id,
         image_hashes,
@@ -168,16 +171,24 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
         // flips to "review" before the child is on the projection. On emit
         // failure the spawn path emits its own MessageReceived instead
         // (pre_emitted_origin stays None).
+        //
+        // `None` is the child's own provenance, not the submitter's. This runs
+        // inline on whichever task submitted. A trigger fire spawning a
+        // sub-thread would otherwise stamp its own marker here, and never wake
+        // on the child it asked for. See `EventBus::emit_as_trigger`.
         let result = engine
             .event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id: child_thread_id,
-                event,
-                meta: EventMeta {
-                    channel: Some(EventChannel::Chat),
-                    ..EventMeta::NONE
+            .emit_as_trigger(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id: child_thread_id,
+                    event,
+                    meta: EventMeta {
+                        channel: Some(EventChannel::Chat),
+                        ..EventMeta::NONE
+                    },
                 },
-            })
+                None,
+            )
             .await;
         let ThreadQueueRequest::SubThread {
             pre_emitted_origin, ..
@@ -256,11 +267,25 @@ impl LucidosEngine {
                     thread_id: origin_thread_id,
                 };
                 crate::scheduler::ACTIVE_TASK_COUNT.fetch_add(1, Ordering::Relaxed);
+                debug_assert_eq!(
+                    user_tasks::current_event_trigger_depth(),
+                    depth,
+                    "the queue scopes the whole execution at the request's depth"
+                );
                 // The run AND the `TriggerExecuted` that closes it are both
-                // links in this fire's chain, so both emit inside the depth
-                // scope. Recording outside it stamped depth 0, and a trigger
-                // subscribed to `TriggerExecuted` then re-fired without bound.
-                let inner = user_tasks::EVENT_TRIGGER_DEPTH.scope(depth, async {
+                // links in this fire's chain, so both run inside the scope
+                // the queue established at the request's depth. Recording
+                // outside it stamped depth 0, and a trigger subscribed to
+                // `TriggerExecuted` re-fired unbounded.
+                //
+                // `ACTIVE_TRIGGER_ID` wraps the same pair, for the same reason:
+                // every event either half emits is this trigger's own, so the
+                // matcher must be able to see whose fire it was. It stays
+                // here rather than moving to the queue beside the depth. It
+                // must NOT reach the work a fire hands off
+                // (`docs/adr/0137-a-trigger-never-wakes-itself.md`), and the
+                // depth must.
+                let inner = user_tasks::ACTIVE_TRIGGER_ID.scope(config.id.clone(), async {
                     let result = user_tasks::execute_user_task(
                         self.clone(),
                         self.pool(),
@@ -268,6 +293,7 @@ impl LucidosEngine {
                         invocation,
                         Some(&event_payload),
                         entry.cancel,
+                        entry.id,
                     )
                     .await;
                     self.record_trigger_executed(
@@ -309,27 +335,37 @@ impl LucidosEngine {
                         config.name
                     );
                 }
-                let result = user_tasks::execute_user_task(
-                    self.clone(),
-                    self.pool(),
-                    &config,
-                    TriggerInvocation::Schedule,
-                    None,
-                    entry.cancel,
-                )
-                .await;
-                crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
-                // Record after execution so crash mid-task → catch-up re-executes.
-                self.record_trigger_executed(
-                    &config.id,
-                    crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
-                )
-                .await;
+                // A cron fire has no chain depth to carry, but it owns every
+                // event it emits just as an event fire does. The scope covers
+                // the run AND the `TriggerExecuted` that closes it.
+                let result = user_tasks::ACTIVE_TRIGGER_ID
+                    .scope(config.id.clone(), async {
+                        let result = user_tasks::execute_user_task(
+                            self.clone(),
+                            self.pool(),
+                            &config,
+                            TriggerInvocation::Schedule,
+                            None,
+                            entry.cancel,
+                            entry.id,
+                        )
+                        .await;
+                        crate::scheduler::ACTIVE_TASK_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        // Record after execution so crash mid-task → catch-up re-executes.
+                        self.record_trigger_executed(
+                            &config.id,
+                            crate::triggers::TriggerRunStatus::from_success(result.is_ok()),
+                        )
+                        .await;
+                        result
+                    })
+                    .await;
                 if let Err(e) = result {
                     log!("[Scheduler] Task '{}' execution failed: {}", config.name, e);
                 }
             }
             ThreadQueueRequest::SubThread {
+                depth: _, // the queue already scoped this task at it
                 prompt,
                 child_thread_id,
                 parent_thread_id,
@@ -393,6 +429,7 @@ impl LucidosEngine {
                 }
             }
             ThreadQueueRequest::AgentChat {
+                depth: _, // the queue already scoped this task at it
                 message,
                 thread_id,
                 event_id,
@@ -553,6 +590,7 @@ mod tests {
     fn eager_sub_thread_message_keeps_attribution_without_linkage() {
         let spawning_thread = Uuid::new_v4();
         let request = ThreadQueueRequest::SubThread {
+            depth: 0,
             prompt: "independent work".into(),
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
@@ -598,6 +636,7 @@ mod tests {
         let spawning_thread = Uuid::new_v4();
         let cc_thread_id = Uuid::new_v4();
         let request = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "independent work".into(),
             cc_thread_id,
             image_hashes: vec![],
@@ -627,6 +666,7 @@ mod tests {
         let spawning_thread = Uuid::new_v4();
         let tool_call = Uuid::new_v4();
         let request = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "delegated work".into(),
             cc_thread_id: Uuid::new_v4(),
             image_hashes: vec![],
@@ -659,6 +699,7 @@ mod tests {
     #[test]
     fn coding_agent_spawn_params_carry_the_model_and_effort_pins() {
         let request = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "a single-file shell edit".into(),
             cc_thread_id: Uuid::new_v4(),
             image_hashes: vec![],
@@ -685,6 +726,7 @@ mod tests {
     #[test]
     fn an_unpinned_spawn_reaches_the_backend_with_no_model() {
         let request = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "unpinned".into(),
             cc_thread_id: Uuid::new_v4(),
             image_hashes: vec![],
@@ -705,26 +747,162 @@ mod tests {
         assert_eq!(params.reasoning_effort, None);
     }
 
+    /// Both trigger arms hand `execute_user_task` the id of the entry being
+    /// executed, so the fire can bind its thread to the row that admitted it.
+    ///
+    /// Pass any OTHER uuid and the fire updates a row it does not own. Its real
+    /// entry then stays unbound and re-fires after a restart, which is the bug
+    /// ADR 0133 fixed. The type system already forces an argument, and only the
+    /// call site can say it is the right one. A behavior test would need a whole
+    /// engine, so the two sites are pinned here, like the depth scope below.
+    #[test]
+    fn both_trigger_arms_pass_their_own_entry_id_to_the_fire() {
+        const SRC: &str = include_str!("executor.rs");
+        // Split so this line is not itself a third match.
+        let needle = concat!("user_tasks::", "execute_user_task(");
+        let calls: Vec<&str> = SRC
+            .match_indices(needle)
+            .map(|(i, _)| {
+                let after = &SRC[i..];
+                &after[..after.find(")\n").expect("the call closes")]
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "one call per trigger kind");
+        for call in calls {
+            assert!(
+                call.contains("entry.id"),
+                "a trigger fire must carry its own entry id: {call}"
+            );
+        }
+    }
+
     /// The frame a fire's completion writes is a link in that fire's chain.
     ///
     /// `TriggerExecuted` is persisted, so a trigger may subscribe to it.
-    /// Recording it after `EVENT_TRIGGER_DEPTH.scope` resolved stamped depth 0,
-    /// and the cap never engaged for such a trigger. A behavior test would need
-    /// a whole engine, so the call site is pinned here instead.
+    /// Recording it outside the fire's depth scope stamped 0, and the cap never
+    /// engaged for such a trigger. The queue now owns that scope, around the
+    /// whole execution. What this pins is that the completion is recorded
+    /// inside the arm rather than after it. A behavior test would need a whole
+    /// engine.
     #[test]
-    fn the_event_arm_records_its_completion_inside_the_depth_scope() {
+    fn the_event_arm_records_its_completion_inside_the_fires_own_future() {
         const SRC: &str = include_str!("executor.rs");
-        let after_scope = SRC
-            .split_once("EVENT_TRIGGER_DEPTH.scope(depth, async {")
-            .expect("the event arm scopes the fire")
+        // Split so this line is not itself the match.
+        let anchor = concat!("let inner = user_tasks::", "ACTIVE_TRIGGER_ID.scope(");
+        let arm = SRC
+            .split_once(anchor)
+            .expect("the event arm builds the fire's future")
             .1;
-        let scoped = after_scope
+        let scoped = arm
             .split_once("let result = match origin_thread_id")
-            .expect("the scope ends where the origin-thread wrapper begins")
+            .expect("the future ends where the origin-thread wrapper begins")
             .0;
         assert!(
             scoped.contains("record_trigger_executed"),
-            "the completion must be recorded inside the fire's depth scope"
+            "the completion must be recorded inside the fire's own future"
+        );
+    }
+
+    /// The queue owns the depth scope, so the executor must not re-establish
+    /// one. Two scopes for one value is how they drift.
+    #[test]
+    fn the_executor_does_not_scope_the_depth_itself() {
+        const SRC: &str = include_str!("executor.rs");
+        let needle = concat!("EVENT_TRIGGER_DEPTH", ".scope(");
+        assert!(
+            !SRC.contains(needle),
+            "the Thread Queue scopes execution; see ThreadQueue::spawn_execution"
+        );
+    }
+
+    /// The body of every `ACTIVE_TRIGGER_ID.scope(...)` in this file, balanced
+    /// from its opening paren. String literals are skipped, so a `log!` holding
+    /// a stray paren cannot throw the count off. Every index lands on an ASCII
+    /// delimiter, which is always a char boundary.
+    fn trigger_id_scope_bodies(src: &str) -> Vec<&str> {
+        // Split so this line is not itself a match.
+        let needle = concat!("user_tasks::", "ACTIVE_TRIGGER_ID");
+        src.match_indices(needle)
+            .map(|(i, _)| {
+                let after = &src[i..];
+                let open =
+                    after.find(".scope(").expect("the marker opens a scope") + ".scope(".len();
+                let bytes = after.as_bytes();
+                let (mut depth, mut in_str, mut escaped) = (1usize, false, false);
+                let mut end = None;
+                for (j, &c) in bytes.iter().enumerate().skip(open) {
+                    match (in_str, escaped, c) {
+                        (true, true, _) => escaped = false,
+                        (true, false, b'\\') => escaped = true,
+                        (true, false, b'"') => in_str = false,
+                        (false, _, b'"') => in_str = true,
+                        (false, _, b'(') => depth += 1,
+                        (false, _, b')') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(j);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                &after[open..end.expect("the scope closes")]
+            })
+            .collect()
+    }
+
+    /// A trigger is never woken by an event its own fire emitted, and the
+    /// matcher decides that from the marker this scope sets. Miss either arm
+    /// and that trigger's fires stay self-waking, silently.
+    ///
+    /// The `TriggerExecuted` that closes a fire must be inside the scope too.
+    /// Leave it outside and the event most likely to match a subscription goes
+    /// unstamped. That is the trap the depth scope above already fell into.
+    #[test]
+    fn both_trigger_arms_run_the_whole_fire_under_the_trigger_id_scope() {
+        let scopes = trigger_id_scope_bodies(include_str!("executor.rs"));
+        assert_eq!(scopes.len(), 2, "one scope per trigger kind");
+        for scope in scopes {
+            assert!(
+                scope.contains("execute_user_task"),
+                "the fire itself must run inside the scope: {scope}"
+            );
+            assert!(
+                scope.contains("record_trigger_executed"),
+                "the closing completion must be inside the scope too: {scope}"
+            );
+        }
+    }
+
+    /// Every emit in this file states whose fire it belongs to. The queue
+    /// executor runs `prepare` inline on whichever task submitted. A bare
+    /// `emit` here would stamp the submitter's trigger onto a sub-thread's
+    /// first event, costing that trigger the wake it asked for.
+    #[test]
+    fn the_executor_never_emits_on_the_ambient_marker() {
+        // Split so the needle is not itself a match.
+        let needle = concat!(".emit", "(");
+        assert!(
+            !include_str!("executor.rs").contains(needle),
+            "state the provenance: call EventBus::emit_as_trigger instead"
+        );
+    }
+
+    /// The balancer must find the real closing paren, not the first one. A
+    /// scope whose body ends early would pass the test above while leaving half
+    /// the fire outside the marker.
+    #[test]
+    fn the_scope_balancer_stops_at_the_matching_paren() {
+        // Built from a split literal, so this fixture is not a third match in
+        // the whole-file scan above.
+        let src = format!(
+            "{}.scope(id, f(x, \") not this one\"))\nafter",
+            concat!("user_tasks::", "ACTIVE_TRIGGER_ID")
+        );
+        assert_eq!(
+            trigger_id_scope_bodies(&src),
+            vec!["id, f(x, \") not this one\")"]
         );
     }
 }

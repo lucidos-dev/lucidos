@@ -73,7 +73,15 @@ Exists because every *coding-agent thread* gets its own *worktree* with its own 
 See also: ADR 0070, `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
 
 ### Capacity policy
-The configurable caps governing the *Thread Queue*: `max_concurrent_total` (the shared ceiling for ALL threads — background spawns and user-initiated work alike), per-kind caps (event trigger / scheduled / sub-thread / coding agent — background only), per-*trigger* concurrency, a per-trigger queue ceiling with a choice of overflow behavior (drop the oldest waiting fire + notify, or pause the trigger + notify), and `reserved_background` — slots background can reclaim ahead of user-initiated work so user priority can't starve triggers/cron (0 = pure user priority). Concurrency caps of 0 mean "hold" — admission pauses and the queue accumulates until the cap is raised. Edited in the Thread Queue panel (`PUT /api/v1/thread-queue/policy`); stored event-sourced — the latest `CapacityPolicyChanged` event IS the policy. User-initiated work is prioritized but still subject to the ceiling (ADR 0008).
+The configurable caps governing the *Thread Queue*. The fields:
+
+- `max_concurrent_total`: the shared ceiling for ALL threads, background spawns and user-initiated work alike.
+- Per-kind caps (event trigger / scheduled / sub-thread / coding agent), background only.
+- Per-*trigger* concurrency, plus a per-trigger queue ceiling with a choice of overflow behavior. Overflow either drops the oldest waiting fire and notifies, or pauses the trigger and notifies.
+- `reserved_background`: slots background can reclaim ahead of user-initiated work, so user priority can't starve triggers/cron. 0 = pure user priority.
+- `max_event_trigger_depth`: how many trigger fires one *event chain* may make before the rest are stopped and the user is notified. Default 5. A spawn does not consume a hop, so a fire's sub-thread, coding agent or script runs at the fire's own depth.
+
+Concurrency caps of 0 mean "hold": admission pauses and the queue accumulates until the cap is raised. `max_event_trigger_depth` must be at least 1. Edited in the Thread Queue panel (`PUT /api/v1/thread-queue/policy`). Stored event-sourced, so the latest `CapacityPolicyChanged` event IS the policy. User-initiated work is prioritized but still subject to the ceiling (ADR 0008).
 
 ### Cascading archive
 Archiving a parent *thread* also archives every *sub-thread* under it, in one atomic operation. Disabled when any descendant is a *blocking descendant*.
@@ -344,6 +352,10 @@ OpenAI, OpenRouter, xAI, OpenCode Free and Local all speak the OpenAI Chat Compl
 A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. The builtin names are `vertex`, `openai`, `openrouter`, `xai`, `anthropic` and `local`. When `<name>` matches one and no `apis.json` entry exists, the engine forwards to that provider's API root. It injects the credential configured under Settings → Models → Providers server-side, so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first).
 
 `vertex` is addressed by the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` URL prefix and mints the access token, so the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+
+### Rejected proxy entry
+An entry in `data/config/apis.json` the engine will not serve, because it does not parse or uses a shape no longer supported. It is rejected on its own: every other entry in the file still works, and the workspace still starts (ADR 0135). You are told twice. A notification names the entry and the reason when the engine boots, and a call to that proxy answers `502` until you fix it. Fix it by editing the entry and restarting the workspace.
+See also: *derived proxy entry*, *builtin provider proxy*, `system-knowhow/building-an-auth-handshake.md`.
 
 ### OAuth provider registry
 The list of OAuth providers Lucidos knows the endpoints for, stored as
@@ -758,6 +770,7 @@ Upstream of those two tabs one dot stands for both, because that path leads to b
 Distinct from the dot on the Lucidos menu's version row, which means you have not read the notes for the release you run. That one is per device and clears the moment you open the panel. This one is about the workspace, and about work.
 See also: *What's New*, *release notice*.
 
+<!--gloss-webhook-start-->
 ### Webhook
 An endpoint you point a third party at, so their service can tell Lucidos something happened. Each webhook emits exactly one *domain event*, which a *trigger* can then react to. Manage them at **Settings > Webhooks**, or with `lucidos webhooks`.
 
@@ -773,6 +786,7 @@ A delivery becomes an event shaped `{summary, headers, payload}`. The sender's o
 
 Deliveries arrive on their own port, the *hook socket*, which answers webhook URLs and nothing else. That is what makes it the one surface you can safely expose to the public internet with `tailscale funnel`.
 See also: *trigger*, *domain event*, *credential*, *delivery deduping*, `system-knowhow/lucidos-cli.md` § `lucidos webhooks`.
+<!--gloss-webhook-end-->
 
 ### Delivery deduping
 A per-*webhook* setting that makes a resent delivery emit nothing instead of firing the event a second time. **Off by default**, so every arrival is an event unless you ask otherwise. Set it with `lucidos webhooks`, which is also where a signature is configured.

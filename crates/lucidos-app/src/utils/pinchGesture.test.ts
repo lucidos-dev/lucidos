@@ -5,7 +5,15 @@ import {
   computePinchUpdate,
   clampPanTransform,
   computeZoomAt,
+  fitToWindowScale,
+  fullSizeScale,
   naturalImageLayout,
+  sameScale,
+  steppedScale,
+  zoomCeiling,
+  zoomFloor,
+  zoomPercent,
+  ZOOM_STEP,
   type PinchInitial,
 } from './pinchGesture';
 
@@ -301,5 +309,145 @@ describe('computeZoomAt', () => {
     expect(a.scale).toBe(10);
     const b = computeZoomAt(1, 0, 0, 0, 0, 0.01, 0, 0, 0.1, 10);
     expect(b.scale).toBe(0.1);
+  });
+});
+
+describe('steppedScale', () => {
+  it('multiplies and divides by one step', () => {
+    expect(steppedScale(1, 1, 1, 10)).toBeCloseTo(ZOOM_STEP, 5);
+    expect(steppedScale(ZOOM_STEP, -1, 1, 10)).toBeCloseTo(1, 5);
+  });
+
+  it('stops at the range ends', () => {
+    expect(steppedScale(1, -1, 1, 10)).toBe(1);
+    expect(steppedScale(9, 1, 1, 10)).toBe(10);
+  });
+});
+
+describe('fullSizeScale', () => {
+  it('is the ratio of natural width to the width in screen pixels', () => {
+    expect(fullSizeScale(300, 1200, 1)).toBe(4);
+    expect(fullSizeScale(1200, 1200, 1)).toBe(1);
+  });
+
+  // The bug this answers: the popup measured CSS pixels. A phone screenshot
+  // filling the phone it came from read 33%, while every one of its pixels sat
+  // on a screen pixel. "Actual size" from there was a threefold blow-up.
+  it('calls a screenshot of this screen, filling this screen, full size', () => {
+    // 1179 device pixels wide, laid out across the phone's 393 CSS pixels.
+    expect(fullSizeScale(393, 1179, 3)).toBe(1);
+  });
+
+  it('halves the target on a screen drawing two pixels per CSS pixel', () => {
+    expect(fullSizeScale(300, 1200, 2)).toBe(2);
+  });
+
+  it('answers 0 when there is nothing to measure', () => {
+    expect(fullSizeScale(0, 1200, 1)).toBe(0);
+    expect(fullSizeScale(300, 0, 1)).toBe(0);
+    expect(fullSizeScale(300, 1200, 0)).toBe(0);
+  });
+});
+
+describe('zoomCeiling', () => {
+  it('raises the cap so full size stays reachable', () => {
+    expect(zoomCeiling(10, 22)).toBe(22);
+  });
+
+  it('keeps the cap when full size is already under it', () => {
+    expect(zoomCeiling(10, 4)).toBe(10);
+    // An image with no intrinsic width reports 0; the plain cap stands.
+    expect(zoomCeiling(10, 0)).toBe(10);
+  });
+});
+
+describe('zoomFloor', () => {
+  it('rests on the fitted view for an image the window has to shrink', () => {
+    // Full size is above the fit, so the fit is as far out as zooming goes.
+    expect(zoomFloor(1, 3.02)).toBe(1);
+  });
+
+  it('drops below the fit so a blown-up image can reach its own pixels', () => {
+    // 100x80 fitted 9.5x into a desktop window, at 1:1 on a 2x screen.
+    expect(zoomFloor(9.5, 0.5)).toBe(0.5);
+  });
+
+  it('rests on the fitted view when there is no full size to aim at', () => {
+    // An SVG that declares no intrinsic width reports 0.
+    expect(zoomFloor(2.5, 0)).toBe(2.5);
+  });
+
+  it('rests on the fitted view when the two coincide', () => {
+    expect(zoomFloor(1, 1)).toBe(1);
+  });
+});
+
+describe('fitToWindowScale', () => {
+  // The bug this answers: a small image sat at its own size in a big window,
+  // and the control called that a fit.
+  it('grows a small image out to the nearer window edge', () => {
+    // 300x200 in an 1800x900 window: width would allow 6x, height only 4.5x.
+    expect(fitToWindowScale(1800, 900, 300, 200)).toBeCloseTo(4.5, 5);
+  });
+
+  it('leaves an image CSS already contained at 1', () => {
+    // An oversized screenshot lays out at the container width, so it fits now.
+    expect(fitToWindowScale(1800, 900, 1800, 600)).toBe(1);
+    expect(fitToWindowScale(1800, 900, 1200, 900)).toBe(1);
+  });
+
+  it('does not chase a sub-pixel gap left by the measured box', () => {
+    // A contained image measures a hair short of its box. Asking for 1.0001x
+    // resamples the whole layer to close a gap nobody can see.
+    expect(fitToWindowScale(1800, 760, 1200, 759.9)).toBe(1);
+  });
+
+  it('answers 1 when there is nothing to measure', () => {
+    expect(fitToWindowScale(0, 900, 300, 200)).toBe(1);
+    expect(fitToWindowScale(1800, 900, 0, 0)).toBe(1);
+  });
+});
+
+describe('zoomPercent', () => {
+  it('reads 100% at one image pixel per screen pixel', () => {
+    // A screenshot laid out at 40% of its own width: full size is scale 2.5.
+    expect(zoomPercent(2.5, 2.5, 1)).toBe(100);
+  });
+
+  // The reported bug, end to end through the two functions that produce it: a
+  // 1179-wide screenshot fitted across the 393 CSS pixels of the phone it was
+  // taken on. It read 33%. Nothing about the image had to change.
+  it('reads a phone screenshot fitted to its own phone as 100%', () => {
+    const full = fullSizeScale(393, 1179, 3);
+    expect(zoomPercent(1, full, 1)).toBe(100);
+  });
+
+  it('reads the fitted view of an oversized image well under 100%', () => {
+    expect(zoomPercent(1, 2.5, 1)).toBe(40);
+  });
+
+  it('reads the fitted view of a small image well over 100%', () => {
+    expect(zoomPercent(4.5, 1, 4.5)).toBe(450);
+  });
+
+  it('falls back to the fitted view for an image with no intrinsic size', () => {
+    expect(zoomPercent(2, 0, 2)).toBe(100);
+    expect(zoomPercent(3, 0, 2)).toBe(150);
+  });
+
+  it('rounds to whole percent, so the readout never jitters on a decimal', () => {
+    expect(zoomPercent(1.234, 1, 1)).toBe(123);
+  });
+});
+
+describe('sameScale', () => {
+  it('accepts a fit recomputed from measured pixels', () => {
+    expect(sameScale(4.5, 4.500_001)).toBe(true);
+  });
+
+  it('holds its tolerance relative, at 1x and at 45x alike', () => {
+    expect(sameScale(1, 1.05)).toBe(false);
+    expect(sameScale(45, 45.01)).toBe(true);
+    expect(sameScale(45, 47)).toBe(false);
   });
 });

@@ -86,8 +86,15 @@ impl EventBus {
                 thread_id,
                 actor: _,
             } => {
+                // `admitted_at` keeps the FIRST admission's time. A trigger
+                // fire re-emits this event once it creates its thread (see
+                // `ThreadQueue::record_entry_thread`). Restamping there would
+                // restart the age the panel shows for a running entry. A
+                // genuine re-admission still gets a fresh stamp: the
+                // `ThreadQueued` upsert above nulls the column first.
                 sqlx::query(
-                    "UPDATE thread_queue SET status = 'admitted', admitted_at = NOW(), \
+                    "UPDATE thread_queue SET status = 'admitted', \
+                     admitted_at = COALESCE(admitted_at, NOW()), \
                      thread_id = COALESCE($2, thread_id) WHERE id = $1",
                 )
                 .bind(entry_id)

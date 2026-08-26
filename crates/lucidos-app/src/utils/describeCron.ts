@@ -20,6 +20,16 @@ function ordinal(n: number): string {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
+/** The day of the month when the field names exactly one day, else null.
+ *
+ *  A step, a list (`1,15`) or a range names more than one, and `parseInt` reads
+ *  only the leading token. A step field therefore rendered as `NaNth` and
+ *  `1,15` as `1st`, dropping the 15. Callers fall back to the raw cron rather
+ *  than state a schedule the expression does not have. */
+function bareDayOfMonth(dom: string): number | null {
+  return /^\d+$/.test(dom) ? parseInt(dom) : null;
+}
+
 function formatTime(hour: string, minute: string): string {
   const h = parseInt(hour);
   const m = parseInt(minute);
@@ -99,9 +109,9 @@ export function describeCron(cron: string): string {
 
   // Specific date: both day-of-month and month are set (not recurring)
   if (hasTime && dom !== '*' && month !== '*' && dow === '*') {
-    const d = parseInt(dom);
+    const d = bareDayOfMonth(dom);
     const monthName = MONTH_NAMES[month.toUpperCase()] || month;
-    if (!isNaN(d)) {
+    if (d !== null) {
       const m = parseInt(month);
       const now = new Date();
       let year = now.getFullYear();
@@ -115,15 +125,18 @@ export function describeCron(cron: string): string {
 
   // Monthly on Nth day (month is *)
   if (hasTime && dom !== '*' && month === '*' && dow === '*') {
-    const d = parseInt(dom);
-    if (!isNaN(d)) {
+    const d = bareDayOfMonth(dom);
+    if (d !== null) {
       return `${ordinal(d)} of every month at ${timeStr}`;
     }
   }
 
   // Specific day of month + day of week (both set)
   if (hasTime && dom !== '*' && dow !== '*') {
-    return `${ordinal(parseInt(dom))} & ${describeWeekday(dow)}${monthStr} at ${timeStr}`;
+    const d = bareDayOfMonth(dom);
+    if (d !== null) {
+      return `${ordinal(d)} & ${describeWeekday(dow)}${monthStr} at ${timeStr}`;
+    }
   }
 
   // Fallback: return the raw cron

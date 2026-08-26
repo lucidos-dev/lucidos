@@ -208,29 +208,37 @@ fn a_missing_or_malformed_preference_defaults_to_enabled() {
     assert_eq!(parse_updates_toml("garbage = = ="), UpdatesToml::default());
     assert_eq!(parse_updates_toml("[release_check"), UpdatesToml::default());
     assert_eq!(read_updates_toml(None), UpdatesToml::default());
+    // The check is functional rather than telemetry, so it is on by default and
+    // no click stands in front of it (ADR 0139).
     assert!(UpdatesToml::default().enabled);
-    // A fresh install has not seen the notice, so it polls nothing yet.
-    assert!(!UpdatesToml::default().notice_acknowledged);
 }
 
 #[test]
-fn a_partial_preference_keeps_the_default_for_what_it_omits() {
-    let parsed = parse_updates_toml("[release_check]\nnotice_acknowledged = true\n");
-    assert!(parsed.enabled);
-    assert!(parsed.notice_acknowledged);
+fn a_section_that_names_nothing_keeps_the_default() {
+    assert!(parse_updates_toml("[release_check]\n").enabled);
+}
+
+/// A file written before ADR 0139 still carries `notice_acknowledged`. The raw
+/// deserialize refuses no unknown field, so the file parses and its `enabled`
+/// is honoured, rather than warning and falling back to the defaults.
+#[test]
+fn a_file_carrying_the_removed_field_still_parses() {
+    // The stale value that used to mean "polls nothing". It now polls, because
+    // the field is gone and `enabled` defaults true.
+    let never_answered = parse_updates_toml("[release_check]\nnotice_acknowledged = false\n");
+    assert_eq!(never_answered, UpdatesToml { enabled: true });
+
+    // An answered notice beside an explicit off switch keeps the off switch.
+    let turned_off =
+        parse_updates_toml("[release_check]\nenabled = false\nnotice_acknowledged = true\n");
+    assert_eq!(turned_off, UpdatesToml { enabled: false });
 }
 
 #[test]
 fn render_then_parse_round_trips() {
     for cfg in [
-        UpdatesToml {
-            enabled: false,
-            notice_acknowledged: true,
-        },
-        UpdatesToml {
-            enabled: true,
-            notice_acknowledged: false,
-        },
+        UpdatesToml { enabled: false },
+        UpdatesToml { enabled: true },
     ] {
         assert_eq!(parse_updates_toml(&render_updates_toml(&cfg)), cfg);
     }
@@ -240,10 +248,7 @@ fn render_then_parse_round_trips() {
 fn writing_the_preference_is_atomic_and_readable_back() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nested/updates.toml");
-    let cfg = UpdatesToml {
-        enabled: false,
-        notice_acknowledged: true,
-    };
+    let cfg = UpdatesToml { enabled: false };
     write_updates_toml(Some(&path), &cfg).unwrap();
     assert_eq!(read_updates_toml(Some(&path)), cfg);
     // No temp file is left behind by the rename.
@@ -308,16 +313,9 @@ async fn origin_serving(response: String, delay: Duration) -> Origin {
 }
 
 /// An installed deployment whose preference lives in `dir`.
-fn deployment_in(dir: &Path, enabled: bool, acknowledged: bool) -> Deployment {
+fn deployment_in(dir: &Path, enabled: bool) -> Deployment {
     let config = dir.join("updates.toml");
-    write_updates_toml(
-        Some(&config),
-        &UpdatesToml {
-            enabled,
-            notice_acknowledged: acknowledged,
-        },
-    )
-    .unwrap();
+    write_updates_toml(Some(&config), &UpdatesToml { enabled }).unwrap();
     Deployment {
         packaged: true,
         exe: Some(dir.join("runtime/lucidos-1.2.3-host/lucidos-gateway")),
@@ -331,11 +329,8 @@ fn deployment_in(dir: &Path, enabled: bool, acknowledged: bool) -> Deployment {
 async fn the_request_carries_three_parameters_and_no_cookie() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     let snapshot = check.refresh(false).await;
     assert_eq!(snapshot["latest"]["version"], "99.0.0");
@@ -365,11 +360,8 @@ async fn three_concurrent_refreshes_make_one_request() {
         Duration::from_millis(80),
     )
     .await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     let (a, b, c) = futures::join!(
         check.refresh(false),
@@ -386,11 +378,8 @@ async fn three_concurrent_refreshes_make_one_request() {
 async fn a_fresh_answer_is_not_re_polled() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     check.refresh(false).await;
     check.refresh(false).await;
@@ -398,22 +387,72 @@ async fn a_fresh_answer_is_not_re_polled() {
     assert_eq!(origin.requests(), 1);
 }
 
-/// Nothing leaves an install nobody has answered the notice on. The AUTOMATIC
-/// check is what this covers; the button is its own decision, one test below.
+/// A first launch polls on its own. There is no preference file yet, so the
+/// default decides, and the default is on (ADR 0139).
 #[tokio::test]
-async fn no_automatic_poll_happens_before_the_notice_is_acknowledged() {
+async fn a_fresh_install_polls_with_no_click() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, false),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let mut dep = deployment_in(dir.path(), true);
+    // Nothing has ever written the preference on this machine.
+    dep.config_path = Some(dir.path().join("never-written/updates.toml"));
+    let check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
 
     let snapshot = check.refresh(false).await;
-    assert_eq!(origin.requests(), 0);
-    assert_eq!(snapshot["latest"], serde_json::Value::Null);
-    assert_eq!(snapshot["notice_acknowledged"], false);
+    assert_eq!(origin.requests(), 1);
+    assert_eq!(snapshot["enabled"], true);
+    assert_eq!(snapshot["latest"]["version"], "99.0.0");
+}
+
+/// An install that never answered the old notice now polls. That group was the
+/// whole point of ADR 0139: an unanswered notice was a permanent silent
+/// opt-out, withholding the fixes the check exists to deliver.
+#[tokio::test]
+async fn an_install_that_never_answered_the_notice_now_polls() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let mut dep = deployment_in(dir.path(), true);
+    // Exactly what a pre-ADR-0139 fresh install left on disk.
+    let config = dir.path().join("unanswered-updates.toml");
+    std::fs::write(
+        &config,
+        "[release_check]\nenabled = true\nnotice_acknowledged = false\n",
+    )
+    .unwrap();
+    dep.config_path = Some(config);
+    let check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
+
+    let snapshot = check.refresh(false).await;
+    assert_eq!(
+        origin.requests(),
+        1,
+        "a stale notice must not gate the poll"
+    );
+    assert_eq!(snapshot["enabled"], true);
+    assert_eq!(snapshot["latest"]["version"], "99.0.0");
+}
+
+/// An install that answered the old notice with "Turn it off" wrote
+/// `enabled = false`, and it stays off. The stale `notice_acknowledged` beside
+/// it is ignored rather than fatal, so the off switch survives the migration.
+#[tokio::test]
+async fn an_install_that_turned_the_check_off_stays_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
+    let mut dep = deployment_in(dir.path(), true);
+    // Written by hand, because the renderer no longer emits the dead field.
+    let config = dir.path().join("legacy-updates.toml");
+    std::fs::write(
+        &config,
+        "[release_check]\nenabled = false\nnotice_acknowledged = true\n",
+    )
+    .unwrap();
+    dep.config_path = Some(config);
+    let check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
+
+    let snapshot = check.refresh(false).await;
+    assert_eq!(origin.requests(), 0, "an off switch on disk must hold");
+    assert_eq!(snapshot["enabled"], false);
     assert_eq!(snapshot["supported"], true);
 }
 
@@ -425,7 +464,7 @@ async fn a_forced_check_works_while_the_automatic_one_is_off() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
     let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), false, true),
+        &deployment_in(dir.path(), false),
         &origin.url,
         POLL_INTERVAL,
     );
@@ -435,28 +474,10 @@ async fn a_forced_check_works_while_the_automatic_one_is_off() {
     assert_eq!(origin.requests(), 0);
     assert_eq!(snapshot["enabled"], false);
 
-    // The button asks anyway, because the click is consent for one request.
+    // The button asks anyway, because the click IS the request.
     let snapshot = check.refresh(true).await;
     assert_eq!(origin.requests(), 1);
     assert_eq!(snapshot["latest"]["version"], "99.0.0");
-}
-
-/// The same for an install that has not seen the notice. Settings states what
-/// the request contains right beside the button, so the click is informed.
-#[tokio::test]
-async fn a_forced_check_works_before_the_notice_is_answered() {
-    let dir = tempfile::tempdir().unwrap();
-    let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, false),
-        &origin.url,
-        POLL_INTERVAL,
-    );
-
-    check.refresh(false).await;
-    assert_eq!(origin.requests(), 0);
-    check.refresh(true).await;
-    assert_eq!(origin.requests(), 1);
 }
 
 /// The deployment gate is the one `force` can never open.
@@ -464,7 +485,7 @@ async fn a_forced_check_works_before_the_notice_is_answered() {
 async fn a_forced_check_still_refuses_from_a_source_checkout() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let mut dep = deployment_in(dir.path(), true, true);
+    let mut dep = deployment_in(dir.path(), true);
     dep.exe = Some(checkout(&dir.path().join("repo")));
     let check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
 
@@ -480,7 +501,7 @@ async fn a_failed_poll_is_recorded_and_a_later_success_clears_it() {
     let html = "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 6\r\n\
                 connection: close\r\n\r\n<html>";
     let broken = origin_serving(html.to_string(), Duration::ZERO).await;
-    let dep = deployment_in(dir.path(), true, true);
+    let dep = deployment_in(dir.path(), true);
     let check = ReleaseCheck::with_origin(&dep, &broken.url, Duration::from_millis(1));
 
     let snapshot = check.refresh(false).await;
@@ -499,7 +520,7 @@ async fn a_failed_poll_is_recorded_and_a_later_success_clears_it() {
 async fn a_dev_deployment_never_reaches_the_origin() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let mut dep = deployment_in(dir.path(), true, true);
+    let mut dep = deployment_in(dir.path(), true);
     dep.exe = Some(checkout(&dir.path().join("repo")));
     let check = ReleaseCheck::with_origin(&dep, &origin.url, POLL_INTERVAL);
 
@@ -512,7 +533,7 @@ async fn a_dev_deployment_never_reaches_the_origin() {
 async fn the_preference_is_re_read_on_every_tick() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let dep = deployment_in(dir.path(), true, true);
+    let dep = deployment_in(dir.path(), true);
     let config = dep.config_path.clone().unwrap();
     // A one-millisecond interval makes the second refresh due immediately, so
     // only the preference can stop it.
@@ -521,14 +542,7 @@ async fn the_preference_is_re_read_on_every_tick() {
     check.refresh(false).await;
     assert_eq!(origin.requests(), 1);
 
-    write_updates_toml(
-        Some(&config),
-        &UpdatesToml {
-            enabled: false,
-            notice_acknowledged: true,
-        },
-    )
-    .unwrap();
+    write_updates_toml(Some(&config), &UpdatesToml { enabled: false }).unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
     let snapshot = check.refresh(false).await;
 
@@ -542,11 +556,8 @@ async fn a_redirect_is_not_followed() {
     let redirect = "HTTP/1.1 302 Found\r\nlocation: http://example.invalid/x\r\n\
                     content-length: 0\r\nconnection: close\r\n\r\n";
     let origin = origin_serving(redirect.to_string(), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     let snapshot = check.refresh(false).await;
     assert_eq!(origin.requests(), 1, "exactly one request, no follow");
@@ -564,11 +575,8 @@ async fn landing_page_html_is_not_read_as_up_to_date() {
         html.len()
     );
     let origin = origin_serving(body, Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     let snapshot = check.refresh(false).await;
     // A soft 404 leaves the answer unknown, so `checked_at` never moves.
@@ -580,11 +588,8 @@ async fn landing_page_html_is_not_read_as_up_to_date() {
 async fn an_older_published_version_is_not_offered() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"0.0.1"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
 
     let snapshot = check.refresh(false).await;
     assert_eq!(snapshot["latest"], serde_json::Value::Null);
@@ -596,11 +601,8 @@ async fn an_older_published_version_is_not_offered() {
 async fn an_installer_install_is_offered_a_command_and_a_bundle_is_not() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let check = ReleaseCheck::with_origin(
-        &deployment_in(dir.path(), true, true),
-        &origin.url,
-        POLL_INTERVAL,
-    );
+    let check =
+        ReleaseCheck::with_origin(&deployment_in(dir.path(), true), &origin.url, POLL_INTERVAL);
     let snapshot = check.refresh(false).await;
     assert_eq!(snapshot["latest"]["install"], "installer-rerun");
     assert!(snapshot["latest"]["command"]
@@ -609,7 +611,7 @@ async fn an_installer_install_is_offered_a_command_and_a_bundle_is_not() {
         .contains("--name default"));
 
     let bundle = origin_serving(http_ok(r#"{"version":"99.0.0"}"#), Duration::ZERO).await;
-    let mut dep = deployment_in(dir.path(), true, true);
+    let mut dep = deployment_in(dir.path(), true);
     dep.exe = Some(
         dir.path()
             .join("Lucidos.app/Contents/Resources/lucidos-gateway"),

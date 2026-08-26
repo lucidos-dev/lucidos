@@ -19,7 +19,7 @@ describe('image popup — tap toggles chrome (close, nav, counter)', () => {
     expect(source).toMatch(/chrome-hidden/);
   });
 
-  it('CSS hides close, mobile-close, nav, and counter when chrome-hidden is set', () => {
+  it('CSS hides close, mobile-close, nav, counter and zoom when chrome-hidden is set', () => {
     const block = css.match(/\.image-popup-content\.chrome-hidden[\s\S]*?\}/);
     expect(block, 'no .image-popup-content.chrome-hidden CSS block found').not.toBeNull();
     const text = block![0];
@@ -27,6 +27,7 @@ describe('image popup — tap toggles chrome (close, nav, counter)', () => {
     expect(text).toContain('floating-mobile-close');
     expect(text).toContain('image-popup-nav');
     expect(text).toContain('image-popup-counter');
+    expect(text).toContain('image-popup-zoom');
   });
 
   it('a click on the strip toggles chromeHidden (registered via addEventListener)', () => {

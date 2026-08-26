@@ -144,7 +144,11 @@ fn tap_belongs_to(link: &serde_json::Value, workspace: Option<&str>) -> bool {
 /// The origin to build tap-target URLs on: the first window actually served off
 /// one. `None` when no window is (every window unnavigated, or none open), in
 /// which case the caller falls back to this install's stable gateway URL.
-#[cfg(any(target_os = "macos", test))]
+///
+/// Compiled on every platform, because a tap is no longer its only caller: the
+/// reopen builds its restored windows on the same origin, and it is not
+/// macOS-only. The body is a fold over `window_origin`, which is platform
+/// independent, so widening this costs nothing.
 pub(crate) fn gateway_origin(windows: &[(String, String)]) -> Option<&str> {
     windows.iter().find_map(|(_, url)| window_origin(url))
 }
@@ -202,7 +206,8 @@ pub(crate) fn choose_tap_target(
     // `desktop::launch` is still waiting on the gateway, and its pending
     // navigation would clobber anything we pointed another window at.
     if windows.iter().any(|(label, url)| {
-        label == crate::MAIN_WINDOW_LABEL && window_context(url) == WindowContext::Unnavigated
+        label == crate::app_window::MAIN_WINDOW_LABEL
+            && window_context(url) == WindowContext::Unnavigated
     }) {
         return TapTarget::LaunchInto { url };
     }
@@ -339,7 +344,7 @@ mod imp {
                         // the deep link is missing (matching the prior behaviour):
                         // with no link there is no workspace to target, so that
                         // case routes to the main window.
-                        let wake = crate::route_native_tap(app, owner.as_deref());
+                        let wake = crate::app_window::route_native_tap(app, owner.as_deref());
                         // Only an ALREADY-LOADED page gets the warm signal. The
                         // other targets are a page about to load, whose startup
                         // drain is the trigger, and an emit into a webview
@@ -540,7 +545,7 @@ mod imp {
     }
 
     /// Set the dock-icon badge to `label`, or clear it with `None`. The caller
-    /// (`crate::apply_unread_indicator`) formats the AGGREGATE unread total across
+    /// (`crate::activation::apply_unread_indicator`) formats the AGGREGATE unread total across
     /// running workspaces (the Tauri window fronts the gateway, so its app icon
     /// represents all workspaces) — including the `0`→clear and `>99`→"99+" rules —
     /// and sends it here only while the client is a normal `Regular` Dock app; a
@@ -565,7 +570,7 @@ mod imp {
     }
 
     /// Set the menu-bar tray icon's title text, clearing it with `""`. This is
-    /// where the unread count lives at ALL times: `crate::apply_unread_indicator`
+    /// where the unread count lives at ALL times: `crate::activation::apply_unread_indicator`
     /// sends it here on every recompute, whatever the activation policy, so the
     /// menu bar is a constant read on how much is waiting. While a window is open
     /// the same count is on the Dock badge too ([`set_dock_badge`]); menu-bar-only
@@ -656,7 +661,7 @@ pub fn dismiss(_workspace: Option<String>, _id: Option<String>) {}
 pub fn set_dock_badge(_label: Option<String>) {}
 
 /// No tray-title unread count off macOS: the menu-bar status item is a macOS
-/// concept. A no-op so `crate::apply_unread_indicator` stays platform-agnostic.
+/// concept. A no-op so `crate::activation::apply_unread_indicator` stays platform-agnostic.
 #[cfg(not(target_os = "macos"))]
 pub fn set_tray_title(_app: &tauri::AppHandle, _title: &str) {}
 

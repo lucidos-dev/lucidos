@@ -623,10 +623,10 @@ impl LucidosEngine {
 
             match found_repo {
                 Some((repo_root, repo_id)) => {
-                    // Prune stale worktree entries so `git worktree add` doesn't
-                    // fail with "already checked out" for a deleted directory.
-                    let _ = git_cmd(&["worktree", "prune"], &repo_root).await;
-
+                    // No prune here, deliberately. `worktree_add` prunes under
+                    // the admin lock right before it adds. That is the only
+                    // sweep which cannot delete a concurrent spawn's half-built
+                    // admin dir.
                     let wt_path = lost_session_worktree_path(
                         self.workspace_path(),
                         branch_to_thread.get(branch).copied(),

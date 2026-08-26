@@ -90,9 +90,7 @@ impl LucidosEngine {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // Defense in depth: the prompt envelope asks the LLM not to call these
         // during a trigger fire; this enforces it even when the LLM ignores it.
-        let active_id = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
-            .try_with(|id| id.clone())
-            .ok();
+        let active_id = crate::scheduler::user_tasks::current_trigger_id();
         let active_name = active_id.as_deref().and_then(|id| {
             self.trigger_configs
                 .read()

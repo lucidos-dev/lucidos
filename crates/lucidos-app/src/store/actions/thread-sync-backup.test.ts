@@ -131,3 +131,42 @@ describe('handleGlobalEvent — Backup terminal events', () => {
     expect(openBackupSettings).toHaveBeenCalledOnce();
   });
 });
+
+describe('handleGlobalEvent: ProxyConfigRejected', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('names every refused provider and its reason', () => {
+    handleGlobalEvent('ProxyConfigRejected', {
+      rejected: [
+        { provider: 'jira', reason: "provider 'jira': auth uses the removed legacy shape" },
+        { provider: 'binance', reason: 'unknown variant `md5`' },
+      ],
+    });
+
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      "Proxy config problem, jira: provider 'jira': auth uses the removed legacy shape; "
+      + 'binance: unknown variant `md5`',
+      'error',
+      expect.objectContaining({ key: 'proxy-config-rejected', showWhileUnavailable: true }),
+    );
+  });
+
+  it('reads a null provider as the file itself', () => {
+    handleGlobalEvent('ProxyConfigRejected', {
+      rejected: [{ provider: null, reason: 'is not usable: expected value at line 1' }],
+    });
+
+    expect(showToast).toHaveBeenCalledExactlyOnceWith(
+      'Proxy config problem, data/config/apis.json: is not usable: expected value at line 1',
+      'error',
+      expect.objectContaining({ key: 'proxy-config-rejected' }),
+    );
+  });
+
+  // A healthy workspace must stay silent, so nothing learns to ignore it.
+  it('says nothing when the list is empty or absent', () => {
+    handleGlobalEvent('ProxyConfigRejected', { rejected: [] });
+    handleGlobalEvent('ProxyConfigRejected', {});
+    expect(showToast).not.toHaveBeenCalled();
+  });
+});

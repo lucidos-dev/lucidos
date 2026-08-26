@@ -5,6 +5,7 @@ import { lucidos } from '@lucidos/sdk';
 import { COPY_ICON, escapeHtmlAttr } from './markedConfig';
 import { addMarkdownParseMs } from './renderPhaseTimers';
 import { WORKSPACE_ID } from './basePath';
+import { DATA_PATH_PREFIXES } from './linkifyPaths';
 import { slugifyWorkspaceName } from './slug';
 
 /** Real destination for a thread link, so hovering shows where it goes instead
@@ -290,14 +291,12 @@ function transformTables(html: string): string {
 /** The workspace's top-level directories, the only relative image sources that
  *  get rewritten. An allowlist rather than "every relative path": a relative
  *  src that means something else in its own context (an app's own asset) must
- *  not be silently redirected at the workspace. */
-const WORKSPACE_DATA_DIRS = new Set([
-  'artifacts',
-  'apps',
-  'knowhow',
-  'triggers',
-  'system-knowhow',
-]);
+ *  not be silently redirected at the workspace.
+ *
+ *  Derived from `DATA_PATH_PREFIXES`, the single source of truth for the same
+ *  list. A hand-kept copy gave a new sub-tree its links but not its images,
+ *  and that miss shows up as an `<img>` served the SPA fallback. */
+const WORKSPACE_DATA_DIRS = new Set(DATA_PATH_PREFIXES.map((p) => p.slice(0, -1)));
 
 /** The attribute-ready `src` for a workspace-relative image source, or `null`
  *  when the source is not ours to resolve.

@@ -1,0 +1,75 @@
+<svg class="lx-diagram" viewBox="0 0 1200 700" role="img"
+     aria-labelledby="t-machine d-machine" xmlns="http://www.w3.org/2000/svg">
+  <title id="t-machine">Lucidos on one machine</title>
+  <desc id="d-machine">Lucidos runs on one machine. The desktop app and a browser tab run on that machine. Your phone, or a browser on any other device, reaches the same gateway over your network. The gateway fronts one engine per workspace. Each engine owns its Postgres event store and its git-tracked files. Three kinds of traffic leave the machine, through the engine: model calls, outside APIs you set up in the proxy, and commands your tools run.</desc>
+  <defs>
+    <marker id="lx-arrow-machine" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-ink-soft)"/>
+    </marker>
+    <marker id="lx-arrow-b-machine" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-blue)"/>
+    </marker>
+    <marker id="lx-arrow-o-machine" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-orange)"/>
+    </marker>
+    <marker id="lx-arrow-a-machine" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-aqua)"/>
+    </marker>
+  </defs>
+
+  <rect x="24" y="60" width="868" height="604" rx="26" fill="var(--lx-panel)" stroke="var(--lx-line)" stroke-width="2" stroke-dasharray="9 9" />
+  <text x="56" y="42" text-anchor="start" font-size="17" font-weight="700" fill="var(--lx-ink-soft)" letter-spacing="2.5">YOUR MACHINE</text>
+
+  <rect x="135" y="104" width="260" height="92" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="265.0" y="159" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Desktop app</text>
+  <rect x="521" y="104" width="260" height="92" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="651.0" y="159" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Browser</text>
+
+  <text x="1038.0" y="86" text-anchor="middle" font-size="14" font-weight="700" fill="var(--lx-blue)" letter-spacing="2">OVER YOUR NETWORK</text>
+  <rect x="916" y="104" width="244" height="92" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="2.5" />
+  <text x="1038.0" y="147" text-anchor="middle" font-size="23" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Phone</text>
+  <text x="1038.0" y="175" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">or a browser elsewhere</text>
+
+  <rect x="72" y="256" width="772" height="76" rx="14" fill="none" stroke="var(--lx-line)" stroke-width="2.5" />
+  <text x="458.0" y="305" text-anchor="middle" font-size="25" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Gateway</text>
+
+  <path d="M 265.0 196 L 265.0 256" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-machine)"/>
+  <path d="M 651.0 196 L 651.0 256" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-machine)"/>
+  <path d="M 1038.0 196 L 1038.0 282 Q 1038.0 294 1026.0 294 L 850 294" fill="none" stroke="var(--lx-blue)" stroke-width="2.5" marker-end="url(#lx-arrow-b-machine)"/>
+
+  <rect x="72" y="400" width="236" height="100" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="190.0" y="444" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Engine</text>
+  <text x="190.0" y="474" text-anchor="middle" font-size="18" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">work</text>
+  <path d="M 190.0 332 L 190.0 400" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-machine)"/>
+  <rect x="340" y="400" width="236" height="100" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="458.0" y="444" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Engine</text>
+  <text x="458.0" y="474" text-anchor="middle" font-size="18" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">home</text>
+  <path d="M 458.0 332 L 458.0 400" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-machine)"/>
+  <rect x="608" y="400" width="236" height="100" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="726.0" y="444" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Engine</text>
+  <text x="726.0" y="474" text-anchor="middle" font-size="18" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">side project</text>
+  <path d="M 726.0 332 L 726.0 400" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-machine)"/>
+
+  <rect x="72" y="560" width="772" height="82" rx="14" fill="none" stroke="var(--lx-line)" stroke-width="2.5" />
+  <path d="M 458.0 574 L 458.0 628" fill="none" stroke="var(--lx-line)" stroke-width="2"/>
+  <text x="265.0" y="610" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Postgres</text>
+  <text x="651.0" y="610" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Your files, in git</text>
+  <path d="M 190.0 500 L 190.0 560" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" marker-end="url(#lx-arrow-machine)"/>
+  <path d="M 458.0 500 L 458.0 560" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" marker-end="url(#lx-arrow-machine)"/>
+  <path d="M 726.0 500 L 726.0 560" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" marker-end="url(#lx-arrow-machine)"/>
+
+  <text x="1038.0" y="378" text-anchor="middle" font-size="13" font-weight="700" fill="var(--lx-orange)" letter-spacing="1.5">WHAT LEAVES THE MACHINE</text>
+  <rect x="916" y="400" width="244" height="270" rx="14" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" stroke-dasharray="8 8" />
+  <text x="1038.0" y="460" text-anchor="middle" font-size="21" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Models</text>
+  <text x="1038.0" y="488" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">yours, swappable</text>
+  <text x="1038.0" y="530" text-anchor="middle" font-size="21" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Outside APIs</text>
+  <text x="1038.0" y="558" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">through the proxy</text>
+  <text x="1038.0" y="600" text-anchor="middle" font-size="17" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Commands your tools run</text>
+  <text x="1038.0" y="628" text-anchor="middle" font-size="16" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">git, installs, the shell</text>
+  <path d="M 848 450 L 910 450" fill="none" stroke="var(--lx-orange)" stroke-width="2.5" marker-end="url(#lx-arrow-o-machine)" marker-start="url(#lx-arrow-o-machine)"/>
+
+</svg>

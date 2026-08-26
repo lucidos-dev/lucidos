@@ -35,7 +35,7 @@ import {
 } from '../MobileAccessPage';
 
 /** The engine's reported tailnet address for the machine it runs on. */
-const HOST_IP = '100.101.71.7';
+const HOST_IP = '100.64.0.2';
 
 // --- Concern 1: the machine running the engine -----------------------------
 

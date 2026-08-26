@@ -86,7 +86,10 @@ twin gets the shorter message.
   a forged name at `POST /api/v1/events/emit`. A test pins that every persisted
   name is now awaitable AND still un-emittable.
 - A trigger subscribing to a frame its own run emits, `TriggerCompleted` being
-  the obvious one, stops after `MAX_EVENT_TRIGGER_DEPTH` hops.
+  the obvious one, stops after `MAX_EVENT_TRIGGER_DEPTH` hops. **Superseded by
+  ADR 0137**: it is now never woken by what its own fire emits. What the cap
+  still ends is a chain across triggers, or one running through work a fire
+  handed off. The rest of this ADR stands.
 - Both carriers read the same depth. `scheduler::trigger_dispatch` answers a
   thread event and a system frame in one place, off `EmittedEvent::depth`.
   `thread_queue::executor` scopes the whole fire, so the `TriggerExecuted` the

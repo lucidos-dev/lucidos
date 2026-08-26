@@ -1260,6 +1260,11 @@ impl GatewayState {
             // Already up — no boot window to narrate, and nothing failed.
             self.clear_boot_phase(&ws.id);
             self.clear_boot_failure(&ws.id);
+            // An adopted engine is as running as a spawned one, and the spawn
+            // below is what normally publishes. Without this, a gateway that
+            // only ever adopts leaves the workspace unresolvable to a
+            // cross-workspace caller forever (ADR 0136).
+            stack::publish_ports_file(resolved_dir, ws, ws.port, self.engine_scheme());
             return Ok((prov.handle, None, Health::Healthy));
         }
 
@@ -1271,6 +1276,7 @@ impl GatewayState {
             &prov.database_url,
             self.inner.gateway_port,
             self.inner.engine_loopback,
+            self.engine_scheme(),
         )
         // Retryable: the common causes (a binary mid-rebuild, a transient
         // resource limit) clear on their own, and the budget bounds the rest.
@@ -1704,6 +1710,7 @@ impl GatewayState {
             &prov.database_url,
             self.inner.gateway_port,
             self.inner.engine_loopback,
+            self.engine_scheme(),
         ) {
             Ok(child) => {
                 let stack = StackRuntime {
@@ -2063,6 +2070,7 @@ impl GatewayState {
             &prov.database_url,
             self.inner.gateway_port,
             self.inner.engine_loopback,
+            self.engine_scheme(),
         ) {
             Ok(child) => {
                 s.engine = Some(child);

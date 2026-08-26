@@ -1400,6 +1400,8 @@ fn build_upstream_patch_thread_request(
     patch_path: &str,
 ) -> crate::engine::thread_queue::ThreadQueueRequest {
     crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+        // Stamped by `submit` from the submitting task's chain depth.
+        depth: 0,
         prompt: format!(
             "Propose my local changes to the {plugin_name} plugin upstream. \
              The patch is at data/{patch_path}."
@@ -1515,6 +1517,8 @@ fn build_setup_thread_request(
     };
 
     crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+        // Stamped by `submit` from the submitting task's chain depth.
+        depth: 0,
         prompt,
         child_thread_id: thread_id,
         parent_thread_id: None,

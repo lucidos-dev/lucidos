@@ -14,8 +14,13 @@
  * ADR 0123 keys one per workspace and reopens the set on the next launch.
  * Repointing the window you are in is the one path fighting that. A browser
  * keeps left-click as a switch, since navigating in place is the web's
- * contract. Both workspace lists come through here, so the modes, the label and
- * the URL shape cannot drift between them.
+ * contract. All three workspace lists come through here, so the modes, the
+ * label and the URL shape cannot drift between them: the gateway picker, the
+ * Lucidos menu's switcher, and its notifications group.
+ *
+ * A row may also ask for a LANDING, a view inside the workspace it opens (see
+ * `utils/workspaceLanding.ts`). It rides every mode, because a notification row
+ * wants the same window rule as every other row plus the notifications view.
  */
 
 import { openWorkspace } from '../api/client/control';
@@ -23,6 +28,7 @@ import { isMac, isStandalone, isTauri } from './platform';
 import type { ClickModifiers } from './documentNavigation';
 import { openNewTab } from './newTab';
 import { showWorkspaceInNativeWindow } from './tauri';
+import { landingHash, type WorkspaceLanding } from './workspaceLanding';
 import type { WorkspaceState } from './workspaceState';
 
 /** Where activating a row puts the workspace.
@@ -152,10 +158,11 @@ export function middleClickHandler(activate: (e: MouseEvent) => void) {
 }
 
 /** The path a workspace is served at, relative to whatever origin this client is
- *  on (ADR 0014). The same shape `openWorkspace` navigates to, so a new tab and
- *  a switch cannot disagree about where a workspace lives. */
-export function workspacePath(id: string): string {
-  return `/${encodeURIComponent(id)}/`;
+ *  on (ADR 0014), plus the fragment `landing` is delivered as. The same shape
+ *  `openWorkspace` navigates to, so a new tab and a switch cannot disagree
+ *  about where a workspace lives. */
+export function workspacePath(id: string, landing?: WorkspaceLanding): string {
+  return `/${encodeURIComponent(id)}/${landingHash(landing)}`;
 }
 
 /** The browser tab a workspace gets. Naming it is what makes a second
@@ -168,7 +175,7 @@ export function workspaceTabName(slug: string): string {
   return `lucidos-ws-${slug}`;
 }
 
-/** Put `id` where `mode` says.
+/** Put `id` where `mode` says, on the view `landing` names.
  *
  *  Only `separate` has two mechanisms. `in-place` is a replacing navigation on
  *  every client, including the desktop one, where it is the alternate a
@@ -177,22 +184,26 @@ export function workspaceTabName(slug: string): string {
  *  Under Tauri the SHELL decides which window a `separate` activation lands in.
  *  It focuses one already on the workspace, repoints a calling window that is on
  *  the picker, or opens a new one. Only the shell can see every window, so only
- *  the shell can choose.
+ *  the shell can choose. It takes the landing by NAME and composes the fragment
+ *  itself, for the reason `utils/workspaceLanding.ts` gives.
  *
- *  Rejects rather than reporting: the two call sites surface a failure
- *  differently, the picker on its own error line and the switcher as a toast.
- *  Every caller is a direct click, so a swallowed rejection would be a button
- *  that did nothing. */
-export async function openWorkspaceIn(mode: WorkspaceOpenMode, id: string): Promise<void> {
+ *  Rejects rather than reporting: the call sites surface a failure differently,
+ *  the picker on its own error line and the menu as a toast. Every caller is a
+ *  direct click, so a swallowed rejection would be a button that did nothing. */
+export async function openWorkspaceIn(
+  mode: WorkspaceOpenMode,
+  id: string,
+  landing?: WorkspaceLanding,
+): Promise<void> {
   if (mode === 'in-place') {
-    openWorkspace(id);
+    openWorkspace(id, landing);
     return;
   }
   if (isTauri()) {
-    await showWorkspaceInNativeWindow(id);
+    await showWorkspaceInNativeWindow(id, landing);
     return;
   }
-  if (!openNewTab(workspacePath(id), workspaceTabName(id))) {
+  if (!openNewTab(workspacePath(id, landing), workspaceTabName(id))) {
     throw new Error('Your browser blocked the new tab. Allow pop-ups for this site.');
   }
 }

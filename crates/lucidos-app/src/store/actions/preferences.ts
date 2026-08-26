@@ -575,16 +575,6 @@ export function currentStyleOverrides(): Record<string, string> {
   return parseStyleOverrides(preferences.value.data[STYLE_OVERRIDES_KEY]);
 }
 
-/** Set or clear one custom property. `null` removes it. Device-scoped, like
- *  theme / font / scale: tuning on the phone must not retune the desktop. */
-export function setStyleOverride(name: string, value: string | null): Promise<void> {
-  const next = { ...currentStyleOverrides() };
-  if (value === null) delete next[name];
-  else next[name] = value;
-  const serialized = serializeStyleOverrides(next);
-  return savePreference(STYLE_OVERRIDES_KEY, serialized, () => applyStyleOverrides(next), true);
-}
-
 export function clearStyleOverrides(): Promise<void> {
   return savePreference(STYLE_OVERRIDES_KEY, '{}', () => applyStyleOverrides({}), true);
 }

@@ -81,7 +81,24 @@ pub struct CapacityPolicy {
     /// value is clamped to `max_concurrent_total`.
     pub reserved_background: usize,
     pub overflow: OverflowPolicy,
+    /// How many trigger fires one event chain may make (A fires B, B's event
+    /// fires C, …). Past it an event is still stored and still reaches SSE, it
+    /// just fires no further triggers, and the user is notified.
+    ///
+    /// A spawn does not consume a hop, so this counts trigger fires and not
+    /// tasks. See [`DEFAULT_MAX_EVENT_TRIGGER_DEPTH`] for why it is 5.
+    pub max_event_trigger_depth: u32,
 }
+
+/// Default ceiling for [`CapacityPolicy::max_event_trigger_depth`].
+///
+/// It was 3 while the depth stopped at the first `tokio::spawn`. Any chain
+/// routed through spawned work was uncounted, so 3 was nominal rather than
+/// real. Counting those chains made it bite, and the release chain in the
+/// maintainer's own workspace already used three hops end to end. This is two
+/// links of headroom over the one pipeline that could be measured, with the
+/// field above for anyone who needs more.
+pub const DEFAULT_MAX_EVENT_TRIGGER_DEPTH: u32 = 5;
 
 impl Default for CapacityPolicy {
     fn default() -> Self {
@@ -95,6 +112,7 @@ impl Default for CapacityPolicy {
             max_queued_per_trigger: 25,
             reserved_background: 8,
             overflow: OverflowPolicy::DropOldest,
+            max_event_trigger_depth: DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
         }
     }
 }
@@ -507,5 +525,45 @@ mod tests {
         );
         assert_eq!(ThreadQueueKind::SubThread.as_str(), "sub-thread");
         assert_eq!(ThreadQueueKind::Cron.as_str(), "cron");
+    }
+
+    /// A policy written before the ceiling was configurable must load, and must
+    /// take the default rather than 0.
+    ///
+    /// The latest persisted `CapacityPolicyChanged` IS the policy, and every
+    /// existing one predates this field. A 0 here would cap every chain at its
+    /// first hop, so no event trigger would fire again after the upgrade.
+    #[test]
+    fn a_policy_written_before_the_ceiling_existed_takes_the_default() {
+        let legacy = serde_json::json!({
+            "max_concurrent_total": 16,
+            "max_concurrent_event_trigger": 6,
+            "max_concurrent_cron": 6,
+            "max_concurrent_sub_thread": 8,
+            "max_concurrent_coding_agent": 12,
+            "max_concurrent_per_trigger": 1,
+            "max_queued_per_trigger": 25,
+            "reserved_background": 4,
+            "overflow": "drop-oldest"
+        });
+        let policy: CapacityPolicy = serde_json::from_value(legacy).expect("legacy policy loads");
+        assert_eq!(
+            policy.max_event_trigger_depth, DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
+            "an absent ceiling means the default, never 0"
+        );
+        assert_eq!(policy.max_concurrent_total, 16, "the rest is untouched");
+    }
+
+    /// The ceiling survives the event round-trip, or a raised one would revert
+    /// to the default on the next restart.
+    #[test]
+    fn a_raised_ceiling_survives_the_persistence_round_trip() {
+        let policy = CapacityPolicy {
+            max_event_trigger_depth: 9,
+            ..CapacityPolicy::default()
+        };
+        let back: CapacityPolicy =
+            serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
+        assert_eq!(back.max_event_trigger_depth, 9);
     }
 }

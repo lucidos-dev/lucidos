@@ -88,6 +88,33 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   return nothing, and with the geometry test that phase adds for the winner.
 - **Status:** `active`
 
+### Dead-press probe on the composer's Send
+
+- **Added:** 2026-08-26
+- **Lives in:** `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, its
+  install call in `src/main.tsx`, and
+  `src/components/chat/__tests__/dead-press-probe.test.ts`.
+- **Impermanent because:** It chases one bug and produces no feature. On an iOS
+  PWA the composer's Send goes dead now and then, wherever the finger presses,
+  until the keyboard is dismissed. Three reports so far, each able to say only
+  "nothing happened", and three fixes shipped against three different readings
+  of that. No emulator reproduces it and the user cannot reproduce it on demand,
+  so the app itself has to report the next episode. The probe toasts which of
+  two families it was, with the geometry: the press never reached the button
+  (paint and hit-testing disagree), or it reached it and no path took it.
+- **Removal / resolution condition:** The next episode produces a toast, OR two
+  months pass with no report. Either way, delete the module, its install call,
+  its test, and this row. The cause the toast names goes into a plan and gets
+  fixed on its own evidence. Verify with a tree-wide search for
+  `deadPressProbe`, which must return nothing.
+- **Investigation:** none. It is narrow enough to stand alone, and the plan
+  behind it is
+  [`docs/plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md`](plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md).
+- **Status:** `active`
+- **Not a workaround.** It changes no behaviour and takes no gesture. Two real
+  fixes ship beside it in the same change, and this only decides what the user
+  is told when they fail.
+
 ### Recorded mirror-history exceptions
 
 - **Added:** 2026-08-11
@@ -728,26 +755,32 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 ### Native cursor mirroring
 
 - **Added:** 2026-08-25
-- **Lives in:** five sites, all under `crates/lucidos-app/`.
+- **Lives in:** nothing now. It occupied five sites, all under
+  `crates/lucidos-app/`, and all five are deleted:
   - `src/cursor.rs`, the keyword table and the `set_window_cursor` command
   - that command's entries in `permissions/app-ipc.json` and `generate_handler!`
   - `src/utils/nativeCursor.ts`, the reconciler, and its two test files
   - the `installNativeCursor()` call in `src/main.tsx`
   - the `setWindowCursor` wrapper in `src/utils/tauri.ts`
-- **Impermanent because:** `tao` gives its content view a cursor rect spanning
-  the whole view, carrying the window's own icon, which is the arrow. AppKit
-  re-asserts that rect as the mouse moves, while WebKit sets the cursor from CSS
-  on the same moves. Two writers, one cursor, so the glyph flickers and the
-  arrow usually wins. A trackpad reports far more movement than a mouse, which
-  is why a pane divider read as an arrow almost always. Upstream tracks it as
-  wry #175 and tao #386, both labelled blocked on upstream.
-- **Removal / resolution condition:** When the `tao` we ship stops laying an
-  arrow cursor rect over the webview, or otherwise lets WebKit own the cursor.
-  Verify by deleting the `installNativeCursor()` call, then hovering a divider,
-  a button and a text field. In the packaged app each glyph must hold still
-  under trackpad movement. Then drop every site above. ADR 0129 records the
-  design and the alternatives.
-- **Status:** active
+- **Impermanent because (the claim at the time, since refuted):** ADR 0129 held
+  that `tao` lays an arrow cursor rect over its whole content view. It held that
+  AppKit re-asserts that rect as the mouse moves, against WebKit writing the
+  cursor from CSS on the same moves. Two writers, one cursor. **None of that was
+  true**, and ADR 0134 refutes each part.
+- **Removal / resolution condition (as recorded, never reached):** when the
+  `tao` we ship let WebKit own the cursor. It was moot from the start, because
+  tao never took the cursor in the first place.
+- **Removed:** 2026-08-25. The mechanism was inert, not merely unnecessary: wry
+  evicts tao's content view, so the invalidate it triggers lands on a view
+  AppKit holds no rects for. All five sites are deleted. ADR 0134 records the
+  evidence, the real mechanism (WebKit declines under four native guards), and
+  the open question.
+- **Confirmed after removal:** a machine restart cleared the symptom in the
+  v0.30.4 bundle, which still carried the mirroring. Docker Desktop showed the
+  identical symptom over the same period. The cause is machine-wide, so do not
+  restore this mechanism if the arrow returns. ADR 0134 lists the three checks
+  to run instead.
+- **Status:** removed (2026-08-25)
 
 ---
 

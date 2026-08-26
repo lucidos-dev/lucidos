@@ -91,21 +91,9 @@ impl VertexProvider {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();
-
-                    if crate::llm::is_retryable_error(&err_str)
-                        && attempt <= crate::llm::MAX_RETRIES
-                    {
-                        let delay = crate::llm::retry_delay(attempt, 2); // longer for stream errors
-                        crate::llm::log_retry(
-                            model,
-                            &format!("Stream error: {}", err_str),
-                            attempt,
-                            delay,
-                        );
-                        tokio::time::sleep(delay).await;
+                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
                         continue;
                     }
-
                     return Err(crate::llm::with_retry_context(e, attempt).into());
                 }
             }

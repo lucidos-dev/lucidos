@@ -12,6 +12,7 @@
 
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { replaceDocument } from '../../utils/documentNavigation';
+import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
 import { gatewayErrorReason } from './gatewayError';
 
 const CONTROL = '/~/api/v1/control';
@@ -114,27 +115,25 @@ export async function deleteWorkspace(id: string, confirm: string): Promise<void
   });
 }
 
-/** Navigate the browser to a workspace (`/<slug>/`, ADR 0014).
+/** Navigate the browser to a workspace (`/<slug>/`, ADR 0014), optionally
+ *  landing on a view inside it.
  *
  *  REPLACES the current history entry rather than pushing one, so the workspace
  *  you leave does not stay on the back stack. See `utils/documentNavigation.ts`
- *  for why a flat history is what keeps a stray back gesture harmless. */
-export function openWorkspace(id: string): void {
-  replaceDocument(`/${encodeURIComponent(id)}/`);
-}
-
-/** Navigate to a workspace and land on its notifications view.
+ *  for why a flat history is what keeps a stray back gesture harmless.
  *
- *  A SAME-WINDOW replacing navigation, exactly like {@link openWorkspace}. A
- *  named `window.open` target is what `openThreadInWorkspace` uses, and it is
- *  wrong here: an installed PWA has origin-wide scope, so `/<slug>/` stays
- *  inside the app while a new window drops the user into the browser.
+ *  `landing` becomes the URL's fragment, which the target page reads in
+ *  `store/actions/hash-deeplink-router.ts`. It carries no id, so the target
+ *  needs nothing fetched before it can honour it. `utils/workspaceLanding.ts`
+ *  owns the fragment, and taking the landing by NAME is what keeps this
+ *  exhaustive: a second channel cannot be silently dropped here.
  *
- *  The bare `#notifications` hash is the landing channel the target page reads
- *  in `store/actions/hash-deeplink-router.ts`. It carries no id, so the target
- *  needs nothing fetched before it can honour it. */
-export function openWorkspaceNotifications(id: string): void {
-  replaceDocument(`/${encodeURIComponent(id)}/#notifications`);
+ *  A SAME-WINDOW navigation whatever the landing. A named `window.open` target
+ *  is what `openThreadInWorkspace` uses, and it is wrong here: an installed PWA
+ *  has origin-wide scope, so `/<slug>/` stays inside the app while a new window
+ *  drops the user into the browser. */
+export function openWorkspace(id: string, landing?: WorkspaceLanding): void {
+  replaceDocument(`/${encodeURIComponent(id)}/${landingHash(landing)}`);
 }
 
 // ── Gateway self-update (picker reload control) ────────────────────────────
@@ -174,10 +173,9 @@ export interface ReleaseOffer {
 
 /** The gateway's release check. Mirrors `release_check::ReleaseCheck::snapshot`. */
 export interface ReleaseCheck {
-  /** The machine-global preference. False stops the check entirely. */
+  /** The machine-global preference, on by default. False stops the automatic
+   *  check; the Settings button still asks by hand. */
   enabled: boolean;
-  /** Whether the first-run notice has been seen. No poll happens before it. */
-  notice_acknowledged: boolean;
   /** Whether this deployment may poll at all: installed, on a published target.
    *  False for a dev gateway, which must never appear in the numbers. */
   supported: boolean;
@@ -212,11 +210,10 @@ export async function requestUpdateCheck(force = false): Promise<ReleaseCheck> {
 }
 
 /** Write the machine-global release-check preference and return the result.
- *  Each field is optional, so the first-run notice can acknowledge without also
- *  restating `enabled`. Takes effect on the next tick, with no restart. */
+ *  The field is optional: a body that names nothing settles on the stored
+ *  value. Takes effect on the next tick, with no restart. */
 export async function setReleaseCheckConfig(body: {
   enabled?: boolean;
-  notice_acknowledged?: boolean;
 }): Promise<ReleaseCheck> {
   return controlJson<ReleaseCheck>('/release-check', {
     method: 'PUT',
@@ -348,14 +345,9 @@ async function authJson<T>(path: string, init?: RequestInit): Promise<T> {
   } catch (e) {
     throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
   }
-  if (!res.ok) {
-    let reason = res.statusText;
-    try {
-      const body = await res.json();
-      if (body?.error) reason = body.error;
-    } catch { /* non-JSON body */ }
-    throw new GatewayError(reason || `HTTP ${res.status}`, res.status);
-  }
+  // Same `{"error": …}` body every gateway handler answers with, read through
+  // the one helper `controlJson` uses. Only the status has to be kept here.
+  if (!res.ok) throw new GatewayError(await gatewayErrorReason(res), res.status);
   return res.status === 204 ? (undefined as T) : res.json();
 }
 

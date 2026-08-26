@@ -1174,3 +1174,105 @@ async fn external_repo_worktree_base_is_none_without_origin() {
         "external repo with no origin remote should branch from HEAD (None)"
     );
 }
+
+/// A staged rename under `docs/plans/` must not wedge Apply.
+///
+/// Porcelain renders it as `R  old -> new`, and the parser used to hand that
+/// whole arrow string to `git add` as one pathspec, which git cannot match. The
+/// verdict now comes from re-reading `git status`, so a failed `add` no longer
+/// decides it: the `commit` still lands the staged rename, and the tree is
+/// clean. Reporting dirty here refuses every Apply, and the state is stable, so
+/// the refusal repeats forever.
+#[tokio::test]
+async fn a_staged_docs_plan_rename_auto_commits_instead_of_wedging_apply() {
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::create_dir_all(repo.join("docs/plans"))
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("docs/plans/old.md"), "plan\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add plan"], &repo).await;
+
+    let _ = git_cmd(&["mv", "docs/plans/old.md", "docs/plans/new.md"], &repo).await;
+    let staged = git_cmd(&["status", "--porcelain"], &repo).await.unwrap();
+    let staged = String::from_utf8_lossy(&staged.stdout);
+    assert!(
+        staged.contains(" -> "),
+        "expected porcelain to render a rename with an arrow, got: {staged}"
+    );
+
+    let dirty = auto_commit_safe_files_if_dirty(&repo).await;
+    assert!(
+        !dirty,
+        "a staged docs/plans rename must auto-commit, not wedge"
+    );
+
+    let after = git_cmd(&["status", "--porcelain"], &repo).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).trim().is_empty(),
+        "tree must be clean after the auto-commit"
+    );
+}
+
+/// A rename whose destination leaves `docs/plans/` is NOT auto-committable.
+///
+/// Both sides of the arrow are weighed. The source path alone cannot vouch for
+/// a file landing where the force-checkout is free to discard it.
+#[tokio::test]
+async fn a_rename_out_of_docs_plans_is_reported_dirty() {
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::create_dir_all(repo.join("docs/plans"))
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("docs/plans/old.md"), "plan\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add plan"], &repo).await;
+
+    let _ = git_cmd(&["mv", "docs/plans/old.md", "escaped.md"], &repo).await;
+
+    let dirty = auto_commit_safe_files_if_dirty(&repo).await;
+    assert!(
+        dirty,
+        "a rename landing outside docs/plans must be reported dirty, never auto-committed"
+    );
+}
+
+/// A staged rename beside an ordinary edit auto-commits both.
+///
+/// The rename's source path is gone. One unmatched pathspec aborts the whole
+/// `git add`, so passing it would strand the edit beside it and refuse an
+/// Apply this function exists to clear.
+#[tokio::test]
+async fn a_rename_beside_an_edit_stages_both() {
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::create_dir_all(repo.join("docs/plans"))
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("docs/plans/old.md"), "plan\n")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("docs/plans/other.md"), "other\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add plans"], &repo).await;
+
+    let _ = git_cmd(&["mv", "docs/plans/old.md", "docs/plans/new.md"], &repo).await;
+    tokio::fs::write(repo.join("docs/plans/other.md"), "edited\n")
+        .await
+        .unwrap();
+
+    let dirty = auto_commit_safe_files_if_dirty(&repo).await;
+    assert!(!dirty, "a rename beside an edit must auto-commit both");
+
+    let after = git_cmd(&["status", "--porcelain"], &repo).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).trim().is_empty(),
+        "tree must be clean: {}",
+        String::from_utf8_lossy(&after.stdout)
+    );
+}

@@ -10,14 +10,19 @@ impl LucidosEngine {
     /// `actor` is the originating `MessageOrigin` (HTTP handler resolves it via
     /// `user_actor_resolved`); engine-internal callers (LLM tool, scheduler)
     /// pass `None`.
+    ///
+    /// `emitting_trigger_id` is the fire this emit belongs to, stated rather
+    /// than read off the ambient scope. An HTTP caller has no ambient scope at
+    /// all, so it hands over what its origin token proved (ADR 0137).
     pub async fn emit_domain_event(
         &self,
         event_type: &str,
         payload: serde_json::Value,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
+        emitting_trigger_id: Option<String>,
     ) -> Result<uuid::Uuid, Box<dyn std::error::Error + Send + Sync>> {
         let result = self
-            .emit_domain_event_inner(event_type, payload, false, actor)
+            .emit_domain_event_inner(event_type, payload, false, actor, emitting_trigger_id)
             .await?;
         Ok(result
             .expect("non-transient DomainEvent always returns EmitResult")
@@ -27,13 +32,18 @@ impl LucidosEngine {
     /// Broadcast a domain event on SSE without writing it to the events table.
     /// Used for high-churn coordination signals (heartbeats, presenter↔remote
     /// state) where the audit trail isn't valuable.
+    ///
+    /// `emitting_trigger_id` means what it does on [`Self::emit_domain_event`].
+    /// A transient frame reaches the trigger matcher too, so it needs the same
+    /// marker.
     pub async fn broadcast_transient_domain_event(
         &self,
         event_type: &str,
         payload: serde_json::Value,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
+        emitting_trigger_id: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.emit_domain_event_inner(event_type, payload, true, actor)
+        self.emit_domain_event_inner(event_type, payload, true, actor, emitting_trigger_id)
             .await?;
         Ok(())
     }
@@ -44,6 +54,7 @@ impl LucidosEngine {
         payload: serde_json::Value,
         transient: bool,
         actor: Option<crate::engine::thread_events::MessageOrigin>,
+        emitting_trigger_id: Option<String>,
     ) -> Result<
         Option<crate::engine::event_bus::EmitResult>,
         Box<dyn std::error::Error + Send + Sync>,
@@ -54,15 +65,18 @@ impl LucidosEngine {
         crate::core::event_subscription::validate_emittable_event_type(event_type)?;
         let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
         self.event_bus
-            .emit(crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::DomainEvent {
-                    event_type: event_type.to_string(),
-                    payload,
-                    depth,
-                    transient,
-                    actor,
-                },
-            ))
+            .emit_as_trigger(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::DomainEvent {
+                        event_type: event_type.to_string(),
+                        payload,
+                        depth,
+                        transient,
+                        actor,
+                    },
+                ),
+                emitting_trigger_id,
+            )
             .await
     }
 

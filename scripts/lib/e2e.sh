@@ -244,6 +244,21 @@ ensure_workspace_running() {
     # After allocate_ports, VITE_PORT is the engine's port (see swap_ports).
     local engine_port="$VITE_PORT"
 
+    # ── Frontend (ADR 0014: the engine serves the built dist/ directly) ──
+    # No Vite dev server / proxy. swap_ports exports LUCIDOS_STATIC_DIR, and the
+    # engine serves dist/ at / (base path '', no gateway). The e2e run tests a
+    # fixed build, so a one-shot `vite build` suffices, as long as it is current
+    # (see ensure_frontend_built).
+    #
+    # It runs BEFORE the engine starts, and that order is load-bearing. At boot
+    # the engine pins the dist/ it finds into a private snapshot and serves THAT
+    # (api/frontend_snapshot.rs), so a build landing afterwards never reaches a
+    # test: the suite passes or fails on the PREVIOUS build, silently. It only
+    # bites where dist/ is stale at boot, which is any worktree, since the
+    # build-watch keeps the main checkout current. A reused engine (--no-reset)
+    # already holds a pin, and only a restart re-takes it.
+    ensure_frontend_built || return 1
+
     # ── Engine ──
     if curl -sk "${PROTO}://localhost:${engine_port}/api/v1/health" >/dev/null 2>&1; then
         echo "Engine already running on port $engine_port"
@@ -256,13 +271,6 @@ ensure_workspace_running() {
         swap_ports
         start_engine
     fi
-
-    # ── Frontend (ADR 0014: the engine serves the built dist/ directly) ──
-    # No Vite dev server / proxy. swap_ports exported LUCIDOS_STATIC_DIR, so the
-    # legacy engine started above serves dist/ at / (base path '', no gateway).
-    # The e2e run tests a fixed build, so a one-shot `vite build` suffices — but
-    # only a build that is actually current (see ensure_frontend_built).
-    ensure_frontend_built || return 1
 
     # Final check: the engine must serve the built frontend at / (retry up to 30s)
     echo -n "Verifying engine serves the frontend"

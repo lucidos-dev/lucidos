@@ -480,7 +480,9 @@ async fn deliver(
     };
     match state
         .engine
-        .emit_domain_event(&hook.event_type, payload, Some(actor))
+        // No trigger: a webhook delivery arrives from outside the workspace, so
+        // no fire of ours emitted it and it must wake every subscriber.
+        .emit_domain_event(&hook.event_type, payload, Some(actor), None)
         .await
     {
         Ok(event_id) => {

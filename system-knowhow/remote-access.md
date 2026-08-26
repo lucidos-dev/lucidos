@@ -250,6 +250,20 @@ device: phones, tablets, and other laptops just work, on or off the LAN. The
 gateway can stay bound to loopback, because `serve` proxies from this machine to
 `127.0.0.1`.
 
+**A second gateway needs a second port.** Serve binds 443, 8443 or 10000, and
+443 belongs to whichever gateway claimed it. So a machine running the packaged
+app beside a dev checkout puts the dev one somewhere else:
+
+```bash
+tailscale serve --bg --https=10000 https+insecure://127.0.0.1:5251
+```
+
+`https+insecure` because that gateway terminates its own TLS with a certificate
+Tailscale has no reason to trust. Serve re-terminates with the real one, which
+is the whole point: an iOS home-screen app keeps a pairing across relaunches on
+a trusted certificate and loses it on an untrusted one. Lucidos probes all
+three ports, so Connect URLs and the pairing QR find the route wherever it is.
+
 **Prerequisite the agent cannot satisfy: Serve, and tailnet HTTPS, are
 account-level and enabled in a browser.** Only a tailnet admin can turn them on.
 This shows up in two different ways depending on which layer you hit first, and

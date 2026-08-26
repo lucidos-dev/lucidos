@@ -29,7 +29,7 @@ beforeEach(() => {
 
 describe('initiateEngineRestart surfaces spawn failures', () => {
   it('shows error toast and clears restarting flag when restart API returns ApiError', async () => {
-    const reason = 'Script not found: /Users/k/old-path/scripts/web-dev.sh';
+    const reason = 'Script not found: /Users/me/old-path/scripts/web-dev.sh';
     mockRestartEngine.mockRejectedValueOnce(new ApiError(500, reason));
 
     await initiateEngineRestart();

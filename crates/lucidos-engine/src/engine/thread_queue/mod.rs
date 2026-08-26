@@ -50,6 +50,7 @@ pub mod executor;
 pub use executor::{ExecutableEntry, ThreadQueueExecutor};
 pub use policy::{
     AdmissionCounts, AdmissionDecision, CapacityPolicy, OverflowPolicy, ThreadQueueKind,
+    DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
 };
 pub(crate) use request::truncate_summary;
 pub use request::ThreadQueueRequest;
@@ -106,6 +107,13 @@ struct ActiveSlot {
     kind: ThreadQueueKind,
     trigger_id: Option<String>,
     completion_tx: Option<oneshot::Sender<()>>,
+    /// The thread this entry's chain depth is registered under, so `complete`
+    /// can drop the registration. `None` until the work has a thread: a trigger
+    /// fire creates its own, and binds it later through `record_entry_thread`.
+    chain_thread_id: Option<Uuid>,
+    /// The entry's chain depth, kept so a late thread binding can register at
+    /// it without re-reading the request.
+    chain_depth: u32,
 }
 
 /// One admitted user-initiated response occupying the pool. In-memory only —
@@ -484,10 +492,15 @@ impl ThreadQueue {
     /// otherwise the entry waits in the queue. Never blocks on execution.
     pub async fn submit(
         self: &Arc<Self>,
-        request: ThreadQueueRequest,
+        mut request: ThreadQueueRequest,
         actor: Option<MessageOrigin>,
         cancel: Option<CancellationToken>,
     ) -> SubmitOutcome {
+        // Before anything else, so the chain depth travels ON the request
+        // rather than in a task-local the spawn below would drop. Read here
+        // because a spawn submit is always awaited inline from the spawning
+        // task, which is the task that owns the chain.
+        request.stamp_caller_depth(crate::scheduler::user_tasks::current_event_trigger_depth());
         let kind = request.kind();
         let trigger_id = request.trigger_id().map(str::to_string);
         let trigger_name = trigger_id.as_deref().and_then(|t| self.trigger_name(t));
@@ -521,6 +534,8 @@ impl ThreadQueue {
                             kind,
                             trigger_id: trigger_id.clone(),
                             completion_tx: entry.completion_tx.take(),
+                            chain_thread_id: entry.thread_id,
+                            chain_depth: entry.request.depth(),
                         },
                     );
                 }
@@ -533,11 +548,16 @@ impl ThreadQueue {
 
         match decision {
             AdmissionDecision::Admit => {
-                if let Some(executor) = self.executor.get() {
-                    executor.prepare(&mut entry.request).await;
-                }
+                self.prepare_entry(&mut entry.request).await;
                 self.emit_queued(&entry, false, actor).await;
-                self.emit_admitted(entry_id, entry.thread_id, None).await;
+                self.emit_admitted(
+                    entry_id,
+                    entry.thread_id,
+                    entry.trigger_id.clone(),
+                    entry.request.depth(),
+                    None,
+                )
+                .await;
                 self.spawn_execution(entry);
                 SubmitOutcome {
                     entry_id,
@@ -787,12 +807,33 @@ impl ThreadQueue {
             self.emit_changed().await;
         }
         for mut entry in to_admit {
-            if let Some(executor) = self.executor.get() {
-                executor.prepare(&mut entry.request).await;
-            }
-            self.emit_admitted(entry.id, entry.thread_id, None).await;
+            self.prepare_entry(&mut entry.request).await;
+            self.emit_admitted(
+                entry.id,
+                entry.thread_id,
+                entry.trigger_id.clone(),
+                entry.request.depth(),
+                None,
+            )
+            .await;
             self.spawn_execution(entry);
         }
+    }
+
+    /// Run the executor's admission hook at the request's chain depth.
+    ///
+    /// `prepare` emits: a sub-thread's eager `MessageReceived` goes out here.
+    /// It runs on three different tasks, the submitter's, the drainer's and
+    /// `run_now`'s, and only the first of those is inside the fire. Scoping the
+    /// hook makes the emitted event carry the same depth whichever admitted it.
+    async fn prepare_entry(&self, request: &mut ThreadQueueRequest) {
+        let Some(executor) = self.executor.get() else {
+            return;
+        };
+        let depth = request.depth();
+        crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+            .scope(depth, executor.prepare(request))
+            .await;
     }
 
     /// Background admission scan (drain phases 1 & 3). Admits queued background
@@ -858,6 +899,8 @@ impl ThreadQueue {
                                 kind: e.kind,
                                 trigger_id: e.trigger_id.clone(),
                                 completion_tx: e.completion_tx.take(),
+                                chain_thread_id: e.thread_id,
+                                chain_depth: e.request.depth(),
                             },
                         );
                         to_admit.push(e);
@@ -919,14 +962,21 @@ impl ThreadQueue {
                     kind: entry.kind,
                     trigger_id: entry.trigger_id.clone(),
                     completion_tx: entry.completion_tx.take(),
+                    chain_thread_id: entry.thread_id,
+                    chain_depth: entry.request.depth(),
                 },
             );
             entry
         };
-        if let Some(executor) = self.executor.get() {
-            executor.prepare(&mut entry.request).await;
-        }
-        self.emit_admitted(entry.id, entry.thread_id, actor).await;
+        self.prepare_entry(&mut entry.request).await;
+        self.emit_admitted(
+            entry.id,
+            entry.thread_id,
+            entry.trigger_id.clone(),
+            entry.request.depth(),
+            actor,
+        )
+        .await;
         self.spawn_execution(entry);
         Ok(())
     }
@@ -968,16 +1018,89 @@ impl ThreadQueue {
         let Some(mut slot) = slot else {
             return; // double-complete or unknown id — nothing to release
         };
+        // The chain depth lasts as long as the work, not as long as the thread:
+        // a user who Continues this thread later starts a fresh chain at 0.
+        // Only THIS entry's binding goes, so a sibling entry on the same thread
+        // keeps its own.
+        if let Some(tid) = slot.chain_thread_id {
+            crate::scheduler::user_tasks::forget_chain_depth(tid, entry_id);
+        }
         if let Some(tx) = slot.completion_tx.take() {
             let _ = tx.send(());
         }
-        self.bus
-            .emit_or_log(
+        // At the entry's depth, for the same reason it states its trigger: this
+        // frame closes that fire, and it goes out on the sibling task that
+        // joined the work rather than on the fire's own.
+        self.at_chain_depth(
+            slot.chain_depth,
+            self.bus.emit_or_log_as_trigger(
                 BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
                 "[ThreadQueue] ThreadQueueCompleted",
-            )
-            .await;
+                slot.trigger_id.clone(),
+            ),
+        )
+        .await;
         self.drain().await;
+    }
+
+    /// Bind the thread a trigger fire just created to its admitted entry.
+    ///
+    /// A cron / event-trigger entry has no thread at submit time: the fire
+    /// creates one only while it executes, so its `ThreadQueueAdmitted` went
+    /// out with a `None` thread id and the row stayed unbound. An unbound row
+    /// is what left [`Self::recover_persisted_entries`] unable to tell a fire
+    /// that already started from one that never did. It re-ran the whole
+    /// trigger after a restart. See
+    /// `docs/plans/2026-08-25-thread-queue-boot-handoff-for-trigger-fires.md`.
+    ///
+    /// Re-emitting `ThreadQueueAdmitted` is the carrier: the projection already
+    /// COALESCEs the id onto the row, holds the status at `admitted`, and keeps
+    /// the original `admitted_at`. Best-effort like every other queue emit, so
+    /// an entry already completed or dropped simply matches no row.
+    pub async fn record_entry_thread(&self, entry_id: Uuid, thread_id: Uuid) {
+        // A trigger fire's thread appears only now, so this is also where its
+        // chain depth gets bound. Everything the fire's thread emits from a
+        // task the executor's scope cannot reach resolves through that binding.
+        let (trigger_id, chain_depth) = {
+            let mut state = self.state.lock().await;
+            match state.active.get_mut(&entry_id) {
+                Some(slot) => {
+                    slot.chain_thread_id = Some(thread_id);
+                    crate::scheduler::user_tasks::register_chain_depth(
+                        thread_id,
+                        entry_id,
+                        slot.chain_depth,
+                    );
+                    (slot.trigger_id.clone(), slot.chain_depth)
+                }
+                None => (None, 0),
+            }
+        };
+        self.emit_admitted(entry_id, Some(thread_id), trigger_id, chain_depth, None)
+            .await;
+    }
+
+    /// Bind a thread's events to this work's chain depth, for the emits the
+    /// executor's task-local scope cannot reach (see
+    /// `scheduler::user_tasks::register_chain_depth`).
+    fn register_chain_thread(&self, entry_id: Uuid, thread_id: Option<Uuid>, depth: u32) {
+        if let Some(tid) = thread_id {
+            crate::scheduler::user_tasks::register_chain_depth(tid, entry_id, depth);
+        }
+    }
+
+    /// Run an emit at `depth`, for a queue frame that goes out on a task the
+    /// fire does not own.
+    ///
+    /// The same reasoning that makes those frames state their trigger owner
+    /// (`docs/adr/0137-a-trigger-never-wakes-itself.md`) applies to the depth.
+    /// `ThreadQueueCompleted` comes from the sibling task that joins the work,
+    /// so the ambient scope reads 0 there. Two triggers subscribed to it would
+    /// then wake each other at depth 1 forever, with nothing to end it.
+    async fn at_chain_depth<F: std::future::Future>(&self, depth: u32, fut: F) -> F::Output {
+        crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+            .scope(depth, fut)
+            .await
     }
 
     // ---- User-initiated work (preempting, prioritized, counted) ----
@@ -1325,6 +1448,14 @@ impl ThreadQueue {
     /// Spawn an admitted entry's work and complete the slot when it resolves
     /// — even on panic (the JoinHandle surfaces it), so a crashed executor
     /// can never leak a capacity slot.
+    ///
+    /// **The spawn is where the chain used to end.** `EVENT_TRIGGER_DEPTH`
+    /// follows an await chain and not a `tokio::spawn`, so execution read 0
+    /// while the `prepare` beside it read the fire's depth. Re-establishing the
+    /// scope here, from the value the request carries, is what lets
+    /// the depth cap end a loop that passes through spawned work.
+    /// Work that spawns AGAIN inside itself is covered by the per-thread
+    /// registration below, not by this scope.
     fn spawn_execution(self: &Arc<Self>, entry: QueueEntry) {
         let entry_id = entry.id;
         let Some(executor) = self.executor.get().cloned() else {
@@ -1336,13 +1467,18 @@ impl ThreadQueue {
             );
             return;
         };
+        let depth = entry.request.depth();
+        self.register_chain_thread(entry.id, entry.thread_id, depth);
         let executable = ExecutableEntry {
             id: entry.id,
             request: entry.request,
             cancel: entry.cancel,
         };
         let mgr = self.clone();
-        let work = tokio::spawn(async move { executor.execute(executable).await });
+        let work = tokio::spawn(
+            crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+                .scope(depth, async move { executor.execute(executable).await }),
+        );
         tokio::spawn(async move {
             if let Err(join_err) = work.await {
                 if join_err.is_panic() {
@@ -1364,11 +1500,11 @@ impl ThreadQueue {
     /// per-trigger FIFO holds across the restart:
     ///
     /// - `queued` rows load back into the in-memory queue (no re-emit).
-    /// - `admitted` rows are work that died with the previous process:
-    ///   trigger kinds re-queue (re-fire semantics, same as missed-cron
-    ///   catch-up); spawn kinds whose thread already materialized complete
-    ///   instead — the thread-level recovery (CC auto-resume / chat settle)
-    ///   owns them from here.
+    /// - `admitted` rows are work the previous process had already started.
+    ///   One rule covers all four kinds: an entry whose `thread_id` names a
+    ///   live `thread_summaries` row completes here, and thread-level recovery
+    ///   (CC auto-resume / chat settle) owns it from there. An entry with no
+    ///   thread re-queues, because nothing ran.
     ///
     /// Draining starts separately via [`Self::start_draining`] once trigger
     /// configs are loaded.
@@ -1407,10 +1543,14 @@ impl ThreadQueue {
         );
 
         // Cron coalescing on recovery: rows arrive oldest-first (ORDER BY
-        // sequence). The first cron row of a trigger is kept; any later one is a
-        // duplicate scheduled fire (a restart storm re-queues the in-flight fire
-        // each boot) — drop it so reboots are cron-idempotent and can't re-stack
-        // a backlog. Tracks trigger_ids already loaded this sweep.
+        // sequence). The first cron row of a trigger to go BACK IN THE QUEUE is
+        // kept. Any later one is a duplicate scheduled fire, so drop it and
+        // reboots stay cron-idempotent.
+        //
+        // A trigger enters this set only where an entry is actually pushed
+        // below, never on the handoff path. A handed-off fire already ran, so
+        // letting it consume the trigger's slot would drop a sibling row that
+        // never ran and still owes a run.
         let mut seen_cron: HashSet<String> = HashSet::new();
 
         for row in rows {
@@ -1430,12 +1570,25 @@ impl ThreadQueue {
             let kind = request.kind();
             debug_assert_eq!(kind.as_str(), row.kind);
 
+            // Deliberately NOT re-registering the chain depth here. A row that
+            // hands off below completes without an in-memory slot, so nothing
+            // would ever clear the binding. It would outlive the work, and a
+            // later user Continue on that thread would inherit a chain it has
+            // nothing to do with. A row that RE-QUEUES needs no help: it
+            // registers when it is admitted. What survives the restart is the
+            // depth on the request, which is the half that has to.
+            //
+            // So work handed to thread recovery resumes at depth 0. That is
+            // safe because the resume is gated on cause (CLAUDE.md § Engine
+            // Statelessness): a crash leaves the manual Continue button, so a
+            // loop cannot restart itself into a fresh budget.
             if kind == ThreadQueueKind::Cron {
-                if let Some(tid) = row.trigger_id.clone() {
-                    if !seen_cron.insert(tid) {
-                        // Already loaded a fire for this cron trigger — this row
-                        // is redundant. Emit ThreadQueueDropped to clear its
-                        // projection row; don't reload it into memory.
+                if let Some(tid) = row.trigger_id.as_deref() {
+                    if seen_cron.contains(tid) {
+                        // A fire for this cron trigger is already back in the
+                        // queue, so this row is redundant. Emit
+                        // ThreadQueueDropped to clear its projection row; don't
+                        // reload it into memory.
                         self.emit_dropped(
                             row.id,
                             "coalesced on recovery — duplicate scheduled fire",
@@ -1450,40 +1603,70 @@ impl ThreadQueue {
             let requeue = if row.status == "queued" {
                 false // already queued — load silently, keep original queued_at
             } else {
-                match kind {
-                    ThreadQueueKind::EventTrigger | ThreadQueueKind::Cron => true,
-                    ThreadQueueKind::SubThread | ThreadQueueKind::CodingAgent => {
-                        let thread_exists = match row.thread_id {
-                            Some(tid) => sqlx::query_scalar::<_, bool>(
-                                "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
-                            )
-                            .bind(tid)
-                            .fetch_one(&self.pool)
-                            .await
-                            .unwrap_or(false),
-                            None => false,
-                        };
-                        if thread_exists {
-                            // The spawn happened — thread-level recovery owns it.
-                            log!(
-                                "[ThreadQueue] Entry {} ({}) already materialized thread {:?} — handing off to thread recovery",
-                                row.id,
-                                kind.as_str(),
-                                row.thread_id
-                            );
-                            self.bus
-                                .emit_or_log(
-                                    BusEvent::System(SystemEvent::ThreadQueueCompleted {
-                                        entry_id: row.id,
-                                    }),
-                                    "[ThreadQueue] ThreadQueueCompleted (boot handoff)",
-                                )
-                                .await;
-                            continue;
+                // An `admitted` row is work the dead process had already
+                // started. Whether re-running it would DUPLICATE that work
+                // turns on one question, the same for every kind: did a thread
+                // materialize? A spawn kind binds its thread at submit time,
+                // and a trigger fire binds one as soon as it mints one (see
+                // `record_entry_thread`). So the column answers for all four.
+                let thread_exists = match row.thread_id {
+                    Some(tid) => {
+                        match sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
+                        )
+                        .bind(tid)
+                        .fetch_one(&self.pool)
+                        .await
+                        {
+                            Ok(exists) => exists,
+                            // A probe that could not run is UNKNOWN, so name the
+                            // side we fall to. Re-queuing risks a duplicate run
+                            // the user can see and stop. Handing off on a
+                            // transient read error abandons the fire in silence,
+                            // with nothing in the inbox to act on.
+                            Err(e) => {
+                                log!(
+                                    "[ThreadQueue] thread_summaries probe failed for entry {} (thread {}): {}, re-queuing",
+                                    row.id,
+                                    tid,
+                                    e
+                                );
+                                false
+                            }
                         }
-                        true
                     }
+                    None => false,
+                };
+                if thread_exists {
+                    // The work happened, so thread-level recovery owns it. This
+                    // is the ONLY thing standing between a trigger fire that
+                    // parked on a question and a second identical run of it:
+                    // parking emits no terminal event, so nothing ever
+                    // completed the entry and the row is still `admitted`.
+                    log!(
+                        "[ThreadQueue] Entry {} ({}) already materialized thread {:?}, handing off to thread recovery",
+                        row.id,
+                        kind.as_str(),
+                        row.thread_id
+                    );
+                    self.bus
+                        .emit_or_log_as_trigger(
+                            BusEvent::System(SystemEvent::ThreadQueueCompleted {
+                                entry_id: row.id,
+                            }),
+                            "[ThreadQueue] ThreadQueueCompleted (boot handoff)",
+                            row.trigger_id.clone(),
+                        )
+                        .await;
+                    continue;
                 }
+                // No thread: the process died between admission and thread
+                // creation, so nothing ran and there is nothing to hand off
+                // to. Re-queue. This case is what keeps the guard above from
+                // being over-eager. It is also where a **script** trigger
+                // permanently lives, since a script fire creates no thread at
+                // all. Re-firing it is the existing crash contract.
+                true
             };
 
             let entry = QueueEntry {
@@ -1500,6 +1683,11 @@ impl ThreadQueue {
             };
             if requeue {
                 self.emit_queued(&entry, true, None).await;
+            }
+            if kind == ThreadQueueKind::Cron {
+                if let Some(tid) = entry.trigger_id.clone() {
+                    seen_cron.insert(tid);
+                }
             }
             self.state.lock().await.queued.push_back(entry);
         }
@@ -1558,6 +1746,17 @@ impl ThreadQueue {
 
     // ---- Event emission helpers ----
 
+    // An entry's three lifecycle frames state whose fire they belong to, taken
+    // from the entry itself. None of them can read it off the ambient scope.
+    // `ThreadQueued` runs before the fire, and `ThreadQueueCompleted` on the
+    // sibling task that joins it. A sub-thread the fire submits is submitted
+    // inline, so it would inherit a marker it must not have. See
+    // `EventBus::emit_as_trigger`.
+    //
+    // `ThreadQueueDropped` passes `None` on purpose. A dropped entry never
+    // fired, so it emitted nothing and there is no self-wake to suppress. The
+    // trigger should still hear that a fire of its was coalesced away.
+
     async fn emit_queued(&self, entry: &QueueEntry, requeued: bool, actor: Option<MessageOrigin>) {
         let request_json = match serde_json::to_value(&entry.request) {
             Ok(v) => v,
@@ -1566,8 +1765,10 @@ impl ThreadQueue {
                 return;
             }
         };
-        self.bus
-            .emit_or_log(
+        let depth = entry.request.depth();
+        self.at_chain_depth(
+            depth,
+            self.bus.emit_or_log_as_trigger(
                 BusEvent::System(SystemEvent::ThreadQueued {
                     entry_id: entry.id,
                     kind: entry.kind,
@@ -1580,37 +1781,45 @@ impl ThreadQueue {
                     actor,
                 }),
                 "[ThreadQueue] ThreadQueued",
-            )
-            .await;
+                entry.trigger_id.clone(),
+            ),
+        )
+        .await;
     }
 
     async fn emit_admitted(
         &self,
         entry_id: Uuid,
         thread_id: Option<Uuid>,
+        trigger_id: Option<String>,
+        depth: u32,
         actor: Option<MessageOrigin>,
     ) {
-        self.bus
-            .emit_or_log(
+        self.at_chain_depth(
+            depth,
+            self.bus.emit_or_log_as_trigger(
                 BusEvent::System(SystemEvent::ThreadQueueAdmitted {
                     entry_id,
                     thread_id,
                     actor,
                 }),
                 "[ThreadQueue] ThreadQueueAdmitted",
-            )
-            .await;
+                trigger_id,
+            ),
+        )
+        .await;
     }
 
     async fn emit_dropped(&self, entry_id: Uuid, reason: &str, actor: Option<MessageOrigin>) {
         self.bus
-            .emit_or_log(
+            .emit_or_log_as_trigger(
                 BusEvent::System(SystemEvent::ThreadQueueDropped {
                     entry_id,
                     reason: reason.to_string(),
                     actor,
                 }),
                 "[ThreadQueue] ThreadQueueDropped",
+                None,
             )
             .await;
     }

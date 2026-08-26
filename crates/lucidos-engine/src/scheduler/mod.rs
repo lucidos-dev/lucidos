@@ -80,6 +80,10 @@ pub(crate) struct TriggerDispatch {
     pub(crate) payload: serde_json::Value,
     /// The depth to dispatch at, so `MAX_EVENT_TRIGGER_DEPTH` engages.
     pub(crate) depth: u32,
+    /// Which trigger's fire emitted this, so the matcher can drop it from the
+    /// matches. Always read off the frame, including for a domain event, which
+    /// reads its depth off the variant instead. See the arm's own comment.
+    pub(crate) emitting_trigger_id: Option<String>,
     /// The thread the firing event lives on. `None` for a domain event, which
     /// belongs to no thread.
     pub(crate) origin_thread_id: Option<uuid::Uuid>,
@@ -105,6 +109,10 @@ pub(crate) struct TriggerDispatch {
 /// `BusEvent::Thread` carrier. A trigger subscribed to an event its own run
 /// emits then re-fired without bound. A domain event reads the depth off its
 /// own variant, the persisted value a replay reconstructs.
+///
+/// **The emitting trigger comes off the frame, in every arm.** The cap above
+/// only ends that chain after three fires. Naming the trigger lets the matcher
+/// drop it outright, so it is never woken by its own fire.
 pub(crate) fn trigger_dispatch(
     emitted: &crate::engine::event_bus::EmittedEvent,
 ) -> Option<TriggerDispatch> {
@@ -124,16 +132,22 @@ pub(crate) fn trigger_dispatch(
                 event_type: event.event_type().to_string(),
                 payload: matchable_thread_payload(event, *thread_id),
                 depth: emitted.depth,
+                emitting_trigger_id: emitted.emitting_trigger_id.clone(),
                 origin_thread_id: Some(*thread_id),
             })
         }
         // A domain event reads its depth off the variant, not off the frame.
         // That copy is persisted, so a replay reconstructs it. Everything else
         // about it is the arm below.
+        //
+        // The emitting trigger is the exception: it comes off the frame here
+        // too, because there is no persisted copy to read. See
+        // `docs/adr/0137-a-trigger-never-wakes-itself.md`.
         BusEvent::System(se @ SystemEvent::DomainEvent { depth, .. }) => Some(TriggerDispatch {
             event_type: se.stored_event_type().to_string(),
             payload: matchable_system_payload(se),
             depth: *depth,
+            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
             origin_thread_id: None,
         }),
         BusEvent::System(se) if is_subscribable_system_event(se) => Some(TriggerDispatch {
@@ -142,6 +156,7 @@ pub(crate) fn trigger_dispatch(
             event_type: se.stored_event_type().to_string(),
             payload: matchable_system_payload(se),
             depth: emitted.depth,
+            emitting_trigger_id: emitted.emitting_trigger_id.clone(),
             origin_thread_id: None,
         }),
         BusEvent::System(_) => None,
@@ -862,6 +877,7 @@ impl SchedulerManager {
                                 &dispatch.event_type,
                                 &dispatch.payload,
                                 dispatch.depth,
+                                dispatch.emitting_trigger_id.as_deref(),
                                 dispatch.origin_thread_id,
                                 Some(emitted.event_id),
                                 &trigger_configs,
@@ -1343,7 +1359,7 @@ mod tests {
     use crate::engine::event_bus::{BusEvent, EmittedEvent, SystemEvent};
     use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-    /// One broadcast frame, at a stated chain depth.
+    /// One broadcast frame, at a stated chain depth, emitted by no trigger.
     fn emitted(typed: BusEvent, depth: u32) -> EmittedEvent {
         EmittedEvent {
             event_id: uuid::Uuid::new_v4(),
@@ -1352,6 +1368,7 @@ mod tests {
             typed,
             aggregate: None,
             depth,
+            emitting_trigger_id: None,
         }
     }
 
@@ -1520,6 +1537,44 @@ mod tests {
         );
         let dispatch = trigger_dispatch(&frame).expect("TriggerExecuted is persisted");
         assert_eq!(dispatch.depth, 2, "the fire's depth, not zero");
+    }
+
+    /// All three carriers read the emitting trigger off the frame, the domain
+    /// arm included, which takes its depth off the variant instead. Miss one
+    /// and a trigger subscribed to that carrier still wakes itself.
+    #[test]
+    fn every_carrier_reports_the_trigger_whose_fire_emitted_it() {
+        let carriers = [
+            thread_frame(uuid::Uuid::new_v4(), response_generated(), 0),
+            emitted(
+                BusEvent::System(SystemEvent::DomainEvent {
+                    event_type: "BuildObserved".into(),
+                    payload: serde_json::json!({}),
+                    depth: 0,
+                    transient: false,
+                    actor: None,
+                }),
+                0,
+            ),
+            emitted(
+                BusEvent::System(SystemEvent::TriggerExecuted {
+                    trigger_id: "t-1".into(),
+                    payload: serde_json::json!({}),
+                }),
+                0,
+            ),
+        ];
+
+        for mut frame in carriers {
+            frame.emitting_trigger_id = Some("t-1".into());
+            let dispatch = trigger_dispatch(&frame).expect("a trigger carrier");
+            assert_eq!(
+                dispatch.emitting_trigger_id.as_deref(),
+                Some("t-1"),
+                "the {} carrier dropped the emitter",
+                dispatch.event_type
+            );
+        }
     }
 
     #[test]

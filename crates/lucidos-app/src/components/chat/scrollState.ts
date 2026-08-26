@@ -1,4 +1,5 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
+import { SCROLLABLE_SLACK_PX } from './threadWindow';
 import { prefersReducedMotion } from '../../utils/platform';
 import { USER_SCROLL_WINDOW_MS } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
@@ -727,12 +728,16 @@ function isAtLiveEdge(el: HTMLElement): boolean {
 /** Can this transcript be scrolled at all? One definition, read by the up
  *  chevron (`notAtTop`) and the mobile title fade (`scrolledFromTop`). A
  *  transcript with a hair of overflow, from a border or a rounded line height,
- *  then answers the same for both. That is what the 10px absorbs.
+ *  then answers the same for both. That is what the slack absorbs.
+ *
+ *  The slack comes from `threadWindow`, whose `windowNeedsFill` grows the render
+ *  window until this is true. A literal here and another there would let the
+ *  fill stop short of a transcript the chevron still calls unscrollable.
  *
  *  The DOWN chevron deliberately asks something else, `isAtLiveEdge`'s 2px. It
  *  describes where the reader IS, not whether the thread can move at all. */
 function isScrollable(el: HTMLElement): boolean {
-  return el.scrollHeight > el.clientHeight + 10;
+  return el.scrollHeight > el.clientHeight + SCROLLABLE_SLACK_PX;
 }
 
 /* ── Held scrolls, and how the reader's gesture is told from ours ────────────

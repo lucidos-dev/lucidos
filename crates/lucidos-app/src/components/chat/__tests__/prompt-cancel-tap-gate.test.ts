@@ -56,13 +56,20 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
     expect(btn).toMatch(/onPointerCancel=\{[^}]*\.cancel\(\)/);
   });
 
-  it('gates the activation body so a discarded press short-circuits the action', () => {
-    // The action must consult the gate and bail when it says no. Tests against
-    // a regression where the gate handlers are wired but the activation no
-    // longer consults them. The body left the JSX when the button grew a touch
-    // path, and both paths run that one body.
+  it('hands the gate to the click path, which is the path it guards', () => {
+    // The gate catches the click iOS fires after a touch that was starting a
+    // scroll. It used to wrap the shared action, where it also vetoed the touch
+    // path. That path is the only one on iOS with the keyboard up, so a veto
+    // there is a dead button. `touchActivated` asks the gate on `onClick` only.
     expect(findMorphButton()).toMatch(/onClick=\{sendActivate\.onClick\}/);
-    expect(findActivationBody('sendActivate')).toMatch(/if\s*\(!morphTapPassed\(\)\)\s*return;/);
+    expect(findActivationBody('sendActivate')).toMatch(/\}, morphMode === 'send', morphActivationGate\);$/);
+  });
+
+  it('gives that gate a spend half, so a served press cannot rule on the next', () => {
+    // The gate holds ONE press, and the touch path serves without asking. So
+    // it spends the press instead. A stale one would rule on the next
+    // activation that arrives with none of its own.
+    expect(promptSource).toMatch(/const morphActivationGate = \{ pass: morphTapPassed, spend: morphGate\.cancel \}/);
   });
 
   it('does not open a confirmation dialog before canceling', () => {
@@ -80,8 +87,10 @@ describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
     expect(promptSource).toMatch(/if\s*\(!morphTapPassed\(\)\)\s*return;\s*cancelExchangeForTarget\(\)/);
   });
 
-  it('gates the lone Submit onClick before sending', () => {
-    expect(promptSource).toMatch(/if\s*\(!morphTapPassed\(\)\)\s*return;\s*void submit\(\)/);
+  it('gates the lone Submit on its click path', () => {
+    // Through `useTouchActivated`'s gate argument rather than inline, for the
+    // reason the morph button's case above gives.
+    expect(findActivationBody('answerSubmitActivate')).toMatch(/\}, true, morphActivationGate\);$/);
   });
 });
 
@@ -160,12 +169,23 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
   });
 
   it('enables that touch path in Send mode only, never on Stop or Cancel', () => {
-    expect(findActivationBody('sendActivate')).toMatch(/\}, morphMode === 'send'\);$/);
+    expect(findActivationBody('sendActivate')).toMatch(/\}, morphMode === 'send', morphActivationGate\);$/);
   });
 
-  it('gives the lone answer Submit a touch path, gated the same way', () => {
+  it('gives the lone answer Submit a touch path', () => {
     expect(promptSource).toMatch(/onTouchEnd=\{answerSubmitActivate\.onTouchEnd\}/);
-    expect(findActivationBody('answerSubmitActivate')).toMatch(/if\s*\(!morphTapPassed\(\)\)\s*return;/);
+  });
+
+  it('never cancels mousedown on a face in this row', () => {
+    // A `preventDefault()` here holds focus, which is why it reads as the
+    // obvious repair for a dropped click. On iOS a cancelled event stops the
+    // rest of the synthesized sequence, `click` included, so it removes the
+    // fallback it was reaching for. It shipped once and the button went dead
+    // wherever the user pressed, until they dismissed the keyboard.
+    for (const source of [promptSource, splitButtonSource]) {
+      expect(source).not.toMatch(/onMouseDown=/);
+      expect(source).not.toMatch(/\bholdFocusOnPress\b/);
+    }
   });
 
   it('opts the multi-select Submit in through the split button', () => {

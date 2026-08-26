@@ -88,6 +88,47 @@ pub(crate) fn workspace_url(origin: &str, workspace: &str) -> String {
     format!("{origin}/{workspace}/")
 }
 
+/// A view inside a workspace a row activation can ask to land on.
+///
+/// The page names one, and this composes the fragment. It never takes the
+/// fragment itself. Every `window-*` webview holds the full IPC permission set
+/// on the gateway origin (ADR 0028). A page-supplied URL part would therefore
+/// let the page choose what loads in a window carrying that grant. Same
+/// reasoning [`is_workspace_slug`] exists for.
+///
+/// `utils/workspaceLanding.ts` is the frontend mirror, and writes the same
+/// fragment for the two mechanisms that never reach this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceLanding {
+    /// That workspace's notifications view, from the Lucidos menu's
+    /// notifications group.
+    Notifications,
+}
+
+impl WorkspaceLanding {
+    /// The landing a page named, or `None` for a name this build does not
+    /// serve. Exact match: no trimming and no case folding, so a caller that
+    /// drifted is refused rather than guessed at.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        match name {
+            "notifications" => Some(Self::Notifications),
+            _ => None,
+        }
+    }
+
+    /// The URL fragment this landing is delivered as, leading `#` included.
+    fn fragment(self) -> &'static str {
+        match self {
+            Self::Notifications => "#notifications",
+        }
+    }
+}
+
+/// What to append to a workspace URL for `landing`, or `""` for no landing.
+fn landing_fragment(landing: Option<WorkspaceLanding>) -> &'static str {
+    landing.map_or("", WorkspaceLanding::fragment)
+}
+
 /// What an app window's current URL says about where it is pointed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowContext<'a> {
@@ -151,8 +192,8 @@ pub(crate) fn labels_in<'a>(
 /// label wins, which keeps the choice deterministic rather than dependent on
 /// map iteration order.
 pub(crate) fn preferred_label<'a>(labels: &[&'a str]) -> Option<&'a str> {
-    if labels.contains(&crate::MAIN_WINDOW_LABEL) {
-        return Some(crate::MAIN_WINDOW_LABEL);
+    if labels.contains(&crate::app_window::MAIN_WINDOW_LABEL) {
+        return Some(crate::app_window::MAIN_WINDOW_LABEL);
     }
     labels.iter().min().copied()
 }
@@ -191,20 +232,37 @@ pub(crate) enum WorkspaceTarget {
 /// at, and repointing another one they can see is a surprise. An unnavigated
 /// window matches neither step, which is deliberate: `desktop::launch` will
 /// navigate `main` itself and clobber anything aimed at it.
+///
+/// A `landing` turns step 1 into a navigation, since only a navigation carries
+/// a fragment into a page already loaded. The URL differs from that window's
+/// own by the fragment alone, so it keeps its state and answers with a
+/// `hashchange`. Without a landing the focus stands: that window may be deep in
+/// a thread, and repointing it at the workspace root would throw that away.
 pub(crate) fn choose_workspace_target(
     windows: &[(String, String)],
     caller_label: &str,
     workspace: &str,
     origin: &str,
+    landing: Option<WorkspaceLanding>,
 ) -> Option<WorkspaceTarget> {
     if !is_workspace_slug(workspace) {
         return None;
     }
-    let url = workspace_url(origin, workspace);
+    let url = format!(
+        "{}{}",
+        workspace_url(origin, workspace),
+        landing_fragment(landing)
+    );
 
     let on_workspace = labels_in(windows, WindowContext::Workspace(workspace));
     if let Some(label) = preferred_label(&on_workspace) {
-        return Some(WorkspaceTarget::Focus(label.to_string()));
+        return Some(match landing {
+            Some(_) => WorkspaceTarget::Navigate {
+                label: label.to_string(),
+                url,
+            },
+            None => WorkspaceTarget::Focus(label.to_string()),
+        });
     }
 
     let caller_is_neutral = windows
@@ -345,13 +403,13 @@ mod tests {
             ("window-1", "http://localhost:3210/work/#thread=t1"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "main", "work", ORIGIN),
+            choose_workspace_target(&open, "main", "work", ORIGIN, None),
             Some(WorkspaceTarget::Focus("window-1".to_string()))
         );
         // Including when the caller IS that window: focusing itself is a no-op,
         // and it must never fall through to opening a second one.
         assert_eq!(
-            choose_workspace_target(&open, "window-1", "work", ORIGIN),
+            choose_workspace_target(&open, "window-1", "work", ORIGIN, None),
             Some(WorkspaceTarget::Focus("window-1".to_string()))
         );
     }
@@ -364,7 +422,7 @@ mod tests {
             ("window-1", "http://localhost:3210/work/"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "window-2", "work", ORIGIN),
+            choose_workspace_target(&open, "window-2", "work", ORIGIN, None),
             Some(WorkspaceTarget::Focus("main".to_string()))
         );
         // Without `main`, the lowest label, rather than whatever order the
@@ -374,7 +432,7 @@ mod tests {
             ("window-1", "http://localhost:3210/work/"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "window-2", "work", ORIGIN),
+            choose_workspace_target(&open, "window-2", "work", ORIGIN, None),
             Some(WorkspaceTarget::Focus("window-1".to_string()))
         );
     }
@@ -385,7 +443,7 @@ mod tests {
         // one more stray picker window on every workspace the user opens.
         let open = windows(&[("main", "http://localhost:3210/~/")]);
         assert_eq!(
-            choose_workspace_target(&open, "main", "work", ORIGIN),
+            choose_workspace_target(&open, "main", "work", ORIGIN, None),
             Some(WorkspaceTarget::Navigate {
                 label: "main".to_string(),
                 url: "http://localhost:3210/work/".to_string(),
@@ -403,7 +461,7 @@ mod tests {
             ("window-1", "http://localhost:3210/dev/"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "window-1", "work", ORIGIN),
+            choose_workspace_target(&open, "window-1", "work", ORIGIN, None),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/".to_string(),
             })
@@ -420,14 +478,14 @@ mod tests {
             ("window-1", "http://localhost:3210/dev/"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "window-1", "work", ORIGIN),
+            choose_workspace_target(&open, "window-1", "work", ORIGIN, None),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/".to_string(),
             })
         );
         // And an unnavigated CALLER is not a neutral window either.
         assert_eq!(
-            choose_workspace_target(&open, "main", "work", ORIGIN),
+            choose_workspace_target(&open, "main", "work", ORIGIN, None),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/".to_string(),
             })
@@ -441,14 +499,14 @@ mod tests {
             ("window-1", "http://localhost:3210/third/"),
         ]);
         assert_eq!(
-            choose_workspace_target(&open, "main", "work", ORIGIN),
+            choose_workspace_target(&open, "main", "work", ORIGIN, None),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/".to_string(),
             })
         );
         // With no windows at all, the same answer.
         assert_eq!(
-            choose_workspace_target(&[], "main", "work", ORIGIN),
+            choose_workspace_target(&[], "main", "work", ORIGIN, None),
             Some(WorkspaceTarget::NewWindow {
                 url: "http://localhost:3210/work/".to_string(),
             })
@@ -460,7 +518,7 @@ mod tests {
     #[test]
     fn a_new_workspace_window_takes_the_callers_own_origin() {
         let at = |caller: Option<&str>| {
-            choose_workspace_target(&[], "main", "work", target_origin(caller, FALLBACK))
+            choose_workspace_target(&[], "main", "work", target_origin(caller, FALLBACK), None)
         };
         assert_eq!(
             at(Some("http://localhost:3210/dev/?pick")),
@@ -515,10 +573,111 @@ mod tests {
             "work-",
         ] {
             assert_eq!(
-                choose_workspace_target(&open, "main", bad, ORIGIN),
+                choose_workspace_target(&open, "main", bad, ORIGIN, None),
                 None,
                 "{bad:?} was accepted"
             );
         }
+    }
+
+    /// The page names the landing. So this is the whole gate on the fragment
+    /// half of a URL loaded under the `window-*` IPC grant (ADR 0028).
+    #[test]
+    fn a_landing_that_is_not_a_name_this_build_serves_is_refused() {
+        assert_eq!(
+            WorkspaceLanding::parse("notifications"),
+            Some(WorkspaceLanding::Notifications)
+        );
+        for bad in [
+            "",
+            // The name, not the fragment: the fragment is ours to compose.
+            "#notifications",
+            // A prefix of the real name, which is the collision the hash
+            // router is anchored against on the receiving side.
+            "notification",
+            "Notifications",
+            " notifications",
+            "notifications#",
+            "../etc",
+            "threads",
+        ] {
+            assert_eq!(WorkspaceLanding::parse(bad), None, "{bad:?} was accepted");
+        }
+    }
+
+    /// The literal the frontend's `utils/workspaceLanding.ts` also writes, for
+    /// the in-place navigation and the browser tab. Those two never reach this
+    /// process, so nothing but a pair of tests holds the two in step.
+    #[test]
+    fn the_notifications_landing_is_the_bare_hash_the_page_router_reads() {
+        assert_eq!(WorkspaceLanding::Notifications.fragment(), "#notifications");
+        assert_eq!(landing_fragment(None), "");
+    }
+
+    #[test]
+    fn a_landing_rides_every_target_the_chooser_can_pick() {
+        const LANDING: Option<WorkspaceLanding> = Some(WorkspaceLanding::Notifications);
+        // A new window.
+        assert_eq!(
+            choose_workspace_target(&[], "main", "work", ORIGIN, LANDING),
+            Some(WorkspaceTarget::NewWindow {
+                url: "http://localhost:3210/work/#notifications".to_string(),
+            })
+        );
+        // The picker window this click came from.
+        let picker = windows(&[("main", "http://localhost:3210/~/")]);
+        assert_eq!(
+            choose_workspace_target(&picker, "main", "work", ORIGIN, LANDING),
+            Some(WorkspaceTarget::Navigate {
+                label: "main".to_string(),
+                url: "http://localhost:3210/work/#notifications".to_string(),
+            })
+        );
+    }
+
+    /// A landing has to REACH the page, and a focus carries nothing. So the
+    /// window already on the workspace is navigated instead, to a URL differing
+    /// from its own by the fragment alone.
+    #[test]
+    fn a_landing_navigates_the_window_already_on_the_workspace_rather_than_opening_one() {
+        let open = windows(&[
+            ("main", "http://localhost:3210/dev/"),
+            ("window-1", "http://localhost:3210/work/#thread=t1"),
+        ]);
+        assert_eq!(
+            choose_workspace_target(
+                &open,
+                "main",
+                "work",
+                ORIGIN,
+                Some(WorkspaceLanding::Notifications)
+            ),
+            Some(WorkspaceTarget::Navigate {
+                label: "window-1".to_string(),
+                url: "http://localhost:3210/work/#notifications".to_string(),
+            })
+        );
+        // And the window count stays bounded by the workspace count: never a
+        // second window on a workspace one is already showing.
+        assert_eq!(
+            choose_workspace_target(&open, "main", "work", ORIGIN, None),
+            Some(WorkspaceTarget::Focus("window-1".to_string()))
+        );
+    }
+
+    /// A landing is refused for a bad slug like anything else: the slug gate
+    /// runs first, so a valid landing cannot smuggle one past it.
+    #[test]
+    fn a_landing_does_not_rescue_a_slug_the_gateway_would_not_serve() {
+        assert_eq!(
+            choose_workspace_target(
+                &[],
+                "main",
+                "../etc",
+                ORIGIN,
+                Some(WorkspaceLanding::Notifications)
+            ),
+            None
+        );
     }
 }

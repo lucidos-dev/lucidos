@@ -1,14 +1,30 @@
 /** Resize a textarea to fit its content, returning true if the height changed.
  *
+ *  Every path stands down while the box has no width, and re-runs when the
+ *  width changes: see {@link boxWidth} and {@link useWidthRemeasure}.
+ *
  *  Four paths to avoid collapsing the textarea to height:0 on every keystroke:
  *  - Paste: text jumped by >1 char → collapse to 0 for fresh measurement
  *  - Fast: content fits and text didn't shrink → no-op (zero reflows)
  *  - Growth: content overflows → grow directly (one reflow)
  *  - Shrink: text deleted → collapse to 0 to measure true content height */
 
-import { useEffect } from 'preact/hooks';
+import { useEffect, useRef } from 'preact/hooks';
+import type { RefObject } from 'preact';
 
 const cache = new WeakMap<HTMLTextAreaElement, { height: number; len: number }>();
+
+/** The box's own laid-out width, or 0 when it has none.
+ *
+ *  Zero is a width the composer really takes: a collapsed pane keeps it in
+ *  layout at `visibility: hidden` rather than unmounting it. Measuring there is
+ *  not merely inaccurate. A textarea wears the UA's `overflow-wrap: break-word`,
+ *  so with no room every CHARACTER takes a line of its own. Even the short
+ *  placeholder then measures past the `max-height: 40vh` cap. What gets written
+ *  is a composer tall enough to eat the pane it reopens into. */
+function boxWidth(el: HTMLTextAreaElement): number {
+  return el.getBoundingClientRect?.().width ?? 0;
+}
 
 /** The height the box needs to show its PLACEHOLDER whole, or 0 when it has
  *  none / is showing a value instead.
@@ -36,7 +52,7 @@ function placeholderHeight(el: HTMLTextAreaElement): number {
   probe.removeAttribute?.('data-role');
   Object.assign(probe.style, {
     position: 'absolute', visibility: 'hidden', boxSizing: 'border-box',
-    width: `${el.getBoundingClientRect?.().width ?? 0}px`,
+    width: `${boxWidth(el)}px`,
     height: '0', minHeight: '0', maxHeight: 'none',
   });
   parent.appendChild(probe);
@@ -61,6 +77,10 @@ function applyHeight(el: HTMLTextAreaElement, measured: number, prevHeight: numb
 }
 
 export function resizeTextarea(el: HTMLTextAreaElement): boolean {
+  // Nothing measured at zero width is worth keeping (see `boxWidth`). Leave the
+  // height AND the cache alone: `useWidthRemeasure` measures again the moment
+  // the box has a width to measure at.
+  if (boxWidth(el) === 0) return false;
   const cached = cache.get(el);
   const prevHeight = cached?.height ?? 0;
   const prevLen = cached?.len ?? -1;
@@ -105,6 +125,7 @@ export function resizeTextarea(el: HTMLTextAreaElement): boolean {
  *
  *  Callers must stand down while {@link isTextareaHeightAnimating} is true. */
 export function remeasureTextarea(el: HTMLTextAreaElement): boolean {
+  if (boxWidth(el) === 0) return false;
   const prevHeight = cache.get(el)?.height ?? 0;
   el.style.height = '0';
   return applyHeight(el, el.scrollHeight, prevHeight, el.value.length);
@@ -124,9 +145,23 @@ const pendingHeightAnim = new WeakMap<HTMLTextAreaElement, () => void>();
  *  landing in that window puts the box AT the target before the transition
  *  starts and the ease plays out over no distance at all: transition engaged,
  *  nothing moved. Standing down loses nothing, because the target the animation
- *  is easing toward was itself measured after the change. */
+ *  is easing toward was itself measured after the change.
+ *
+ *  That last sentence is the whole condition, and a WIDTH change fails it: the
+ *  target was measured at the old width. See {@link abandonHeightAnimation}. */
 export function isTextareaHeightAnimating(el: HTMLTextAreaElement): boolean {
   return pendingHeightAnim.has(el);
+}
+
+/** Drop an in-flight height ease, leaving the box wherever it currently rests.
+ *
+ *  For the one change {@link isTextareaHeightAnimating} must not be met with a
+ *  stand-down. The ease is heading for a height the new width has invalidated,
+ *  so waiting it out lands on a wrong number. Skipping the measurement strands
+ *  it there instead: the observer fires on a width change, and the width has
+ *  already finished changing. Abandon the ease and measure. */
+function abandonHeightAnimation(el: HTMLTextAreaElement): void {
+  pendingHeightAnim.get(el)?.();
 }
 
 /** Smoothly animate a textarea's height from a previous inline height to the one
@@ -179,6 +214,60 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
   });
   // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
   timer = setTimeout(finish, 400);
+}
+
+/** Watch one box and re-measure it on a WIDTH change. Returns the teardown.
+ *
+ *  Width ONLY. Our own height write re-enters the observer, so acting on a
+ *  height change would loop. */
+function observeWidth(el: HTMLTextAreaElement): { el: HTMLTextAreaElement; stop: () => void } {
+  let lastWidth = boxWidth(el);
+  const observer = new ResizeObserver(() => {
+    const width = boxWidth(el);
+    if (width === lastWidth) return;
+    lastWidth = width;
+    // The one writer that does NOT stand down for an in-flight ease, because
+    // this change is what makes the ease's target wrong. See
+    // `abandonHeightAnimation`.
+    abandonHeightAnimation(el);
+    remeasureTextarea(el);
+  });
+  observer.observe(el);
+  return { el, stop: () => observer.disconnect() };
+}
+
+/** Re-measure whenever the box's own WIDTH changes.
+ *
+ *  A measured height is only ever right for the width it was measured at: the
+ *  same text and the same placeholder take more lines in a narrow box than a
+ *  wide one. {@link resizeTextarea} decides everything from the VALUE, so a
+ *  width change is invisible to it. Without this the box keeps a height that
+ *  belongs to a pane width it no longer has: clipped after a narrowing, and
+ *  left too tall after a widening. Everything that moves the composer's edges
+ *  feeds in here, with no per-cause listener to forget: a divider drag, the
+ *  window, the thread drawer opening, a pane collapsing to zero and coming back.
+ *
+ *  The first effect carries NO dependency array, because the box can arrive,
+ *  leave and come back on any render: the trigger form unmounts its Intent
+ *  field whenever the run type changes. A mount-only effect would read `null`
+ *  once and never look again, leaving that field unobserved for good. Tracking
+ *  the element is what re-attaches, and it is also what keeps a re-render from
+ *  churning a live observer, since an unchanged element returns early. */
+export function useWidthRemeasure(ref: RefObject<HTMLTextAreaElement | null>) {
+  const attached = useRef<{ el: HTMLTextAreaElement; stop: () => void } | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (el === (attached.current?.el ?? null)) return;
+    attached.current?.stop();
+    attached.current = el ? observeWidth(el) : null;
+  });
+
+  // Unmount only. The effect above owns every element swap before that.
+  useEffect(() => () => {
+    attached.current?.stop();
+    attached.current = null;
+  }, []);
 }
 
 /** Re-measure when root font metrics change (UI scale, font family, font load).

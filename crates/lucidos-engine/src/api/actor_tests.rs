@@ -442,8 +442,13 @@ fn install_test_secret() {
 
 /// A token minted for `thread_id`, exactly as a spawn would hand it out.
 fn token_for(thread_id: Option<Uuid>) -> String {
+    token_for_fire(thread_id, None)
+}
+
+/// A token minted for a spawn that IS `emitting_trigger_id`'s fire.
+fn token_for_fire(thread_id: Option<Uuid>, emitting_trigger_id: Option<&str>) -> String {
     install_test_secret();
-    mint_agent_origin_token(thread_id).expect("secret installed")
+    mint_agent_origin_token(thread_id, 0, emitting_trigger_id).expect("secret installed")
 }
 
 #[test]
@@ -467,7 +472,9 @@ fn subprocess_origin_subprocess_with_matching_token_no_thread() {
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: None
+            source_thread_id: None,
+            chain_depth: 0,
+            emitting_trigger_id: None,
         }
     );
 }
@@ -480,7 +487,9 @@ fn subprocess_origin_subprocess_with_matching_token_and_thread_id() {
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: Some(source)
+            source_thread_id: Some(source),
+            chain_depth: 0,
+            emitting_trigger_id: None,
         },
         "the token's own prefix is the source thread; no other input names it"
     );
@@ -499,7 +508,8 @@ fn a_tampered_thread_prefix_is_not_a_subprocess() {
     let theirs = Uuid::new_v4();
     let token = token_for(Some(mine));
     let mac = token.rsplit_once('.').expect("minted token has a mac").1;
-    let forged = format!("{theirs}.{mac}");
+    // Every other field left as minted, so only the thread swap is on trial.
+    let forged = format!("{theirs}@0@-.{mac}");
 
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &forged)]);
     assert_eq!(
@@ -528,7 +538,9 @@ fn a_token_minted_for_one_thread_does_not_authenticate_another() {
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: Some(a)
+            source_thread_id: Some(a),
+            chain_depth: 0,
+            emitting_trigger_id: None,
         },
         "a token authenticates as exactly the thread it was minted for"
     );
@@ -541,7 +553,7 @@ fn a_token_minted_for_one_thread_does_not_authenticate_another() {
 fn a_thread_bound_token_cannot_be_downgraded_to_the_sentinel() {
     let token = token_for(Some(Uuid::new_v4()));
     let mac = token.rsplit_once('.').expect("minted token has a mac").1;
-    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-.{mac}"))]);
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@-.{mac}"))]);
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
 }
 
@@ -578,7 +590,7 @@ fn a_malformed_token_is_not_a_subprocess() {
 fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
     install_test_secret();
     let tid = Uuid::new_v4();
-    let vars = subprocess_origin_env_vars(Some(tid));
+    let vars = subprocess_origin_env_vars(Some(tid), 0, None);
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
 
     let token = map
@@ -586,7 +598,7 @@ fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
         .expect("spawn env carries a token");
     assert_eq!(
         token,
-        &mint_agent_origin_token(Some(tid)).expect("secret installed"),
+        &mint_agent_origin_token(Some(tid), 0, None).expect("secret installed"),
         "the spawn env's token must be the one minted for this thread"
     );
     // And it round-trips through the wire: what the spawn hands out is what
@@ -595,7 +607,9 @@ fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: Some(tid)
+            source_thread_id: Some(tid),
+            chain_depth: 0,
+            emitting_trigger_id: None,
         }
     );
     // `LUCIDOS_THREAD_ID` still ships, for the subprocess-side consumers
@@ -609,7 +623,7 @@ fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
 #[test]
 fn subprocess_origin_env_vars_without_a_thread_binds_the_sentinel() {
     install_test_secret();
-    let vars = subprocess_origin_env_vars(None);
+    let vars = subprocess_origin_env_vars(None, 0, None);
     let map: std::collections::HashMap<_, _> = vars.iter().cloned().collect();
     assert!(vars.iter().all(|(k, _)| *k != ENV_SOURCE_THREAD_ID));
 
@@ -620,10 +634,153 @@ fn subprocess_origin_env_vars_without_a_thread_binds_the_sentinel() {
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: None
+            source_thread_id: None,
+            chain_depth: 0,
+            emitting_trigger_id: None,
         },
         "a scheduled script authenticates as a subprocess with no thread"
     );
+}
+
+// The trigger claim. A trigger's script runs in its own process, where the
+// `ACTIVE_TRIGGER_ID` task-local cannot reach, so the claim rides the signed
+// prefix instead. See ADR 0137 and the module docs.
+
+/// A trigger's script carries its trigger and no thread. That is the shape
+/// `execute_script` mints for a scheduled fire.
+#[test]
+fn a_scheduled_script_token_carries_the_trigger_that_ran_it() {
+    let trigger = Uuid::new_v4().to_string();
+    let token = token_for_fire(None, Some(&trigger));
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 0,
+            emitting_trigger_id: Some(trigger),
+        },
+        "the script IS the fire, so its emits must not wake the trigger"
+    );
+}
+
+/// A bash or python tool inside a fire carries both. It runs on the fire's own
+/// task and starts no thread, so the marker travels with it.
+#[test]
+fn a_tool_token_carries_both_the_thread_and_the_trigger() {
+    let tid = Uuid::new_v4();
+    let trigger = Uuid::new_v4().to_string();
+    let token = token_for_fire(Some(tid), Some(&trigger));
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: Some(tid),
+            chain_depth: 0,
+            emitting_trigger_id: Some(trigger),
+        }
+    );
+}
+
+/// The MAC comes off the last dot, and the trigger is the last field. So a
+/// trigger id holding a separator of its own still parses. Trigger ids are
+/// uuids today, and this keeps a future id shape from breaking the claim.
+#[test]
+fn a_trigger_id_holding_a_separator_still_round_trips() {
+    for id in ["scan.inbox.v2", "scan@inbox", "scan@v2.1"] {
+        let token = token_for_fire(None, Some(id));
+        let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+        assert_eq!(
+            subprocess_origin(&h),
+            SubprocessOrigin::Subprocess {
+                source_thread_id: None,
+                chain_depth: 0,
+                emitting_trigger_id: Some(id.to_string()),
+            },
+            "'{id}' must round-trip intact"
+        );
+    }
+}
+
+/// A segment that would not survive an HTTP header drops the claim rather
+/// than the token. Fail-open: an unmarked emit wakes everybody, which is
+/// recoverable, and a spawn that cannot authenticate at all is not.
+#[test]
+fn a_trigger_id_that_is_not_header_safe_drops_only_the_claim() {
+    let token = token_for_fire(None, Some("with a space"));
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 0,
+            emitting_trigger_id: None,
+        }
+    );
+}
+
+/// The denial-of-wake attempt, and the reason the claim is not a plain header.
+/// Every way of editing a trigger into or out of a verifying token fails,
+/// because the MAC covers the whole prefix.
+#[test]
+fn a_trigger_claim_can_be_neither_forged_nor_stripped() {
+    let tid = Uuid::new_v4();
+    let victim = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+    let plain = token_for(Some(tid));
+    let claimed = token_for_fire(Some(tid), Some(&victim));
+    let plain_mac = plain.rsplit_once('.').expect("minted token has a mac").1;
+    let claimed_mac = claimed.rsplit_once('.').expect("minted token has a mac").1;
+
+    for (label, candidate) in [
+        ("forged claim", format!("{tid}@0@{victim}.{plain_mac}")),
+        ("stripped claim", format!("{tid}@0@-.{claimed_mac}")),
+        ("swapped claim", format!("{tid}@0@{other}.{claimed_mac}")),
+        ("dropped field", format!("{tid}@0.{claimed_mac}")),
+    ] {
+        let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &candidate)]);
+        assert_eq!(
+            subprocess_origin(&h),
+            SubprocessOrigin::NotSubprocess,
+            "{label} must not authenticate"
+        );
+    }
+}
+
+/// What an app through the SDK presents: no token at all. So it can express no
+/// claim, and cannot mute a trigger by naming it. The contrast is the point.
+/// A trigger id reaches the engine only inside a token that was minted for it.
+#[test]
+fn a_caller_with_no_token_claims_no_trigger() {
+    let trigger = Uuid::new_v4().to_string();
+    let minted = token_for_fire(None, Some(&trigger));
+    let signed = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &minted)]);
+    assert_eq!(
+        subprocess_origin(&signed),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 0,
+            emitting_trigger_id: Some(trigger.clone()),
+        },
+        "a minted token carries the fire it was minted for"
+    );
+
+    for (label, headers) in [
+        (
+            "an app through the SDK",
+            headers_with(&[("user-agent", "Mozilla/5.0")]),
+        ),
+        (
+            "a caller naming the trigger in the header",
+            headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &trigger)]),
+        ),
+    ] {
+        assert_eq!(
+            subprocess_origin(&headers),
+            SubprocessOrigin::NotSubprocess,
+            "{label} must express no claim"
+        );
+    }
 }
 
 // Shared serialization for tests that mutate process-wide LUCIDOS_API_PORT.

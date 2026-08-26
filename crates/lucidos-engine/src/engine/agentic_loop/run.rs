@@ -582,9 +582,11 @@ impl LucidosEngine {
                             },
                             aggregate: None,
                             // Per-token streaming never reaches the trigger
-                            // matcher, so the depth is answered rather than
-                            // resolved: this closure runs off-task anyway.
+                            // matcher, so the depth and the emitting trigger are
+                            // answered rather than resolved: this closure runs
+                            // off-task anyway.
                             depth: 0,
+                            emitting_trigger_id: None,
                         });
                         // Persist new text since last persistence point
                         let mut last = persisted_len.lock().unwrap();

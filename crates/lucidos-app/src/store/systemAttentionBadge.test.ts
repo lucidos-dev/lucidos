@@ -6,6 +6,9 @@
  * on an unknown answer, which would flash a dot on every cold load. And it must
  * not clear on a DISMISSAL, which would spend the one time the workspace is
  * told.
+ *
+ * The version below is a fixed synthetic value, deliberately not a real
+ * release, so it can never collide with the `RELEASE` file being shipped.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
 import { systemAttentionBadge, systemAttentionBadgeLabel } from './systemAttentionBadge';
@@ -27,7 +30,6 @@ function owe(notices: ReleaseNotice[]): void {
 function offer(version: string): void {
   releaseCheck.value = {
     enabled: true,
-    notice_acknowledged: true,
     supported: true,
     current_version: '0.30.2',
     checked_at: null,
@@ -49,7 +51,7 @@ describe('systemAttentionBadgeLabel', () => {
   });
 
   it('names the release when one is offered', () => {
-    expect(systemAttentionBadgeLabel('0.31.0', 0)).toBe('Lucidos 0.31.0 available');
+    expect(systemAttentionBadgeLabel('9.9.9', 0)).toBe('Lucidos 9.9.9 available');
   });
 
   it('counts what is owed, in the singular and the plural', () => {
@@ -58,7 +60,7 @@ describe('systemAttentionBadgeLabel', () => {
   });
 
   it('states both when both are true', () => {
-    expect(systemAttentionBadgeLabel('0.31.0', 2)).toBe('Lucidos 0.31.0 available · 2 things to do');
+    expect(systemAttentionBadgeLabel('9.9.9', 2)).toBe('Lucidos 9.9.9 available · 2 things to do');
   });
 });
 
@@ -69,8 +71,8 @@ describe('systemAttentionBadge', () => {
   });
 
   it('answers the gateway offer', () => {
-    offer('0.31.0');
-    expect(systemAttentionBadge()).toBe('Lucidos 0.31.0 available');
+    offer('9.9.9');
+    expect(systemAttentionBadge()).toBe('Lucidos 9.9.9 available');
   });
 
   it('answers an owed notice', () => {

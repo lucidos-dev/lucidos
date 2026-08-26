@@ -107,6 +107,7 @@ vi.mock('../store', async () => {
 
 const { handleHashLocation, setupHashDeeplinkRouting, _resetThreadHashLandingForTesting } =
   await import('./hash-deeplink-router');
+const { landingHash } = await import('../../utils/workspaceLanding');
 
 /** Let queued microtasks (the landing's awaits) run to completion. */
 const flush = () => new Promise<void>(resolve => { setTimeout(resolve, 0); });
@@ -147,7 +148,7 @@ describe('hash-deeplink-router', () => {
     _resetThreadHashLandingForTesting();
   });
 
-  // The third hash channel, written by `openWorkspaceNotifications` when a
+  // The third hash channel, written by `utils/workspaceLanding.ts` when a
   // Lucidos-menu notifications row points at another workspace.
   describe('the bare #notifications landing channel', () => {
     it('lands on the notifications view and consumes the hash', () => {
@@ -165,6 +166,15 @@ describe('hash-deeplink-router', () => {
       handleHashLocation();
       handleHashLocation();
       expect(switchMenuItem).toHaveBeenCalledTimes(1);
+    });
+
+    // The router's pattern is written out, so that its anchoring is readable
+    // where the prefix collision above is explained. This is what keeps it
+    // matching what the opener actually writes.
+    it('matches the fragment the opener composes', () => {
+      setUrl(`http://localhost/dev/${landingHash('notifications')}`);
+      handleHashLocation();
+      expect(switchMenuItem).toHaveBeenCalledWith('notifications');
     });
 
     it('does NOT swallow the push-tap channel, whose key it is a prefix of', () => {

@@ -728,9 +728,10 @@ impl CliCodingAgent {
 
 #[derive(Args)]
 pub(crate) struct SpawnThreadArgs {
-    /// Target workspace name (e.g. "dev", "myws"). Resolved relative to
-    /// $LUCIDOS_WORKSPACES_ROOT (or `~/workspaces` if unset). Pass an absolute
-    /// path to bypass the root lookup.
+    /// Target workspace name (e.g. "dev", "myws"). Resolved against
+    /// $LUCIDOS_WORKSPACES_ROOT when set, else the directory holding your own
+    /// workspace, so a sibling is always reachable by name. Falls back to
+    /// `~/workspaces`. Pass an absolute path to bypass the lookup.
     #[arg(long)]
     pub(crate) to: String,
     /// Task prompt for the new thread. Must be self-contained.

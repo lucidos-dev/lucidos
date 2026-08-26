@@ -617,6 +617,40 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
     analysis\") unless you actually put it in a visible message this turn. When in doubt, write \
     it in the message.";
 
+/// Sibling of [`REASONING_NOT_VISIBLE_RULE`], riding the same
+/// [`append_backend_rules`] chokepoint, and the same shape of mistake: the
+/// agent believes the user can see what only it can see.
+///
+/// A session rendered a docs page to a PNG, called `Read` on it, and told the
+/// user "I did send an image". Reading an image is an INPUT: Claude Code hands
+/// the picture to the agent's own context and nothing else. So the agent could
+/// genuinely see the page while the user saw an empty step.
+///
+/// The rule names the alternative rather than only prohibiting the mistake,
+/// because not knowing the alternative is what the transcript shows. An
+/// artifact plus markdown image syntax renders inline, since `renderMarkdown`
+/// rewrites a workspace-relative source onto the `/data` mount. Full trace in
+/// `docs/plans/2026-08-26-cc-tool-results-and-showing-the-user-an-image.md`.
+///
+/// The tell is deliberately the STEP'S SUBJECT, never the label
+/// `claude_code_parse::describe_content_block` renders. A rule naming a
+/// rendering detail goes stale the next time one moves. It then teaches the
+/// agent a test that no longer distinguishes anything.
+///
+/// Mirrored for the chat agent by the FILE REFERENCES section of
+/// `chat::process::system_prompt`, which made the same mistake for the same
+/// reason: it taught that a path becomes a link and stopped there. It is
+/// phrased differently because that agent writes `data/` directly and needs no
+/// `lucidos data write`. Change both together.
+const SHOWING_AN_IMAGE_RULE: &str = "\n\n\
+    READING AN IMAGE DOES NOT SHOW IT TO THE USER: `Read` on a PNG is an INPUT. It puts the \
+    picture in YOUR context and sends the user nothing: their step records that you read a \
+    file, never the picture itself. So never read a screenshot and then write \"here is the \
+    image\". To show one, put it in the workspace and use markdown IMAGE syntax: \
+    `lucidos data write artifacts/x.png --from /tmp/x.png`, then \
+    `![what it shows](artifacts/x.png)`, which renders inline. Same for any render, chart or \
+    diagram you produce.";
+
 /// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
 /// [`append_backend_rules`], the same chokepoint [`REASONING_NOT_VISIBLE_RULE`]
 /// rides.
@@ -685,12 +719,14 @@ pub(super) fn append_backend_rules(
     prompt: String,
     coding_agent: crate::runtime::CodingAgent,
 ) -> String {
-    // Backend-INDEPENDENT: both backends hide the model's reasoning from the UI
-    // and both talk to the user about work they track by sha, so every prompt
-    // flavor gets these two rules here (the shared chokepoint) before the
+    // Backend-INDEPENDENT: neither backend shows the user the model's reasoning
+    // or an image it read, and both talk about work they track by sha. So every
+    // prompt flavor gets these rules here (the shared chokepoint) before the
     // backend-specific teaching below.
-    let prompt =
-        format!("{prompt}{REASONING_NOT_VISIBLE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}");
+    let prompt = format!(
+        "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
+         {NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}"
+    );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
@@ -1526,26 +1562,30 @@ mod tests {
     ///
     /// Backend labels are `CodingAgent::as_str()` values, kebab-case, so the
     /// table reads the same as every other public surface naming a backend.
+    /// EVERY row rose by about 500 bytes for `SHOWING_AN_IMAGE_RULE`. It rides
+    /// the shared chokepoint, so no flavor can opt out, and none should: a
+    /// screenshot read into the agent's own context reaches the user on no
+    /// backend and in no worktree shape.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
-        ("worktree", "claude-code", 23148),
-        ("worktree", "codex", 21592),
+        ("worktree", "claude-code", 23643),
+        ("worktree", "codex", 22102),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 16643),
-        ("external_repo", "codex", 15087),
-        ("recovery", "claude-code", 21743),
-        ("recovery", "codex", 20187),
-        ("external_repo_recovery", "claude-code", 16519),
-        ("external_repo_recovery", "codex", 14963),
-        ("app_worktree", "claude-code", 19284),
-        ("app_worktree", "codex", 17728),
-        ("app_worktree_recovery", "claude-code", 17848),
-        ("app_worktree_recovery", "codex", 16292),
-        ("conflict_resolution", "claude-code", 5343),
-        ("conflict_resolution", "codex", 6577),
+        ("external_repo", "claude-code", 17138),
+        ("external_repo", "codex", 15597),
+        ("recovery", "claude-code", 22238),
+        ("recovery", "codex", 20697),
+        ("external_repo_recovery", "claude-code", 17014),
+        ("external_repo_recovery", "codex", 15473),
+        ("app_worktree", "claude-code", 19779),
+        ("app_worktree", "codex", 18238),
+        ("app_worktree_recovery", "claude-code", 18343),
+        ("app_worktree_recovery", "codex", 16802),
+        ("conflict_resolution", "claude-code", 5811),
+        ("conflict_resolution", "codex", 7083),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -1718,6 +1758,38 @@ mod tests {
             codex.contains("ask_user_question` tool (on the `lucidos` MCP"),
             "Codex prompt must still swap in the MCP ask_user_question rule",
         );
+    }
+
+    /// Regression guard for the session that screenshotted a docs page, called
+    /// `Read` on the PNG, and told the user "I did send an image". Reading an
+    /// image feeds the agent's own context and reaches the user not at all, so
+    /// every flavor must carry both halves: that `Read` shows them nothing, and
+    /// what to do instead. Rides the same `append_backend_rules` chokepoint as
+    /// the reasoning rule.
+    #[test]
+    fn coding_agent_prompts_say_reading_an_image_does_not_show_it() {
+        let flavors = all_prompt_flavors();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &flavors {
+                let full = append_backend_rules(base.clone(), agent);
+                for needle in [
+                    "READING AN IMAGE DOES NOT SHOW IT TO THE USER",
+                    // The alternative is the load-bearing half: the session
+                    // that failed did not know one existed.
+                    "lucidos data write artifacts/",
+                    "![what it shows](artifacts/x.png)",
+                ] {
+                    assert!(
+                        full.contains(needle),
+                        "{label} ({agent:?}) must say reading an image shows the user nothing, \
+                         and how to show one (`{needle}`)",
+                    );
+                }
+            }
+        }
     }
 
     /// Regression guard for the question card that asked "Change 99da1708 is
@@ -2376,6 +2448,12 @@ mod tests {
         let base = worktree_system_prompt("feature/x", "dev");
         let codex = append_backend_rules(base.clone(), crate::runtime::CodingAgent::Codex);
         for needle in [
+            // The header discriminates and cannot drift: it is the one needle
+            // no shared rule can satisfy. `lucidos data write` and
+            // `lucidos spawn-thread` no longer discriminate on their own,
+            // because `SHOWING_AN_IMAGE_RULE` and `NAMES_NOT_IDS_RULE` name
+            // them for both backends. They stay to pin the section's contents.
+            "LUCIDOS CLI: The `lucidos` CLI is on your PATH",
             "lucidos data write",
             "lucidos events emit",
             "lucidos changes apply",
@@ -2434,10 +2512,25 @@ mod tests {
             cc.starts_with(&base),
             "backend rules must append, not replace, the worktree prompt",
         );
-        assert!(
-            !cc.contains("lucidos data write"),
-            "the CC prompt must not duplicate the Codex CLI teaching",
-        );
+        // The sentinels are the SECTION HEADER plus two subcommands only it
+        // teaches, never a command it happens to mention. `lucidos data write`
+        // used to stand in for the section and stopped being unique to it:
+        // `SHOWING_AN_IMAGE_RULE` names the same command for every backend,
+        // because writing an artifact is how any agent shows a picture. The
+        // body needles matter because a header-only check passes if the CLI
+        // teaching is ever split across two consts and CC picks up the second.
+        // `lucidos spawn-thread` is NOT eligible: `NAMES_NOT_IDS_RULE` names it
+        // on both backends.
+        for needle in [
+            "LUCIDOS CLI: The `lucidos` CLI is on your PATH",
+            "lucidos events emit",
+            "lucidos await-event",
+        ] {
+            assert!(
+                !cc.contains(needle),
+                "the CC prompt must not duplicate the Codex CLI teaching ({needle:?})",
+            );
+        }
     }
 
     /// The permission-config rule (`--allowedTools` / `cc-allowed-tools`

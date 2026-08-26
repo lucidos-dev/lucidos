@@ -58,6 +58,7 @@ fn emitted_event_carries_sequence_and_type() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
     assert_eq!(emitted.seq, Some(42));
     assert!(matches!(emitted.typed, BusEvent::Thread { .. }));
@@ -76,6 +77,7 @@ fn transient_events_have_no_sequence() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
     assert_eq!(emitted.seq, None);
 }
@@ -97,6 +99,7 @@ fn broadcast_channel_works() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let _ = tx.send(emitted);
@@ -166,6 +169,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -210,6 +214,7 @@ fn thread_event_sse_json_includes_meta_channel() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -245,6 +250,7 @@ fn thread_event_sse_json_omits_channel_when_none() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -269,6 +275,7 @@ fn thread_event_sse_json_has_created() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -297,6 +304,7 @@ fn transient_event_sse_json_has_no_seq() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -328,6 +336,7 @@ fn system_notification_created_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -350,6 +359,7 @@ fn system_preferences_changed_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -372,6 +382,7 @@ fn system_changes_updated_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -393,6 +404,7 @@ fn system_memory_rebuild_progress_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -424,6 +436,7 @@ fn embedding_model_status_event_matches_the_rest_snapshot() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -493,6 +506,7 @@ fn system_backup_progress_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -514,6 +528,7 @@ fn system_backup_completed_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -550,6 +565,7 @@ fn system_backup_failed_matches_server_event_shape() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
@@ -592,6 +608,7 @@ fn domain_event_sse_json_uses_inner_event_type() {
         }),
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();

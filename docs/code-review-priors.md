@@ -54,6 +54,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   only if the child gains its own process group, or if the wrapper starts
   outliving the build. (ADR 0070 § Consequences.)
 
+- **`kill_on_drop(true)` releasing the worktree admin lock without awaiting the
+  child is bounded to one syscall, not a live race.** A reviewer reading
+  `git_cmd_spawn` (`git_ops/mod.rs`) correctly observes that dropping the
+  `output()` future signals SIGKILL and returns. The guard is therefore released
+  before the child is reaped. Codex flagged exactly this as P2 on the branch
+  that added the lock.
+
+  SIGKILL is not deliverable later. The kernel stops the target at its next
+  scheduling point, so at most one already-entered syscall completes and no new
+  one starts. Deleting an admin directory takes a readdir, several unlinks and
+  an rmdir, so a killed prune cannot finish one. Neither guarded command spawns
+  a grandchild that would survive the signal. Prune spawns nothing, and the add
+  passes `--no-checkout`, so no `post-checkout` hook runs.
+
+  The fix a reviewer reaches for is worse. Awaiting the exit means replacing
+  `cmd.output()` with a hand-rolled spawn, pipe drain and wait. Every git call
+  in the engine goes through that helper. Get the drain wrong and a command with
+  large output deadlocks on a full pipe. Re-flag if a guarded command starts
+  running hooks, or if the residual window is ever observed.
+
 - **`cancel_event_wait`'s `on` ending a whole multi-type subscription is the
   intended reading, not a leak.** `LiveWait::watches` (`event_wait/mod.rs`) is
   an `any` over the `on` list, so a wait armed with `--on A --on B` answers yes
@@ -796,25 +816,28 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only with a client that demonstrably types such a glyph, or with
   evidence the fallthrough cannot reach a browser.
 
-- **The native cursor mirror needs no blur reset, and a blur reset would be
-  worse than the gap it closes.** A reviewer reading `utils/nativeCursor.ts`
-  observes that a Cmd-Tab away fires no `pointerout`, so a `col-resize` ask can
-  outlive the hover. Codex flagged it as P2 on the branch that added the file.
-
-  An `NSWindow` cursor rect governs that window alone, so nothing our window
-  asked for can reach another application's window. Whatever is under the
-  pointer over there sets its own. Coming back cannot land the pointer on a
-  different element either, because a Cmd-Tab moves no pointer, so the ask is
-  still the right one.
-
-  The proposed remedy introduces the wrong state it was meant to prevent. On
-  blur the pointer is still over the divider. Resetting to the arrow therefore
-  makes the glyph wrong the moment focus returns, until the user moves a pixel.
-  Every case a blur listener could catch is one where a pointer move follows,
-  and a move re-resolves the cursor on its own. Re-flag with a path that leaves
-  the window's cursor wrong AFTER a pointer move.
-
 ## Frontend
+
+- **`touchActivated` rules on a press by TRAVEL, not by whether the finger
+  lifted inside the button's rect. The rect version was tried and it broke the
+  bug it was guarding.** `utils/tapGesture.ts` runs the composer's Send inside
+  the gesture because WebKit drops the synthetic click when the keyboard
+  dismisses. A reviewer correctly observes that a `touchend` goes to the element
+  the touch STARTED on. A press that slid off therefore arrives looking like a
+  tap, and the reach is for a containment test against
+  `getBoundingClientRect()`. Two reviews reached for it, one of them Codex's.
+
+  Containment is a CLIENT-space test, and the iOS keyboard is what moves client
+  space: the button travels while the finger holds still. Real taps then read as
+  slid-off presses, were declined in silence, and fell back on the click WebKit
+  was dropping. That is the dead Send button, reported twice, the second time
+  against the containment test itself. Travel in screen space answers the same
+  question without a moving frame, at the threshold `createTapGate` beside it
+  already uses.
+
+  Re-flag only with a case travel cannot separate, and never by reintroducing a
+  client-space measurement. `tapGesture.test.ts` § "survives the layout moving
+  under the finger" carries the reproduction.
 
 - **A total function over an enum keeps every arm, including one today's
   callers never reach. That is not dead code.** `openModeLabel` in
@@ -1110,6 +1133,28 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   plus the PUT response, so the two reports can be ordered; re-flag with that
   design, not with the ordering suspicion alone.
   (`store/actions/compose.ts` `serverDraft` / `applyRemoteCompose`.)
+
+- **`lastSyncedComposeMode` going stale on a dropped peer frame is the accepted
+  residual its sibling already carries.** A reviewer (Codex flagged this P2) may
+  note that `thread-sync.ts` drops a `ThreadComposeChanged` while
+  `pendingComposePuts` holds. A peer's mode change inside our PUT's round trip is
+  therefore never recorded. Our own ack records the older mode, and every later
+  write sends `mode: null`. The engine keeps the peer's value while this device's
+  picker still shows ours.
+
+  Four reasons it stands. (1) `lastSyncedImageHashes` two lines above has the
+  same window and the same outcome, so fixing this for mode alone is
+  inconsistent rather than safer. (2) It self-heals: the next thread-summary
+  snapshot passes the staleness guards, and `stageDraftFromApi` rewrites both the
+  draft's mode and this map. (3) No send is misrouted, because `sendCompose`
+  binds the channel from the local picker rather than from the stored
+  `compose_mode`. (4) It needs two devices changing one draft's channel inside a
+  single round trip, which the 2026-08-06 compose-ordering plan scoped out as
+  last-write-wins.
+
+  The principled fix is the server-stamped compose version the prior above
+  names. Re-flag with that design, not with the ordering suspicion.
+  (`store/actions/compose.ts` `composeModeForWrite` / `noteServerComposeMode`.)
 
 - **`initiateEngineRestart` dismissing the `engine-new-version` switch toast on
   a spawn-FAILURE path is intentional; the badge is the recovery affordance.** A
@@ -1489,8 +1534,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   use passes a second argument — `var(--border-subtle, var(--border-color))`,
   `var(--border-subtle, var(--bg-tertiary))`, `var(--accent-contrast, #fff)` — so
   the property is an OPTIONAL override hook with a working default, and CSS
-  resolves it to the fallback when the token is absent. Two more that look
-  undefined for different reasons: `--toast-accent` is declared per-type inline
+  resolves it to the fallback when the token is absent. `--thread-drawer-width`
+  (`drawer.css`) is the same shape. **The hook is live, not decorative**, which
+  is what makes collapsing one a behavior change rather than a cleanup: the
+  style remote's `applyStyleOverrides` sets ANY name passing
+  `isValidOverrideName` onto `<html>`, so a user can retune these. A nightly
+  sweep collapsed all four to their fallbacks as "dead code" and had to revert.
+  Two more that look undefined for different reasons: `--toast-accent` is
+  declared per-type inline
   (`.toast-warning { --toast-accent: … }`), so a line-anchored `^\s*--x:` grep
   misses it, and `--user-ui-scale` / `--app-height` / `--thread-depth` are set
   from JS at runtime. Re-flag only a `var(--x)` with NO second argument whose
@@ -3071,3 +3122,47 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag when either paragraph is being rewritten for its own sake, which is
   when the swap becomes free. Re-flag too if a THIRD spelling appears, since the
   argument here is only that the two survivors are ordinary adjectives.
+
+- **A parked cron fire does NOT get re-fired by the missed-slot catch-up, even
+  though it emits no `TriggerExecuted`.** `catch_up_decision` appears to gate on
+  `TriggerExecuted` alone. A reviewer tracing the Thread Queue's
+  boot handoff (ADR 0133) concludes the duplicate moves to the scheduler.
+
+  It does not. The function takes `max(in_memory_last_run, history.last_run)`,
+  and the in-memory half comes from `triggers/replay.rs`, which stamps
+  `config.last_run` on **`TriggerStarted`** as well as on `TriggerExecuted`. A
+  fire that started and then parked has already stamped its slot, so the
+  decision reads `Skip(AlreadyRan)`. Only `history.last_run` is
+  `TriggerExecuted`-only, and it is the weaker of the two inputs.
+
+  Re-flag if the replay stops stamping `last_run` on `TriggerStarted`, or if
+  `catch_up_decision` drops the in-memory input.
+
+- **`ReleaseCheck::update_config` keeps `enabled: Option<bool>` even though its
+  one field means no caller ever passes `None`.** A reviewer reads a single-field
+  partial update as dead flexibility, and the wasted read-parse on the `Some`
+  path as free to delete.
+
+  The partial shape is ADR 0132's recorded decision: `updates.toml` is
+  machine-global, every gateway on the machine writes it, and the write is a
+  partial update that re-reads first. Collapsing to `enabled: bool` also turns a
+  body naming no field from a settle into a 422. That is a wire change for a
+  case nothing sends. ADR 0139 removed the second field and deliberately left
+  the shape.
+
+  Re-flag if ADR 0132's partial-update clause is superseded, or if a second
+  field never returns and the wire contract is being revised for another reason.
+
+- **`clampPanTransform` zeroing the pan at `scale <= 1` is correct now that the
+  image popup can zoom below 1.** A reviewer sees that `zoomFloor` lets the
+  scale fall under 1. That happens for an image whose own pixels sit below the
+  fitted view. The early return then reads as a pan the function discards.
+
+  It discards nothing. The image is a flex child of the popup slide under
+  `max-width: 100%; max-height: 100%`, so its unscaled box never exceeds the
+  container. At any scale at or below 1 the drawn image is inside the container
+  on both axes. `overflowX` and `overflowY` are then both 0, so the full branch
+  clamps to the same `(0, 0)` the early return answers.
+
+  Re-flag if the popup's image loses that CSS containment, or if a caller starts
+  passing an `imgW` measured somewhere the container does not bound.

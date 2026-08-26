@@ -499,6 +499,156 @@ fn parse_user_multiple_tool_results() {
     assert!(matches!(&events[1], AgentEvent::ToolResult { .. }));
 }
 
+/// Pull the one `ToolResult` a line is expected to produce.
+fn one_tool_result(line: &str) -> (String, String, String) {
+    let events = parse_one_line(line);
+    assert_eq!(events.len(), 1, "expected one event from {line}");
+    match &events[0] {
+        AgentEvent::ToolResult { output, status, id } => {
+            (output.clone(), status.clone(), id.clone())
+        }
+        other => panic!("Expected ToolResult, got {other:?}"),
+    }
+}
+
+/// A subagent's whole report arrives as `content: [{type: text}]`, and reading
+/// that field as a string alone blanked every `Agent` step in the UI.
+#[test]
+fn parse_user_tool_result_joins_an_array_of_text_blocks() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"text","text":"Findings"},{"type":"text","text":"Nothing broke."}],"is_error":false}]}}"#;
+    let (output, status, id) = one_tool_result(line);
+    assert_eq!(output, "Findings\nNothing broke.");
+    assert_eq!(status, "success");
+    assert_eq!(id, "tu_1");
+}
+
+/// The legacy line shape takes the same array. The bug lived in both arms, so
+/// a fix landing on only one is the failure mode to prevent.
+#[test]
+fn parse_legacy_tool_result_joins_an_array_of_text_blocks() {
+    let line = r#"{"type":"tool_result","tool_use_id":"toolu_legacy","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}],"is_error":false}"#;
+    let (output, status, id) = one_tool_result(line);
+    assert_eq!(output, "first\nsecond");
+    assert_eq!(status, "success");
+    assert_eq!(id, "toolu_legacy");
+}
+
+/// An image read must reach the step as a LABEL. One full-page screenshot is
+/// hundreds of KB of base64, and inlining it would ride the event payload and
+/// every SSE frame carrying it.
+#[test]
+fn parse_tool_result_labels_an_image_without_inlining_its_data() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgoAAAANSUhEUg"}}],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[image]");
+    assert!(
+        !output.contains("iVBORw0KGgo"),
+        "base64 image data must never reach the event",
+    );
+}
+
+/// `ToolSearch` answers with `tool_reference` blocks, whose only readable part
+/// is the tool they name.
+#[test]
+fn parse_tool_result_names_the_subject_of_a_reference_block() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"tool_reference","tool_name":"TaskOutput"}],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[tool_reference: TaskOutput]");
+}
+
+/// The default that matters: a block type nobody has seen yet is VISIBLE. An
+/// unrecognised shape reading as `""` is exactly how `tool_reference` blanked
+/// 583 steps in 30 days without anyone noticing.
+#[test]
+fn parse_tool_result_labels_an_unrecognised_block_rather_than_blanking() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"some_future_block"}],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[some_future_block]");
+}
+
+/// A block with no `type` at all still says something.
+#[test]
+fn parse_tool_result_labels_a_typeless_block() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"unexpected":true}],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[unknown]");
+}
+
+/// An array-shaped result still reports its error status and pairs with its
+/// call, which is what re-arms the session watchdog.
+#[test]
+fn parse_tool_result_keeps_error_status_on_an_array_shape() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_9","content":[{"type":"text","text":"boom"}],"is_error":true}]}}"#;
+    let (output, status, id) = one_tool_result(line);
+    assert_eq!(output, "boom");
+    assert_eq!(status, "error");
+    assert_eq!(id, "tu_9");
+}
+
+/// A missing `content` stays empty, as it was before the array handling.
+/// Absent is the one shape that genuinely carries nothing.
+#[test]
+fn parse_tool_result_with_no_content_is_empty() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert!(output.is_empty());
+}
+
+/// An explicit `null` reads the same as absent.
+#[test]
+fn parse_tool_result_with_null_content_is_empty() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":null,"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert!(output.is_empty());
+}
+
+/// A bare string inside the array carries its own text and has no `type`.
+/// Labelling it would drop the very content the label exists to preserve.
+#[test]
+fn parse_tool_result_keeps_a_bare_string_array_element() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":["plain text","more"],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "plain text\nmore");
+}
+
+/// A `text` block whose `text` key is missing takes the label path. The empty
+/// string is reserved for content that is genuinely absent.
+#[test]
+fn parse_tool_result_labels_a_text_block_with_no_text() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"text"}],"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[text]");
+}
+
+/// A `content` that is neither string nor array, and carries no block `type`
+/// to dispatch on, still reaches the step as its JSON. CC has never sent this
+/// shape. What it buys is that present content is labelled or rendered, never
+/// dropped for being unrecognised.
+#[test]
+fn parse_tool_result_renders_an_unexpected_content_shape() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":{"unexpected":true},"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert!(
+        !output.is_empty(),
+        "an object content must not read as empty"
+    );
+    assert!(output.contains("unexpected"));
+}
+
+/// A lone block sent unwrapped takes the same path a wrapped one does. The
+/// JSON fallback above must never claim an image, or an unwrapped screenshot
+/// spills the base64 that the array form is careful to label.
+#[test]
+fn parse_tool_result_labels_an_unwrapped_image_block() {
+    let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_1","content":{"type":"image","source":{"type":"base64","data":"iVBORw0KGgoAAAANSUhEUg"}},"is_error":false}]}}"#;
+    let (output, ..) = one_tool_result(line);
+    assert_eq!(output, "[image]");
+    assert!(
+        !output.contains("iVBORw0KGgo"),
+        "an unwrapped image must not spill base64 either",
+    );
+}
+
 #[test]
 fn parse_user_non_tool_result_ignored() {
     // A user message with text content (not tool_result) should produce no events

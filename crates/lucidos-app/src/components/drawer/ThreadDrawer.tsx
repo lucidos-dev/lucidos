@@ -17,6 +17,7 @@ import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { DraftOverflowMenu } from '../shared/DraftOverflowMenu';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
+import { LoadableError } from '../shared/LoadableError';
 import { LoadingFade } from '../shared/LoadingFade';
 import type { ThreadState, ThreadStatus } from '../../store/thread-events';
 import { getDraft } from '../../store/composeDrafts';
@@ -26,7 +27,7 @@ import { threadContextName, type ThreadContextFields } from './threadRowInfo';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { useFlipTransitions } from '../../hooks/useFlipAnimation';
-import { useDelayedLoading, useLingeringFlag } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag, useDelayedLoading, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { PANE_TRANSITION_MS } from '../layout/splitHelpers';
 import { useScrollMemory } from '../../hooks/useScrollMemory';
 import { getRemPx } from '../../utils/dom';
@@ -698,6 +699,10 @@ function ThreadList() {
     }, [hydrated, applied]);
 
     const hasMore = threadHasMore.value;
+    // Delay-gated, like every other loader. The fill loop pages repeatedly, and
+    // a page that lands inside SPINNER_DELAY_MS would flash this line once per
+    // page. Read before the unhydrated return so the hook order holds.
+    const showLoadingMore = useDelayedFlag(threadLoadingMore.value);
 
     useEffect(() => {
         const sentinel = sentinelRef.current;
@@ -724,8 +729,6 @@ function ThreadList() {
             </>
         );
     }
-
-    const loadingMore = threadLoadingMore.value;
 
     return (
         <>
@@ -768,7 +771,7 @@ function ThreadList() {
                 )}
                 {hasMore && (
                     <div ref={sentinelRef} class="thread-drawer-load-more">
-                        {loadingMore && <span class="thread-drawer-loading">Loading...</span>}
+                        {showLoadingMore && <span class="thread-drawer-loading">Loading...</span>}
                     </div>
                 )}
             </div>
@@ -1505,7 +1508,9 @@ function SearchResults() {
     useEffect(() => { navNodes.value = flatThreadNodes(resultIds); }, [resultKey]);
 
     if (loadable.status === 'failed') {
-        return <div class="empty-state error-text">Search failed</div>;
+        // The reason, not a bare "Search failed": this is the only report the
+        // user gets, and a dropped `loadable.error` is a swallowed error.
+        return <LoadableError noun="search results" error={loadable.error} />;
     }
 
     return (

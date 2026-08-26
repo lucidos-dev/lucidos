@@ -57,7 +57,20 @@ pub(super) fn apply_lucidos_env(
     for (key, value) in crate::core::pg_env_vars_cached() {
         cmd.env(key, value);
     }
-    for (key, value) in crate::api::actor::subprocess_origin_env_vars(Some(args.thread_id)) {
+    // A coding-agent session emits from a spawn tree no task-local reaches.
+    // So its chain depth comes from the thread's registration rather than from
+    // the ambient scope. That survives a restart too: a session the recovery
+    // path respawns re-mints at the depth its re-queued entry registered.
+    let chain_depth =
+        crate::scheduler::user_tasks::chain_depth_for_thread(args.thread_id).unwrap_or_default();
+    // The trigger is `None` here, always, and stated rather than inherited.
+    // This spawn starts a coding-agent session, which is work a fire hands off
+    // and not the fire itself. A trigger waiting on the session it started must
+    // still be woken by it. The depth reaches it, the trigger does not: see
+    // ADR 0138 and ADR 0137.
+    for (key, value) in
+        crate::api::actor::subprocess_origin_env_vars(Some(args.thread_id), chain_depth, None)
+    {
         cmd.env(key, value);
     }
     // Read by `lucidos spawn-thread` to default `--caller-event-id` so
@@ -345,6 +358,80 @@ pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The trigger claim stops at a handoff (ADR 0137) ────────────────────
+    // A coding-agent spawn runs INSIDE the fire's `ACTIVE_TRIGGER_ID` scope.
+    // A mint site reading that scope would hand the session the fire's own
+    // trigger. The trigger would then never be woken by the session it
+    // started, and the work would stall with no error. The spawn states
+    // `None` instead.
+
+    fn spawn_args_for(thread_id: uuid::Uuid, workspace: &Path) -> SpawnArgs<'_> {
+        SpawnArgs {
+            worktree_path: workspace,
+            workspace_path: workspace,
+            allowed_tools: None,
+            system_prompt: None,
+            resume_session_id: None,
+            model: None,
+            reasoning_effort: None,
+            thread_id,
+            spawning_event_id: None,
+            repo_name: None,
+            interactive: false,
+            continuation: false,
+            user_env_vars: &[],
+            claude_config_dir: None,
+            binary_override: None,
+            permission_mode: None,
+        }
+    }
+
+    /// Guards the exclusion, so widening it fails here rather than in a
+    /// workspace whose trigger silently stopped firing.
+    #[tokio::test]
+    async fn a_coding_agent_spawn_carries_no_trigger_claim() {
+        use crate::api::actor::{
+            init_agent_origin_secret, subprocess_origin, SubprocessOrigin, ENV_AGENT_ORIGIN_TOKEN,
+            HEADER_AGENT_ORIGIN_TOKEN,
+        };
+        init_agent_origin_secret("spawn-env-test-secret".to_string());
+        let thread_id = uuid::Uuid::new_v4();
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let args = spawn_args_for(thread_id, workspace.path());
+
+        let mut cmd = tokio::process::Command::new("true");
+        crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
+            .scope("the-fire-that-started-the-session".to_string(), async {
+                apply_lucidos_env(&mut cmd, &args, None, "SpawnEnvTest");
+            })
+            .await;
+
+        let token = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(ENV_AGENT_ORIGIN_TOKEN))
+            .and_then(|(_, value)| value)
+            .and_then(|value| value.to_str())
+            .expect("every agent spawn carries an origin token")
+            .to_string();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().expect("header"));
+        let SubprocessOrigin::Subprocess {
+            source_thread_id,
+            emitting_trigger_id,
+            ..
+        } = subprocess_origin(&headers)
+        else {
+            panic!("every agent spawn authenticates as a subprocess");
+        };
+        assert_eq!(source_thread_id, Some(thread_id));
+        assert_eq!(
+            emitting_trigger_id, None,
+            "a trigger must still be woken by the session it started"
+        );
+    }
 
     #[test]
     fn agent_path_prefixes_pg_bin_alone_still_contributes() {

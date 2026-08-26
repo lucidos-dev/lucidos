@@ -1265,11 +1265,16 @@ mod tests {
         // The reported bug in one test: the CLI printed the approval link and
         // then blocked, and reading the pipes only after exit meant the kill
         // took the link with it.
+        //
+        // The deadline has to outlast forking `/bin/sh`, not just the printf.
+        // At 1500ms this flaked on a loaded host, killing the stub before it
+        // had said anything. What is under test is the ORDERING, so the margin
+        // is free to grow.
         let cancel = AtomicBool::new(false);
         let err = supervise_serve(
             sh("printf 'something worth reading\\n'; sleep 30"),
             &cancel,
-            Duration::from_millis(1500),
+            Duration::from_secs(4),
             Duration::from_secs(30),
             &mut no_phases(),
         )
@@ -1291,14 +1296,18 @@ mod tests {
         // decide it. The stub prints the notice, keeps going past the configure
         // deadline, then exits 0 the way the real CLI does once Serve is
         // enabled. Succeeding is only possible if the deadline moved.
+        //
+        // The notice still has to ARRIVE before the configure deadline, which
+        // is a stopwatch after all. At 500ms a loaded host lost that race, so
+        // both numbers grew and the gap between them held.
         let cancel = AtomicBool::new(false);
         let mut phases = Vec::new();
         let result = supervise_serve(
             sh(&format!(
-                "printf '%s' '{SERVE_NOT_ENABLED}'; sleep 2; exit 0"
+                "printf '%s' '{SERVE_NOT_ENABLED}'; sleep 3; exit 0"
             )),
             &cancel,
-            Duration::from_millis(500),
+            Duration::from_millis(1500),
             Duration::from_secs(30),
             &mut |p| phases.push(p),
         );

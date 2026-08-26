@@ -124,6 +124,7 @@ const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string }
   { key: 'max_concurrent_coding_agent', label: 'Max concurrent coding agents' },
   { key: 'max_concurrent_per_trigger', label: 'Max concurrent per trigger' },
   { key: 'max_queued_per_trigger', label: 'Max queued per trigger' },
+  { key: 'max_event_trigger_depth', label: 'Max event chain depth' },
 ];
 
 function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {

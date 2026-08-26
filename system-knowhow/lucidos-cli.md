@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex): write files under data/, emit and query domain events, await an event instead of polling, spawn threads, apply pending changes, and call an external API through the engine proxy.
+description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex). It writes files under data/, emits and queries domain events, and awaits an event instead of polling. It applies pending changes and calls an external API through the engine proxy. It spawns threads, in this workspace or another (`spawn-thread --to <ws>`).
 ---
 
 # `lucidos` CLI
@@ -358,7 +358,7 @@ Five things worth knowing:
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
 
-Start a new *thread* in another (or this same) workspace — a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` names the target workspace (resolved under `$LUCIDOS_WORKSPACES_ROOT`, or an absolute path). Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
+Start a new *thread* in another (or this same) workspace: a *chat thread* by default, or a *coding-agent thread* with a coding-agent flag. `--to` takes an absolute path, or a bare workspace name. A bare name resolves against `$LUCIDOS_WORKSPACES_ROOT` when set, else the directory holding your own workspace, else `~/workspaces`. So a sibling of the calling workspace is always reachable by name. Caller provenance (`caller_*` fields) defaults from `$LUCIDOS_WORKSPACE` / `$LUCIDOS_THREAD_ID` / `$LUCIDOS_EVENT_ID`, which the engine sets on every spawned subprocess. Prints a clickable `[title](thread:<ws>/<uuid>)` markdown link on stdout.
 
 `--relation top` (the default) starts an independent thread that does not report back; `--relation child` is a same-workspace parent-with-callback spawn (the calling thread auto-resumes when the child finishes).
 

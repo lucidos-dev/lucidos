@@ -33,6 +33,7 @@ import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartState } from '../store/actions/chat-changes';
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
+import { inlineMarkdownImage, openImagePopupFromGroup } from '../store/imagePopup';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
 import { clipboardOrReport } from '../utils/clipboard';
 import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
@@ -192,9 +193,21 @@ export function useStartup(): void {
       .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
     refreshChangesState();
 
-    // Global click handler for thread links, external URLs, and copy buttons
+    // Global click handler for thread links, inline images, external URLs, and
+    // copy buttons
     function onGlobalClick(e: MouseEvent) {
       const target = e.target as HTMLElement;
+
+      // An inline markdown image opens the image popup, the only surface that
+      // can zoom it. Delegated here rather than bound per component: a chat turn,
+      // a rendered `.md` preview and a notification body all emit the same
+      // wrapper, and none owns a click handler of its own.
+      const inlineImage = inlineMarkdownImage(target);
+      if (inlineImage) {
+        e.preventDefault();
+        openImagePopupFromGroup(inlineImage.src, inlineImage);
+        return;
+      }
 
       const threadLink = target.closest('.thread-link') as HTMLElement | null;
       if (threadLink) {

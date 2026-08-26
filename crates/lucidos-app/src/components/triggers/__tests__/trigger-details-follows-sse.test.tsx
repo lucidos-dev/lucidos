@@ -29,13 +29,9 @@ import { TriggerDetails } from '../TriggerDetails';
 import { triggers, triggerGroups, panelOverlay, chatModels } from '../../../store/store';
 import type { TriggerInfo, TriggerGroup } from '../../../store/types';
 
-// jsdom ships no FontFaceSet, and the Intent textarea's `useFontMetricsResize`
-// subscribes to `document.fonts`. Stub the two methods it uses.
-if (!('fonts' in document)) {
-  Object.defineProperty(document, 'fonts', {
-    value: { addEventListener() { /* no fonts load in jsdom */ }, removeEventListener() {} },
-  });
-}
+import { stubIntentFieldObservers } from './intentFieldStubs';
+
+stubIntentFieldObservers();
 
 const TRIGGER_ID = '220e6c0d-f626-41c3-955c-6b6a66674ce6';
 const NIGHTLY = 'group-nightly';

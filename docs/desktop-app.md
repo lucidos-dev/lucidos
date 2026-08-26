@@ -119,8 +119,8 @@ client stays resident in the macOS menu bar and the service keeps running
 (triggers, scheduled tasks, coding-agent sessions, and mobile push keep going
 headless). The only thing that stops the service is the explicit **Quit & Stop
 Background Service** action — in the menu-bar (tray) menu and the app menu —
-which `launchctl bootout`s it. "Open Lucidos" (menu bar) or a Dock click
-re-shows the window.
+which `launchctl bootout`s it. "Open Lucidos" (menu bar) or a Dock click brings
+back every window Cmd+Q parked, each on its own workspace (ADR 0141).
 
 The stable gateway port is persisted at `<app-data>/config/engine-port`
 (historical file/env name; default `5252`; override with `LUCIDOS_ENGINE_PORT`)

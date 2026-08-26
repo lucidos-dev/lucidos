@@ -10,7 +10,13 @@ import {
   showConfirm,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
-import type { EventSubscription, SideEffectCategory, TriggerRun } from '../types';
+import type {
+  EventSubscription,
+  Loadable,
+  SideEffectCategory,
+  TriggerInfo,
+  TriggerRun,
+} from '../types';
 import type { ApiResult } from '../../api/types';
 import {
   listTriggers,
@@ -83,6 +89,15 @@ export function openEditTrigger(triggerId: string): void {
   revealContentPane();
 }
 
+/** The list has loaded and does not hold this trigger.
+ *
+ *  A function rather than the check written inline, because an inline one
+ *  narrows `triggers.value` to the loaded variant for the rest of the block.
+ *  The re-fetch below can leave it `failed`, and the narrowing hides that arm. */
+function loadedWithout(list: Loadable<TriggerInfo[]>, triggerId: string): boolean {
+  return list.status === 'loaded' && !list.data.some((t) => t.id === triggerId);
+}
+
 /** Go to a trigger: the Triggers panel, scrolled to that trigger's ROW and
  *  marked with the navigation focus marker.
  *
@@ -99,6 +114,9 @@ export async function navigateToTrigger(triggerId: string, source?: string): Pro
   // `source` names where the navigate originated (e.g. a thread label) so a
   // genuine-miss toast says where it came from instead of swallowing it.
   const from = source ? ` (requested by ${source})` : '';
+  // loadTriggers stamps the failure on the Loadable, but the user who clicked
+  // the link is not on the triggers panel, so surface it directly.
+  const loadFailed = `Couldn't open trigger "${triggerId}"${from}: triggers failed to load`;
 
   // Defense-in-depth on a cache miss, mirroring openAppById: `triggers` is a
   // cached projection refreshed by Trigger* SSE events, so a sibling thread
@@ -107,17 +125,24 @@ export async function navigateToTrigger(triggerId: string, source?: string): Pro
   // pre-check would report a live trigger as "no longer exists" and swallow
   // the real cause.
   if (triggers.value.status !== 'loaded') await loadTriggers();
-  if (triggers.value.status === 'loaded' && !triggers.value.data.some((t) => t.id === triggerId)) {
+  if (loadedWithout(triggers.value, triggerId)) {
+    // The re-fetch must not clobber the cache when it fails. A blip on this
+    // second read would turn the loaded list into `failed` for every surface
+    // reading it. Snapshot first and hand the data back, as `openAppById` does.
+    const snapshot = triggers.value;
     await loadTriggers();
-    if (triggers.value.status === 'loaded' && !triggers.value.data.some((t) => t.id === triggerId)) {
+    if (triggers.value.status === 'failed') {
+      triggers.value = snapshot;
+      showToast(loadFailed, 'error');
+      return;
+    }
+    if (loadedWithout(triggers.value, triggerId)) {
       showToast(`Trigger "${triggerId}" no longer exists${from}`, 'error');
       return;
     }
   }
   if (triggers.value.status === 'failed') {
-    // loadTriggers stamped the failure on the Loadable, but the user who
-    // clicked the link isn't on the triggers panel — surface it directly.
-    showToast(`Couldn't open trigger "${triggerId}"${from} — triggers failed to load`, 'error');
+    showToast(loadFailed, 'error');
     return;
   }
   // A null overlay, so an edit form already open on another trigger closes and

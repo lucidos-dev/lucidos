@@ -384,9 +384,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // still wins.
     lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
 
-    // Upgrade a legacy `apis.json` to the pipeline shape. Idempotent, and a
-    // failure is fatal: better to refuse to start than to silently lose proxy
-    // auth. The migration writes a backup first.
+    // Upgrade a legacy `apis.json` to the pipeline shape. Idempotent, and it
+    // writes a backup first. NOT fatal: an `Err` here is the filesystem or
+    // the JSON parser saying no, and the config load below reports what it
+    // then refuses. See ADR 0135.
     match lucidos_engine::api::proxy_migration::migrate_apis_json_if_needed(&workspace_path) {
         Ok(lucidos_engine::api::proxy_migration::MigrationOutcome::Migrated { backup_path }) => {
             log!(
@@ -395,19 +396,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
         Ok(_) => {}
-        Err(e) => {
-            log!("[Startup] apis.json migration failed: {}", e);
-            return Err(format!("apis.json migration failed: {e}").into());
-        }
+        Err(e) => log!("[Startup] apis.json migration skipped: {}", e),
     }
 
-    // Validate the migrated config once, here, so a refused entry stops the
-    // boot with a message naming it. The proxy routes load the same file per
-    // request. Without this call the first news of a bad `apis.json` is a 500,
-    // on whichever proxy somebody happens to use first.
-    if let Err(e) = lucidos_engine::api::validate_proxy_config(&workspace_path) {
-        log!("[Startup] apis.json is not usable: {}", e);
-        return Err(format!("apis.json is not usable: {e}").into());
+    // Read the config once here so a refused entry is named in the startup
+    // log, then hand the list on. The proxy routes re-read the same file per
+    // request, so this call adds no authority, only timing. The announce
+    // cannot happen yet: there is no EventBus until `LucidosEngine::new`.
+    let proxy_config_rejections = lucidos_engine::api::load_proxy_config(&workspace_path).rejected;
+    for rejected in &proxy_config_rejections {
+        log!(
+            "[Startup] apis.json: refusing '{}': {}",
+            rejected.label(),
+            rejected.reason
+        );
     }
 
     let database_url = lucidos_engine::core::database_url();
@@ -549,6 +551,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // migration, so just-migrated vars are included. Reserved names are
     // filtered, so engine-critical process vars are never clobbered.
     lucidos_engine::core::environment_variables::apply_to_process_env(engine.pool()).await;
+
+    // Tell the workspace about any `apis.json` entry the load refused above.
+    // The read happened before the DB was up, so this is the first point with
+    // an EventBus to announce it on. Silent when nothing was refused.
+    //
+    // TWO surfaces, because the SSE one cannot reach anybody from here. This
+    // runs long before `axum_server::bind`, and `/api/v1/events` hands a client
+    // the LIVE broadcast with no replay. So the event alone is sent to zero
+    // subscribers on every ordinary boot. The notification is the guaranteed
+    // half: the bus projects it into `notifications`, which the client polls
+    // whenever it connects. See ADR 0135.
+    if !proxy_config_rejections.is_empty() {
+        let summary = proxy_config_rejections
+            .iter()
+            .map(|r| format!("{}: {}", r.label(), r.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine
+            .event_bus
+            .emit_or_log(
+                lucidos_engine::engine::event_bus::BusEvent::System(
+                    lucidos_engine::engine::event_bus::SystemEvent::NotificationCreated {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title: "Proxy config problem".to_string(),
+                        message: format!(
+                            "Lucidos will not serve these entries in \
+                             data/config/apis.json, and a call to one answers 502. \
+                             Everything else in the file still works.\n\n{summary}"
+                        ),
+                        task_id: None,
+                        app_id: None,
+                        thread_id: None,
+                        event_id: None,
+                        tap: Default::default(),
+                        actor: None,
+                    },
+                ),
+                "[Proxy] apis.json NotificationCreated",
+            )
+            .await;
+        engine
+            .event_bus
+            .emit_or_log(
+                lucidos_engine::engine::event_bus::BusEvent::System(
+                    lucidos_engine::engine::event_bus::SystemEvent::ProxyConfigRejected {
+                        rejected: proxy_config_rejections,
+                    },
+                ),
+                "[Proxy] ProxyConfigRejected",
+            )
+            .await;
+    }
 
     // Extracted before the engine is wrapped in an Arc.
     let event_store = engine.event_store().clone();
@@ -859,9 +913,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Rebuild the Thread Queue's in-memory state BEFORE the scheduler starts.
     // The scheduler is the first submission path to come alive, so loading the
     // persisted backlog first keeps per-trigger FIFO intact across a restart.
-    // An admitted row whose work died with the previous process re-queues; a
-    // spawn row whose thread already materialized hands off to the recovery
-    // above.
+    // An admitted row whose thread already materialized hands off to the
+    // recovery above; one that bound no thread ran nothing, so it re-queues.
     shared_engine.thread_queue.recover_persisted_entries().await;
 
     // Keep the in-memory user-initiated pool a faithful mirror of each thread's

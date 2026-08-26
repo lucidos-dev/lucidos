@@ -54,6 +54,12 @@ pub enum ThreadQueueRequest {
     SubThread {
         prompt: String,
         child_thread_id: Uuid,
+        /// Event-trigger chain depth this spawn belongs to. Stamped by
+        /// [`ThreadQueueRequest::stamp_caller_depth`] from the submitting task,
+        /// so construction sites pass 0 and the queue fills it in (same shape
+        /// as `pre_emitted_origin` below). See the field on `EventTrigger`.
+        #[serde(default)]
+        depth: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +95,9 @@ pub enum ThreadQueueRequest {
     CodingAgent {
         prompt: String,
         cc_thread_id: Uuid,
+        /// Chain depth, stamped by the queue. See `SubThread::depth`.
+        #[serde(default)]
+        depth: u32,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +141,9 @@ pub enum ThreadQueueRequest {
     AgentChat {
         message: String,
         thread_id: Uuid,
+        /// Chain depth, stamped by the queue. See `SubThread::depth`.
+        #[serde(default)]
+        depth: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         event_id: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -188,6 +200,44 @@ impl ThreadQueueRequest {
         }
     }
 
+    /// The event-trigger chain depth this work runs at.
+    ///
+    /// A spawn does NOT consume a hop: work a fire hands off runs at the fire's
+    /// own depth. A hop is a trigger fire, counted once in
+    /// `task_runner::handle_domain_event`.
+    ///
+    /// `Cron` roots a fresh chain, so it carries no field and answers 0. Its
+    /// submit sites (the task loop, the missed-grace catch-up, the
+    /// off-schedule run) are never inside a fire.
+    pub fn depth(&self) -> u32 {
+        match self {
+            Self::EventTrigger { depth, .. }
+            | Self::SubThread { depth, .. }
+            | Self::CodingAgent { depth, .. }
+            | Self::AgentChat { depth, .. } => *depth,
+            Self::Cron { .. } => 0,
+        }
+    }
+
+    /// Record the submitting task's chain depth on a spawn request.
+    ///
+    /// Called once, by [`super::ThreadQueue::submit`], because every spawn
+    /// submit is awaited inline from the task that spawns it. Centralising it
+    /// there is what stops a new spawn site shipping without a depth.
+    ///
+    /// `EventTrigger` is deliberately untouched. It already carries the
+    /// dispatcher's `next_depth`. The bus subscriber that submits it has an
+    /// ambient depth of 0, which would overwrite the real value with a lie.
+    /// `Cron` has no field to write.
+    pub(super) fn stamp_caller_depth(&mut self, caller_depth: u32) {
+        match self {
+            Self::SubThread { depth, .. }
+            | Self::CodingAgent { depth, .. }
+            | Self::AgentChat { depth, .. } => *depth = caller_depth,
+            Self::EventTrigger { .. } | Self::Cron { .. } => {}
+        }
+    }
+
     /// The owning trigger, for per-trigger caps and FIFO.
     pub fn trigger_id(&self) -> Option<&str> {
         match self {
@@ -241,6 +291,7 @@ mod tests {
     #[test]
     fn agent_chat_kind_follows_use_coding_agent() {
         let mk = |cc: bool| ThreadQueueRequest::AgentChat {
+            depth: 0,
             message: "do it".into(),
             thread_id: Uuid::new_v4(),
             event_id: None,
@@ -309,6 +360,7 @@ mod tests {
         });
 
         let sub = ThreadQueueRequest::SubThread {
+            depth: 0,
             prompt: "run it".into(),
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,
@@ -334,6 +386,7 @@ mod tests {
         }
 
         let cc = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "run it".into(),
             cc_thread_id: Uuid::new_v4(),
             image_hashes: vec![],
@@ -371,6 +424,7 @@ mod tests {
     #[test]
     fn the_model_and_effort_pins_survive_the_persistence_round_trip() {
         let cc = ThreadQueueRequest::CodingAgent {
+            depth: 0,
             prompt: "run it".into(),
             cc_thread_id: Uuid::new_v4(),
             image_hashes: vec![],
@@ -453,6 +507,7 @@ mod tests {
 
         let long = "x".repeat(500);
         let req = ThreadQueueRequest::SubThread {
+            depth: 0,
             prompt: long,
             child_thread_id: Uuid::new_v4(),
             parent_thread_id: None,

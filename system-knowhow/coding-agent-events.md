@@ -74,7 +74,9 @@ That means right now (each line is one entry inside a trigger's `on` list, see `
 - `event_type: CodingAgentTextStreamed` / `CodingAgentThoughtStreamed`: does not fire. Per-token streaming is the only `ThreadEvent` the scheduler blocks, so subscribing to either is a no-op.
 - `event_type: <any chat-side lifecycle event>` (`ResponseGenerated`, `ResponseFailed`, `ChangeApplied`, …) — works; same blocklist semantics. See `system-knowhow/thread-events.md` for the full set.
 
-The blocklist is not the only gate. An event a trigger's own run emits dispatches one level deeper in the chain, and `MAX_EVENT_TRIGGER_DEPTH` (3) stops it there. That matters most for `CodingAgentIdled` and `ResponseGenerated`, which a trigger's own run emits on its own thread. See `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist" for the cap, and `system-knowhow/triggers.md` for the authoring rule the cap only backstops.
+The blocklist is not the only gate. A trigger is never woken by an event its own fire emitted, so an *intent* trigger subscribed to `ResponseGenerated` does not see its own. The split that matters here is what the fire hands off. A coding-agent session the fire STARTS runs on its own thread, so its `CodingAgentIdled` still wakes the trigger. That is what makes "wait for the session I started" work.
+
+Across triggers, `max_event_trigger_depth` (default 5) bounds the chain, and that gate DOES follow the handed-off session. The session runs at the fire's own depth, and every event it emits carries that depth. So the waiting trigger fires at hop 1, while a chain that keeps going ends at the ceiling. See `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist" for both gates, and `system-knowhow/triggers.md` for what they mean when you author a subscription.
 
 ## The full enumerated list
 

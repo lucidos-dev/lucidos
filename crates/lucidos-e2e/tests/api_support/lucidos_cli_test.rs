@@ -7,7 +7,7 @@
 use crate::support::{unique_marker, workspace_path};
 use std::process::Command;
 
-pub(crate) fn lucidos_bin() -> std::path::PathBuf {
+fn lucidos_bin() -> std::path::PathBuf {
     // Integration tests live at target/<profile>/deps/<test-binary>. The
     // sibling `lucidos` CLI binary sits at target/<profile>/lucidos. We can
     // find it by walking up two directories from the current test executable.
@@ -25,20 +25,31 @@ pub(crate) fn lucidos_bin() -> std::path::PathBuf {
     bin
 }
 
+/// The CLI, aimed at the e2e workspace the way an engine-spawned session is.
+///
+/// Every CLI call in the suite goes through here. A suite run inside a
+/// coding-agent session inherits that session's own `LUCIDOS_API_BASE_URL` and
+/// origin token. The CLI honours both over the workspace it is handed. Left in
+/// place, the call reaches the PARENT engine, and a token-less test carries a
+/// real token. Clearing them here leaves the CLI resolving the target from
+/// `<workspace>/.lucidos/ports`, speaking for nobody.
+pub(crate) fn lucidos_cmd() -> Command {
+    let mut cmd = Command::new(lucidos_bin());
+    cmd.env("LUCIDOS_WORKSPACE", workspace_path())
+        .env_remove("LUCIDOS_API_BASE_URL")
+        .env_remove("LUCIDOS_AGENT_ORIGIN_TOKEN");
+    cmd
+}
+
 #[test]
 fn emit_then_query_round_trip_against_running_workspace() {
-    let bin = lucidos_bin();
-
-    // Use the e2e-test workspace exactly the way an engine-spawned CC would:
-    // PWD outside the workspace, LUCIDOS_WORKSPACE pointing at it.
-    let ws = workspace_path();
     let event_type = "LucidosCliE2eEmitted";
     let summary = unique_marker("cli-e2e");
 
     let payload = serde_json::json!({ "marker": summary }).to_string();
 
     // Emit
-    let emit = Command::new(&bin)
+    let emit = lucidos_cmd()
         .args([
             "events",
             "emit",
@@ -48,7 +59,6 @@ fn emit_then_query_round_trip_against_running_workspace() {
             "--payload",
         ])
         .arg(&payload)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos events emit should run");
     assert!(
@@ -59,9 +69,8 @@ fn emit_then_query_round_trip_against_running_workspace() {
     );
 
     // Query and find our marker
-    let query = Command::new(&bin)
+    let query = lucidos_cmd()
         .args(["events", "query", "--type", event_type, "--limit", "10"])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos events query should run");
     assert!(
@@ -88,9 +97,7 @@ fn emit_then_query_round_trip_against_running_workspace() {
 
 #[test]
 fn emit_rejects_missing_summary() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args([
             "events",
             "emit",
@@ -98,7 +105,6 @@ fn emit_rejects_missing_summary() {
             "--payload",
             "{\"foo\": 1}",
         ])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos should run");
     assert!(!out.status.success(), "emit without summary must fail");
@@ -116,9 +122,6 @@ fn emit_rejects_missing_summary() {
 /// reports `MISSING → FRESH → STALE` correctly against the real engine.
 #[test]
 fn hardened_query_round_trip() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-
     // Throwaway git repo so we don't pollute the e2e workspace's hardened_branches
     // rows for actual branches. Unique branch name keeps state isolated across runs.
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -134,10 +137,9 @@ fn hardened_query_round_trip() {
     run_git(repo, &["checkout", "-q", "-b", &branch]);
 
     // 1) MISSING — nothing recorded yet for this (repo, branch).
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["hardened", "query"])
         .current_dir(repo)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos hardened query should run");
     assert!(
@@ -152,10 +154,9 @@ fn hardened_query_round_trip() {
     );
 
     // 2) Mark — should record current HEAD.
-    let mark = Command::new(&bin)
+    let mark = lucidos_cmd()
         .args(["hardened", "mark"])
         .current_dir(repo)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos hardened mark should run");
     assert!(
@@ -166,10 +167,9 @@ fn hardened_query_round_trip() {
     );
 
     // 3) FRESH — HEAD still matches the just-recorded SHA.
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["hardened", "query"])
         .current_dir(repo)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos hardened query should run");
     assert!(out.status.success());
@@ -184,10 +184,9 @@ fn hardened_query_round_trip() {
     run_git(repo, &["add", "."]);
     run_git(repo, &["commit", "-q", "-m", "second"]);
 
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["hardened", "query"])
         .current_dir(repo)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos hardened query should run");
     assert!(out.status.success());
@@ -205,12 +204,8 @@ fn hardened_query_round_trip() {
 /// subcommand exists and surfaces the `pending` array a caller reads ids from.
 #[test]
 fn changes_list_returns_expected_shape() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["changes", "list"])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos changes list should run");
     assert!(
@@ -260,18 +255,14 @@ fn run_git(dir: &std::path::Path, args: &[&str]) {
 /// `emit_then_query_round_trip_against_running_workspace` style.
 #[tokio::test]
 async fn notify_creates_inbox_notification_against_running_workspace() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-
     // Unique title so we can find this exact notification regardless of any
     // background notifications the e2e workspace produces (auto-cleanup,
     // backup-failure, etc.).
     let title = unique_marker("cli-notify-title");
     let message = unique_marker("cli-notify-message");
 
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["notify", "--title", &title, "--message", &message])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos notify should run");
     assert!(
@@ -324,11 +315,8 @@ async fn notify_creates_inbox_notification_against_running_workspace() {
 
 #[test]
 fn notify_rejects_missing_title() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["notify", "--message", "no title here"])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos should run");
     assert!(!out.status.success(), "notify without --title must fail");
@@ -336,11 +324,8 @@ fn notify_rejects_missing_title() {
 
 #[test]
 fn notify_rejects_missing_message() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["notify", "--title", "no body here"])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos should run");
     assert!(!out.status.success(), "notify without --message must fail");
@@ -350,11 +335,8 @@ fn notify_rejects_missing_message() {
 /// flag with an empty value) and must be rejected by the engine with 400.
 #[test]
 fn notify_rejects_empty_title_at_engine() {
-    let bin = lucidos_bin();
-    let ws = workspace_path();
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["notify", "--title", "", "--message", "msg"])
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos should run");
     assert!(
@@ -401,7 +383,6 @@ async fn notify_endpoint_rejects_whitespace_only_title() {
 /// really reach the store, which the CLI's own stub-server test cannot.
 #[test]
 fn data_write_announces_the_artifact_against_a_running_workspace() {
-    let bin = lucidos_bin();
     let ws = workspace_path();
     let marker = unique_marker("cli-data-write");
     let rel = format!("artifacts/cli-e2e/{marker}.md");
@@ -414,10 +395,9 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
     // the right call here and only here: this is a plain `#[test]`, so there is
     // no async runtime to park.
     let _tree = crate::support::workspace_tree_lock().blocking_read();
-    let out = Command::new(&bin)
+    let out = lucidos_cmd()
         .args(["data", "write", &rel, "--from"])
         .arg(&src)
-        .env("LUCIDOS_WORKSPACE", &ws)
         .output()
         .expect("lucidos data write should run");
     let _ = std::fs::remove_file(&src);
@@ -446,13 +426,13 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
     // the memory index, and lets an `on_event: ArtifactCreated` trigger see it.
     let artifact_rel = rel.strip_prefix("artifacts/").expect("artifacts-rooted");
     assert!(
-        query_system_event_mentions(&bin, &ws, "ArtifactCreated", "artifact_path", artifact_rel),
+        query_system_event_mentions("ArtifactCreated", "artifact_path", artifact_rel),
         "no ArtifactCreated carrying {artifact_rel}"
     );
 
     // And the API-origin audit event alongside it, carrying the store path.
     assert!(
-        query_system_event_mentions(&bin, &ws, "DataFileWritten", "path", &rel),
+        query_system_event_mentions("DataFileWritten", "path", &rel),
         "no DataFileWritten carrying {rel}"
     );
 }
@@ -465,16 +445,9 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
 /// payload is the caller's object flat at the top level (see
 /// `emit_then_query_round_trip_against_running_workspace`, which reads
 /// `payload.summary` directly).
-fn query_system_event_mentions(
-    bin: &std::path::Path,
-    ws: &std::path::Path,
-    event_type: &str,
-    field: &str,
-    value: &str,
-) -> bool {
-    let out = Command::new(bin)
+fn query_system_event_mentions(event_type: &str, field: &str, value: &str) -> bool {
+    let out = lucidos_cmd()
         .args(["events", "query", "--type", event_type, "--limit", "50"])
-        .env("LUCIDOS_WORKSPACE", ws)
         .output()
         .expect("lucidos events query should run");
     assert!(

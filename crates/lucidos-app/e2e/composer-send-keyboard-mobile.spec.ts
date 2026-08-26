@@ -12,13 +12,19 @@ import { randomUUID } from 'crypto';
  * keyboard dismissal then moves the button out from under the finger, before
  * WebKit dispatches the synthetic click, and the click is dropped.
  *
- * The button now also runs on `touchend`, inside the gesture. This pins the two
- * halves an emulator CAN see: a touch tap sends, and it sends exactly once. The
- * second is the hazard the fix introduces, since a browser that dispatches the
- * suppressed click anyway would otherwise send twice.
+ * The repair runs the button on `touchend`, inside the gesture. That path is
+ * the ONLY one on iOS with a field focused, so it takes every press it is
+ * given. It has twice been given a test to fail instead, and both shipped as a
+ * dead Send: a hit test against the button's live rect, then the finger's
+ * travel between press and lift.
  *
- * It cannot reproduce the original failure. Playwright's WebKit dispatches the
- * click real Safari drops, which is why the decision itself is unit-tested in
+ * This pins what an emulator CAN see. A touch tap sends. It sends exactly once,
+ * which is the hazard the touch path introduces, since a browser dispatching
+ * the suppressed click anyway would send twice. And a press that TRAVELS still
+ * sends, which is the case both of those tests refused.
+ *
+ * It cannot reproduce the dropped click itself. Playwright's WebKit dispatches
+ * the click real Safari drops, which is why the decision is unit-tested in
  * `src/utils/tapGesture.test.ts` and the wiring in `prompt-cancel-tap-gate.test.ts`.
  */
 
@@ -120,6 +126,86 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       // this half guards, and it would land after the twin window closes.
       await page.waitForTimeout(LATE_CLICK_GRACE_MS);
       expect(sentCount(), 'one tap sent the message twice').toBe('1');
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  // The case both retired tests refused, and the one an emulator CAN drive: a
+  // press that moves before it lifts. A thumb reaching a 29 px circle over the
+  // keyboard rolls, and the visual viewport settles under a finger that did
+  // not. Neither is a reason to throw the press away, and doing so silently is
+  // how this reached a third report.
+  //
+  // It pins the composed behaviour rather than the helper alone. The tap gate
+  // sees the same movement through `pointermove`, and must NOT veto here. If it
+  // does, the dead button becomes a "Tap ignored" toast and still no message.
+  test('a press that travels before lifting still sends', async ({ page, browserName }) => {
+    test.skip(!isMobileViewport(page), 'the keyboard-active block is a mobile-only rule');
+    // Chromium injects real touch input over CDP. WebKit exposes no equivalent
+    // on a mobile context, same as the tap case above.
+    test.skip(browserName !== 'chromium', 'needs CDP touch injection');
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const title = `E2E Travel ${suffix}`;
+    const followUp = `finger rolled ${suffix}`;
+    const now = new Date().toISOString();
+
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', '${title}', 'chat', '${now}', 1, false, true, 'idle', 'inbox', 'active', false, 0, 0, false, false, false)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"seed","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'ResponseGenerated', '{"text":"Seeded.","images":[]}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    const sentCount = () => psql(
+      `SELECT count(*) FROM events WHERE thread_id = '${threadId}'`
+      + ` AND event_type = 'MessageReceived' AND payload->>'text' = '${followUp}'`,
+    );
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+      await page.locator(`.thread-row:has-text("${title}")`).first().click();
+      await ensureOnThreadPane(page);
+
+      await page.evaluate((h: number) => {
+        document.documentElement.style.setProperty('--app-height', `${h}px`);
+      }, KEYBOARD_APP_HEIGHT_PX);
+
+      const input = page.locator('[data-role="prompt-input"]:visible').first();
+      await input.focus();
+      await input.fill(followUp);
+
+      const send = page.locator('button[aria-label="Send message"]:visible').first();
+      await expect(send).toBeVisible({ timeout: 10_000 });
+      const box = await send.boundingBox();
+      expect(box, 'the Send button never rendered').not.toBeNull();
+
+      const x = Math.round(box!.x + box!.width / 2);
+      const y = Math.round(box!.y + box!.height / 2);
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+      // Well past the 8 px both retired tests refused at, and past the tap
+      // gate's own threshold, so this drives the composed decision.
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + 20 }] });
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+
+      await expect
+        .poll(sentCount, { timeout: 15_000, message: 'a press that moved 20px was thrown away' })
+        .toBe('1');
+      await expect(input, 'the draft survived the send').toHaveValue('');
+
+      // No "Tap ignored" toast either: the gate must have stayed on the click
+      // path, where the press never arrived.
+      await expect(page.locator('.toast', { hasText: 'Tap ignored' })).toHaveCount(0);
+
+      await page.waitForTimeout(LATE_CLICK_GRACE_MS);
+      expect(sentCount(), 'one press sent the message twice').toBe('1');
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

@@ -121,6 +121,16 @@ pub enum SystemEvent {
         /// When it failed (RFC 3339).
         finished_at: chrono::DateTime<chrono::Utc>,
     },
+    /// The engine booted with entries in `data/config/apis.json` it refuses
+    /// to serve. PERSISTED, and emitted only when something is refused.
+    ///
+    /// The workspace stays up and every other provider keeps working. So
+    /// this event is the only thing standing between the user and a proxy
+    /// that silently 502s. A rejected entry used to abort the boot instead
+    /// (ADR 0135).
+    ProxyConfigRejected {
+        rejected: Vec<crate::api::RejectedProvider>,
+    },
     RecoveryProgress {
         completed: usize,
         total: usize,
@@ -1066,6 +1076,12 @@ pub enum SystemEvent {
     /// clicked Run now; that path carries the `actor`). The entry's work is
     /// now executing; the `thread_queue` row flips to `'admitted'` and is the
     /// persisted active-session record until `ThreadQueueCompleted`.
+    ///
+    /// **A trigger fire emits this TWICE** (ADR 0133). The fire creates its
+    /// thread while it runs, so the admission emit carries no `thread_id` and
+    /// the fire re-emits with one (`ThreadQueue::record_entry_thread`). The
+    /// projection COALESCEs the id in and keeps the first `admitted_at`, so a
+    /// consumer counting admissions sees two rows per trigger fire.
     ThreadQueueAdmitted {
         entry_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1211,6 +1227,7 @@ impl SystemEvent {
         "CapacityPolicyChanged",
         "BackupCompleted",
         "BackupFailed",
+        "ProxyConfigRejected",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1247,6 +1264,7 @@ impl SystemEvent {
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
+            Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
@@ -1372,6 +1390,7 @@ impl SystemEvent {
         "BackupProgress",
         "BackupCompleted",
         "BackupFailed",
+        "ProxyConfigRejected",
         "RecoveryProgress",
         "Toast",
         "ArtifactImported",
@@ -1485,6 +1504,7 @@ impl SystemEvent {
             | Self::BackupProgress { .. }
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }
+            | Self::ProxyConfigRejected { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }

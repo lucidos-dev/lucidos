@@ -503,6 +503,10 @@ export interface CapacityPolicy {
   /** Slots background work can always reclaim ahead of user-initiated work,
    *  so user priority can't starve triggers/cron. */
   reserved_background: number;
+  /** Trigger fires one event chain may make (A fires B, B's event fires C, …)
+   *  before the rest are stopped and the user is notified. A spawn does not
+   *  consume a hop. */
+  max_event_trigger_depth: number;
   overflow: 'drop-oldest' | 'pause-trigger';
 }
 

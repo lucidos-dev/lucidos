@@ -416,43 +416,53 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
               </button>
             )}
           </div>
-          {/* The off switch for the machine's release check, beside the thing it
-              governs rather than buried. Rendered only where the check can
-              actually run, so a dev gateway shows no knob for a poll it will
-              never make. */}
+          {/* The machine's release check, beside the thing it governs rather
+              than buried. The product says what this sends nowhere else, so the
+              note states it in the open (ADR 0139). It is worded for both
+              switch positions, since a row that describes an hourly request
+              while the switch is off is the one thing it must not do. Rendered
+              only where the check can run, so a dev gateway shows no knob for a
+              poll it will never make. */}
           {check?.supported && (
-            <div class="settings-row" data-search-anchor="system:update-check">
-              <span class="settings-row-label">
-                Check for updates
-                <Explainer title="Check for updates">
-                  <p>
-                    Once an hour Lucidos asks <code>lucidos.dev</code> whether a newer
-                    version is published. One request per machine, from the gateway,
-                    however many windows you have open.
-                  </p>
-                  <p>
-                    It sends your platform, your architecture and the version you run.
-                    It also carries your IP address, as any web request does. Nothing
-                    else is sent, nothing identifies you, and nothing installs itself.
-                  </p>
-                  <p>
-                    Turn it off and Lucidos stops asking. You can still check by hand
-                    with the button above.
-                  </p>
-                </Explainer>
-              </span>
-              <label class="toggle-switch">
-                <input
-                  type="checkbox"
-                  checked={check.enabled}
-                  onChange={(e) => {
-                    const on = (e.currentTarget as HTMLInputElement).checked;
-                    void setReleaseCheckEnabled(on);
-                  }}
-                />
-                <span class="toggle-slider" />
-              </label>
-            </div>
+            <>
+              <div class="settings-row" data-search-anchor="system:update-check">
+                <span class="settings-row-label">
+                  Check for updates automatically
+                  <Explainer title="Check for updates automatically">
+                    <p>
+                      One request per machine, from the gateway, however many windows
+                      you have open. A gateway started from a source checkout never
+                      asks at all.
+                    </p>
+                    <p>
+                      Nothing else is sent, nothing identifies you, and nothing
+                      installs itself. Taking an update is always your click.
+                    </p>
+                    <p>
+                      Turn it off and Lucidos stops asking on its own. You can still
+                      check by hand with the button above.
+                    </p>
+                  </Explainer>
+                </span>
+                <label class="toggle-switch">
+                  <input
+                    type="checkbox"
+                    checked={check.enabled}
+                    onChange={(e) => {
+                      const on = (e.currentTarget as HTMLInputElement).checked;
+                      void setReleaseCheckEnabled(on);
+                    }}
+                  />
+                  <span class="toggle-slider" />
+                </label>
+              </div>
+              <div class="settings-row-note">
+                While this is on, Lucidos asks <code>lucidos.dev</code> once an hour
+                whether a newer version is published. The request carries your
+                platform, your architecture and the version you run, plus the IP
+                address any web request carries.
+              </div>
+            </>
           )}
         </div>
       </>

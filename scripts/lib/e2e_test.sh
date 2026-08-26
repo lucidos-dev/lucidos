@@ -594,6 +594,32 @@ test_ensure_workspace_running_does_not_leak_loop_index() {
     fi
 }
 
+test_ensure_workspace_running_builds_the_frontend_before_the_engine() {
+    echo "test: ensure_workspace_running builds dist/ before the engine pins it"
+    # At boot the engine snapshots the dist/ it finds and serves that copy
+    # (api/frontend_snapshot.rs). A build landing after start_engine is never
+    # served, so every spec grades the PREVIOUS build and says nothing about it.
+    # Stubs only, in a subshell: the two steps announce themselves and nothing
+    # is booted. The health curl answers no, so the start branch is the one run.
+    local order
+    order="$(
+        e2e_workspace_env() { VITE_PORT=65000; PROTO=http; }
+        swap_ports() { :; }
+        setup_postgres() { :; }
+        build_e2e_engine_once() { :; }
+        ensure_frontend_built() { echo "frontend"; }
+        start_engine() { echo "engine"; }
+        curl() { if [[ "$*" == *health* ]]; then return 1; fi; echo "<!DOCTYPE html>"; }
+        ensure_workspace_running 2>/dev/null | grep -E '^(frontend|engine)$' | tr '\n' ' '
+    )"
+
+    if [ "$order" = "frontend engine " ]; then
+        pass "the build lands before the boot that pins it"
+    else
+        fail "order was '$order': the engine pins a stale dist/ and serves it all run"
+    fi
+}
+
 # ── the sandbox contract itself ───────────────────────────────────────
 # Every test above aims at $E2E_WORKSPACE, which this file pins to a sandbox
 # BEFORE sourcing e2e.sh. That pin is load-bearing well beyond worktree pruning:
@@ -633,6 +659,7 @@ test_report_non_numeric_rc_is_unknown
 test_report_non_numeric_overall_forced_nonzero
 test_no_sourced_lib_leaks_a_loop_variable
 test_ensure_workspace_running_does_not_leak_loop_index
+test_ensure_workspace_running_builds_the_frontend_before_the_engine
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

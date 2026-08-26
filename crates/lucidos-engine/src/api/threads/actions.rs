@@ -484,18 +484,16 @@ pub(super) fn refuse_event_waits_for_another_thread(
 ) -> Result<(), (StatusCode, String)> {
     use crate::api::actor::SubprocessOrigin;
     match crate::api::actor::subprocess_origin(headers) {
-        SubprocessOrigin::Subprocess { source_thread_id }
-            if source_thread_id != Some(thread_id) =>
-        {
-            Err((
-                StatusCode::FORBIDDEN,
-                "A thread's event subscriptions are its own. This route acts on the \
+        SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } if source_thread_id != Some(thread_id) => Err((
+            StatusCode::FORBIDDEN,
+            "A thread's event subscriptions are its own. This route acts on the \
                  calling thread, and the id in the path is not it. Drop the id: \
                  `lucidos event-waits list` / `cancel` and `lucidos await-event` \
                  already act on the thread you are running in."
-                    .to_string(),
-            ))
-        }
+                .to_string(),
+        )),
         _ => Ok(()),
     }
 }

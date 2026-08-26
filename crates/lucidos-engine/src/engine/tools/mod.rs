@@ -604,7 +604,15 @@ impl LucidosEngine {
             .unwrap_or(serde_json::json!({}));
         // The agent itself is the actor; attribution flows via the
         // surrounding `MessageReceived` / `ToolCalled` events.
-        match self.emit_domain_event(event_type, payload, None).await {
+        //
+        // The tool call runs on the fire's own task, so the ambient marker is
+        // this fire. Passing it keeps what `EventBus::emit` used to read for
+        // free, now that the emit states its owner (ADR 0137).
+        let emitting_trigger_id = crate::scheduler::user_tasks::current_trigger_id();
+        match self
+            .emit_domain_event(event_type, payload, None, emitting_trigger_id)
+            .await
+        {
             Ok(id) => Ok(format!("Event {} emitted (id: {})", event_type, id)),
             Err(e) => Err(format!("Error: failed to emit event: {}", e)),
         }
@@ -1024,6 +1032,13 @@ pub(crate) fn merge_thread_queue_policy_patch(
     )?;
     apply_usize_policy_field(args, "reserved_background", &mut policy.reserved_background)?;
 
+    if let Some(value) = args.get("max_event_trigger_depth") {
+        policy.max_event_trigger_depth =
+            serde_json::from_value::<u32>(value.clone()).map_err(|_| {
+                "Error: max_event_trigger_depth must be an unsigned integer".to_string()
+            })?;
+    }
+
     if let Some(value) = args.get("overflow") {
         policy.overflow =
             serde_json::from_value::<OverflowPolicy>(value.clone()).map_err(|_| {
@@ -1033,6 +1048,11 @@ pub(crate) fn merge_thread_queue_policy_patch(
 
     if policy.max_queued_per_trigger == 0 {
         return Err("Error: max_queued_per_trigger must be at least 1".to_string());
+    }
+    // 0 would cap every chain at its first hop, so no event trigger would ever
+    // fire. That is a config that silently switches triggers off.
+    if policy.max_event_trigger_depth == 0 {
+        return Err("Error: max_event_trigger_depth must be at least 1".to_string());
     }
     Ok(policy)
 }
@@ -1061,6 +1081,7 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
             | "max_concurrent_per_trigger"
             | "max_queued_per_trigger"
             | "reserved_background"
+            | "max_event_trigger_depth"
             | "overflow"
     )
 }

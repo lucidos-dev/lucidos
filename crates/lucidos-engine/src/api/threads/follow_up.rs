@@ -135,7 +135,9 @@ pub(in crate::api) async fn follow_up_child(
     // thread context (a scheduled script), has no thread whose children could
     // be looked up, so both are `NoCaller`.
     let caller_thread_id = match crate::api::actor::subprocess_origin(&headers) {
-        crate::api::actor::SubprocessOrigin::Subprocess { source_thread_id } => source_thread_id,
+        crate::api::actor::SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => source_thread_id,
         crate::api::actor::SubprocessOrigin::NotSubprocess => None,
     };
 

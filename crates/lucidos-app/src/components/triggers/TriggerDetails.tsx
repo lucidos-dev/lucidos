@@ -16,7 +16,7 @@ import type { EventSubscription, SideEffectCategory, TriggerInfo, TriggerRun, Lo
 import { describeCron, validateCron } from '../../utils/describeCron';
 import { Dropdown } from '../shared/Dropdown';
 import { fetchEventTypes } from '../../api/client';
-import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
+import { resizeTextarea, useFontMetricsResize, useWidthRemeasure } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { useServerBackedField, sameJson, sameSet } from '../../hooks/useServerBackedField';
 import { LoadableError } from '../shared/LoadableError';
@@ -249,6 +249,9 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
   // runType included in deps because the textarea is unmounted/remounted when switching to script.
   useEffect(resizeIntent, [intentText, runType]);
   useFontMetricsResize(resizeIntent);
+  // The content pane resizes under this field exactly as the thread pane does
+  // under the composer, so the Intent box owes the same width re-measure.
+  useWidthRemeasure(intentRef);
 
   const showCron = formType === 'schedule' || formType === 'both';
   const showEvent = formType === 'event' || formType === 'both';

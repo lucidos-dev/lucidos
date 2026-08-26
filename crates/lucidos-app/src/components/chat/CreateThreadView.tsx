@@ -613,9 +613,9 @@ function landingScrollTop(container: HTMLElement, top: number): number {
  * clamp was never chosen by the reader. So the deficit is remembered and paid
  * back by the next anchored mutation on the same container.
  *
- * It is dropped the moment the reader scrolls. `debtAt` records where our write
- * landed, and a container sitting anywhere else has been moved by somebody
- * whose position now counts. `debtHeight` is the other half of that test, and
+ * It is dropped the moment the reader scrolls. `anchorDebtAt` records where our
+ * write landed, and a container sitting anywhere else has been moved by somebody
+ * whose position now counts. `anchorDebtHeight` is the other half of that test, and
  * what keeps the debt inside ONE thread. The transcript element is REUSED
  * across threads. So an offset `useScrollMemory` restores could land on the
  * remembered one by coincidence and collect a debt it never earned. Same

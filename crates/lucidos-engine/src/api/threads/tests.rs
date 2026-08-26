@@ -355,7 +355,7 @@ use axum::http::HeaderMap;
 fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
     init_agent_origin_secret("harden-test-secret".to_string());
     let mut h = HeaderMap::new();
-    let token = mint_agent_origin_token(thread_id)
+    let token = mint_agent_origin_token(thread_id, 0, None)
         .expect("the secret is installed above, so minting cannot fail");
     h.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
     h

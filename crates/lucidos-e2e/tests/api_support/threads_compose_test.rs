@@ -633,11 +633,21 @@ async fn post_threads_rejects_unknown_mode() {
 // (`event_bus_tests::thread_state_and_eviction`). Doing it in SQL also keeps
 // the case deterministic and free of an LLM round trip.
 
-/// Stand in for a submission consuming the thread's compose slot.
+/// Stand in for a submission consuming the thread's compose slot. Writes what
+/// the `MessageReceived` projection writes in one transaction: the row leaves
+/// `composing`, the stored draft goes, and the epoch advances.
+///
+/// The `state` flip is load-bearing, not decoration. It is the column the mode
+/// lock reads, so a stand-in that left the row `composing` could never reach
+/// the lock. That omission is why this suite passed while a real send answered
+/// a stale write with 409.
 async fn consume_compose_slot(pool: &sqlx::PgPool, thread_id: Uuid) {
     sqlx::query(
         "UPDATE thread_summaries \
-         SET compose_epoch = compose_epoch + 1, compose_text = '' \
+         SET compose_epoch = compose_epoch + 1, \
+             compose_text = '', \
+             compose_mode = NULL, \
+             state = 'active' \
          WHERE thread_id = $1",
     )
     .bind(thread_id)
@@ -772,6 +782,107 @@ async fn consecutive_compose_puts_at_one_epoch_are_all_accepted() {
         0,
         "a compose write must not move the epoch"
     );
+}
+
+/// The reported card. A keystroke write carrying the draft's mode is stalled by
+/// a bad link and lands after the send it preceded. The epoch is why it was not
+/// applied, so the answer is the 412 the client resyncs from silently. The mode
+/// lock's 409 surfaced as a "Compose sync failed" card on an ordinary send.
+#[tokio::test]
+async fn a_stale_write_carrying_a_mode_is_refused_as_stale_not_mode_locked() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+
+    // The draft write the client had in flight when the user hit Send.
+    let stale_body = json!({
+        "text": "half a sentence",
+        "mode": "lucidos",
+        "compose_epoch": 0,
+    });
+    let resp = client
+        .put(compose_url(&id))
+        .json(&stale_body)
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 204, "the first write is at the live epoch");
+
+    consume_compose_slot(&pool, id).await;
+
+    let resp = client
+        .put(compose_url(&id))
+        .json(&stale_body)
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(
+        resp.status(),
+        412,
+        "a stale write must be refused as stale, whatever else it carried, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("412 body");
+    assert_eq!(
+        body["compose_epoch"].as_i64(),
+        Some(1),
+        "the refusal must hand back the current epoch so the client can re-issue"
+    );
+
+    let (state, text, _images, mode) = fetch_compose_row(&pool, id).await;
+    // The mode lock's precondition. Without this the case is toothless: a row
+    // left `composing` takes the 412 anyway, so the test would pass while never
+    // reaching the branch it exists to order.
+    assert_eq!(state, "active", "the row must be post-send for this case");
+    assert_eq!(text, "", "the refused write must not have been applied");
+    assert_eq!(mode, None, "the refused write must not restore a mode");
+}
+
+/// The mode lock itself, at the CURRENT epoch. A client toggling the channel on
+/// a thread the engine has as sent really has diverged, and 409 says so. This
+/// is what the reordering above must not weaken.
+#[tokio::test]
+async fn a_current_write_carrying_a_mode_on_a_sent_thread_is_mode_locked() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+    consume_compose_slot(&pool, id).await;
+
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({
+            "text": "x",
+            "mode": "claude_code",
+            "compose_epoch": 1,
+        }))
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(
+        resp.status(),
+        409,
+        "a mode change at the live epoch on a sent thread must stay 409 (got {})",
+        resp.status()
+    );
+
+    let (_state, _text, _images, mode) = fetch_compose_row(&pool, id).await;
+    assert_eq!(mode, None, "the refused write must not set a mode");
 }
 
 #[tokio::test]

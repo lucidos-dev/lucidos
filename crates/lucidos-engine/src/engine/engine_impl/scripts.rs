@@ -72,9 +72,14 @@ impl LucidosEngine {
     /// `LUCIDOS_WORKSPACE` + the `.lucidos/bin` symlink let scripts call
     /// `lucidos data write` / `lucidos events emit` / `lucidos events query`
     /// instead of hand-rolling HTTP requests back to the engine.
+    ///
+    /// `emitting_trigger_id` is the trigger whose fire this subprocess is, so
+    /// its emits back through the CLI carry the marker ADR 0137 needs. Every
+    /// caller states it, and `None` is the honest answer outside a fire.
     pub(crate) async fn build_script_env_vars(
         &self,
         thread_id: Option<Uuid>,
+        emitting_trigger_id: Option<&str>,
     ) -> Vec<(String, String)> {
         use crate::core::oauth;
         use crate::core::{CredentialStore, EnvironmentVariableStore, OAuthStore};
@@ -114,10 +119,19 @@ impl LucidosEngine {
         // future subprocess surface (MCP child, signer host, …) cannot ship
         // without origin attribution — the failure mode that grew the
         // original incident.
+        //
+        // The depth is read here, inline, because a script trigger builds its
+        // env inside the fire's own scope. It is what lets the script's
+        // `lucidos events emit` stay on the fire's chain instead of restarting
+        // it at 0 on the axum request task.
         env_vars.extend(
-            crate::api::actor::subprocess_origin_env_vars(thread_id)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v)),
+            crate::api::actor::subprocess_origin_env_vars(
+                thread_id,
+                crate::scheduler::user_tasks::current_event_trigger_depth(),
+                emitting_trigger_id,
+            )
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
         );
 
         // Host-process kill-guard env (LUCIDOS_HOST_PID + optional
@@ -163,16 +177,34 @@ impl LucidosEngine {
         env_vars
     }
 
+    /// Env for a bash or python tool, which is [`Self::build_script_env_vars`]
+    /// plus the ambient trigger. The tool runs inside the fire rather than as
+    /// work the fire hands off, so the marker travels with it (ADR 0137).
+    ///
+    /// Reading `ACTIVE_TRIGGER_ID` is right for exactly that reason. A spawn
+    /// that starts a new thread passes `None` instead, and says so at its own
+    /// call site.
+    pub(crate) async fn build_tool_env_vars(&self, thread_id: Uuid) -> Vec<(String, String)> {
+        let trigger = crate::scheduler::user_tasks::current_trigger_id();
+        self.build_script_env_vars(Some(thread_id), trigger.as_deref())
+            .await
+    }
+
     /// Execute a script file by workspace-relative path. Used by scheduled script tasks.
     ///
     /// Runtime is determined by file extension:
     /// - `.py` → Python (per-workspace venv)
     /// - `.sh` → Bash (`/bin/sh`)
+    ///
+    /// `emitting_trigger_id` is set when this script IS a trigger's fire, which
+    /// is every scheduled-script run. It reaches the origin token, so the
+    /// script's own emits cannot wake the trigger that ran it (ADR 0137).
     pub async fn execute_script(
         &self,
         script_path: &str,
         args: &[String],
         extra_env: &[(String, String)],
+        emitting_trigger_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if crate::core::is_path_traversal(script_path) {
             return Err("Invalid script path: must be relative, no '..'".into());
@@ -199,9 +231,10 @@ impl LucidosEngine {
         for (i, arg) in args.iter().enumerate() {
             env_vars.push((format!("LUCIDOS_ARG_{}", i), arg.clone()));
         }
-        // Scheduled scripts run without a thread context — no source thread
-        // id to attribute their HTTP callbacks back to.
-        env_vars.extend(self.build_script_env_vars(None).await);
+        // A scheduled script runs without a thread context, so it has no source
+        // thread id to attribute its HTTP callbacks back to. It does carry its
+        // trigger: the script IS the fire, not work the fire handed off.
+        env_vars.extend(self.build_script_env_vars(None, emitting_trigger_id).await);
         env_vars.extend(extra_env.iter().cloned());
 
         let output = match extension {

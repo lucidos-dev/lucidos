@@ -69,6 +69,70 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
   already notes "many sites block framing, but it's the best we can do without a
   native webview").
 
+### Window management goes blind while a URL preview is open
+- **Where:** `crates/lucidos-app/src/` (`app_window.rs`, `window_persist.rs`,
+  `crash_watchdog.rs`, `window_restore.rs`, `panel_preview.rs`).
+- **Gap:** With a URL preview open, or merely hidden behind an overlay, five
+  window-management paths could not see the window hosting it, which was always
+  `main`. The Cmd-Q park left `main` on screen and then went menu-bar-only
+  around it. That window had no Dock icon, no Cmd-Tab entry and an unclickable
+  menu. The window session recorded itself without `main`, so the next launch
+  forgot that window's workspace and frame. File to New Window landed on the
+  picker rather than the workspace you were on. The crash watchdog skipped its
+  reload, which is the recovery for a previewed page taking the content process
+  down.
+- **Why:** A preview is a native child webview, and tauri's
+  `WebviewWindow`-flavoured lookups answer only for a window whose webviews are
+  all itself. Every one of them failed silently: `None`, or a map with the
+  window missing. ADR 0140 has the mechanism.
+- **Status:** closed in our own crate (2026-08-26), by
+  `docs/plans/2026-08-26-a-preview-lives-on-the-window-that-asked-for-it.md`.
+  All twelve remaining lookups take the flavour their operation needs, and
+  `no_manager_lookup_asks_for_a_webview_window` fails the build on a new one.
+  The preview slot is per window too, so a child is hosted on its owner rather
+  than parked on `main`. None of it is verifiable outside a packaged build
+  (ADR 0016), so the sweep rests on that gate and on reading. One residue
+  remains, below.
+
+### A content read that draws no report strands the next one
+- **Where:** `crates/lucidos-app/src/panel_preview.rs`, `webview_get_content` and
+  `__panel_content_report`.
+- **Gap:** two content reads can be in flight from one window, because
+  `sendMessage` awaits `getWebviewContent()` outside the per-thread send chain.
+  A report carries no request id, so it answers the oldest read waiting. If the
+  FIRST read draws no report, the second read's answer is handed to the first.
+  The second then waits out its five seconds and its message ships with no page
+  content.
+- **Why:** the injected JS is guarded on `window.__TAURI_INTERNALS__`, which is
+  undefined for a moment after a navigation, so an eval landing there reports
+  nothing at all. Pairing by position is right only while reads and reports stay
+  one to one.
+- **Status:** Open, and older than the per-window preview work. Every read lost
+  its content in this case before; now one of the two is answered. Closing it
+  means stamping a request id into the injected JS and taking it back as a
+  command argument. Arbitrary previewed content invokes that command, and no
+  test outside a packaged build can reach it (ADR 0016). A mistake there breaks
+  extraction outright, which is worse than the stall it fixes.
+
+### A window hosting a URL preview keeps a stale fullscreen flag
+- **Where:** `tauri-plugin-window-state` 2.4.1, `save_window_state` (`src/lib.rs`),
+  reached from `crates/lucidos-app/src/window_persist.rs`.
+- **Gap:** while a preview is open on a window, that window's `fullscreen` and
+  `maximized` stop being refreshed in `.window-state.json`. Its size and
+  position stay correct. To see it, enter fullscreen and THEN open a preview on
+  that window: the next launch restores it windowed.
+- **Why:** the plugin enumerates `webview_windows()` and skips what it cannot
+  find, then writes the stale entry anyway. That is the ADR 0140 mechanism
+  again, one layer down. Our own gate cannot reach it: a source scan over
+  `crates/lucidos-app/src` sees no dependency. The plugin's own `Moved` and
+  `Resized` handlers are ungated, which is why only the two flags they do not
+  touch go stale.
+- **Status:** Open, and NARROWER than before this change. Every preview used to
+  be parked on `main`, so `main` was always the skipped window. It is now
+  whichever window hosts one, and `main` is the only label stable across
+  launches. Closing it upstream is a one-line change (`self.windows()`), which
+  is behaviour-preserving for a single-webview app.
+
 ## Notifications & push
 
 ### iOS web push requires an installed (home-screen) PWA

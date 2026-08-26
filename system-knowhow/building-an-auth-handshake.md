@@ -98,7 +98,18 @@ Layer shapes (all live in `proxy_pipeline_config::LayerConfig`):
 }
 ```
 
-Old single-variant configs (`{"auth": {"type": "bearer", ...}}`) are auto-upgraded to the pipeline shape on engine startup, with a `apis.json.bak.<unix>` backup written next to the live file (`proxy_migration.rs`). `credential_bundle` is permanently removed and refused at startup with an actionable error.
+Old single-variant configs (`{"auth": {"type": "bearer", ...}}`) are auto-upgraded to the pipeline shape on engine startup, with a `apis.json.bak.<unix>` backup written next to the live file (`proxy_migration.rs`). The upgrade is decided **per entry**, so a legacy entry appended beside already-migrated ones is still upgraded. `credential_bundle` is permanently removed, and an entry using it is rejected rather than upgraded.
+
+### A bad entry is rejected, never fatal (ADR 0135)
+
+Nothing in `apis.json` can stop the workspace starting. Each entry is parsed on its own:
+
+- **Good entries load and work**, including the ones beside a bad entry.
+- **A rejected entry is named** in the startup log, and announced to the workspace as a notification plus a `ProxyConfigRejected` event. The reason is the upgrade error where there is one (`credential_bundle`, an unknown `auth.type`, a missing required field), otherwise the parse error.
+- **A request to a rejected name answers 502**, carrying that reason. It is deliberately not a 404. Only a 404 falls through to the builtin provider of the same name, so answering one here would silently change which backend the request reaches.
+- **An unreadable or unparseable file** rejects every name, builtins included. Nothing can tell which entry the file was overriding, so the safe answer is to serve none of them until it parses again.
+
+Fix a rejected entry by editing `data/config/apis.json` and restarting the workspace.
 
 ## Layer 1: `static_credential`
 
@@ -111,7 +122,7 @@ For login dances. The engine caches the script's output until `expires_in` elaps
 ### Script contract
 
 - **Where the file lives.** `script` is resolved relative to `data/` — the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. Keep handshake scripts under `data/` so they're git-tracked. (A legacy script placed at the workspace root still resolves as a back-compat fallback, but move it under `data/`.)
-- **The path must be relative, with no `..` anywhere in it.** Not just no `..` segment: any `..` substring is refused, because this is a filesystem path. A refused value stops the engine at startup, naming the provider and the value. So a bad edit is a boot failure, not a 500 on first use.
+- **The path must be relative, with no `..` anywhere in it.** Not just no `..` segment: any `..` substring is refused, because this is a filesystem path. A rejected value takes out that one entry, naming the provider and the value, and a call to it answers 502. See "A bad entry is rejected, never fatal" above.
 - **`credential` is optional.** When the layer config sets `credential`, that credential is injected as env vars (shape below) before the script runs. When it's omitted, no `CRED_*` env var is injected from this layer — the script must source its secret by other means (read a rotating token from the OS keychain, do an OAuth-only exchange, etc.). The env-var table below applies only when a credential is configured.
 - Reads the named credential from env vars. The shape depends on the credential's type — same convention `run_python` / `run_bash` already inject for their subprocesses, so a script you wrote for one works for the other:
 

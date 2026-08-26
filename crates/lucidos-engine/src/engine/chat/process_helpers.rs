@@ -31,6 +31,19 @@ pub(super) struct TriggerContext {
     /// command guard consults it to decide whether an `IrreversibleDanger`
     /// command may run unattended; an ungranted side-effect fails the trigger.
     pub side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
+    /// The *Thread Queue* entry this fire was admitted under.
+    ///
+    /// A trigger entry binds no thread at submit time, so the turn reports the
+    /// id it mints back to the queue through
+    /// `ThreadQueue::record_entry_thread`. That is what lets the boot sweep
+    /// hand a fire that already started to thread-level recovery instead of
+    /// running it a second time (ADR 0133).
+    ///
+    /// Not an `Option`, because every trigger fire is admitted by the queue
+    /// before it runs. A nullable id would let a new fire path skip the report
+    /// and silently re-run after every restart, which is the bug ADR 0133
+    /// fixed. The compiler carries the id from the executor instead.
+    pub queue_entry_id: Uuid,
 }
 
 /// What restarts actually do to a chat thread, written as the chat-system

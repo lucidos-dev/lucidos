@@ -138,6 +138,36 @@ export async function disarmFollowSeed(page: Page): Promise<void> {
   });
 }
 
+/** Put the WHOLE thread in the DOM, the way a reader does: press the up
+ *  chevron, which renders every exchange and then scrolls to the true top
+ *  (`threadWindow.scrollToTopNeedsRenderAll`).
+ *
+ *  A transcript opens WINDOWED, showing only a trailing slice sized by the step
+ *  budget. Two kinds of spec ask past it: one measuring a seeded thread's full
+ *  height, and one hunting a row in an early turn. Press first, and the rest of
+ *  the spec sees what it seeded.
+ *
+ *  Returns with the reader at the top and the chevron gone. A spec that parks
+ *  the reader somewhere sets `scrollTop` itself afterwards. No-op on a thread
+ *  small enough to render whole, where the chevron never appears. */
+export async function renderWholeTranscript(page: Page): Promise<void> {
+  const chevron = page.locator('.scroll-to-top.visible').first();
+  if (await chevron.count() === 0) return;
+  await chevron.click();
+  // The chevron GLIDES, and its easing sits near zero for several frames before
+  // it lands. A caller that parked the reader while the tween still had frames
+  // to write would have its own `scrollTop` overwritten on the next one. So
+  // wait for two settled frames at the top, not merely for a small offset.
+  await expect.poll(() => page.evaluate(() => new Promise<boolean>(resolve => {
+    const el = document.querySelector('.thread-content') as HTMLElement | null;
+    if (!el) return resolve(false);
+    const first = el.scrollTop;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      resolve(first === 0 && el.scrollTop === 0);
+    }));
+  }))).toBe(true);
+}
+
 /** Wait until the page's SSE event stream is open.
  *  Required before tests emit transient engine events that are delivered only
  *  over SSE, such as `/api/v1/ui/navigate` NavigationRequested events. */

@@ -187,6 +187,30 @@ describe('describeCron', () => {
   it('dom + dow both set without month', () => {
     expect(describeCron('0 0 12 15 * 1')).toBe('15th & Monday at 12:00');
   });
+
+  // A day-of-month field naming more than one day. `parseInt` reads only the
+  // leading token, so each of these used to state a schedule the expression
+  // does not have. The raw cron is the honest answer.
+
+  it('a stepped day of month falls back to the raw cron', () => {
+    expect(describeCron('0 0 12 */2 * *')).toBe('0 0 12 */2 * *');
+  });
+
+  it('a day-of-month list falls back rather than dropping every day but the first', () => {
+    expect(describeCron('0 0 12 1,15 * *')).toBe('0 0 12 1,15 * *');
+  });
+
+  it('a day-of-month range falls back', () => {
+    expect(describeCron('0 0 12 1-5 * *')).toBe('0 0 12 1-5 * *');
+  });
+
+  it('a day-of-month list beside a weekday falls back', () => {
+    expect(describeCron('0 0 12 1,15 * 1')).toBe('0 0 12 1,15 * 1');
+  });
+
+  it('a stepped day of month with a month falls back', () => {
+    expect(describeCron('0 0 12 */2 6 *')).toBe('0 0 12 */2 6 *');
+  });
 });
 
 describe('validateCron', () => {

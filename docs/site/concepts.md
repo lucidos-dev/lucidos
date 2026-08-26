@@ -3,8 +3,9 @@
 Lucidos is built from a small set of concepts that compose. Everything you do is
 recorded as an **event**; your files are **artifacts**; what you want is an
 **intent** and how to do it is **knowhow**; **apps** give that a UI and **triggers**
-make it happen automatically. This page defines each one, straight from the
-canonical glossary and taxonomy.
+make it happen automatically. A **webhook** lets an outside service set a trigger
+off. This page defines each one, straight from the canonical glossary and
+taxonomy.
 
 ## Events and artifacts
 
@@ -65,6 +66,17 @@ response to an event.
    include-markdown "../../system-knowhow/glossary.md"
    start="<!--gloss-trigger-start-->"
    end="<!--gloss-trigger-end-->"
+%}
+
+## Webhooks
+
+A trigger can react to an event an outside service sent you. A **webhook** is
+where that event comes from, and it is the one surface a stranger can reach.
+
+{%
+   include-markdown "../../system-knowhow/glossary.md"
+   start="<!--gloss-webhook-start-->"
+   end="<!--gloss-webhook-end-->"
 %}
 
 ## The prompt-first model

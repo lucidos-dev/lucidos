@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.31.0 — 2026-08-26
+
+### Added
+
+- Open a previewed image at full size. Click an image in Files, in a chat transcript or in a repo file preview and it opens in the image popup, on every device. The popup has a zoom cluster (out, a level control that swaps between full size and a fit, in) and the `+`, `-` and `0` keys. On a small image, 1:1 stays reachable.
+- The event-trigger chain depth ceiling is a Thread Queue policy field, `max_event_trigger_depth`, default 5. When a fire is suppressed at the ceiling, a notification names the trigger, the event and the knob to raise.
+
+### Changed
+
+- The update check is consented in Settings, System, and nowhere else. The workspace picker's first-run notice is gone, so a remembered workspace reopens without waiting on it. The System row states what is sent and how often.
+- A trigger is never woken by its own fire. A trigger that subscribes broadly can watch `TriggerCompleted` without waking itself.
+- A workspace name in the picker wraps onto as many lines as it needs instead of being cut, so two rows sharing a long prefix read apart. Manage workspaces stays reachable.
+
+### Fixed
+
+- On iOS, the send button sends. The touch path judges the finger rather than the event, takes every press, and holds focus so the keyboard stays up. No other part of the button can cancel it, and a press that still does nothing reports which half of the stack failed.
+- The UI scale slider answers a touch anywhere on the track, takes arrow keys, and survives a cancel. Its thumb is smaller.
+- A long thread opens straight away, and it opens filled. The transcript render window counts steps rather than turns, so one long turn no longer blocks the first paint, and it fills the pane it opens in, so an old thread no longer paints collapsed and unscrollable.
+- Compose no longer reports a stale mode after a send.
+- The composer follows its pane's width. Resizing or collapsing the Conversation pane no longer leaves the box clipped or too tall.
+- An inline markdown image in a transcript opens the image popup on click.
+- The image viewer shows the image rather than reshaping it: fit to the window, even hairlines around the chrome, and no transform left on the slide you swiped away from. The zoom reads out in screen pixels, so a phone screenshot fitted to the window reads 100%, not 33%.
+- Coding-agent steps whose tool result arrives as a list of blocks render their output instead of painting blank.
+- Opening a workspace, closing a window and quitting all work with a URL preview open. A preview belongs to the window that opened it, so closing one page cannot take another window's preview with it.
+- A reopen after Cmd-Q restores the windows that were parked, and adds no extra one.
+- A right-clicked notification row does not survive its menu closing. A notification row opens its workspace by the same rule the rest of the app uses.
+- A trigger fire that was in flight when the engine restarted no longer runs a second time.
+- A trigger's chain stays its own across a subprocess emit, a handoff and a sub-thread's first event.
+- One malformed entry in `apis.json` no longer aborts the engine boot. The bad entry is refused and named, the rest of the file loads.
+- Proxy config changes announce themselves on boot, and a backup can no longer be lost.
+- Connect URLs and the pairing QR find a Tailscale serve route on any port, not only 443.
+- A gateway that adopts a running engine publishes its ports file, so a cross-workspace call reaches it without a restart.
+- `lucidos spawn-thread --to <name>` resolves a bare workspace name beside the caller's own workspace.
+- Two coding-agent sessions starting at once no longer race: one session's worktree prune cannot delete another's half-built admin directory.
+- Apply no longer wedges on a staged rename.
+- Machine identifiers no longer reach the public mirror.
+- The Lucidos agent draws an image inline when you ask to see one.
+
+### Removed
+
+- Native cursor mirroring. It never reached the screen, and the arrow-cursor symptom it was added for is not ours.
 ## v0.30.4 — 2026-08-25
 
 ### Changed

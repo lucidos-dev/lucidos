@@ -166,6 +166,16 @@
     padding: 0.75rem;
 }
 
+/* The image body of any file preview (components/files/PreviewImage.tsx). It
+   is scaled to fit the pane, so the cursor advertises the click that opens it
+   full size in the image popup. */
+.preview-image {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    cursor: zoom-in;
+}
+
 .file-preview-code {
     font-family: var(--font-ui);
     font-size: var(--font-size-sm);

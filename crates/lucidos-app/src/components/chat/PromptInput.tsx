@@ -36,7 +36,7 @@ import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
 import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
-import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, animateTextareaHeightFrom } from './promptResize';
+import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { prefersReducedMotion } from '../../utils/platform';
 import { createTapGate } from '../../utils/tapGesture';
@@ -189,13 +189,14 @@ export function PromptInput() {
   // destructive Cancel, which aborts the turn and stamps a pending question
   // `Canceled`.
   //
+  // It therefore guards the CLICK path, which is where that stray click
+  // arrives. `touchActivated` takes the gate and asks it there.
+  //
   // The morph and the answer control are mutually exclusive, so they share one
   // gate instance. The multi-select split-button Submit needs no gate: its
-  // caret menu makes the action deliberate. Touch activation leaves that
-  // standing, since `touchActivated` fires only where a click would have. Each
-  // gated button wires the down, move and cancel handlers inline rather than
-  // spreading a shared object, because `prompt-cancel-tap-gate.test.ts` greps
-  // for that wiring.
+  // caret menu makes the action deliberate. Each gated button wires the down,
+  // move and cancel handlers inline rather than spreading a shared object,
+  // because `prompt-cancel-tap-gate.test.ts` greps for that wiring.
   const morphGate = useMemo(() => createTapGate(), []);
   /** A discarded tap is the user's press thrown away, so it must never be
    *  silent: the button reads as dead and nothing says why.
@@ -210,6 +211,10 @@ export function PromptInput() {
     showToast(`Tap ignored: it moved ${moved}px and read as a swipe. Try again.`, 'info');
     return false;
   }
+  /** The gate as `touchActivated` takes it. `spend` is `cancel`, which forgets
+   *  the in-flight press: a press the touch path served is spent, not ruled on.
+   *  Left unspent it would rule on the next activation with no press behind it. */
+  const morphActivationGate = { pass: morphTapPassed, spend: morphGate.cancel };
   // Watch for pending messages from other modules (e.g. new app modal)
   useSignalEffect(() => {
     const msg = pendingChatMessage.value;
@@ -291,6 +296,7 @@ export function PromptInput() {
   }, [tid, composeText, overrideSyncSeq]);
 
   useFontMetricsResize(() => autoResize());
+  useWidthRemeasure(inputRef);
 
   function autoResize() {
     const el = inputRef.current;
@@ -706,19 +712,21 @@ export function PromptInput() {
   // enabled only while it reads Send. Every other mode keeps the click path,
   // which is what stops a tap aborting a live turn a gesture earlier.
   //
-  // The gate check stays inside the action, so one press is settled once
-  // whichever path fires. Both actions blur on their own (`submit`,
-  // `submitMultiAnswer`): the suppressed click never reaches
-  // `installActionBtnBlurListener`, which listens on `click`.
+  // The gate goes to the CLICK path, not around the action. The spurious click
+  // after a scroll is what it exists to catch. In front of both paths it also
+  // vetoed the touch path, which on iOS with the keyboard up is the only one
+  // there is. See `touchActivated`.
+  //
+  // Both actions blur on their own (`submit`, `submitMultiAnswer`): the
+  // suppressed click never reaches `installActionBtnBlurListener`, which
+  // listens on `click`.
   const sendActivate = useTouchActivated(() => {
-    if (!morphTapPassed()) return;
     if (morphMode === 'send') void submit();
     else if (morphMode === 'cancel') cancelExchangeForTarget();
-  }, morphMode === 'send');
+  }, morphMode === 'send', morphActivationGate);
   const answerSubmitActivate = useTouchActivated(() => {
-    if (!morphTapPassed()) return;
     void submit();
-  });
+  }, true, morphActivationGate);
 
   // Release the optimistic canceling flag once the cancel has landed. The set
   // survives component re-renders by design, since the button lives in the
@@ -957,6 +965,10 @@ export function PromptInput() {
       onPointerDown={e => morphGate.down(e)}
       onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
+      // No touch path here, by the decision above, so the click is this
+      // button's only one. It used to cancel `mousedown` to hold focus and
+      // save that click. On iOS a cancelled event stops the rest of the
+      // synthesized sequence, `click` included, so the repair killed it.
       onClick={() => { if (!morphTapPassed()) return; cancelExchangeForTarget(); }}
       aria-label="Cancel"
       // A pending question card gets the wording that says what Cancel does to
@@ -1176,8 +1188,11 @@ export function PromptInput() {
                 data-row-item
                 data-role="wip-preview-toggle"
               >
-                {/* eye icon — keep it inline so we don't pull in another svg file */}
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                {/* A filled eye, distinct from the outlined `EyeIcon` in
+                    shared/icons.tsx. No inline width/height: the enclosing
+                    `.icon-btn.header-icon` sizes the glyph from
+                    `--icon-glyph`, so an attribute here is overridden. */}
+                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                   <path d="M8 3C4.5 3 1.7 5.3 0.5 8c1.2 2.7 4 5 7.5 5s6.3-2.3 7.5-5c-1.2-2.7-4-5-7.5-5zm0 8a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-1.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z"/>
                 </svg>
               </button>

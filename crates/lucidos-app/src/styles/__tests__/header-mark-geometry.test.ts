@@ -21,6 +21,12 @@ const styles = (rel: string): string => readFileSync(resolve(stylesDir, rel), 'u
 const markCss = styles('header-mark.css');
 const mobileCss = styles('mobile.css');
 const shellCss = styles('panels/shell.css');
+// The switcher's markup, for the one promise here that spans both: which box
+// the Manage workspaces row is nested in decides whether it can scroll away.
+const switcherSource: string = readFileSync(
+  resolve(here, '../../components/layout/WorkspaceSwitcher.tsx'),
+  'utf-8',
+);
 
 /** The menu carries the Restart control, and the toast most likely to be on
  *  screen when a user reaches for it is the persistent "Restart needed" one.
@@ -41,15 +47,32 @@ describe('the menu paints above a persistent toast', () => {
 /** The unfolded workspace list is the one thing in the panel whose height the
  *  panel does not control: it is as long as the machine has workspaces. The
  *  panel is `position: fixed` under the header and `overflow: hidden`, so an
- *  uncapped list is CLIPPED rather than scrolled, and the rows past the cut,
- *  Manage workspaces among them, cannot be reached at all. Both halves are
- *  required and each is useless alone: a cap with no scroll hides the tail, a
- *  scroll with no cap never engages. */
+ *  uncapped list is CLIPPED rather than scrolled and the rows past the cut
+ *  cannot be reached at all. Both halves are required and each is useless
+ *  alone: a cap with no scroll hides the tail, a scroll with no cap never
+ *  engages. */
 describe('the unfolded workspace list scrolls instead of overflowing the panel', () => {
-  it('.brand-menu-ws-list caps its height and scrolls', () => {
+  it('.brand-menu-ws-scroll caps its height and scrolls', () => {
+    const scroll = block(markCss, '.brand-menu-ws-scroll {');
+    expect(decl(scroll, 'max-height')).toBe('var(--brand-menu-ws-list-max-height)');
+    expect(decl(scroll, 'overflow-y')).toBe('auto');
+  });
+
+  it('Manage workspaces sits outside the scroller, so it never scrolls away', () => {
+    // It is the way OUT of a list too long to read. Inside the scroller it was
+    // the one row a long list hid, which is the report this answers.
     const list = block(markCss, '.brand-menu-ws-list {');
-    expect(decl(list, 'max-height')).toBe('var(--brand-menu-ws-list-max-height)');
-    expect(decl(list, 'overflow-y')).toBe('auto');
+    expect(decl(list, 'max-height')).toBeNull();
+    expect(decl(list, 'overflow-y')).toBeNull();
+
+    // The markup half: the manage row is a sibling of the scroller, so every
+    // `<div>` opened after it is closed again before the row.
+    const from = switcherSource.indexOf('<div class="brand-menu-ws-scroll">');
+    const to = switcherSource.indexOf('brand-menu-ws-row brand-menu-ws-manage', from);
+    expect(from, 'the scroller is gone').toBeGreaterThanOrEqual(0);
+    expect(to, 'the manage row is gone').toBeGreaterThan(from);
+    const between = switcherSource.slice(from, to);
+    expect(between.match(/<\/div>/g)?.length).toBe(between.match(/<div\b/g)?.length);
   });
 
   it('the panel itself is bounded by the room below the header', () => {
@@ -67,6 +90,37 @@ describe('the unfolded workspace list scrolls instead of overflowing the panel',
     // the header than a desktop window does.
     const cap = decl(block(markCss, ':root {'), '--brand-menu-ws-list-max-height');
     expect(cap).toContain('vh');
+  });
+});
+
+/** The action a right-click unfolds hangs under the row it belongs to. Its
+ *  glyph has to start on that row's NAME column, or it reads as a sibling
+ *  instead of a satellite. Two hosts unfold one, and their rows lead with
+ *  different columns, so there are two indents and neither may be a constant:
+ *  each is the row's own padding plus its own leading box plus its own gap. */
+describe('an unfolded action indents off the row it hangs under', () => {
+  it('leaves the shared rule with the dressing and no indent of its own', () => {
+    const shared = block(markCss, '.brand-menu-ws-action {');
+    expect(decl(shared, 'color')).toBe('var(--text-muted)');
+    expect(
+      decl(shared, 'padding-left'),
+      'an indent here would be one host\'s column imposed on both',
+    ).toBeNull();
+  });
+
+  it('derives each indent from its own host\'s leading column', () => {
+    // Under a switcher row, which leads with a status dot.
+    const underDot = decl(block(markCss, '.brand-menu-ws-action-under-dot {'), 'padding-left') ?? '';
+    expect(underDot).toContain('var(--ws-picker-dot-size)');
+    // Under a notifications row, a `.brand-menu-item` leading with the bell.
+    const underIcon = decl(block(markCss, '.brand-menu-ws-action-under-icon {'), 'padding-left') ?? '';
+    expect(underIcon).toContain('var(--icon-size-md)');
+    // Both against the spacing scale, never an eyeballed rem.
+    for (const indent of [underDot, underIcon]) {
+      expect(indent, 'a raw rem agrees with the row above it at one ui-scale only')
+        .toMatch(/var\(--space-(xs|sm|md|lg|xl)\)/);
+      expect(indent).not.toMatch(/\d+(\.\d+)?rem/);
+    }
   });
 });
 

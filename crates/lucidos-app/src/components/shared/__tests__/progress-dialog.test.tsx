@@ -12,6 +12,9 @@ import type { ProgressDialogState } from '../../../store/types';
  * is a lie the user waits on. And the panel is always programmatically
  * focusable. That is what lets the container move focus off the button that
  * opened the dialog, even in a phase with no Cancel to focus.
+ *
+ * The version below is a fixed synthetic value, deliberately not a real
+ * release, so it can never collide with the `RELEASE` file being shipped.
  */
 
 function walk(node: ComponentChildren, out: VNode[] = []): VNode[] {
@@ -92,7 +95,7 @@ describe('the flows that own the dialog', () => {
 
   it('gives a sized download a bar and a Cancel', () => {
     const state = appUpdateDialogState(
-      { version: '0.31.0', phase: 'downloading', downloaded: 50, total: 200 },
+      { version: '9.9.9', phase: 'downloading', downloaded: 50, total: 200 },
       () => {},
     );
     const body = progressDialogBody({ state });
@@ -101,7 +104,7 @@ describe('the flows that own the dialog', () => {
   });
 
   it('takes the Cancel away once the install has committed', () => {
-    const state = appUpdateDialogState({ version: '0.31.0', phase: 'installing' }, () => {});
+    const state = appUpdateDialogState({ version: '9.9.9', phase: 'installing' }, () => {});
     const body = progressDialogBody({ state });
     expect(byClass(body, 'confirm-btn-cancel')).toHaveLength(0);
     expect(byClass(body, 'mini-spinner')).toHaveLength(1);

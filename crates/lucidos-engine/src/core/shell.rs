@@ -532,6 +532,12 @@ mod tests {
             TaskOutcome::from_persisted(None, Some(9)),
             TaskOutcome::Signaled(9)
         );
+        // The malformed row the comment above names. Reading its exit_code
+        // would report a clean exit for a child that was killed.
+        assert_eq!(
+            TaskOutcome::from_persisted(Some(0), Some(9)),
+            TaskOutcome::Signaled(9)
+        );
         assert_eq!(
             TaskOutcome::from_persisted(Some(101), None),
             TaskOutcome::Exited(101)

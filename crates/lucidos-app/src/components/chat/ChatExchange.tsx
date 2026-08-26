@@ -259,8 +259,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       const triggerId = triggerTarget.dataset.triggerId;
       // navigateToTrigger, not a `triggers.find(...)` on the cached list: it
       // re-fetches the registry on a miss before concluding the trigger is
-      // gone, and names it in the toast if it really is. Same reasoning as the
-      // app branch routing through openAppById.
+      // gone, and names it in the toast if it really is. The app branch above
+      // still reads its cached list, so a miss there is silent.
       if (triggerId) void navigateToTrigger(triggerId);
       return;
     }
@@ -464,9 +464,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // Sections tagged with each section's base index in `visibleEvents`, so
   // `renderResponseEvents` can key rows stably as the list grows during
   // streaming. `splitEventSections` drops the break markers, so re-walking
-  // `visibleEvents` recovers each section's offset. The whole exchange renders:
-  // the open cost is bounded at the LOAD layer instead, so a huge coding-agent
-  // turn only ever holds a tail of its events.
+  // `visibleEvents` recovers each section's offset. The whole exchange renders,
+  // with no per-exchange clamp: the open cost is bounded by which EXCHANGES
+  // ThreadView renders, on a step budget (`threadWindow.seedRenderCount`). The
+  // clamp that used to sit here shipped a "Show earlier steps" expander the
+  // reader found confusing, and it is not coming back.
   const renderedSections = useMemo(() => {
     const sections = splitEventSections(visibleEvents);
     let cursor = 0;

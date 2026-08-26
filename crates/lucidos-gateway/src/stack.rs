@@ -175,6 +175,12 @@ fn engine_env_overrides(
 ///   * **dev, `false`**: all interfaces on `ws.port`, so `https://localhost:
 ///     <port>/` reaches the workspace app directly as well as through the
 ///     gateway. Dev-only convenience, not a relaxation of the posture above.
+///
+/// `proto` is the scheme the engine will serve, from the caller's
+/// `engine_scheme()`. Taken as an argument rather than re-derived from
+/// `loopback`, so the ports file cannot disagree with the scheme the gateway
+/// proxies and probes over. Publishing it is part of the spawn (ADR 0136), so
+/// a new spawn site cannot leave a workspace unresolvable.
 pub fn spawn_engine(
     engine_bin: &Path,
     ws: &Workspace,
@@ -182,6 +188,7 @@ pub fn spawn_engine(
     database_url: &str,
     gateway_port: u16,
     loopback: bool,
+    proto: &str,
 ) -> std::io::Result<Child> {
     // The engine writes its pidfile in here, and wants a writable CWD.
     std::fs::create_dir_all(resolved_dir.join(".lucidos"))?;
@@ -269,7 +276,72 @@ pub fn spawn_engine(
             ws.id
         );
     }
+    publish_ports_file(resolved_dir, ws, ws.port, proto);
     Ok(child)
+}
+
+/// Publish `<workspace>/.lucidos/ports` for an engine that is up.
+///
+/// The cross-workspace resolvers read this file and nothing else:
+/// `lucidos-cli`'s `resolve_target` and the engine's `http::workspace_resolver`.
+/// Until this call existed nothing wrote it on a packaged install, because the
+/// gateway's own registry lives in `<app-data>/config/workspaces.json` and
+/// neither resolver knows about it. So `lucidos spawn-thread --to <ws>` failed
+/// on every packaged workspace.
+///
+/// Written here rather than in the resolvers because the running engine is the
+/// only thing that knows both halves for certain (ADR 0136).
+///
+/// Called on the spawn path AND on re-adoption. A re-adopted engine is just as
+/// running as a spawned one, and a gateway that only ever adopts would
+/// otherwise never publish: adoption returns before the spawn.
+pub fn publish_ports_file(resolved_dir: &Path, ws: &Workspace, api_port: u16, proto: &str) {
+    let path = resolved_dir.join(".lucidos/ports");
+    let existing = std::fs::read_to_string(&path).ok();
+    let contents = merge_ports_file(existing.as_deref(), api_port, proto);
+    if let Err(e) = std::fs::write(&path, contents) {
+        crate::log!(
+            "[Gateway] could not write {} for '{}': {e} \
+             (cross-workspace spawns aimed at this workspace will not resolve it)",
+            path.display(),
+            ws.id
+        );
+    }
+}
+
+/// Set `API_PORT` and `PROTO` in a ports file, preserving every other line.
+///
+/// Key-preserving because the dev scripts own the same file and write more into
+/// it: `scripts/lib/workspace.sh`'s `swap_ports` adds `VITE_PORT`, `PG_PORT`,
+/// `PG_DATABASE` and `DATABASE_URL`, and `scripts/status.sh` sources the result.
+/// Clobbering it would strip a running dev workspace's database details.
+fn merge_ports_file(existing: Option<&str>, api_port: u16, proto: &str) -> String {
+    let api_line = format!("API_PORT={api_port}");
+    let proto_line = format!("PROTO={proto}");
+    let Some(existing) = existing else {
+        return format!("{api_line}\n{proto_line}\n");
+    };
+    let mut out = Vec::new();
+    let (mut saw_api, mut saw_proto) = (false, false);
+    for line in existing.lines() {
+        if line.starts_with("API_PORT=") {
+            saw_api = true;
+            out.push(api_line.clone());
+        } else if line.starts_with("PROTO=") {
+            saw_proto = true;
+            out.push(proto_line.clone());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !saw_api {
+        out.push(api_line);
+    }
+    if !saw_proto {
+        out.push(proto_line);
+    }
+    out.push(String::new());
+    out.join("\n")
 }
 
 /// Read the engine pidfile written by [`spawn_engine`].
@@ -1063,6 +1135,82 @@ mod tests {
                 "LUCIDOS_GATEWAY_PORT",
             ],
             "the workspace-specific set changed: add the new variable here deliberately"
+        );
+    }
+
+    /// The file is a KEY=VALUE store the dev scripts also write. `swap_ports`
+    /// puts the database details in there and `status.sh` sources them, so a
+    /// clobbering write would strip a live dev workspace's Postgres config.
+    #[test]
+    fn publishing_ports_keeps_the_keys_the_dev_scripts_own() {
+        let merged = merge_ports_file(
+            Some("API_PORT=5173\nVITE_PORT=5173\nPG_PORT=5432\nDATABASE_URL=postgres://x\n"),
+            5999,
+            "http",
+        );
+        assert_eq!(
+            merged,
+            "API_PORT=5999\nVITE_PORT=5173\nPG_PORT=5432\nDATABASE_URL=postgres://x\nPROTO=http\n"
+        );
+    }
+
+    /// The packaged case: no file at all until the gateway writes one.
+    #[test]
+    fn publishing_ports_writes_both_keys_when_there_is_no_file() {
+        assert_eq!(
+            merge_ports_file(None, 42000, "http"),
+            "API_PORT=42000\nPROTO=http\n"
+        );
+    }
+
+    /// A file left by an earlier run can name a port the engine no longer
+    /// listens on, and a scheme it no longer serves. Both are corrected, or the
+    /// caller connects somewhere dead and blames the target workspace.
+    #[test]
+    fn publishing_ports_corrects_a_stale_file() {
+        assert_eq!(
+            merge_ports_file(Some("API_PORT=41000\nPROTO=https\n"), 42000, "http"),
+            "API_PORT=42000\nPROTO=http\n"
+        );
+    }
+
+    /// The publication has to be wired into the spawn, not merely available.
+    /// That is the half the unit tests above cannot see, and the half that was
+    /// missing: `merge_ports_file` could be perfect and every packaged
+    /// workspace still unresolvable. Spawns `/usr/bin/true` as a stand-in
+    /// engine, which is enough because publication does not wait on health.
+    #[test]
+    fn a_spawn_publishes_the_ports_file_beside_the_pidfile() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let ws = Workspace {
+            id: "smoke".into(),
+            name: "Smoke".into(),
+            dir: dir.display().to_string(),
+            port: 42000,
+            database_url: None,
+            autostart: false,
+        };
+
+        let mut child = spawn_engine(
+            Path::new("/usr/bin/true"),
+            &ws,
+            dir,
+            "postgres://local/smoke",
+            5252,
+            true,
+            "http",
+        )
+        .expect("stand-in engine spawns");
+        let _ = child.wait();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".lucidos/ports")).unwrap(),
+            "API_PORT=42000\nPROTO=http\n"
+        );
+        assert!(
+            dir.join(".lucidos/engine.pid").is_file(),
+            "the ports file must land beside the pidfile, not instead of it"
         );
     }
 }

@@ -47,7 +47,7 @@ async fn network_config_roundtrips_and_rejects_garbage() {
     // PUT a valid IP → success; GET reflects it.
     let resp = client
         .put(format!("{}/api/v1/network-config", api))
-        .json(&json!({ "engine_bind": "100.101.71.58" }))
+        .json(&json!({ "engine_bind": "100.64.0.1" }))
         .send()
         .await
         .expect("put ip failed");
@@ -62,7 +62,7 @@ async fn network_config_roundtrips_and_rejects_garbage() {
         .json()
         .await
         .unwrap();
-    assert_eq!(body["engine_bind"], "100.101.71.58");
+    assert_eq!(body["engine_bind"], "100.64.0.1");
 
     // Reset to the safe default so the e2e workspace is left at loopback.
     let resp = client

@@ -1905,6 +1905,14 @@ PG_DATABASE=$(workspace_database_name)
 DATABASE_URL=$(workspace_database_url)
 EOF
 
+    # That truncated the file detect_tls appended PROTO to, so write it again.
+    # Every reader falls back to https when the line is missing. On a machine
+    # with no dev certs the engine then serves plain http, and each caller
+    # fails at the TLS handshake with "record overflow".
+    if [ -n "${PROTO:-}" ]; then
+        echo "PROTO=$PROTO" >> "$WORKSPACE/.lucidos/ports"
+    fi
+
     # LUCIDOS_API_PORT here is the ENGINE's port (the legacy/direct + tauri/e2e
     # paths spawn the engine on it). start_gateway overrides LUCIDOS_API_PORT to
     # GATEWAY_PORT for the gateway process itself.

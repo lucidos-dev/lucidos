@@ -20,7 +20,7 @@ interface WindowDragOptions {
 /**
  * Make an element a window drag region in the Tauri desktop build, replacing
  * `data-tauri-drag-region` (whose internal `plugin:window|start_dragging` IPC is
- * denied by our capability ACL — see `lib.rs::start_window_drag`). A press that
+ * denied by our capability ACL, see `app_window.rs::start_window_drag`). A press that
  * then moves past `WINDOW_DRAG_THRESHOLD_PX` starts a native window drag via the
  * always-allowed `start_window_drag` app command; pure clicks and double-clicks
  * never cross the threshold, so they still reach the page's own handlers.

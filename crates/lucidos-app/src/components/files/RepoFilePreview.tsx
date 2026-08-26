@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
-import { repoDiff, repoPending, filePreviewSource, diffSideBySide, openImagePopup, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
+import { repoDiff, repoPending, filePreviewSource, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
@@ -9,8 +9,9 @@ import { highlightFileLines, CODE_EXTS } from '../../utils/syntaxHighlight';
 import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
+import { PreviewImage } from './PreviewImage';
 import { REPO_RENDERABLE_EXTS, previewMediaKind } from './previewExts';
-import { isMobile, viewportIsMobile } from '../../utils/viewport';
+import { viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { DiffView } from './DiffView';
@@ -221,7 +222,7 @@ function RepoFileMedia({ repoId, path, changeId, gitRef, revision, ext }: RepoFi
   const kind = previewMediaKind(ext);
 
   if (kind === 'image') {
-    return <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />;
+    return <PreviewImage src={url} alt={path} />;
   }
   if (kind === 'pdf') return <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
   if (kind === 'video') return <video src={url} controls style="max-width:100%;max-height:100%;" />;
@@ -281,7 +282,7 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision }: RepoFileCont
     if (ext === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
     // The media variant keeps a definite height so the image's max-height:100%
     // still fits the pane (the bare padding wrapper would leave it unconstrained).
-    if (ext === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} /></div>;
+    if (ext === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedHtml!} alt={path} /></div>;
   }
 
   return (

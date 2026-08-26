@@ -256,6 +256,16 @@ impl LucidosEngine {
         let thread_id = thread_id.unwrap_or(request_id);
         let thread_id_str = thread_id.to_string();
 
+        // A trigger fire mints its thread HERE, long after the Thread Queue
+        // admitted its entry. So this is the queue's first chance to learn
+        // which thread the fire produced. A fire that parks on a question
+        // reaches no later reporting point.
+        if let Some(tc) = trigger.as_ref() {
+            self.thread_queue
+                .record_entry_thread(tc.queue_entry_id, thread_id)
+                .await;
+        }
+
         // Spawn Flash image description in background (don't block main LLM flow).
         // Returns `(description, model)` so the agentic loop can emit
         // `ImageDescribed { model, .. }` with the actual model that produced

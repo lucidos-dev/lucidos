@@ -166,6 +166,26 @@ pub fn log_retry(model: &str, reason: &str, attempt: u32, delay: Duration) {
     );
 }
 
+/// Back off after a failed SSE parse, when the error is retryable and attempts
+/// remain. `true` means the caller re-sends the whole request; `false` means it
+/// returns the error.
+///
+/// The four streaming providers (OpenAI Chat, OpenAI Responses, direct
+/// Anthropic, Vertex Claude) all reached this arm with the same fourteen lines.
+/// One home keeps the base delay and the log wording the same across them. A
+/// change to the backoff can no longer land on three paths out of four.
+pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u32) -> bool {
+    if !is_retryable_error(err) || attempt > MAX_RETRIES {
+        return false;
+    }
+    // Base 2 rather than 1: a stream that died partway costs more to re-run
+    // than a connect that never started.
+    let delay = retry_delay(attempt, 2);
+    log_retry(model, &format!("Stream error: {}", err), attempt, delay);
+    tokio::time::sleep(delay).await;
+    true
+}
+
 /// Wrap a final error with retry context so logs/notifications show what was attempted.
 pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String {
     if attempts > 1 {
@@ -404,6 +424,22 @@ mod tests {
         assert_eq!(
             with_retry_context("connection failed", 3),
             "connection failed (after 3 attempts)"
+        );
+    }
+
+    /// The two ways the shared stream-error arm declines to retry. Both return
+    /// without sleeping, so the four provider loops fall through to the error
+    /// they were going to return anyway.
+    #[tokio::test]
+    async fn a_stream_error_stops_retrying_when_spent_or_not_transient() {
+        assert!(
+            !retry_after_stream_error("test-model", "connection reset by peer", MAX_RETRIES + 1)
+                .await,
+            "attempts are spent"
+        );
+        assert!(
+            !retry_after_stream_error("test-model", "authentication failed", 1).await,
+            "an auth failure is not transient"
         );
     }
 

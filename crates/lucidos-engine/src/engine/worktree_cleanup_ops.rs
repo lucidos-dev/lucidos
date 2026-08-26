@@ -516,12 +516,27 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
 /// Time since the most recent thread event, or `None` when no events exist
 /// (a stranded worktree) or the lookup fails. The cleanup worker treats
 /// `None` as "don't act" rather than guessing.
+///
+/// The subtraction happens in SQL (ADR 0053). Postgres stamps
+/// `events.created`, so `Utc::now() - created` puts the host clock and the
+/// database clock on opposite sides of one minus. In dev those are two
+/// machines. A container behind the host inflates every age. A thread active
+/// minutes ago then crosses `TIER_0_GRACE` and loses its worktree to the
+/// retention gate.
+///
+/// A negative age (the drift pointing the other way) clamps to zero, so a
+/// freshly-emitted event never reads as ancient.
 pub(crate) async fn last_activity_age(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Duration> {
-    let last = lookup_last_activity(pool, thread_id).await?;
-    let delta = Utc::now().signed_duration_since(last);
-    // Negative deltas (clock skew) round to zero so we don't accidentally
-    // treat a freshly-emitted event as ancient.
-    Some(delta.to_std().unwrap_or(Duration::ZERO))
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT EXTRACT(EPOCH FROM now() - MAX(created))::bigint FROM events \
+         WHERE aggregate = 'thread' AND aggregate_id = $1::text",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+    let secs = row.and_then(|(opt,)| opt)?;
+    Some(Duration::from_secs(secs.max(0) as u64))
 }
 
 pub(crate) async fn lookup_thread_summary(

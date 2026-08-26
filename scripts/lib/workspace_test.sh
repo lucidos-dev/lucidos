@@ -769,6 +769,39 @@ test_swap_ports_writes_shared_database_url() {
     fi
 }
 
+# Every launcher runs detect_tls before swap_ports, and swap_ports rewrites the
+# same file. A reader that finds no PROTO falls back to https, so a dropped
+# line makes every caller fail the TLS handshake against a plain http engine.
+test_swap_ports_keeps_the_proto_detect_tls_wrote() {
+    echo "test: swap_ports keeps the PROTO line detect_tls wrote"
+
+    local PROJECT_DIR="$SANDBOX/proj-proto"
+    local FRONTEND_DIR="$PROJECT_DIR/crates/lucidos-app"
+    mkdir -p "$FRONTEND_DIR" "$HOME/workspaces/proto-project/.lucidos"
+
+    WORKSPACE="$HOME/workspaces/proto-project"
+    VITE_PORT=5190
+    PG_PORT=5545
+    LUCIDOS_TLS_CERT=""
+    LUCIDOS_TLS_KEY=""
+
+    local ports_file="$WORKSPACE/.lucidos/ports"
+    echo "API_PORT=$VITE_PORT" > "$ports_file"
+
+    detect_tls
+    swap_ports >/dev/null
+
+    if [ "$PROTO" != "http" ]; then
+        fail "fixture expected a cert-less detect_tls, got PROTO=${PROTO:-<unset>}"
+        return
+    fi
+    if grep -qx "PROTO=http" "$ports_file"; then
+        pass "ports file still records the detected scheme"
+    else
+        fail "swap_ports dropped PROTO: $(cat "$ports_file")"
+    fi
+}
+
 test_seed_gateway_registry_removes_legacy_database_url() {
     echo "test: seed_gateway_registry removes legacy database_url"
 
@@ -851,6 +884,7 @@ test_shared_pg_sql_quoting
 test_legacy_pg_volume_layout_detects_parent_pgdata
 test_legacy_pg_volume_layout_detects_root_pgdata
 test_swap_ports_writes_shared_database_url
+test_swap_ports_keeps_the_proto_detect_tls_wrote
 test_seed_gateway_registry_removes_legacy_database_url
 
 # ── worktree-pinned stack guard ────────────────────────────────────────

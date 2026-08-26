@@ -3,7 +3,7 @@
  *
  *  Three channels coexist in the hash:
  *  - Bare `#notifications` (cross-workspace landing channel, see
- *    `openWorkspaceNotifications`) → the notifications view. Matched FIRST,
+ *    `utils/workspaceLanding.ts`) → the notifications view. Matched FIRST,
  *    because `notification` is a prefix of it.
  *  - Bare `#thread=<uuid>` (cross-workspace landing channel — see
  *    `openThreadInWorkspace`) → focusThreadOrBootstrap.
@@ -110,14 +110,18 @@ async function landThreadHash(threadId: string): Promise<void> {
   }
 }
 
-/** The bare cross-workspace NOTIFICATIONS landing channel, written by
- *  `openWorkspaceNotifications` when a Lucidos-menu row points at a peer.
+/** The bare cross-workspace NOTIFICATIONS landing channel, written whenever a
+ *  Lucidos-menu row points at a peer. `utils/workspaceLanding.ts` is the
+ *  writing half, and owns the fragment this must keep matching.
  *
  *  ANCHORED, and that is load-bearing rather than tidy. `notification` is a
  *  prefix of `notifications`, so a loose match would also swallow
  *  `#notification=<uuid>`, the push-tap channel parsed below. An iOS push tap
  *  would then open the inbox list instead of the notification it was raised
- *  for. */
+ *  for.
+ *
+ *  Written out rather than composed from `landingHash`, so the anchoring the
+ *  channel's correctness rests on is readable here. A test pins the two. */
 const NOTIFICATIONS_HASH_RE = /^#notifications$/;
 
 export function handleHashLocation(): void {

@@ -69,6 +69,9 @@ pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
 /// tree, and when a filter such as git-crypt blows up on a locked repo. Neither
 /// says there is nothing to lose. Reporting dirty costs the user a retry behind
 /// an accurate refusal.
+///
+/// An auto-commit that does not land returns `true` for the same reason. Only a
+/// committed file is safe from the force-checkout.
 pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
     ensure_head_on_main(repo_root).await;
     let output = match git_cmd(&["status", "--porcelain"], repo_root).await {
@@ -91,28 +94,102 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
         }
     };
     let status = String::from_utf8_lossy(&output.stdout);
-    // Porcelain format: "XY filename" -- status is first 2 chars, then a space, then path
-    // Skip untracked files (??) -- they don't block git merge
-    let dirty_files: Vec<&str> = status
+    // Porcelain v1 is "XY path", or "XY old -> new" for a rename or a copy.
+    //
+    // Both sides of a rename decide whether the entry is safe to auto-commit,
+    // so both are weighed. Only the destination is handed to `git add`: the
+    // source no longer exists, and ONE unmatched pathspec aborts the whole
+    // invocation, taking every other path in the same call with it.
+    let mut dirty_files: Vec<&str> = Vec::new();
+    let mut add_paths: Vec<&str> = Vec::new();
+    for entry in status
         .lines()
-        .filter(|l| l.len() >= 4 && !l.starts_with("??"))
-        .map(|l| l[3..].trim())
-        .collect();
+        .filter(|l| porcelain_line_blocks_merge(l))
+        .map(|l| &l[3..])
+    {
+        match entry.split_once(" -> ") {
+            Some((from, to)) => {
+                dirty_files.push(from.trim());
+                dirty_files.push(to.trim());
+                add_paths.push(to.trim());
+            }
+            None => {
+                dirty_files.push(entry.trim());
+                add_paths.push(entry.trim());
+            }
+        }
+    }
     if dirty_files.is_empty() {
         return false;
     }
     // Auto-commit harmless dirty files that shouldn't block merging Lucidos changes
     let auto_committable = dirty_files.iter().all(|f| f.starts_with("docs/plans/"));
     if auto_committable {
-        let msg = "chore: commit docs changes";
         let mut add_args: Vec<&str> = vec!["add", "--"];
-        add_args.extend(dirty_files.iter());
-        let _ = git_cmd(&add_args, repo_root).await;
-        let _ = git_cmd(&["commit", "-m", msg], repo_root).await;
-        log!("[Git] Auto-committed dirty files: {:?}", dirty_files);
-        return false;
+        add_args.extend(add_paths.iter());
+        let commit_args = ["commit", "-m", "chore: commit docs changes"];
+        // Try both, then ask git whether the tree is clean. Neither exit code
+        // answers that on its own. A swallowed failure used to report clean
+        // while the files were still uncommitted, and the `checkout -f main`
+        // downstream discarded them. Trusting the codes instead fails the other
+        // way: `git commit` exits non-zero with nothing left to commit, which a
+        // sibling apply reaching these same files first produces.
+        for args in [add_args.as_slice(), commit_args.as_slice()] {
+            match git_cmd(args, repo_root).await {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => log!(
+                    "[Git] auto-commit of {:?}: `git {}` exited non-zero: {}",
+                    dirty_files,
+                    args.join(" "),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => log!(
+                    "[Git] auto-commit of {:?}: could not run `git {}`: {}",
+                    dirty_files,
+                    args.join(" "),
+                    e
+                ),
+            }
+        }
+        return match git_cmd(&["status", "--porcelain"], repo_root).await {
+            Ok(o) if o.status.success() => {
+                let still_dirty = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(porcelain_line_blocks_merge);
+                if still_dirty {
+                    log!(
+                        "[Git] auto-commit of {:?} did not land. Reporting dirty, never clean",
+                        dirty_files
+                    );
+                } else {
+                    log!("[Git] Auto-committed dirty files: {:?}", dirty_files);
+                }
+                still_dirty
+            }
+            Ok(o) => {
+                log!(
+                    "[Git] auto-commit re-check: git status exited non-zero: {}. Reporting dirty, never clean",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                true
+            }
+            Err(e) => {
+                log!(
+                    "[Git] auto-commit re-check: git status failed: {e}. Reporting dirty, never clean"
+                );
+                true
+            }
+        };
     }
     true
+}
+
+/// Whether a porcelain v1 line names something that blocks a merge.
+///
+/// An untracked file does not, and `git merge` is happy to run over it. The
+/// length guard covers the `XY ` prefix every other line carries.
+fn porcelain_line_blocks_merge(line: &str) -> bool {
+    line.len() >= 4 && !line.starts_with("??")
 }
 
 /// Subjects we never surface to the user — internal auto-commits.

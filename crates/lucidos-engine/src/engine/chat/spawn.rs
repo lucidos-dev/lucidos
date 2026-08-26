@@ -89,40 +89,50 @@ impl LucidosEngine {
 
         let engine = self.clone_arc();
         let prompt_owned = prompt.to_string();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = engine
-                .process_message_with_steps(
-                    &prompt_owned,
-                    model.as_deref(),
-                    None,
-                    None,
-                    reasoning_effort.as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(child_thread_id),
-                    None,
-                    None,
-                    None,
-                    parent_thread_id,
-                    spawning_event_id,
-                    ActorMode::Agent,
-                    None,
-                    None,
-                    // The Thread Queue executor persists the child's
-                    // MessageReceived at admission time; it is a real message,
-                    // just one this task didn't emit.
-                    pre_emitted_origin.map(PreEmittedOrigin::Message),
-                    None,
-                    origin,
-                    crate::engine::FollowUpUrgency::Normal,
-                )
-                .await
-            {
-                log!("[FanOut] Child thread {} failed: {}", child_thread_id, e);
-            }
-        });
+        // Carry the caller's event-trigger chain depth across the spawn. The
+        // Thread Queue scoped the task that called us; this is the second hop,
+        // and a task-local does not follow a `tokio::spawn`. Without it the
+        // child's whole turn reads 0: its terminal event, and every
+        // `emit_event` its tools make. A chain through `run_thread` would then
+        // never reach the depth cap.
+        let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
+        let handle = tokio::spawn(crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH.scope(
+            depth,
+            async move {
+                if let Err(e) = engine
+                    .process_message_with_steps(
+                        &prompt_owned,
+                        model.as_deref(),
+                        None,
+                        None,
+                        reasoning_effort.as_deref(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(child_thread_id),
+                        None,
+                        None,
+                        None,
+                        parent_thread_id,
+                        spawning_event_id,
+                        ActorMode::Agent,
+                        None,
+                        None,
+                        // The Thread Queue executor persists the child's
+                        // MessageReceived at admission time; it is a real message,
+                        // just one this task didn't emit.
+                        pre_emitted_origin.map(PreEmittedOrigin::Message),
+                        None,
+                        origin,
+                        crate::engine::FollowUpUrgency::Normal,
+                    )
+                    .await
+                {
+                    log!("[FanOut] Child thread {} failed: {}", child_thread_id, e);
+                }
+            },
+        ));
 
         Ok((child_thread_id, handle))
     }

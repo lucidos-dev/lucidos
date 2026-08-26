@@ -75,7 +75,7 @@ describe('networkAccessBody: it opens on the saved bind', () => {
     expect(activeMode(render({ status: 'loaded', data: editor('loopback') }))).toBe(
       'Loopback only',
     );
-    expect(activeMode(render({ status: 'loaded', data: editor('100.101.71.58') }))).toBe(
+    expect(activeMode(render({ status: 'loaded', data: editor('100.64.0.1') }))).toBe(
       'Tailnet / IP',
     );
   });
@@ -95,7 +95,7 @@ describe('networkAccessBody: no layout jumps', () => {
     for (const state of [
       { status: 'loading' },
       { status: 'loaded', data: editor('all') },
-      { status: 'loaded', data: editor('100.101.71.58') },
+      { status: 'loaded', data: editor('100.64.0.1') },
     ] as Loadable<NetworkEditor>[]) {
       expect(render(state)).toContain('ws-picker-net-collapse');
     }
@@ -103,7 +103,7 @@ describe('networkAccessBody: no layout jumps', () => {
     expect(render({ status: 'loaded', data: editor('all') })).not.toContain(
       'ws-picker-net-collapse is-open',
     );
-    expect(render({ status: 'loaded', data: editor('100.101.71.58') })).toContain(
+    expect(render({ status: 'loaded', data: editor('100.64.0.1') })).toContain(
       'ws-picker-net-collapse is-open',
     );
   });
@@ -141,7 +141,7 @@ describe('networkAccessBody: save is explained, never mutely grey', () => {
   it('offers Save with no reason line once the draft is a valid change', () => {
     const changed: NetworkEditor = {
       config: { gateway_bind: 'all', inherit: true, detected_tailscale_ip: null },
-      draft: { mode: 'address', address: '100.101.71.58', inherit: true },
+      draft: { mode: 'address', address: '100.64.0.1', inherit: true },
     };
     const text = render({ status: 'loaded', data: changed });
     expect(text).not.toContain('ws-picker-net-blocked');
@@ -169,12 +169,12 @@ describe('networkAccessBody: save affordance', () => {
   it('offers the detected Tailscale address as click-to-fill when there is one', () => {
     const withIp = render({
       status: 'loaded',
-      data: editor('100.101.71.58', true, '100.101.71.58'),
+      data: editor('100.64.0.1', true, '100.64.0.1'),
     });
     expect(withIp).toContain('ws-picker-net-detected');
     expect(withIp).toContain('Detected Tailscale');
     // No detection: the generic hint stands in, same row, same height.
-    const noIp = render({ status: 'loaded', data: editor('100.101.71.58') });
+    const noIp = render({ status: 'loaded', data: editor('100.64.0.1') });
     expect(noIp).not.toContain('ws-picker-net-detected');
     expect(noIp).toContain('Your Tailscale 100.x address');
   });

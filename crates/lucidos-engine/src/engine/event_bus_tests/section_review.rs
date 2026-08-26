@@ -636,6 +636,7 @@ fn message_received_destructures_parent_thread_id() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(
@@ -668,6 +669,7 @@ fn message_received_destructures_parent_thread_id() {
         },
         aggregate: None,
         depth: 0,
+        emitting_trigger_id: None,
     };
     let json2: serde_json::Value = serde_json::from_str(&emitted_no_parent.to_sse_json()).unwrap();
     assert!(json2["data"]["event"].get("parent_thread_id").is_none()

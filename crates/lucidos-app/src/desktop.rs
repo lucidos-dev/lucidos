@@ -766,7 +766,7 @@ static LAUNCH_TARGET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(N
 /// the gateway is up can only produce one landing, and the most recent is the
 /// one the user just asked for.
 ///
-/// macOS-gated because its one caller is `crate::route_native_tap`, and native
+/// macOS-gated because its one caller is `crate::app_window::route_native_tap`, and native
 /// banners exist only there. Off macOS nothing sets it and
 /// [`take_launch_target`] just keeps answering `None`.
 #[cfg(target_os = "macos")]
@@ -776,7 +776,7 @@ pub fn set_launch_target(url: String) {
 
 /// Take the pending launch target, if any. Consuming (rather than peeking) is
 /// what keeps it to the FIRST navigation: a tap arriving after the window is
-/// live is routed by `crate::route_native_tap` against the real window list
+/// live is routed by `crate::app_window::route_native_tap` against the real window list
 /// instead.
 fn take_launch_target() -> Option<String> {
     LAUNCH_TARGET.lock().unwrap().take()
@@ -864,7 +864,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
                             // Always onto the menu-bar tray title, and onto the
                             // Dock badge as well while a window is open (Regular);
                             // menu-bar-only (Accessory) has no Dock tile.
-                            crate::apply_unread_indicator(&h, total);
+                            crate::activation::apply_unread_indicator(&h, total);
                         });
                         // Record the value only once the hop is ACCEPTED. Nothing
                         // reads the tray or the Dock tile back, so `last` is the
@@ -971,7 +971,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         // session for `main`: the user asked for that workspace just now, and
         // the session is only what they had last time.
         let origin = gateway_url(port);
-        let restore = crate::resolve_window_session_plan();
+        let restore = crate::window_persist::resolve_window_session_plan();
         let mut plan = launch_plan(take_launch_target(), restore, &origin);
         navigate_main_window(&handle, &plan.main);
         // A tap that landed between the take above and the navigate would
@@ -991,7 +991,7 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             let extra = plan.extra;
             let windows = handle.clone();
             if let Err(e) = handle.run_on_main_thread(move || {
-                crate::restore_extra_windows(&windows, &extra);
+                crate::app_window::restore_extra_windows(&windows, &extra);
             }) {
                 eprintln!("[desktop] could not restore the other windows: {e}");
             }
@@ -1088,12 +1088,131 @@ pub(crate) fn launch_plan(
     }
 }
 
+/// One live app window, as a reopen sees it.
+///
+/// `visible` is the field that matters. Close to Menu Bar HIDES every window
+/// rather than destroying any, so the hidden set IS the arrangement waiting to
+/// come back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveWindow {
+    pub label: String,
+    pub url: String,
+    pub visible: bool,
+}
+
+/// What a reopen owes the user.
+///
+/// Two sources, because a reopen meets the client in two states. A PARKED client
+/// still holds every window, hidden, and owes only a show. A client that never
+/// restored owes windows it does not have. That second state is the login
+/// agent's launch, which comes up menu-bar-only and restores nothing (ADR 0072).
+/// So the first reopen after a reboot is where the arrangement is finally owed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReopenPlan {
+    /// Hidden windows to show, `main` first and then by label.
+    pub show: Vec<String>,
+    /// Where to point `main` first, when it is on no workspace and the record
+    /// still names one. It keeps whatever frame the user gave it.
+    pub navigate_main: Option<String>,
+    /// Recorded workspaces no live window is on.
+    pub build: Vec<PlannedWindow>,
+    /// The window to front LAST, so it ends on top. `None` only when this
+    /// process holds no app window at all, and the caller has to make one.
+    pub front: Option<String>,
+}
+
+/// Decide what a reopen puts back. Pure, so the precedence is testable.
+///
+/// A live window always beats the record, in both directions. One that is
+/// hidden is shown rather than rebuilt, which is what preserves its page state
+/// and makes a park cheap to undo. One that is already visible is left exactly
+/// where it is.
+///
+/// A workspace the record names and no live window is on is BUILT. An adrift
+/// `main` takes the first of those as a navigate instead. Otherwise the reopen
+/// leaves a picker window sitting behind the restored ones.
+///
+/// Every URL is composed here from a slug validated by `is_workspace_slug`.
+/// Every `window-*` webview holds the full IPC permission set on the gateway
+/// origin (ADR 0028), so nothing read off the record may reach one verbatim.
+pub(crate) fn reopen_plan(
+    live: &[LiveWindow],
+    session: &crate::window_session::WindowSession,
+    origin: &str,
+) -> ReopenPlan {
+    let mut ordered: Vec<&LiveWindow> = live.iter().collect();
+    ordered.sort_by(|a, b| {
+        crate::app_window::window_order_key(&a.label)
+            .cmp(&crate::app_window::window_order_key(&b.label))
+    });
+
+    let show: Vec<String> = ordered
+        .iter()
+        .filter(|w| !w.visible)
+        .map(|w| w.label.clone())
+        .collect();
+
+    let main = ordered
+        .iter()
+        .find(|w| w.label == crate::app_window::MAIN_WINDOW_LABEL);
+    // A `main` still on the bundled splash means `launch` has not reached the
+    // gateway yet, and it owns that window's first navigation. It is about to
+    // restore these same workspaces, so consulting the record here would
+    // navigate twice and build a duplicate. A workspace URL asked for before
+    // the gateway is healthy does not even load. A reopen mid-boot therefore
+    // shows what is parked and leaves the record alone, the same deference
+    // `route_native_tap` shows when it AIMS the boot navigation.
+    //
+    // This is the likeliest moment of all after a reboot: the login agent sits
+    // in the menu bar while the service starts, and the user clicks it.
+    let booting = main.is_some_and(|w| !crate::window_target::window_is_navigated(&w.url));
+
+    let mut owed: Vec<(&str, Option<crate::window_restore::Rect>)> = Vec::new();
+    if !booting {
+        // Every workspace this process is already serving, visible or parked.
+        let served: Vec<&str> = live
+            .iter()
+            .filter_map(|w| crate::window_target::window_workspace(&w.url))
+            .collect();
+        for id in &session.open {
+            let id = id.as_str();
+            let known = served.contains(&id) || owed.iter().any(|(seen, _)| *seen == id);
+            if crate::window_target::is_workspace_slug(id) && !known {
+                owed.push((id, session.geometry.get(id).copied()));
+            }
+        }
+    }
+
+    // Adrift: on the picker or the gateway root, i.e. navigated but on no
+    // workspace. Such a window is the one to point somewhere, never to leave.
+    let adrift = main.is_some_and(|w| crate::window_target::window_workspace(&w.url).is_none());
+    let navigate_main = (adrift && !owed.is_empty())
+        .then(|| crate::window_target::workspace_url(origin, owed.remove(0).0));
+
+    ReopenPlan {
+        front: main
+            .map(|w| w.label.clone())
+            .or_else(|| show.first().cloned()),
+        show,
+        navigate_main,
+        build: owed
+            .into_iter()
+            .map(|(id, frame)| PlannedWindow {
+                url: crate::window_target::workspace_url(origin, id),
+                frame,
+            })
+            .collect(),
+    }
+}
+
 /// Point the declared main window at `url`. Best-effort: a missing window or
 /// an unparseable URL is logged, never fatal. The alternative is stranding the
 /// user on the boot splash with no explanation.
-fn navigate_main_window(app: &AppHandle, url: &str) {
+pub(crate) fn navigate_main_window(app: &AppHandle, url: &str) {
+    // By webview, not webview window, per ADR 0140. A blind lookup leaves an
+    // adrift `main` on the picker whenever it has a URL preview open.
     match (
-        app.get_webview_window(crate::MAIN_WINDOW_LABEL),
+        app.get_webview(crate::app_window::MAIN_WINDOW_LABEL),
         url.parse::<tauri::Url>(),
     ) {
         (Some(win), Ok(parsed)) => {
@@ -2447,6 +2566,245 @@ mod tests {
         assert_eq!(plan.main, "https://box.tail1234.ts.net/myws/");
         assert_eq!(
             plan.extra,
+            vec![planned("https://box.tail1234.ts.net/dev/", None)]
+        );
+    }
+
+    // ── What a reopen puts back ──────────────────────────────────────────────
+
+    fn live(label: &str, url: &str, visible: bool) -> LiveWindow {
+        LiveWindow {
+            label: label.to_string(),
+            url: url.to_string(),
+            visible,
+        }
+    }
+
+    /// A record naming `open`, with a frame for each entry `geometry` lists.
+    fn session(
+        open: &[&str],
+        geometry: &[(&str, crate::window_restore::Rect)],
+    ) -> crate::window_session::WindowSession {
+        crate::window_session::WindowSession {
+            open: open.iter().map(|id| id.to_string()).collect(),
+            geometry: geometry
+                .iter()
+                .map(|(id, frame)| (id.to_string(), *frame))
+                .collect(),
+        }
+    }
+
+    // The reported defect. Cmd-Q parks three windows and the reopen brought
+    // back `main` alone, because the park had destroyed the other two.
+    #[test]
+    fn a_reopen_shows_every_parked_window() {
+        let plan = reopen_plan(
+            &[
+                live("main", "http://localhost:3210/myws/", false),
+                live("window-1", "http://localhost:3210/dev/", false),
+                live("window-2", "http://localhost:3210/other/", false),
+            ],
+            &session(&["myws", "dev", "other"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(plan.show, vec!["main", "window-1", "window-2"]);
+        assert_eq!(plan.front.as_deref(), Some("main"));
+        // Every recorded workspace already has a window, so nothing is built.
+        assert!(plan.build.is_empty());
+        assert_eq!(plan.navigate_main, None);
+    }
+
+    // `main` first, then by label. The same order `window_session::capture`
+    // writes, through the one `window_order_key`.
+    #[test]
+    fn the_parked_windows_come_back_in_a_stable_order() {
+        let plan = reopen_plan(
+            &[
+                live("window-2", "http://localhost:3210/c/", false),
+                live("main", "http://localhost:3210/a/", false),
+                live("window-1", "http://localhost:3210/b/", false),
+            ],
+            &crate::window_session::WindowSession::default(),
+            ORIGIN,
+        );
+        assert_eq!(plan.show, vec!["main", "window-1", "window-2"]);
+    }
+
+    // A window already on screen is where the user put it. The tray item still
+    // fronts `main`, which is what it did before any of this.
+    #[test]
+    fn a_visible_window_is_left_alone() {
+        let plan = reopen_plan(
+            &[
+                live("main", "http://localhost:3210/myws/", true),
+                live("window-1", "http://localhost:3210/dev/", false),
+            ],
+            &session(&["myws", "dev"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(plan.show, vec!["window-1"]);
+        assert_eq!(plan.front.as_deref(), Some("main"));
+    }
+
+    // The reboot case. The login agent comes up menu-bar-only and restores
+    // nothing (ADR 0072), so the first reopen is where the record is owed.
+    #[test]
+    fn a_reopen_with_nothing_restored_rebuilds_from_the_record() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/", false)],
+            &session(
+                &["myws", "dev"],
+                &[
+                    ("myws", rect(0, 0, 1200, 800)),
+                    ("dev", rect(9, 9, 900, 700)),
+                ],
+            ),
+            ORIGIN,
+        );
+        // `main` is adrift on the gateway root, so it TAKES the first workspace
+        // rather than leaving a picker window behind the restored ones.
+        assert_eq!(
+            plan.navigate_main.as_deref(),
+            Some("http://localhost:3210/myws/")
+        );
+        assert_eq!(
+            plan.build,
+            vec![planned(
+                "http://localhost:3210/dev/",
+                Some(rect(9, 9, 900, 700))
+            )]
+        );
+        assert_eq!(plan.show, vec!["main"]);
+        assert_eq!(plan.front.as_deref(), Some("main"));
+    }
+
+    // A live window always beats the record. Rebuilding a workspace one is
+    // already on would double it on every reopen.
+    #[test]
+    fn a_workspace_a_live_window_is_on_is_never_rebuilt() {
+        let plan = reopen_plan(
+            &[
+                live("main", "http://localhost:3210/myws/", false),
+                live("window-1", "http://localhost:3210/dev/", true),
+            ],
+            &session(&["myws", "dev"], &[]),
+            ORIGIN,
+        );
+        assert!(plan.build.is_empty());
+        assert_eq!(plan.navigate_main, None);
+    }
+
+    // A `main` already on a workspace is not adrift. It keeps the page it is
+    // on, and the record's entry becomes a window of its own.
+    #[test]
+    fn a_main_on_a_workspace_is_never_navigated_away() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/myws/", false)],
+            &session(&["dev"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(plan.navigate_main, None);
+        assert_eq!(
+            plan.build,
+            vec![planned("http://localhost:3210/dev/", None)]
+        );
+    }
+
+    // The record is a file on disk, and every `window-*` webview holds the full
+    // IPC permission set on the gateway origin (ADR 0028). A slug that is not
+    // one is dropped rather than composed into a URL.
+    #[test]
+    fn a_reopen_builds_nothing_from_a_slug_the_record_cannot_justify() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/myws/", false)],
+            &session(
+                &["..", "a/b", "MyWs", "~", "", "http://evil.example", "ok"],
+                &[],
+            ),
+            ORIGIN,
+        );
+        assert_eq!(plan.build, vec![planned("http://localhost:3210/ok/", None)]);
+    }
+
+    // Two entries naming one workspace would land the second window exactly on
+    // the first, which is the rule `capture` already applies on the way in.
+    #[test]
+    fn a_repeated_workspace_is_built_once() {
+        let plan = reopen_plan(&[], &session(&["dev", "dev"], &[]), ORIGIN);
+        assert_eq!(
+            plan.build,
+            vec![planned("http://localhost:3210/dev/", None)]
+        );
+    }
+
+    // Nothing at all: no window in the process and nothing recorded. The caller
+    // reads the empty `front` as "make one".
+    #[test]
+    fn a_reopen_with_no_window_and_no_record_leaves_the_caller_to_make_one() {
+        let plan = reopen_plan(
+            &[],
+            &crate::window_session::WindowSession::default(),
+            ORIGIN,
+        );
+        assert_eq!(plan, ReopenPlan::default());
+        assert_eq!(plan.front, None);
+    }
+
+    // No `main` in the process, so the first parked window is what comes
+    // forward. Fronting nothing leaves the client `Regular` with no window.
+    #[test]
+    fn without_main_the_first_parked_window_is_fronted() {
+        let plan = reopen_plan(
+            &[live("window-1", "http://localhost:3210/dev/", false)],
+            &session(&["dev"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(plan.front.as_deref(), Some("window-1"));
+        assert_eq!(plan.navigate_main, None);
+        assert!(plan.build.is_empty());
+    }
+
+    // `launch` owns `main`'s first navigation and is about to restore these
+    // same workspaces. Acting on the record here navigates twice, builds a
+    // duplicate, and asks for a workspace URL the gateway cannot serve yet.
+    // The likeliest reopen of all lands here: the menu-bar item, clicked while
+    // the service is still starting after a reboot.
+    #[test]
+    fn a_reopen_mid_boot_leaves_the_record_to_the_launch() {
+        let plan = reopen_plan(
+            &[live("main", "tauri://localhost", false)],
+            &session(&["myws", "dev"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(plan.navigate_main, None);
+        assert!(plan.build.is_empty());
+        // The parked window still comes back, which is all a reopen owes here.
+        assert_eq!(plan.show, vec!["main"]);
+        assert_eq!(plan.front.as_deref(), Some("main"));
+    }
+
+    // Boot is over the moment `main` reaches the gateway, even on the root.
+    // That is the login start, and its first reopen is owed the arrangement.
+    #[test]
+    fn a_main_on_the_gateway_root_is_past_boot() {
+        let plan = reopen_plan(
+            &[live("main", "http://localhost:3210/~/", false)],
+            &session(&["myws"], &[]),
+            ORIGIN,
+        );
+        assert_eq!(
+            plan.navigate_main.as_deref(),
+            Some("http://localhost:3210/myws/")
+        );
+    }
+
+    // A client reached over a tailnet address rebuilds its windows there too,
+    // the same rule `launch_plan` follows.
+    #[test]
+    fn a_rebuilt_window_follows_the_origin_it_is_given() {
+        let plan = reopen_plan(&[], &session(&["dev"], &[]), "https://box.tail1234.ts.net");
+        assert_eq!(
+            plan.build,
             vec![planned("https://box.tail1234.ts.net/dev/", None)]
         );
     }

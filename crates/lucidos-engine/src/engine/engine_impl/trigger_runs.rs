@@ -201,9 +201,7 @@ impl LucidosEngine {
         &self,
         trigger_id: &str,
     ) -> Result<RunOutcome, RunRefusal> {
-        let active_id = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
-            .try_with(|id| id.clone())
-            .ok();
+        let active_id = crate::scheduler::user_tasks::current_trigger_id();
         let (config, active_name) = {
             let configs = self.trigger_configs.read().unwrap();
             (

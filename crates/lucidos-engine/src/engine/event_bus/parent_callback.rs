@@ -74,7 +74,8 @@ impl EventBus {
                 meta: EventMeta::default(),
             },
             aggregate,
-            depth: crate::scheduler::user_tasks::current_event_trigger_depth(),
+            depth: super::thread_emit_depth(parent_id),
+            emitting_trigger_id: crate::scheduler::user_tasks::current_trigger_id(),
         });
     }
 

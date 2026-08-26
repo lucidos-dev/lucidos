@@ -23,7 +23,7 @@ impl LucidosEngine {
             }
         }
 
-        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
+        let env_vars = self.build_tool_env_vars(thread_id).await;
         let run_id = uuid::Uuid::new_v4().to_string();
         let staging_dir = self.workspace_path().join(".lucidos/staging").join(&run_id);
 
@@ -206,7 +206,7 @@ impl LucidosEngine {
             ));
         }
 
-        let env_vars = self.build_script_env_vars(Some(thread_id)).await;
+        let env_vars = self.build_tool_env_vars(thread_id).await;
         let command =
             build_python_background_command(self.python_runtime.python_bin(), &script_path);
         // The constructed command embeds absolute paths only — no user

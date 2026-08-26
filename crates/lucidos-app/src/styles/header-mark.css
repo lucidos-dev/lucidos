@@ -141,17 +141,14 @@
        and neither may guess it: the dot's box, and the offset that lands it on
        the notice's FIRST line rather than in the middle of a wrapped sentence. */
     --brand-menu-notice-dot: 0.5rem;
-    /* How much of the screen the unfolded workspace list may take before it
-       scrolls inside the panel. The panel is `position: fixed` under the header
-       and `overflow: hidden`, so an uncapped list is CLIPPED rather than
-       scrolled and its last rows, Manage workspaces among them, become
-       unreachable.
+    /* How much of the screen the unfolded workspace ROWS may take before they
+       scroll inside the panel. Manage workspaces sits outside that box and is
+       never counted here, so it cannot be scrolled away from.
        Derived from the row height rather than eyeballed: seven and a half rows,
-       so a machine with half a dozen workspaces shows all of them AND the
-       Manage row without scrolling, and anything past that cuts a row in half,
-       which is what says there is more below. The vh term is the one that holds
-       on a phone in landscape, where the rem term alone would overrun the
-       viewport. */
+       so a machine with half a dozen workspaces shows all of them without
+       scrolling, and anything past that cuts a row in half, which is what says
+       there is more below. The vh term is the one that holds on a phone in
+       landscape, where the rem term alone would overrun the viewport. */
     --brand-menu-ws-list-max-height: min(
         calc(7.5 * var(--brand-menu-ws-row-min-height)),
         40vh
@@ -927,12 +924,22 @@
     /* Hangs under the row's text column, so the list belongs to the row above
        it rather than reading as more menu items. */
     margin-left: var(--space-md);
-    /* The one thing in this panel that can outgrow it: the panel is
-       `position: fixed` under the header and `overflow: hidden`, so without a
-       cap a long list is CLIPPED rather than scrolled and its last rows, Manage
-       workspaces among them, cannot be reached at all. `contain` keeps the
-       scroll from chaining out to the page behind the menu once it bottoms out.
-       Pinned by styles/__tests__/header-mark-geometry.test.ts. */
+}
+
+/* The workspace rows, and ONLY them. Manage workspaces is a sibling of this box
+   rather than its last child (see `workspaceSwitcherList`), so it stays on
+   screen whatever the row count: inside, it was the row you had to scroll to
+   reach, which put the way out of an unreadably long list at the bottom of that
+   list.
+
+   The cap is what makes this a scroller at all. The panel is `position: fixed`
+   under the header and `overflow: hidden`, so an uncapped list is CLIPPED
+   rather than scrolled. `contain` stops the scroll chaining out to the page
+   behind the menu once it bottoms out. Pinned by
+   styles/__tests__/header-mark-geometry.test.ts. */
+.brand-menu-ws-scroll {
+    display: flex;
+    flex-direction: column;
     max-height: var(--brand-menu-ws-list-max-height);
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -1028,17 +1035,29 @@ div.brand-menu-ws-row {
 /* The action a right-click unfolds under a workspace, dressed as a satellite of
    that row: muted and at the smaller step, the same way Manage workspaces is.
    It is a row of the panel rather than a popover over it, and
-   `switcherActionRow` in WorkspaceSwitcher.tsx owns why.
+   `WorkspaceActionRow.tsx` owns why.
 
-   Its GLYPH starts on the name column, one step in from the dots above it, so
-   the row hangs under the workspace it belongs to. Derived, not guessed: the
-   base padding, plus the dot the rows above lead with, plus the row's own gap.
-   The picker indents its fault note off the same two tokens. The label lands
-   one glyph further in again, which is the indent that says satellite. */
+   Its GLYPH starts on the name column of the row above it, so the action hangs
+   under the workspace it belongs to. Which column that is depends on the host,
+   so the indent comes from the modifier below and never from here. The label
+   lands one glyph further in again, which is the indent that says satellite. */
 .brand-menu-ws-action {
-    padding-left: calc(var(--space-sm) + var(--ws-picker-dot-size) + var(--space-sm));
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+}
+
+/* Under a SWITCHER row, which leads with a status dot. Derived, not guessed:
+   the row's own padding, plus that dot, plus the row's gap. The picker indents
+   its fault note off the same two tokens. */
+.brand-menu-ws-action-under-dot {
+    padding-left: calc(var(--space-sm) + var(--ws-picker-dot-size) + var(--space-sm));
+}
+
+/* Under a NOTIFICATIONS row, which is a `.brand-menu-item` leading with the
+   bell. Same derivation against that row's own two tokens: its padding, plus
+   the icon box every menu-row glyph takes, plus its gap. */
+.brand-menu-ws-action-under-icon {
+    padding-left: calc(var(--space-md) + var(--icon-size-md) + var(--space-sm));
 }
 
 /* Sized here rather than left to the icon, so it cannot reshape a row whose

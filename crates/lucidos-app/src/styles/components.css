@@ -1179,6 +1179,24 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     overflow: hidden;
     overscroll-behavior: contain;
     z-index: calc(var(--z-control-panel) + 100);
+    /* Width of the white ring on every control below. A hairline needs two
+       DEVICE pixels to hold an even weight around a curve. At one, its straight
+       runs land on a whole row and paint solid, while its arcs spread over two
+       rows and paint at part coverage. The ring visibly thins and brightens as
+       it turns, which is the "uneven, rasterized" look, and a higher alpha only
+       makes it a brighter uneven ring. So 2px on a 1x screen, and back to 1px
+       from 2x up, where a hairline already gets its two device pixels. The
+       chrome inherits this: it is fixed-positioned, yet still nested in the
+       overlay. It stays a px literal because the browser snaps a border width
+       to a whole unit before layout (.claude/rules/frontend-css.md), and the
+       pill's radius below derives from it. */
+    --image-popup-ring: 2px;
+}
+
+@media (min-resolution: 2dppx), (-webkit-min-device-pixel-ratio: 2) {
+    .image-popup {
+        --image-popup-ring: 1px;
+    }
 }
 
 .image-popup-content {
@@ -1212,11 +1230,23 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     justify-content: center;
 }
 
+/* No `border-radius` here, and that is a contract rather than an omission.
+   A viewer shows the image, so it may not reshape it. No CSS can tell whether
+   an edge belongs to the picture, and rounding cuts the ones that do. The
+   lucidos.dev og-card draws its own two-pixel rim, and a 0.5rem radius takes
+   each corner off it. A browser tab rounds nothing, and the reader compares the
+   two. The shadow stays, because it paints outside the box and touches no pixel
+   of the image. Pinned by
+   styles/__tests__/image-popup-image-unshaped-guard.test.ts.
+
+   That shadow is a literal rather than `--shadow-lg`, which is the one place
+   the token rule gives way. The backdrop over it is `rgba(0, 0, 0, 0.9)` in
+   both themes, so the surface here is near-black whatever the theme is. The
+   light-theme token rests at alpha 0.1 and would vanish against it. */
 .image-popup-slide img {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
-    border-radius: 0.5rem;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
     user-select: none;
     -webkit-user-select: none;
@@ -1234,14 +1264,46 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     backface-visibility: hidden;
 }
 
+/* Every piece of popup chrome is pinned to the VIEWPORT, for the reason spelled
+   out over .image-popup-nav below: .image-popup-content clips its children, so
+   an absolutely-positioned control outside the box is simply not drawn. This
+   button used to sit at `top: -2.5rem` above a box that grew to a fixed 95vh,
+   which put it off the top of the screen as well as outside the clip.
+
+   Every bordered control below takes a size in WHOLE CSS PIXELS on purpose,
+   and that is what the odd-looking 0.5rem steps buy. The browser snaps a
+   rounded box to the pixel grid before painting its ring, so a box whose edges
+   land on a fraction gets a ring that paints bright on one arc and washes out
+   on the opposite one. It reads as a jagged, uneven circle. The UI scale runs
+   75% to 200% in 12.5% steps (packages/lucidos-sdk/src/appearance.ts), so the
+   root font size is always an even whole number of px and every 0.5rem
+   multiple lands on the grid. Keep each box's total a 0.5rem multiple plus its
+   borders. A padding or gap may be fractional alone, as long as the pair sums
+   to one. */
 .image-popup-close {
-    position: absolute;
-    top: -2.5rem;
-    right: 0;
+    position: fixed;
+    top: 1.5rem;
+    right: 1.5rem;
+    width: 1.5rem;
+    height: 1.5rem;
+    padding: 0;
+    justify-content: center;
     background: rgba(0, 0, 0, 0.7);
-    border: 1px solid rgba(255, 255, 255, 0.5);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
     color: #fff;
     border-radius: 50%;
+    z-index: 1;
+}
+
+/* .icon-btn's own hover is a THEME fill (--bg-hover plus --text-primary), which
+   on this dark overlay reads as a blue tile in the dark theme and as a
+   near-white one in the light theme, where it swallows the glyph. The chrome
+   here is theme-independent, so it darkens like the nav buttons instead. */
+@media (hover: hover) {
+    .image-popup-close:hover {
+        background: rgba(0, 0, 0, 0.85);
+        color: #fff;
+    }
 }
 
 .floating-mobile-close {
@@ -1259,7 +1321,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     height: 3rem;
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.6);
-    border: 1px solid rgba(255, 255, 255, 0.5);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
     color: #fff;
     cursor: pointer;
     display: flex;
@@ -1284,8 +1346,8 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 }
 
 .image-popup-counter {
-    position: absolute;
-    bottom: -2rem;
+    position: fixed;
+    bottom: 1.5rem;
     left: 50%;
     transform: translateX(-50%);
     color: var(--text-on-accent);
@@ -1296,10 +1358,74 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     pointer-events: none;
 }
 
+/* Zoom controls: out, the level readout, and in. Pinned to the viewport like
+   the rest of the chrome. Each button is wide enough for a word, so the cluster
+   is a pill rather than three circles. */
+.image-popup-zoom {
+    position: fixed;
+    right: 1.5rem;
+    bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    /* The paddings and the gaps each sum to 0.25rem, which is what carries the
+       2.25rem buttons to a pill 2.5rem + its borders tall and 9rem + its
+       borders wide: whole pixels at every UI scale, per the note over
+       .image-popup-close. The buttons keep their own size, so the inset gives
+       way rather than the tap target. */
+    gap: 0.125rem;
+    padding: 0.125rem;
+    /* Exactly half the outer height, so the ends are true semicircles. A larger
+       radius is clamped instead, and the clamp is what made the two ends
+       disagree once the height carried a fraction. */
+    border-radius: calc(1.25rem + var(--image-popup-ring));
+    background: rgba(0, 0, 0, 0.6);
+    border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
+    z-index: 1;
+}
+
+.image-popup-zoom-btn {
+    min-width: 2.25rem;
+    height: 2.25rem;
+    padding: 0 0.5rem;
+    border: none;
+    border-radius: 1.125rem;
+    background: transparent;
+    color: #fff;
+    font-size: var(--font-size-md);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--duration-fast);
+}
+
+/* The readout changes on every step, so it holds room for four digits and
+   lines them up: a proportional font would shuffle the cluster under the
+   pointer each time a digit changed width. A whole rem rather than 3.75, so
+   the pill stays 9rem plus its borders wide at every UI scale, per the note
+   over .image-popup-close. */
+.image-popup-zoom-level {
+    min-width: 4rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* Zoomed all the way out or all the way in. */
+.image-popup-zoom-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .image-popup-zoom-btn:not(:disabled):hover {
+        background: rgba(255, 255, 255, 0.15);
+    }
+}
+
 .image-popup-close,
 .floating-mobile-close,
 .image-popup-nav,
-.image-popup-counter {
+.image-popup-counter,
+.image-popup-zoom {
     transition: opacity var(--duration-fast) ease-out;
 }
 
@@ -1307,7 +1433,8 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 .image-popup-content.chrome-hidden .image-popup-close,
 .image-popup-content.chrome-hidden .floating-mobile-close,
 .image-popup-content.chrome-hidden .image-popup-nav,
-.image-popup-content.chrome-hidden .image-popup-counter {
+.image-popup-content.chrome-hidden .image-popup-counter,
+.image-popup-content.chrome-hidden .image-popup-zoom {
     opacity: 0;
     pointer-events: none;
 }
@@ -1323,8 +1450,9 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
         height: 100vh;
     }
 
+    /* A phone fills the screen with the image, so no backdrop is left for a
+       shadow to lift it off. */
     .image-popup-slide img {
-        border-radius: 0;
         box-shadow: none;
     }
 
@@ -1332,18 +1460,22 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
         display: none;
     }
 
+    /* 1rem rather than the 0.75rem the rest of the phone chrome pads by: a
+       quarter-rem is a fraction of a pixel at the 112.5% mobile root, and this
+       is a bordered circle, so it owes the whole-pixel rule over
+       .image-popup-close. The env() term is the platform's and stays as it is. */
     .floating-mobile-close {
         display: flex;
         align-items: center;
         justify-content: center;
         position: fixed;
-        top: max(3.5rem, calc(0.75rem + env(safe-area-inset-top, 0px)));
-        right: calc(0.75rem + env(safe-area-inset-right, 0px));
+        top: max(3.5rem, calc(1rem + env(safe-area-inset-top, 0px)));
+        right: calc(1rem + env(safe-area-inset-right, 0px));
         width: 3rem;
         height: 3rem;
         border-radius: 50%;
         background: rgba(0, 0, 0, 0.7);
-        border: 1px solid rgba(255, 255, 255, 0.5);
+        border: var(--image-popup-ring) solid rgba(255, 255, 255, 0.5);
         color: #fff;
         cursor: pointer;
         z-index: 1;
@@ -1361,7 +1493,15 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     }
 
     .image-popup-counter {
-        bottom: max(0.75rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+        bottom: max(1rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
+    }
+
+    /* Same bottom line as the counter, clear of the home indicator. Pinch is
+       the natural gesture here, but the controls stay: they are the only way
+       to reach full size in one move. */
+    .image-popup-zoom {
+        right: calc(1rem + env(safe-area-inset-right, 0px));
+        bottom: max(1rem, calc(0.5rem + env(safe-area-inset-bottom, 0px)));
     }
 }
 

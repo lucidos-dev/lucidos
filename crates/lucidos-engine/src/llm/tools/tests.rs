@@ -754,6 +754,7 @@ fn thread_queue_grouped_tool_exposes_list_and_update_policy() {
         "max_concurrent_per_trigger",
         "max_queued_per_trigger",
         "reserved_background",
+        "max_event_trigger_depth",
         "overflow",
     ] {
         assert!(

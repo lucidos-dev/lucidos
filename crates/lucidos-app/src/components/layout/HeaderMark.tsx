@@ -1,13 +1,11 @@
 import { useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
-import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease, unreadCount } from '../../store/store';
+import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
-import { openWhatsNew, switchMenuItem } from '../../store/actions/menu';
-import { crossWorkspaceUnreadTotal, peerWorkspaces, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
-import { openWorkspaceNotifications } from '../../api/client/control';
-import { WORKSPACE_ID } from '../../utils/basePath';
+import { openWhatsNew } from '../../store/actions/menu';
+import { crossWorkspaceUnreadTotal, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
 import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { composeHandlers } from '../chat/promptFocus';
@@ -16,7 +14,7 @@ import { Overlay } from '../shared/Overlay';
 import { ComposeIcon, SearchIcon, HelpIcon, LucidosMarkIcon } from '../shared/icons';
 import { confirmAndStartSetupInterview } from '../shared/setupInterview';
 import { BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
-import { notificationsMenuGroup } from './NotificationsMenuRows';
+import { NotificationsMenuGroup } from './NotificationsMenuRows';
 import { WorkspaceRefreshRow, WorkspaceRestartRow } from './WorkspaceMenuRows';
 import { WorkspacesMenuRow } from './WorkspaceSwitcher';
 
@@ -182,19 +180,7 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow }: {
             advertised, and the icon badge before that: a user who opened the
             menu because something said "1" must not have to hunt. Renders
             nothing, separator included, when everything is read. */}
-        {notificationsMenuGroup({
-          peers: peerWorkspaces.value,
-          ownUnread: unreadCount.value,
-          ownId: WORKSPACE_ID,
-          ownName: visibleWorkspaceName.value,
-          onOpenOwn: () => { onClose(); switchMenuItem('notifications'); },
-          onOpenPeer: (row) => {
-            onClose();
-            // `id` is non-null for a peer: peers only exist behind the gateway,
-            // and every row there comes from the control listing.
-            if (row.id) openWorkspaceNotifications(row.id);
-          },
-        })}
+        <NotificationsMenuGroup onClose={onClose} />
 
         {/* What you are running, and the answer to the question a version
             number raises. It leads the menu because it is identity rather than

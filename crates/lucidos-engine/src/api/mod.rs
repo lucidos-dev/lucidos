@@ -63,6 +63,11 @@ mod triggers;
 mod webhooks;
 mod workspace_label;
 
+/// The `apis.json` read, re-exported because the engine binary reads it at
+/// startup and `SystemEvent::ProxyConfigRejected` carries the refusals. The
+/// rest of `proxy` stays crate-internal.
+pub use proxy::{load_proxy_config, ProxyConfigLoad, RejectedProvider};
+
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
@@ -1064,16 +1069,6 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
         }
         Err(_) => (StatusCode::NOT_FOUND, "frontend not built").into_response(),
     }
-}
-
-/// Startup gate for `data/config/apis.json`: `Err` means do not boot.
-///
-/// The proxy routes re-read the file per request, so this call adds no
-/// authority. What it adds is timing. A refused entry surfaces once in the
-/// startup log, naming the provider and the value. Otherwise it surfaces as a
-/// 500, on whichever proxy somebody reaches for first.
-pub fn validate_proxy_config(workspace_path: &std::path::Path) -> Result<(), String> {
-    proxy::load_proxy_config(workspace_path).map(|_| ())
 }
 
 // Top-level wiring helper that takes every engine subsystem the router needs;

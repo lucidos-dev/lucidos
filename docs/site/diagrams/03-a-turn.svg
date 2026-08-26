@@ -1,0 +1,50 @@
+<svg class="lx-diagram" viewBox="0 0 1200 700" role="img"
+     aria-labelledby="t-turn d-turn" xmlns="http://www.w3.org/2000/svg">
+  <title id="t-turn">One turn, end to end</title>
+  <desc id="d-turn">You type in any client. The engine picks the model, the model answers or calls a tool, and the loop repeats until the work is done. Every step goes on the event bus, which streams it to your screen and writes it to Postgres and to git.</desc>
+  <defs>
+    <marker id="lx-arrow-turn" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-ink-soft)"/>
+    </marker>
+    <marker id="lx-arrow-a-turn" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--lx-aqua)"/>
+    </marker>
+  </defs>
+  <text x="40" y="46" text-anchor="start" font-size="17" font-weight="700" fill="var(--lx-ink-soft)" letter-spacing="2.5">A TURN</text>
+  <rect x="40" y="176" width="236" height="108" rx="14" fill="var(--lx-blue-t)" stroke="var(--lx-blue)" stroke-width="3" />
+  <text x="158.0" y="224" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">You type</text>
+  <text x="158.0" y="256" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">in any client</text>
+  <path d="M 276 230.0 L 312 230.0" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2.5" marker-end="url(#lx-arrow-turn)"/>
+  <rect x="316" y="176" width="236" height="108" rx="14" fill="none" stroke="var(--lx-ink)" stroke-width="3" />
+  <text x="434.0" y="224" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Engine</text>
+  <text x="434.0" y="256" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">picks the model</text>
+  <path d="M 552 230.0 L 588 230.0" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2.5" marker-end="url(#lx-arrow-turn)"/>
+  <rect x="592" y="176" width="236" height="108" rx="14" fill="none" stroke="var(--lx-orange)" stroke-width="3" />
+  <text x="710.0" y="224" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Model</text>
+  <text x="710.0" y="256" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">answers, or calls a tool</text>
+  <path d="M 828 230.0 L 864 230.0" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2.5" marker-end="url(#lx-arrow-turn)"/>
+  <rect x="868" y="176" width="236" height="108" rx="14" fill="none" stroke="var(--lx-ink)" stroke-width="3" />
+  <text x="986.0" y="224" text-anchor="middle" font-size="24" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Tools</text>
+  <text x="986.0" y="256" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">files, data, the web</text>
+  <path d="M 986.0 176 C 986.0 92 710.0 92 710.0 170" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2.5" stroke-dasharray="7 6" marker-end="url(#lx-arrow-turn)"/>
+  <text x="848.0" y="80" text-anchor="middle" font-size="18" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">and round again, until it is done</text>
+  <rect x="40" y="424" width="1064" height="90" rx="45" fill="none" stroke="var(--lx-ink)" stroke-width="3.5" />
+  <text x="572" y="480" text-anchor="middle" font-size="27" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Event bus</text>
+  <path d="M 158.0 284 L 158.0 424" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" stroke-dasharray="5 6" marker-end="url(#lx-arrow-turn)"/>
+  <path d="M 434.0 284 L 434.0 424" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" stroke-dasharray="5 6" marker-end="url(#lx-arrow-turn)"/>
+  <path d="M 710.0 284 L 710.0 424" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" stroke-dasharray="5 6" marker-end="url(#lx-arrow-turn)"/>
+  <path d="M 986.0 284 L 986.0 424" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2" stroke-dasharray="5 6" marker-end="url(#lx-arrow-turn)"/>
+  <text x="1120" y="472" text-anchor="start" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">every step,</text>
+  <text x="1120" y="496" text-anchor="start" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">recorded</text>
+  <rect x="40" y="574" width="512" height="90" rx="14" fill="none" stroke="var(--lx-aqua)" stroke-width="3" />
+  <text x="296" y="614" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Your screen updates as it goes</text>
+  <text x="296" y="644" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">the same stream, on every device</text>
+  <path d="M 296 514 L 296 574" fill="none" stroke="var(--lx-aqua)" stroke-width="2.5" marker-end="url(#lx-arrow-a-turn)"/>
+  <rect x="592" y="574" width="512" height="90" rx="14" fill="none" stroke="var(--lx-ink)" stroke-width="2.5" />
+  <text x="848" y="614" text-anchor="middle" font-size="22" font-weight="600" fill="var(--lx-ink)" letter-spacing="0">Postgres, and files in git</text>
+  <text x="848" y="644" text-anchor="middle" font-size="17" font-weight="400" fill="var(--lx-ink-soft)" letter-spacing="0">readable without Lucidos</text>
+  <path d="M 848 514 L 848 574" fill="none" stroke="var(--lx-ink-soft)" stroke-width="2.5" marker-end="url(#lx-arrow-turn)"/>
+
+</svg>

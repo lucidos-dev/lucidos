@@ -141,9 +141,9 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
         aria-orientation="vertical"
         aria-label="Resize thread and content panes"
         style={contentCollapsed
-          ? { marginRight: '0.25rem' }
+          ? { marginRight: 'var(--space-xs)' }
           : threadCollapsed
-            ? { marginLeft: '0.25rem' }
+            ? { marginLeft: 'var(--space-xs)' }
             : undefined}
         onPointerDown={onDividerDown}
         onDblClick={onDividerDblClick}

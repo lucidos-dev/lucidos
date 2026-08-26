@@ -56,6 +56,101 @@ pub fn current_event_trigger_depth() -> u32 {
     EVENT_TRIGGER_DEPTH.try_with(|d| *d).unwrap_or(0)
 }
 
+/// Chain depth per thread, for background work whose events are emitted from
+/// tasks no scope can reach.
+///
+/// The task-local above covers work that stays on one await chain. A
+/// coding-agent session does not: its `CodingAgentIdled` comes from a spawn
+/// tree several levels deep, and after a restart from `agent_recovery`. The one
+/// identity every one of those emits holds is the thread id, so that is the
+/// key.
+///
+/// **Keyed by thread, but owned per queue entry.** Two entries can name one
+/// thread, and a plain `thread -> depth` map let the first to finish clear a
+/// binding the other still needed.
+///
+/// A cache, never a source of truth. What survives a restart is the depth on
+/// the persisted request. A row is dropped when its own queue entry completes,
+/// so the depth belongs to the unit of background work rather than to the
+/// thread. Nothing registers on the boot handoff path, where the entry
+/// completes with no in-memory slot. See
+/// `docs/adr/0138-event-trigger-depth-reaches-spawned-work.md`.
+static CHAIN_DEPTHS: std::sync::LazyLock<std::sync::RwLock<ChainDepthOwners>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Thread id to the live `(queue entry, depth)` bindings on it.
+type ChainDepthOwners = std::collections::HashMap<uuid::Uuid, Vec<(uuid::Uuid, u32)>>;
+
+/// Bind `thread_id`'s events to `depth`, on behalf of queue entry `owner`.
+///
+/// Depth 0 registers nothing: it is the answer an unregistered thread already
+/// gives, and a row per ordinary chat thread would grow without bound.
+/// Re-registering the same owner replaces its row rather than stacking one.
+pub fn register_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid, depth: u32) {
+    if depth == 0 {
+        return;
+    }
+    if let Ok(mut map) = CHAIN_DEPTHS.write() {
+        let owners = map.entry(thread_id).or_default();
+        match owners.iter_mut().find(|(id, _)| *id == owner) {
+            Some(row) => row.1 = depth,
+            None => owners.push((owner, depth)),
+        }
+    }
+}
+
+/// Drop `owner`'s binding when the work that owned it finishes. Another entry's
+/// binding on the same thread is left alone.
+pub fn forget_chain_depth(thread_id: uuid::Uuid, owner: uuid::Uuid) {
+    if let Ok(mut map) = CHAIN_DEPTHS.write() {
+        let empty = match map.get_mut(&thread_id) {
+            Some(owners) => {
+                owners.retain(|(id, _)| *id != owner);
+                owners.is_empty()
+            }
+            None => false,
+        };
+        if empty {
+            map.remove(&thread_id);
+        }
+    }
+}
+
+/// The chain depth bound to `thread_id`, if it is background chain work.
+///
+/// The DEEPEST of the live bindings, matching how `EventBus::emit` ranks this
+/// against the task-local. Under-counting re-opens the loop silently, and
+/// over-counting suppresses a fire the cap notification names.
+///
+/// A poisoned lock answers `None`, which degrades to the ambient read. That
+/// loses the cap for one emit rather than failing it.
+pub fn chain_depth_for_thread(thread_id: uuid::Uuid) -> Option<u32> {
+    CHAIN_DEPTHS
+        .read()
+        .ok()?
+        .get(&thread_id)?
+        .iter()
+        .map(|(_, depth)| *depth)
+        .max()
+}
+
+/// Which trigger's fire the current task is running, if any.
+///
+/// `None` outside a fire, which is what an ordinary user turn and an HTTP
+/// handler both are. Inside one it is the id the queue executor scoped.
+/// `EventBus::emit` stamps it onto every frame the fire emits, so the scheduler
+/// can drop that trigger from the matches.
+///
+/// Same one-reader rule as [`current_event_trigger_depth`], and the same way to
+/// get it wrong. Read it from a spawned task, where the scope does not reach,
+/// and the answer silently becomes `None`. That direction is deliberate for
+/// work a fire hands off (`docs/adr/0137-a-trigger-never-wakes-itself.md`). A
+/// caller that must state the owner outright uses
+/// [`crate::engine::event_bus::EventBus::emit_as_trigger`] instead.
+pub fn current_trigger_id() -> Option<String> {
+    ACTIVE_TRIGGER_ID.try_with(|id| id.clone()).ok()
+}
+
 /// True when the currently running trigger is deleting itself — i.e. the LLM
 /// called `delete_trigger` with its own trigger ID. The scheduler's
 /// `TriggerDeleted` handler reads this flag (carried in the event payload) to
@@ -104,6 +199,9 @@ async fn emit_failure_notification(
     crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id)).await;
 }
 
+/// `queue_entry_id` is the admitting *Thread Queue* entry (see
+/// `TriggerContext::queue_entry_id`). A script fire creates no thread and
+/// ignores it, which keeps today's "a crash mid-script re-executes" contract.
 pub async fn execute_user_task(
     engine: SharedEngine,
     pool: &PgPool,
@@ -111,6 +209,7 @@ pub async fn execute_user_task(
     invocation: TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
     external_cancel: Option<CancellationToken>,
+    queue_entry_id: uuid::Uuid,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match &config.run {
         TriggerRun::Script { path } => {
@@ -126,11 +225,11 @@ pub async fn execute_user_task(
                 engine,
                 pool,
                 config,
-                &config.id,
                 intent,
                 invocation,
                 event_payload,
                 external_cancel,
+                queue_entry_id,
             )
             .await
         }
@@ -179,8 +278,11 @@ async fn execute_script_task(
 
     let extra_env = build_event_env(invocation, event_payload);
 
+    // The script IS this trigger's fire, so its own emits must not wake it.
+    // Stated from the config rather than read off the ambient scope, because
+    // the scope also covers spawns the fire hands off (ADR 0137).
     match engine
-        .execute_script(&full_script_path, &[], &extra_env)
+        .execute_script(&full_script_path, &[], &extra_env, Some(&config.id))
         .await
     {
         Ok(output) => {
@@ -222,11 +324,11 @@ async fn execute_llm_task(
     engine: SharedEngine,
     pool: &PgPool,
     config: &TriggerConfig,
-    trigger_id: &str,
     intent: &str,
     invocation: TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
     external_cancel: Option<CancellationToken>,
+    queue_entry_id: uuid::Uuid,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The on_event triggering payload (if any) is appended to the intent
     // body as a `## Triggering Event` JSON block. Schedule fires pass None
@@ -240,23 +342,26 @@ async fn execute_llm_task(
         user_message.chars().take(50).collect::<String>()
     );
 
-    let process_fut = engine.process_trigger(
-        &config.id,
-        &config.name,
-        &config.slug,
-        &user_message,
-        invocation,
-        config.go_to_review,
-        config.side_effect_grant.clone(),
-        // `None` on either means this trigger is on the account chat default
-        // for that field, which is what every trigger did before the per-trigger
-        // model existed.
-        config.model.as_deref(),
-        config.reasoning_effort.as_deref(),
-        external_cancel,
-    );
-    let result = ACTIVE_TRIGGER_ID
-        .scope(trigger_id.to_string(), process_fut)
+    // No `ACTIVE_TRIGGER_ID` scope here: the Thread Queue executor already
+    // holds one around both trigger arms, so a script fire carries the marker
+    // too.
+    let result = engine
+        .process_trigger(
+            &config.id,
+            &config.name,
+            &config.slug,
+            &user_message,
+            invocation,
+            config.go_to_review,
+            config.side_effect_grant.clone(),
+            // `None` on either means this trigger is on the account chat
+            // default for that field. That is what every trigger did before
+            // the per-trigger model existed.
+            config.model.as_deref(),
+            config.reasoning_effort.as_deref(),
+            external_cancel,
+            queue_entry_id,
+        )
         .await;
     let result = match result {
         // The scheduler emits NO terminator of its own, deliberately. One turn,
@@ -514,8 +619,8 @@ mod tests {
     use serde_json::json;
 
     /// Every emit stamps this onto `EmittedEvent::depth`, so an answer of 0
-    /// inside a trigger would restart the chain and let a self-subscribing
-    /// trigger run forever.
+    /// inside a trigger would restart the chain and let a chain across
+    /// triggers run forever.
     #[tokio::test]
     async fn the_current_depth_is_the_scoped_one_inside_a_trigger_and_zero_outside() {
         assert_eq!(current_event_trigger_depth(), 0);

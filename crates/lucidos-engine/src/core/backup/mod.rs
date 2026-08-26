@@ -385,15 +385,21 @@ pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), 
     Ok(())
 }
 
-/// Read the persisted last-run outcome. Returns `None` when never recorded; a
-/// malformed stored value is logged and treated as absent rather than failing
-/// the whole status response.
+/// Read the persisted last-run outcome. Returns `None` when never recorded.
+///
+/// A malformed stored value and an unreadable row both resolve to `None`, so
+/// the status card degrades instead of failing. Each logs first. A silent
+/// `None` reads exactly like a workspace that has never backed up, and that is
+/// the reading a user acts on.
 pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
     use crate::core::PreferenceStore;
-    let raw = PreferenceStore::get(pool, PREF_BACKUP_LAST_RUN)
-        .await
-        .ok()
-        .flatten()?;
+    let raw = match PreferenceStore::get(pool, PREF_BACKUP_LAST_RUN).await {
+        Ok(raw) => raw?,
+        Err(e) => {
+            crate::log!("[Backup] Could not read {PREF_BACKUP_LAST_RUN}: {e}");
+            return None;
+        }
+    };
     match serde_json::from_str(&raw) {
         Ok(run) => Some(run),
         Err(e) => {

@@ -8,6 +8,12 @@
  * because the real module exports it as a const, not a function.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync, readdirSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 
 const platform = vi.hoisted(() => ({ isTauri: false, isStandalone: false, isMac: true }));
 vi.mock('./platform', () => ({
@@ -37,6 +43,26 @@ const {
   workspacePath,
   workspaceTabName,
 } = await import('./workspaceWindow');
+
+/** Every non-test source under `src/`, as `[path relative to src, code]`. The
+ *  definition of a production caller for the source scan below. */
+function sources(): Array<[string, string]> {
+  const root: string = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const found: Array<[string, string]> = [];
+  const walk = (dir: string): void => {
+    const entries = readdirSync(dir, { withFileTypes: true }) as
+      Array<{ name: string; isDirectory(): boolean }>;
+    for (const entry of entries) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
+        found.push([full.slice(root.length + 1), readFileSync(full, 'utf-8')]);
+      }
+    }
+  };
+  walk(root);
+  return found;
+}
 
 /** The alternate for a PEER row: this view is on `dev`, the row is `work`. */
 const peer = (state: Parameters<typeof alternateOpenMode>[0] = 'healthy') =>
@@ -231,12 +257,19 @@ describe('the path and the tab name', () => {
     expect(workspaceTabName('work')).toBe('lucidos-ws-work');
     expect(workspaceTabName('dev')).not.toBe(workspaceTabName('work'));
   });
+
+  // A landing rides the same path, so a tab and a switch cannot disagree about
+  // where inside the workspace the row was aiming.
+  it('carries the landing fragment, and nothing when there is none', () => {
+    expect(workspacePath('work', 'notifications')).toBe('/work/#notifications');
+    expect(workspacePath('work', undefined)).toBe('/work/');
+  });
 });
 
 describe('opening in place', () => {
   it('replaces this document, on every client', async () => {
     await openWorkspaceIn('in-place', 'work');
-    expect(openWorkspace).toHaveBeenCalledWith('work');
+    expect(openWorkspace).toHaveBeenCalledWith('work', undefined);
     expect(openNewTab).not.toHaveBeenCalled();
     expect(showWorkspaceInNativeWindow).not.toHaveBeenCalled();
 
@@ -245,7 +278,7 @@ describe('opening in place', () => {
     tauri();
     openWorkspace.mockClear();
     await openWorkspaceIn('in-place', 'work');
-    expect(openWorkspace).toHaveBeenCalledWith('work');
+    expect(openWorkspace).toHaveBeenCalledWith('work', undefined);
     expect(showWorkspaceInNativeWindow).not.toHaveBeenCalled();
   });
 });
@@ -265,7 +298,7 @@ describe('opening separately', () => {
   it('asks the shell under Tauri, and never opens a tab', async () => {
     tauri();
     await openWorkspaceIn('separate', 'work');
-    expect(showWorkspaceInNativeWindow).toHaveBeenCalledWith('work');
+    expect(showWorkspaceInNativeWindow).toHaveBeenCalledWith('work', undefined);
     expect(openNewTab).not.toHaveBeenCalled();
     expect(openWorkspace).not.toHaveBeenCalled();
   });
@@ -281,5 +314,57 @@ describe('opening separately', () => {
     tauri();
     showWorkspaceInNativeWindow.mockRejectedValue('"nope" is not a workspace');
     await expect(openWorkspaceIn('separate', 'nope')).rejects.toBe('"nope" is not a workspace');
+  });
+});
+
+// A notifications row wants the same window rule as every other row PLUS the
+// notifications view, so the landing has to survive all three mechanisms. A
+// mode that drops it lands the user on the workspace's default view, hunting
+// for the bell the row already counted for them.
+describe('the landing', () => {
+  it('rides the in-place navigation by name, never as a branch on the value', () => {
+    // Passed THROUGH, so a landing added to the closed set reaches this
+    // mechanism by construction. A branch per landing here would drop the next
+    // one silently, with nothing failing to compile.
+    void openWorkspaceIn('in-place', 'work', 'notifications');
+    expect(openWorkspace).toHaveBeenCalledWith('work', 'notifications');
+  });
+
+  it('rides the named tab as a fragment, in the same tab as a plain row', async () => {
+    await openWorkspaceIn('separate', 'work', 'notifications');
+    expect(openNewTab).toHaveBeenCalledWith('/work/#notifications', 'lucidos-ws-work');
+  });
+
+  // By NAME, never as a fragment: the shell composes the URL (ADR 0028).
+  it('crosses to the shell as a name', async () => {
+    tauri();
+    await openWorkspaceIn('separate', 'work', 'notifications');
+    expect(showWorkspaceInNativeWindow).toHaveBeenCalledWith('work', 'notifications');
+  });
+
+  // The whole point of the change this test arrived with: a workspace row must
+  // not navigate in place on its own, whatever the client shape. So the
+  // same-window navigation keeps a SHORT allow-list. A surface joining it is a
+  // surface that built its own rule instead of asking for the mode.
+  it('leaves the same-window navigation with two callers, both deliberate', () => {
+    // Matched on the IMPORT, so the defining module does not count itself.
+    const imports = /^import[^;]*\bopenWorkspace\b[^;]*from '[^']*client\/control'/m;
+    const callers = sources().filter(([, code]) => imports.test(code));
+    expect(callers.map(([path]) => path).sort()).toEqual([
+      // Its auto-open of the remembered workspace, which is not a row
+      // activation and has no gesture to read a mode from.
+      'components/picker/WorkspacePicker.tsx',
+      'utils/workspaceWindow.ts',
+    ]);
+  });
+
+  it('is absent from every mechanism when no row asked for one', async () => {
+    await openWorkspaceIn('in-place', 'work');
+    expect(openWorkspace).toHaveBeenCalledWith('work', undefined);
+    await openWorkspaceIn('separate', 'work');
+    expect(openNewTab).toHaveBeenCalledWith('/work/', 'lucidos-ws-work');
+    tauri();
+    await openWorkspaceIn('separate', 'work');
+    expect(showWorkspaceInNativeWindow).toHaveBeenCalledWith('work', undefined);
   });
 });

@@ -446,6 +446,9 @@ export function applyRemoteCompose(
   // is accepted and self-heals, the server keeping the text. See
   // `docs/code-review-priors.md` for why the obvious guard is worse.
   noteServerDraft(threadId, fields.text, fields.image_hashes);
+  // The broadcast states the stored mode too, on the same footing and recorded
+  // before the same guards.
+  noteServerComposeMode(threadId, fields.mode);
   if (fields.text === '' && fields.image_hashes.length === 0 && fields.mode === null) {
     // **A remote EMPTY snapshot must never clear a non-empty draft this device
     // authored.** The SSE mirror of stageDraftFromApi's guard
@@ -610,6 +613,7 @@ export function _resetUndeliveredComposeDraftsForTesting(): void {
   runningComposePushes.clear();
   owedComposePushes.clear();
   composeEpoch.clear();
+  lastSyncedComposeMode.clear();
   composePushFailures.recordSuccess();
 }
 
@@ -694,6 +698,43 @@ function imageHashesUnchanged(threadId: string, current: string[]): boolean {
   return prev.every((h, i) => h === current[i]);
 }
 
+/** What the ENGINE is known to hold as each thread's stored compose mode. The
+ *  mode sibling of `lastSyncedImageHashes` above: an unchanged value goes out as
+ *  `null` and the server's COALESCE preserves it.
+ *
+ *  Written only where the engine reports its own value, the same rule
+ *  `serverDraft` follows. Four sites: the `POST /threads` ack, our own PUT ack,
+ *  a thread-summary snapshot, and a `ThreadComposeChanged` broadcast. The POST
+ *  counts because that handler 409s on a different mode, so an OK proves the
+ *  stored value is ours. Absent means never heard, so the write carries the
+ *  mode. Not knowing therefore costs one redundant field and can never drop a
+ *  channel pick. */
+const lastSyncedComposeMode = new Map<string, ComposeMode | null>();
+
+/** Record an engine report of the thread's stored compose mode. */
+export function noteServerComposeMode(threadId: string, mode: ComposeMode | null): void {
+  lastSyncedComposeMode.set(threadId, mode);
+}
+
+/** The `mode` a compose write should carry. Only a composing draft has one to
+ *  state: once sent, the channel is locked server-side and the picker is hidden.
+ *  A pick the engine already holds goes out as `null`.
+ *
+ *  Sending it on every keystroke is what turned an ordinary send race into a
+ *  user-facing card. A write composed before the send arrived after it. The
+ *  engine then read a mode it never needed as an attempt to change a sent
+ *  thread's channel. See
+ *  `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`. */
+function composeModeForWrite(
+  threadId: string,
+  state: ThreadMeta['state'],
+  draft: ComposeDraft,
+): ComposeMode | null {
+  if (state !== 'composing') return null;
+  if (lastSyncedComposeMode.get(threadId) === draft.mode) return null;
+  return draft.mode;
+}
+
 /** One compose write, reading the draft at the moment it goes out. Only ever
  *  called from `runComposePushes`, which guarantees no sibling write is in
  *  flight for the same thread. `staleRetries` counts the re-issues this runner
@@ -725,15 +766,16 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
     const selectionOverride = getComposeSelectionOverride(threadId);
     const selectionForPut: ComposeSelectionOverride | undefined =
       Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
+    // null = preserve via COALESCE, so a pick the engine already holds costs
+    // nothing and cannot trip the server's mode lock.
+    const wireMode = composeModeForWrite(threadId, thread.meta.state, draft);
     let result: ComposePutResult;
     try {
       result = await putComposeOnThread(
         threadId,
         draft.text,
         wireHashes,
-        // Mode is only meaningful for composing threads. Once active, the
-        // channel field is authoritative and the server rejects mode changes.
-        thread.meta.state === 'composing' ? draft.mode : null,
+        wireMode,
         selectionForPut,
         composeEpoch.get(threadId),
       );
@@ -774,6 +816,11 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
     noteServerDraft(threadId, draft.text, draft.image_hashes);
     if (wireHashes !== null) {
       lastSyncedImageHashes.set(threadId, wireHashes);
+    }
+    // A `null` mode asked the server to preserve, so it reported nothing and we
+    // learned nothing. Only a mode we actually sent is now known to be stored.
+    if (wireMode !== null) {
+      noteServerComposeMode(threadId, wireMode);
     }
     settleComposeDelivered(threadId);
   } finally {
@@ -829,6 +876,10 @@ export async function startComposeIfNeeded(threadId: string, mode: ComposeMode):
     rollbackOptimistic(threadId);
     throw err;
   }
+  // The row now holds this mode: `ThreadStarted` stores it, and the endpoint
+  // 409s rather than accepting a different one. So the first keystroke write
+  // has nothing to state about the channel.
+  noteServerComposeMode(threadId, mode);
 }
 
 function rollbackOptimistic(threadId: string): void {
@@ -1284,10 +1335,12 @@ function flushAllPending(): void {
     // every other write. The page is unloading, so this is the last thing we
     // can say. If a submission has since consumed the slot, the engine refusing
     // it is exactly right.
+    // Same mode rule as `pushNow`, and this records nothing: the page is
+    // unloading, so no ack is observable.
     const body = JSON.stringify({
       text: draft.text,
       image_hashes: draft.image_hashes,
-      mode: thread.meta.state === 'composing' ? draft.mode : null,
+      mode: composeModeForWrite(threadId, thread.meta.state, draft),
       selection: selectionForFlush,
       compose_epoch: composeEpoch.get(threadId),
     });

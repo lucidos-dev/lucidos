@@ -73,9 +73,11 @@ pub(super) async fn drop_thread_queue_entry(
 ///
 /// Concurrency caps of 0 are legal and mean "hold" — `max_concurrent_total: 0`
 /// pauses ALL background admission (the queue accumulates until the cap is
-/// raised). Only `max_queued_per_trigger` must be ≥ 1: at 0 every trigger
-/// fire would instantly overflow, which under `drop-oldest` (nothing older
-/// to drop) silently degrades to an unbounded queue.
+/// raised). Two fields must be ≥ 1. `max_queued_per_trigger` at 0 would make
+/// every trigger fire overflow instantly, which under `drop-oldest` (nothing
+/// older to drop) silently degrades to an unbounded queue.
+/// `max_event_trigger_depth` at 0 would cap every chain at its first hop, so
+/// no event trigger would ever fire again.
 pub(super) async fn update_capacity_policy(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -84,6 +86,11 @@ pub(super) async fn update_capacity_policy(
     if policy.max_queued_per_trigger == 0 {
         return Err(ApiError::bad_request(
             "max_queued_per_trigger must be at least 1",
+        ));
+    }
+    if policy.max_event_trigger_depth == 0 {
+        return Err(ApiError::bad_request(
+            "max_event_trigger_depth must be at least 1",
         ));
     }
     let actor = super::actor::user_actor_resolved(&headers, state.engine.pool(), None).await;

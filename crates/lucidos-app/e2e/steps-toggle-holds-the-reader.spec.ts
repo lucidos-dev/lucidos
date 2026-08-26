@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
-import { assertHealthy, disableMobileHeaderSticky, disarmFollowSeed, enableMobileHeaderSticky, ensureOnThreadPane, navigateToApp } from './helpers';
+import { assertHealthy, disableMobileHeaderSticky, disarmFollowSeed, enableMobileHeaderSticky, ensureOnThreadPane, navigateToApp, renderWholeTranscript } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -127,6 +127,12 @@ async function openThread(page: Page, threadId: string, disarm = true): Promise<
   await ensureOnThreadPane(page);
   await expect(page.locator('.chat-exchange').first()).toBeVisible({ timeout: 30_000 });
   await expect(page.locator('[data-role="inline-step"]:visible').first()).toBeVisible({ timeout: 30_000 });
+  // The transcript opens windowed, so the turns this spec parks in and presses
+  // on are not all in the DOM yet. Ask for the whole thread the way a reader
+  // does. Skipped for the RIDER, whose case is the end of the thread: the
+  // chevron lands at the top, which is the one place that case is not about,
+  // and the tail it rides is rendered already.
+  if (disarm) await renderWholeTranscript(page);
 }
 
 /** The row carrying `text`: which turn it belongs to, and how far its top sits

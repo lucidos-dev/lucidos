@@ -37,7 +37,6 @@
           "start_window_drag",
           "toggle_window_maximize",
           "set_window_title",
-          "set_window_cursor",
           "show_workspace_window",
           "get_connect_info",
           "tailscale_up",
@@ -52,7 +51,7 @@
     },
     {
       "identifier": "allow-panel-report",
-      "description": "The three report-back commands that the panel URL preview's injected JS calls from the PREVIEWED PAGE (see TITLE_OBSERVER_JS / URL_OBSERVER_JS / webview_get_content in src/lib.rs). Because the caller is arbitrary third-party content, the capability that grants this accepts any remote origin. So this permission is deliberately kept to the smallest possible surface and is granted ONLY on `url-preview-*` webviews (capabilities/panel-preview.json). Never add a command here that does anything other than report the previewed page's own title/URL/text back to the main window.",
+      "description": "The three report-back commands that the panel URL preview's injected JS calls from the PREVIEWED PAGE (see TITLE_OBSERVER_JS / URL_OBSERVER_JS / webview_get_content in src/panel_preview.rs). Because the caller is arbitrary third-party content, the capability that grants this accepts any remote origin. So this permission is deliberately kept to the smallest possible surface and is granted ONLY on `url-preview-*` webviews (capabilities/panel-preview.json). Never add a command here that does anything other than report the previewed page's own title/URL/text back to the window that opened the preview.",
       "commands": {
         "allow": [
           "__panel_title_report",

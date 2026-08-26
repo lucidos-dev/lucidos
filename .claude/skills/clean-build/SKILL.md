@@ -176,14 +176,15 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 458 sites across 160 files, every one of them
-  test-only code: 153 `*.test.ts`, six `*.test.tsx`
+  `@types/node` in project**, 476 sites across 167 files, every one of them
+  test-only code: 159 `*.test.ts`, seven `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
   `components/picker/__tests__/pairing-code-boxes.test.tsx`,
-  `components/settings/__tests__/mcp-servers-page.test.tsx` and
-  `components/shared/__tests__/apps-glyph-single-source.test.tsx`), and one
+  `components/settings/__tests__/mcp-servers-page.test.tsx`,
+  `components/shared/__tests__/apps-glyph-single-source.test.tsx` and
+  `components/shared/__tests__/system-attention-badge.test.tsx`), and one
   Vitest-only helper, `styles/__tests__/css-rule-helpers.ts`, which imports
   `node:fs` for two of the sites. The
   expectation is real: TS does not know about Node globals, but Vitest
@@ -246,14 +247,17 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   phase above invokes it.** Recorded 2026-08-04. The npm workspace has two
   JS members (`crates/lucidos-app` and `packages/lucidos-sdk`), but only
   the app is gated by phases 3 and 4. Running the SDK's script directly
-  fails with eight `TS2307: Cannot find module 'vitest'` errors, one per
-  `packages/lucidos-sdk/src/*.test.ts`: the SDK's `tsconfig.json` includes
-  its whole `src` tree, its test files import `vitest`, and `vitest` is
-  declared only by `crates/lucidos-app` and pinned by `package-lock.json`
-  to `crates/lucidos-app/node_modules/vitest`, which the SDK's resolution
-  path never reaches. This is not a worktree-provisioning artifact: the
-  lockfile puts it there for a root `npm ci` too. Nothing in the repo calls
-  the script, so it has been inert rather than failing.
+  fails with 13 `TS2307: Cannot find module 'vitest'` errors, one per
+  `packages/lucidos-sdk/src/**/*.test.ts`. It was eight when this was first
+  recorded, and the count grows with the SDK's test suite.
+
+  The cause is a resolution gap. The SDK's `tsconfig.json` includes its
+  whole `src` tree, and its test files import `vitest`. `vitest` is declared
+  only by `crates/lucidos-app`, and `package-lock.json` pins it to
+  `crates/lucidos-app/node_modules/vitest`, which the SDK's resolution path
+  never reaches. This is not a worktree-provisioning artifact: the lockfile
+  puts it there for a root `npm ci` too. Nothing in the repo calls the
+  script, so it has been inert rather than failing.
 
   **Do not "fix" this by trimming the SDK tsconfig's `include`.** That
   would drop the test files from type checking rather than type check
@@ -270,8 +274,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
   the vitest include list, so `/run-tests` runs them.
 
-- **Phase 4's entry chunk is 661.64 kB against its 600 kB ceiling, and the
-  2026-08-25 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 671.67 kB against its 600 kB ceiling, and the
+  2026-08-26 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -288,28 +292,32 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   That cut costs the picker one extra round trip, which `main.tsx` explains
   at the split.
 
-  **The on-demand surfaces can no longer close the gap.** That is new since
-  2026-08-19, when the same list was 36 kB against a 36 kB gap. It stopped
-  there on a product call. Sourcemap attribution now puts the whole list at
-  about 38 kB, against a 61.64 kB gap:
+  **The on-demand surfaces can no longer close the gap, and the shortfall is
+  widening.** That is new since 2026-08-19, when the same list was 36 kB
+  against a 36 kB gap. It stopped there on a product call. Sourcemap
+  attribution now puts the whole list at 38.23 kB, against a 71.67 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.52 |
+  | `CodingAgentControlMenu` | 8.54 |
   | `ThreadFilterPanel` | 5.91 |
-  | `WorkspaceSwitcher` | 4.30 |
+  | `WorkspaceSwitcher` | 4.45 |
   | `QuestionCard` | 3.98 |
   | `TodoListPanel` | 2.96 |
   | `OverflowMenu` | 2.38 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing. The next cut has to come out of first-paint
-  code instead, which is a wider decision than this skill makes.
+  leave the advisory firing, and would now leave over 33 kB of it. The next
+  cut has to come out of first-paint code instead, which is a wider decision
+  than this skill makes.
 
-  Growth is diffuse rather than one mistake. The rest of the top is
-  `icons.tsx` at 19.85 kB, `ThreadDrawer.tsx` at 17.85 and `store.ts` at
-  16.80. The three thread-event exchange modules add 41.5 kB between them. A
+  Growth is diffuse rather than one mistake. The 2026-08-26 run added 10 kB
+  over the previous one and looked for the usual culprit, a component that
+  went from lazy to eager. There was none: every separately emitted chunk was
+  absent from the entry chunk's attribution. The rest of the top is
+  `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.85 and `store.ts` at
+  17.05. The three thread-event exchange modules add 42.8 kB between them. A
   first paint reaches all of them.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not

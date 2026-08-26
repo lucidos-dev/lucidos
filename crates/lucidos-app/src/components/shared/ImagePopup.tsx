@@ -8,14 +8,23 @@ import {
   computePinchUpdate,
   clampPanTransform,
   computeZoomAt,
+  fitToWindowScale,
+  fullSizeScale,
   naturalImageLayout,
+  sameScale,
+  steppedScale,
+  zoomCeiling,
+  zoomFloor,
+  zoomPercent,
   type PinchInitial,
   type ImageLayout,
 } from '../../utils/pinchGesture';
+import { isTextInput } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
 
-const MIN_SCALE = 1;
-const MAX_SCALE = 10;
+// How far past the fitted view a gesture zooms, raised per image so full size
+// always fits under it (see `zoomRange` below).
+const MAX_ZOOM_PAST_FIT = 10;
 const WHEEL_FACTOR = 0.002;
 const DOUBLE_TAP_SCALE = 3;
 const SWIPE_COMMIT_MS = 220;
@@ -40,6 +49,51 @@ function shortestDelta(i: number, c: number, n: number): number {
   return d;
 }
 
+/** What the zoom cluster and the zoom keys can do. The gesture effect owns the
+ *  geometry these need, so it publishes them rather than letting the render
+ *  tree reach into the transform itself. */
+interface ZoomApi {
+  /** One press of zoom in (`1`) or zoom out (`-1`), anchored at the centre. */
+  step(direction: 1 | -1): void;
+  /** Full size from the fitted view, back to fitted from anywhere else. */
+  preset(): void;
+  /** Back to the fitted view. */
+  fit(): void;
+  /** Fit again, but only where that would not throw away a chosen zoom. */
+  refit(): void;
+  /** Whether the image is blown up past its fitted size. */
+  isZoomed(): boolean;
+}
+
+/** What the zoom cluster reads out: the live level, and whether each control
+ *  still has somewhere to go. */
+interface ZoomLevel {
+  percent: number;
+  atFit: boolean;
+  atMin: boolean;
+  atMax: boolean;
+  /** Whether the fit / actual-size toggle has a second place to go. An image
+   *  that fills the screen it was captured on is already at 1:1, so both ends
+   *  of the toggle are the same place. */
+  canPreset: boolean;
+}
+
+// Where every image starts, and what an unmeasured one reads as.
+const FITTED: ZoomLevel =
+  { percent: 100, atFit: true, atMin: true, atMax: false, canPreset: true };
+
+function sameLevel(a: ZoomLevel, b: ZoomLevel): boolean {
+  return a.percent === b.percent && a.atFit === b.atFit
+    && a.atMin === b.atMin && a.atMax === b.atMax && a.canPreset === b.canPreset;
+}
+
+// Device pixels the screen draws per CSS pixel, which is what makes 100% mean
+// one image pixel per screen pixel. Read live: it changes with browser zoom and
+// with a move to another display, and `handleResize` re-fits off the new value.
+function screenPixelRatio(): number {
+  return window.devicePixelRatio || 1;
+}
+
 function step(delta: -1 | 1) {
   const s = popupImage.value;
   if (!s || s.images.length <= 1) return;
@@ -62,7 +116,12 @@ export function ImagePopup() {
   const state = popupImage.value;
   const stripRef = useRef<HTMLDivElement>(null);
   const zoomRef = useRef({ scale: 1, tx: 0, ty: 0 });
-  const zoomedImgRef = useRef<HTMLImageElement | null>(null);
+  // The image we last wrote a transform onto. Whoever wrote one owns clearing
+  // it: the geometry is recovered by dividing the live transform back out of a
+  // measured rect, and that only holds while the element and `zoomRef` agree.
+  // A slide left carrying the fit of a previous visit measures 4.5x its own
+  // size, and the fit computed from that is nonsense.
+  const transformedImgRef = useRef<HTMLImageElement | null>(null);
   const dragRef = useRef({ active: false, startX: 0, startY: 0, originTx: 0, originTy: 0 });
   const pinchRef = useRef<PinchInitial | null>(null);
   const swipeRef = useRef<SwipeTouch | null>(null);
@@ -88,6 +147,16 @@ export function ImagePopup() {
   // skips the transition so opening the popup doesn't slide.
   const lastStripRef = useRef<HTMLDivElement | null>(null);
   const [chromeHidden, setChromeHidden] = useState(false);
+  // What the level control shows. This is the only part of a zoom the render
+  // tree cares about.
+  const [level, setLevel] = useState<ZoomLevel>(FITTED);
+  // True while the image rests at its fitted scale. A fit is a measurement, so
+  // it has to be taken again once the image loads or the window changes size.
+  // This says whether doing so would overwrite a zoom the user chose.
+  const fittedRef = useRef(true);
+  // Published by the gesture effect below, which owns the geometry the zoom
+  // controls act on. Null while the popup is closed.
+  const zoomApiRef = useRef<ZoomApi | null>(null);
   // Reset on each open so the chrome is always visible when re-launching.
   useEffect(() => { if (state) setChromeHidden(false); }, [state !== null]);
 
@@ -110,15 +179,19 @@ export function ImagePopup() {
     }
   }, [state?.index]);
 
-  // Reset zoom when navigating to a new image.
+  // Reset zoom when navigating to a new image. The fitted scale for the image
+  // arriving is a measurement of it, so the effect below takes it once the new
+  // slide has rendered.
   useLayoutEffect(() => {
     zoomRef.current = { scale: 1, tx: 0, ty: 0 };
+    fittedRef.current = true;
+    setLevel(FITTED);
     layoutRef.current = null;
-    const old = zoomedImgRef.current;
+    const old = transformedImgRef.current;
     if (old) {
       old.style.transform = '';
       old.style.cursor = 'zoom-in';
-      zoomedImgRef.current = null;
+      transformedImgRef.current = null;
     }
   }, [state?.index]);
 
@@ -153,9 +226,50 @@ export function ImagePopup() {
         z.scale, z.tx, z.ty,
       );
     }
+    // An image that has not painted yet measures as a zero box, which is
+    // nothing to zoom or clamp against. Caching one would freeze every later
+    // gesture against an image of no size, so a caller waits instead.
+    function measurable(layout: ImageLayout | null): layout is ImageLayout {
+      return layout !== null && layout.imgW > 0 && layout.imgH > 0;
+    }
     function ensureLayout(): ImageLayout | null {
-      if (!layoutRef.current) layoutRef.current = captureLayout();
-      return layoutRef.current;
+      if (layoutRef.current) return layoutRef.current;
+      const measured = captureLayout();
+      if (!measurable(measured)) return null;
+      layoutRef.current = measured;
+      return measured;
+    }
+
+    // Full size for the image on screen: the scale where one image pixel covers
+    // one physical screen pixel. `0` means the image declares no intrinsic
+    // width, so there is no 1:1 to aim at and the plain range stands.
+    function fullScale(): number {
+      const img = getCurrentImg();
+      const layout = ensureLayout();
+      if (!img || !layout) return 0;
+      return fullSizeScale(layout.imgW, img.naturalWidth, screenPixelRatio());
+    }
+    // Where the image rests: touching the window edge, whatever its own size.
+    // An image smaller than the window is blown up to reach it, which is what
+    // makes this a fit rather than a cap.
+    function fitScale(): number {
+      const layout = ensureLayout();
+      if (!layout) return 1;
+      return fitToWindowScale(layout.containerW, layout.containerH, layout.imgW, layout.imgH);
+    }
+    // The band every zoom moves in. Both ends are widened per image to keep
+    // full size reachable, whichever side of the fitted view it falls on. It
+    // takes its two measurements rather than reading them, so a caller holding
+    // one already cannot end up comparing against a second reading of it.
+    function zoomRange(fit: number, full: number): { min: number; max: number } {
+      return { min: zoomFloor(fit, full), max: zoomCeiling(MAX_ZOOM_PAST_FIT * fit, full) };
+    }
+    // Blown up past the fitted view, so there is something to pan around and a
+    // click means something other than a dismiss.
+    function zoomedPastFit(): boolean {
+      const scale = zoomRef.current.scale;
+      const fit = fitScale();
+      return scale > fit && !sameScale(scale, fit);
     }
 
     function applyZoom() {
@@ -163,8 +277,31 @@ export function ImagePopup() {
       if (!img) return;
       const { scale, tx, ty } = zoomRef.current;
       img.style.transform = `translate3d(${tx}px, ${ty}px, 0) scale(${scale})`;
-      img.style.cursor = scale > 1 ? 'grab' : 'zoom-in';
-      zoomedImgRef.current = scale > 1 ? img : null;
+      img.style.cursor = zoomedPastFit() ? 'grab' : 'zoom-in';
+      transformedImgRef.current = img;
+      const fit = fitScale();
+      fittedRef.current = sameScale(scale, fit);
+      // The control label is the one reactive part of a zoom, and a pinch runs
+      // this every frame. Writing state there would re-render the popup on each
+      // finger move, so the gesture's own release publishes the final value.
+      if (!touchActiveRef.current) publishLevel(fit);
+    }
+    // The level the cluster reads out. Identity is compared away, so a pan or a
+    // scale change too small to show costs no render.
+    function publishLevel(fit: number) {
+      const scale = zoomRef.current.scale;
+      const full = fullScale();
+      const range = zoomRange(fit, full);
+      const atFit = sameScale(scale, fit);
+      const next: ZoomLevel = {
+        percent: zoomPercent(scale, full, fit),
+        atFit,
+        atMin: scale <= range.min || sameScale(scale, range.min),
+        atMax: scale >= range.max || sameScale(scale, range.max),
+        // Fitted, and the fit already is 1:1. The toggle's other end is here.
+        canPreset: !atFit || full <= 0 || !sameScale(full, fit),
+      };
+      setLevel(prev => (sameLevel(prev, next) ? prev : next));
     }
     function scheduleApplyZoom() {
       if (rafRef.current !== null) return;
@@ -188,11 +325,12 @@ export function ImagePopup() {
       const layout = ensureLayout();
       if (!layout) return;
       const z = zoomRef.current;
+      const range = zoomRange(fitScale(), fullScale());
       const u = computeZoomAt(
         z.scale, z.tx, z.ty,
         clientX, clientY, newScale,
         layout.natCenterX, layout.natCenterY,
-        MIN_SCALE, MAX_SCALE,
+        range.min, range.max,
       );
       z.scale = u.scale; z.tx = u.tx; z.ty = u.ty;
       clamp();
@@ -204,10 +342,40 @@ export function ImagePopup() {
       clamp();
       scheduleApplyZoom();
     }
-    function resetZoom() {
-      zoomRef.current = { scale: 1, tx: 0, ty: 0 };
+    function zoomToFit() {
+      zoomRef.current = { scale: fitScale(), tx: 0, ty: 0 };
       scheduleApplyZoom();
     }
+
+    // The zoom controls act on the middle of the visible image. A wheel or a
+    // double tap points at a spot itself; a button press has no other anchor.
+    function stripCenter(): { x: number; y: number } {
+      const r = strip.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+    function stepZoom(direction: 1 | -1) {
+      const c = stripCenter();
+      const range = zoomRange(fitScale(), fullScale());
+      zoomAt(c.x, c.y, steppedScale(zoomRef.current.scale, direction, range.min, range.max));
+    }
+    function zoomToFullSize() {
+      const c = stripCenter();
+      // Nothing to hit 1:1 against on an image with no intrinsic width: land on
+      // the double-tap step, so the control still does something predictable.
+      zoomAt(c.x, c.y, fullScale() || fitScale() * DOUBLE_TAP_SCALE);
+    }
+    zoomApiRef.current = {
+      step: stepZoom,
+      // The standard toggle: 1:1 from the fitted view, and back to fitted from
+      // anywhere else.
+      preset: () => {
+        if (sameScale(zoomRef.current.scale, fitScale())) zoomToFullSize();
+        else zoomToFit();
+      },
+      fit: zoomToFit,
+      refit: () => { if (fittedRef.current) zoomToFit(); },
+      isZoomed: zoomedPastFit,
+    };
 
     function cancelSwipeRaf() {
       if (rafRef.current !== null) {
@@ -311,8 +479,10 @@ export function ImagePopup() {
         const cur = parseTranslateX(strip);
         strip.style.transition = 'none';
         strip.style.transform = `translate3d(${cur}px, 0, 0)`;
+        // Captured fresh rather than through ensureLayout: the strip may be
+        // mid-animation, and this gesture's geometry is where it is NOW.
         const layout = captureLayout();
-        if (!layout) return;
+        if (!measurable(layout)) return;
         layoutRef.current = layout;
         const t0 = e.touches[0];
         const t1 = e.touches[1];
@@ -327,7 +497,7 @@ export function ImagePopup() {
         return;
       }
       if (e.touches.length !== 1) return;
-      if (zoomRef.current.scale > 1) return;  // pointer-pan handles zoomed drag
+      if (zoomedPastFit()) return;  // pointer-pan handles zoomed drag
       cancelSwipeRaf();
       cancelTransition();
       // Lock BEFORE flushing — flushPendingCommit writes the signal, and we
@@ -353,7 +523,8 @@ export function ImagePopup() {
         const t1 = e.touches[1];
         const mid = fingerMidpoint(t0.clientX, t0.clientY, t1.clientX, t1.clientY);
         const dist = fingerDistance(t0.clientX, t0.clientY, t1.clientX, t1.clientY);
-        const u = computePinchUpdate(pinchRef.current, mid.x, mid.y, dist, MIN_SCALE, MAX_SCALE);
+        const range = zoomRange(fitScale(), fullScale());
+        const u = computePinchUpdate(pinchRef.current, mid.x, mid.y, dist, range.min, range.max);
         const z = zoomRef.current;
         z.scale = u.scale; z.tx = u.tx; z.ty = u.ty;
         clamp();
@@ -374,6 +545,9 @@ export function ImagePopup() {
       touchActiveRef.current = false;
       dragStartRef.current = null;
       pendingCommitRef.current = null;
+      // The frames a pinch ran through skipped this (see applyZoom), so the
+      // level control catches up with where the fingers left the image.
+      publishLevel(fitScale());
     }
 
     function handleTouchEnd(e: TouchEvent) {
@@ -437,8 +611,8 @@ export function ImagePopup() {
     function onPointerDown(e: PointerEvent) {
       if (e.button !== 0) return;
       if (pinchRef.current) return;
+      if (!zoomedPastFit()) return;
       const z = zoomRef.current;
-      if (z.scale <= 1) return;
       e.preventDefault();
       dragRef.current = {
         active: true,
@@ -464,16 +638,16 @@ export function ImagePopup() {
       const img = getCurrentImg();
       if (img) {
         try { img.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
-        img.style.cursor = zoomRef.current.scale > 1 ? 'grab' : 'zoom-in';
+        img.style.cursor = zoomedPastFit() ? 'grab' : 'zoom-in';
       }
     }
     function onDoubleClick(e: MouseEvent) {
       e.preventDefault();
       e.stopPropagation();
-      if (zoomRef.current.scale > 1) {
-        resetZoom();
+      if (zoomedPastFit()) {
+        zoomToFit();
       } else {
-        zoomAt(e.clientX, e.clientY, DOUBLE_TAP_SCALE);
+        zoomAt(e.clientX, e.clientY, fitScale() * DOUBLE_TAP_SCALE);
       }
     }
 
@@ -481,7 +655,7 @@ export function ImagePopup() {
       // detail>1 is the second click of a dblclick; skip so we don't
       // toggle twice on the way to dblclick-zoom.
       if (e.detail > 1) return;
-      if (zoomRef.current.scale > 1) return;
+      if (zoomedPastFit()) return;
       // Backdrop clicks close — the modal-overlay handles the outer
       // padding, the strip handles the dark area inside content.
       if (e.target instanceof HTMLImageElement) {
@@ -491,20 +665,24 @@ export function ImagePopup() {
       }
     }
 
-    // Viewport resize / orientation change. Snap the strip back to rest
-    // (slides reposition via render) and, if zoomed, drop the now-stale cached
-    // layout and re-clamp the current zoom against the fresh bounds — otherwise
-    // rotating the device while zoomed would leave the image panned outside its
-    // new edges. Skipped mid-gesture so it can't fight an in-flight pinch/swipe.
+    // Viewport resize / orientation change. Snap the strip back to rest (slides
+    // reposition via render) and drop the now-stale cached layout. A fitted
+    // view is measured against the window, so it is measured again. A zoom the
+    // user chose is kept, and only pulled back inside the new bounds. Without
+    // the re-clamp, rotating the device while zoomed would leave the image
+    // panned outside its new edges. Skipped mid-gesture so it can't fight an
+    // in-flight pinch or swipe.
     function handleResize() {
       if (touchActiveRef.current) return;
       strip.style.transition = 'none';
       strip.style.transform = STRIP_REST_TRANSFORM;
       layoutRef.current = null;
-      if (zoomRef.current.scale > 1) {
-        clamp();
-        applyZoom();
+      if (fittedRef.current) {
+        zoomToFit();
+        return;
       }
+      clamp();
+      applyZoom();
     }
 
     strip.addEventListener('wheel', handleWheel, { passive: false });
@@ -539,11 +717,19 @@ export function ImagePopup() {
       pinchRef.current = null;
       dragStartRef.current = null;
       layoutRef.current = null;
+      zoomApiRef.current = null;
     };
     // ImagePopup is always mounted at App root; the strip DOM only exists
     // when state is non-null. Re-run on open/close transitions so listeners
     // attach to the freshly-mounted strip.
   }, [state !== null]);
+
+  // Fit the image the popup just landed on. Declared after the gesture effect
+  // so the API it calls is already published. An image still downloading has
+  // nothing to measure, and asks again from its own load event below.
+  useEffect(() => {
+    zoomApiRef.current?.fit();
+  }, [state?.index]);
 
   useEffect(() => {
     if (!hasNav) return;
@@ -555,6 +741,21 @@ export function ImagePopup() {
     return () => window.removeEventListener('keydown', onKey);
   }, [hasNav]);
 
+  // The zoom keys every viewer has, mirroring the control cluster. A modified
+  // chord is left alone, so the browser's own zoom still works.
+  useEffect(() => {
+    if (state === null) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isTextInput(e.target)) return;
+      if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomApiRef.current?.step(1); }
+      else if (e.key === '-') { e.preventDefault(); zoomApiRef.current?.step(-1); }
+      else if (e.key === '0') { e.preventDefault(); zoomApiRef.current?.fit(); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [state !== null]);
+
   if (!state) return null;
 
   function close() {
@@ -562,14 +763,19 @@ export function ImagePopup() {
   }
 
   return (
-    // While zoomed (scale>1) the backdrop tap pans, so onClose returns false —
-    // the dismiss hook then neither closes nor swallows, and Escape (routed via
-    // the overlay stack) is a no-op too. Matches the old `onClose={undefined}`
-    // gate. The strip's own click handler still closes / toggles chrome for
-    // clicks inside the panel.
+    // While zoomed, a dismiss backs out ONE step: the image drops to its fitted
+    // size and the popup stays open. Returning false says so, and the dismiss
+    // hook then neither closes nor swallows the paired click. Escape arrives
+    // here too, through the overlay stack, so it unzooms and then closes rather
+    // than doing nothing at all. The strip's own click handler still closes and
+    // toggles the chrome for clicks inside the panel.
     <Overlay
       open
-      onClose={() => { if (zoomRef.current.scale > 1) return false; close(); }}
+      onClose={() => {
+        const zoom = zoomApiRef.current;
+        if (zoom?.isZoomed()) { zoom.fit(); return false; }
+        close();
+      }}
       overlayClass="image-popup"
       panelClass={`image-popup-content${chromeHidden ? ' chrome-hidden' : ''}`}
     >
@@ -600,6 +806,49 @@ export function ImagePopup() {
             <div class="image-popup-counter">{state.index + 1} / {total}</div>
           </>
         )}
+        {/* Zoom, for the pointer and the keyboard. A wheel and a pinch are
+            invisible affordances, and an image fitted to the window can be far
+            too small to read. The middle control reads out the level, as a
+            percentage of the image's own pixels against the screen's, and
+            toggles fit against 1:1. Its label reads the level and then names
+            the action, both as verbs: "450%, zoom to actual size" says what a
+            press does, where a bare "450%, actual size" claims the image is
+            already at 1:1. It greys out where the two ends coincide, which is
+            an image fitting the screen it came from, and there the label is the
+            level alone. */}
+        <div class="image-popup-zoom" role="group" aria-label="Zoom">
+          <button
+            class="image-popup-zoom-btn"
+            onClick={() => zoomApiRef.current?.step(-1)}
+            disabled={level.atMin}
+            aria-label="Zoom out"
+            data-tooltip="Zoom out"
+          >
+            −
+          </button>
+          <button
+            class="image-popup-zoom-btn image-popup-zoom-level"
+            onClick={() => zoomApiRef.current?.preset()}
+            disabled={!level.canPreset}
+            aria-label={level.canPreset
+              ? `${level.percent}%, ${level.atFit ? 'zoom to actual size' : 'fit to window'}`
+              : `${level.percent}%`}
+            data-tooltip={level.canPreset
+              ? (level.atFit ? 'Zoom to actual size' : 'Fit to window')
+              : undefined}
+          >
+            {level.percent}%
+          </button>
+          <button
+            class="image-popup-zoom-btn"
+            onClick={() => zoomApiRef.current?.step(1)}
+            disabled={level.atMax}
+            aria-label="Zoom in"
+            data-tooltip="Zoom in"
+          >
+            +
+          </button>
+        </div>
         <div class="image-popup-strip" ref={stripRef}>
           {state.images.map((imgSrc, i) => (
             <div
@@ -607,7 +856,16 @@ export function ImagePopup() {
               key={imgSrc}
               style={`left: ${shortestDelta(i, state.index, total) * 100}%;`}
             >
-              <img src={imgSrc} alt={i === state.index ? 'Full size' : ''} draggable={false} />
+              {/* A fit is a measurement, and there is nothing to measure until
+                  the image has arrived. Whichever slide that is, the fit taken
+                  here is the current one's, and only where the view still
+                  rests on a fit. */}
+              <img
+                src={imgSrc}
+                alt={i === state.index ? 'Full size' : ''}
+                draggable={false}
+                onLoad={() => zoomApiRef.current?.refit()}
+              />
             </div>
           ))}
           {/* shortestDelta(_, _, 2) returns 0 or +1 only, never -1, so the

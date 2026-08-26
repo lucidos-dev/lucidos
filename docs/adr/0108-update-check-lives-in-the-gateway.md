@@ -1,6 +1,8 @@
 # 0108: The update check lives in the gateway, polls lucidos.dev, and covers every install type
 
-- **Status**: Accepted
+- **Status**: Accepted (the first-run notice is superseded by
+  [0139](0139-update-check-runs-on-notice-not-a-click.md); every other gate,
+  the payload and announce-never-install all stand)
 - **Date**: 2026-08-23
 
 ## Context
@@ -92,6 +94,12 @@ Two obligations bind the origin:
   AUTOMATIC check only. The Settings button asks anyway, since that click is
   itself consent for one request. Being able to ask by hand is what makes
   turning the check off safe. The deployment gate is the one nothing bypasses.
+
+  *Superseded in part 2026-08-26, for the notice only ([ADR 0139](0139-update-check-runs-on-notice-not-a-click.md)).*
+  A packaged install polls from first launch, with no click. An unanswered
+  notice was a permanent silent opt-out, which withheld the fixes this record
+  exists to deliver. The preference gate and the deployment gate both stand, and
+  so does the Settings button working while the automatic check is off.
 - **Announce, never install.** The result rides the existing
   `GET /~/api/v1/control/gateway/status`, in a new nested `release_check` field.
   It carries `last_error`, because a failed poll returns an unchanged answer and
@@ -113,6 +121,11 @@ carries "Got it" and "Turn it off", and either answer unblocks the poll. The
 persistent switch lives in Settings, System, backed by a machine-global
 `~/.lucidos/updates.toml`. There is no environment override, which would
 permanently shadow the switch.
+
+*Superseded in part 2026-08-26, for the notice only ([ADR 0139](0139-update-check-runs-on-notice-not-a-click.md)).*
+The notice is gone. `PRIVACY.md` states what is sent and how often, and the
+Settings switch remains the control. The rest of this section stands, the absent
+environment override included.
 
 ### What the request reveals
 
@@ -231,6 +244,11 @@ privacy position. It would also leave most users unaware of releases that fix
 bugs they are hitting. That is the defect this record exists to close. The
 first-run notice is the compromise, with no poll before acknowledgement. The
 user is told before anything leaves the machine, and one click stops it.
+
+*Superseded in part 2026-08-26, for the compromise only ([ADR 0139](0139-update-check-runs-on-notice-not-a-click.md)).*
+The rejection of opt-in stands. The notice turned out not to be a compromise: an
+unanswered one is indistinguishable from a refusal, so it re-created the very
+defect named above. `PRIVACY.md` is the notice now, and the switch is the click.
 
 **Poll daily instead of hourly.** Considered, and it counts better: a daily poll
 fired at startup makes the raw request count read as daily active installs, with

@@ -54,12 +54,44 @@ pub(crate) async fn git_cmd_env_timeout(
     envs: &[(&str, &OsStr)],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    git_cmd_spawn(args, dir, envs, timeout, false).await
+}
+
+/// [`git_cmd`] for a command the engine may SIGKILL the moment it stops
+/// waiting. Opt-in, because leaving a timed-out process alone is the right
+/// default. Killing a half-written `commit` or `merge` strands a lock file over
+/// a command that would have finished.
+///
+/// The opposite case is the pair [`worktree::WORKTREE_ADMIN_MUTEX`] guards.
+/// Both write `$GIT_DIR/worktrees/<id>`, and a timeout releases that guard
+/// while the process writes on. Whichever spawn holds the guard next then
+/// races the one that gave up. Neither destroys anything pre-existing when
+/// killed: a prune is idempotent, and an add owns only what this attempt is
+/// creating.
+pub(crate) async fn git_cmd_kill_on_timeout(
+    args: &[&str],
+    dir: &Path,
+) -> Result<std::process::Output, String> {
+    git_cmd_spawn(args, dir, &[], GIT_TIMEOUT, true).await
+}
+
+/// The one place a git subprocess is spawned. `kill_on_timeout` decides whether
+/// giving up on the wait also kills the process.
+async fn git_cmd_spawn(
+    args: &[&str],
+    dir: &Path,
+    envs: &[(&str, &OsStr)],
+    timeout: Duration,
+    kill_on_timeout: bool,
+) -> Result<std::process::Output, String> {
     let mut full_args: Vec<&str> = Vec::with_capacity(args.len() + 2);
     full_args.push("-c");
     full_args.push("core.quotepath=false");
     full_args.extend_from_slice(args);
     let mut cmd = tokio::process::Command::new("git");
-    cmd.args(&full_args).current_dir(dir);
+    cmd.args(&full_args)
+        .current_dir(dir)
+        .kill_on_drop(kill_on_timeout);
     for (key, value) in envs {
         cmd.env(key, value);
     }

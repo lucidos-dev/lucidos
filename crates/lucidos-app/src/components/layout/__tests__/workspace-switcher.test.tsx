@@ -311,8 +311,13 @@ describe('the right-click action row', () => {
     // A nested overlay would break twice. The panel is transformed and clipped,
     // so a fixed child lands in the wrong place. And a portaled one reads as
     // OUTSIDE this menu, so the first press on it would shut the menu.
-    expect(list(two, { contextId: 'work' }))
-      .toContain('<button class="brand-menu-ws-row brand-menu-ws-action">');
+    //
+    // The trailing indent class is THIS list's, and the notifications group
+    // passes its own: their rows lead with different columns, so a shared one
+    // would hang the action off the wrong column in one of the two.
+    expect(list(two, { contextId: 'work' })).toContain(
+      '<button class="brand-menu-ws-row brand-menu-ws-action brand-menu-ws-action-under-dot">',
+    );
   });
 
   it('says what pressing it does, in this platform\'s words', () => {

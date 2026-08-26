@@ -156,13 +156,14 @@ The handler resolves an actor from the request headers via
 `ChangeApplied` event. One header drives the agent-vs-human distinction:
 
 - **`x-lucidos-agent-origin-token`**: the *thread-bound origin token*,
-  shaped `<thread-id>.<mac>`, minted per spawn under a per-engine-startup
-  HMAC secret. Set by the `lucidos` CLI from the
+  shaped `<thread-id>@<depth>@<trigger>.<mac>`, minted per spawn under a
+  per-engine-startup HMAC secret. A `-` stands in for any field the spawn
+  does not carry. Set by the `lucidos` CLI from the
   `LUCIDOS_AGENT_ORIGIN_TOKEN` env var that the engine injects into every
   spawned subprocess.
 
 The token is self-describing: when its MAC verifies, the spawning thread
-is the token's own prefix, so nothing else on the request names it. The
+is the prefix's first field, so nothing else on the request names it. The
 actor stamps as `Api { mode: Agent, source_thread_id }`, which the UI
 renders as **"Lucidos Agent"** with a popover linking back to the
 spawning thread. Drop the header, or present a token that does not

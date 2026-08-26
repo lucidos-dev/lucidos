@@ -369,11 +369,50 @@ pub(crate) async fn worktree_add(
 /// lets the add create its branch exactly once. A CC spawn reusing the
 /// deterministic `thread-<id>` path would otherwise die with an Event stream
 /// error.
+///
+/// The pair runs under [`WORKTREE_ADMIN_MUTEX`], so one spawn's prune cannot
+/// delete another spawn's half-created admin directory. The lock covers the add
+/// as well, because the add is what owns that directory. Work after the add
+/// runs unlocked: `gitdir` is on disk by then, and a prune leaves the entry
+/// alone.
 async fn worktree_add_pruning_stale(
     repo_root: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    match git_cmd(&["worktree", "prune"], repo_root).await {
+    let _guard = WORKTREE_ADMIN_MUTEX.lock().await;
+    prune_worktrees_locked(repo_root).await;
+    git_cmd_kill_on_timeout(args, repo_root).await
+}
+
+/// Serialises `git worktree prune` against `git worktree add` in this process.
+///
+/// A prune deletes every `$GIT_DIR/worktrees/<id>` that holds no `gitdir` file,
+/// with no grace period. An add creates that directory a few syscalls BEFORE it
+/// writes the file. A prune landing in that window deletes a sibling's admin
+/// directory, and the sibling dies on `could not open .../gitdir for writing`.
+/// Six spawns from one response is the shape that hits it, since each prunes
+/// before it adds.
+///
+/// One global mutex, not one per repo. Spawns against different repos cannot
+/// corrupt each other, but an add takes milliseconds, so a keyed map is cost
+/// with no payoff. A leaf in the lock order: below it sits only a `git_cmd`
+/// subprocess.
+///
+/// A guard binds only what it can see. So BOTH halves run under
+/// [`super::git_cmd_kill_on_timeout`]: a timed-out one outlives the guard and
+/// races whichever spawn takes it next. A prune from ANOTHER process still
+/// lands in that window: the release and e2e scripts each run one. Git takes
+/// no repo lock that would cover them.
+pub(super) static WORKTREE_ADMIN_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Clear registrations whose working tree is gone. The caller holds
+/// [`WORKTREE_ADMIN_MUTEX`] for the sweep.
+///
+/// It logs a failed prune and carries on, because the caller's own step reports
+/// whatever the leftover garbage then breaks.
+async fn prune_worktrees_locked(repo_root: &Path) {
+    match git_cmd_kill_on_timeout(&["worktree", "prune"], repo_root).await {
         Ok(p) if p.status.success() => {}
         Ok(p) => log!(
             "[Git] git worktree prune returned non-zero in {}: {}",
@@ -386,7 +425,6 @@ async fn worktree_add_pruning_stale(
             e
         ),
     }
-    git_cmd(args, repo_root).await
 }
 
 async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {

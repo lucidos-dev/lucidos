@@ -8,7 +8,6 @@ import {
   getGatewayStatus,
   reloadGateway,
   openWorkspace,
-  openWorkspaceNotifications,
   slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
 } from './control';
@@ -207,8 +206,8 @@ describe('workspace navigation leaves nothing on the back stack', () => {
     expect(fakeLocation.replace).toHaveBeenCalledWith('/a%20b/');
   });
 
-  it('openWorkspaceNotifications replaces, and carries the landing hash', () => {
-    openWorkspaceNotifications('loopws');
+  it('openWorkspace carries a landing as the fragment, and still replaces', () => {
+    openWorkspace('loopws', 'notifications');
     expect(fakeLocation.replace).toHaveBeenCalledWith('/loopws/#notifications');
     expect(fakeLocation.href).toBe(CURRENT);
   });

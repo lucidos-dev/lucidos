@@ -113,6 +113,92 @@ export function naturalImageLayout(
   };
 }
 
+// One press of a zoom button multiplies (or divides) the scale by this.
+export const ZOOM_STEP = 1.5;
+
+// Where one press of the zoom-in / zoom-out control lands, within the range.
+export function steppedScale(
+  scale: number,
+  direction: 1 | -1,
+  minScale: number,
+  maxScale: number,
+): number {
+  const next = direction > 0 ? scale * ZOOM_STEP : scale / ZOOM_STEP;
+  return Math.max(minScale, Math.min(maxScale, next));
+}
+
+// The scale at which one image pixel covers one PHYSICAL screen pixel: full
+// size, what the readout calls 100%. `fittedWidth` is the CSS width the image
+// occupies at scale 1. `pixelRatio` is the device pixels the screen draws per
+// CSS pixel.
+//
+// Counting CSS pixels instead reads a phone screenshot as 33% on the phone it
+// came from. The screen is drawing it as sharply as it can, and the "actual
+// size" offered from there is a threefold blow-up of the same pixels.
+//
+// Returns 0 when there is nothing to measure against, which is an image with no
+// intrinsic width (an SVG that declares none). The caller then has no full-size
+// target to offer and needs a fallback.
+export function fullSizeScale(
+  fittedWidth: number,
+  naturalWidth: number,
+  pixelRatio: number,
+): number {
+  if (fittedWidth <= 0 || naturalWidth <= 0 || pixelRatio <= 0) return 0;
+  return naturalWidth / (fittedWidth * pixelRatio);
+}
+
+// The zoom ceiling: the fixed cap, raised whenever full size sits above it. A
+// tall screenshot fits the window at a small fraction of its own size. A
+// constant cap would put 1:1 out of reach for the images that need it most.
+export function zoomCeiling(cap: number, fullSize: number): number {
+  return fullSize > cap ? fullSize : cap;
+}
+
+// The zoom floor, and the mirror of the ceiling above. An image with fewer
+// pixels than the window fits by being blown up, so its own pixels sit BELOW
+// the fitted view. A floor at the fit would hide 1:1 from exactly those images.
+// A fixed floor of 1 hides it on any screen drawing several device pixels per
+// CSS pixel.
+export function zoomFloor(fit: number, fullSize: number): number {
+  return fullSize > 0 && fullSize < fit ? fullSize : fit;
+}
+
+// The scale that makes the image touch the window edge: what a viewer calls
+// fit. `imgW` and `imgH` are the size at scale 1. CSS already shrinks an
+// oversized image to the container, so that one answers 1. A small one answers
+// the factor that grows it out to the edge.
+export function fitToWindowScale(
+  containerW: number,
+  containerH: number,
+  imgW: number,
+  imgH: number,
+): number {
+  if (containerW <= 0 || containerH <= 0 || imgW <= 0 || imgH <= 0) return 1;
+  const fit = Math.min(containerW / imgW, containerH / imgH);
+  // Sub-pixel rounding in the measured box makes an image that already fits ask
+  // for a hair of upscale. Leave it alone: a transform of 1.0001 buys nothing
+  // and costs the crispness of an unscaled layer.
+  return sameScale(fit, 1) ? 1 : fit;
+}
+
+// What the level control reads out: the size on screen as a percentage of the
+// image's own pixels, so 100% is one image pixel per physical screen pixel.
+// `fullSize` is the scale where the two meet. It is 0 for an image that
+// declares no intrinsic size, and the fitted view stands in for 1:1 there.
+export function zoomPercent(scale: number, fullSize: number, fit: number): number {
+  const oneToOne = fullSize > 0 ? fullSize : fit;
+  if (oneToOne <= 0) return 100;
+  return Math.round((scale / oneToOne) * 100);
+}
+
+// Two scales the same, within a relative tolerance. A fit computed from
+// measured pixels never lands on exact equality, and an absolute epsilon means
+// something different at 1x and at 45x.
+export function sameScale(a: number, b: number): boolean {
+  return Math.abs(a - b) <= Math.max(a, b) * 0.001;
+}
+
 // Single-anchor zoom (wheel, double-tap). The screen point at (anchorX,
 // anchorY) stays fixed across the scale change.
 export function computeZoomAt(

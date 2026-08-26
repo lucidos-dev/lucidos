@@ -3,7 +3,8 @@
 //! Mirrors `lucidos-cli/src/workspace.rs` + `spawn_thread::resolve_target` so
 //! the engine can do cross-workspace POSTs without shelling out to the CLI.
 //! Both must agree on:
-//!   1. Workspaces live under `$LUCIDOS_WORKSPACES_ROOT` (default `~/workspaces`).
+//!   1. Workspaces live under [`workspaces_root`]: `$LUCIDOS_WORKSPACES_ROOT`,
+//!      else beside `$LUCIDOS_WORKSPACE`, else `~/workspaces`.
 //!   2. Each workspace publishes its API port in `<root>/<name>/.lucidos/ports`
 //!      as a `KEY=VALUE` line `API_PORT=<u16>`.
 //!   3. The ports file may contain `PROTO=http|https` (defaults to `https`).
@@ -27,8 +28,7 @@ pub struct CrossWorkspaceTarget {
 /// Resolve `workspace_name` to a `CrossWorkspaceTarget`.
 ///
 /// `workspaces_root` overrides discovery for tests. Production callers pass
-/// `None`, which falls back to `$LUCIDOS_WORKSPACES_ROOT` and then to
-/// `~/workspaces`.
+/// `None`, which defers to [`workspaces_root_from_env`].
 pub fn resolve_workspace(
     workspace_name: &str,
     workspaces_root: Option<&Path>,
@@ -52,13 +52,11 @@ pub fn resolve_workspace(
     }
     let root = match workspaces_root {
         Some(r) => r.to_path_buf(),
-        None => std::env::var("LUCIDOS_WORKSPACES_ROOT")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join("workspaces")))
-            .map_err(|_| {
-                "cannot resolve workspaces root: neither LUCIDOS_WORKSPACES_ROOT nor HOME is set"
-                    .to_string()
-            })?,
+        None => workspaces_root_from_env(
+            std::env::var_os("LUCIDOS_WORKSPACES_ROOT"),
+            std::env::var_os("LUCIDOS_WORKSPACE"),
+            std::env::var_os("HOME"),
+        )?,
     };
     let workspace_path = root.join(workspace_name);
     let ports_file = workspace_path.join(".lucidos/ports");
@@ -68,6 +66,45 @@ pub fn resolve_workspace(
         api_port,
         proto,
     })
+}
+
+/// The directory a bare workspace name is resolved against, in priority order:
+/// an explicit `LUCIDOS_WORKSPACES_ROOT`, then the directory holding
+/// `LUCIDOS_WORKSPACE`, then `~/workspaces`.
+///
+/// The middle step is what makes a packaged install work. Its workspaces live
+/// under `<app-data>/workspaces`, so a bare name resolved against `~/workspaces`
+/// misses, and `--to dev` reaches an unrelated dev-checkout workspace instead.
+///
+/// It is derived from `LUCIDOS_WORKSPACE` rather than pushed in as a new
+/// variable, because the caller may be an engine the gateway ADOPTED. No env
+/// var can be added to a process already running, so a pushed one would strand
+/// every pre-upgrade engine on the old fallback. `LUCIDOS_WORKSPACE` is already
+/// set on every engine and subprocess (ADR 0136).
+///
+/// Takes its three inputs as arguments so the ordering is testable without
+/// mutating process env, which is racy under a parallel test runner.
+fn workspaces_root_from_env(
+    explicit: Option<std::ffi::OsString>,
+    workspace: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(root) = explicit {
+        return Ok(PathBuf::from(root));
+    }
+    if let Some(parent) = workspace
+        .map(PathBuf::from)
+        .as_deref()
+        .and_then(Path::parent)
+    {
+        return Ok(parent.to_path_buf());
+    }
+    home.map(|h| PathBuf::from(h).join("workspaces"))
+        .ok_or_else(|| {
+            "cannot resolve workspaces root: none of LUCIDOS_WORKSPACES_ROOT, \
+             LUCIDOS_WORKSPACE or HOME is set"
+                .to_string()
+        })
 }
 
 /// Parse `API_PORT=` and `PROTO=` out of a `.lucidos/ports` KEY=VALUE file.
@@ -171,6 +208,56 @@ mod tests {
         write_ports(tmp.path(), "ws", "API_PORT=not-a-number\n");
         let err = resolve_workspace("ws", Some(tmp.path())).unwrap_err();
         assert!(err.contains("bad API_PORT"), "error: {}", err);
+    }
+
+    fn os(s: &str) -> std::ffi::OsString {
+        std::ffi::OsString::from(s)
+    }
+
+    /// A packaged workspace sits under app-support, not `~/workspaces`, and
+    /// nothing sets an explicit root there. Resolving beside the caller's own
+    /// workspace is what makes a bare `--to <name>` find its sibling.
+    #[test]
+    fn a_bare_name_resolves_beside_the_callers_own_workspace() {
+        assert_eq!(
+            workspaces_root_from_env(None, Some(os("/app-data/workspaces/other")), Some(os("/h")))
+                .unwrap(),
+            PathBuf::from("/app-data/workspaces")
+        );
+    }
+
+    /// An operator who set the root explicitly means it.
+    #[test]
+    fn an_explicit_root_beats_the_callers_workspace() {
+        assert_eq!(
+            workspaces_root_from_env(
+                Some(os("/elsewhere")),
+                Some(os("/app-data/workspaces/other")),
+                Some(os("/h"))
+            )
+            .unwrap(),
+            PathBuf::from("/elsewhere")
+        );
+    }
+
+    /// With no workspace in the environment the legacy default still applies,
+    /// so a dev checkout that never set either variable is unaffected.
+    #[test]
+    fn home_workspaces_is_still_the_last_resort() {
+        assert_eq!(
+            workspaces_root_from_env(None, None, Some(os("/h"))).unwrap(),
+            PathBuf::from("/h/workspaces")
+        );
+    }
+
+    /// A workspace at the filesystem root has no parent to resolve beside, so
+    /// the fallback must continue rather than yield an empty root.
+    #[test]
+    fn a_parentless_workspace_falls_through_to_home() {
+        assert_eq!(
+            workspaces_root_from_env(None, Some(os("/")), Some(os("/h"))).unwrap(),
+            PathBuf::from("/h/workspaces")
+        );
     }
 
     #[test]

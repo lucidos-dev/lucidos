@@ -8,10 +8,10 @@ import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
+import { installDeadPressProbe } from './components/chat/deadPressProbe';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
 import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
-import { installNativeCursor } from './utils/nativeCursor';
 import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
@@ -68,12 +68,11 @@ if (isIOSPwa()) {
 }
 
 installActionBtnBlurListener();
+// A diagnostic, not a feature. See its header and docs/temporary-measures.md.
+installDeadPressProbe();
 installNoAutofill();
 installNoDrag();
 installNoFunctionKeyText();
-// Packaged desktop only: hand the native window the cursor the hovered element
-// asks for, so AppKit stops overwriting WebKit's (utils/nativeCursor.ts).
-installNativeCursor();
 // Both render roots, so a near-miss drop cannot navigate the picker document
 // either (utils/strayFileDrop.ts).
 installStrayFileDropGuard();
@@ -160,7 +159,7 @@ function recoverFromBrokenContext(): boolean {
  *  WebKit's "string did not match the expected pattern". Keep the inline boot
  *  splash up instead; `desktop::launch()` navigates to the gateway once the
  *  service is healthy. Heartbeat on the cadence `useStartup` would, so the
- *  WKWebView crash watchdog (lib.rs) does not reload the splash while we wait. */
+ *  WKWebView crash watchdog (crash_watchdog.rs) does not reload the splash while we wait. */
 function stayOnStartingSplash(): void {
   // Painted now rather than a poll-tick from now, and matching
   // `desktop::STARTING_LABEL`, so a fast start never sees the text change.

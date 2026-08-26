@@ -1,4 +1,5 @@
 import { recordIpcOutcome } from './ipcHealth';
+import type { WorkspaceLanding } from './workspaceLanding';
 
 declare global {
   interface Window {
@@ -137,19 +138,7 @@ export function toggleWindowMaximize(): Promise<void> {
 }
 
 /**
- * Point the CALLING window's native cursor at a CSS cursor keyword (Rust
- * `cursor::set_window_cursor`). The keyword travels verbatim, because the one
- * table that turns it into a native icon lives in `src/cursor.rs` and this side
- * deliberately holds none.
- *
- * Called by the reconciler in `utils/nativeCursor.ts`, which is where the whole
- * mechanism is explained. Only call when isTauri() is true. */
-export function setWindowCursor(cursor: string): Promise<void> {
-  return invoke('set_window_cursor', { cursor });
-}
-
-/**
- * Name the CALLING window (lib.rs `set_window_title`), so the macOS Window menu
+ * Name the CALLING window (app_window.rs `set_window_title`), so the macOS Window menu
  * tells two windows apart by the workspace each is showing.
  *
  * Compose the string with `utils/windowTitle.ts` rather than here, and call it
@@ -491,21 +480,27 @@ export function saveToDownloads(filename: string, contents: string): Promise<Sav
   return invoke<SavedDownload>('save_to_downloads', { filename, contents });
 }
 
-/** Show a workspace in a window (lib.rs `show_workspace_window`). The desktop
+/** Show a workspace in a window (app_window.rs `show_workspace_window`). The desktop
  *  half of `openWorkspaceIn`, which is the only thing that should call it.
  *
  *  The shell decides WHICH window: it focuses one already on the workspace,
  *  points the calling window at it when that window is on the picker, or opens
  *  a new one. Only the shell can see every window, so only the shell can choose.
+ *  A `landing` makes the first of those three a navigation instead, since only a
+ *  navigation carries a fragment into a page that is already loaded.
  *
- *  Takes the workspace SLUG, never a URL, and the shell composes the URL itself
- *  on the calling window's own origin. A `window-*` webview carries the full IPC
- *  grant on the gateway origin (ADR 0028). Rejects with a string when the slug is
- *  not one the gateway serves, or the window could not be built.
+ *  Takes the workspace SLUG and the landing's NAME, never a URL or a fragment.
+ *  The shell composes the URL itself, on the calling window's own origin. A
+ *  `window-*` webview carries the full IPC grant on the gateway origin (ADR
+ *  0028). Rejects with a string when the slug or the landing is not one the
+ *  shell serves, or the window could not be built.
  *
  *  Only call when isTauri() is true. */
-export function showWorkspaceInNativeWindow(workspace: string): Promise<void> {
-  return invoke('show_workspace_window', { workspace });
+export function showWorkspaceInNativeWindow(
+  workspace: string,
+  landing?: WorkspaceLanding,
+): Promise<void> {
+  return invoke('show_workspace_window', { workspace, landing: landing ?? null });
 }
 
 /** Surface the engine's connect URLs (localhost / LAN / Tailscale). Only call

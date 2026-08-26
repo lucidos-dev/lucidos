@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn tailnet_range_covers_100_64_through_100_127() {
         assert!(is_tailnet_ipv4("100.64.0.1"));
-        assert!(is_tailnet_ipv4("100.101.71.7"));
+        assert!(is_tailnet_ipv4("100.100.0.1"));
         assert!(is_tailnet_ipv4("100.127.255.255"));
         // Just outside the /10 on either side.
         assert!(!is_tailnet_ipv4("100.63.255.255"));
@@ -150,9 +150,9 @@ mod tests {
             select_tailnet_addr(&[
                 ("lo0", v4("127.0.0.1")),
                 ("en0", v4("192.168.1.10")),
-                ("utun4", v4("100.101.71.7")),
+                ("utun4", v4("100.64.0.2")),
             ]),
-            Some(v4("100.101.71.7"))
+            Some(v4("100.64.0.2"))
         );
         assert_eq!(
             select_tailnet_addr(&[("tailscale0", v4("100.90.1.2"))]),

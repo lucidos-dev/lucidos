@@ -57,8 +57,10 @@ pub(super) struct PutComposeBody {
     /// Mutually exclusive with `image_hashes`.
     #[serde(default)]
     pub images: Option<Vec<LegacyComposeImage>>,
-    /// `Some` only when the user is also toggling mode — rejected with 409 if
-    /// the thread is no longer in `composing`. Absent on text-only updates.
+    /// `Some` only when the user is toggling the channel, absent on every other
+    /// write. A CURRENT one is rejected with 409 once the thread leaves
+    /// `composing`. A stale one takes the 412 below instead: it was composed
+    /// while the thread was still a draft, so its mode was legal then.
     #[serde(default)]
     pub mode: Option<String>,
     /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
@@ -343,9 +345,9 @@ pub(super) async fn put_compose(
     let (resolved_mode, post_compose_images, post_compose_selection, compose_epoch) = match row {
         Some(r) => r,
         None => {
-            // Cold path: UPDATE matched zero rows. Distinguish "no row" from
-            // "wrong state" / "mode-locked" / "stale epoch" with a follow-up
-            // read so the e2e contract (404/410/409/412) stays specific.
+            // Cold path: UPDATE matched zero rows. A follow-up read tells the
+            // refusals apart, so the client gets the reason rather than a bare
+            // "not applied".
             let lookup: Option<(String, i64)> = sqlx::query_as(
                 "SELECT state, compose_epoch FROM thread_summaries WHERE thread_id = $1",
             )
@@ -358,37 +360,44 @@ pub(super) async fn put_compose(
                 .map(|(s, _)| ThreadState::from_db_str(&s))
                 .transpose()
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            // Mode locks at first send — once the thread leaves Composing,
-            // mode is fixed. Archived rows carry state='active' so they hit
-            // this branch naturally. Without it the cold-path would fall
-            // through to `compose_error` which (correctly) accepts compose
-            // updates from post-send states, masking the mode lock as a
-            // silent no-op.
+            // Answered most specific reason first, and the order is the
+            // contract. A missing or discarded row settles the request on its
+            // own. There is no draft to compose against, so neither the fence
+            // nor the mode lock applies.
+            if let Some(e) = compose_error(st) {
+                return Err(e);
+            }
+            // The fence before the mode lock, and the order is the fix. A write
+            // carrying an epoch a submission has consumed was composed against
+            // the pre-send state, where its mode was legal. The epoch is why it
+            // was not applied, and 412 is the one answer the client resyncs
+            // from silently. Asking about the mode first reported that race as
+            // an illegal mode change, and every keystroke write on a draft
+            // carries a mode. A silent 204 stays wrong for the reason it always
+            // was: the client would record the text as stored while the engine
+            // dropped it.
+            // See `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
+            if let (Some(sent), Some(current)) = (body.compose_epoch, current_epoch) {
+                if sent != current {
+                    return Ok(stale_compose_epoch_response(current));
+                }
+            }
+            // Mode locks at first send. This write is CURRENT: it matched the
+            // epoch, or carried none. A mode here is a real divergence rather
+            // than a straggler. Archived rows carry state='active' and reach
+            // this naturally. Without it the request falls through to the 204
+            // below, which would swallow the mode change in silence.
             if body.mode.is_some() && matches!(st, Some(ThreadState::Active)) {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "mode is locked once the thread has been sent",
                 ));
             }
-            // The state was fine and only the fence rejected: a submission
-            // consumed the compose slot after this write was composed. Answer
-            // 412 with the current epoch rather than a silent 204, because the
-            // client would otherwise record the text as stored and stop owing a
-            // re-send while the engine had dropped it. The client adopts the
-            // epoch and re-issues, so a draft typed while behind still lands.
-            if let (Some(sent), Some(current)) = (body.compose_epoch, current_epoch) {
-                if sent != current && compose_error(st).is_none() {
-                    return Ok(stale_compose_epoch_response(current));
-                }
-            }
-            // TOCTOU: a concurrent send between the UPDATE and the lookup
-            // may have flipped state to active and the row now matches
-            // `compose_can_compose`. Treat as a benign no-op — the
-            // concurrent path already wrote a more authoritative value.
-            return match compose_error(st) {
-                Some(e) => Err(e),
-                None => Ok(StatusCode::NO_CONTENT.into_response()),
-            };
+            // TOCTOU: a concurrent send between the UPDATE and the lookup may
+            // have flipped state to active, so the row now satisfies the state
+            // guard. Treat as a benign no-op: the concurrent path already wrote
+            // a more authoritative value.
+            return Ok(StatusCode::NO_CONTENT.into_response());
         }
     };
 

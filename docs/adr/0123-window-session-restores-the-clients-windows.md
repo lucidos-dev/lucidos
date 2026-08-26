@@ -123,14 +123,11 @@ uses that one rather than growing another.
   applies them, which File > New Window did not have before. The clamp reads a
   frame under the minimum as corruption. That inference is only sound for a
   window the user could not drag that small.
-- **Close to Menu Bar does not preserve the arrangement.** Cmd+Q is bound to it,
-  and it closes every secondary window, so the record shrinks to `main`'s
-  workspace. A relaunch after parking therefore gives one window. That is
-  consistent with the tray reopen, which also brings back `main` alone. A
-  counter that held the record across a park was tried and reverted: it left
-  the tray reopen and the record disagreeing, and each round of patching it
-  opened another hole. Restoring the parked windows on the tray reopen is the
-  coherent fix, and is a separate change.
+- **Close to Menu Bar did not preserve the arrangement. FIXED by ADR 0141.**
+  Cmd+Q closed every secondary window, so the record shrank to `main`'s
+  workspace and both the reopen and a relaunch gave one window. The park now
+  hides every window instead, so nothing shrinks the record. The counter that
+  held the record across a park stays retired: do not re-add it.
 - **A notification tap during boot costs two remembered sizes.** `setup` sized
   `main` from the first recorded workspace, and a tap then points it elsewhere.
   The record stays accurate, since it describes the windows as they now are, but

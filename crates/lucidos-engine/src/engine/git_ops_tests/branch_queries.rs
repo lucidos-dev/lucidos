@@ -1029,3 +1029,42 @@ async fn worktree_add_succeeds_while_config_lock_is_held() {
         "worktree not checked out"
     );
 }
+
+/// The third concurrent-spawn hazard: `worktree_add` prunes before it adds, and
+/// a prune deletes any `worktrees/<id>` holding no `gitdir` file yet. That is
+/// what a sibling's add looks like for a few syscalls, so no add may run while
+/// another spawn holds the admin lock. Held here the way `prune_worktrees`
+/// holds it.
+///
+/// Structural, because the real window is a few syscalls wide and only opens
+/// under load. It fails when the lock leaves `worktree_add_pruning_stale`, and
+/// cannot tell the prune's half of that pair from the add's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_add_waits_for_a_prune_holding_the_admin_lock() {
+    let (_tmp, repo) = make_test_repo().await;
+    let wt_dir = tempfile::tempdir().unwrap();
+    let wt_path = wt_dir.path().join("wt");
+
+    let guard = super::worktree::WORKTREE_ADMIN_MUTEX.lock().await;
+    let add = tokio::spawn(async move {
+        worktree_add(&repo, &wt_path, &["-b", "claude-code/serialised", "main"]).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let ran_anyway = add.is_finished();
+
+    drop(guard);
+    let out = add
+        .await
+        .expect("add task panicked")
+        .expect("worktree_add returned Err");
+
+    assert!(
+        !ran_anyway,
+        "worktree add ran while the admin lock was held, so a concurrent prune can still delete its half-built admin dir"
+    );
+    assert!(
+        out.status.success(),
+        "worktree_add failed once the lock was free: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

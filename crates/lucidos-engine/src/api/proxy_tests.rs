@@ -354,24 +354,110 @@ fn hmac_signature_matches_binance_known_example() {
 
 // ---- Config loader ----------------------------------------------------
 
+/// Write an `apis.json` holding `body` and return the workspace root.
+fn workspace_with_apis_json(tmp: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+    let cfg_dir = tmp.path().join("data/config");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(cfg_dir.join("apis.json"), body).unwrap();
+    tmp.path().to_path_buf()
+}
+
+/// The wedge that took a live workspace offline. One bad entry used to fail
+/// the whole file, so every other proxy in it stopped working too.
+#[test]
+fn one_refused_provider_does_not_take_its_neighbours_down() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(
+        &tmp,
+        r#"{
+          "good": {"base_url": "https://good.test"},
+          "broken": {"base_url": "https://x", "auth": {"pipeline": [
+            {"type": "bearrer", "credential": "k"}
+          ]}},
+          "also-good": {"base_url": "https://also.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "k"}
+          ]}}
+        }"#,
+    );
+    let load = load_proxy_config(&ws);
+    assert_eq!(load.providers.len(), 2, "both good entries must load");
+    assert!(load.providers.contains_key("good"));
+    assert!(load.providers.contains_key("also-good"));
+    assert_eq!(rejected_names(&ws), vec!["broken".to_string()]);
+}
+
+/// A legacy entry the migration could not rewrite gets the translator's
+/// words, not serde's "missing field `pipeline`".
+#[test]
+fn a_refused_legacy_entry_is_reported_in_words_a_user_can_act_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(
+        &tmp,
+        r#"{"old": {"base_url": "https://x", "auth": {"type": "credential_bundle"}}}"#,
+    );
+    let reason = &load_proxy_config(&ws).rejected[0].reason;
+    assert!(reason.contains("credential_bundle"), "{reason}");
+    assert!(
+        !reason.contains("pipeline"),
+        "serde's words leaked: {reason}"
+    );
+}
+
+/// A refused entry must NOT read as "not configured". Only a 404 falls
+/// through to the builtin of the same name. A 404 here would send the
+/// request to a different backend than the one that was configured.
+#[tokio::test]
+async fn a_refused_provider_is_a_502_and_never_reaches_the_builtin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(
+        &tmp,
+        r#"{"openai": {"base_url": "https://x", "auth": {"pipeline": [
+            {"type": "bearrer", "credential": "k"}
+        ]}}}"#,
+    );
+    let (status, msg) = resolve_proxy_target(&ws, "openai")
+        .await
+        .expect_err("a refused entry must not resolve");
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(msg.contains("openai"), "names the provider: {msg}");
+    assert!(msg.contains("unusable"), "says what is wrong: {msg}");
+}
+
+/// An unreadable file answers for every name, builtins included. It may have
+/// overridden one, and there is no way left to know which.
+#[tokio::test]
+async fn an_unparseable_file_refuses_every_name_rather_than_rerouting_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(&tmp, "{ not json");
+    let (status, _) = resolve_proxy_target(&ws, "openai")
+        .await
+        .expect_err("nothing resolves while the file is unreadable");
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+/// A name nobody configured is still a plain 404, which is what lets the
+/// builtin fallback fire.
+#[tokio::test]
+async fn an_unconfigured_name_is_still_a_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(&tmp, r#"{"other": {"base_url": "https://x"}}"#);
+    let (status, _) = resolve_proxy_target(&ws, "openai").await.unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 #[test]
 fn load_config_returns_empty_when_file_missing() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg = load_proxy_config(tmp.path()).unwrap();
-    assert!(cfg.is_empty());
+    let load = load_proxy_config(tmp.path());
+    assert!(load.providers.is_empty());
+    assert!(load.rejected.is_empty());
 }
 
 #[test]
 fn load_config_parses_basic_shape() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
-        r#"{"sonos": {"base_url": "http://localhost:5005"}}"#,
-    )
-    .unwrap();
-    let cfg = load_proxy_config(tmp.path()).unwrap();
+    let ws = workspace_with_apis_json(&tmp, r#"{"sonos": {"base_url": "http://localhost:5005"}}"#);
+    let cfg = load_proxy_config(&ws).providers;
     assert_eq!(cfg.len(), 1);
     let sonos = cfg.get("sonos").unwrap();
     assert_eq!(sonos.base_url, "http://localhost:5005");
@@ -391,10 +477,8 @@ fn load_config_parses_basic_shape() {
 #[test]
 fn load_config_parses_pipeline_shape_with_static_credential_layer() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
+    let ws = workspace_with_apis_json(
+        &tmp,
         r#"{
                 "comfort": {
                     "base_url": "https://accsmart.panasonic.com",
@@ -403,9 +487,8 @@ fn load_config_parses_pipeline_shape_with_static_credential_layer() {
                     ]}
                 }
             }"#,
-    )
-    .unwrap();
-    let cfg = load_proxy_config(tmp.path()).unwrap();
+    );
+    let cfg = load_proxy_config(&ws).providers;
     let comfort = cfg.get("comfort").unwrap();
     let pipeline = comfort.auth.as_ref().unwrap();
     assert_eq!(pipeline.pipeline.len(), 1);
@@ -414,64 +497,67 @@ fn load_config_parses_pipeline_shape_with_static_credential_layer() {
 #[test]
 fn load_config_rejects_unknown_layer_type_in_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
+    let ws = workspace_with_apis_json(
+        &tmp,
         r#"{"foo": {"base_url": "https://x", "auth": {"pipeline": [
                 {"type": "bearrer", "credential": "k"}
             ]}}}"#,
-    )
-    .unwrap();
-    // Typo `bearrer` must surface at config-load time.
-    assert!(load_proxy_config(tmp.path()).is_err());
+    );
+    // Typo `bearrer` must surface at config-load time, as a refusal of
+    // that one provider rather than of the file.
+    assert_eq!(rejected_names(&ws), vec!["foo".to_string()]);
 }
 
 #[test]
 fn load_config_rejects_script_handshake_with_traversal_path_in_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
+    let ws = workspace_with_apis_json(
+        &tmp,
         r#"{"x": {"base_url": "https://x", "auth": {"pipeline": [
                 {"type": "script_handshake", "credential": "x", "script": "../../../etc/passwd"}
             ]}}}"#,
-    )
-    .unwrap();
-    assert!(load_proxy_config(tmp.path()).is_err());
+    );
+    assert_eq!(rejected_names(&ws), vec!["x".to_string()]);
 }
 
 #[test]
 fn load_config_rejects_script_handshake_with_absolute_path_in_pipeline() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
+    let ws = workspace_with_apis_json(
+        &tmp,
         r#"{"x": {"base_url": "https://x", "auth": {"pipeline": [
                 {"type": "script_handshake", "credential": "x", "script": "/etc/passwd"}
             ]}}}"#,
-    )
-    .unwrap();
-    assert!(load_proxy_config(tmp.path()).is_err());
+    );
+    assert_eq!(rejected_names(&ws), vec!["x".to_string()]);
 }
 
 /// Write an `apis.json` whose single provider runs `script` and load it.
-fn load_config_with_script(script: &str) -> Result<ProxyConfigMap, String> {
+fn load_config_with_script(script: &str) -> Result<(), String> {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("apis.json"),
-        format!(
+    let ws = workspace_with_apis_json(
+        &tmp,
+        &format!(
             r#"{{"acme": {{"base_url": "https://x", "auth": {{"pipeline": [
                 {{"type": "script_handshake", "credential": "x", "script": "{script}"}}
             ]}}}}}}"#
         ),
-    )
-    .unwrap();
-    load_proxy_config(tmp.path())
+    );
+    match load_proxy_config(&ws).rejected.into_iter().next() {
+        Some(rejected) => Err(rejected.reason),
+        None => Ok(()),
+    }
+}
+
+/// Every provider this config refuses, in order. The file itself reads as
+/// `data/config/apis.json`, so a file-level refusal is distinguishable from
+/// a provider that happens to be named after it.
+fn rejected_names(workspace: &std::path::Path) -> Vec<String> {
+    load_proxy_config(workspace)
+        .rejected
+        .iter()
+        .map(|r| r.label().to_string())
+        .collect()
 }
 
 /// Regression: the config load and the spawn must refuse the SAME script
@@ -512,12 +598,16 @@ fn a_refused_script_path_names_the_provider_and_the_value() {
 }
 
 #[test]
-fn load_config_invalid_json_returns_err() {
+fn load_config_invalid_json_is_rejected_as_the_file_itself() {
     let tmp = tempfile::tempdir().unwrap();
-    let cfg_dir = tmp.path().join("data/config");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(cfg_dir.join("apis.json"), "{ not json").unwrap();
-    assert!(load_proxy_config(tmp.path()).is_err());
+    let ws = workspace_with_apis_json(&tmp, "{ not json");
+    // Unparseable, so there is no entry to blame and the file answers for
+    // itself. Still a rejection rather than an error: the engine boots.
+    let load = load_proxy_config(&ws);
+    assert!(load.providers.is_empty());
+    assert_eq!(load.rejected.len(), 1);
+    assert!(load.rejected[0].provider.is_none());
+    assert_eq!(load.rejected[0].label(), "data/config/apis.json");
 }
 
 // ---- Integration tests with a tiny upstream server --------------------

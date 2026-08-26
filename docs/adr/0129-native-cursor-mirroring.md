@@ -1,7 +1,13 @@
 # 0129: Mirror the page's CSS cursor onto the native window
 
-- **Status**: Accepted
+- **Status**: Superseded by [ADR 0134](0134-cursor-glyph-webkit-declines.md)
 - **Date**: 2026-08-25
+
+> **This ADR is wrong, and is kept as the record of a wrong turn.** The
+> mechanism it describes shipped in v0.30.2 and changed no glyph, because wry
+> evicts tao's content view and the invalidate lands on nothing. Its
+> two-writers premise, its coverage claim, its `disableCursorRects` risk and its
+> upstream citations are each refuted in ADR 0134. Read that one instead.
 
 ## Context
 

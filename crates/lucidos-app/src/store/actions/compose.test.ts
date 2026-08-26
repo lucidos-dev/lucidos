@@ -1999,3 +1999,97 @@ describe('a suggestion never lands on an already-sent thread', () => {
     expect(getDraft('cc-1').image_hashes).toEqual(['h1']);
   });
 });
+
+/**
+ * A compose write carries a `mode` only when the mode CHANGES.
+ *
+ * `POST /threads` already stores the channel, and the endpoint COALESCEs, so a
+ * keystroke re-sending the same value changes nothing server-side. It did have
+ * one effect. A write composed before a send and landing after it was read as
+ * an attempt to change a sent thread's channel. The user got a "Compose sync
+ * failed" card for typing. See
+ * `docs/plans/2026-08-26-compose-mode-lock-masks-the-stale-write-fence.md`.
+ */
+describe('a compose write states the mode only when it changes', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  const composeModes = () => mockFetch.mock.calls
+    .filter(([url, init]) => String(url).endsWith('/compose') && (init as RequestInit | undefined)?.method === 'PUT')
+    .map(([, init]) => JSON.parse(String((init as RequestInit).body)).mode as string | null);
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    inputMode.value = { type: 'do' };
+    _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    toasts.value = [];
+    mockFetch = vi.fn(() => Promise.resolve(new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetThreadNavForTesting();
+    localStorage.removeItem(FOCUSED_THREAD_KEY);
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('sends no mode on a keystroke: the POST that created the thread stored it', async () => {
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { text: 'typing' });
+    await vi.runAllTimersAsync();
+
+    expect(composeModes()).toEqual([null]);
+  });
+
+  it('sends the mode on a toggle, then stops once the engine has it', async () => {
+    const id = ensureFocusedComposeThread();
+    updateCompose(id, { mode: 'claude_code' });
+    await vi.runAllTimersAsync();
+    expect(composeModes()).toEqual(['claude_code']);
+
+    updateCompose(id, { text: 'now typing' });
+    await vi.runAllTimersAsync();
+    expect(composeModes()).toEqual(['claude_code', null]);
+  });
+
+  it('re-states a mode the engine never acknowledged', async () => {
+    const id = ensureFocusedComposeThread();
+    await vi.runAllTimersAsync();
+
+    // The toggle's write is dropped in transit, so nothing proves the engine
+    // stored it. A mode we only ever failed to deliver must keep going out.
+    let dropComposeWrites = true;
+    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+      const isComposePut = String(url).endsWith('/compose') && (init?.method ?? '') === 'PUT';
+      if (isComposePut && dropComposeWrites) return Promise.reject(new TypeError('Load failed'));
+      return Promise.resolve(new Response(null, { status: 204 }));
+    });
+
+    updateCompose(id, { mode: 'claude_code' });
+    await vi.runAllTimersAsync();
+
+    dropComposeWrites = false;
+    updateCompose(id, { text: 'still owed' });
+    await vi.runAllTimersAsync();
+
+    // Every attempt states the mode, the landing one included. The count is
+    // left alone: `mutatingFetchIdempotent` retries a dropped write once, and
+    // that is its business rather than this rule's.
+    expect(composeModes()).not.toEqual([]);
+    expect(composeModes().every((m) => m === 'claude_code')).toBe(true);
+  });
+});

@@ -34,7 +34,7 @@ use crate::engine::LucidosEngine;
 pub(crate) const MAX_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 
 /// How many times a thread may subscribe with no human `MessageReceived` in
-/// between (S8). Mirrors `MAX_EVENT_TRIGGER_DEPTH` in intent: the events still
+/// between (S8). Mirrors `max_event_trigger_depth` in intent: the events still
 /// persist, the fan-out just stops.
 pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 

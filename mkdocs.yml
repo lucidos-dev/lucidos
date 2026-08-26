@@ -33,6 +33,9 @@ plugins:
   - search
   - include-markdown
 
+extra_css:
+  - stylesheets/diagrams.css
+
 markdown_extensions:
   - admonition
   - pymdownx.superfences
@@ -45,6 +48,7 @@ nav:
   - Home: index.md
   - Quickstart: quickstart.md
   - Concepts: concepts.md
+  - Architecture: architecture.md
   - Philosophy: philosophy.md
   - Develop Lucidos: develop.md
   - Tutorials:

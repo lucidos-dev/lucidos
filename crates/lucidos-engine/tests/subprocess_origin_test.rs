@@ -29,8 +29,23 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
 /// makes the first writer win, so re-running this in the same process
 /// signs under whatever secret the lock already holds.
 fn token_for(thread_id: Option<Uuid>) -> String {
+    token_at_depth(thread_id, 0)
+}
+
+/// [`token_for`] with an explicit event-trigger chain depth.
+fn token_at_depth(thread_id: Option<Uuid>, chain_depth: u32) -> String {
+    token_for_fire(thread_id, chain_depth, None)
+}
+
+/// [`token_at_depth`] for a spawn that IS `emitting_trigger_id`'s fire.
+fn token_for_fire(
+    thread_id: Option<Uuid>,
+    chain_depth: u32,
+    emitting_trigger_id: Option<&str>,
+) -> String {
     init_agent_origin_secret("subprocess-integration-secret".to_string());
-    mint_agent_origin_token(thread_id).expect("secret installed at least once")
+    mint_agent_origin_token(thread_id, chain_depth, emitting_trigger_id)
+        .expect("secret installed at least once")
 }
 
 /// Reproduce the exact request shape from the in-the-wild incident: a
@@ -179,7 +194,8 @@ fn a_subprocess_cannot_stamp_a_thread_its_token_was_not_minted_for() {
     let mac = token.rsplit_once('.').expect("minted token has a mac").1;
     let h = headers(&[
         ("user-agent", "curl/8.7.1"),
-        (HEADER_AGENT_ORIGIN_TOKEN, &format!("{theirs}.{mac}")),
+        // Every other field left as minted, so only the thread swap is on trial.
+        (HEADER_AGENT_ORIGIN_TOKEN, &format!("{theirs}@0@-.{mac}")),
     ]);
 
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
@@ -251,5 +267,116 @@ fn api_origin_legacy_rows_deserialize_without_source_thread_id() {
     assert!(
         json.get("source_thread_id").is_none(),
         "absent source_thread_id must not serialize (back-compat)"
+    );
+}
+
+// ---- Event-trigger chain depth ----
+
+/// A script trigger's `lucidos events emit` arrives on an axum task. It has no
+/// link to the fire that spawned the script, so the depth travels with the
+/// subprocess instead. It rides the signed prefix, which a script fire has no
+/// thread for.
+#[test]
+fn a_thread_less_script_token_carries_its_fires_chain_depth() {
+    let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_at_depth(None, 2))]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 2,
+            emitting_trigger_id: None,
+        }
+    );
+}
+
+/// The thread-bound half carries it too, for a coding-agent session's own
+/// `lucidos events emit`.
+#[test]
+fn a_thread_bound_token_carries_both_the_thread_and_the_depth() {
+    let tid = Uuid::new_v4();
+    let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_at_depth(Some(tid), 3))]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: Some(tid),
+            chain_depth: 3,
+            emitting_trigger_id: None,
+        }
+    );
+}
+
+/// The depth is inside the MAC, so it is a fact and not a claim.
+///
+/// If it were forgeable, any caller could declare 0 and escape the recursion
+/// cap. That is the whole point of moving it into the token rather than into a
+/// header of its own.
+#[test]
+fn an_edited_depth_fails_verification_rather_than_lowering_the_cap() {
+    let tid = Uuid::new_v4();
+    let honest = token_at_depth(Some(tid), 4);
+    let forged = honest.replace(&format!("{tid}@4"), &format!("{tid}@0"));
+    assert_ne!(forged, honest, "the edit has to actually change the token");
+    let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &forged)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::NotSubprocess,
+        "a token whose depth was edited must not verify"
+    );
+}
+
+/// An ordinary spawn is not inside any chain, and must stay at 0.
+#[test]
+fn a_spawn_outside_any_fire_carries_depth_zero() {
+    let tid = Uuid::new_v4();
+    let h = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_for(Some(tid)))]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: Some(tid),
+            chain_depth: 0,
+            emitting_trigger_id: None,
+        }
+    );
+}
+
+// ---- The emitting trigger (ADR 0137) ----
+
+/// A trigger's script emits over HTTP, off the fire's own task. The claim rides
+/// the same signed prefix the depth does, so the emit knows which fire it came
+/// from and cannot wake it.
+#[test]
+fn a_script_fires_token_names_the_trigger_that_ran_it() {
+    let trigger = Uuid::new_v4().to_string();
+    let h = headers(&[(
+        HEADER_AGENT_ORIGIN_TOKEN,
+        &token_for_fire(None, 1, Some(&trigger)),
+    )]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+            chain_depth: 1,
+            emitting_trigger_id: Some(trigger),
+        }
+    );
+}
+
+/// The denial-of-wake case. An app through the SDK holds no minted token, so it
+/// can express no claim and cannot mute a trigger by naming it. A forger who
+/// splices a trigger onto a valid MAC does not authenticate at all.
+#[test]
+fn a_trigger_claim_cannot_be_forged_by_an_untrusted_caller() {
+    let victim = Uuid::new_v4().to_string();
+    let honest = token_for(None);
+    let mac = honest.rsplit_once('.').expect("minted token has a mac").1;
+
+    let sdk = headers(&[("user-agent", "Mozilla/5.0")]);
+    assert_eq!(subprocess_origin(&sdk), SubprocessOrigin::NotSubprocess);
+
+    let forged = headers(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-@0@{victim}.{mac}"))]);
+    assert_eq!(
+        subprocess_origin(&forged),
+        SubprocessOrigin::NotSubprocess,
+        "a spliced trigger claim must not authenticate"
     );
 }

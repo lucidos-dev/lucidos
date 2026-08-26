@@ -17,9 +17,9 @@ describe('parseBindValue', () => {
   });
 
   it('maps an IP literal to address mode, preserving the original text', () => {
-    expect(parseBindValue('100.101.71.58')).toEqual({
+    expect(parseBindValue('100.64.0.1')).toEqual({
       mode: 'address',
-      address: '100.101.71.58',
+      address: '100.64.0.1',
     });
   });
 });
@@ -28,13 +28,13 @@ describe('toBindValue', () => {
   it('round-trips with parseBindValue', () => {
     expect(toBindValue('loopback', '')).toBe('loopback');
     expect(toBindValue('all', '')).toBe('all');
-    expect(toBindValue('address', ' 100.101.71.58 ')).toBe('100.101.71.58');
+    expect(toBindValue('address', ' 100.64.0.1 ')).toBe('100.64.0.1');
   });
 });
 
 describe('isValidIp', () => {
   it('accepts valid IPv4', () => {
-    expect(isValidIp('100.101.71.58')).toBe(true);
+    expect(isValidIp('100.64.0.1')).toBe(true);
     expect(isValidIp('127.0.0.1')).toBe(true);
     expect(isValidIp('0.0.0.0')).toBe(true);
   });
@@ -64,15 +64,15 @@ describe('draftFromBind', () => {
       address: '',
       inherit: false,
     });
-    expect(draftFromBind('100.101.71.58', true)).toEqual({
+    expect(draftFromBind('100.64.0.1', true)).toEqual({
       mode: 'address',
-      address: '100.101.71.58',
+      address: '100.64.0.1',
       inherit: true,
     });
   });
 
   it('round-trips through toBindValue, so an untouched draft saves what it loaded', () => {
-    for (const bind of ['loopback', 'all', '100.101.71.58']) {
+    for (const bind of ['loopback', 'all', '100.64.0.1']) {
       const d = draftFromBind(bind, true);
       expect(toBindValue(d.mode, d.address)).toBe(bind);
     }
@@ -81,14 +81,14 @@ describe('draftFromBind', () => {
 
 describe('bindDraftMatchesSaved', () => {
   it('a freshly seeded draft matches, so Save has nothing to offer on open', () => {
-    for (const bind of ['loopback', 'all', '100.101.71.58']) {
+    for (const bind of ['loopback', 'all', '100.64.0.1']) {
       expect(bindDraftMatchesSaved(draftFromBind(bind, true), bind, true)).toBe(true);
     }
   });
 
   it('detects a changed mode, address, or inherit flag', () => {
     expect(bindDraftMatchesSaved(draftFromBind('loopback', true), 'all', true)).toBe(false);
-    expect(bindDraftMatchesSaved(draftFromBind('100.64.0.1', true), '100.101.71.58', true)).toBe(
+    expect(bindDraftMatchesSaved(draftFromBind('100.64.0.2', true), '100.64.0.1', true)).toBe(
       false,
     );
     expect(bindDraftMatchesSaved(draftFromBind('all', false), 'all', true)).toBe(false);
@@ -100,8 +100,8 @@ describe('bindDraftMatchesSaved', () => {
     );
     expect(
       bindDraftMatchesSaved(
-        { mode: 'address', address: ' 100.101.71.58 ', inherit: true },
-        '100.101.71.58',
+        { mode: 'address', address: ' 100.64.0.1 ', inherit: true },
+        '100.64.0.1',
         true,
       ),
     ).toBe(true);
@@ -120,7 +120,7 @@ describe('isValidBindSelection', () => {
   it('keyword modes are always valid; address mode needs a valid IP', () => {
     expect(isValidBindSelection('loopback', '')).toBe(true);
     expect(isValidBindSelection('all', '')).toBe(true);
-    expect(isValidBindSelection('address', '100.101.71.58')).toBe(true);
+    expect(isValidBindSelection('address', '100.64.0.1')).toBe(true);
     expect(isValidBindSelection('address', 'garbage')).toBe(false);
     expect(isValidBindSelection('address', '')).toBe(false);
   });

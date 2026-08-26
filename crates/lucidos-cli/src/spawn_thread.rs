@@ -241,20 +241,49 @@ fn link_label(title: Option<&str>, message: &str) -> String {
         .collect()
 }
 
+/// The directory a bare `--to <name>` is resolved against, in priority order:
+/// an explicit `LUCIDOS_WORKSPACES_ROOT`, then the directory holding
+/// `LUCIDOS_WORKSPACE`, then `~/workspaces`.
+///
+/// Mirrors `workspaces_root_from_env` in the engine's
+/// `engine::http::workspace_resolver`, which owns the full reasoning. Both
+/// must agree, or `--to <ws>` and `run_coding_agent(workspace=<ws>)` resolve to
+/// different places. The short version: a packaged install keeps its
+/// workspaces under `<app-data>/workspaces`, and the middle step is what finds
+/// a sibling there without a new env var (ADR 0136).
+fn workspaces_root(
+    explicit: Option<std::ffi::OsString>,
+    workspace: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = explicit {
+        return Some(PathBuf::from(root));
+    }
+    if let Some(parent) = workspace
+        .map(PathBuf::from)
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        return Some(parent.to_path_buf());
+    }
+    home.map(|h| h.join("workspaces"))
+}
+
 fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
     let p = PathBuf::from(name_or_path);
     if p.is_absolute() {
         return Ok(p);
     }
-    let root = match std::env::var("LUCIDOS_WORKSPACES_ROOT") {
-        Ok(v) => PathBuf::from(v),
-        Err(_) => dirs::home_dir()
-            .ok_or_else(|| -> BoxError {
-                "Cannot resolve target workspace: no $LUCIDOS_WORKSPACES_ROOT and no home directory. \
-                 Pass an absolute path to --to or set $LUCIDOS_WORKSPACES_ROOT.".into()
-            })?
-            .join("workspaces"),
-    };
+    let root = workspaces_root(
+        std::env::var_os("LUCIDOS_WORKSPACES_ROOT"),
+        std::env::var_os("LUCIDOS_WORKSPACE"),
+        dirs::home_dir(),
+    )
+    .ok_or_else(|| -> BoxError {
+        "Cannot resolve target workspace: no $LUCIDOS_WORKSPACES_ROOT, no $LUCIDOS_WORKSPACE \
+         and no home directory. Pass an absolute path to --to."
+            .into()
+    })?;
     let candidate = root.join(name_or_path);
     if !candidate.join(".lucidos/ports").is_file() {
         return Err(format!(
@@ -269,7 +298,58 @@ fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::link_label;
+    use super::{link_label, workspaces_root};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn os(s: &str) -> OsString {
+        OsString::from(s)
+    }
+
+    /// A packaged workspace sits under app-support, so resolving beside the
+    /// caller's own workspace is what finds a sibling by bare name. Must match
+    /// the engine's `workspaces_root_from_env`, or the CLI and the
+    /// `run_coding_agent(workspace=…)` tool disagree about where `<name>` is.
+    #[test]
+    fn a_bare_name_resolves_beside_the_callers_own_workspace() {
+        assert_eq!(
+            workspaces_root(
+                None,
+                Some(os("/app-data/workspaces/other")),
+                Some(PathBuf::from("/h"))
+            ),
+            Some(PathBuf::from("/app-data/workspaces"))
+        );
+    }
+
+    /// An operator who set the root explicitly means it.
+    #[test]
+    fn an_explicit_root_beats_the_callers_workspace() {
+        assert_eq!(
+            workspaces_root(
+                Some(os("/elsewhere")),
+                Some(os("/app-data/workspaces/other")),
+                Some(PathBuf::from("/h"))
+            ),
+            Some(PathBuf::from("/elsewhere"))
+        );
+    }
+
+    /// A dev checkout that sets neither variable keeps the legacy default.
+    #[test]
+    fn home_workspaces_is_still_the_last_resort() {
+        assert_eq!(
+            workspaces_root(None, None, Some(PathBuf::from("/h"))),
+            Some(PathBuf::from("/h/workspaces"))
+        );
+    }
+
+    /// Nothing to resolve against is an error the caller reports, not a bare
+    /// relative path joined onto nothing.
+    #[test]
+    fn no_source_at_all_yields_no_root() {
+        assert_eq!(workspaces_root(None, None, None), None);
+    }
 
     #[test]
     fn label_uses_title_when_given() {

@@ -21,14 +21,13 @@ const mocks = vi.hoisted(() => ({
 }));
 
 /** What the gateway's `release_check` object looks like. Defaults describe an
- *  installed deployment with the notice acknowledged and nothing published. */
+ *  installed deployment with the check on and nothing published. */
 function releaseCheckOf(
   latest: Partial<ReleaseOffer> | null = null,
   over: Partial<ReleaseCheck> = {},
 ): ReleaseCheck {
   return {
     enabled: true,
-    notice_acknowledged: true,
     supported: true,
     current_version: '1.2.3',
     checked_at: '2026-08-23T10:00:00Z',

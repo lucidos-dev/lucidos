@@ -595,10 +595,6 @@ async fn register_and_track(
     );
 }
 
-/// Maximum depth for event-triggered chains (A→B→A…). Beyond this, events
-/// are still stored but won't fire additional triggers.
-const MAX_EVENT_TRIGGER_DEPTH: u32 = 3;
-
 /// Why an incoming event must not fan out to event-triggers. Returned by
 /// [`event_trigger_skip_reason`] so the decision is unit-testable without a
 /// full engine.
@@ -618,13 +614,118 @@ enum EventTriggerSkip {
 /// Decide whether an event at `depth` should skip event-trigger dispatch.
 /// Shutdown takes precedence over the depth cap so the log reflects the real
 /// reason during a restart.
-fn event_trigger_skip_reason(is_shutting_down: bool, depth: u32) -> Option<EventTriggerSkip> {
+///
+/// `ceiling` is `CapacityPolicy::max_event_trigger_depth`, passed in rather
+/// than read here so this stays a pure function over the decision's inputs.
+fn event_trigger_skip_reason(
+    is_shutting_down: bool,
+    depth: u32,
+    ceiling: u32,
+) -> Option<EventTriggerSkip> {
     if is_shutting_down {
         Some(EventTriggerSkip::ShuttingDown)
-    } else if depth >= MAX_EVENT_TRIGGER_DEPTH {
+    } else if depth >= ceiling {
         Some(EventTriggerSkip::MaxDepth)
     } else {
         None
+    }
+}
+
+/// The event type the cap report itself is carried on.
+///
+/// A persisted frame is subscribable (ADR 0113), so the report is a triggerable
+/// event like any other. Reporting a suppression of THIS type would then
+/// produce another report, without end. Naming the carrier is what closes that.
+const CAP_REPORT_EVENT_TYPE: &str = "NotificationCreated";
+
+/// Minimum spacing between cap notifications for one trigger, matching the
+/// Thread Queue's backlog cooldown. A chain that re-enters every few seconds
+/// should tell the user once, not once per lap.
+const CAP_NOTIFY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Last cap notification per trigger. Allowed-ephemeral: a restart resetting a
+/// cooldown at worst re-notifies once.
+static CAP_NOTIFIED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether this trigger's cap notification is due, recording the send when it
+/// is. Separate from the send so the decision is testable without an engine.
+fn cap_notification_due(trigger_id: &str) -> bool {
+    let Ok(mut seen) = CAP_NOTIFIED.lock() else {
+        // A poisoned cooldown map must not swallow the report: the user losing
+        // a notification is the failure this whole surface exists to prevent.
+        return true;
+    };
+    let due = seen
+        .get(trigger_id)
+        .is_none_or(|t| t.elapsed() >= CAP_NOTIFY_COOLDOWN);
+    if due {
+        seen.insert(trigger_id.to_string(), std::time::Instant::now());
+    }
+    due
+}
+
+/// Tell the user which triggers the depth cap just stopped, and why.
+///
+/// **A log line is not enough.** While the depth stopped at the first
+/// `tokio::spawn`, a chain routed through one was uncounted and ran forever.
+/// Counting it means a legitimate long chain can now hit the ceiling. A
+/// verification step that silently stops running is worse than one that runs
+/// too often, so the cap announces itself and names the knob.
+///
+/// Two things keep the report from feeding itself. It is only sent when a
+/// trigger really would have fired, so a deep event nobody subscribes to stays
+/// silent. And it is emitted at the capped depth, so the notification is itself
+/// at or past the ceiling: a trigger subscribed to it is skipped, and that skip
+/// is not reported (see [`CAP_REPORT_EVENT_TYPE`]).
+async fn report_depth_cap(
+    engine: &SharedEngine,
+    event_type: &str,
+    depth: u32,
+    ceiling: u32,
+    stopped: &[TriggerConfig],
+) {
+    if event_type == CAP_REPORT_EVENT_TYPE {
+        return;
+    }
+    for config in stopped {
+        if !cap_notification_due(&config.id) {
+            continue;
+        }
+        let title = format!("{} did not fire", config.name);
+        let message = format!(
+            "The event chain reached its limit of {ceiling} trigger fires, so \
+             \"{}\" was not fired by {event_type} (chain depth {depth}). Raise \
+             max_event_trigger_depth in the capacity policy if this chain is \
+             meant to be longer.",
+            config.name
+        );
+        let notification_id = uuid::Uuid::new_v4();
+        if let Err(e) = engine
+            .event_bus
+            .emit(crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::NotificationCreated {
+                    id: notification_id.to_string(),
+                    title: title.clone(),
+                    message: message.clone(),
+                    task_id: Some(config.id.clone()),
+                    app_id: None,
+                    thread_id: None,
+                    event_id: None,
+                    tap: crate::scheduler::notifications::Tap::Modal,
+                    actor: None,
+                },
+            ))
+            .await
+        {
+            crate::log!(
+                "[Scheduler] Failed to emit depth-cap notification for '{}': {}",
+                config.name,
+                e
+            );
+        }
+        crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id))
+            .await;
     }
 }
 
@@ -637,40 +738,70 @@ fn event_trigger_skip_reason(is_shutting_down: bool, depth: u32) -> Option<Event
 ///
 /// `source_event_id` is the UUID of the event row that fired the trigger
 /// (used by the popover panel to deep-link to the event).
+///
+/// `emitting_trigger_id` is the trigger whose fire emitted this event, if any.
+/// The matcher drops it, so a trigger is never woken by its own fire.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_domain_event(
     event_type: &str,
     payload: &serde_json::Value,
     depth: u32,
+    emitting_trigger_id: Option<&str>,
     origin_thread_id: Option<uuid::Uuid>,
     source_event_id: Option<uuid::Uuid>,
     trigger_configs: &Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
     engine: &SharedEngine,
 ) {
-    match event_trigger_skip_reason(engine.is_shutting_down(), depth) {
+    // Evaluated per branch rather than once up front: the shutdown arm must not
+    // scan at all, and the cap arm needs the matches only to decide whether the
+    // suppression is worth reporting. An in-memory scan of the config map.
+    let matching = || {
+        let configs = trigger_configs.read().unwrap();
+        crate::triggers::find_matching_event_triggers(
+            &configs,
+            event_type,
+            payload,
+            emitting_trigger_id,
+        )
+    };
+
+    let ceiling = engine.thread_queue.policy().await.max_event_trigger_depth;
+    match event_trigger_skip_reason(engine.is_shutting_down(), depth, ceiling) {
         Some(EventTriggerSkip::ShuttingDown) => {
             crate::log!(
-                "[Scheduler] Engine shutting down — not firing triggers for event '{}'",
+                "[Scheduler] Engine shutting down, not firing triggers for event '{}'",
                 event_type
             );
             return;
         }
         Some(EventTriggerSkip::MaxDepth) => {
+            // Report only what a person could act on. An event at the ceiling
+            // that no trigger subscribes to suppressed nothing, so it stays
+            // silent rather than becoming noise about nothing.
+            let stopped = matching();
+            if stopped.is_empty() {
+                return;
+            }
             crate::log!(
-                "[Scheduler] Event '{}' at depth {} — skipping triggers to prevent recursion",
+                "[Scheduler] Event '{}' at depth {}: skipping {} trigger(s) to prevent recursion",
                 event_type,
-                depth
+                depth,
+                stopped.len()
             );
+            // At the capped depth, so the notification is itself past the
+            // ceiling and cannot start a new chain. See `report_depth_cap`.
+            crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+                .scope(
+                    depth,
+                    report_depth_cap(engine, event_type, depth, ceiling, &stopped),
+                )
+                .await;
             return;
         }
         None => {}
     }
 
-    let matching = {
-        let configs = trigger_configs.read().unwrap();
-        crate::triggers::find_matching_event_triggers(&configs, event_type, payload)
-    };
-
+    let matching = matching();
     if matching.is_empty() {
         return;
     }
@@ -1066,6 +1197,9 @@ mod tests {
         );
     }
 
+    /// The ceiling every walk below runs against, and the shipped default.
+    const CEILING: u32 = crate::engine::thread_queue::DEFAULT_MAX_EVENT_TRIGGER_DEPTH;
+
     #[test]
     fn skip_reason_shutting_down_takes_precedence() {
         // Regression: during graceful shutdown / restart the engine emits
@@ -1075,41 +1209,40 @@ mod tests {
         // hits the API mid-restart and dies with a "<trigger> failed" push.
         // Shutdown must short-circuit dispatch regardless of depth.
         assert_eq!(
-            event_trigger_skip_reason(true, 0),
+            event_trigger_skip_reason(true, 0, CEILING),
             Some(EventTriggerSkip::ShuttingDown)
         );
         assert_eq!(
-            event_trigger_skip_reason(true, MAX_EVENT_TRIGGER_DEPTH + 5),
+            event_trigger_skip_reason(true, CEILING + 5, CEILING),
             Some(EventTriggerSkip::ShuttingDown),
             "shutdown wins over the depth cap so the log names the real reason"
         );
     }
 
-    /// The whole point of Bug 2's fix, walked end to end with the real pieces.
+    /// The depth cap, walked end to end with the real pieces.
     ///
-    /// A trigger subscribed to an event its own run emits is a feedback loop.
-    /// `system-knowhow/triggers.md` states it as an authoring rule, and this is
-    /// the engine backstop under it. Three parts have to agree: the fire runs
-    /// inside `EVENT_TRIGGER_DEPTH.scope(next_depth)`, the events it emits read
-    /// that scope, and the dispatcher decides on what they read.
+    /// What the cap still ends is a chain across triggers: A's fire wakes B,
+    /// and B's fire wakes A. Three parts have to agree. The fire runs inside
+    /// `EVENT_TRIGGER_DEPTH.scope(next_depth)`, the events it emits read that
+    /// scope, and the dispatcher decides on what they read.
     ///
-    /// The loop below drives all three. It used to run forever, because the
-    /// thread-event dispatch hardcoded zero and the scope was never read.
+    /// A trigger's own fire never reaches it at all, since the matcher drops
+    /// that trigger (`docs/adr/0137-a-trigger-never-wakes-itself.md`).
     #[tokio::test]
-    async fn a_self_subscribed_trigger_stops_at_the_depth_cap() {
+    async fn a_chain_across_triggers_stops_at_the_depth_cap() {
         use crate::scheduler::user_tasks::{current_event_trigger_depth, EVENT_TRIGGER_DEPTH};
 
         // The first event is emitted by an ordinary turn, outside any fire.
         let mut observed_depth = current_event_trigger_depth();
         let mut fires = 0u32;
 
-        while event_trigger_skip_reason(false, observed_depth).is_none() {
+        while event_trigger_skip_reason(false, observed_depth, CEILING).is_none() {
             fires += 1;
             assert!(
-                fires <= MAX_EVENT_TRIGGER_DEPTH + 1,
+                fires <= CEILING + 1,
                 "the chain must terminate, not run away"
             );
-            // `handle_domain_event`'s `next_depth`, then the executor's scope.
+            // `handle_domain_event`'s `next_depth`, then the queue's scope.
             let next_depth = observed_depth + 1;
             observed_depth = EVENT_TRIGGER_DEPTH
                 .scope(next_depth, async { current_event_trigger_depth() })
@@ -1117,27 +1250,159 @@ mod tests {
         }
 
         assert_eq!(
-            fires, MAX_EVENT_TRIGGER_DEPTH,
-            "a self-subscribed trigger gets {} fires and then stops",
-            MAX_EVENT_TRIGGER_DEPTH
+            fires, CEILING,
+            "a chain across triggers gets {CEILING} fires and then stops"
         );
     }
 
     #[test]
     fn skip_reason_depth_cap_when_not_shutting_down() {
         assert_eq!(
-            event_trigger_skip_reason(false, MAX_EVENT_TRIGGER_DEPTH),
+            event_trigger_skip_reason(false, CEILING, CEILING),
             Some(EventTriggerSkip::MaxDepth)
         );
         assert_eq!(
-            event_trigger_skip_reason(false, MAX_EVENT_TRIGGER_DEPTH - 1),
+            event_trigger_skip_reason(false, CEILING - 1, CEILING),
             None,
             "below the cap and not shutting down → dispatch proceeds"
         );
         assert_eq!(
-            event_trigger_skip_reason(false, 0),
+            event_trigger_skip_reason(false, 0, CEILING),
             None,
             "normal operation → dispatch proceeds"
+        );
+    }
+
+    /// The ceiling is the policy's, so a workspace with a longer legitimate
+    /// pipeline can raise it. A hardcoded constant here is what forced the
+    /// choice between capping a real chain and capping nothing.
+    #[test]
+    fn a_raised_ceiling_admits_a_fire_the_default_would_cap() {
+        assert_eq!(
+            event_trigger_skip_reason(false, CEILING, CEILING),
+            Some(EventTriggerSkip::MaxDepth)
+        );
+        assert_eq!(
+            event_trigger_skip_reason(false, CEILING, CEILING + 2),
+            None,
+            "the same event, under a policy that allows a longer chain"
+        );
+    }
+
+    /// The bug this change exists for, walked with the hop that broke it.
+    ///
+    /// The sibling walk above stays on one await chain, which is why it always
+    /// terminated. Real work does not: the Thread Queue hands execution to
+    /// `tokio::spawn`, and a task-local does not cross that. Measured against
+    /// the old code, the fire read depth 0 and this loop never advanced.
+    ///
+    /// What makes it terminate is the depth travelling ON the request and the
+    /// scope being re-established inside the spawn, which is what
+    /// `ThreadQueue::spawn_execution` now does.
+    #[tokio::test]
+    async fn a_chain_through_a_spawn_stops_at_the_depth_cap() {
+        use crate::scheduler::user_tasks::{current_event_trigger_depth, EVENT_TRIGGER_DEPTH};
+
+        let mut observed_depth = current_event_trigger_depth();
+        let mut fires = 0u32;
+
+        while event_trigger_skip_reason(false, observed_depth, CEILING).is_none() {
+            fires += 1;
+            assert!(
+                fires <= CEILING + 1,
+                "the chain must terminate even when every hop crosses a spawn"
+            );
+            // `handle_domain_event`'s `next_depth`, carried on the request...
+            let carried = observed_depth + 1;
+            // ...and re-established inside the queue's spawn.
+            observed_depth = tokio::spawn(
+                EVENT_TRIGGER_DEPTH.scope(carried, async { current_event_trigger_depth() }),
+            )
+            .await
+            .expect("the probe task runs");
+        }
+
+        assert_eq!(
+            fires, CEILING,
+            "a loop through spawned work gets {CEILING} fires and then stops"
+        );
+    }
+
+    /// The counter must not be mistaken for a suppressor.
+    ///
+    /// A sibling change deliberately kept its self-wake marker out of spawned
+    /// work, because a suppressor reaching hop 1 kills a wake the user wanted.
+    /// Depth is different: it suppresses nothing until the ceiling. A trigger
+    /// that starts a coding agent and fires on its completion is the case that
+    /// has to keep working.
+    #[tokio::test]
+    async fn a_trigger_waiting_on_the_coding_agent_it_started_still_fires() {
+        use crate::scheduler::user_tasks::{current_event_trigger_depth, EVENT_TRIGGER_DEPTH};
+
+        // Hop 1: an ordinary event at depth 0 fires the trigger, which runs at
+        // depth 1 and spawns a coding agent through the queue.
+        let session_depth =
+            tokio::spawn(EVENT_TRIGGER_DEPTH.scope(1, async { current_event_trigger_depth() }))
+                .await
+                .expect("the session task runs");
+        assert_eq!(session_depth, 1, "the session inherits the fire's depth");
+
+        // The session's CodingAgentIdled therefore dispatches at depth 1.
+        assert_eq!(
+            event_trigger_skip_reason(false, session_depth, CEILING),
+            None,
+            "the trigger waiting on its own coding agent must still fire"
+        );
+
+        // Hop 2, its follow-on fire, is still well inside the ceiling.
+        assert_eq!(
+            event_trigger_skip_reason(false, session_depth + 1, CEILING),
+            None
+        );
+    }
+
+    /// The measured release chain: three hops, each script emitting over HTTP
+    /// at its fire's depth. Every one of them has to fire under the default.
+    ///
+    /// This is the pipeline that decided the ceiling. Closing the script emit
+    /// path is what makes it counted at all. A default that capped it would
+    /// silently stop a verification step running several times a day.
+    #[test]
+    fn a_three_hop_release_chain_fires_every_link_under_the_default() {
+        // LucidosReleased(0) → bump(1) → SitePublishRequested(1) →
+        // publish-site(2) → SitePublished(2) → verify-front-door(3).
+        for emitting_depth in 0..3 {
+            assert_eq!(
+                event_trigger_skip_reason(false, emitting_depth, CEILING),
+                None,
+                "hop {} of the release chain must fire",
+                emitting_depth + 1
+            );
+        }
+    }
+
+    /// The report is carried on a persisted, and therefore subscribable, event.
+    /// Reporting a suppression of its own carrier would produce another report,
+    /// without end.
+    #[test]
+    fn the_cap_report_is_never_reported_for_its_own_carrier() {
+        assert_eq!(
+            CAP_REPORT_EVENT_TYPE, "NotificationCreated",
+            "the guard has to name the event `report_depth_cap` actually emits"
+        );
+    }
+
+    /// A hot chain tells the user once, not once per lap.
+    #[test]
+    fn the_cap_notification_cooldown_suppresses_a_repeat() {
+        let trigger = format!("cooldown-probe-{}", uuid::Uuid::new_v4());
+        assert!(
+            cap_notification_due(&trigger),
+            "the first suppression for a trigger is always reported"
+        );
+        assert!(
+            !cap_notification_due(&trigger),
+            "an immediate repeat is inside the cooldown"
         );
     }
 }

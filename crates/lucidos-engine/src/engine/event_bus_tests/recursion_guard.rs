@@ -38,13 +38,13 @@ async fn next_system_frame(
     }
 }
 
-/// The plumbing Bug 2 was missing. `MAX_EVENT_TRIGGER_DEPTH` can only reach a
-/// thread event if the emitting run's chain depth does, and the bus is where
-/// that depth is read.
+/// The plumbing Bug 2 was missing. The depth cap can only reach a thread event
+/// if the emitting run's chain depth does, and the bus is where that depth is
+/// read.
 ///
-/// The scope here is the one `thread_queue::executor` puts around a fire, and
-/// the read is the one `EventBus::emit` does. A user's own turn is outside any
-/// scope and must stay at zero, or the cap would start refusing ordinary work.
+/// The scope here is the one the Thread Queue puts around a fire, and the read
+/// is the one `EventBus::emit` does. A user's own turn is outside any scope and
+/// must stay at zero, or the cap would start refusing ordinary work.
 #[tokio::test]
 async fn a_thread_event_carries_the_emitting_runs_trigger_depth() {
     use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;

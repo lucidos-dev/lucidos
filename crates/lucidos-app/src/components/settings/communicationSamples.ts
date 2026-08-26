@@ -158,15 +158,17 @@ export function sampleConsentPrompt(): void {
 
 /** Frames the packaged install really emits, in order. Real frames rather than
  *  invented copy: the dialog is then built by the shipped `appUpdateDialogState`,
- *  so the preview cannot drift from the run it depicts. */
+ *  so the preview cannot drift from the run it depicts. The version is a fixed
+ *  synthetic value, deliberately not the real release, so it can never collide
+ *  with the `RELEASE` file being shipped. */
 const INSTALL_FRAMES: AppUpdateRunning[] = [
-  { version: '0.31.0', phase: 'checking' },
-  { version: '0.31.0', phase: 'downloading', downloaded: 12_582_912, total: 68_157_440 },
-  { version: '0.31.0', phase: 'downloading', downloaded: 43_646_976, total: 68_157_440 },
-  { version: '0.31.0', phase: 'verifying' },
-  { version: '0.31.0', phase: 'installing' },
-  { version: '0.31.0', phase: 'restarting-services' },
-  { version: '0.31.0', phase: 'relaunching' },
+  { version: '9.9.9', phase: 'checking' },
+  { version: '9.9.9', phase: 'downloading', downloaded: 12_582_912, total: 68_157_440 },
+  { version: '9.9.9', phase: 'downloading', downloaded: 43_646_976, total: 68_157_440 },
+  { version: '9.9.9', phase: 'verifying' },
+  { version: '9.9.9', phase: 'installing' },
+  { version: '9.9.9', phase: 'restarting-services' },
+  { version: '9.9.9', phase: 'relaunching' },
 ];
 
 /** One install frame as the gallery shows it: the real dialog, with its Cancel

@@ -759,6 +759,7 @@ fn thread_queue_policy_patch_merges_with_current_policy() {
         max_queued_per_trigger: 25,
         reserved_background: 4,
         overflow: OverflowPolicy::DropOldest,
+        max_event_trigger_depth: 5,
     };
 
     let out = merge_thread_queue_policy_patch(

@@ -14,9 +14,10 @@
  *
  * What it does NOT do is manage workspaces. Create, rename, delete, restore,
  * start, stop, auto-start and Network access all stay on the picker, which is
- * the always-reachable recovery surface; **Manage workspaces** is the list's
- * last row and the way to them. So the two surfaces divide cleanly: the menu
- * switches, the picker manages.
+ * the always-reachable recovery surface. **Manage workspaces** is the way to
+ * them. It sits under the list rather than inside its scroller, so a long list
+ * cannot hide it. The two surfaces divide cleanly: the menu switches, the
+ * picker manages.
  *
  * WHERE a row opens is not decided here. `utils/workspaceWindow.ts` owns that,
  * so the picker cannot disagree: a plain activation takes this client's default
@@ -45,7 +46,7 @@ import { toFailed } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { CheckIcon, ChevronDownIcon, PopInIcon, PopOutIcon } from '../shared/icons';
+import { CheckIcon, ChevronDownIcon } from '../shared/icons';
 import { listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
 import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { showToast, visibleWorkspaceName } from '../../store/store';
@@ -54,10 +55,10 @@ import {
   middleClickActivates,
   middleClickHandler,
   openModeForClick,
-  openModeLabel,
   openWorkspaceIn,
   type WorkspaceOpenMode,
 } from '../../utils/workspaceWindow';
+import { workspaceActionRow } from './WorkspaceActionRow';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import { replaceOnPlainClick } from '../../utils/documentNavigation';
 import { rememberLastWorkspaceCount, recallLastWorkspaceCount } from '../../utils/lastWorkspace';
@@ -67,6 +68,10 @@ import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState'
  *  not the picker's three: an unfolded list pushes the rows below it down, so
  *  the cheaper guess is the one that moves less when it is wrong. */
 const DEFAULT_SKELETON_ROWS = 2;
+
+/** The indent an unfolded action takes under a row of THIS list, whose rows
+ *  lead with a status dot. The notifications group passes its own. */
+const SWITCHER_ACTION_INDENT = 'brand-menu-ws-action-under-dot';
 
 /** What the placeholder has to draw to stand exactly as tall as the list it
  *  replaces: one row per workspace the last listing saw, PLUS the footer.
@@ -250,7 +255,7 @@ export interface SwitcherListProps {
  *    row in the picker does.
  *
  *  A RIGHT-CLICK is a fourth thing, and it crosses all three: it unfolds the
- *  action row below (see {@link switcherActionRow}) instead of raising the
+ *  action row below (see `WorkspaceActionRow.tsx`) instead of raising the
  *  browser's own menu. Which rows carry it is `alternateOpenMode`'s decision,
  *  so the picker cannot quietly disagree. */
 function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
@@ -363,45 +368,6 @@ function switcherRow(w: WorkspaceStatus, props: SwitcherListProps) {
   );
 }
 
-/** The action a right-click unfolds, as a row of the menu rather than as a
- *  popover over it.
- *
- *  Two independent reasons it is not a nested `<Overlay>`. The panel is
- *  `transform`ed and `overflow: hidden auto`, so a `position: fixed` child
- *  resolves against it and is clipped by it. A portaled panel is also OUTSIDE
- *  this menu for the dismiss contract. The first pointerdown on it would
- *  therefore shut the menu and unmount the action with it.
- *
- *  `WorkspaceRestartRow` renders its confirm inline for the second reason. The
- *  panel's own list already unfolds this way too, so this is the shape the
- *  surface has rather than a workaround. */
-function switcherActionRow(
-  w: WorkspaceStatus,
-  mode: WorkspaceOpenMode,
-  onAlternate: (w: WorkspaceStatus, mode: WorkspaceOpenMode) => void,
-) {
-  const label = openModeLabel(mode);
-  return (
-    <button
-      type="button"
-      class="brand-menu-ws-row brand-menu-ws-action"
-      role="menuitem"
-      // Names the workspace, which the visible label cannot: the row sits under
-      // it, and an `aria-label` replaces the content a screen reader would read.
-      aria-label={`${label}: ${w.name}`}
-      onClick={() => onAlternate(w, mode)}
-      // A colon, because a slug cannot contain one and a workspace row's key is
-      // a bare slug. `${w.id}-window` could not promise that: it collides with
-      // the row of a workspace actually named `<id>-window`, and two siblings
-      // sharing a key is how keyed diffing reuses the wrong node.
-      key={`window:${w.id}`}
-    >
-      {mode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
-      <span class="brand-menu-ws-name">{label}</span>
-    </button>
-  );
-}
-
 /** The unfolded list. Pure, so all four `Loadable` states are unit-testable.
  *
  *  `not-loaded` / `loading` render nothing at all: the skeleton the caller
@@ -414,29 +380,42 @@ export function workspaceSwitcherList(props: SwitcherListProps) {
   if (state.status === 'not-loaded' || state.status === 'loading') return null;
   return (
     <div class="brand-menu-ws-list" role="group" aria-label="Switch workspace">
-      {state.status === 'failed' && (
-        <p class="brand-menu-ws-note brand-menu-ws-error">
-          Could not list workspaces: {state.error}
-        </p>
-      )}
-      {/* The action row is emitted right under the workspace it belongs to,
-          rather than at the end of the list, so it cannot be read as belonging
-          to whichever row it happened to land beside.
+      {/* Only the workspaces scroll. Manage workspaces is a SIBLING of this box
+          below, never its last child: it is the way out of a list too long to
+          read, so putting it at the bottom of that list is where it is least
+          reachable. Leading the list instead would push every workspace down a
+          row to fix a problem only long lists have. */}
+      <div class="brand-menu-ws-scroll">
+        {state.status === 'failed' && (
+          <p class="brand-menu-ws-note brand-menu-ws-error">
+            Could not list workspaces: {state.error}
+          </p>
+        )}
+        {/* The action row is emitted right under the workspace it belongs to,
+            rather than at the end of the list, so it cannot be read as belonging
+            to whichever row it happened to land beside.
 
-          `alternateOpenMode` is asked again here, and not only where the
-          right-click is claimed. `contextId` and `state` arrive as independent
-          props, so this function cannot assume its caller paired them: a row
-          may only carry the action while its own state still justifies one. */}
-      {state.status === 'loaded' &&
-        state.data.flatMap((w) => {
-          const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
-          return [
-            switcherRow(w, props),
-            w.id === contextId && mode !== null
-              ? switcherActionRow(w, mode, onAlternate)
-              : null,
-          ];
-        })}
+            `alternateOpenMode` is asked again here, and not only where the
+            right-click is claimed. `contextId` and `state` arrive as independent
+            props, so this function cannot assume its caller paired them: a row
+            may only carry the action while its own state still justifies one. */}
+        {state.status === 'loaded' &&
+          state.data.flatMap((w) => {
+            const mode = alternateOpenMode(workspaceState(w), currentId, w.id);
+            return [
+              switcherRow(w, props),
+              w.id === contextId && mode !== null
+                ? workspaceActionRow({
+                    id: w.id,
+                    name: w.name,
+                    mode,
+                    indentClass: SWITCHER_ACTION_INDENT,
+                    onActivate: (m) => onAlternate(w, m),
+                  })
+                : null,
+            ];
+          })}
+      </div>
       {manageHref !== null && (
         <a
           class="brand-menu-ws-row brand-menu-ws-manage"
@@ -460,17 +439,19 @@ function WorkspaceSwitcherSkeleton({ rows, manage }: { rows: number; manage: boo
   return (
     <SkeletonProvider>
       <div class="brand-menu-ws-list" aria-hidden="true">
-        {Array.from({ length: rows }, (_, i) => (
-          <div class="brand-menu-ws-row" key={i}>
-            {/* The `.ws-picker-dot` footprint, so a shimmer row is exactly as
-                tall and as indented as a loaded one. */}
-            <SkBlock w="0.625rem" h="0.625rem" circle />
-            <SkText class="brand-menu-ws-name" w="7rem" />
-          </div>
-        ))}
+        <div class="brand-menu-ws-scroll">
+          {Array.from({ length: rows }, (_, i) => (
+            <div class="brand-menu-ws-row" key={i}>
+              {/* The `.ws-picker-dot` footprint, so a shimmer row is exactly as
+                  tall and as indented as a loaded one. */}
+              <SkBlock w="0.625rem" h="0.625rem" circle />
+              <SkText class="brand-menu-ws-name" w="7rem" />
+            </div>
+          ))}
+        </div>
         {/* The Manage workspaces footer: both of its classes, so it takes the
             smaller type and carries no dot, exactly as the loaded list draws
-            it. */}
+            it. Outside the scroller, as the loaded list has it. */}
         {manage && (
           <div class="brand-menu-ws-row brand-menu-ws-manage">
             <SkText w="8rem" />

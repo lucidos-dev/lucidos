@@ -202,9 +202,18 @@ Two questions worth measuring before picking:
 
 One consideration that is not about cost: **a whole-window recompute is idempotent and self-healing.** Rerun it and nothing changes; miss a run and the next one repairs the gap. An incremental per-event append is neither: a rerun double-counts, and a missed fire is silent drift with nothing to detect it. That is a reason to lean toward recompute, or to pair an incremental path with a reconciling recompute underneath, rather than a reason to rule incremental out.
 
-**The one hard rule here, and the exception to the surrounding guidance: a trigger must not subscribe to an event class its own run emits.** That is a feedback loop, not a tradeoff. The concrete case is an *intent* trigger on any LLM-activity event: its own model call emits the event it subscribes to. Only the script flavour is even arguable on that class of event.
+**One thing you do not have to design around: a trigger is never woken by an event its own fire emitted.** Every event a fire emits carries the emitting trigger's id, and the matcher drops that trigger from the matches. Other subscribers still see the event, so nothing is hidden from anyone else.
 
-The engine backstops this rather than preventing it. An event a run emits dispatches one level deeper in the chain, and `MAX_EVENT_TRIGGER_DEPTH` (3) stops the chain there. So the loop ends after three fires instead of never. Three fires of an opus trigger is still a bill you did not mean to pay. That is why this is a rule, not a setting.
+So subscribing to an event class your own run emits needs no defensive narrowing. An *intent* trigger may subscribe to `ResponseGenerated`, whose own model call emits it. Broad-subscribe plus a cheap internal gate is a supported shape: an idle detector watching every terminator event, `TriggerCompleted` included. Write the subscription you actually mean.
+
+The suppression covers your fire, and stops where the fire hands work off: your script counts as the fire, so what it emits is marked too. That covers a bash or python tool, plus any emit through the `lucidos` CLI or from Python: both attach the fire's signed token for you. Bare `curl` does not attach it, so an emit posted that way wakes you like anyone else's. Use the CLI. A sub-thread the fire spawns, or a coding-agent session it starts, is a handoff. Those emit unmarked and still wake you, which is deliberate: a trigger waiting on a session it started must fire when that session reports back.
+
+An app emitting through the SDK is nobody's fire, so its events wake every subscriber.
+
+`max_event_trigger_depth` (a *capacity policy* field, default 5) still bounds a chain running ACROSS triggers, where A's fire wakes B and B's fire wakes A. Past the cap an event is still stored and still reaches SSE, it just fires no further triggers. Unlike the marker, the depth DOES follow the work a fire hands off, so a spawn buys no fresh chain. Two consequences worth knowing:
+
+- **A trigger waiting on a coding agent it started still fires.** Depth counts trigger fires, not tasks, so hop 1 is nowhere near the ceiling.
+- **A long legitimate chain can hit the ceiling.** If it does you get a notification naming the trigger that did not fire, so it never stops silently. Raise `max_event_trigger_depth` in the Thread Queue panel if the chain is meant to be that long.
 
 Shapes worth knowing, roughly in the order they tend to fit:
 

@@ -370,7 +370,10 @@ pub fn detect_tailscale_ipv4() -> Option<String> {
 mod tests {
     use super::*;
 
-    const TAILNET: &str = "100.101.71.58";
+    /// A synthetic address from the CGNAT range Tailscale hands out. Invented,
+    /// never captured: only "valid, and not loopback" is load-bearing here.
+    /// Same value as the engine's sibling test, so the two read alike.
+    const TAILNET: &str = "100.64.0.1";
 
     #[test]
     fn default_is_loopback() {

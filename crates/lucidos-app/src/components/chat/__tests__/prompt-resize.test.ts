@@ -31,9 +31,22 @@ function createMockTextarea(config: {
     get offsetHeight() { return renderedHeight(); },
     get clientHeight() { return renderedHeight(); },
     get scrollHeight() { return Math.max(config.contentHeight, renderedHeight()); },
+    // Every path reads the box's width before measuring, so a mock without one
+    // reads as a collapsed pane and stands down. Real width by default.
+    getBoundingClientRect: () => ({ width: 300 }),
   };
 
   return el as unknown as HTMLTextAreaElement;
+}
+
+/** Take the box's width away, as a collapsed pane does. */
+function collapseBox(el: HTMLTextAreaElement) {
+  Object.assign(el, { getBoundingClientRect: () => ({ width: 0 }) });
+}
+
+/** Give it back, as expanding the pane does. */
+function expandBox(el: HTMLTextAreaElement) {
+  Object.assign(el, { getBoundingClientRect: () => ({ width: 300 }) });
 }
 
 /** Give a mock textarea a placeholder that needs `needed` px to render whole.
@@ -51,7 +64,6 @@ function withPlaceholder(el: HTMLTextAreaElement, text: string, needed: () => nu
     placeholder: text,
     cloneNode: () => probe,
     parentElement: { appendChild() {} },
-    getBoundingClientRect: () => ({ width: 300 }),
   });
 }
 
@@ -246,6 +258,50 @@ describe('resizeTextarea', () => {
     const changed = resizeTextarea(el);
     expect(changed).toBe(true);
     expect(el.style.height).toBe('90px');
+  });
+});
+
+// The composer stays in layout at zero width while its pane is collapsed, and a
+// textarea wears the UA's `overflow-wrap: break-word`. A measurement taken there
+// puts every character on a line of its own. It lands far past the 40vh cap, and
+// the box reopens at the cap. Nothing may be measured without a width.
+describe('a box with no width is never measured', () => {
+  it('resizeTextarea leaves the height standing while the pane is collapsed', () => {
+    const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 56, value: 'two lines' });
+    resizeTextarea(el);
+    expect(el.style.height).toBe('56px');
+
+    collapseBox(el);
+    // What a zero-width box would report: one line per character.
+    Object.defineProperty(el, 'scrollHeight', { get: () => 900, configurable: true });
+    el.value = 'two lines and more';
+
+    expect(resizeTextarea(el)).toBe(false);
+    expect(el.style.height).toBe('56px');
+  });
+
+  it('remeasureTextarea stands down too, so a placeholder swap cannot poison it', () => {
+    const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 36, value: '' });
+    withPlaceholder(el, 'Post a follow up…', () => 36);
+    resizeTextarea(el);
+    expect(el.style.height).toBe('36px');
+
+    collapseBox(el);
+    Object.defineProperty(el, 'scrollHeight', { get: () => 900, configurable: true });
+
+    expect(remeasureTextarea(el)).toBe(false);
+    expect(el.style.height).toBe('36px');
+  });
+
+  it('measures again once the pane gives the width back', () => {
+    const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 36, value: '' });
+    withPlaceholder(el, 'Type custom answer here…', () => 56);
+    collapseBox(el);
+    expect(remeasureTextarea(el)).toBe(false);
+
+    expandBox(el);
+    expect(remeasureTextarea(el)).toBe(true);
+    expect(el.style.height).toBe('56px');
   });
 });
 

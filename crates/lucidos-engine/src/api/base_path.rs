@@ -100,12 +100,19 @@ pub fn gateway_port() -> Option<String> {
 /// reach it. Behind the gateway the relative route already works, so the page
 /// ignores this; it is harmless to stamp in both cases. `None` is a no-op (no
 /// gateway). Falls back to prepending when there is no `<head>`.
+///
+/// The value is HTML-escaped. It reaches us through an env var and lands in a
+/// double-quoted attribute, which is the reason `inject_workspace_id` escapes
+/// its own. A real port is digits, so the escape is an identity there.
 pub fn inject_gateway_port(html: &str, port: Option<&str>) -> String {
     match port {
         None => html.to_string(),
         Some(port) => insert_into_head(
             html,
-            &format!("<meta name=\"lucidos-gateway-port\" content=\"{port}\">"),
+            &format!(
+                "<meta name=\"lucidos-gateway-port\" content=\"{}\">",
+                escape_attr(port)
+            ),
         ),
     }
 }
@@ -286,6 +293,18 @@ mod tests {
             inject_gateway_port(html, Some("5252")),
             "<meta name=\"lucidos-gateway-port\" content=\"5252\"><p>x</p>"
         );
+    }
+
+    /// Same attribute, same env-var provenance, so the same escape as the
+    /// workspace-id and base-href stampers.
+    #[test]
+    fn inject_gateway_port_escapes_the_value() {
+        let out = inject_gateway_port(
+            "<html><head></head></html>",
+            Some("5251\"><script>alert(1)</script>"),
+        );
+        assert!(!out.contains("<script>"), "{out}");
+        assert!(out.contains("&quot;&gt;&lt;script&gt;"), "{out}");
     }
 
     #[test]

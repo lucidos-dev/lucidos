@@ -165,7 +165,7 @@ pub(crate) fn place(window: &tauri::Window) {
 pub(crate) fn place_all(app: &tauri::AppHandle) {
     let bar_height_px = current_bar_height();
     for (label, window) in tauri::Manager::windows(app) {
-        if crate::is_app_window(&label) {
+        if crate::app_window::is_app_window(&label) {
             place_at(&window, bar_height_px);
         }
     }
@@ -294,7 +294,7 @@ fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
     // called for. A `url-preview-*` panel webview is not one, and its
     // `ns_window()` is the APP window hosting it. Watching under its label
     // would register a second observer on a window that already has one.
-    if !crate::is_app_window(label) {
+    if !crate::app_window::is_app_window(label) {
         return;
     }
     if RESIZE_OBSERVERS.with_borrow(|observers| observers.contains_key(label)) {

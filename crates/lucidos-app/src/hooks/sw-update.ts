@@ -142,7 +142,9 @@ const SW_UPDATE_CHECK_DELAYS_MS = [3_000, 8_000, 15_000, 30_000];
  *  re-snapshots: for a **frontend-only** Apply the engine does that in-process
  *  (`engine::frontend_refresh`), and a mixed change advances it via a Switch.
  *  Either way `registration.update()` then detects the new worker and fires the
- *  "New version available → Refresh" toast (hooks/useStartup.ts). Without this
+ *  "New version available → Refresh" toast (`surfaceUpdateToast` in
+ *  store/actions/client-update.ts, reached through `syncClientUpdateFromBuild`;
+ *  useStartup.ts routes to it rather than deciding). Without this
  *  nudge the toast would only appear on the next resume or the 5-min SW health
  *  probe — this makes "push Apply → get told when it's ready" prompt and hands-free.
  *
@@ -394,14 +396,14 @@ export async function getServedBuildId(): Promise<string | null> {
 
 /** Ask the active service worker for its stamped BUILD_ID (vite.config.ts
  *  `lucidos-sw-stamp`). The reply arrives as a `lucidos:build-id` message,
- *  handled in useStartup.ts where it lands in the `serviceWorkerBuildId` signal
- *  for the control panel.
+ *  handled in useStartup.ts where it lands in the `serviceWorkerBuildId` signal.
+ *  Its one reader is the Settings → System page's "Service worker" row.
  *
  *  We query the SW rather than baking the id into the app bundle so the reported
  *  value is the build that's ACTUALLY controlling the page — the same value
  *  whose byte-change drives the update toast — which makes it a real "did the SW
  *  update?" probe. Best-effort: no SW / no controller → no reply, and the
- *  control panel simply omits the build row. */
+ *  System page simply omits the build row. */
 export function requestServiceWorkerBuildId(): void {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
   const sw = navigator.serviceWorker;

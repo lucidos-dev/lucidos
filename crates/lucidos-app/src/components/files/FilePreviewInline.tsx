@@ -1,11 +1,12 @@
 import { useState, useEffect, useMemo } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewEditing, openImagePopup, showToast } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewEditing, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
 import { renderCsvTable } from '../../utils/csv';
+import { PreviewImage } from './PreviewImage';
 import { SlidesPreview } from './SlidesPreview';
-import { isMobile, viewportIsMobile } from '../../utils/viewport';
+import { viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { ApiError, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
@@ -70,7 +71,7 @@ export function FilePreviewInline({ path, layout }: Props) {
     <div class="file-preview-inline">
       <div class="file-preview-content">
         {editing && <FileEditor path={path} url={url} />}
-        {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <img src={url} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(url); }} />}
+        {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <PreviewImage src={url} alt={path} />}
         {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
         {!editing && VIDEO_EXTS.includes(ext) && <video src={url} controls style="max-width:100%;max-height:100%;" />}
         {!editing && AUDIO_EXTS.includes(ext) && <audio src={url} controls style="width:100%;" />}
@@ -339,6 +340,10 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
     return (
       <iframe
         srcDoc={withPreviewBase(content, previewBaseHref(url))}
+        // `#fff` is functional rather than thematic, the token rule's second
+        // carve-out. An artifact is authored against a white page and usually
+        // sets no background. A themed canvas would put its black text on the
+        // dark surface and leave the document unreadable.
         style="width:100%;height:100%;border:none;background:#fff;"
         onLoad={(e) => {
           bridgePreviewIframeShortcuts(e.currentTarget);

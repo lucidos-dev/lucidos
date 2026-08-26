@@ -238,6 +238,11 @@ export function useFlipTransitions(
         // Cleanup after all animations finish
         if (newAnims.length > 0) {
             Promise.allSettled(newAnims.map(a => a.finished)).then(() => {
+                // A newer batch cancelled these, which is what settled us, and
+                // its takeover above already did this batch's cleanup. Running
+                // it again would un-hide a row whose new clone is still flying,
+                // and would wipe the refs the NEXT batch cancels through.
+                if (runningAnims.current !== newAnims) return;
                 for (const r of touched) {
                     r.classList.remove('flip-animating');
                 }

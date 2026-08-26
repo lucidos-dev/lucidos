@@ -919,36 +919,72 @@ pub(super) async fn emit_event(
     // preserved unchanged.
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
-    if body.transient {
-        match state
-            .engine
-            .broadcast_transient_domain_event(&body.event_type, body.payload, actor)
-            .await
-        {
-            Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to emit event: {}", e) })),
-            )
-                .into_response(),
+    // Re-establish the caller's event-trigger chain depth on this request task.
+    //
+    // A script trigger's `lucidos events emit` lands here on an axum task. It
+    // shares nothing with the fire that spawned the script, so the emit used to
+    // stamp 0 and restart the chain. That is why a script trigger subscribed to
+    // the event its own script emits never stopped. The depth comes off the
+    // HMAC-signed origin token, so it is authenticated and a caller cannot
+    // declare a lower one to escape the cap.
+    //
+    // The fire comes off the same token, for the same reason. The scope cannot
+    // carry it either, so the emit states it (ADR 0137).
+    let (depth, emitting_trigger_id) = emit_chain_and_trigger(&headers);
+    let emit = async {
+        if body.transient {
+            state
+                .engine
+                .broadcast_transient_domain_event(
+                    &body.event_type,
+                    body.payload,
+                    actor,
+                    emitting_trigger_id,
+                )
+                .await
+                .map(|()| None)
+        } else {
+            state
+                .engine
+                .emit_domain_event(&body.event_type, body.payload, actor, emitting_trigger_id)
+                .await
+                .map(Some)
         }
-    } else {
-        match state
-            .engine
-            .emit_domain_event(&body.event_type, body.payload, actor)
-            .await
-        {
-            Ok(id) => Json(serde_json::json!({
-                "success": true,
-                "event_id": id.to_string(),
-            }))
+    };
+    match crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH
+        .scope(depth, emit)
+        .await
+    {
+        Ok(Some(id)) => Json(serde_json::json!({
+            "success": true,
+            "event_id": id.to_string(),
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to emit event: {}", e) })),
+        )
             .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to emit event: {}", e) })),
-            )
-                .into_response(),
-        }
+    }
+}
+
+/// The chain depth and the emitting trigger an inbound emit belongs to.
+///
+/// A Lucidos-spawned subprocess presents a signed origin token carrying both.
+/// Every other caller (a browser, an app UI, an external API client) roots its
+/// own chain at 0 and claims no trigger. That is an ordinary user action.
+///
+/// Both come off ONE verify. They ride the same token, so reading them apart
+/// would check the same MAC twice on every emit.
+fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
+    match super::actor::subprocess_origin(headers) {
+        super::actor::SubprocessOrigin::Subprocess {
+            chain_depth,
+            emitting_trigger_id,
+            ..
+        } => (chain_depth, emitting_trigger_id),
+        super::actor::SubprocessOrigin::NotSubprocess => (0, None),
     }
 }
 
@@ -991,6 +1027,46 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The emit surface reads both facts off the token, and neither off a
+    /// header a caller could set (ADR 0137, ADR 0138).
+    ///
+    /// A trigger's script posts here from its own process, so the fire's
+    /// task-local reaches nothing. The token is what carries the fire across.
+    #[test]
+    fn an_emit_takes_its_depth_and_its_fire_from_the_signed_token() {
+        use super::super::actor::{
+            init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+        };
+        init_agent_origin_secret("history-emit-secret".to_string());
+
+        let with = |token: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(token) = token {
+                headers.insert(
+                    HEADER_AGENT_ORIGIN_TOKEN,
+                    HeaderValue::from_str(token).expect("a minted token is header safe"),
+                );
+            }
+            emit_chain_and_trigger(&headers)
+        };
+
+        let fire = mint_agent_origin_token(None, 2, Some("nightly-scan")).expect("secret is set");
+        assert_eq!(with(Some(&fire)), (2, Some("nightly-scan".to_string())));
+
+        let plain = mint_agent_origin_token(None, 1, None).expect("secret is set");
+        assert_eq!(
+            with(Some(&plain)),
+            (1, None),
+            "a spawn outside any fire claims no trigger"
+        );
+
+        assert_eq!(
+            with(None),
+            (0, None),
+            "an untrusted caller roots its own chain and suppresses nobody"
+        );
+    }
 
     /// A browser must not wait for an event to learn the stream is open.
     ///

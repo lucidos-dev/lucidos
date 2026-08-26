@@ -642,6 +642,8 @@ impl LucidosEngine {
                 let images = resolved_images.as_deref().or(user_images);
                 let cc_thread_id = uuid::Uuid::new_v4();
                 let request = crate::engine::thread_queue::ThreadQueueRequest::CodingAgent {
+                    // Stamped by `submit` from this task's chain depth.
+                    depth: 0,
                     prompt: prompt.to_string(),
                     cc_thread_id,
                     image_hashes: self.queued_image_hashes(images),
@@ -706,6 +708,8 @@ impl LucidosEngine {
                             // on the admitted path, preserving the ordering.
                             let request =
                                 crate::engine::thread_queue::ThreadQueueRequest::SubThread {
+                                    // Stamped by `submit`, as above.
+                                    depth: 0,
                                     prompt: prompt.to_string(),
                                     child_thread_id,
                                     parent_thread_id,

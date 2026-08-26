@@ -263,11 +263,8 @@ impl LucidosEngine {
                     Err(e) => return Ok(e),
                 };
 
-                // Trigger runs are unattended — skip send confirmation.
-                // ACTIVE_TRIGGER_ID is set for all trigger executions.
-                let is_trigger = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
-                    .try_with(|_| ())
-                    .is_ok();
+                // Trigger runs are unattended, so skip send confirmation.
+                let is_trigger = crate::scheduler::user_tasks::current_trigger_id().is_some();
                 if account.require_send_confirmation && !is_trigger {
                     let attachment_names: Vec<String> =
                         validated.iter().map(|v| v.filename.clone()).collect();

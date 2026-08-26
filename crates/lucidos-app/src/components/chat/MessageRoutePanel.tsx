@@ -117,8 +117,8 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
 /** Live lookup wins over `cachedLinkedTitle` because SSE handlers
  *  (`CodingAgentThreadSpawned`, the skeleton path in `handleThreadEvent`)
  *  create the linked thread without metadata, so the cache stays undefined
- *  until the next 5s `loadAllThreads` poll — without this fallback the
- *  popover shows the linked thread's UUID for that window. */
+ *  until the next full thread load (boot, or an SSE reconnect). Without this
+ *  fallback the popover shows the linked thread's UUID for that window. */
 export function resolveThreadLinkTitle(
   origin: Extract<MessageOrigin, { kind: 'thread_link' }>,
   cachedLinkedTitle: string | undefined,

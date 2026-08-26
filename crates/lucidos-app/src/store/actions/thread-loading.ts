@@ -16,7 +16,7 @@ import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch } from './compose';
+import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch, noteServerComposeMode } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads. Hundreds of
  *  threads through the upsertThread loop land in ONE signal write. `null`
@@ -113,6 +113,9 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   // and likewise recorded before the guard below.
   noteComposeEpoch(info.thread_id, info.compose_epoch);
   const mode = info.compose_mode ?? null;
+  // The stored mode, same footing again. A write only carries a mode the engine
+  // is not already known to hold.
+  noteServerComposeMode(info.thread_id, mode);
   const isEmpty = composeSnapshotIsEmpty(info);
   // A bulk snapshot must NEVER clear a non-empty draft the user typed ON THIS
   // DEVICE. The compose PUT is debounced and can fail or time out under host

@@ -2,7 +2,8 @@
 // 8 px matches the swipe direction-lock threshold in `swipe.ts`.
 const TAP_MOVE_THRESHOLD_PX = 8;
 
-/** The pointer fields the gate reads: SCREEN coordinates, never client ones.
+/** The fields everything in this file reads off a pointer or a touch: SCREEN
+ *  coordinates, never client ones.
  *
  *  The gate takes the event rather than two numbers so that no call site can
  *  hand it another coordinate space. `clientX/clientY` measure the finger
@@ -90,42 +91,22 @@ export function createTapGate() {
  *  touch path serves every `touchend` it is given. */
 const TOUCH_CLICK_WINDOW_MS = 500;
 
-interface TouchTargetRect {
-  left: number;
-  right: number;
-  top: number;
-  bottom: number;
-}
-
-/** What the touch path reads off the event: the finger that lifted, and the box
- *  it had to lift inside. Structural, like `TapPointer` above, so the helper
- *  unit-tests without a DOM. */
-export interface TouchEndLike {
+/** All the touch path needs off the event. Structural, like `TapPointer` above,
+ *  so the helper unit-tests without a DOM. */
+export interface TouchEventLike {
   preventDefault(): void;
-  changedTouches?: ArrayLike<{ clientX: number; clientY: number }>;
-  currentTarget?: { getBoundingClientRect(): TouchTargetRect } | null;
 }
 
-/** Whether the finger lifted while still on the button.
- *
- *  A `touchend` is dispatched to the element the touch STARTED on, wherever it
- *  ends. A press that slid off therefore arrives here looking like a tap, and
- *  would activate where a `click` never would. Touch activation substitutes for
- *  the click. It must not be the looser trigger.
- *
- *  CLIENT coordinates, deliberately, unlike `createTapGate` right above. That
- *  measures whether the finger MOVED, across a span the viewport can shift
- *  under, so it needs screen space. This asks whether one point is inside one
- *  box, both read in the same frame, which is what client space answers.
- *
- *  True when the event cannot say, mirroring the gate's treatment of a click
- *  with no press behind it. A real browser always says. */
-function liftedOnTarget(e: TouchEndLike): boolean {
-  const point = e.changedTouches?.[0];
-  const rect = e.currentTarget?.getBoundingClientRect();
-  if (!point || !rect) return true;
-  return point.clientX >= rect.left && point.clientX <= rect.right
-    && point.clientY >= rect.top && point.clientY <= rect.bottom;
+/** A `createTapGate` as an activation sees it. Both halves travel together
+ *  because both concern ONE press, and the gate holds one press at a time. */
+export interface ActivationGate {
+  /** Rule on the press and report a rejection. The CLICK path only asks. */
+  pass(): boolean;
+  /** Spend the press without ruling on it, for the TOUCH path, which serves it
+   *  without asking. An unspent press is one the gate still holds. It would
+   *  then rule on the NEXT activation that arrives with no press of its own,
+   *  such as a keyboard Enter on the same button. */
+  spend(): void;
 }
 
 export interface TouchActivateOptions {
@@ -133,6 +114,9 @@ export interface TouchActivateOptions {
    *  alone. A button whose action turns destructive in some state passes that
    *  state here, so the state keeps ordinary click activation. */
   enabled?: () => boolean;
+  /** The scroll-vs-tap gate. See `onClick` for why the touch path spends the
+   *  press rather than asking. Absent means every click activates. */
+  gate?: ActivationGate;
   /** Injected clock, so the twin window is testable without a real one. */
   now?: () => number;
 }
@@ -146,12 +130,19 @@ export interface TouchActivateOptions {
  *
  *  `onTouchEnd` runs the action inside the gesture, before any of that, and
  *  cancels the synthetic click. `onClick` serves the mouse, the keyboard and a
- *  programmatic click, and ignores the twin of a touch it already served.
+ *  programmatic click, and ignores the twin of a touch it already served. One
+ *  `action` for both, since two callbacks would drift.
  *
- *  One `action` for both paths on purpose: two callbacks would drift, and the
- *  touch path is the one nobody can exercise on a desktop. Compose with
- *  `createTapGate` by doing the gate check inside `action`, which keeps one
- *  press to one settle whichever path fires.
+ *  **The touch path takes every press it is given.** With a field focused on iOS
+ *  it is the only path, so any test it can fail throws the press away in
+ *  silence. Two such tests shipped and both were reported as a dead Send. Each
+ *  asked whether the finger was still on the button at the lift. `TapPointer`
+ *  above records why no coordinate answers that here, in any space.
+ *
+ *  So the lift half is given up, and `touchend` going to the element the press
+ *  STARTED on is the guarantee left. A press sliding off a constructive button
+ *  now fires it. That is the trade, and the reasoning is in
+ *  `docs/plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md`.
  *
  *  Local copies of this repair live in `promptFocus.ts` (`composeHandlers`,
  *  which adds focus-first) and `FileSearchModal.tsx`. */
@@ -160,8 +151,11 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
   const clock = opts.now ?? Date.now;
   let lastTouchAt: number | null = null;
   return {
-    onTouchEnd(e: TouchEndLike): void {
-      if (!enabled() || !liftedOnTarget(e)) return;
+    onTouchEnd(e: TouchEventLike): void {
+      if (!enabled()) return;
+      // Served, so the gate's press is spent rather than ruled on. See
+      // `ActivationGate.spend`.
+      opts.gate?.spend();
       lastTouchAt = clock();
       e.preventDefault();
       action();
@@ -169,10 +163,15 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
     onClick(): void {
       if (lastTouchAt !== null && clock() - lastTouchAt < TOUCH_CLICK_WINDOW_MS) {
         // A touch has ONE twin. Forget it here, so a genuine second tap landing
-        // inside the window is served rather than eaten as well.
+        // inside the window is served rather than eaten as well. Before the
+        // gate, so a twin never rules on a press the touch path already spent.
         lastTouchAt = null;
         return;
       }
+      // The gate is asked on this path alone. What it catches is the click iOS
+      // fires after a touch that was starting a scroll. In front of BOTH paths
+      // it would veto the touch path too, on the measurement named above.
+      if (opts.gate && !opts.gate.pass()) return;
       action();
     },
   };

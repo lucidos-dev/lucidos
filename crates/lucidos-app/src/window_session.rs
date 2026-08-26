@@ -65,7 +65,7 @@ pub struct WindowSnapshot {
 /// arrangement: `main` is hidden rather than closed, and the tray brings it
 /// back on the workspace it was on.
 ///
-/// The other half is `lib.rs`'s `PresentedGate`, which rules out a login start.
+/// The other half is `window_persist.rs`'s `PresentedGate`, which rules out a login start.
 pub fn any_window_is_navigated(windows: &[WindowSnapshot]) -> bool {
     windows
         .iter()
@@ -94,8 +94,8 @@ pub fn record_path(app_data: &Path) -> PathBuf {
 pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSession {
     let mut ordered: Vec<&WindowSnapshot> = windows.iter().collect();
     ordered.sort_by(|a, b| {
-        let key = |s: &WindowSnapshot| (s.label != crate::MAIN_WINDOW_LABEL, s.label.clone());
-        key(a).cmp(&key(b))
+        crate::app_window::window_order_key(&a.label)
+            .cmp(&crate::app_window::window_order_key(&b.label))
     });
 
     let mut session = WindowSession {
@@ -378,6 +378,26 @@ mod tests {
         assert!(after.open.is_empty());
         // The sizes are still remembered for when either is opened again.
         assert_eq!(after.geometry.get("dev"), Some(&rect(0, 0, 900, 700)));
+    }
+
+    // Close to Menu Bar HIDES every window rather than destroying any, so the
+    // window list a park leaves behind is the same list. Visibility is
+    // deliberately not an input here: a hidden window is still part of the
+    // arrangement, and `main` has always been hidden rather than closed. Add a
+    // visibility filter and a park silently forgets every window but one.
+    #[test]
+    fn a_parked_window_is_still_part_of_the_arrangement() {
+        let live = [
+            snapshot("main", "http://localhost:3210/myws/", rect(0, 0, 1200, 800)),
+            snapshot(
+                "window-1",
+                "http://localhost:3210/dev/",
+                rect(100, 50, 900, 700),
+            ),
+        ];
+        let before = capture(&WindowSession::default(), &live);
+        assert_eq!(capture(&before, &live), before);
+        assert_eq!(before.open, vec!["myws", "dev"]);
     }
 
     // ── When a capture is worth writing ──────────────────────────────────────

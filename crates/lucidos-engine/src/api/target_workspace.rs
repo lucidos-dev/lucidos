@@ -174,11 +174,11 @@ mod tests {
     }
 
     /// The incident shape: a request meant for `dev`, delivered to the engine
-    /// serving `personal-dmg`.
+    /// serving another workspace on the same machine.
     #[test]
     fn a_mismatched_assertion_is_refused() {
         assert_eq!(
-            check_target_workspace(Some("dev"), "personal-dmg"),
+            check_target_workspace(Some("dev"), "myws"),
             TargetCheck::WrongWorkspace
         );
     }
@@ -192,15 +192,15 @@ mod tests {
             TargetCheck::WrongWorkspace
         );
         assert_eq!(
-            check_target_workspace(Some("personal"), "personal-dmg"),
+            check_target_workspace(Some("myws"), "myws-packaged"),
             TargetCheck::WrongWorkspace
         );
     }
 
     #[test]
     fn the_refusal_names_both_workspaces() {
-        let msg = wrong_workspace_message("dev", "personal-dmg");
-        assert!(msg.contains("personal-dmg"), "must name the actual: {msg}");
+        let msg = wrong_workspace_message("dev", "myws");
+        assert!(msg.contains("myws"), "must name the actual: {msg}");
         assert!(msg.contains("dev"), "must name the asserted: {msg}");
         assert!(
             msg.contains("nothing was written"),

@@ -211,6 +211,14 @@ pub(crate) const REPEATED_ACTION_RULE: &str = "DOING IT AGAIN, A REPEAT \
 ///
 /// Deliberately short. It points at the tools that do work rather than
 /// restating their contracts, which `system-knowhow/lucidos-cli.md` owns.
+///
+/// The closing paragraph exists because the opening one used to overreach.
+/// "Acting in another workspace" was listed as an example of something no tool
+/// covers, which is false: `lucidos spawn-thread --to` has always done it. A
+/// chat thread read that, told the user cross-workspace threads were
+/// impossible, and offered three workarounds instead. A refusal rule that
+/// names a real capability as a refusal case teaches the agent to lie. So the
+/// correction sits next to the rule, not in knowhow it may never load.
 const NO_IMPERSONATION_RULE: &str = "NEVER ACT AS THE USER, AND NEVER ROUTE \
      AROUND A TOOL:\n\
      You may never post to the Lucidos engine's own HTTP API by hand (curl, \
@@ -220,11 +228,14 @@ const NO_IMPERSONATION_RULE: &str = "NEVER ACT AS THE USER, AND NEVER ROUTE \
      timeline and the event log, so it is a lie the user cannot detect. The \
      engine refuses these, but do not go looking for the edge it misses.\n\
      WHEN A TOOL REFUSES YOU, SAY SO. That is the whole rule. Asked for \
-     something no tool covers (messaging a thread that is not your own child, \
-     acting in another workspace), tell the user plainly that it is not \
-     possible and offer what IS: name the threads and let them send the \
-     message themselves. A refusal reported honestly is a good turn; a refusal \
-     worked around is a broken one, however well it appears to succeed.";
+     something no tool covers, such as messaging a thread that is not your own \
+     child, tell the user plainly that it is not possible and offer what IS: \
+     name the threads and let them send the message themselves. A refusal \
+     reported honestly is a good turn; a refusal worked around is a broken \
+     one, however well it appears to succeed.\n\
+     ANOTHER WORKSPACE IS NOT ONE OF THOSE CASES: `run_bash` with `lucidos \
+     spawn-thread --to <ws> --message '<text>'` starts a thread there, plus \
+     `--cc` or `--codex` for a coding-agent one. Never call it impossible.";
 
 /// Routes "tell me here when X happens" to `await_event` rather than a
 /// trigger, at the moment the mechanism is chosen.
@@ -408,7 +419,7 @@ CONTENT TAXONOMY (intent, knowhow, script, trigger; each scoped to an app, a kno
 Change an intent only when the user's goal changes, and never put technical detail in one. Write the knowhow file BEFORE the intent that needs it, so the procedure has somewhere to live.
 
 SCRIPT FILES (under apps/, triggers/, knowhow/scripts/):
-- Every script the engine spawns gets the `lucidos` CLI on PATH and LUCIDOS_WORKSPACE set. Write data with `lucidos data write`, not raw HTTP to the engine, and emit or read domain events with `lucidos events emit` / `lucidos events query`. Full reference: load_knowhow('system-knowhow/lucidos-cli').
+- Every script the engine spawns gets the `lucidos` CLI on PATH and LUCIDOS_WORKSPACE set, and so do your own `run_bash` and `run_python`: the CLI is yours to call, not just a script's. Write data with `lucidos data write`, not raw HTTP to the engine, and emit or read domain events with `lucidos events emit` / `lucidos events query`. Full reference: load_knowhow('system-knowhow/lucidos-cli').
 
 FILE FORMATTING:
 Clean structured markdown: ## headings, bullet lists, **bold** for key values.
@@ -502,6 +513,7 @@ REFRESHING OPEN WINDOWS:
 
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
+- ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered.
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
 - Link a UI panel by its bare name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Apps and other plugins are downloaded from `[Plugins](app-store)`; call it the Plugins panel, never the retired "App Store" or "Store".
@@ -1047,7 +1059,26 @@ mod tests {
     /// System tab. The agent has to be able to send a user to the tab that owes
     /// them work. Every other System subpanel but Communication Surfaces is
     /// already reachable that way.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 115_579;
+    ///
+    /// Raised by 362 to a measured 115,941 to stop the resident text claiming
+    /// that acting in another workspace is impossible. It is not:
+    /// `lucidos spawn-thread --to` does it. A chat thread believed the old
+    /// wording and told the user so, then hunted for workarounds. Deleting the
+    /// false clause was not enough on its own. An agent just told "not that"
+    /// has to be told "this instead" in the same breath, and knowhow cannot
+    /// carry it: it decides the thing is impossible before it would load a doc.
+    ///
+    /// Raised by 217 to a measured 116,158 for the image line in FILE
+    /// REFERENCES. A link had been the agent's whole vocabulary for showing a
+    /// file. The incident is in
+    /// `the_file_references_section_says_an_image_is_drawn_not_linked`.
+    /// Knowhow cannot carry this one: writing the message is the moment the
+    /// choice is made, and nothing prompts a lookup first.
+    ///
+    /// The line itself is 285 chars, so the ratchet moved less than the line
+    /// costs. The previous ceiling carried 68 chars of slack, and this
+    /// absorbed it. Every row below is a measured total, never a rounded one.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_158;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1787,17 +1818,16 @@ mod tests {
         );
     }
 
-    /// A trigger was the one first-class thing the agent names in a reply with
-    /// no link form of its own. So it linked the Triggers PANEL, and when told
-    /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
-    /// The section has to carry the form AND keep the two destinations apart.
+    /// The FILE REFERENCES block, read out of this file's own source. Both
+    /// tests below assert on the same section, so they take it from here: a
+    /// second copy of the extraction can go stale against the first and report
+    /// green on a section that no longer parses.
     ///
     /// Source-scanned and scoped to the section, like
     /// `the_state_change_section_excludes_the_threads_own_child`: this is plain
-    /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps this test's own
+    /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps a caller's own
     /// prose from satisfying its assertions.
-    #[test]
-    fn the_file_references_section_links_a_trigger_not_just_the_panel() {
+    fn file_references_section() -> String {
         let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
         let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
         let src = std::fs::read_to_string(&path)
@@ -1808,7 +1838,17 @@ mod tests {
             .find("FILE REFERENCES:\n")
             .expect("the prompt no longer has a FILE REFERENCES section");
         let section = &src[from..];
-        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+        section[..section.find("\n\n").unwrap_or(section.len())].to_string()
+    }
+
+    /// A trigger was the one first-class thing the agent names in a reply with
+    /// no link form of its own. So it linked the Triggers PANEL, and when told
+    /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
+    /// The section has to carry the form AND keep the two destinations apart.
+    #[test]
+    fn the_file_references_section_links_a_trigger_not_just_the_panel() {
+        let section = file_references_section();
+        let section = section.as_str();
 
         assert!(
             section.contains("(trigger:<id>)"),
@@ -1830,6 +1870,42 @@ mod tests {
         assert!(
             section.contains("Run once"),
             "the section must name what the trigger link lands on:\n{section}"
+        );
+    }
+
+    /// Asked to show an image, the agent read a PNG, saw it, and wrote the
+    /// bare path. The user got a link and asked "can you not inline it?". It
+    /// then spent eight tool calls grepping this repo and `renderMarkdown.ts`
+    /// to rediscover a capability it already had. That recovery only worked
+    /// because the machine happened to have the Lucidos source checked out.
+    ///
+    /// The section taught "a full path becomes a clickable link" and stopped,
+    /// so a link was the whole vocabulary. Mirrored for coding agents by
+    /// `agent_session::prompts::SHOWING_AN_IMAGE_RULE`, tuned there to
+    /// `lucidos data write` because a worktree cannot write `data/` directly.
+    /// Change both together.
+    #[test]
+    fn the_file_references_section_says_an_image_is_drawn_not_linked() {
+        let section = file_references_section();
+        let section = section.as_str();
+
+        // The syntax itself. Naming the concept without the leading `!` is
+        // what left the agent writing a path and calling it shown.
+        assert!(
+            section.contains("![what it shows](artifacts/branding/card.png)"),
+            "the section must show the image form, not just name it:\n{section}"
+        );
+        // Why a path is not enough. Without the contrast the link rule above
+        // it keeps reading as the complete answer.
+        assert!(
+            section.contains("is a LINK"),
+            "the section must tell a link apart from a drawn image:\n{section}"
+        );
+        // The half the transcript proves the agent does not know: looking at
+        // an image is not showing it.
+        assert!(
+            section.contains("shows it to YOU"),
+            "the section must say a read reaches the agent, not the user:\n{section}"
         );
     }
 
@@ -2297,6 +2373,25 @@ mod tests {
         assert!(
             rule.contains("do not go looking for the edge it misses"),
             "rule must not read as an invitation to find the engine's gap:\n{rule}"
+        );
+    }
+
+    /// The rule once offered "acting in another workspace" as an example of
+    /// something no tool covers. It is not: `lucidos spawn-thread --to` does
+    /// it, and a chat thread that believed the rule told the user the whole
+    /// capability was impossible. A refusal rule may only cite REAL refusals,
+    /// so this pins the example out and the correction in.
+    #[test]
+    fn no_impersonation_rule_does_not_call_cross_workspace_impossible() {
+        let rule = NO_IMPERSONATION_RULE;
+        assert!(
+            !rule.contains("acting in another workspace"),
+            "cross-workspace is a supported route, not a refusal case:\n{rule}"
+        );
+        assert!(
+            rule.contains("lucidos spawn-thread --to"),
+            "rule must name the route that works, or the agent invents a \
+             workaround for a capability it has:\n{rule}"
         );
     }
 

@@ -332,7 +332,7 @@ export async function fetchThreadEvents(
   if (opts.afterSeq !== undefined) params.set('after', String(opts.afterSeq));
   if (opts.includeContext) params.set('include_context', 'true');
   const query = params.toString() ? `?${params.toString()}` : '';
-  return json(`${API}/threads/${threadId}/events${query}`);
+  return json(`${API}/threads/${encodeURIComponent(threadId)}/events${query}`);
 }
 
 /** Payload returned by the lazy-load endpoint for one `ContextCaptured`

@@ -151,11 +151,15 @@ identity for this route.
 it is your click: the macOS app installs and relaunches, and a headless install
 gives you the exact `install.sh` command to run.
 
-**Turning it off.** Settings > System > Check for updates, or set
+**It is on by default, and you are not asked first.** Lucidos does not open with
+a consent dialog about it, for the same reason `npm`, `cargo`, `gh` and Homebrew
+do not. This page is the notice, and the switch named below is the control.
+
+**Turning it off.** Settings > System > Check for updates automatically, or set
 `enabled = false` under `[release_check]` in `~/.lucidos/updates.toml`. The
-gateway re-reads that file on every tick, so it stops at once. **Nothing is sent
-before you answer the first-run notice**, which the workspace picker shows once
-on a fresh install.
+gateway re-reads that file on every tick, so it stops at once. The **Check for
+Updates** button on that same page still works while it is off. Turning it off
+therefore costs you nothing but the automatic poll.
 
 **A dev build never checks.** A gateway launched from a source checkout makes no
 request at all, whatever its configuration says.

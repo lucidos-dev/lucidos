@@ -164,7 +164,7 @@ async fn follow_up_route_is_mounted_and_post_only() {
 /// binary, so it also proves the subcommand is wired into `main.rs`.
 #[test]
 fn cli_follow_up_refuses_a_title_instead_of_an_id() {
-    let out = std::process::Command::new(crate::lucidos_cli_test::lucidos_bin())
+    let out = crate::lucidos_cli_test::lucidos_cmd()
         .args([
             "threads",
             "follow-up",
@@ -173,7 +173,6 @@ fn cli_follow_up_refuses_a_title_instead_of_an_id() {
             "--message",
             "go the other way",
         ])
-        .env("LUCIDOS_WORKSPACE", crate::support::workspace_path())
         .output()
         .expect("lucidos threads follow-up runs");
     assert!(!out.status.success(), "a title is not a thread id");
@@ -190,7 +189,7 @@ fn cli_follow_up_refuses_a_title_instead_of_an_id() {
 #[test]
 fn cli_follow_up_reaches_the_route() {
     let marker = unique_marker("cli-follow-up");
-    let out = std::process::Command::new(crate::lucidos_cli_test::lucidos_bin())
+    let out = crate::lucidos_cli_test::lucidos_cmd()
         .args([
             "threads",
             "follow-up",
@@ -199,7 +198,6 @@ fn cli_follow_up_reaches_the_route() {
             "--message",
             &marker,
         ])
-        .env("LUCIDOS_WORKSPACE", crate::support::workspace_path())
         .output()
         .expect("lucidos threads follow-up runs");
     assert!(!out.status.success(), "a token-less CLI call is refused");
@@ -279,7 +277,7 @@ fn cli_follow_up_sends_urgent_only_when_asked() {
         (vec!["--urgent"], "with --urgent"),
         (vec![], "without --urgent"),
     ] {
-        let mut cmd = std::process::Command::new(crate::lucidos_cli_test::lucidos_bin());
+        let mut cmd = crate::lucidos_cli_test::lucidos_cmd();
         cmd.args([
             "threads",
             "follow-up",
@@ -289,10 +287,7 @@ fn cli_follow_up_sends_urgent_only_when_asked() {
             &unique_marker("cli-urgent"),
         ]);
         cmd.args(&args);
-        let out = cmd
-            .env("LUCIDOS_WORKSPACE", crate::support::workspace_path())
-            .output()
-            .expect("lucidos threads follow-up runs");
+        let out = cmd.output().expect("lucidos threads follow-up runs");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains("403"),

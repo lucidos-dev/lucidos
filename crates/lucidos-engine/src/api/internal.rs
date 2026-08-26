@@ -293,6 +293,7 @@ pub(super) async fn coding_agent_diff_refresh(
     match crate::api::actor::subprocess_origin(&headers) {
         crate::api::actor::SubprocessOrigin::Subprocess {
             source_thread_id: Some(source_thread_id),
+            ..
         } if source_thread_id == thread_id => {}
         _ => return (StatusCode::FORBIDDEN, "Invalid subprocess origin").into_response(),
     }

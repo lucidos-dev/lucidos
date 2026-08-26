@@ -472,12 +472,11 @@ async fn gateway_check_updates(
     Json(state.release_check().refresh(force).await)
 }
 
-/// Body for the release-check preference write. Each field is optional, so the
-/// first-run notice can acknowledge without also restating `enabled`.
+/// Body for the release-check preference write. The field is optional, so a
+/// body that names nothing settles on the stored value rather than erroring.
 #[derive(Deserialize)]
 struct ReleaseCheckBody {
     enabled: Option<bool>,
-    notice_acknowledged: Option<bool>,
 }
 
 /// PUT /~/api/v1/control/release-check: write `~/.lucidos/updates.toml` and
@@ -488,11 +487,11 @@ async fn set_release_check_config(
     Json(body): Json<ReleaseCheckBody>,
 ) -> Result<Json<Value>, ApiError> {
     let check = state.release_check();
-    // The merge belongs to the writer, not here: it re-reads the file so a
-    // field this request says nothing about keeps whatever another gateway on
-    // this machine wrote.
+    // The merge belongs to the writer, not here. It re-reads the file, so an
+    // absent field settles on what is stored rather than on what this handler
+    // last happened to see.
     check
-        .update_config(body.enabled, body.notice_acknowledged)
+        .update_config(body.enabled)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(check.snapshot()))
 }

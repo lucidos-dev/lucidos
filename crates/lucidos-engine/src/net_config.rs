@@ -324,7 +324,9 @@ mod tests {
     use super::*;
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    const TAILNET: &str = "100.101.71.58";
+    /// A synthetic address from the CGNAT range Tailscale hands out. Invented,
+    /// never captured: only "valid, and not loopback" is load-bearing here.
+    const TAILNET: &str = "100.64.0.1";
 
     #[test]
     fn default_is_loopback() {
@@ -430,7 +432,7 @@ mod tests {
     fn parse_network_toml_defaults_and_values() {
         assert_eq!(parse_network_toml(""), NetworkToml::default());
 
-        let full = "[gateway]\nbind = \"100.101.71.58\"\n[engine]\ninherit = false\n";
+        let full = "[gateway]\nbind = \"100.64.0.1\"\n[engine]\ninherit = false\n";
         let parsed = parse_network_toml(full);
         assert_eq!(parsed.gateway_bind.as_deref(), Some(TAILNET));
         assert!(!parsed.engine_inherit);

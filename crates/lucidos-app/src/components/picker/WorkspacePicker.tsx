@@ -18,11 +18,13 @@
  * brand-blue gradient the mark itself uses. Rows are flat (no card chrome): the
  * whole row opens the workspace, start/stop is a single play/pause control, and
  * the secondary actions (auto-start / rename / delete) stay out of the way until
- * the row is hovered (always tappable on touch). The name lives in a flex-grow
- * cell with ellipsis so its length can never reshape the row.
+ * the row is hovered (always tappable on touch). The name is always spelled
+ * whole, wrapping onto as many lines as it needs, with the address under it: a
+ * name is what tells two workspaces apart, so the row's height yields to it
+ * rather than the other way round.
  */
 
-import { useSignal, useComputed } from '@preact/signals';
+import { useSignal } from '@preact/signals';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -70,8 +72,6 @@ import {
   reloadGateway,
   getGatewayNetworkConfig,
   setGatewayNetworkConfig,
-  requestUpdateCheck,
-  setReleaseCheckConfig,
   type WorkspaceStatus,
   type GwRestoreStatus,
   type GatewayStatus,
@@ -291,10 +291,14 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
         {Array.from({ length: rows }, (_, i) => (
           <li class="ws-picker-row" key={i}>
             <div class="ws-picker-open">
-              <SkBlock w="0.625rem" h="0.625rem" circle />
-              <SkText class="ws-picker-name" w="9rem" />
-              <div class="ws-picker-actions">
-                <SkBlock w="2rem" h="2rem" round />
+              <div class="ws-picker-line">
+                <SkBlock w="0.625rem" h="0.625rem" circle />
+                <div class="ws-picker-id">
+                  <SkText class="ws-picker-name" w="9rem" />
+                </div>
+                <div class="ws-picker-actions">
+                  <SkBlock w="2rem" h="2rem" round />
+                </div>
               </div>
             </div>
           </li>
@@ -332,12 +336,6 @@ export function WorkspacePicker() {
   // available" badge. Null until the first poll lands (legacy non-gateway mode
   // never resolves it, so the control stays hidden).
   const gatewayStatus = useSignal<GatewayStatus | null>(null);
-  // Show the release check's first-run notice while this install could poll and
-  // has not been told yet. An older gateway omits the field, so nothing shows.
-  const updateNotice = useComputed(() => {
-    const check = gatewayStatus.value?.release_check;
-    return !!check?.supported && !check.notice_acknowledged;
-  });
   const reloading = useSignal(false);
   // Confirm step before re-execing the gateway (the reload re-execs the running
   // process). Anchored to the header reload icon.
@@ -416,19 +414,6 @@ export function WorkspacePicker() {
     // After a reload, the running gateway IS the on-disk binary, so the update
     // clears — that's our signal the new image is up; drop the "Reloading…" state.
     if (reloading.value && !status.update_available) reloading.value = false;
-  }
-
-  /** Answer the release check's first-run notice, and start checking if the
-   *  user said yes. Writing the acknowledgement is what opens the gate: the
-   *  gateway makes no request at all before it. */
-  async function answerUpdateNotice(enabled: boolean): Promise<void> {
-    try {
-      await setReleaseCheckConfig({ enabled, notice_acknowledged: true });
-      await fetchGatewayStatus();
-      if (enabled) await requestUpdateCheck();
-    } catch (e) {
-      error.value = `Couldn't save the update-check setting: ${String(e)}`;
-    }
   }
 
   // Initial load + user-initiated actions: a failure surfaces the error screen.
@@ -554,16 +539,6 @@ export function WorkspacePicker() {
     workspaces.value = { status: 'loading' };
     void (async () => {
       await refresh();
-      // The release check's notice must be answered before anything is sent, so
-      // an install that skips straight past the picker would leave it gated
-      // forever. That is every EXISTING install: it remembers a workspace, so
-      // this is the one screen it never renders. Awaiting the status costs a
-      // warm loopback hop behind the splash, and only on the smart root.
-      await fetchGatewayStatus().catch(() => { /* no notice until the poll lands */ });
-      if (updateNotice.value) {
-        autoOpening.value = false;
-        return;
-      }
       if (!autoOpening.value) return;
       const list = workspaces.value;
       const remembered = recallLastWorkspace();
@@ -956,34 +931,6 @@ export function WorkspacePicker() {
 
         {error.value && <div class="ws-picker-error">{error.value}</div>}
 
-        {/* The update check tells the user before it asks anything (ADR 0108).
-            Nothing leaves the machine until one of these two is clicked, so a
-            notice nobody answers means a check that never runs. */}
-        {updateNotice.value && (
-          <div class="ws-picker-notice">
-            <p class="ws-picker-notice-text">
-              Lucidos checks <code>lucidos.dev</code> once an hour for a newer version.
-              It sends your platform, your architecture and the version you run, plus
-              your IP address as any web request does. Nothing else, and nothing
-              installs itself.
-            </p>
-            <div class="ws-picker-notice-actions">
-              <button
-                class="ws-picker-btn ws-picker-btn-confirm"
-                onClick={() => { void answerUpdateNotice(true); }}
-              >
-                Got it
-              </button>
-              <button
-                class="ws-picker-btn"
-                onClick={() => { void answerUpdateNotice(false); }}
-              >
-                Turn it off
-              </button>
-            </div>
-          </div>
-        )}
-
         {v.status === 'failed' && (
           <div class="ws-picker-error">Failed to load workspaces: {v.error}</div>
         )}
@@ -1077,223 +1024,230 @@ export function WorkspacePicker() {
                         }
                       }}
                     >
-                      {/* The dot keeps its hover tooltip for every state, since
-                          that is where the label lives when the row says nothing.
-                          Its `aria-label` is the fallback for the same reason,
-                          and it steps aside for the fault note below: with the
-                          error rendered as text in this row, labelling the dot
-                          with it too has a screen reader read the same sentence
-                          twice. */}
-                      <span
-                        class={`ws-picker-dot ws-picker-dot-${state}`}
-                        data-tooltip={workspaceStateLabel(w)}
-                        aria-label={fault ? undefined : workspaceStateLabel(w)}
-                        aria-hidden={fault ? 'true' : undefined}
-                      />
-                      <span class="ws-picker-name">{w.name}</span>
-                      {/* The address is normally invisible, and normally that's
-                          fine (it matches the name). It is shown exactly when it
-                          would otherwise surprise: a rename left the name off its
-                          address, or two rows share a name and this is the only
-                          thing telling them apart. See `showsAddress`. */}
-                      {showsAddress(w, v.data) && (
+                      <div class="ws-picker-line">
+                        {/* The dot keeps its hover tooltip for every state, since
+                            that is where the label lives when the row says nothing.
+                            Its `aria-label` is the fallback for the same reason,
+                            and it steps aside for the fault note below: with the
+                            error rendered as text in this row, labelling the dot
+                            with it too has a screen reader read the same sentence
+                            twice. */}
                         <span
-                          class="ws-picker-address"
-                          data-tooltip={`Served at ${workspaceAddress(w.id)}`}
-                          aria-label={`Address ${workspaceAddress(w.id)}`}
+                          class={`ws-picker-dot ws-picker-dot-${state}`}
+                          data-tooltip={workspaceStateLabel(w)}
+                          aria-label={fault ? undefined : workspaceStateLabel(w)}
+                          aria-hidden={fault ? 'true' : undefined}
+                        />
+                        {/* Name over address, as one cell. Both name this
+                            workspace, so they stack instead of splitting the
+                            row's one horizontal budget between them. */}
+                        <div class="ws-picker-id">
+                          <span class="ws-picker-name">{w.name}</span>
+                          {/* The address is normally invisible, and normally that's
+                              fine (it matches the name). It is shown exactly when it
+                              would otherwise surprise: a rename left the name off its
+                              address, or two rows share a name and this is the only
+                              thing telling them apart. See `showsAddress`. */}
+                          {showsAddress(w, v.data) && (
+                            <span
+                              class="ws-picker-address"
+                              data-tooltip={`Served at ${workspaceAddress(w.id)}`}
+                              aria-label={`Address ${workspaceAddress(w.id)}`}
+                            >
+                              {workspaceAddress(w.id)}
+                            </span>
+                          )}
+                        </div>
+                        {typeof w.unread_count === 'number' && w.unread_count > 0 && (
+                          <span
+                            class="ws-picker-badge"
+                            data-tooltip={`${w.unread_count} unread`}
+                            aria-label={`${w.unread_count} unread notifications`}
+                          >
+                            {w.unread_count > 99 ? '99+' : w.unread_count}
+                          </span>
+                        )}
+                        {/* Both, because they are different events: a middle
+                            press dispatches `auxclick` and no `click` at all, so
+                            the click stopper alone let a middle-click on Stop or
+                            the ⋯ trigger fall through and open the workspace. */}
+                        <div
+                          class="ws-picker-actions"
+                          onClick={(e) => e.stopPropagation()}
+                          onAuxClick={(e) => e.stopPropagation()}
                         >
-                          {workspaceAddress(w.id)}
-                        </span>
-                      )}
-                      {typeof w.unread_count === 'number' && w.unread_count > 0 && (
-                        <span
-                          class="ws-picker-badge"
-                          data-tooltip={`${w.unread_count} unread`}
-                          aria-label={`${w.unread_count} unread notifications`}
-                        >
-                          {w.unread_count > 99 ? '99+' : w.unread_count}
-                        </span>
-                      )}
-                      {/* Both, because they are different events: a middle
-                          press dispatches `auxclick` and no `click` at all, so
-                          the click stopper alone let a middle-click on Stop or
-                          the ⋯ trigger fall through and open the workspace. */}
-                      <div
-                        class="ws-picker-actions"
-                        onClick={(e) => e.stopPropagation()}
-                        onAuxClick={(e) => e.stopPropagation()}
-                      >
-                        {running ? (
-                          <div class="ws-picker-stop-wrap">
+                          {running ? (
+                            <div class="ws-picker-stop-wrap">
+                              <button
+                                class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
+                                disabled={busy.value}
+                                data-tooltip="Stop"
+                                aria-label={`Stop ${w.name}`}
+                                aria-haspopup="dialog"
+                                aria-expanded={stopConfirmId.value === w.id}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const btn = e.currentTarget as HTMLElement;
+                                  if (stopConfirmId.value === w.id) {
+                                    stopConfirmId.value = null;
+                                  } else {
+                                    stopAnchor.value = btn;
+                                    stopConfirmId.value = w.id;
+                                  }
+                                }}
+                              ><StopIcon /></button>
+                              <Overlay
+                                open={stopConfirmId.value === w.id}
+                                onClose={() => (stopConfirmId.value = null)}
+                                anchor={stopAnchor.value}
+                                backdrop={false}
+                                panelClass="ws-picker-confirm ws-picker-confirm-stop"
+                              >
+                                <p class="ws-picker-confirm-text">
+                                  Stop “{w.name}”? It shuts down and becomes unreachable
+                                  until you start it again.
+                                </p>
+                                <div class="ws-picker-confirm-actions">
+                                  <button
+                                    class="ws-picker-btn"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      stopConfirmId.value = null;
+                                    }}
+                                  >Cancel</button>
+                                  <button
+                                    class="ws-picker-btn ws-picker-btn-danger"
+                                    disabled={busy.value}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      stopConfirmId.value = null;
+                                      void withBusy(() => stopWorkspace(w.id).then(refresh));
+                                    }}
+                                  >Stop</button>
+                                </div>
+                              </Overlay>
+                            </div>
+                          ) : (
                             <button
-                              class="ws-picker-icon ws-picker-icon-play ws-picker-icon-stop"
+                              class="ws-picker-icon ws-picker-icon-play"
                               disabled={busy.value}
-                              data-tooltip="Stop"
-                              aria-label={`Stop ${w.name}`}
-                              aria-haspopup="dialog"
-                              aria-expanded={stopConfirmId.value === w.id}
+                              data-tooltip={state === 'unhealthy' ? 'Retry' : 'Start'}
+                              aria-label={`${state === 'unhealthy' ? 'Retry' : 'Start'} ${w.name}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void withBusy(() => restartWorkspace(w.id).then(refresh));
+                              }}
+                            ><PlayIcon /></button>
+                          )}
+                          <div class="ws-picker-menu-wrap">
+                            <button
+                              class="ws-picker-icon ws-picker-icon-more"
+                              data-role="ws-row-more"
+                              disabled={busy.value}
+                              data-tooltip="More"
+                              aria-label={`More actions for ${w.name}`}
+                              aria-haspopup="menu"
+                              aria-expanded={menuOpenId.value === w.id}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 const btn = e.currentTarget as HTMLElement;
-                                if (stopConfirmId.value === w.id) {
-                                  stopConfirmId.value = null;
+                                if (menuOpenId.value === w.id) {
+                                  menuOpenId.value = null;
                                 } else {
-                                  stopAnchor.value = btn;
-                                  stopConfirmId.value = w.id;
+                                  menuAnchor.value = btn;
+                                  menuOpenId.value = w.id;
                                 }
                               }}
-                            ><StopIcon /></button>
+                            ><MoreIcon /></button>
                             <Overlay
-                              open={stopConfirmId.value === w.id}
-                              onClose={() => (stopConfirmId.value = null)}
-                              anchor={stopAnchor.value}
+                              open={menuOpenId.value === w.id}
+                              onClose={() => (menuOpenId.value = null)}
+                              anchor={menuAnchor.value}
                               backdrop={false}
-                              panelClass="ws-picker-confirm ws-picker-confirm-stop"
+                              panelClass="ws-picker-menu"
+                              panelRole="menu"
                             >
-                              <p class="ws-picker-confirm-text">
-                                Stop “{w.name}”? It shuts down and becomes unreachable
-                                until you start it again.
-                              </p>
-                              <div class="ws-picker-confirm-actions">
+                              {/* Leads the menu because it is the only item that
+                                  OPENS the workspace, which is what the row is
+                                  for; the three below it configure or destroy it.
+                                  It carries the ALTERNATE mode, so it is always
+                                  the thing a plain tap on the row does not do.
+                                  `alternateOpenMode` decides which rows get one,
+                                  and the in-app switcher asks the same function.
+
+                                  `WORKSPACE_ID` is null here, since the picker is
+                                  served at `/~/`, inside no workspace. That is
+                                  what withholds the desktop client's "switch this
+                                  window": the default already repoints THIS
+                                  window, so the item would say nothing new. */}
+                              {alternateMode !== null && (
                                 <button
-                                  class="ws-picker-btn"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    stopConfirmId.value = null;
-                                  }}
-                                >Cancel</button>
-                                <button
-                                  class="ws-picker-btn ws-picker-btn-danger"
+                                  class="ws-picker-menu-item"
+                                  role="menuitem"
                                   disabled={busy.value}
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    stopConfirmId.value = null;
-                                    void withBusy(() => stopWorkspace(w.id).then(refresh));
+                                    menuOpenId.value = null;
+                                    // `withBusy` reports a rejection on the
+                                    // picker's own error line, which is the only
+                                    // surface it has: no toast host is mounted
+                                    // here.
+                                    void withBusy(async () => {
+                                      await openWorkspaceIn(alternateMode, w.id);
+                                    });
                                   }}
-                                >Stop</button>
-                              </div>
-                            </Overlay>
-                          </div>
-                        ) : (
-                          <button
-                            class="ws-picker-icon ws-picker-icon-play"
-                            disabled={busy.value}
-                            data-tooltip={state === 'unhealthy' ? 'Retry' : 'Start'}
-                            aria-label={`${state === 'unhealthy' ? 'Retry' : 'Start'} ${w.name}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void withBusy(() => restartWorkspace(w.id).then(refresh));
-                            }}
-                          ><PlayIcon /></button>
-                        )}
-                        <div class="ws-picker-menu-wrap">
-                          <button
-                            class="ws-picker-icon ws-picker-icon-more"
-                            data-role="ws-row-more"
-                            disabled={busy.value}
-                            data-tooltip="More"
-                            aria-label={`More actions for ${w.name}`}
-                            aria-haspopup="menu"
-                            aria-expanded={menuOpenId.value === w.id}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              const btn = e.currentTarget as HTMLElement;
-                              if (menuOpenId.value === w.id) {
-                                menuOpenId.value = null;
-                              } else {
-                                menuAnchor.value = btn;
-                                menuOpenId.value = w.id;
-                              }
-                            }}
-                          ><MoreIcon /></button>
-                          <Overlay
-                            open={menuOpenId.value === w.id}
-                            onClose={() => (menuOpenId.value = null)}
-                            anchor={menuAnchor.value}
-                            backdrop={false}
-                            panelClass="ws-picker-menu"
-                            panelRole="menu"
-                          >
-                            {/* Leads the menu because it is the only item that
-                                OPENS the workspace, which is what the row is
-                                for; the three below it configure or destroy it.
-                                It carries the ALTERNATE mode, so it is always
-                                the thing a plain tap on the row does not do.
-                                `alternateOpenMode` decides which rows get one,
-                                and the in-app switcher asks the same function.
-
-                                `WORKSPACE_ID` is null here, since the picker is
-                                served at `/~/`, inside no workspace. That is
-                                what withholds the desktop client's "switch this
-                                window": the default already repoints THIS
-                                window, so the item would say nothing new. */}
-                            {alternateMode !== null && (
+                                >
+                                  {alternateMode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
+                                  <span>{openModeLabel(alternateMode)}</span>
+                                </button>
+                              )}
                               <button
-                                class="ws-picker-menu-item"
+                                class={`ws-picker-menu-item${w.autostart ? ' is-on' : ''}`}
                                 role="menuitem"
                                 disabled={busy.value}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   menuOpenId.value = null;
-                                  // `withBusy` reports a rejection on the
-                                  // picker's own error line, which is the only
-                                  // surface it has: no toast host is mounted
-                                  // here.
-                                  void withBusy(async () => {
-                                    await openWorkspaceIn(alternateMode, w.id);
-                                  });
+                                  void withBusy(() => setAutostart(w.id, !w.autostart).then(refresh));
                                 }}
                               >
-                                {alternateMode === 'separate' ? <PopOutIcon /> : <PopInIcon />}
-                                <span>{openModeLabel(alternateMode)}</span>
+                                <ClockIcon />
+                                {/* States the CURRENT state, and states it in terms of
+                                    what the user gets. "Starts with gateway" named an
+                                    internal process the user never sees; what the
+                                    setting actually decides is whether this workspace
+                                    keeps working (triggers, scheduled tasks, coding
+                                    agents, notifications) while no window is open. */}
+                                <span>{w.autostart ? 'Runs in the background' : 'Only runs while open'}</span>
                               </button>
-                            )}
-                            <button
-                              class={`ws-picker-menu-item${w.autostart ? ' is-on' : ''}`}
-                              role="menuitem"
-                              disabled={busy.value}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                menuOpenId.value = null;
-                                void withBusy(() => setAutostart(w.id, !w.autostart).then(refresh));
-                              }}
-                            >
-                              <ClockIcon />
-                              {/* States the CURRENT state, and states it in terms of
-                                  what the user gets. "Starts with gateway" named an
-                                  internal process the user never sees; what the
-                                  setting actually decides is whether this workspace
-                                  keeps working (triggers, scheduled tasks, coding
-                                  agents, notifications) while no window is open. */}
-                              <span>{w.autostart ? 'Runs in the background' : 'Only runs while open'}</span>
-                            </button>
-                            <button
-                              class="ws-picker-menu-item"
-                              role="menuitem"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                menuOpenId.value = null;
-                                renamingId.value = w.id;
-                                renameValue.value = w.name;
-                              }}
-                            >
-                              <PencilIcon />
-                              <span>Rename</span>
-                            </button>
-                            <button
-                              class="ws-picker-menu-item ws-picker-menu-item-danger"
-                              role="menuitem"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                menuOpenId.value = null;
-                                deletingId.value = w.id;
-                                deleteConfirm.value = '';
-                              }}
-                            >
-                              <TrashIcon />
-                              <span>Delete</span>
-                            </button>
-                          </Overlay>
+                              <button
+                                class="ws-picker-menu-item"
+                                role="menuitem"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  menuOpenId.value = null;
+                                  renamingId.value = w.id;
+                                  renameValue.value = w.name;
+                                }}
+                              >
+                                <PencilIcon />
+                                <span>Rename</span>
+                              </button>
+                              <button
+                                class="ws-picker-menu-item ws-picker-menu-item-danger"
+                                role="menuitem"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  menuOpenId.value = null;
+                                  deletingId.value = w.id;
+                                  deleteConfirm.value = '';
+                                }}
+                              >
+                                <TrashIcon />
+                                <span>Delete</span>
+                              </button>
+                            </Overlay>
+                          </div>
                         </div>
                       </div>
                       {/* What the red dot means, in words, on the row it is
@@ -1303,11 +1257,12 @@ export function WorkspacePicker() {
                           that did not happen to land on it) a workspace could be
                           broken and say nothing about it.
 
-                          LAST child, so it wraps onto its own line UNDER the row
-                          rather than pushing the actions off it: the dot, name
-                          and action columns every other row shares are
-                          untouched, and only a faulty row is taller, by exactly
-                          the line that explains it. */}
+                          OUTSIDE `.ws-picker-line`, and that is what keeps it
+                          off the three cells: the row is a column of two boxes,
+                          and the note is the second one. Move it back inside
+                          the line and it becomes a wrapping item, which is what
+                          pushes the actions off the row. Only a faulty row is
+                          taller, by exactly the line that explains it. */}
                       {fault && <p class="ws-picker-row-note">{fault}</p>}
                     </div>
                   )}

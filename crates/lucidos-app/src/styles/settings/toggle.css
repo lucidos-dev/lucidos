@@ -75,28 +75,6 @@
     opacity: 0.4;
 }
 
-@media (max-width: 600px) {
-    /* A big, solid dot IS the tap target on mobile (2.5em ≈ 40px). The old
-       trick — a 2.75em hit box with a 0.75em transparent border + padding-box
-       background-clip — kept the visible dot a tiny 1.25em, which read as "a
-       small dot with a halo (the transparent ring) around it". A solid thumb has
-       no ring and is easy to grab. box-shadow:none guards against any inherited
-       glow. */
-    .scale-modal-slider::-webkit-slider-thumb {
-        width: 2.5em;
-        height: 2.5em;
-        box-shadow: none;
-        /* Center thumb on track: -(2.5 - 0.25) / 2 */
-        margin-top: -1.125em;
-    }
-
-    .scale-modal-slider::-moz-range-thumb {
-        width: 2.5em;
-        height: 2.5em;
-        box-shadow: none;
-    }
-}
-
 /* Error notice — the red-tinted surface + red bold heading carry the emphasis.
    No left accent bar (see .claude/rules/frontend.md — left-accent stripes on
    cards/callouts/notices are forbidden). */

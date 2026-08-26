@@ -758,8 +758,9 @@ pub(super) async fn chat_submit(
     // origin contract (Workspace variant) and don't route through the
     // per-engine subprocess token channel.
     if request.caller_workspace.is_none() {
-        if let crate::api::actor::SubprocessOrigin::Subprocess { source_thread_id } =
-            crate::api::actor::subprocess_origin(&headers)
+        if let crate::api::actor::SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } = crate::api::actor::subprocess_origin(&headers)
         {
             if !subprocess_chat_legitimate(
                 mode,
@@ -1154,6 +1155,8 @@ pub(super) async fn chat_submit(
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let queue_request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+            // Stamped by `submit` from this task's chain depth.
+            depth: 0,
             message: request.message.clone(),
             thread_id: queue_thread_id,
             event_id: Some(response_event_id.clone()),

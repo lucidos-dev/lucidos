@@ -145,6 +145,8 @@ impl LucidosEngine {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
         external_cancel: Option<CancellationToken>,
+        // See `TriggerContext::queue_entry_id`.
+        queue_entry_id: Uuid,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // The trigger's own model / effort when it pinned one, else `None` so
         // the single canonical resolver in `process_message_with_steps_internal`
@@ -160,6 +162,7 @@ impl LucidosEngine {
                 invocation,
                 go_to_review,
                 side_effect_grant,
+                queue_entry_id,
             }),
             None, // app_context
             None, // file_context

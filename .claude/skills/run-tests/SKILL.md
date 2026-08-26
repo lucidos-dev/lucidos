@@ -21,7 +21,7 @@ Run both phases. If either fails, the whole skill FAILED.
       engine suite because it needs no Postgres and takes under a second.
       **`./scripts/test-engine.sh --full` is NOT equivalent to `make
       test-full`**: only the make target carries the `test-eval` prerequisite,
-      so the script alone drops this phase and its ~115 tests silently.
+      so the script alone drops this phase and its ~270 tests silently.
       The crate is bin-only, so this runs the binary's own unit tests.
       `scripts/check-eval-not-a-test.sh` (in `make lint`) keeps those tests
       unable to reach anything that spends money or boots a workspace

@@ -387,8 +387,8 @@ describe('attachScrollMemory teardown', () => {
   it('never lands the reader on the live edge when the saved offset is out of reach', async () => {
     // Clamping to `Math.min(saved.top, max)` at the deadline is the live edge
     // three seconds late, since the deadline only runs when the offset is
-    // UNREACHABLE. The transcript renders a 20-exchange TAIL
-    // (`threadWindow.INITIAL_WINDOW`). A position recorded against a taller
+    // UNREACHABLE. The transcript renders a TAIL sized by
+    // `threadWindow.seedRenderCount`. A position recorded against a taller
     // render is therefore out of reach on the next open.
     vi.useFakeTimers();
     try {

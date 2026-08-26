@@ -52,6 +52,72 @@ impl ThreadQueueExecutor for GatedExecutor {
     }
 }
 
+/// Executor that records the chain depth each hook observes, and parks
+/// `execute` on a gate like [`GatedExecutor`] so the test controls slot
+/// lifetimes.
+///
+/// The bug this exists for was invisible from outside the queue. `prepare` is
+/// awaited inline by `submit` and read the fire's depth. `execute` runs one
+/// `tokio::spawn` later and read 0, because a task-local does not follow a
+/// spawn.
+struct DepthProbeExecutor {
+    gate: Arc<tokio::sync::Semaphore>,
+    prepared: Arc<std::sync::Mutex<Vec<u32>>>,
+    executed: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Fires as `execute` starts, so a test can await the spawned task instead
+    /// of sleeping for it.
+    entered: tokio::sync::mpsc::UnboundedSender<u32>,
+}
+
+impl DepthProbeExecutor {
+    fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<u32>) {
+        let (entered, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                prepared: Arc::new(std::sync::Mutex::new(Vec::new())),
+                executed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                entered,
+            }),
+            rx,
+        )
+    }
+
+    fn release_one(&self) {
+        self.gate.add_permits(1);
+    }
+
+    fn prepared_depths(&self) -> Vec<u32> {
+        self.prepared.lock().unwrap().clone()
+    }
+
+    fn executed_depths(&self) -> Vec<u32> {
+        self.executed.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ThreadQueueExecutor for DepthProbeExecutor {
+    async fn prepare(&self, _request: &mut ThreadQueueRequest) {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push(crate::scheduler::user_tasks::current_event_trigger_depth());
+    }
+
+    async fn execute(&self, _entry: ExecutableEntry) {
+        let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
+        self.executed.lock().unwrap().push(depth);
+        let _ = self.entered.send(depth);
+        let permit = self
+            .gate
+            .acquire()
+            .await
+            .expect("gate semaphore closed mid-test");
+        permit.forget();
+    }
+}
+
 fn test_policy(max_total: usize) -> CapacityPolicy {
     CapacityPolicy {
         max_concurrent_total: max_total,
@@ -66,6 +132,7 @@ fn test_policy(max_total: usize) -> CapacityPolicy {
         // explicitly via set_policy.
         reserved_background: 0,
         overflow: OverflowPolicy::DropOldest,
+        max_event_trigger_depth: DEFAULT_MAX_EVENT_TRIGGER_DEPTH,
     }
 }
 
@@ -132,6 +199,8 @@ fn event_trigger_request(trigger_id: &str) -> ThreadQueueRequest {
 
 fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
     ThreadQueueRequest::SubThread {
+        // Stamped by `submit` from the submitting task's chain depth.
+        depth: 0,
         prompt: "do the thing".to_string(),
         child_thread_id,
         parent_thread_id: None,
@@ -168,16 +237,7 @@ async fn fixture(max_total: usize) -> Fixture {
     let trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>> =
         Arc::new(std::sync::RwLock::new(HashMap::new()));
     let workspace = tempfile::tempdir().expect("temp workspace");
-    let queue = Arc::new(ThreadQueue::new(
-        pool.clone(),
-        bus.clone(),
-        trigger_configs.clone(),
-        workspace.path().to_path_buf(),
-        Arc::new(tokio::sync::Mutex::new(())),
-        test_policy(max_total),
-    ));
-    let executor = GatedExecutor::new();
-    queue.set_executor(executor.clone());
+    let (queue, executor) = gated_queue(&pool, &bus, &trigger_configs, workspace.path(), max_total);
     Fixture {
         pool,
         db,
@@ -195,6 +255,153 @@ async fn row_status(pool: &sqlx::PgPool, entry_id: Uuid) -> Option<String> {
         .fetch_optional(pool)
         .await
         .expect("thread_queue query")
+}
+
+async fn row_thread_id(pool: &sqlx::PgPool, entry_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT thread_id FROM thread_queue WHERE id = $1")
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .expect("thread_queue query")
+}
+
+/// `(queued_at, admitted_at)` for one entry, so a test can pin that recovery
+/// and the follow-up admit leave the original stamps alone.
+async fn row_stamps(pool: &sqlx::PgPool, entry_id: Uuid) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    sqlx::query_as("SELECT queued_at, admitted_at FROM thread_queue WHERE id = $1")
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .expect("thread_queue stamps query")
+}
+
+/// How many times `event_type` was persisted for this entry. Recovery of a
+/// `queued` row must add none: a re-emitted `ThreadQueued` would reset
+/// `queued_at` and mark work as re-fired that never ran.
+async fn entry_event_count(pool: &sqlx::PgPool, entry_id: Uuid, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1 AND aggregate_id = $2")
+        .bind(event_type)
+        .bind(entry_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("events count query")
+}
+
+/// Create the `thread_summaries` row a started TRIGGER fire leaves behind.
+/// `TriggerStarted` is the real starter event of a trigger thread. Its row is
+/// what the boot sweep reads to decide an admitted entry already did its work.
+async fn materialize_trigger_thread(bus: &EventBus, thread_id: Uuid, trigger_id: &str) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: crate::engine::thread_events::ThreadEvent::TriggerStarted {
+            trigger_id: trigger_id.to_string(),
+            trigger_name: Some(format!("Trigger {trigger_id}")),
+            prompt: Some("run it".to_string()),
+            invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
+            origin: None,
+            go_to_review: false,
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: crate::engine::thread_events::EventMeta {
+            channel: Some(crate::engine::thread_events::EventChannel::Trigger),
+            ..crate::engine::thread_events::EventMeta::NONE
+        },
+    })
+    .await
+    .expect("TriggerStarted emit");
+}
+
+/// The `emitting_trigger_id` carried by each of one entry's three lifecycle
+/// frames, in arrival order. Waits until all three have come off the bus.
+async fn entry_frame_markers(
+    rx: &mut tokio::sync::broadcast::Receiver<crate::engine::event_bus::EmittedEvent>,
+    entry_id: Uuid,
+) -> Vec<(&'static str, Option<String>)> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut seen: Vec<(&'static str, Option<String>)> = Vec::new();
+        while seen.len() < 3 {
+            let emitted = rx.recv().await.expect("bus channel stays open");
+            let name = match &emitted.typed {
+                BusEvent::System(SystemEvent::ThreadQueued { entry_id: id, .. })
+                    if *id == entry_id =>
+                {
+                    "ThreadQueued"
+                }
+                BusEvent::System(SystemEvent::ThreadQueueAdmitted { entry_id: id, .. })
+                    if *id == entry_id =>
+                {
+                    "ThreadQueueAdmitted"
+                }
+                BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id: id })
+                    if *id == entry_id =>
+                {
+                    "ThreadQueueCompleted"
+                }
+                _ => continue,
+            };
+            seen.push((name, emitted.emitting_trigger_id.clone()));
+        }
+        seen
+    })
+    .await
+    .expect("all three lifecycle frames arrive")
+}
+
+/// A manager wired to a fresh [`GatedExecutor`]. The one construction site, so
+/// a new `ThreadQueue::new` argument lands in one place.
+fn gated_queue(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    trigger_configs: &Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    workspace: &std::path::Path,
+    max_total: usize,
+) -> (Arc<ThreadQueue>, Arc<GatedExecutor>) {
+    let executor = GatedExecutor::new();
+    let queue = queue_with_executor(
+        pool,
+        bus,
+        trigger_configs,
+        workspace,
+        max_total,
+        executor.clone(),
+    );
+    (queue, executor)
+}
+
+/// A manager wired to a caller-supplied executor. `set_executor` is a
+/// `OnceLock`, so a fixture that wants a different probe has to build its own
+/// queue rather than swap one in.
+fn queue_with_executor(
+    pool: &sqlx::PgPool,
+    bus: &EventBus,
+    trigger_configs: &Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    workspace: &std::path::Path,
+    max_total: usize,
+    executor: Arc<dyn ThreadQueueExecutor>,
+) -> Arc<ThreadQueue> {
+    let queue = Arc::new(ThreadQueue::new(
+        pool.clone(),
+        bus.clone(),
+        trigger_configs.clone(),
+        workspace.to_path_buf(),
+        Arc::new(tokio::sync::Mutex::new(())),
+        test_policy(max_total),
+    ));
+    queue.set_executor(executor);
+    queue
+}
+
+/// A fresh manager over the same database, standing in for the next engine
+/// process. The old process's in-flight executions died with it.
+fn restarted_queue(f: &Fixture, max_total: usize) -> (Arc<ThreadQueue>, Arc<GatedExecutor>) {
+    gated_queue(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        max_total,
+    )
 }
 
 async fn cron_row_count(pool: &sqlx::PgPool, trigger_id: &str) -> i64 {
@@ -574,17 +781,7 @@ async fn recover_collapses_duplicate_cron_rows_to_one() {
     let queued2 = emit_cron_queued(&f.bus, "trig-a", false).await;
     assert_eq!(cron_row_count(&f.pool, "trig-a").await, 3);
 
-    // A fresh manager recovers over the same DB.
-    let queue2 = Arc::new(ThreadQueue::new(
-        f.pool.clone(),
-        f.bus.clone(),
-        f.trigger_configs.clone(),
-        f.workspace.path().to_path_buf(),
-        Arc::new(tokio::sync::Mutex::new(())),
-        test_policy(5),
-    ));
-    let executor2 = GatedExecutor::new();
-    queue2.set_executor(executor2.clone());
+    let (queue2, executor2) = restarted_queue(&f, 5);
     queue2.recover_persisted_entries().await;
 
     // The duplicates are coalesced away — exactly one cron row survives (the
@@ -699,18 +896,9 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
         Some("admitted")
     );
 
-    // "Restart": a fresh manager over the same DB (the old process's
-    // in-flight execution died with it).
-    let queue2 = Arc::new(ThreadQueue::new(
-        f.pool.clone(),
-        f.bus.clone(),
-        f.trigger_configs.clone(),
-        f.workspace.path().to_path_buf(),
-        Arc::new(tokio::sync::Mutex::new(())),
-        test_policy(5),
-    ));
-    let executor2 = GatedExecutor::new();
-    queue2.set_executor(executor2.clone());
+    // "Restart" with the entry still bound to no thread: the process died
+    // before the fire minted one, so nothing ran and the fire is owed.
+    let (queue2, executor2) = restarted_queue(&f, 5);
     queue2.recover_persisted_entries().await;
 
     // The admitted-but-dead fire re-queued (status back to 'queued')…
@@ -738,46 +926,216 @@ async fn recover_hands_off_spawn_entries_whose_thread_materialized() {
     let a = f.queue.submit(sub_thread_request(child), None, None).await;
     assert!(a.admitted);
 
-    // Materialize the thread (what the dead process's execution did before
-    // crashing) — MessageReceived creates the thread_summaries row.
-    f.bus
-        .emit(BusEvent::Thread {
-            thread_id: child,
-            event: crate::engine::thread_events::ThreadEvent::MessageReceived {
-                text: "spawned".into(),
-                user_image_hashes: vec![],
-                device_id: None,
-                device: None,
-                image_description: None,
-                parent_thread_id: None,
-                spawning_event_id: None,
-                mode: crate::engine::thread_events::ActorMode::Agent,
-                model: None,
-                reasoning_effort: None,
-                origin: None,
-            },
-            meta: crate::engine::thread_events::EventMeta {
-                channel: Some(crate::engine::thread_events::EventChannel::Chat),
-                ..crate::engine::thread_events::EventMeta::NONE
-            },
-        })
-        .await
-        .expect("MessageReceived emit");
+    // Materialize the thread, which is what the dead process's execution did
+    // before crashing.
+    emit_message_received(&f.bus, child).await;
 
-    let queue2 = Arc::new(ThreadQueue::new(
-        f.pool.clone(),
-        f.bus.clone(),
-        f.trigger_configs.clone(),
-        f.workspace.path().to_path_buf(),
-        Arc::new(tokio::sync::Mutex::new(())),
-        test_policy(5),
-    ));
-    queue2.set_executor(GatedExecutor::new());
+    let (queue2, _executor2) = restarted_queue(&f, 5);
     queue2.recover_persisted_entries().await;
 
     // The spawn already happened — the entry completes (row deleted) and
     // ownership passes to thread-level recovery (chat settle / CC resume).
     assert_eq!(row_status(&f.pool, a.entry_id).await, None);
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// THE restart-replay bug: a cron fire ran, parked on `ask_user_question`, and
+/// the engine restarted. Parking emits no terminal event, so nothing ever
+/// completed the entry and its row sat at `admitted`. The boot sweep re-queued
+/// it and the whole trigger ran a second time, five minutes after the first.
+///
+/// The fire's thread is bound to the entry, so the sweep can see the work
+/// already started and hand the thread to thread-level recovery instead.
+#[tokio::test]
+async fn recover_hands_off_a_cron_fire_whose_thread_started() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let entry_id = emit_cron_queued(&f.bus, "trig-a", true).await;
+    let fired_thread = Uuid::new_v4();
+    f.queue.record_entry_thread(entry_id, fired_thread).await;
+    materialize_trigger_thread(&f.bus, fired_thread, "trig-a").await;
+
+    let (queue2, executor2) = restarted_queue(&f, 5);
+    queue2.recover_persisted_entries().await;
+
+    assert_eq!(
+        row_status(&f.pool, entry_id).await,
+        None,
+        "a fire that already started completes instead of re-queuing"
+    );
+    // Nothing re-fires. `prepare` is awaited INLINE inside `drain`, ahead of
+    // the spawn, so a zero here is deterministic. An empty `executed_ids` would
+    // only mean the spawned task had not run yet.
+    queue2.drain().await;
+    assert_eq!(
+        executor2.prepared.load(Ordering::SeqCst),
+        0,
+        "the parked thread is thread-level recovery's to own, not the queue's"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// A handed-off fire must not consume its trigger's coalescing slot. The
+/// handoff row already ran. The queued sibling behind it never did, so dropping
+/// it as a "duplicate scheduled fire" would lose a run nobody notices.
+#[tokio::test]
+async fn a_handed_off_cron_fire_leaves_its_queued_sibling_alone() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let started = emit_cron_queued(&f.bus, "trig-a", true).await;
+    let waiting = emit_cron_queued(&f.bus, "trig-a", false).await;
+    let fired_thread = Uuid::new_v4();
+    f.queue.record_entry_thread(started, fired_thread).await;
+    materialize_trigger_thread(&f.bus, fired_thread, "trig-a").await;
+
+    let (queue2, executor2) = restarted_queue(&f, 5);
+    queue2.recover_persisted_entries().await;
+
+    assert_eq!(
+        row_status(&f.pool, started).await,
+        None,
+        "the fire that already ran hands off"
+    );
+    assert_eq!(
+        row_status(&f.pool, waiting).await.as_deref(),
+        Some("queued"),
+        "the sibling that never ran survives the handoff"
+    );
+    queue2.drain().await;
+    wait_until(|| {
+        let ex = executor2.clone();
+        async move { ex.executed_ids() == vec![waiting] }
+    })
+    .await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// The residual case that keeps the guard above from being over-eager. This
+/// fire got as far as minting a thread id and no further, so nothing ran and
+/// the fire is still owed.
+///
+/// Its sibling, an entry bound to no thread at all, is covered by
+/// `recover_requeues_admitted_trigger_entries_after_restart`.
+#[tokio::test]
+async fn recover_requeues_an_admitted_cron_fire_whose_thread_never_existed() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let entry_id = emit_cron_queued(&f.bus, "trig-a", true).await;
+    f.queue.record_entry_thread(entry_id, Uuid::new_v4()).await;
+
+    let (queue2, executor2) = restarted_queue(&f, 5);
+    queue2.recover_persisted_entries().await;
+
+    assert_eq!(
+        row_status(&f.pool, entry_id).await.as_deref(),
+        Some("queued"),
+        "no thread materialized, so the fire is re-queued"
+    );
+    queue2.drain().await;
+    wait_until(|| {
+        let ex = executor2.clone();
+        async move { ex.executed_ids() == vec![entry_id] }
+    })
+    .await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// The branch the handoff must leave alone. A `queued` row never ran, so it
+/// reloads silently: no `ThreadQueued` re-emit, and the original `queued_at`
+/// stands so the backlog-age notification keeps counting from the real wait.
+#[tokio::test]
+async fn recover_loads_a_queued_row_silently_with_its_original_queued_at() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let entry_id = emit_cron_queued(&f.bus, "trig-a", false).await;
+    let (queued_at, admitted_at) = row_stamps(&f.pool, entry_id).await;
+    assert_eq!(admitted_at, None, "a queued row was never admitted");
+
+    let (queue2, _executor2) = restarted_queue(&f, 5);
+    queue2.recover_persisted_entries().await;
+
+    assert_eq!(
+        row_status(&f.pool, entry_id).await.as_deref(),
+        Some("queued")
+    );
+    assert_eq!(
+        row_stamps(&f.pool, entry_id).await.0,
+        queued_at,
+        "reloading a queued row must not restart its wait"
+    );
+    assert_eq!(
+        entry_event_count(&f.pool, entry_id, "ThreadQueued").await,
+        1,
+        "a row that never ran is not re-queued, so it emits no second ThreadQueued"
+    );
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// A cron entry binds no thread at submit time, so admission alone leaves the
+/// row unbound. The fire reports the thread it mints, which is the half that
+/// gives the boot handoff above something to test.
+#[tokio::test]
+async fn admitting_a_cron_entry_records_its_thread_id() {
+    let f = fixture(5).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let a = f.queue.submit(cron_request("trig-a"), None, None).await;
+    assert!(a.admitted);
+    assert_eq!(
+        row_thread_id(&f.pool, a.entry_id).await,
+        None,
+        "a trigger fire creates its thread at execution, not at admission"
+    );
+    let admitted_at = row_stamps(&f.pool, a.entry_id).await.1;
+    assert!(admitted_at.is_some());
+
+    let fired_thread = Uuid::new_v4();
+    f.queue.record_entry_thread(a.entry_id, fired_thread).await;
+
+    assert_eq!(
+        row_thread_id(&f.pool, a.entry_id).await,
+        Some(fired_thread),
+        "the fire's thread lands on its queue row"
+    );
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("admitted"),
+        "recording the thread does not move the entry out of Running"
+    );
+    assert_eq!(
+        row_stamps(&f.pool, a.entry_id).await.1,
+        admitted_at,
+        "the panel's Running age counts from the first admission"
+    );
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -797,6 +1155,64 @@ async fn set_policy_persists_and_reloads() {
     assert_eq!(f.queue.policy().await, policy);
     // A fresh boot reconstructs the policy from the latest event.
     assert_eq!(ThreadQueue::load_policy(&f.pool).await, policy);
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// Every lifecycle frame of a trigger fire's entry names its owning trigger, so
+/// the matcher can keep that fire from waking the trigger.
+///
+/// None of the three can read the ambient scope. `ThreadQueued` goes out before
+/// the fire starts, and `ThreadQueueCompleted` comes from the sibling task that
+/// joins it. `ThreadQueueCompleted` is the one that matters most: it is
+/// persisted, so a broad subscription really does wake on it.
+#[tokio::test]
+async fn a_trigger_fires_queue_frames_name_the_trigger_that_owns_them() {
+    let f = fixture(10).await;
+    f.trigger_configs
+        .write()
+        .unwrap()
+        .insert("trig-a".to_string(), test_trigger_config("trig-a"));
+
+    let mut rx = f.bus.subscribe();
+    let a = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    assert!(a.admitted);
+    f.executor.release_one(); // execution finishes → the sibling task completes
+
+    for (name, marker) in entry_frame_markers(&mut rx, a.entry_id).await {
+        assert_eq!(marker.as_deref(), Some("trig-a"), "{name} lost its owner");
+    }
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+/// The fail-open direction. A sub-thread a fire spawns is not the fire, so its
+/// frames must carry no marker even though `submit` runs inside the fire's
+/// scope. Inherit it and the trigger stops hearing about work it asked for,
+/// which is the one failure that never recovers.
+#[tokio::test]
+async fn a_sub_thread_a_fire_submits_does_not_inherit_the_fires_marker() {
+    let f = fixture(10).await;
+    let mut rx = f.bus.subscribe();
+    let queue = f.queue.clone();
+    let sub = crate::scheduler::user_tasks::ACTIVE_TRIGGER_ID
+        .scope("trig-a".to_string(), async move {
+            queue
+                .submit(sub_thread_request(Uuid::new_v4()), None, None)
+                .await
+        })
+        .await;
+    assert!(sub.admitted);
+    f.executor.release_one();
+
+    for (name, marker) in entry_frame_markers(&mut rx, sub.entry_id).await {
+        assert_eq!(marker, None, "{name} inherited the parent fire's marker");
+    }
 
     f.pool.close().await;
     teardown_test_db(&f.db).await;
@@ -1511,4 +1927,338 @@ fn affects_user_running_selects_status_transitions() {
         tool_use_id: String::new(),
     }));
     assert!(!affects_user_running(&ThreadEvent::ThreadSaved));
+}
+
+// ---- Event-trigger chain depth ----
+
+/// THE boundary the bug lived at, measured with a probe.
+///
+/// A trigger fire hands its `run_thread` spawn to the queue, and the queue
+/// hands the execution to `tokio::spawn`. `EVENT_TRIGGER_DEPTH` follows an
+/// await chain and not a spawn, so `prepare` read the fire's depth and
+/// `execute` read 0. With execution at 0 the chain restarts every hop, and
+/// the depth cap can never end a loop that passes through spawned work.
+#[tokio::test]
+async fn a_fires_spawned_work_runs_at_the_fires_own_depth() {
+    use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;
+
+    const FIRE_DEPTH: u32 = 2;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let (probe, mut entered) = DepthProbeExecutor::new();
+    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 4, probe.clone());
+
+    // Submitted from inside the fire, exactly as the `run_thread` tool does.
+    let outcome = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+        )
+        .await;
+    assert!(outcome.admitted);
+    let executed_depth = entered.recv().await.expect("execute runs");
+
+    assert_eq!(
+        probe.prepared_depths(),
+        vec![FIRE_DEPTH],
+        "the admission hook emits, so it has to run at the fire's depth"
+    );
+    assert_eq!(
+        executed_depth, FIRE_DEPTH,
+        "a spawn does not consume a hop: spawned work runs AT the fire's depth"
+    );
+    assert_eq!(probe.executed_depths(), vec![FIRE_DEPTH]);
+
+    probe.release_one();
+    let _ = pool;
+    teardown_test_db(&db).await;
+}
+
+/// The same request, admitted by the drainer instead of by `submit`.
+///
+/// The drainer runs on the completing entry's task, whose own chain depth is 0.
+/// A depth read from the ambient task there would be 0 too. One queued fire
+/// would then behave differently from an identical one that had a free slot.
+/// The depth travels on the request precisely so both answer the same.
+#[tokio::test]
+async fn a_queued_spawn_keeps_its_depth_when_the_drainer_admits_it() {
+    use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;
+
+    const FIRE_DEPTH: u32 = 1;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let (probe, mut entered) = DepthProbeExecutor::new();
+    // One slot, so the second submit has to wait for the drainer.
+    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 1, probe.clone());
+
+    let first = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+        )
+        .await;
+    assert!(first.admitted);
+    assert_eq!(entered.recv().await, Some(FIRE_DEPTH));
+
+    let second = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            queue.submit(sub_thread_request(Uuid::new_v4()), None, None),
+        )
+        .await;
+    assert!(!second.admitted, "the pool is full, so this one queues");
+
+    // Free the slot. The drain that follows runs on the completing task.
+    probe.release_one();
+    let drained_depth = entered.recv().await.expect("the queued entry drains");
+
+    assert_eq!(
+        drained_depth, FIRE_DEPTH,
+        "a drained entry runs at the depth it was submitted with, not the drainer's"
+    );
+    assert_eq!(
+        probe.prepared_depths(),
+        vec![FIRE_DEPTH, FIRE_DEPTH],
+        "both admissions emit at the fire's depth"
+    );
+
+    probe.release_one();
+    let _ = pool;
+    teardown_test_db(&db).await;
+}
+
+/// A coding-agent session emits from a spawn tree the executor's scope cannot
+/// reach, so its thread carries the depth instead.
+///
+/// The binding lasts as long as the WORK, not as long as the thread: once the
+/// entry completes, a later user Continue on the same thread starts a fresh
+/// chain at 0.
+#[tokio::test]
+async fn an_admitted_spawns_thread_carries_the_chain_depth_until_it_completes() {
+    use crate::scheduler::user_tasks::{chain_depth_for_thread, EVENT_TRIGGER_DEPTH};
+
+    const FIRE_DEPTH: u32 = 2;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let configs = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let (probe, mut entered) = DepthProbeExecutor::new();
+    let queue = queue_with_executor(&pool, &bus, &configs, workspace.path(), 4, probe.clone());
+
+    let child = Uuid::new_v4();
+    let outcome = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            queue.submit(sub_thread_request(child), None, None),
+        )
+        .await;
+    assert!(outcome.admitted);
+    entered.recv().await.expect("execute runs");
+
+    assert_eq!(
+        chain_depth_for_thread(child),
+        Some(FIRE_DEPTH),
+        "every event on this thread belongs to the fire's chain, whichever task emits it"
+    );
+
+    queue.complete(outcome.entry_id).await;
+    assert_eq!(
+        chain_depth_for_thread(child),
+        None,
+        "the work is over, so a later user Continue starts a fresh chain"
+    );
+
+    probe.release_one();
+    let _ = pool;
+    teardown_test_db(&db).await;
+}
+
+/// The depth survives a restart on the persisted request, and the re-queued
+/// entry re-fires at it.
+///
+/// This is the half that has to survive. The registry does not: it is rebuilt
+/// when the entry is admitted, so a re-fire after a restart carries the same
+/// chain the dead process was on.
+#[tokio::test]
+async fn a_re_queued_entry_re_fires_at_the_depth_it_was_submitted_with() {
+    use crate::scheduler::user_tasks::{
+        chain_depth_for_thread, forget_chain_depth, EVENT_TRIGGER_DEPTH,
+    };
+
+    const FIRE_DEPTH: u32 = 2;
+    let f = fixture(4).await;
+    let child = Uuid::new_v4();
+    let outcome = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            f.queue.submit(sub_thread_request(child), None, None),
+        )
+        .await;
+    assert!(outcome.admitted);
+
+    // The previous process died mid-flight: its in-memory registry went with
+    // it, and its thread never materialized, so the row is owed a re-fire.
+    forget_chain_depth(child, outcome.entry_id);
+    assert_eq!(chain_depth_for_thread(child), None);
+
+    let (probe, mut entered) = DepthProbeExecutor::new();
+    let restarted = queue_with_executor(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        4,
+        probe.clone(),
+    );
+    restarted.recover_persisted_entries().await;
+    restarted.drain().await;
+    let refired_depth = entered.recv().await.expect("the re-queued entry re-fires");
+
+    assert_eq!(
+        refired_depth, FIRE_DEPTH,
+        "the re-fire reads its depth off the persisted request"
+    );
+    assert_eq!(
+        chain_depth_for_thread(child),
+        Some(FIRE_DEPTH),
+        "and re-registers the thread, so emits from its own tasks stay on the chain"
+    );
+
+    restarted.complete(outcome.entry_id).await;
+    f.executor.release_one();
+    probe.release_one();
+    teardown_test_db(&f.db).await;
+}
+
+/// A row handed to thread recovery leaves NO chain-depth binding behind.
+///
+/// The handoff completes the entry without an in-memory slot, so nothing would
+/// ever clear one. It would outlive the work, and a later user Continue on that
+/// thread would inherit a chain it has nothing to do with.
+#[tokio::test]
+async fn a_handed_off_row_leaves_no_chain_depth_behind() {
+    use crate::scheduler::user_tasks::{
+        chain_depth_for_thread, forget_chain_depth, EVENT_TRIGGER_DEPTH,
+    };
+
+    let f = fixture(4).await;
+    let child = Uuid::new_v4();
+    let outcome = EVENT_TRIGGER_DEPTH
+        .scope(2, f.queue.submit(sub_thread_request(child), None, None))
+        .await;
+    assert!(outcome.admitted);
+    // A live thread is what makes the boot sweep hand off instead of re-queue.
+    materialize_trigger_thread(&f.bus, child, "t1").await;
+    forget_chain_depth(child, outcome.entry_id);
+
+    let (restarted, _executor) = restarted_queue(&f, 4);
+    restarted.recover_persisted_entries().await;
+
+    assert_eq!(
+        chain_depth_for_thread(child),
+        None,
+        "the work is thread recovery's now, and a binding here would never expire"
+    );
+
+    f.executor.release_one();
+    teardown_test_db(&f.db).await;
+}
+
+/// Two entries can name one thread, and the first to finish must not take the
+/// other's binding with it.
+///
+/// A plain `thread -> depth` map let it. The surviving entry's work then fell
+/// back to 0 and escaped the cap, silently, which is the failure the whole
+/// carrier exists to prevent.
+#[test]
+fn one_entry_completing_leaves_a_sibling_entrys_binding_alone() {
+    use crate::scheduler::user_tasks::{
+        chain_depth_for_thread, forget_chain_depth, register_chain_depth,
+    };
+
+    let thread = Uuid::new_v4();
+    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+    register_chain_depth(thread, first, 1);
+    register_chain_depth(thread, second, 3);
+
+    assert_eq!(
+        chain_depth_for_thread(thread),
+        Some(3),
+        "the deepest live binding wins, matching how EventBus ranks the carriers"
+    );
+
+    forget_chain_depth(thread, second);
+    assert_eq!(
+        chain_depth_for_thread(thread),
+        Some(1),
+        "the sibling's work is still on its own chain"
+    );
+
+    forget_chain_depth(thread, first);
+    assert_eq!(chain_depth_for_thread(thread), None);
+}
+
+/// Re-registering one owner replaces its row rather than stacking another.
+#[test]
+fn re_registering_the_same_entry_does_not_stack_a_second_binding() {
+    use crate::scheduler::user_tasks::{
+        chain_depth_for_thread, forget_chain_depth, register_chain_depth,
+    };
+
+    let thread = Uuid::new_v4();
+    let entry = Uuid::new_v4();
+    register_chain_depth(thread, entry, 2);
+    register_chain_depth(thread, entry, 2);
+    forget_chain_depth(thread, entry);
+
+    assert_eq!(
+        chain_depth_for_thread(thread),
+        None,
+        "one forget clears what one owner registered"
+    );
+}
+
+/// The frame that closes a fire's entry carries that fire's depth.
+///
+/// It goes out on the sibling task that joins the work, where the ambient scope
+/// reads 0. `ThreadQueueCompleted` is persisted and therefore subscribable, so
+/// at depth 0 two triggers subscribed to it would wake each other forever. The
+/// self-wake gate cannot help: each wakes the OTHER.
+#[tokio::test]
+async fn the_frame_closing_a_fire_carries_the_fires_depth() {
+    use crate::scheduler::user_tasks::EVENT_TRIGGER_DEPTH;
+
+    const FIRE_DEPTH: u32 = 2;
+    let f = fixture(4).await;
+    let mut rx = f.bus.subscribe();
+    let outcome = EVENT_TRIGGER_DEPTH
+        .scope(
+            FIRE_DEPTH,
+            f.queue
+                .submit(sub_thread_request(Uuid::new_v4()), None, None),
+        )
+        .await;
+    assert!(outcome.admitted);
+    f.queue.complete(outcome.entry_id).await;
+
+    let mut completed_depth = None;
+    while let Ok(emitted) = rx.try_recv() {
+        if let BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }) = &emitted.typed {
+            if *entry_id == outcome.entry_id {
+                completed_depth = Some(emitted.depth);
+            }
+        }
+    }
+    assert_eq!(
+        completed_depth,
+        Some(FIRE_DEPTH),
+        "the closing frame belongs to the fire's chain, not to the joining task"
+    );
+
+    f.executor.release_one();
+    teardown_test_db(&f.db).await;
 }

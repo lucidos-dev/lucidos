@@ -848,9 +848,9 @@ describe('tool description from event', () => {
     // The full command is preserved on the step so the UI can show it on mouseover.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
-    const fullCmd = 'cd /Users/alex/IdeaProjects/lucidos && git log --oneline -50 | head -20';
+    const fullCmd = 'cd /Users/me/projects/lucidos && git log --oneline -50 | head -20';
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'show recent commits' } as ThreadEvent, '2026-04-30T10:00:00Z');
-    handleEvent(map, 't', 2, { type: 'ToolCalled', name: 'run_bash', args: { command: fullCmd }, description: 'Running: cd /Users/alex/IdeaProjects/l…log --oneline -50 | head -20...' } as ThreadEvent, '2026-04-30T10:00:01Z');
+    handleEvent(map, 't', 2, { type: 'ToolCalled', name: 'run_bash', args: { command: fullCmd }, description: 'Running: cd /Users/me/projects/lucid…log --oneline -50 | head -20...' } as ThreadEvent, '2026-04-30T10:00:01Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
     const respEvents = exchangeResponseEvents(exchanges[0]);
@@ -1094,7 +1094,7 @@ describe('tool description from event', () => {
     const thread = makeThreadState();
     thread.meta.channel = 'claude_code';
     const map = new Map([['t', thread]]);
-    const fullPath = '/Users/alex/IdeaProjects/lucidos/crates/lucidos-app/src/store/thread-events.ts';
+    const fullPath = '/Users/me/projects/lucidos/crates/lucidos-app/src/store/thread-events.ts';
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'open it' } as ThreadEvent, '2026-05-09T10:00:00Z');
     handleEvent(map, 't', 2, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: fullPath }, description: 'Read thread-events.ts' } as ThreadEvent, '2026-05-09T10:00:01Z');
 

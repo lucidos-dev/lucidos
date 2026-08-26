@@ -215,7 +215,9 @@ pub(in crate::api) async fn refuse_out_of_reach(
 ) -> Result<(), ThreadReachError> {
     let caller_thread_id = match crate::api::actor::subprocess_origin(headers) {
         SubprocessOrigin::NotSubprocess => return Ok(()),
-        SubprocessOrigin::Subprocess { source_thread_id } => source_thread_id,
+        SubprocessOrigin::Subprocess {
+            source_thread_id, ..
+        } => source_thread_id,
     };
     let Some(caller_thread_id) = caller_thread_id else {
         crate::log!(

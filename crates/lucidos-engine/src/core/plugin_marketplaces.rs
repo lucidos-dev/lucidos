@@ -509,8 +509,7 @@ fn clone_marketplace(
     credentials: &GitCredentials,
 ) -> Result<(tempfile::TempDir, PathBuf, Option<String>), String> {
     let parent = workspace_path
-        .join(".lucidos")
-        .join("tmp")
+        .join(crate::core::TMP_DIR)
         .join("plugin-marketplaces");
     std::fs::create_dir_all(&parent).map_err(|e| format!("create scratch dir: {e}"))?;
     let scratch =

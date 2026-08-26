@@ -90,8 +90,8 @@ const SAVE_DEBOUNCE_MS = 150;
  *  **Giving up MOVES NOBODY.** Clamping an unreachable offset to the current
  *  maximum is the live edge and nothing else, which nothing may scroll to on
  *  its own (ADR 0064). The windowed transcript makes an unreachable offset
- *  routine rather than rare: ThreadView renders a trailing slice
- *  (`threadWindow.INITIAL_WINDOW`), so a position recorded against a taller
+ *  routine rather than rare: ThreadView renders a trailing slice sized by
+ *  `threadWindow.seedRenderCount`, so a position recorded against a taller
  *  render is out of reach on the next open. `scrollToSelectorAndPulse`'s
  *  deadline reaches the same conclusion for a dead deep-link. */
 const RESTORE_DEADLINE_MS = 3000;

@@ -82,6 +82,10 @@ playwright-report/
 # run that costs real money. It is local evidence, not source, and an agent
 # worktree that auto-commits its tree would otherwise carry one onto a branch.
 eval/context-mode/results/
+# Hand-rolled eval run wrappers and their stdout logs. Same reasoning as the
+# results above: local scratch from a paid run, hundreds of KB per log, and it
+# holds run ids and state files that mean nothing on another machine.
+.eval-logs/
 
 # Version files and stamps (build.rs manages these — gitignored so worktrees
 # don't create merge conflicts. Only exist in main working directory.)

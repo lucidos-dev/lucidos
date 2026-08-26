@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
-use crate::scheduler::user_tasks::current_event_trigger_depth;
+use crate::scheduler::user_tasks::{current_event_trigger_depth, current_trigger_id};
 
 /// CC session-end status — always `'idle'`. A proposed change is a review
 /// artifact, not a parked loop, so it does not block the parent's "is my
@@ -119,15 +119,53 @@ pub struct EmittedEvent {
     /// thread broadcasts that carry out-of-band projection refreshes.
     /// `None` for System events and projection-free transient Thread events.
     pub aggregate: Option<crate::core::store::ThreadAggregate>,
-    /// How deep in an event-trigger chain the EMITTING task was running
-    /// (`scheduler::user_tasks::current_event_trigger_depth`).
+    /// How deep in an event-trigger chain the work that emitted this was
+    /// running. Resolved by [`emit_depth`] from the emitting task's scope and
+    /// the Thread Queue's per-thread registration, whichever is deeper.
     ///
-    /// Broadcast-only, and never persisted: it describes the task, not the
+    /// Broadcast-only, and never persisted: it describes the work, not the
     /// event. The scheduler dispatches a thread event at this depth. That is
-    /// what makes `MAX_EVENT_TRIGGER_DEPTH` engage for a trigger subscribed to
-    /// an event its own run emits. A domain event carries the same number in
-    /// its own variant, where it IS persisted, so a replay reconstructs it.
+    /// what makes the depth cap engage for a chain across triggers, where A's
+    /// fire wakes B and B's fire wakes A. It reaches a chain routed through
+    /// spawned work too, unlike `emitting_trigger_id` below. A domain event
+    /// carries the same number in its own
+    /// variant, where it IS persisted, so a replay reconstructs it.
     pub depth: u32,
+    /// Which trigger's fire emitted this, if any. Read from
+    /// `scheduler::user_tasks::current_trigger_id`, or stated outright by a
+    /// caller of [`EventBus::emit_as_trigger`].
+    ///
+    /// Broadcast-only and never persisted: it describes the emitting task, not
+    /// the event, so it is absent from the stored row and from every replay
+    /// path. The scheduler drops this trigger from the matches, so a trigger is
+    /// never woken by an event its own fire emitted. Absent means no
+    /// suppression, which is the direction to fail in: an extra wake, never a
+    /// missing one. See `docs/adr/0137-a-trigger-never-wakes-itself.md`.
+    pub emitting_trigger_id: Option<String>,
+}
+
+/// The chain depth an event belongs to, resolved from both carriers.
+///
+/// A thread event has two: the emitting task's scope, and the registration the
+/// Thread Queue made for that thread. They disagree whenever a task is too deep
+/// in a spawn tree for the scope to reach it, which is most of a coding-agent
+/// session. Take the deeper of the two.
+///
+/// The direction matters. Under-counting re-opens the loop the cap exists to
+/// end, and does it silently. Over-counting suppresses a fire, which the cap
+/// notification now names for the user. Prefer the recoverable error.
+fn emit_depth(event: &BusEvent) -> u32 {
+    match event {
+        BusEvent::Thread { thread_id, .. } => thread_emit_depth(*thread_id),
+        BusEvent::System(_) => current_event_trigger_depth(),
+    }
+}
+
+/// [`emit_depth`] for a caller that has the thread id but no `BusEvent` yet.
+fn thread_emit_depth(thread_id: Uuid) -> u32 {
+    let registered =
+        crate::scheduler::user_tasks::chain_depth_for_thread(thread_id).unwrap_or_default();
+    current_event_trigger_depth().max(registered)
 }
 
 /// Arguments to [`EventBus::replay_historical_event`]. Fields mirror the
@@ -422,6 +460,7 @@ impl EventBus {
             typed: BusEvent::System(event),
             aggregate: None,
             depth: current_event_trigger_depth(),
+            emitting_trigger_id: current_trigger_id(),
         });
     }
 
@@ -468,7 +507,8 @@ impl EventBus {
                     meta: EventMeta::NONE,
                 },
                 aggregate: Some(aggregate),
-                depth: current_event_trigger_depth(),
+                depth: thread_emit_depth(thread_id),
+                emitting_trigger_id: current_trigger_id(),
             });
         }
 
@@ -596,8 +636,10 @@ impl EventBus {
                 }),
                 aggregate: None,
                 // A backfill is not a link in anyone's trigger chain, and the
-                // variant above says the same thing.
+                // variant above says the same thing. No trigger owns it either,
+                // so it wakes every subscriber it matches.
                 depth: 0,
+                emitting_trigger_id: None,
             });
         }
 
@@ -617,6 +659,20 @@ impl EventBus {
     /// `ctx` should identify the call site, e.g. `"[ChangeOps] ChangeApplied"`.
     pub async fn emit_or_log(&self, event: BusEvent, ctx: &str) {
         if let Err(e) = self.emit(event).await {
+            log!("[EventBus] {} emit failed: {}", ctx, e);
+        }
+    }
+
+    /// [`Self::emit_or_log`] for a caller that states which trigger's fire the
+    /// event belongs to, rather than inheriting it. See
+    /// [`Self::emit_as_trigger`].
+    pub async fn emit_or_log_as_trigger(
+        &self,
+        event: BusEvent,
+        ctx: &str,
+        emitting_trigger_id: Option<String>,
+    ) {
+        if let Err(e) = self.emit_as_trigger(event, emitting_trigger_id).await {
             log!("[EventBus] {} emit failed: {}", ctx, e);
         }
     }
@@ -666,10 +722,36 @@ impl EventBus {
         &self,
         event: BusEvent,
     ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // Read before the first `.await`, so the marker is this caller's fire
+        // and not one a later hop happens to be running under.
+        self.emit_as_trigger(event, current_trigger_id()).await
+    }
+
+    /// Emit on behalf of `emitting_trigger_id`'s fire, whatever task this runs
+    /// on. [`Self::emit`] passes the ambient marker. Two callers state one
+    /// instead: the *Thread Queue* and `emit_domain_event`.
+    ///
+    /// A queue entry's lifecycle frames go out on tasks the fire does not own.
+    /// `ThreadQueued` precedes the fire, and `ThreadQueueCompleted` comes from
+    /// the sibling task that joins it. Neither sees the ambient scope, so the
+    /// queue states the owner it recorded on the entry.
+    ///
+    /// A domain event has the opposite problem. An HTTP emit runs on a request
+    /// task with no ambient scope, and the fire that caused it may be another
+    /// process. Its marker comes off the verified origin token (ADR 0137).
+    ///
+    /// `None` states the opposite just as firmly. A sub-thread the fire
+    /// submitted is not the fire, and must not inherit its marker. Suppressing
+    /// a wake the trigger asked for is the one direction that cannot recover.
+    pub async fn emit_as_trigger(
+        &self,
+        event: BusEvent,
+        emitting_trigger_id: Option<String>,
+    ) -> Result<Option<EmitResult>, Box<dyn std::error::Error + Send + Sync>> {
         // Read before the first `.await`, so it is this caller's chain depth
         // and not something a later hop happens to be running under. Every
         // branch below stamps the same value onto its broadcast.
-        let depth = current_event_trigger_depth();
+        let depth = emit_depth(&event);
         match &event {
             BusEvent::Thread {
                 thread_id,
@@ -836,6 +918,7 @@ impl EventBus {
                         typed: event,
                         aggregate,
                         depth,
+                        emitting_trigger_id,
                     });
                     // Rebroadcast each affected ancestor's aggregate so the
                     // frontend's `meta.blockingDescendantCount` stays live —
@@ -896,6 +979,7 @@ impl EventBus {
                         typed: event,
                         aggregate: None,
                         depth,
+                        emitting_trigger_id,
                     });
                     Ok(None)
                 }
@@ -925,6 +1009,7 @@ impl EventBus {
                         typed: event,
                         aggregate: None,
                         depth,
+                        emitting_trigger_id,
                     });
                     Ok(Some(EmitResult { event_id, seq }))
                 } else {
@@ -943,6 +1028,7 @@ impl EventBus {
                             typed: event,
                             aggregate: None,
                             depth,
+                            emitting_trigger_id,
                         });
                     }
                     Ok(None)

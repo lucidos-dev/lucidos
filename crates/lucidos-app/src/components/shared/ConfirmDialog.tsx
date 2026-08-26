@@ -44,7 +44,11 @@ export function ConfirmDialog() {
     return () => {
       document.removeEventListener('keydown', handleKey);
     };
-  }, [state.visible]);
+    // Key on `resolve` (a fresh closure per showConfirm call), not `visible`.
+    // A second confirm REPLACES a visible one, keeping visible true→true, so a
+    // `[state.visible]` dep would skip the focus. The caret would stay on the
+    // previous dialog's button. Same reason as `PromptDialog`.
+  }, [state.resolve]);
 
   if (!state.visible) return null;
 

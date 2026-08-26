@@ -5,13 +5,15 @@
 <sub>Described in chat, running seconds later in the same window, wired to the user's own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux.</sub>
 
 <!--intro-start-->
-Lucidos is an AI companion that shares your whole workspace. You talk, build, run, automate, and remember together - in one place. Chat lives alongside your work in a persistent split view on desktop, and as a separate pane you can swipe to on mobile. You're never leaving your work to talk to the AI; you're always working with it - manifesting your intent in a rich, extensible interface.
+Lucidos builds and runs the apps and automations you describe. Describe one in chat and you are using it seconds later, in the same window, wired to your own data. Ask for a change and it changes while it keeps running. No build step, no deploy, no separate service to stand up.
 
 > *If you can describe it, it exists*
 
-A local, event-driven AI OS that keeps the apps you describe running, and acts when something happens. It is the environment your apps, data, automations, and memory live in, all on your own machine. You own and store all the data yourself. The prompt is the primary interface, but Lucidos is a unified, integrated environment where configurable LLMs know all about your apps, triggers (scheduled or event-driven), and files. Describe an app and you're using it seconds later. No build step, no deploy. Built to augment the *user*, it remembers everything you do. While it is not an "autonomous" role playing entity, you can automate anything. Nothing happens without a user intent, though - which is a central concept for Lucidos.
+Everything you make lives in one workspace on your own machine: the apps, the automations, the files, the data, and the memory. They share all of it, so the twentieth thing you build costs less than the first, because it already knows what the others learned. Researching a topic, keeping the findings, building an app around them, and pulling in data from an outside API on a schedule is one flow, not four tools.
 
-The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and pulling in data from external sources (whether through scheduled syncs or direct API calls) can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
+Chat sits beside the work in a split view on desktop, and as a pane you swipe to on mobile. You never leave your work to talk to it. So the loop that makes an app better runs while you are using it: you spot the thing, you say it, the app changes under you and keeps running. That loop is the same on a phone. It asks for no editor, no build, no redeploy, and no permission to read code, though knowing what is going on underneath is still an advantage. The prompt is the main interface, and the models are configurable and swappable.
+
+You own the data. It lives in a local Postgres event store, or as git-versioned artifacts you can read without Lucidos. Nothing happens without your intent: you can automate anything, on a schedule or on an event, but Lucidos does not act on its own.
 <!--intro-end-->
 
 ---
