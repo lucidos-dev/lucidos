@@ -2,7 +2,7 @@
  *  blank while its summary (title / pin / compose / status) renders fine. The
  *  data is confirmed present in the DB for every report of this bug, so the
  *  failure is downstream of the store: either the view never rendered the
- *  exchanges, or it rendered them and iOS WKWebView didn't paint the layer.
+ *  exchanges, or it rendered them and WebKit didn't paint the layer.
  *
  *  A paint loss is INVISIBLE to JS (the DOM is fully built and laid out; only the
  *  compositor texture is stale), so this probe can't assert "the screen is blank"
@@ -22,19 +22,19 @@
  *    - `content-present`  — exchanges rendered AND the content DOM is built with
  *      non-zero height. Indistinguishable in JS from a healthy paint, so a blank
  *      report landing here is COMPOSITOR PAINT LOSS (recovered by a real scroll) —
- *      the `forceIOSRepaint*` machinery's domain.
+ *      the `forceWebKitRepaint*` machinery's domain.
  *    - `genuinely-empty`  — no content events at all (a legit empty / draft thread,
  *      not a bug). Callers skip the breadcrumb for this class.
  *
- *  PERMANENT debug tooling (not a temporary measure). Built for the
- *  `ios-pwa-blackout` investigation (resolved 2026-06-30 — blank body = compositor
- *  paint loss, fixed by the `forceIOSRepaint*` hardening; see
- *  docs/temporary-measures.md), and RETAINED to confirm a future blank-render
- *  regression. The most symptom-specific of the client probes, but tiny and silent
- *  when idle. */
+ *  Built for the `ios-pwa-blackout` investigation, which closed on paint loss
+ *  and the repaint hardening that cures it, then kept to confirm exactly this:
+ *  a later blank-render regression. It is live again for
+ *  `webkit-desktop-blank-thread`, the same blank on the packaged Mac app, and
+ *  is registered against that investigation in docs/temporary-measures.md. The
+ *  most symptom-specific of the client probes, but tiny and silent when idle. */
 
 import { postClientLog } from './liveness';
-import { isIOSPwa } from './platform';
+import { isWebKit } from './platform';
 
 export type ThreadRenderClass =
   | 'genuinely-empty'
@@ -103,12 +103,17 @@ export function shouldReportThreadRender(cls: ThreadRenderClass): boolean {
   return cls !== 'genuinely-empty';
 }
 
-/** Fire the diagnostic breadcrumb for a render probe. iOS-PWA-only (the surface
- *  the bug is reported on; keeps desktop / dev logs quiet) and skips the
+/** Fire the diagnostic breadcrumb for a render probe. WebKit-only, and skips the
  *  genuinely-empty class. Fire-and-forget — `postClientLog` never throws. Lands as
- *  an engine.log `[Client/render] thread_render_probe …` line. */
+ *  an engine.log `[Client/render] thread_render_probe …` line.
+ *
+ *  The surface is the ENGINE rather than the iOS PWA, because the blank came
+ *  back on the packaged Mac app, which is a WKWebView. A Blink or Gecko client
+ *  still logs nothing. The cost is one line per thread open on a WebKit client,
+ *  which is why it is registered as a temporary measure: see
+ *  docs/temporary-measures.md § `webkit-desktop-blank-thread`. */
 export function reportThreadRenderProbe(probe: ThreadRenderProbe): void {
-  if (!isIOSPwa()) return;
+  if (!isWebKit()) return;
   const cls = classifyThreadRender(probe);
   if (!shouldReportThreadRender(cls)) return;
   postClientLog('render', 'thread_render_probe', {

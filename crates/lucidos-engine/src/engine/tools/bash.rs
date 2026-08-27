@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use super::bash_background_recovery;
 use super::ToolOutcome;
 use crate::core::shell::{command_shell, TaskOutcome};
 use crate::core::{redact_postgres_secrets, sanitize_for_jsonb};
@@ -264,7 +265,7 @@ fn finalize_stream(bytes: &[u8]) -> String {
 /// before we ever saw it. It has to be folded into the marker: reporting
 /// only what this function trims would state a byte count *lower* than the
 /// true loss, and a truncation marker that understates reads as a bound.
-fn finalize_drain(text: &str, already_dropped: usize) -> String {
+pub(super) fn finalize_drain(text: &str, already_dropped: usize) -> String {
     let sanitized = sanitize_for_jsonb(text);
     truncate_output_tail(&sanitized, MAX_OUTPUT_BYTES, already_dropped)
 }
@@ -443,7 +444,7 @@ impl LucidosEngine {
             log!("[BashBg] failed to emit BackgroundBashStarted: {}", e);
         }
 
-        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), safe_command, finish_rx);
+        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), finish_rx);
 
         Ok(serde_json::json!({
             "task_id": task_id,
@@ -454,7 +455,7 @@ impl LucidosEngine {
     }
 
     /// Awaits the registry watchdog's notify, reads the finished task's
-    /// [`CompletionRecord`], emits `BackgroundBashCompleted` with the final
+    /// `CompletionRecord`, emits `BackgroundBashCompleted` with the final
     /// state, and, if the owning CC session is still parked on this thread,
     /// pushes a synthetic
     /// `AgentUserInput { kind: User }` onto its `msg_tx` so CC resumes the
@@ -481,49 +482,37 @@ impl LucidosEngine {
         &self,
         thread_id: uuid::Uuid,
         task_id: String,
-        safe_command: String,
         finish_rx: tokio::sync::oneshot::Receiver<()>,
     ) {
         let bus = self.event_bus.clone();
         let registry = self.bash_background.clone();
         let agent_sessions = self.agent_sessions.clone();
+        let shutting_down = self.shutting_down.clone();
         tokio::spawn(async move {
             // finish_rx only errors when the runtime is shutting down.
             if finish_rx.await.is_err() {
                 return;
             }
+            // `None` covers two cases, and neither is a loss. The entry was
+            // swept, or the teardown sweep took the record first and emitted
+            // this same event. Either way somebody else owns the completion.
             let Some(record) = registry.completion_record(&task_id).await else {
-                log!("[BashBg] watcher fired but task {} already gone", task_id);
+                log!(
+                    "[BashBg] watcher fired but task {} is gone or already recorded",
+                    task_id
+                );
                 return;
             };
-            let cmd_prefix = {
-                let s = safe_command.as_str();
-                s[..s.floor_char_boundary(200)].to_string()
-            };
+            let cmd_prefix = record.command.clone();
+            // The wake text reports what the command did, so it wants the
+            // reaped status even when the teardown is what ended the task.
             let outcome = record.outcome;
             let timed_out = record.timed_out;
             let killed = record.killed;
-            let event = ThreadEvent::BackgroundBashCompleted {
-                task_id: task_id.clone(),
-                command: cmd_prefix.clone(),
-                exit_code: outcome.exit_code(),
-                signal: outcome.signal(),
-                // Tail, not head — `bash_output` falls back to this payload
-                // once the task is evicted, and the drain path it must agree
-                // with keeps the tail. For a 40-minute build the last lines
-                // are the failure; the first are `Compiling serde`.
-                //
-                // The record carries the whole retained buffer plus every byte
-                // the registry's buffer cap cut over the task's life, so the
-                // marker counts real loss and not just what the 100 KB tail
-                // cap trimmed here.
-                stdout: finalize_drain(&record.stdout, record.stdout_dropped),
-                stderr: finalize_drain(&record.stderr, record.stderr_dropped),
-                started_at: record.started_at,
-                finished_at: record.finished_at,
-                timed_out,
-                killed,
-            };
+            // The teardown may have killed this task on its way out and then
+            // lost the race to record it. Built through the shared builder for
+            // exactly that reason: the row must not depend on who won.
+            let event = bash_background_recovery::completion_event(task_id.clone(), record);
             if let Err(e) = bus
                 .emit(BusEvent::Thread {
                     thread_id,
@@ -533,6 +522,10 @@ impl LucidosEngine {
                 .await
             {
                 log!("[BashBg] failed to emit BackgroundBashCompleted: {}", e);
+                // Hand the claim back. It is a promise to write the row, and
+                // this one did not. Holding it tells the teardown the task is
+                // settled, and the boot sweep then reports a success as a loss.
+                registry.release_completion_claim(&task_id).await;
             }
 
             // Auto-wake the parked CC session. The wake message is informative
@@ -540,9 +533,23 @@ impl LucidosEngine {
             // call `bash_output` to read the actual stdout/stderr. Skip the
             // wake when the session is gone (CC truly exited, or this is a
             // chat-mode background bash with no CC session at all).
+            //
+            // A teardown skips it, and asks the flag rather than the task. Any
+            // completion landing then would start a turn against a session
+            // being torn down, whether or not the shutdown is what ended it.
+            // The resumed session hears through the turn-gap note instead,
+            // which covers exactly the completions no wake reached.
             let msg_tx = {
                 let guard = agent_sessions.lock().await;
-                guard.get(&thread_id).map(|s| s.msg_tx.clone())
+                // Read UNDER the lock, not before it. The teardown takes this
+                // same mutex to abort sessions. A check outside it can pass and
+                // then hand back a sender the shutdown just claimed. The flag
+                // is never cleared, so reading it late is sound.
+                if shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+                    None
+                } else {
+                    guard.get(&thread_id).map(|s| s.msg_tx.clone())
+                }
             };
             if let Some(tx) = msg_tx {
                 let wake_text =
@@ -677,15 +684,24 @@ impl LucidosEngine {
         };
 
         if let Some(snap) = snapshot {
+            // Same `as_reported` rule as the persisted row, so a task the
+            // teardown killed does not read as `signal: 9` here and as no
+            // status there. The two are one tool call to the LLM.
+            let outcome = snap.outcome.map(|o| o.as_reported(snap.abandoned));
             return Ok(serde_json::json!({
                 "stdout": finalize_drain(&snap.stdout, snap.stdout_dropped),
                 "stderr": finalize_drain(&snap.stderr, snap.stderr_dropped),
-                "exit_code": snap.outcome.and_then(|o| o.exit_code()),
-                "signal": snap.outcome.and_then(|o| o.signal()),
-                "status": snap.outcome.map(|o| o.describe()),
+                "exit_code": outcome.and_then(|o| o.exit_code()),
+                "signal": outcome.and_then(|o| o.signal()),
+                "status": outcome.map(|o| o.describe()),
                 "finished": snap.finished,
                 "timed_out": snap.timed_out,
                 "killed": snap.killed,
+                // Reachable in-memory, not just from the event store: after the
+                // teardown's kill, a drain inside the retention window reads a
+                // task this process abandoned. Both come from `ending`, because
+                // the two branches are one tool call and must not disagree.
+                "abandoned": snap.abandoned,
                 "elapsed_secs": snap.elapsed_secs,
                 "waited_secs": call_started.elapsed().as_secs(),
             })
@@ -734,6 +750,10 @@ impl LucidosEngine {
                     "finished": true,
                     "timed_out": payload.get("timed_out").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
+                    // True only on a row the recovery sweep wrote: the engine
+                    // that owned the task stopped, so no status was ever
+                    // reaped and `elapsed_secs` spans the downtime too.
+                    "abandoned": payload.get("abandoned").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     // Same two time fields as the in-memory branch, so the LLM
                     // never has to guess how long the task ran just because the
                     // registry entry was gone by the time it drained.
@@ -746,7 +766,34 @@ impl LucidosEngine {
                 })
                 .to_string())
             }
-            None => Err(format!("Error: unknown task_id '{}'", task_id)),
+            // No registry entry and no completion row. Before calling the id
+            // unknown, ask whether this thread ever spawned it: a task with no
+            // recorded outcome looks exactly like a typo from here.
+            //
+            // Rare, because both settle paths write a completion. What is left
+            // is a task whose own settle emit failed, or one on a thread the
+            // boot sweep skips. So the message names no cause it cannot know.
+            None => match bash_background_recovery::task_start_time(&self.pool, thread_id, task_id)
+                .await
+            {
+                Ok(Some(started_at)) => Err(format!(
+                    "Error: task '{}' was spawned on this thread at {} and no outcome was ever \
+                     recorded for it. The usual cause is an engine stop: a background task is a \
+                     child of the engine process. Treat the work as unfinished, and check \
+                     whether it is still running before starting it again.",
+                    task_id,
+                    started_at.to_rfc3339(),
+                )),
+                Ok(None) => Err(format!("Error: unknown task_id '{}'", task_id)),
+                // A probe that could not run must not answer "no". Reporting
+                // an unreadable event store as an unknown id sends the agent
+                // hunting a typo it did not make.
+                Err(e) => Err(format!(
+                    "Error: no output for task '{}', and the event store could not be checked \
+                     for whether this thread ever spawned it: {}",
+                    task_id, e,
+                )),
+            },
         }
     }
 

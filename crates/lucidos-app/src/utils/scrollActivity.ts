@@ -4,7 +4,7 @@
  *  scroll container's `scrollTop` — the "scrolling randomly stops instead of
  *  going further when you let go" bug on the iOS PWA. The only programmatic
  *  scrollTop write that fires INDEPENDENTLY of the user's gesture is
- *  `forceIOSRepaint`'s ±1px compositor-recovery nudge (streaming throttle,
+ *  `forceWebKitRepaint`'s ±1px compositor-recovery nudge (streaming throttle,
  *  thread-open burst, settle probe, page-resume); ticking on a timer, it lands
  *  mid-fling and kills the momentum. So the nudge must stand down while a
  *  finger-drag or its momentum tail is in flight. During a real scroll the
@@ -40,7 +40,7 @@ function onTouchMove(): void {
 
 /** Install the global touch listener once. Lazy (called from isUserScrolling) so
  *  the module has no import-time side effects; idempotent + SSR/test-safe. The
- *  first `forceIOSRepaint` (thread-open burst) installs it well before the user
+ *  first `forceWebKitRepaint` (thread-open burst) installs it well before the user
  *  can start a fling. */
 function ensureInstalled(): void {
   if (installed || typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;

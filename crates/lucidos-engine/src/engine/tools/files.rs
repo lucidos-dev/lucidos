@@ -1041,7 +1041,8 @@ impl LucidosEngine {
 
                 let file_exists = full_path.exists();
                 // Snapshot before writing: did the app already exist? Decides
-                // AppCreated vs AppUpdated for apps/<id>/ writes (no-op otherwise).
+                // AppCreated vs nothing for a write to apps/<id>/manifest.json
+                // (see `app_lifecycle_event`); a no-op for every other path.
                 let app_existed_before = data_path_app_id(path)
                     .map(|id| self.app_manager.app_exists(id))
                     .unwrap_or(false);

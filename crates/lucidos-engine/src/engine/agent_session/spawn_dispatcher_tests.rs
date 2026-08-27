@@ -465,7 +465,9 @@ async fn shadow_dispatch_for_user_message_does_not_enqueue() {
     };
     dispatcher.dispatch_spawn(trigger).await;
     assert_eq!(
-        dispatcher.dispatch_count(),
+        dispatcher
+            .dispatch_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         1,
         "shadow-mode dispatch still increments the counter for observability"
     );

@@ -204,7 +204,6 @@ export interface ModelsListResponse {
   models: ModelInfo[];
 }
 
-/** Generic success/error response used by credential, preference, and trigger endpoints. */
 /** The engine's read-back on a trigger's cron after a create or update. Present
  *  only on the trigger write endpoints. */
 export interface CronPreview {
@@ -216,6 +215,8 @@ export interface CronPreview {
   warnings: string[];
 }
 
+/** Generic success/error response used by credential, preference, and trigger
+ *  endpoints. */
 export interface ApiResult {
   success: boolean;
   error?: string;

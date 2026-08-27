@@ -1107,8 +1107,13 @@ async fn spawn_refuses_when_user_checked_out_different_branch() {
     let err = super::super::external_edits::verify_branch(&repo_root, expected_branch)
         .await
         .expect_err("branch mismatch must refuse the spawn");
-    assert_eq!(err.expected, expected_branch);
-    assert_eq!(err.found.as_deref(), Some("user-detour"));
+    assert_eq!(
+        err,
+        super::super::external_edits::BranchMismatch::OnOtherBranch {
+            expected: expected_branch.to_string(),
+            found: "user-detour".to_string(),
+        }
+    );
     let msg = format!("{}", err);
     assert!(msg.contains("user-detour"));
     assert!(msg.contains(expected_branch));

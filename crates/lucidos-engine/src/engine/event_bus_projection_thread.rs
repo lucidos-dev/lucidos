@@ -472,7 +472,9 @@ impl EventBus {
 
             // Activity events — update last_activity + status
             ThreadEvent::ResponseGenerated { .. } => {
-                // Normal completion — go idle (or waiting if CC has a pending proposal).
+                // Normal completion: go idle. A pending coding-agent proposal
+                // does not change that; see STATUS_FROM_PROPOSED_CHANGE for why
+                // review surfaces through `coding_agent_proposed` instead.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
@@ -816,9 +818,11 @@ impl EventBus {
                 Vec::new()
             }
             ThreadEvent::ResponseFailed { .. } => {
-                // Failed response — distinct from 'waiting' (which means CC has
-                // changes to review) so the UI can render an error indicator.
-                // Set has_response so the thread stays visible.
+                // Failed response: always 'failed', so the UI can render an
+                // error indicator. `ResponseGenerated` writes 'idle' and
+                // `ResponseAborted` picks per cause, so this is the one
+                // terminal whose status never varies. Set has_response so the
+                // thread stays visible.
                 sqlx::query(
                     "UPDATE thread_summaries SET last_agent_action = NOW(), has_response = TRUE, status = 'failed' WHERE thread_id = $1",
                 )

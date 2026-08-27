@@ -46,7 +46,9 @@ pub(super) fn spawn_task_runner(
     let cancel_token = CancellationToken::new();
     let task_cancel = cancel_token.clone();
     let handle = tokio::spawn(async move {
-        // Wrap the entire task in a panic catcher
+        // Nothing here catches a panic. An `Err` is a loop that gave up, say
+        // on a corrupt cron expression, and it is logged below. A panic ends
+        // the task, and `check_task_health_and_restart` re-arms it.
         let result = run_task_loop(
             trigger_id,
             task_name.clone(),

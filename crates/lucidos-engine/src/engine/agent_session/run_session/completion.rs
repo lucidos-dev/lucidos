@@ -13,7 +13,7 @@ use crate::engine::change_ops::branch_is_hardened;
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, commits_in_range, consume_harden_marker,
     default_local_branch, describe_branch_changes, ff_merge_to_main, files_have_client_update,
-    files_require_restart, git_cmd, git_commit_no_edit, has_branch_commits,
+    files_require_restart, git_cmd, git_commit_no_edit, git_ran_ok, has_branch_commits,
     worktree_current_branch,
 };
 use crate::engine::thread_events::EventChannel;
@@ -55,9 +55,13 @@ async fn remove_discarded_worktree(
         WorktreeRemoval::Remove => {
             let wt_path_str = worktree.to_string_lossy();
             if let Err(e) =
-                git_cmd(&["worktree", "remove", "--force", &wt_path_str], repo_root).await
+                git_ran_ok(&["worktree", "remove", "--force", &wt_path_str], repo_root).await
             {
-                log!("[AgentSession] {}", e);
+                log!(
+                    "[AgentSession] Failed to remove discarded worktree {}: {}",
+                    worktree.display(),
+                    e
+                );
             }
         }
     }
@@ -463,9 +467,25 @@ impl LucidosEngine {
                         change.merge_temp_branch.as_deref(),
                         &branch_name,
                     ) {
-                        let _ =
-                            git_cmd(&["worktree", "remove", "--force", &wt_str], &repo_root).await;
-                        let _ = git_cmd(&["branch", "-D", &branch_name], &repo_root).await;
+                        if let Err(e) =
+                            git_ran_ok(&["worktree", "remove", "--force", &wt_str], &repo_root)
+                                .await
+                        {
+                            log!(
+                                "[ConflictResolution] Failed to remove temp merge worktree {}: {}",
+                                wt_str,
+                                e
+                            );
+                        }
+                        if let Err(e) =
+                            git_ran_ok(&["branch", "-D", &branch_name], &repo_root).await
+                        {
+                            log!(
+                                "[ConflictResolution] Failed to delete temp merge branch {}: {}",
+                                branch_name,
+                                e
+                            );
+                        }
                     }
                     self.emit_merge_resolution_cleared(
                         change.thread_id.unwrap_or(thread_id),

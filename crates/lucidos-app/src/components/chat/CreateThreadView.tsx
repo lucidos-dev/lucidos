@@ -20,7 +20,7 @@ import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
 import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
-import { forceIOSRepaint, SCROLLER_PINNED_ATTR } from '../../utils/iosRepaint';
+import { forceWebKitRepaint, SCROLLER_PINNED_ATTR } from '../../utils/webkitRepaint';
 
 /** First line of a change's description and its file count, keyed by change_id.
  *  Harvested from the `ChangeProposed` events riding a thread's coding-agent
@@ -402,7 +402,7 @@ function firstRowReaching(
  *
  *  The LOWEST of them, not the first. The marker invites a second pinned row,
  *  and reading only one would leave the edge above chrome that is drawn over
- *  it. `publishPinnedShift` in utils/iosRepaint.ts serves them all for the same
+ *  it. `publishPinnedShift` in utils/webkitRepaint.ts serves them all for the same
  *  reason. */
 function readerTopEdge(container: HTMLElement): number {
   const top = container.getBoundingClientRect().top;
@@ -806,7 +806,7 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // The overflow freeze plus a large DOM shrink can leave iOS WKWebView
     // showing a blanked layer texture. The whole `.thread-content` renders
     // black until a scroll forces a repaint, so trigger it proactively.
-    forceIOSRepaint(container);
+    forceWebKitRepaint(container);
 
     // Tell the transcript that THIS correction was ours, so it cannot read as
     // the reader scrolling away and retire their standing follow. Only a scroll

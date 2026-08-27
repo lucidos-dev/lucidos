@@ -145,8 +145,16 @@ describe('pageResume DOM wiring', () => {
     expect(resumeSrc).toMatch(/addEventListener\(\s*'click'[\s\S]*?,\s*true\s*\)/);
   });
 
-  it('is gated to iOS so desktop click-to-focus is never swallowed', () => {
-    expect(resumeSrc).toMatch(/isIOS\(\)/);
+  it('installs on any WebKit client, so the packaged desktop app repaints too', () => {
+    // The compositor bug belongs to the engine. Gating the install on iOS left
+    // the Mac app resuming onto a blank transcript with no lever to recover it.
+    expect(resumeSrc).toMatch(/if\s*\(installed\s*\|\|\s*!isWebKit\(\)\)\s*return;/);
+  });
+
+  it('still arms the wake-tap swallow on iOS alone', () => {
+    // A desktop window is RAISED by a click, so swallowing the first one there
+    // would eat an ordinary click-to-focus. Only the phone taps a blank layer.
+    expect(resumeSrc).toMatch(/if\s*\(isIOS\(\)\)\s*document\.addEventListener\(\s*'click'/);
   });
 
   it('disarms after the post-resume repaint settles via a double requestAnimationFrame', () => {
@@ -160,7 +168,7 @@ describe('pageResume DOM wiring', () => {
 });
 
 describe('ThreadView resume repaint wiring', () => {
-  it('drives its iOS repaint off the shared onPageResume signal', () => {
+  it('drives its WebKit repaint off the shared onPageResume signal', () => {
     expect(threadViewSrc).toMatch(/import\s*\{[^}]*\bonPageResume\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/pageResume['"]/);
     expect(threadViewSrc).toMatch(/onPageResume\(/);
   });

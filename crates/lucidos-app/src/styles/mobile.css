@@ -766,7 +766,7 @@
 
            The second term undoes the iOS repaint nudge's compensation. That
            compensation cancels a scroll this sticky row never took, so it
-           displaces the row a pixel per toggle. utils/iosRepaint.ts publishes
+           displaces the row a pixel per toggle. utils/webkitRepaint.ts publishes
            the shift here, on this element alone. Why, and why the two terms
            simply add:
            docs/plans/2026-08-16-the-sticky-title-undoes-the-repaint-nudge-compensation.md */

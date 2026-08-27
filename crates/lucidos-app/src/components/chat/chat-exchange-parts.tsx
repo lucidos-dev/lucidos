@@ -416,7 +416,7 @@ export function changeActions(changeId?: string, suppress?: boolean, reserveWhil
 function CollapsedIndicator({ onToggle }: { onToggle?: () => void }) {
   return (
     <div class="turn-collapsed" onClick={onToggle}>
-      <span class="turn-collapsed-dots" aria-label="Collapsed — click to expand">⋯</span>
+      <span class="turn-collapsed-dots" aria-label="Collapsed. Click to expand">⋯</span>
     </div>
   );
 }

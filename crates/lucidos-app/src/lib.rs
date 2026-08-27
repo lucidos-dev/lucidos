@@ -845,6 +845,10 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(window_persist::window_state_flags())
+                // `main` only. Every other label is a per-process counter, so
+                // the plugin would restore one window's geometry onto an
+                // unrelated one. See `window_persist::plugin_tracks`.
+                .with_filter(window_persist::plugin_tracks)
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())

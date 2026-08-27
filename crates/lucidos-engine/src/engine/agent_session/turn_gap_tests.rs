@@ -395,9 +395,11 @@ async fn multiple_events_listed_oldest_first_and_capped() {
         .await
         .unwrap()
         .note;
-    // 60 commits, MAX_LINES = 50, so 10 truncated.
+    // 60 commits against `MAX_LINES_PER_EVENT` = 20, so 40 truncated. The
+    // per-event cap binds before the overall `MAX_LINES` = 50, which is the
+    // point: one big Apply must leave room for whatever follows it.
     assert!(
-        note.contains("and 10 more"),
+        note.contains("and 40 more"),
         "expected truncation note: {note}"
     );
     assert!(note.contains("commit 0"), "first commit present: {note}");
@@ -917,4 +919,316 @@ async fn missing_session_branch_still_renders() {
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 17. A background completion nobody delivered reaches the resumed agent,
+///     and the two endings read differently. Abandoned means the engine
+///     stopped and there is no verdict; ordinary means the task finished and
+///     only the wake went missing. Both leave the agent believing its build is
+///     still running if the note stays silent.
+///
+///     Nothing filters by kind here, because the boundary set does it: a wake
+///     the watcher DID deliver emits `CodingAgentPromptSent`, which is a
+///     boundary, so that completion falls outside the next gap. Test 18 pins
+///     that half.
+#[tokio::test]
+async fn a_background_completion_nobody_delivered_reaches_the_resumed_agent() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the suite").await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-finished", "cargo test --lib", Some(0), false),
+    )
+    .await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-lost", "./scripts/e2e.sh", None, true),
+    )
+    .await;
+    let current = emit_message_received(&bus, thread_id, "how did it go?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .expect("an abandoned background task must reach the resumed agent")
+        .note;
+    assert!(note.contains("BACKGROUND TASK LOST"), "{note}");
+    assert!(note.contains("./scripts/e2e.sh"), "{note}");
+    assert!(
+        note.contains("BACKGROUND TASK FINISHED"),
+        "an undelivered ordinary completion is news too: {note}"
+    );
+    assert!(note.contains("cargo test --lib"), "{note}");
+    assert!(
+        note.contains("exit code 0"),
+        "the ordinary line reports the verdict: {note}"
+    );
+    // The line tells the agent to drain, and every bash_output lookup is an
+    // exact match, so a shortened id comes back as `unknown task_id`.
+    assert!(
+        note.contains("task task-lost"),
+        "the id must be usable: {note}"
+    );
+    assert!(
+        note.contains("task task-finished"),
+        "the id must be usable: {note}"
+    );
+    assert!(
+        !note.contains("./scripts/e2e.sh` (task task-los) ended"),
+        "an abandoned task has no verdict to report: {note}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 19. **A `ContinuationRequested` must NOT advance the boundary.** It is
+///     persisted when a resume is REQUESTED, and several ordinary paths never
+///     actuate it: a racing user message takes the session first, a later
+///     request supersedes it, two Continue clicks emit two. Counting it lost
+///     the note permanently in each of those, on the crash-restart path this
+///     coverage exists for.
+///
+///     The accepted residual is the opposite: a resume that DID deliver the
+///     note records nothing, so it repeats once on the next message. That
+///     costs a re-read; the other costs the agent believing its build runs.
+#[tokio::test]
+async fn a_continuation_request_that_never_ran_does_not_swallow_the_note() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the suite").await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-lost", "./scripts/e2e.sh", None, true),
+    )
+    .await;
+    // Requested, and then never actuated: the user's own message won the
+    // session, so no turn ever built a note from this.
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ContinuationRequested {
+            reason: "auto_resume_after_switch".into(),
+        },
+    )
+    .await;
+
+    let next = emit_message_received(&bus, thread_id, "what now?").await;
+    let note = compute_turn_gap_note(&pool, thread_id, next, Some(BRANCH))
+        .await
+        .expect("an unactuated resume request must not consume the note")
+        .note;
+    assert!(note.contains("BACKGROUND TASK LOST"), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 18. The other half: a completion whose wake WAS delivered is not repeated.
+///     The delivery emits `CodingAgentPromptSent`, which is a turn boundary, so
+///     the completion falls before the next gap and needs no filter of its own.
+#[tokio::test]
+async fn a_background_completion_whose_wake_landed_is_not_repeated() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the suite").await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-woke", "cargo test --lib", Some(0), false),
+    )
+    .await;
+    // What the watcher's wake becomes once `run_session` consumes it.
+    emit_engine_prompt(&bus, thread_id, "Background task task-woke finished").await;
+    let current = emit_message_received(&bus, thread_id, "how did it go?").await;
+
+    assert!(
+        compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+            .await
+            .is_none(),
+        "the agent already heard about it, so the gap holds nothing to say"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 20. The ordinary line names `timed_out` and `killed`, for the same reason
+///     the wake it replaces leads with them. Without it a deadline, a
+///     cancellation and a segfault all read as "killed by SIGKILL".
+#[tokio::test]
+async fn the_ordinary_line_names_how_the_task_ended() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "run the suite").await;
+    let mut timed_out = completion("task-slow", "cargo test --lib", None, false);
+    if let ThreadEvent::BackgroundBashCompleted {
+        timed_out: flag,
+        signal,
+        ..
+    } = &mut timed_out
+    {
+        *flag = true;
+        *signal = Some(9);
+    }
+    emit(&bus, thread_id, timed_out).await;
+    let current = emit_message_received(&bus, thread_id, "how did it go?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .unwrap()
+        .note;
+    assert!(
+        note.contains("blowing its own timeout"),
+        "a deadline is not a plain SIGKILL: {note}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 21. **A big Apply must not bury the lost-task line.** The note truncates its
+///     tail, an Apply renders a line per merged commit, and a completion
+///     always sorts after the Apply that preceded it. So the one channel an
+///     undelivered background completion has was the line that got dropped.
+#[tokio::test]
+async fn a_large_apply_does_not_bury_the_background_task_line() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "land it").await;
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ChangeApplied {
+            change_id: Uuid::new_v4().to_string(),
+            requires_restart: false,
+            client_update: false,
+            commits: (0..60).map(|i| format!("commit {i}")).collect(),
+            thread_title: None,
+            actor: None,
+            pre_merge_sha: None,
+            post_merge_sha: Some("deadbeef".into()),
+            path: String::new(),
+        },
+    )
+    .await;
+    emit(
+        &bus,
+        thread_id,
+        completion("task-lost", "./scripts/e2e.sh", None, true),
+    )
+    .await;
+    let current = emit_message_received(&bus, thread_id, "how did it go?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .unwrap()
+        .note;
+    assert!(
+        note.contains("BACKGROUND TASK LOST"),
+        "a 60-commit apply must not spend the whole budget: {note}"
+    );
+    assert!(
+        note.contains("commit 0"),
+        "the apply is still reported: {note}"
+    );
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// 22. **The overall budget cannot bury it either.** A per-event cap alone
+///     still lost the line once enough events shared the gap, and the boot
+///     sweep makes that reachable: it settles every historical unsettled task
+///     on a thread at once. Background lines are rendered first for that
+///     reason, whatever their sequence.
+#[tokio::test]
+async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    start_cc_session(&bus, thread_id, BRANCH, None).await;
+
+    emit_message_received(&bus, thread_id, "land them all").await;
+    // Three applies at the per-event cap already exceed MAX_LINES on their own.
+    for batch in 0..3 {
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ChangeApplied {
+                change_id: Uuid::new_v4().to_string(),
+                requires_restart: false,
+                client_update: false,
+                commits: (0..25)
+                    .map(|i| format!("batch {batch} commit {i}"))
+                    .collect(),
+                thread_title: None,
+                actor: None,
+                pre_merge_sha: None,
+                post_merge_sha: Some("deadbeef".into()),
+                path: String::new(),
+            },
+        )
+        .await;
+    }
+    emit(
+        &bus,
+        thread_id,
+        completion("task-lost", "./scripts/e2e.sh", None, true),
+    )
+    .await;
+    let current = emit_message_received(&bus, thread_id, "how did it go?").await;
+
+    let note = compute_turn_gap_note(&pool, thread_id, current, Some(BRANCH))
+        .await
+        .unwrap()
+        .note;
+    assert!(
+        note.contains("BACKGROUND TASK LOST"),
+        "the only channel a lost task has must survive the budget: {note}"
+    );
+    assert!(note.contains("./scripts/e2e.sh"), "{note}");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A background completion, ordinary or abandoned.
+fn completion(
+    task_id: &str,
+    command: &str,
+    exit_code: Option<i32>,
+    abandoned: bool,
+) -> ThreadEvent {
+    ThreadEvent::BackgroundBashCompleted {
+        task_id: task_id.into(),
+        command: command.into(),
+        exit_code,
+        signal: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        started_at: chrono::Utc::now(),
+        finished_at: chrono::Utc::now(),
+        timed_out: false,
+        killed: false,
+        abandoned,
+    }
 }

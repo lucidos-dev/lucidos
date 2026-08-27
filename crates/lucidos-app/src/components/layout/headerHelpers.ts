@@ -89,7 +89,7 @@ function contentTitle(short: boolean): string {
     // file; the tooltip is already the description on its own (see AppHeader,
     // which prefers `getDiffDescription`), so nothing is lost by dropping it.
     const desc = short ? null : getDiffDescription();
-    if (desc) return `${fileName} — ${desc}`;
+    if (desc) return `${fileName}: ${desc}`;
     return fileName;
   }
   if (overlay?.type === 'url-preview') return pageTitle || getHostname(url!);

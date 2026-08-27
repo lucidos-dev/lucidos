@@ -1112,8 +1112,12 @@ pub(crate) struct ReopenPlan {
     /// Hidden windows to show, `main` first and then by label.
     pub show: Vec<String>,
     /// Where to point `main` first, when it is on no workspace and the record
-    /// still names one. It keeps whatever frame the user gave it.
-    pub navigate_main: Option<String>,
+    /// still names one, and the frame that workspace was left at.
+    ///
+    /// A `PlannedWindow` rather than a bare URL, because this IS one: the same
+    /// workspace, composed the same way, wearing the same remembered frame. It
+    /// differs from `build` only in reusing a window instead of making one.
+    pub navigate_main: Option<PlannedWindow>,
     /// Recorded workspaces no live window is on.
     pub build: Vec<PlannedWindow>,
     /// The window to front LAST, so it ends on top. `None` only when this
@@ -1130,7 +1134,9 @@ pub(crate) struct ReopenPlan {
 ///
 /// A workspace the record names and no live window is on is BUILT. An adrift
 /// `main` takes the first of those as a navigate instead. Otherwise the reopen
-/// leaves a picker window sitting behind the restored ones.
+/// leaves a picker window sitting behind the restored ones. It carries that
+/// workspace's frame like any other owed window: `main` here is the same window
+/// `setup` sizes from the same record, and a reopen owes what a launch owes.
 ///
 /// Every URL is composed here from a slug validated by `is_workspace_slug`.
 /// Every `window-*` webview holds the full IPC permission set on the gateway
@@ -1186,8 +1192,13 @@ pub(crate) fn reopen_plan(
     // Adrift: on the picker or the gateway root, i.e. navigated but on no
     // workspace. Such a window is the one to point somewhere, never to leave.
     let adrift = main.is_some_and(|w| crate::window_target::window_workspace(&w.url).is_none());
-    let navigate_main = (adrift && !owed.is_empty())
-        .then(|| crate::window_target::workspace_url(origin, owed.remove(0).0));
+    let navigate_main = (adrift && !owed.is_empty()).then(|| {
+        let (id, frame) = owed.remove(0);
+        PlannedWindow {
+            url: crate::window_target::workspace_url(origin, id),
+            frame,
+        }
+    });
 
     ReopenPlan {
         front: main
@@ -2662,10 +2673,15 @@ mod tests {
             ORIGIN,
         );
         // `main` is adrift on the gateway root, so it TAKES the first workspace
-        // rather than leaving a picker window behind the restored ones.
+        // rather than leaving a picker window behind the restored ones. With
+        // that workspace's frame: it is owed exactly what `setup` would have
+        // given it, had this launch restored anything.
         assert_eq!(
-            plan.navigate_main.as_deref(),
-            Some("http://localhost:3210/myws/")
+            plan.navigate_main,
+            Some(planned(
+                "http://localhost:3210/myws/",
+                Some(rect(0, 0, 1200, 800))
+            ))
         );
         assert_eq!(
             plan.build,
@@ -2792,9 +2808,10 @@ mod tests {
             &session(&["myws"], &[]),
             ORIGIN,
         );
+        // Nothing recorded about its size, so it keeps the one it has.
         assert_eq!(
-            plan.navigate_main.as_deref(),
-            Some("http://localhost:3210/myws/")
+            plan.navigate_main,
+            Some(planned("http://localhost:3210/myws/", None))
         );
     }
 

@@ -26,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 //
 // The frontend test environment is deliberately non-jsdom, so there is no
 // rendered DOM to assert against. Pin the wiring in source, the same approach as
-// content-pane-ios-repaint.test.ts and AppUiInline.test.ts.
+// content-pane-webkit-repaint.test.ts and AppUiInline.test.ts.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(resolve(here, '../ContentPane.tsx'), 'utf-8');

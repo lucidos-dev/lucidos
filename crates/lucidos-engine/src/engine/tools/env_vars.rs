@@ -68,7 +68,17 @@ impl LucidosEngine {
             .iter()
             .map(|v| serde_json::json!({ "name": v.name, "value": v.value }))
             .collect();
-        Ok(serde_json::to_string(&items).unwrap_or_default())
+        // An empty string here would reach the LLM stamped as a successful
+        // `list`, i.e. "no environment variables", which is the one answer that
+        // is never true at this point.
+        match serde_json::to_string(&items) {
+            Ok(json) => Ok(json),
+            Err(e) => Ok(format!(
+                "Error: Failed to render {} environment variable(s): {}",
+                items.len(),
+                e
+            )),
+        }
     }
 
     /// `delete` — remove one var by name. Mirrors the HTTP `delete_env_var`

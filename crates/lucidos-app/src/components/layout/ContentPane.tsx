@@ -6,7 +6,7 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
 import { FilePreviewPath } from '../files/FilePreviewPath';
 import { lazyComponent } from '../../utils/lazyComponent';
-import { forceIOSRepaint } from '../../utils/iosRepaint';
+import { forceWebKitRepaint } from '../../utils/webkitRepaint';
 import { onPageResume } from '../../utils/pageResume';
 
 const FilesView = lazyComponent(() => import('../files/FilesView').then(m => m.FilesView));
@@ -34,10 +34,10 @@ const NotificationDetailInline = lazyComponent(() => import('../notifications/No
 const NAV_COVER_ANIM_MS = 200;
 const NAV_COVER_SLACK_MS = 50;
 
-/** The one view the iOS repaint below skips. The app-ui body is `overflow: hidden`
+/** The one view the WebKit repaint below skips. The app-ui body is `overflow: hidden`
  *  with an iframe child, so it is not the scroll container that blanks, and the
  *  iframe composites itself out of our reach: the repaint buys nothing there. It
- *  also costs something. `forceIOSRepaint` writes a transform for one frame, which
+ *  also costs something. `forceWebKitRepaint` writes a transform for one frame, which
  *  makes `.content-pane-body` the containing block for the pseudo-fullscreen app
  *  panel's `position: fixed` (`.app-ui-fullscreen`, rendered in-tree by
  *  AppUiInline), snapping a fullscreen app back to the pane's box for that frame.
@@ -116,7 +116,8 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
     return () => clearTimeout(fuse);
   }, [viewKey]);
 
-  // iOS PWA paint loss (see utils/iosRepaint.ts for the mechanism).
+  // WebKit paint loss (see utils/webkitRepaint.ts for the mechanism), reported
+  // first on the iOS PWA and since on the packaged desktop app.
   // `.content-pane-body` is an `overflow-y: auto` scroll container, so WKWebView
   // gives it its own compositing layer, and a backgrounded PWA (the phone locked)
   // leaves that layer frozen on a stale-or-empty backing texture: the panel is
@@ -132,7 +133,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // three superseding attempts at it.
   //
   // ON RESUME ONLY, deliberately. A per-view repaint on every panel switch was
-  // tried and REVERTED: `forceIOSRepaint`'s recovery nudge writes `scrollTop`, and
+  // tried and REVERTED: `forceWebKitRepaint`'s recovery nudge writes `scrollTop`, and
   // `useHideOnScroll` listens for scroll on this exact element
   // (`.mobile-swipe-pane .content-pane-body`), so each nudge moved the mobile
   // header and rewrote the `--mobile-header-offset` custom property on `:root`. As
@@ -154,7 +155,7 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // switch-triggered render does not already cover.
   useEffect(() => onPageResume(() => {
     if (hostsAppUiIframe()) return;
-    forceIOSRepaint(bodyRef.current);
+    forceWebKitRepaint(bodyRef.current);
   }), []);
 
   return (

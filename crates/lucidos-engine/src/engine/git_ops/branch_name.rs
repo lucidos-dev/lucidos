@@ -260,8 +260,15 @@ pub(crate) async fn allocate_coding_agent_branch(
             GIT_TIMEOUT.as_secs()
         );
     }
-    let unique = &Uuid::new_v4().as_simple().to_string()[..6];
-    pick_free_branch_name(&base, existing.as_ref(), unique)
+    // `chars().take` rather than a byte slice, matching `git_ops/worktree.rs`:
+    // a uuid's ASCII-ness should not be what keeps an index from panicking.
+    let unique: String = Uuid::new_v4()
+        .as_simple()
+        .to_string()
+        .chars()
+        .take(6)
+        .collect();
+    pick_free_branch_name(&base, existing.as_ref(), &unique)
 }
 
 #[cfg(test)]

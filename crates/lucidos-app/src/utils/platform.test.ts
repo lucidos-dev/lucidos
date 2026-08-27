@@ -5,6 +5,7 @@ import {
   isTauriPreGatewayEntryFor,
   isMobileDeviceUserAgent,
   describeDeviceUserAgent,
+  isWebKitUserAgent,
 } from './platform';
 
 /** Registration user-agents as the engine actually stores them. */
@@ -19,6 +20,14 @@ const UA = {
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
   macSafari:
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+  macFirefox:
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:141.0) Gecko/20100101 Firefox/141.0',
+  macEdge:
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0',
+  iosChrome:
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/140.0.0.0 Mobile/15E148 Safari/604.1',
+  linuxWebKitGtk:
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
 } as const;
 
 describe('registrationUserAgent', () => {
@@ -65,6 +74,33 @@ describe('isMobileDeviceUserAgent', () => {
     expect(isMobileDeviceUserAgent(null)).toBe(false);
     expect(isMobileDeviceUserAgent(undefined)).toBe(false);
     expect(isMobileDeviceUserAgent('')).toBe(false);
+  });
+});
+
+describe('isWebKitUserAgent', () => {
+  it('recognizes every WebKit client, the packaged Mac app included', () => {
+    // The desktop app's live `navigator.userAgent` IS the macOS Safari string:
+    // the product token is appended at registration only, so the engine is all
+    // this can key on. That client is the reason the predicate exists.
+    expect(isWebKitUserAgent(UA.macSafari)).toBe(true);
+    expect(isWebKitUserAgent(UA.iphone)).toBe(true);
+    expect(isWebKitUserAgent(UA.ipad)).toBe(true);
+    expect(isWebKitUserAgent(UA.linuxWebKitGtk)).toBe(true);
+  });
+
+  it('recognizes an iOS browser that is WKWebView under another badge', () => {
+    // Every iOS browser is WKWebView, whatever it calls itself, so the Apple
+    // devices are matched before the Chromium tokens are excluded.
+    expect(isWebKitUserAgent(UA.iosChrome)).toBe(true);
+  });
+
+  it('is false for Blink and Gecko', () => {
+    // Blink still says `AppleWebKit`, so excluding the Chromium tokens by name
+    // is what keeps a Chrome reader out of the repaint path entirely.
+    expect(isWebKitUserAgent(UA.macChrome)).toBe(false);
+    expect(isWebKitUserAgent(UA.macEdge)).toBe(false);
+    expect(isWebKitUserAgent(UA.android)).toBe(false);
+    expect(isWebKitUserAgent(UA.macFirefox)).toBe(false);
   });
 });
 

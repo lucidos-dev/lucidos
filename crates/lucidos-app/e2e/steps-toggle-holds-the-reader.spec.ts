@@ -257,12 +257,14 @@ async function parkPressAndMeasure(
   return { before, after: await lineOffsetFromTop(page, text) };
 }
 
-/** Park the reader deep INSIDE the run of steps after `text`'s line. Reports
- *  how far below the reader's edge that line's bottom then sits.
- *
- *  A negative reading is the line being off the top of the screen, which is the
- *  whole point: the reader can see neither end of the run they are in. */
-async function parkInsideTheRunAfter(page: Page, text: string, into: number): Promise<number> {
+/** Where the step `depth` into the run after `text`'s line sits relative to the
+ *  container's top, and where that line's own bottom sits. Both readings in one
+ *  round trip, so the park below compares a pair taken of the same layout. */
+async function runReadings(
+  page: Page,
+  text: string,
+  into: number,
+): Promise<{ target: number; lineBottom: number }> {
   return await page.evaluate(({ needle, depth }: { needle: string; depth: number }) => {
     const el = document.querySelector('.thread-content') as HTMLElement;
     const rows = Array.from(el.querySelectorAll<HTMLElement>('.response-content > *'));
@@ -271,9 +273,38 @@ async function parkInsideTheRunAfter(page: Page, text: string, into: number): Pr
     const steps = rows.slice(at + 1).filter(r => r.matches('[data-role="inline-step"]'));
     const target = steps[Math.min(depth, steps.length - 1)];
     if (!target) throw new Error(`no step run after ${needle}`);
-    el.scrollTop += target.getBoundingClientRect().top - el.getBoundingClientRect().top;
-    return rows[at].getBoundingClientRect().bottom - el.getBoundingClientRect().top;
+    const top = el.getBoundingClientRect().top;
+    return {
+      target: target.getBoundingClientRect().top - top,
+      lineBottom: rows[at].getBoundingClientRect().bottom - top,
+    };
   }, { needle: text, depth: into });
+}
+
+/** Park the reader deep INSIDE the run of steps after `text`'s line. Reports
+ *  how far below the reader's edge that line's bottom then sits.
+ *
+ *  A negative reading is the line being off the top of the screen, which is the
+ *  whole point: the reader can see neither end of the run they are in.
+ *
+ *  It CONVERGES, for the reason `parkLineAtTop` does and one of its own. The
+ *  chevron that renders the whole transcript writes a second `scrollToTop` when
+ *  the full slice commits, and one write made before that commit is undone.
+ *  Read back in the same tick, that undo is invisible. The browser reports the
+ *  offset just asked for. So the caller's premise check passes, and the press
+ *  lands on a reader sitting at the top of the thread. The loop settles, and
+ *  the reading it returns is one the layout has kept for a frame. */
+async function parkInsideTheRunAfter(page: Page, text: string, into: number): Promise<number> {
+  for (let round = 0; round < 4; round++) {
+    const { target } = await runReadings(page, text, into);
+    if (Math.abs(target) <= 1) break;
+    await page.evaluate((d: number) => {
+      const el = document.querySelector('.thread-content') as HTMLElement;
+      el.scrollTop += d;
+    }, target);
+    await page.waitForTimeout(400);
+  }
+  return (await runReadings(page, text, into)).lineBottom;
 }
 
 /** How far `text`'s line's BOTTOM sits from the reader's first readable line.

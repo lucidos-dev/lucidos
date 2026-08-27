@@ -1,8 +1,4 @@
 import { Page, expect, Locator } from '@playwright/test';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
-
-const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`);
 
 /** CSS selector for the body of a rendered user message (initiator panel).
  *  Centralized so a UI rename only requires changing this one constant. */
@@ -52,16 +48,7 @@ export async function ensureOnThreadPane(page: Page): Promise<void> {
   await ensureMobileView(page, 'thread');
 }
 
-export function getBaseUrl(): string {
-  const portsFile = resolve(WORKSPACE, '.lucidos/ports');
-  if (!existsSync(portsFile)) {
-    throw new Error(`Ports file missing: ${portsFile}`);
-  }
-  const content = readFileSync(portsFile, 'utf-8');
-  const match = content.match(/VITE_PORT=(\d+)/);
-  if (!match) throw new Error('VITE_PORT not found');
-  return `https://localhost:${match[1]}`;
-}
+export { getBaseUrl } from './address';
 
 /** Wait for a physically visible prompt input (dual-layout safe).
  *  At mobile viewports the desktop layout is `display: none`, so `.first()` can

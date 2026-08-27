@@ -142,7 +142,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-24. Anything not
+The currently-accepted categories, counted as of 2026-08-27. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 79 sites across 49 files,
@@ -176,8 +176,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 476 sites across 167 files, every one of them
-  test-only code: 159 `*.test.ts`, seven `*.test.tsx`
+  `@types/node` in project**, 491 sites across 172 files, every one of them
+  test-only code: 164 `*.test.ts`, seven `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -274,8 +274,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
   the vitest include list, so `/run-tests` runs them.
 
-- **Phase 4's entry chunk is 671.67 kB against its 600 kB ceiling, and the
-  2026-08-26 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 676.98 kB against its 600 kB ceiling, and the
+  2026-08-27 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -295,29 +295,29 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.23 kB, against a 71.67 kB gap:
+  attribution now puts the whole list at 38.11 kB, against a 76.98 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.54 |
+  | `CodingAgentControlMenu` | 8.52 |
   | `ThreadFilterPanel` | 5.91 |
-  | `WorkspaceSwitcher` | 4.45 |
+  | `WorkspaceSwitcher` | 4.36 |
   | `QuestionCard` | 3.98 |
   | `TodoListPanel` | 2.96 |
   | `OverflowMenu` | 2.38 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave over 33 kB of it. The next
+  leave the advisory firing, and would now leave nearly 39 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
-  Growth is diffuse rather than one mistake. The 2026-08-26 run added 10 kB
-  over the previous one and looked for the usual culprit, a component that
-  went from lazy to eager. There was none: every separately emitted chunk was
-  absent from the entry chunk's attribution. The rest of the top is
-  `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.85 and `store.ts` at
-  17.05. The three thread-event exchange modules add 42.8 kB between them. A
+  Growth is diffuse rather than one mistake. The 2026-08-27 run added 5.31 kB
+  and re-ran the check for the usual culprit, a component gone from lazy to
+  eager. There was none, for the second run running: no module appears in
+  both the entry chunk and a separately emitted chunk. The rest of the top is
+  `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.84 and `store.ts` at
+  17.06. The three thread-event exchange modules add 42.8 kB between them. A
   first paint reaches all of them.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
@@ -330,6 +330,14 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `ChevronRightIcon`, worth 4.2 kB of source and less once minified.
   Re-measure before spending the churn, rather than assuming the split is
   free money.
+
+  **`api/client.ts` is a second barrel, and the 2026-08-27 run measured it. It
+  is not a lever either.** 24.15 kB of `api/*` lands in the entry chunk across 16
+  modules, and tree-shaking already works: `mcp.ts`, `webhooks.ts` and
+  `data.ts` never reach it. The biggest resident is `settings.ts` at 5.32 kB,
+  which first paint genuinely needs. It exports `getPreferences`,
+  `setPreference` and the notification calls beside the backup, memory and
+  OAuth ones. Splitting it is an API-client refactor rather than a clean cut.
 
   To attribute bytes, run
   `npx vite build --sourcemap --outDir dist.smap` in `crates/lucidos-app`,

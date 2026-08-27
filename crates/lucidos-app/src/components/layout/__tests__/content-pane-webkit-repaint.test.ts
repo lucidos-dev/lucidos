@@ -44,7 +44,7 @@ const contentPaneSrc = readFileSync(resolve(here, '../ContentPane.tsx'), 'utf-8'
 
 /** The same source with comments stripped. The negative assertions below ban a
  *  CALL, not the word, and this component's comments deliberately explain the
- *  reverted per-view repaint: naming `forceIOSRepaintBurst` or `[viewKey]` while
+ *  reverted per-view repaint: naming `forceWebKitRepaintBurst` or `[viewKey]` while
  *  explaining why they are gone must not turn the guard red. Scanning raw source
  *  would make that prose fail the test it exists to document. */
 const contentPaneCode = contentPaneSrc
@@ -66,12 +66,12 @@ describe('ContentPane iOS resume repaint', () => {
   it('repaints the content pane body element, not some other node', () => {
     // The blanked layer is the scroll container itself, and `bodyRef` is the only
     // ref pointing at `.content-pane-body`.
-    expect(contentPaneCode).toMatch(/forceIOSRepaint\(\s*bodyRef\.current\s*\)/);
+    expect(contentPaneCode).toMatch(/forceWebKitRepaint\(\s*bodyRef\.current\s*\)/);
   });
 
   it('does NOT repaint on panel switch (the reverted lag regression)', () => {
     // A per-view repaint keyed on `viewKey` was tried and reverted.
-    // `forceIOSRepaint`'s recovery nudge writes `scrollTop`, and `useHideOnScroll`
+    // `forceWebKitRepaint`'s recovery nudge writes `scrollTop`, and `useHideOnScroll`
     // listens for scroll on this exact element
     // (`.mobile-swipe-pane .content-pane-body`), so every nudge moved the mobile
     // header and rewrote `--mobile-header-offset` on `:root`. As a 5-attempt burst
@@ -92,7 +92,7 @@ describe('ContentPane iOS resume repaint', () => {
     // Stated as "exactly one repaint call site, and it is inside a mount-once
     // effect". That covers the burst, a second plain toggle, and any future
     // variant, without depending on the banned symbol's name.
-    const repaintCalls = contentPaneCode.match(/forceIOSRepaint\w*\(/g) ?? [];
+    const repaintCalls = contentPaneCode.match(/forceWebKitRepaint\w*\(/g) ?? [];
     expect(repaintCalls).toHaveLength(1);
     expect(contentPaneCode).toMatch(/onPageResume\([\s\S]*?\)\s*,\s*\[\s*\]\s*\)/);
     // A `[viewKey]` dep array is not banned outright: the navigation reveal
@@ -111,7 +111,7 @@ describe('ContentPane iOS resume repaint', () => {
   });
 
   it('skips the app-ui overlay on the repaint path', () => {
-    // `forceIOSRepaint` writes a transform for one frame, which makes
+    // `forceWebKitRepaint` writes a transform for one frame, which makes
     // `.content-pane-body` the containing block for the pseudo-fullscreen app
     // panel's `position: fixed` (`.app-ui-fullscreen`, rendered in-tree by
     // AppUiInline), snapping a fullscreen app back to the pane's box for that
@@ -130,12 +130,12 @@ describe('ContentPane iOS resume repaint', () => {
   });
 
   it('uses the shared repaint utilities rather than a hand-rolled toggle', () => {
-    // `forceIOSRepaint` is iOS-gated, detached-node-safe, supersede-safe, and
+    // `forceWebKitRepaint` is iOS-gated, detached-node-safe, supersede-safe, and
     // yields to concurrent scroll writers (useScrollMemory's restore). A local
     // `style.transform` poke would have none of that and would fight the
     // saved-scroll restore this same component sets up.
     expect(contentPaneCode).toMatch(
-      /import\s*\{[^}]*\bforceIOSRepaint\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/iosRepaint['"]/,
+      /import\s*\{[^}]*\bforceWebKitRepaint\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/webkitRepaint['"]/,
     );
     expect(contentPaneCode).not.toMatch(/style\.transform/);
   });

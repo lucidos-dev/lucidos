@@ -1,28 +1,8 @@
 import { defineConfig } from '@playwright/test';
-import { readFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
-
-const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`);
-const portsFile = resolve(WORKSPACE, '.lucidos/ports');
-
-// The workspace records both halves of its own address. The protocol is the
-// half that gets forgotten. `detect_tls` (scripts/lib/workspace.sh) serves
-// plain HTTP on a machine with no `.certs/`. A hardcoded https:// baseURL then
-// fails every spec on its first request, with a TLS record error that reads
-// like a broken server. Later lines win, since detect_tls appends.
-function readAddress(): { port: number; proto: string } {
-  if (!existsSync(portsFile)) {
-    throw new Error(`Ports file not found: ${portsFile}. Start the workspace first: ./scripts/web-dev.sh -w ${WORKSPACE} -b`);
-  }
-  const content = readFileSync(portsFile, 'utf-8');
-  const match = content.match(/VITE_PORT=(\d+)/);
-  if (!match) throw new Error(`VITE_PORT not found in ${portsFile}`);
-  const protos = [...content.matchAll(/^PROTO=(\w+)$/gm)];
-  return {
-    port: parseInt(match[1], 10),
-    proto: protos.length ? protos[protos.length - 1][1] : 'https',
-  };
-}
+// The workspace records both halves of its own address, and e2e/address.ts is
+// the one place that reads them. See its header for why the protocol half is
+// not optional.
+import { readAddress } from './e2e/address';
 
 const { port, proto } = readAddress();
 

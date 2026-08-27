@@ -236,6 +236,25 @@ impl TaskOutcome {
         matches!(self, TaskOutcome::Exited(0))
     }
 
+    /// The status to REPORT, which is [`TaskOutcome::Unknown`] once the engine
+    /// has abandoned the task.
+    ///
+    /// An abandoned task was ended by the engine's own shutdown SIGKILL, so its
+    /// reaped status is ours and not the command's verdict. Reporting
+    /// `signal: 9` reads as the work having failed.
+    ///
+    /// One function because three LLM-facing surfaces ask: the persisted
+    /// `BackgroundBashCompleted`, the `bash_output` drain of a retained task,
+    /// and the same drain's event-store fallback. They are one tool call to the
+    /// model and must not disagree about a task killed mid-drain.
+    pub fn as_reported(self, abandoned: bool) -> TaskOutcome {
+        if abandoned {
+            TaskOutcome::Unknown
+        } else {
+            self
+        }
+    }
+
     /// The human-readable phrase every LLM-facing surface uses. One
     /// implementation so the summary line, the sync `run_bash` result, and the
     /// `bash_output` JSON can never disagree about what happened.

@@ -3767,9 +3767,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "[Populate]   PostgreSQL notifications: {}",
         db_notifications[0].0
     );
+    // Propagated, not defaulted. A failed count printed as `0` reads as
+    // "indexing wrote nothing" right after it wrote thousands of entries.
     log!(
         "[Populate]   Memory index entries: {}",
-        memory_index.len().await.unwrap_or(0)
+        memory_index.len().await?
     );
     log!("[Populate]   Artifact files created: {}", artifact_count);
     log!("[Populate]   Time: {:.1}s", elapsed.as_secs_f64());

@@ -40,13 +40,15 @@ pub(crate) async fn ff_main_to(
     branch_sha: &str,
     main_sha: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-    // An unresolved ref reaches here as an empty string (the callers' own
-    // `rev-parse` calls fall back to `unwrap_or_default`). Reject that up front:
-    // otherwise a `merge-base` that also failed leaves both sides empty, the
-    // ff-ability guard below compares equal, and an `update-ref` fires on refs
-    // nobody could resolve. Deliberately ahead of the lock below: it reads no
-    // repo state, so an unresolvable ref should fail fast rather than queue
-    // behind an unrelated worktree snapshot.
+    // An unresolved ref reaches here as an empty string: every caller resolves
+    // through `branch_head_sha`, which checks the exit status and answers
+    // `None`, and then applies `unwrap_or_default`. Reject that up front.
+    // Otherwise a
+    // `merge-base` that also failed leaves both sides empty, the ff-ability
+    // guard below compares equal, and an `update-ref` fires on refs nobody
+    // could resolve. Deliberately ahead of the lock below: it reads no repo
+    // state, so an unresolvable ref should fail fast rather than queue behind
+    // an unrelated worktree snapshot.
     if branch_sha.is_empty() || main_sha.is_empty() {
         return Err("Cannot fast-forward: could not resolve the branch and main revisions".into());
     }
@@ -155,13 +157,9 @@ pub(crate) async fn catchup_and_ff_to_main(
     for attempt in 1..=3 {
         catchup_with_main(worktree_path).await?;
 
-        let main_sha = git_cmd(&["rev-parse", "main"], repo_root)
+        let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
+        let branch_sha = branch_head_sha(repo_root, branch_name)
             .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let branch_sha = git_cmd(&["rev-parse", branch_name], repo_root)
-            .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
 
         match ff_main_to(repo_root, &branch_sha, &main_sha).await {
@@ -220,13 +218,9 @@ pub(crate) async fn ff_merge_to_main(
     for attempt in 1..=3 {
         catchup_with_main(Path::new(wt_path)).await?;
 
-        let main_sha = git_cmd(&["rev-parse", "main"], repo_root)
+        let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
+        let branch_sha = branch_head_sha(repo_root, temp_branch)
             .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
-        let branch_sha = git_cmd(&["rev-parse", temp_branch], repo_root)
-            .await
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
 
         // Worktree stays alive until merge succeeds so retries can re-catchup

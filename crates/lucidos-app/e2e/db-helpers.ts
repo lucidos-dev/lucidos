@@ -2,8 +2,9 @@ import { execSync } from 'child_process';
 import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'fs';
 import { resolve } from 'path';
 import { randomUUID } from 'crypto';
+import { E2E_WORKSPACE } from './address';
 
-export const WORKSPACE = resolve(process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`);
+export const WORKSPACE = E2E_WORKSPACE;
 
 /**
  * Canonical (symlink-resolved) workspace path, matching the engine's

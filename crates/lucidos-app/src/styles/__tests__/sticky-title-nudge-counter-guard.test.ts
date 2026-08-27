@@ -1,7 +1,7 @@
 /**
  * The mobile thread title bar undoes the iOS repaint nudge's compensation.
  *
- * `forceIOSRepaint` (utils/iosRepaint.ts) recovers a frozen WKWebView layer. It
+ * `forceWebKitRepaint` (utils/webkitRepaint.ts) recovers a frozen WKWebView layer. It
  * writes 1px of `scrollTop` on `.thread-content`, then cancels the painted
  * motion with a `translateY` on that same element. The cancellation is exact for
  * content the scroll moved. `.mobile-thread-title-row` is `position: sticky`, so
@@ -30,7 +30,7 @@ import { rulesTargeting, type CssRule } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const read = (rel: string): string => readFileSync(resolve(here, rel), 'utf-8');
 
-const primitive = read('../../utils/iosRepaint.ts');
+const primitive = read('../../utils/webkitRepaint.ts');
 const header = read('../../components/layout/MobileAppHeader.tsx');
 const threadView = read('../../components/chat/ThreadView.tsx');
 
@@ -45,7 +45,7 @@ const sheets: Array<[string, string]> = readdirSync(resolve(here, '../..'), { re
  *  against the spelling the code publishes, not against a copy that can drift. */
 function literal(name: string): string {
   const m = new RegExp(`${name}\\s*=\\s*'([^']+)'`).exec(primitive);
-  expect(m, `${name} not declared in utils/iosRepaint.ts`).not.toBeNull();
+  expect(m, `${name} not declared in utils/webkitRepaint.ts`).not.toBeNull();
   return m![1];
 }
 
@@ -88,7 +88,7 @@ describe('the sticky thread title undoes the repaint nudge', () => {
   it('renders the row as a direct child of the scroller the nudge writes to', () => {
     // The publish scans the scroller's own children, so wrapping the row one
     // level deeper would stop it and leave the CSS on its 0px fallback. The
-    // scroller is the element `areaRef` points at: what `forceIOSRepaint` gets.
+    // scroller is the element `areaRef` points at: what `forceWebKitRepaint` gets.
     const open = /<div[^>]*class="thread-content visible"[^>]*ref=\{areaRef\}[^>]*>/.exec(threadView);
     expect(open, 'no transcript container carrying ref={areaRef}').not.toBeNull();
     const after = threadView.slice(open!.index + open![0].length);

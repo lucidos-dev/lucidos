@@ -437,7 +437,7 @@ describe('useHideOnScroll during one of our own navigations', () => {
 });
 
 describe('useHideOnScroll iOS repaint nudge suppression', () => {
-  // `forceIOSRepaint` (utils/iosRepaint.ts) recovers a blanked WKWebView
+  // `forceWebKitRepaint` (utils/webkitRepaint.ts) recovers a blanked WKWebView
   // compositor layer by writing scrollTop ±1px and restoring it a frame later.
   // Both writes fire a real scroll event on the container the header listens to.
   // Reported on an iOS PWA, 2026-08-03: with "Keep header visible" off, the
@@ -462,7 +462,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
     );
   }
 
-  /** Drive one nudge round trip at `scrollTop`. `forceIOSRepaint` nudges UP first
+  /** Drive one nudge round trip at `scrollTop`. `forceWebKitRepaint` nudges UP first
    *  (`live > 0 ? live - 1 : live + 1`) and restores a frame later, so the legs
    *  are -1 then +1. Asserting only the end state misses the bug: the twitch is
    *  the intermediate leg, and the drift needs the legs in this exact order. */
@@ -540,7 +540,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
   });
 
   it('never suppresses a live drag, even inside the nudge window', () => {
-    // The two gates are duals: forceIOSRepaint refuses to WRITE a nudge while
+    // The two gates are duals: forceWebKitRepaint refuses to WRITE a nudge while
     // isUserScrolling(), so a scroll event arriving during a drag is the user's.
     // Suppressing it would only make the header lag the finger, and lastNudgeAt
     // is module-global, so a repaint of a DIFFERENT pane must not be able to

@@ -3,7 +3,7 @@ import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverl
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
 import { isAnchorScroll, isNavigationScroll, isHeaderPinnedForScroll, onAnchorScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
-import { isRepaintNudging } from '../utils/iosRepaint';
+import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
 import { currentMobileHeaderSticky } from '../store/actions/preferences';
 
@@ -251,7 +251,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
       recoverKeyboardState();
 
-      // The iOS compositor-recovery nudge (utils/iosRepaint.ts) writes ±1px to
+      // The iOS compositor-recovery nudge (utils/webkitRepaint.ts) writes ±1px to
       // this exact container and puts it back a frame later. Both writes fire a
       // real scroll event, and turning them into header deltas made the header
       // twitch by a pixel once per nudge. On a streaming thread that nudge runs
@@ -273,7 +273,7 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // the scroll consumer doing the ignoring.
       //
       // A live drag overrides the window, because the two gates are duals and
-      // must stay that way: forceIOSRepaint refuses to WRITE a nudge while
+      // must stay that way: forceWebKitRepaint refuses to WRITE a nudge while
       // isUserScrolling() (it would cancel iOS momentum), so a nudge can only
       // exist when the user is still. Suppressing during a drag could therefore
       // only ever eat the user's own events, and `lastNudgeAt` is module-global,

@@ -114,6 +114,28 @@ uses that one rather than growing another.
 - **Maximized and fullscreen are not per workspace.** They stay with the plugin,
   by label, for `main` only. Restoring a Space per window is a different problem
   and no report asks for it.
+- **"For `main` only" is now enforced. FIXED.** It shipped as prose, and the
+  plugin was registered with no filter, so it went on restoring and saving every
+  `window-<n>`. That key names a different window each launch, so it applied one
+  session's second window onto an unrelated one, maximized and fullscreen with
+  it. Placing a frame undoes neither, so a fresh window could come up fullscreen
+  from a past life. The filter is `window_persist::plugin_tracks`.
+- **Reopening a workspace now uses its remembered frame. FIXED.** "Geometry
+  outlives the window" was true of the record and false of the code: only the
+  two LAUNCH callers passed a frame. A picker or switcher row is the ordinary
+  way to reopen a workspace, and it passed none. Neither did a notification tap
+  that found no window on the raising workspace. The rule now: a window takes a
+  workspace's remembered frame when the client puts that workspace on screen
+  with no window on it.
+- **File > New Window keeps the declared default.** It opens a SECOND window on
+  the workspace you are already on, and the record holds one frame per
+  workspace. Handing it that frame would drop the new window exactly over the
+  one it was opened from. This is the case that shows the rule above is keyed on
+  the right thing.
+- **A reopen sizes an adrift `main` too.** `reopen_plan` points it at the first
+  owed workspace, and that is the same window `setup` sizes from the same
+  record. The two took opposite answers, so the first tray click after a reboot
+  gave `main` whatever frame the picker had.
 - **Dev writes nothing.** Dev shares the packaged app-data dir and restores
   nothing, so a dev run could only rearrange the packaged client's windows.
 - **`window_restore::Rect` is now serializable**, because the record persists

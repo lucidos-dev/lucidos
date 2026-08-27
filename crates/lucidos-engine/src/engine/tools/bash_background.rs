@@ -18,6 +18,11 @@
 //! [`MAX_RETAINED_FINISHED`] completed tasks are held at once. Past that
 //! window `bash_output` falls back to the persisted `BackgroundBashCompleted`
 //! row, which is the durable record.
+//!
+//! **Exactly one completion per task**, gated by
+//! [`BackgroundTask::completion_claimed`]. Two emitters can reach a task: its
+//! own watchdog, and the teardown sweep in `bash_background_recovery`. Both
+//! claim under the registry lock, and the loser writes nothing.
 
 use crate::core::shell::{command_shell, TaskOutcome};
 use chrono::{DateTime, Utc};
@@ -70,6 +75,20 @@ pub(super) const FINISHED_RETENTION_SECS: i64 = 300;
 /// ~2 MB trim trigger, and only if all sixteen maxed both buffers inside the
 /// same five minutes.
 pub(super) const MAX_RETAINED_FINISHED: usize = 16;
+
+/// How much of the command a completion record carries, for log readability.
+/// The full command is on the paired `BackgroundBashStarted`.
+const COMMAND_PREFIX_BYTES: usize = 200;
+
+/// Cut a command to what a `BackgroundBashCompleted` carries.
+///
+/// One function rather than two slices against a shared constant, because the
+/// constant is not the part that can go wrong. `bash_background_recovery`
+/// rebuilds this field from the `Started` row, and a hand-written
+/// `&s[..COMMAND_PREFIX_BYTES]` beside it would panic on a multi-byte boundary.
+pub(super) fn command_prefix(command: &str) -> String {
+    command[..command.floor_char_boundary(COMMAND_PREFIX_BYTES)].to_string()
+}
 
 #[derive(Clone)]
 pub struct BackgroundBashRegistry {
@@ -150,6 +169,10 @@ impl Stream {
 /// promotes it to a first-class one.
 struct BackgroundTask {
     started_at: DateTime<Utc>,
+    /// The command, redacted and cut by [`command_prefix`], exactly as
+    /// `BackgroundBashCompleted` carries it. Held here so the registry can name
+    /// its own tasks: the watcher and the teardown sweep both read it.
+    command: String,
     stdout: Stream,
     stderr: Stream,
     /// How the child ended. `None` until the watchdog writes it, in the same
@@ -159,17 +182,32 @@ struct BackgroundTask {
     outcome: Option<TaskOutcome>,
     timed_out: bool,
     killed: bool,
+    /// The engine is stopping and took this task down as part of stopping.
+    ///
+    /// Set by [`BackgroundBashRegistry::hand_over_at_teardown`] in the same locked
+    /// block that fires the kill, so the outcome the watchdog then reaps is
+    /// already labelled. It outranks `killed` on the emitted event: both are
+    /// a SIGKILL from us, and only this one says the work was not called off.
+    abandoned: bool,
     /// Single source of truth for "has the watchdog finished?", and the clock
     /// the retention sweep reads. `None` = still running, `Some(t)` = finished
     /// at `t`, drainable until `t + FINISHED_RETENTION_SECS`.
     finished_at: Option<DateTime<Utc>>,
-    /// Whether someone has taken this task's [`CompletionRecord`] yet, which
-    /// in production means the watcher is about to persist
-    /// `BackgroundBashCompleted`. Until then the completion exists nowhere but
-    /// here, so the retention CAP must leave the entry alone: dropping it
-    /// would lose the durable record entirely. Expiry ignores this flag, so
-    /// the exemption cannot pin memory. See [`sweep_finished`].
-    completion_recorded: bool,
+    /// Whether an emitter has claimed the right to write this task's
+    /// `BackgroundBashCompleted`. **The one-shot gate that makes exactly one
+    /// terminal event per task true.**
+    ///
+    /// Two callers race for it, both through
+    /// [`BackgroundBashRegistry::completion_record`] and so both under this
+    /// lock: the task's own watchdog watcher, and the teardown sweep once its
+    /// kill has been reaped. Whichever wins builds the same event from the same
+    /// record, and the loser writes nothing.
+    ///
+    /// It also exempts the entry from the retention CAP while it is false,
+    /// because until someone claims it the completion exists nowhere but here.
+    /// Expiry ignores the flag, so the exemption cannot pin memory. See
+    /// [`sweep_finished`].
+    completion_claimed: bool,
     /// Thread that spawned this task. `None` for tests and engine-internal
     /// callers with no owning thread. Drives `has_running_for_thread` so the
     /// agent-session idle handler can keep CC alive while bg bash is still
@@ -200,6 +238,29 @@ struct BackgroundTask {
 }
 
 impl BackgroundTask {
+    /// A blank task for [`ending`]'s truth table. Only the three fields that
+    /// function reads are meaningful; the rest are whatever `spawn` would have
+    /// set before the child ran.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        BackgroundTask {
+            started_at: Utc::now(),
+            command: "cargo build".to_string(),
+            stdout: Stream::default(),
+            stderr: Stream::default(),
+            outcome: None,
+            timed_out: false,
+            killed: false,
+            abandoned: false,
+            finished_at: None,
+            completion_claimed: false,
+            thread_id: None,
+            timeout_secs: 600,
+            kill_signal: None,
+            finish_notify: Arc::new(Notify::new()),
+        }
+    }
+
     fn is_finished(&self) -> bool {
         self.finished_at.is_some()
     }
@@ -227,6 +288,19 @@ pub struct RunningTaskHandle {
     pub watchdog_deadline: DateTime<Utc>,
 }
 
+/// One task the teardown is responsible for recording, as
+/// [`BackgroundBashRegistry::hand_over_at_teardown`] hands it over.
+///
+/// Not "abandoned": most were, but a task an earlier `bash_kill` already ended
+/// is in here too, and still needs its completion written before the process
+/// goes. Only what the caller needs to go back for the record once the watchdog
+/// has reaped it. Nothing about the outcome, because there is not one yet.
+#[derive(Debug, Clone)]
+pub struct TeardownTask {
+    pub thread_id: Uuid,
+    pub task_id: String,
+}
+
 /// The final state of a completed task, read for the
 /// `BackgroundBashCompleted` event. Owned rather than a borrow so the dispatch
 /// site can build and emit the event without holding the registry lock, and
@@ -240,6 +314,9 @@ pub struct RunningTaskHandle {
 pub struct CompletionRecord {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+    /// Redacted and already cut to [`COMMAND_PREFIX_BYTES`], ready for the
+    /// event field of the same name.
+    pub command: String,
     /// A finished task always has an outcome (the watchdog writes it in the
     /// same locked block as `finished_at`), so this is not optional. A status
     /// the engine could not obtain is [`TaskOutcome::Unknown`], which renders
@@ -247,6 +324,9 @@ pub struct CompletionRecord {
     pub outcome: TaskOutcome,
     pub timed_out: bool,
     pub killed: bool,
+    /// The engine stopped and took this task with it. Outranks `killed`, which
+    /// is the same SIGKILL sent for a different reason.
+    pub abandoned: bool,
     pub stdout: String,
     pub stdout_dropped: usize,
     pub stderr: String,
@@ -273,6 +353,12 @@ pub struct OutputSnapshot {
     pub finished: bool,
     pub timed_out: bool,
     pub killed: bool,
+    /// The engine's own shutdown ended this task. Derived by [`ending`], the
+    /// same function the persisted row uses, because the two are one tool call
+    /// to the LLM and must never disagree. Reachable in-memory as well as from
+    /// the event store: a drain landing after the teardown's kill, but inside
+    /// the retention window, reads a task this process abandoned.
+    pub abandoned: bool,
     /// Wall-clock seconds since the task was spawned (its total runtime once
     /// finished). An LLM has no clock of its own: given only a stream of
     /// drains it infers elapsed time from how long it *asked* to wait, and
@@ -352,19 +438,26 @@ impl BackgroundBashRegistry {
         let (kill_tx, kill_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // Redacted here rather than taken as a second parameter. Given both a
+        // raw command to run and a safe one to store, `spawn` would be one
+        // transposition away from persisting the secret.
+        let safe_prefix = command_prefix(&crate::core::redact_postgres_secrets(command));
+
         {
             let mut tasks = self.locked().await;
             tasks.insert(
                 task_id.clone(),
                 BackgroundTask {
                     started_at: Utc::now(),
+                    command: safe_prefix,
                     stdout: Stream::default(),
                     stderr: Stream::default(),
                     outcome: None,
                     timed_out: false,
                     killed: false,
+                    abandoned: false,
                     finished_at: None,
-                    completion_recorded: false,
+                    completion_claimed: false,
                     thread_id,
                     timeout_secs,
                     kill_signal: Some(kill_tx),
@@ -594,6 +687,95 @@ impl BackgroundBashRegistry {
             .collect()
     }
 
+    /// Is this exact task still running in THIS process?
+    ///
+    /// The guard the boot sweep asks before settling a task the event store
+    /// calls unfinished. At boot the registry is empty, so it always answers
+    /// no; the point is that the sweep is safe wherever else it is called from.
+    /// Settling a live task would resolve its wait while the work runs, and
+    /// make the next `bash_output` report a finished task that is not.
+    ///
+    /// Same `!is_finished()` filter as [`Self::has_running_for_thread`], never
+    /// mere presence in the map, so a retained completion answers no.
+    pub async fn is_running(&self, task_id: &str) -> bool {
+        let tasks = self.locked().await;
+        tasks.get(task_id).is_some_and(|t| !t.is_finished())
+    }
+
+    /// Hand the teardown every task whose completion nobody has written yet,
+    /// killing the ones still running. Called once, from graceful teardown.
+    ///
+    /// **Unclaimed, not unfinished.** A task that reached `finished_at` just
+    /// before the signal has a watcher that may never be scheduled again.
+    /// Filtering on "still running" dropped it, so the next boot reported a
+    /// success as an engine loss. It needs recording, not killing.
+    ///
+    /// **Kills rather than merely recording**, so "this did not finish" is true
+    /// when the caller writes it. The caller's own docs carry that argument.
+    ///
+    /// **Marks only a task whose kill signal it actually takes**, but returns
+    /// every one regardless. An earlier `bash_kill` has spent that signal and
+    /// owns the ending under its own name. The task still needs recording. A
+    /// task with no owning thread is the one real skip.
+    ///
+    /// The mark is not the last word: [`ending`] drops it unless our signal is
+    /// what ended the task. The caller then takes the record through
+    /// [`Self::completion_record`], where the one-shot gate lives.
+    pub async fn hand_over_at_teardown(&self) -> Vec<TeardownTask> {
+        let mut tasks = self.locked().await;
+        tasks
+            .iter_mut()
+            .filter(|(_, t)| !t.completion_claimed)
+            .filter_map(|(task_id, t)| {
+                let thread_id = t.thread_id?;
+                // Single-pid, which is all `Child::kill` sends: a pipeline
+                // behind the shell survives. `ENGINE_STOPPED_NOTE` says so.
+                if !t.is_finished() {
+                    if let Some(tx) = t.kill_signal.take() {
+                        t.abandoned = true;
+                        let _ = tx.send(());
+                    }
+                }
+                Some(TeardownTask {
+                    thread_id,
+                    task_id: task_id.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Block until this task's watchdog has written `finished_at`, or `wait`
+    /// runs out. `false` means it is still running, or is gone entirely.
+    ///
+    /// The teardown's join. Same register-then-recheck shape as
+    /// [`Self::read_output_in_memory_wait`], for the same reason: the watchdog
+    /// fires `notify_waiters`, which leaves no permit for a waiter that has not
+    /// registered yet.
+    pub async fn wait_until_finished(&self, task_id: &str, wait: Duration) -> bool {
+        let finish_notify = {
+            let tasks = self.locked().await;
+            let Some(task) = tasks.get(task_id) else {
+                return false;
+            };
+            if task.is_finished() {
+                return true;
+            }
+            task.finish_notify.clone()
+        };
+        let notified = finish_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let tasks = self.locked().await;
+            if tasks.get(task_id).is_some_and(|t| t.is_finished()) {
+                return true;
+            }
+        }
+        let _ = tokio::time::timeout(wait, notified).await;
+        let tasks = self.locked().await;
+        tasks.get(task_id).is_some_and(|t| t.is_finished())
+    }
+
     /// Read a finished task's final state, for the `BackgroundBashCompleted`
     /// event. Returns `None` if the task is missing or still running.
     ///
@@ -605,31 +787,58 @@ impl BackgroundBashRegistry {
     /// reached the agent as `unknown task_id`. Eviction is now the retention
     /// sweep's job alone.
     ///
-    /// Taking the record is what makes the entry a candidate for the sweep's
-    /// cap: until the caller has this, the task's completion exists nowhere
-    /// durable, so the cap must not drop it. See [`sweep_finished`].
+    /// **One-shot.** It claims [`BackgroundTask::completion_claimed`], and a
+    /// second call returns `None` even though the entry is still there. The
+    /// caller writes `BackgroundBashCompleted` from what this returns. Handing
+    /// it out twice would put two terminal events on one task, and
+    /// `bash_output` reads the last row. The other claimant is
+    /// [`Self::hand_over_at_teardown`], whose caller records what it killed.
+    ///
+    /// The claim is also what makes the entry a candidate for the sweep's cap:
+    /// until someone has it, the task's completion exists nowhere durable, so
+    /// the cap must not drop it. See [`sweep_finished`].
     pub async fn completion_record(&self, task_id: &str) -> Option<CompletionRecord> {
         let mut tasks = self.locked().await;
         let task = tasks.get_mut(task_id)?;
         let finished_at = task.finished_at?;
-        task.completion_recorded = true;
+        if task.completion_claimed {
+            return None;
+        }
+        task.completion_claimed = true;
+        // A finished task always has an outcome (written in the same locked
+        // block as `finished_at`). Defend anyway rather than unwrapping:
+        // `Unknown` is the honest reading, and it renders as words, not a `0`.
+        let outcome = task.outcome.unwrap_or(TaskOutcome::Unknown);
+        let (abandoned, killed) = ending(&*task, outcome);
         let (stdout, stdout_dropped) = task.stdout.all();
         let (stderr, stderr_dropped) = task.stderr.all();
         Some(CompletionRecord {
             started_at: task.started_at,
             finished_at,
-            // A finished task always has an outcome (written in the same
-            // locked block as `finished_at`). Defend anyway rather than
-            // unwrapping: `Unknown` is the honest reading, and it renders as
-            // words, not as a `0`.
-            outcome: task.outcome.unwrap_or(TaskOutcome::Unknown),
+            command: task.command.clone(),
+            outcome,
             timed_out: task.timed_out,
-            killed: task.killed,
+            killed,
+            abandoned,
             stdout,
             stdout_dropped,
             stderr,
             stderr_dropped,
         })
+    }
+
+    /// Hand a claim back, for an emitter whose write failed.
+    ///
+    /// The claim is a promise to persist `BackgroundBashCompleted`, not proof
+    /// that it happened. An emitter that took it and then failed leaves nothing
+    /// durable, and holding the claim tells the teardown the task is settled.
+    /// The boot sweep would then report a success as an engine loss.
+    ///
+    /// Safe to call for a task that is gone: the entry may have been swept.
+    pub async fn release_completion_claim(&self, task_id: &str) {
+        if let Some(task) = self.locked().await.get_mut(task_id) {
+            task.completion_claimed = false;
+        }
     }
 
     /// Test helper: poll-wait until the task's not-yet-read stdout contains
@@ -712,6 +921,37 @@ impl BackgroundBashRegistry {
     }
 }
 
+/// Which of the two engine-side endings this was: `(abandoned, killed)`.
+///
+/// Decided once, here, so no reader re-derives the precedence. Both are the
+/// same SIGKILL down the same channel, and `BackgroundTask::abandoned` is the
+/// only record of who sent it.
+///
+/// **Neither is claimed unless our signal is what ended the task**, which is
+/// exactly `BackgroundTask::killed`: the watchdog sets it only on the arm the
+/// kill receiver won. Three other endings reach here with a signal already
+/// sent or in flight, and each has its own name.
+///
+/// - A normal exit. The teardown fires at every task without a `finished_at`.
+///   That includes one whose child has already gone while the watchdog joins
+///   its drain readers, up to two seconds later. A release that exited 0 in
+///   there really did ship, so `ran_to_exit` keeps its verdict.
+/// - The watchdog's own budget, which never takes the kill signal and so is
+///   still markable. It reports `timed_out`.
+/// - A signal from outside, a SIGSEGV say, which must keep its own number.
+fn ending(task: &BackgroundTask, outcome: TaskOutcome) -> (bool, bool) {
+    let ran_to_exit = matches!(outcome, TaskOutcome::Exited(_));
+    let ended_by_our_signal = task.killed && !ran_to_exit;
+    // Exclusive on the wire, because they name different deciders. Reporting
+    // both would tell the agent `bash_kill` was called on work the shutdown
+    // ended. Only one can be true anyway: `bash_kill` and the teardown
+    // race for the one kill signal, and the loser marks nothing.
+    (
+        ended_by_our_signal && task.abandoned,
+        ended_by_our_signal && !task.abandoned,
+    )
+}
+
 /// Apply the retention policy: drop every completed task past
 /// [`FINISHED_RETENTION_SECS`], then, if more than
 /// [`MAX_RETAINED_FINISHED`] *recorded* completions remain, drop the oldest
@@ -722,21 +962,22 @@ impl BackgroundBashRegistry {
 ///
 /// - **Running tasks**, however long they have been going. They are live
 ///   state.
-/// - **Completions whose [`CompletionRecord`] has not been read**, on the CAP
-///   pass. That read is what the watcher does immediately before emitting
-///   `BackgroundBashCompleted`, so evicting one first would leave the task
-///   with no durable record at all: the watcher finds nothing, emits nothing,
-///   and every later `bash_output` reports an unknown task. That is the exact
-///   loss this whole change exists to prevent, so a burst of more than
+/// - **Completions nobody has claimed** ([`BackgroundTask::completion_claimed`]),
+///   on the CAP pass. That claim is what the watcher takes immediately before
+///   emitting `BackgroundBashCompleted`, so evicting one first would leave the
+///   task with no durable record at all: the watcher finds nothing, emits
+///   nothing, and every later `bash_output` reports an unknown task. That is the
+///   exact loss this whole change exists to prevent, so a burst of more than
 ///   `MAX_RETAINED_FINISHED` simultaneous completions must overshoot the cap
 ///   briefly rather than drop one.
 ///
-/// The EXPIRY pass is deliberately unconditional, which is what keeps the
-/// overshoot bounded: an unread completion is a transient (the watcher is a
-/// spawned task already parked on the finish signal, so it reads within
-/// microseconds), and a five-minute window is many orders of magnitude longer
-/// than that. Gating expiry on the read too would pin an entry forever
-/// whenever a watcher never runs, and unbounded memory is the worse failure.
+/// The EXPIRY pass is deliberately unconditional, and it is the only thing
+/// bounding the overshoot. An unclaimed completion is USUALLY a transient: the
+/// watcher is a spawned task already parked on the finish signal, so it claims
+/// within microseconds. A claim handed back by a failed emit is not, and a
+/// database outage hands back every one for as long as it lasts. Expiry still
+/// caps that at the retention window. Gating expiry on the claim too would pin
+/// an entry forever, and unbounded memory is the worse failure.
 fn sweep_finished(tasks: &mut HashMap<String, BackgroundTask>) {
     let now = Utc::now();
     tasks.retain(|_, t| !t.is_expired(now));
@@ -746,7 +987,7 @@ fn sweep_finished(tasks: &mut HashMap<String, BackgroundTask>) {
     // and sort them just to discover there was nothing to do.
     let excess = tasks
         .values()
-        .filter(|t| t.completion_recorded)
+        .filter(|t| t.completion_claimed)
         .count()
         .saturating_sub(MAX_RETAINED_FINISHED);
     if excess == 0 {
@@ -754,7 +995,7 @@ fn sweep_finished(tasks: &mut HashMap<String, BackgroundTask>) {
     }
     let mut recorded: Vec<(DateTime<Utc>, String)> = tasks
         .iter()
-        .filter(|(_, t)| t.completion_recorded)
+        .filter(|(_, t)| t.completion_claimed)
         .filter_map(|(id, t)| t.finished_at.map(|at| (at, id.clone())))
         .collect();
     // Oldest completion first: the newest are the ones an agent may still be
@@ -775,6 +1016,9 @@ fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
     // Measure to `finished_at` once the task is done so a late drain reports
     // the task's runtime, not "how long ago it was spawned".
     let until = task.finished_at.unwrap_or_else(Utc::now);
+    // A running task has no outcome yet, so it is neither ending. `ending`
+    // needs one, and `Unknown` is what a status-less task honestly has.
+    let (abandoned, killed) = ending(task, task.outcome.unwrap_or(TaskOutcome::Unknown));
     OutputSnapshot {
         stdout,
         stderr,
@@ -783,7 +1027,8 @@ fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
         outcome: task.outcome,
         finished: task.is_finished(),
         timed_out: task.timed_out,
-        killed: task.killed,
+        killed,
+        abandoned,
         elapsed_secs: (until - task.started_at).num_seconds().max(0),
     }
 }
@@ -1190,6 +1435,388 @@ mod tests {
         assert_eq!(reg.retained_finished_count().await, MAX_RETAINED_FINISHED);
     }
 
+    /// The guard the boot sweep asks before settling a task. A retained
+    /// completion must answer no, or a re-run of the sweep would decline to
+    /// settle a task that is genuinely over.
+    #[tokio::test]
+    async fn is_running_is_false_for_a_retained_finished_task() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+        assert!(
+            reg.is_running(&task_id).await,
+            "a task this process owns must block the sweep from settling it"
+        );
+
+        assert!(reg.kill(&task_id).await);
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(8)).await);
+        assert!(!reg.is_running(&task_id).await);
+        assert!(!reg.is_running("never-spawned").await);
+    }
+
+    /// **The whole point of killing before recording.** A task the teardown
+    /// abandons is dead by the time its record is read, and that record carries
+    /// everything it ever wrote.
+    ///
+    /// Recording first and killing later (or never, leaving `kill_on_drop` to
+    /// the runtime) is a claim about the future: the teardown then awaits
+    /// seconds of session and browser cleanup, and a command finishing inside
+    /// that window really does finish, with real side effects.
+    #[tokio::test]
+    async fn hand_over_at_teardown_kills_the_child_and_keeps_what_it_wrote() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo mid-flight; sleep 300",
+                600,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(my_thread),
+            )
+            .await
+            .expect("spawn");
+        assert!(
+            reg.wait_for_stdout(&task_id, "mid-flight", Duration::from_secs(5))
+                .await,
+            "the echo never flushed, so this test cannot say what teardown would keep",
+        );
+
+        let killed = reg.hand_over_at_teardown().await;
+        assert_eq!(killed.len(), 1, "killed: {killed:?}");
+        assert_eq!(killed[0].thread_id, my_thread);
+        assert_eq!(killed[0].task_id, task_id);
+
+        // The `sleep 300` is nowhere near its 600 s budget, so finishing here
+        // is the kill and nothing else.
+        assert!(
+            reg.wait_until_finished(&task_id, Duration::from_secs(30))
+                .await,
+            "hand_over_at_teardown must kill, not merely mark",
+        );
+
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert_eq!(record.command, "echo mid-flight; sleep 300");
+        assert!(record.abandoned);
+        assert!(
+            !record.killed,
+            "`abandoned` outranks `killed`: nobody called bash_kill"
+        );
+        // The teardown builds the row through this, so the note is on it
+        // whichever emitter wins the record.
+        let crate::engine::thread_events::ThreadEvent::BackgroundBashCompleted { stderr, .. } =
+            super::super::bash_background_recovery::completion_event(
+                task_id.clone(),
+                record.clone(),
+            )
+        else {
+            panic!("expected a completion");
+        };
+        assert!(stderr.contains("the engine was shutting down"), "{stderr}");
+        assert!(
+            stderr.contains("may still be running"),
+            "a single-pid SIGKILL cannot promise the pipeline stopped: {stderr}"
+        );
+        assert!(
+            record.stdout.contains("mid-flight"),
+            "the output written before the kill was lost: {:?}",
+            record.stdout
+        );
+    }
+
+    /// [`ending`] as a truth table, which is the only way to cover it. Every
+    /// row below is a real interleaving, and three of them live inside the
+    /// watchdog's 2 s drain join. Racing a real child into that window makes a
+    /// test that fails in both directions under suite load. It says nothing
+    /// about the product when it does.
+    #[test]
+    fn ending_claims_nothing_our_signal_did_not_do() {
+        // (abandoned mark, killed arm, reaped outcome) -> (abandoned, killed)
+        let cases = [
+            // The teardown killed live work. The case the flag exists for.
+            ((true, true, TaskOutcome::Signaled(9)), (true, false)),
+            // `bash_kill` killed live work: same signal, different decider.
+            ((false, true, TaskOutcome::Signaled(9)), (false, true)),
+            // The child exited before either signal arrived, and the release
+            // it was running really did ship.
+            ((true, true, TaskOutcome::Exited(0)), (false, false)),
+            ((false, true, TaskOutcome::Exited(1)), (false, false)),
+            // The watchdog's own budget. Its arm never takes the kill signal,
+            // so the mark can land, but `timed_out` owns this ending.
+            ((true, false, TaskOutcome::Signaled(9)), (false, false)),
+            // A signal from outside, which keeps its own number.
+            ((true, false, TaskOutcome::Signaled(11)), (false, false)),
+            // Nothing engine-side happened at all.
+            ((false, false, TaskOutcome::Exited(0)), (false, false)),
+        ];
+        for ((abandoned_mark, killed_arm, outcome), want) in cases {
+            let mut task = BackgroundTask::for_test();
+            task.abandoned = abandoned_mark;
+            task.killed = killed_arm;
+            assert_eq!(
+                ending(&task, outcome),
+                want,
+                "mark={abandoned_mark} killed={killed_arm} outcome={outcome:?}"
+            );
+        }
+    }
+
+    /// An earlier `bash_kill` owns the ending, and the shutdown must not take
+    /// the credit. Its signal is already spent, so nothing marks the task, but
+    /// the teardown still gets a handle: the completion has to be written
+    /// before this process goes, whoever ended the work.
+    #[tokio::test]
+    async fn a_task_already_killed_by_the_agent_stays_killed() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "sleep 300",
+                600,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+
+        assert!(reg.kill(&task_id).await);
+        let handles = reg.hand_over_at_teardown().await;
+        assert_eq!(
+            handles.len(),
+            1,
+            "the teardown still has to record it before the process goes"
+        );
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(30)).await);
+
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert!(record.killed, "bash_kill ended it, and says so");
+        assert!(!record.abandoned);
+    }
+
+    /// A task that blew its own `timeout_secs` keeps `timed_out` and its
+    /// signal even when the shutdown marks it. The watchdog's timeout arm never
+    /// takes the kill signal, so the mark lands. Only `killed` says our signal
+    /// ended the task, and that arm does not set it.
+    #[tokio::test]
+    async fn a_timed_out_task_is_not_stolen_by_the_shutdown() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "sleep 300",
+                1,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(30)).await);
+
+        // The teardown still has to RECORD it: its watcher may never run.
+        // What it must not do is kill it again or call the ending its own.
+        assert_eq!(reg.hand_over_at_teardown().await.len(), 1);
+
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert!(record.timed_out, "its own budget ended it, and says so");
+        assert!(!record.abandoned);
+        assert_eq!(record.outcome, TaskOutcome::Signaled(9));
+    }
+
+    /// The teardown-versus-watchdog race. Both go through `completion_record`,
+    /// so the one-shot gate settles it and the loser writes nothing. Two
+    /// terminal events on one task would be read by `bash_output` last-row
+    /// first, so a successful release could come back reported as abandoned.
+    #[tokio::test]
+    async fn only_one_of_the_two_emitters_gets_the_record() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo nearly; sleep 0.2",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(60)).await);
+
+        assert!(reg.completion_record(&task_id).await.is_some(), "the first");
+        assert!(
+            reg.completion_record(&task_id).await.is_none(),
+            "the second must write nothing"
+        );
+        // The entry is still drainable, so a late `bash_output` is unaffected.
+        assert!(reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .is_some());
+    }
+
+    /// **A task that finished but whose watcher never claimed it is handed
+    /// over too.** Its watcher may never be scheduled again, and dropping it
+    /// here made the next boot report a success as an engine loss. It is not
+    /// killed and not marked, only recorded.
+    ///
+    /// A task with no owning thread is the one real skip: a completion is a
+    /// thread event, so there is nowhere for it to land.
+    #[tokio::test]
+    async fn hand_over_at_teardown_takes_the_unclaimed_and_skips_the_thread_less() {
+        let reg = BackgroundBashRegistry::new();
+        let (orphan, _rx1) = reg
+            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+        let (done, _rx2) = reg
+            .spawn(
+                "echo bye",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&done, Duration::from_secs(5)).await);
+
+        let handed = reg.hand_over_at_teardown().await;
+        let ids: Vec<&str> = handed.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(ids, vec![done.as_str()], "handed: {handed:?}");
+        assert!(
+            reg.is_running(&orphan).await,
+            "a thread-less task must be left running, not killed for nothing"
+        );
+
+        let record = reg.completion_record(&done).await.expect("record");
+        assert!(
+            !record.abandoned,
+            "a task that finished on its own is not abandoned"
+        );
+        assert_eq!(
+            record.outcome,
+            TaskOutcome::Exited(0),
+            "its real verdict is what the teardown records"
+        );
+
+        reg.kill(&orphan).await;
+    }
+
+    /// A claim is a promise to write the row, not proof that it happened. An
+    /// emitter that fails its write hands the claim back, so the task is
+    /// handed over again and the completion still gets written.
+    ///
+    /// Without the release the boot sweep is the only floor left. It reports a
+    /// task that exited 0 as an engine loss, with no output.
+    #[tokio::test]
+    async fn a_released_claim_makes_the_task_recordable_again() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo written",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(8)).await);
+
+        assert!(reg.completion_record(&task_id).await.is_some());
+        assert!(reg.hand_over_at_teardown().await.is_empty());
+
+        // What the watcher does when its emit comes back `Err`.
+        reg.release_completion_claim(&task_id).await;
+
+        assert_eq!(reg.hand_over_at_teardown().await.len(), 1);
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert!(record.stdout.contains("written"));
+    }
+
+    /// Releasing a task that is gone must not panic. The retention sweep can
+    /// take the entry between the failed emit and the release.
+    #[tokio::test]
+    async fn releasing_a_claim_on_a_missing_task_is_a_no_op() {
+        let reg = BackgroundBashRegistry::new();
+        reg.release_completion_claim("never-spawned").await;
+    }
+
+    /// A completion somebody has already claimed is not handed over again. The
+    /// claimant is about to write it, so a second row would be the duplicate
+    /// the one-shot gate exists to prevent.
+    #[tokio::test]
+    async fn hand_over_at_teardown_skips_a_claimed_completion() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo claimed",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(8)).await);
+        assert!(reg.completion_record(&task_id).await.is_some());
+
+        assert!(reg.hand_over_at_teardown().await.is_empty());
+    }
+
+    /// `wait_until_finished` answers about the task, not about the wait. Both
+    /// negatives matter: the teardown skips the emit on either, and the boot
+    /// sweep is the floor under both.
+    #[tokio::test]
+    async fn wait_until_finished_is_false_for_a_running_and_an_unknown_task() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn("sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+
+        assert!(
+            !reg.wait_until_finished(&task_id, Duration::from_millis(50))
+                .await
+        );
+        assert!(
+            !reg.wait_until_finished("never-spawned", Duration::from_millis(50))
+                .await
+        );
+
+        assert!(reg.kill(&task_id).await);
+        assert!(
+            reg.wait_until_finished(&task_id, Duration::from_secs(30))
+                .await
+        );
+    }
+
+    /// The registry redacts its own copy of the command, so a teardown emit
+    /// cannot persist a password the caller happened not to scrub.
+    #[tokio::test]
+    async fn the_stored_command_is_redacted() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "psql postgres://u:hunter2@h:5432/d -c 'select 1'",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(8)).await);
+
+        let record = reg.completion_record(&task_id).await.expect("record");
+        assert!(
+            !record.command.contains("hunter2"),
+            "the stored command leaked a password: {:?}",
+            record.command
+        );
+    }
+
     /// Retention must not make a finished task read as running. The
     /// agent-session idle handler keeps a coding agent alive while this is
     /// true, so a retained task counted as running would pin the session open
@@ -1239,12 +1866,19 @@ mod tests {
 
         // Reading the final state must NOT be the same step as removing the
         // entry: that coupling is what made a drain at the completion instant
-        // fail. Reading it twice is fine, and the task stays drainable.
-        assert!(reg.completion_record(&task_id).await.is_some());
+        // fail. The task stays drainable afterwards.
         assert!(reg
             .read_output_in_memory_wait(&task_id, Duration::ZERO)
             .await
             .is_some());
+
+        // But the RECORD is one-shot, and that is a separate rule from
+        // eviction. Its holder writes `BackgroundBashCompleted`, so a second
+        // caller getting one would put two terminal events on one task.
+        assert!(
+            reg.completion_record(&task_id).await.is_none(),
+            "a claimed completion must not be handed out twice"
+        );
     }
 
     /// The completion record reads the whole retained buffer via

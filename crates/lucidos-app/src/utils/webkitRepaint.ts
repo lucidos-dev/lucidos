@@ -1,13 +1,17 @@
-import { isIOS } from './platform';
+import { isWebKit } from './platform';
 import { hasPendingEventScroll } from '../components/chat/scrollState';
 import { isUserScrolling } from './scrollActivity';
 
-/** Force iOS Safari / WKWebView to repaint a compositor layer whose backing
- *  texture it has blanked: the content is in the DOM but renders black. WebKit
- *  stops committing the layer tree, so the layer freezes on a stale texture
- *  until a scroll, rotation or layout change forces a fresh commit. The iOS
- *  PWA is Safari's own WKWebView, so a frontend repaint is the only recovery
- *  lever on that surface.
+/** Force WebKit to repaint a compositor layer whose backing texture it has
+ *  blanked: the content is in the DOM but renders blank. WebKit stops
+ *  committing the layer tree, so the layer freezes on a stale texture until a
+ *  scroll, rotation or layout change forces a fresh commit. A frontend repaint
+ *  is the only recovery lever we have on any of those surfaces.
+ *
+ *  Gated on the ENGINE, so it serves every WebKit client: the iOS PWA it was
+ *  built for, mobile Safari, macOS Safari, and the packaged desktop app, whose
+ *  Tauri window is a WKWebView. Gating it on iOS left the desktop app opening a
+ *  blank transcript that came back on the first scroll.
  *
  *  Three additive nudges across two animation frames, applied in frame one and
  *  restored in frame two, so the intermediate state is genuinely painted:
@@ -20,7 +24,7 @@ import { isUserScrolling } from './scrollActivity';
  *       `translateY`, so the layer gets the offset change and the reader sees
  *       nothing move (see `nudgedTransform`).
  *
- *  No-op off iOS and for detached nodes. Returns a cleanup that cancels the
+ *  No-op off WebKit and for detached nodes. Returns a cleanup that cancels the
  *  pending frames AND restores both baselines, so a caller can hand it
  *  straight back from a `useEffect`. */
 
@@ -177,8 +181,8 @@ function restoreNudge(el: HTMLElement, entry: InFlightToggle) {
   }
 }
 
-export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void) | undefined {
-  if (!el?.isConnected || !isIOS()) return;
+export function forceWebKitRepaint(el: HTMLElement | null | undefined): (() => void) | undefined {
+  if (!el?.isConnected || !isWebKit()) return;
 
   // A burst is common: a single iOS PWA resume fires visibilitychange +
   // pageshow + focus in one tick, each triggering a repaint. SUPERSEDE any
@@ -294,17 +298,17 @@ export const OPEN_REPAINT_BURST_DELAYS_MS = [0, 100, 300, 600, 1000];
  *  Fires several attempts spaced over a few hundred ms, so one dropped frame
  *  cannot swallow the whole recovery. Each is a full supersede-safe toggle, so
  *  they never accumulate, and each only touches `transform` so scroll math is
- *  untouched. No-op off iOS and for a detached node. Returns a cleanup that
+ *  untouched. No-op off WebKit and for a detached node. Returns a cleanup that
  *  cancels the immediate toggle's frames AND every pending retry. */
-export function forceIOSRepaintBurst(el: HTMLElement | null | undefined): (() => void) | undefined {
-  if (!el?.isConnected || !isIOS()) return;
+export function forceWebKitRepaintBurst(el: HTMLElement | null | undefined): (() => void) | undefined {
+  if (!el?.isConnected || !isWebKit()) return;
   let immediateCleanup: (() => void) | undefined;
   const timers: Array<ReturnType<typeof setTimeout>> = [];
   for (const delay of OPEN_REPAINT_BURST_DELAYS_MS) {
     if (delay === 0) {
-      immediateCleanup = forceIOSRepaint(el);
+      immediateCleanup = forceWebKitRepaint(el);
     } else {
-      timers.push(setTimeout(() => forceIOSRepaint(el), delay));
+      timers.push(setTimeout(() => forceWebKitRepaint(el), delay));
     }
   }
   return () => {

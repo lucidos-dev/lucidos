@@ -12,7 +12,8 @@
 //! It is keyed by workspace SLUG rather than by window label, which is the
 //! other half of the same defect. `tauri-plugin-window-state` keys geometry by
 //! label, and an extra window's label is `window-<n>` off a counter that resets
-//! each process. That label means nothing across launches.
+//! each process. That label means nothing across launches, which is why the
+//! plugin is confined to `main` (`window_persist::plugin_tracks`).
 //!
 //! Everything here fails soft. It sits on the client's boot path, so a bad
 //! record must mean "restore nothing", never a client that will not start.
@@ -165,6 +166,21 @@ pub fn write(app_data: &Path, session: &WindowSession) {
     if let Err(e) = std::fs::rename(&tmp, &path) {
         eprintln!("[Tauri] could not replace {}: {e}", path.display());
     }
+}
+
+/// The frame recorded for the workspace `url` serves, when one is remembered.
+///
+/// The exact mirror of what [`capture`] wrote. That keys each frame by
+/// `window_target::window_workspace` of the window's URL. This reads it back by
+/// the same parse, of the URL a window is about to load. So the two cannot key
+/// differently, which a caller deriving a slug some other way could.
+///
+/// `None` for a URL on no workspace (the picker, the boot splash) and for a
+/// workspace nothing is remembered about. Both mean the same thing to a caller:
+/// build the window at the declared default.
+pub fn frame_for_url(session: &WindowSession, url: &str) -> Option<Rect> {
+    let workspace = crate::window_target::window_workspace(url)?;
+    session.geometry.get(workspace).copied()
 }
 
 /// The workspaces to restore, and the frame each one wants.
@@ -477,6 +493,64 @@ mod tests {
         let session = read(tmp.path());
         assert_eq!(session.open, vec!["myws"]);
         assert!(session.geometry.is_empty());
+    }
+
+    // ── frame_for_url ────────────────────────────────────────────────────────
+
+    // The reason `geometry` is merged rather than replaced: a workspace with no
+    // window right now is exactly the one a reopen has to size.
+    #[test]
+    fn a_closed_workspace_is_reopened_at_the_frame_it_was_left() {
+        let session = capture(
+            &WindowSession::default(),
+            &[
+                snapshot("main", "http://localhost:3210/myws/", rect(0, 0, 1200, 800)),
+                snapshot(
+                    "window-1",
+                    "http://localhost:3210/dev/",
+                    rect(100, 50, 900, 700),
+                ),
+            ],
+        );
+        // Both, whether or not a window is still on them: the caller only ever
+        // asks about a workspace nothing is showing.
+        assert_eq!(
+            frame_for_url(&session, "http://localhost:3210/dev/"),
+            Some(rect(100, 50, 900, 700))
+        );
+        assert_eq!(
+            frame_for_url(&session, "http://localhost:3210/myws/"),
+            Some(rect(0, 0, 1200, 800))
+        );
+        // The landing fragment and a deep link ride the same URL, and neither is
+        // part of the key.
+        assert_eq!(
+            frame_for_url(&session, "http://localhost:3210/dev/#notifications"),
+            Some(rect(100, 50, 900, 700))
+        );
+    }
+
+    // Nothing remembered, and nothing that is a workspace at all. Both hand the
+    // caller the declared default rather than another workspace's frame.
+    #[test]
+    fn a_url_with_no_recorded_frame_asks_for_the_default() {
+        let session = WindowSession {
+            open: vec!["myws".into()],
+            geometry: BTreeMap::from([("myws".to_string(), rect(1, 2, 1200, 800))]),
+        };
+        for url in [
+            "http://localhost:3210/dev/",
+            "http://localhost:3210/~/?pick",
+            "http://localhost:3210/",
+            "tauri://localhost",
+            "",
+        ] {
+            assert_eq!(frame_for_url(&session, url), None, "{url:?}");
+        }
+        assert_eq!(
+            frame_for_url(&WindowSession::default(), "http://localhost:3210/myws/"),
+            None
+        );
     }
 
     // ── restore_plan ─────────────────────────────────────────────────────────

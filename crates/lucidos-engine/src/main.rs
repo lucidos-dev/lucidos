@@ -85,6 +85,20 @@ async fn shutdown_signal(
     // the same verdict.
     engine.abort_in_flight_for_restart(teardown_actor).await;
 
+    // Record every background task this process is about to kill, while its
+    // buffered output still exists. `is_shutting_down` already holds, set by
+    // `begin_teardown` above, so the event-wait dispatcher declines to open a
+    // turn on an engine that is leaving.
+    //
+    // AFTER the boundary emits, not before, because this one blocks: it kills
+    // each child and waits for the reap. The supervisor force-kills the whole
+    // shutdown at 15 s, and a device-attributed `ResponseAborted` that misses
+    // that window costs every in-flight thread its auto-resume. The tail of a
+    // background log is not worth that, so the durable emits go first.
+    //
+    // The boot sweep is the floor under this, for the deaths no hook sees.
+    engine.settle_running_background_tasks_at_teardown().await;
+
     // Must happen before HTTP shutdown, so the event bus can still persist the
     // CodingAgentIdled events that carry each session id.
     engine.shutdown_agent_sessions().await;
@@ -842,6 +856,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //    (there is no table) and run each catch-up scan. A match that landed
     //    while the engine was down then still reaches its thread. A deadline
     //    that passed expires loudly on the next sweep tick.
+    // 4. The abandoned-background-task sweep between steps 2 and 3, for the
+    //    reason stated at its own call site below.
     shared_engine.start_wait_reentry_consumer();
     shared_engine.start_event_wait_dispatcher();
     // Before either: close any `await_event` call the legacy attached-wait
@@ -850,6 +866,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // array is already valid.
     shared_engine.settle_legacy_attached_event_waits().await;
     shared_engine.refire_unresolved_wait_reentries().await;
+
+    // Settle the background tasks the last engine took down with it. A thread
+    // that ended a turn with background work running is subscribed to that
+    // task's `BackgroundBashCompleted`, and no process will ever emit it now.
+    //
+    // Wedged between the two steps around it, and both sides are load-bearing.
+    // AFTER the lost-re-entry sweep, whose predicate is "the anchor is the last
+    // event on this thread". This appends one, so running it first buries a
+    // stranded re-entry and the thread never runs its turn. BEFORE the rebuild,
+    // because its catch-up scan reads forward from each wait's watermark. That
+    // scan is what re-opens the thread at boot instead of at its own deadline.
+    //
+    // The dispatcher above cannot match this live: the rebuild has not run, so
+    // the cache holds no wait yet.
+    shared_engine.settle_abandoned_background_tasks().await;
+
     shared_engine.rebuild_event_waits().await;
 
     // Rebuild the Apply-All batch registry from the durable table and resolve
@@ -1009,10 +1041,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(e) => log!("[AuxContextBackfill] failed: {}", e),
         }
     });
-    let api_port = std::env::var("LUCIDOS_API_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
+    // An unparseable value says so before falling back, the way a malformed
+    // `LUCIDOS_BIND_ADDR` does. Silently binding 3000 sends the user hunting a
+    // "connection refused" on the port they set. Blank counts as unset, as in
+    // `api::base_path::api_port`: a launcher exporting an empty shell variable
+    // asserted nothing.
+    let api_port_env = std::env::var("LUCIDOS_API_PORT").ok();
+    let api_port_raw = api_port_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let api_port = match api_port_raw {
+        Some(raw) => raw.parse::<u16>().unwrap_or_else(|e| {
+            log!("[Startup] LUCIDOS_API_PORT={raw:?} is not a port ({e}); using 3000");
+            3000
+        }),
+        None => 3000,
+    };
     // SECURITY: the bind resolves loopback-first, and `net_config` owns the
     // whole precedence order. With nothing set the default is loopback-only,
     // because a directly-launched engine has no request-level API auth. A
@@ -1066,8 +1111,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The http/https decision is resolved in ONE place,
     // `net_config::tls_scheme_from`. The branch below only loads the cert paths
     // that decision implies.
-    let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
-    let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
+    //
+    // Trimmed at the read, because `tls_scheme_from` trims before deciding and
+    // `from_pem_file` does not. A padded path would otherwise pick https and
+    // then abort the boot on a file the user does have.
+    let tls_cert = std::env::var("LUCIDOS_TLS_CERT")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let tls_key = std::env::var("LUCIDOS_TLS_KEY")
+        .ok()
+        .map(|v| v.trim().to_string());
     let scheme = net_config::tls_scheme_from(tls_cert.as_deref(), tls_key.as_deref());
 
     // Serve every resolved address concurrently, sharing the one graceful-shutdown

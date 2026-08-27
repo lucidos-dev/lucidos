@@ -531,15 +531,26 @@ pub(crate) async fn revert_with_shas(
     post_sha: &str,
     branch_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let parents: Vec<String> = git_cmd(&["log", "--pretty=%P", "-1", post_sha], repo_root)
+    // A parent list nobody could read is NOT "this is a single-parent commit".
+    // Swallowing the failure sends a merge commit down the range-revert arm
+    // below. That then fails with a confusing error, about a question git was
+    // never asked. `git_cmd` returns `Err` on a spawn failure and on its 30s
+    // timeout, and a non-zero exit means the sha did not resolve.
+    let log_out = git_cmd(&["log", "--pretty=%P", "-1", post_sha], repo_root)
         .await
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+        .map_err(|e| format!("cannot read the parents of {}: {}", post_sha, e))?;
+    if !log_out.status.success() {
+        return Err(format!(
+            "cannot read the parents of {}: {}",
+            post_sha,
+            String::from_utf8_lossy(&log_out.stderr).trim()
+        )
+        .into());
+    }
+    let parents: Vec<String> = String::from_utf8_lossy(&log_out.stdout)
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
 
     if parents.len() > 1 {
         // Match pre_sha to determine which parent is old main — catchup

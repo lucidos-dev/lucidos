@@ -33,6 +33,22 @@ pub(crate) async fn git_cmd(args: &[&str], dir: &Path) -> Result<std::process::O
     git_cmd_env(args, dir, &[]).await
 }
 
+/// Run a git command that is expected to DO something, folding a non-zero exit
+/// into the same `Err` a spawn failure or the [`GIT_TIMEOUT`] produces.
+///
+/// [`git_cmd`] returning `Ok` says only that git ran, not that it did the
+/// thing. A caller who just needs "did it work, and if not why" otherwise
+/// writes that three-arm match out at every site. Use this for a mutating
+/// call. For a yes/no *question* reach for [`git_answer`] instead, which keeps
+/// "no" and "could not ask" apart.
+pub(crate) async fn git_ran_ok(args: &[&str], dir: &Path) -> Result<(), String> {
+    match git_cmd(args, dir).await {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Like [`git_cmd`] but with extra environment variables. Used by the command
 /// checkpoint helpers, which set `GIT_INDEX_FILE` to a throwaway index so a
 /// snapshot/restore never disturbs the repo's real index or working tree.

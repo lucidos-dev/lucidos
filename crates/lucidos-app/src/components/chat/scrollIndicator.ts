@@ -59,7 +59,7 @@ export interface ScrollEventContext {
    *  came from one of our own navigations writing scrollTop frame by frame (a
    *  chevron tap, turn-nav, a deep-link glide), not from the reader. */
   programmaticScroll: boolean;
-  /** `isRepaintNudging()` (utils/iosRepaint.ts): the compositor-recovery nudge
+  /** `isRepaintNudging()` (utils/webkitRepaint.ts): the compositor-recovery nudge
    *  writes +/-1px and puts it back a frame later, firing two real scroll events
    *  for a movement the user never made. */
   repaintNudge: boolean;

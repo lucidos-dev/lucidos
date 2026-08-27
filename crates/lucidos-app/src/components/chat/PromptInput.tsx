@@ -372,7 +372,7 @@ export function PromptInput() {
       return Promise.resolve();
     }
     if (effectiveThreadStatus(thread) === 'waiting_for_user_answer' && currentImages.length > 0) {
-      showToast('Remove attached images to answer this question — answers are text only.', 'info');
+      showToast('Remove attached images to answer this question: answers are text only.', 'info');
       clearSubmittingThread(threadId);
       return Promise.resolve();
     }
@@ -394,7 +394,7 @@ export function PromptInput() {
     // losing them. Disabling the attach buttons covers fresh attachments; this
     // catches images attached before the question opened.
     if (isAnsweringQuestion && (currentImages.length > 0 || pendingForThread.length > 0)) {
-      showToast('Remove attached images to answer this question — answers are text only.', 'info');
+      showToast('Remove attached images to answer this question: answers are text only.', 'info');
       return;
     }
     const thread = threadId ? threadMap.value.get(threadId) : undefined;
@@ -845,7 +845,7 @@ export function PromptInput() {
       // cleared toggles + text avoids racing fresh input typed during the
       // failure window.
       clearPendingAnswer(pendingMultiQ.toolUseId);
-      showToast('Could not send answer — please try again.', 'error');
+      showToast('Could not send answer. Please try again.', 'error');
     }
     restoreComposerFocus();
   }

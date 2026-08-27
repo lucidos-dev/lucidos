@@ -577,7 +577,10 @@ export type ThreadEvent =
   // the engine could not obtain a status; that is a failure, never a success.
   // `signal` is absent on rows written before the field existed.
   | { type: 'BackgroundBashStarted'; task_id: string; command: string; timeout_secs: number; started_at: string }
-  | { type: 'BackgroundBashCompleted'; task_id: string; command: string; exit_code: number | null; signal?: number | null; stdout: string; stderr: string; started_at: string; finished_at: string; timed_out?: boolean; killed?: boolean }
+  // `abandoned` is the engine-stop case: the task was a child of the engine
+  // process, so a restart or crash killed it and no status was ever reaped.
+  // Absent when false, and distinct from `killed`, which means `bash_kill`.
+  | { type: 'BackgroundBashCompleted'; task_id: string; command: string; exit_code: number | null; signal?: number | null; stdout: string; stderr: string; started_at: string; finished_at: string; timed_out?: boolean; killed?: boolean; abandoned?: boolean }
   // Background Flash enrichment of a prior MessageReceived's attached images
   // (one event per attached hash, all carrying the same description text).
   // Replaces the deprecated `image_description` field on MessageReceived; new

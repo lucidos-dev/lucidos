@@ -196,7 +196,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
     if (!ok) {
       localPending.value = null;
-      showToast('Could not send answer — please try again.', 'error');
+      showToast('Could not send answer. Please try again.', 'error');
     }
   };
 

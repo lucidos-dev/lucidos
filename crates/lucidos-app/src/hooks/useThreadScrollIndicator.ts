@@ -6,7 +6,7 @@ import {
   nextIndicatorVisibility,
 } from '../components/chat/scrollIndicator';
 import { isNavigationScroll } from '../components/chat/scrollState';
-import { isRepaintNudging } from '../utils/iosRepaint';
+import { isRepaintNudging } from '../utils/webkitRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
 import { viewportIsMobile } from '../utils/viewport';
 

@@ -203,7 +203,7 @@ test.describe('Lucidos menu from the desktop mark', () => {
     await expect(notice).toHaveCount(1);
     // The state in words, with the workspace it is about, and the dot carrying
     // the state so the shared `.status-dot` scale can colour it.
-    await expect(notice).toContainText(/^Disconnected from \S/);
+    await expect(notice).toContainText(/^Cannot reach \S/);
     await expect(notice.locator('.status-dot.disconnected')).toHaveCount(1);
     // A statement, not a control: the panel's rows are what answer a tap.
     await expect(notice.locator('button')).toHaveCount(0);

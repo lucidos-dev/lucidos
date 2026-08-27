@@ -250,7 +250,7 @@ A proxy entry obtained by watching a site's own frontend rather than by reading 
 See also: *endpoint catalog*, *credential*, `system-knowhow/deriving-an-api-from-a-site.md`.
 
 ### Engine
-The process serving one *workspace*: it holds the threads, answers the app, runs triggers and scheduled tasks, and talks to its database. One per workspace, started by the *workspace gateway* (dev term) and addressed through it. When the app says "Disconnected from the dev engine" it means this process stopped answering, not that the workspace is gone. The picker and the Lucidos menu's Workspaces row reach the gateway instead, so listing and switching keep working. Settings → System shows its version and is where you restart it.
+The process serving one *workspace*: it holds the threads, answers the app, runs triggers and scheduled tasks, and talks to its database. One per workspace, started by the *workspace gateway* (dev term) and addressed through it. When the app says "Cannot reach the dev engine" it means this client got no answer from that process. It does not mean the workspace is gone, or that the engine stopped: a client can lose the route to a healthy engine. The picker and the Lucidos menu's Workspaces row reach the gateway instead, so listing and switching keep working. Settings → System shows its version and is where you restart it.
 Contrast with *Lucidos Engine*, the actor chip on work the engine did without the LLM.
 
 ### Environment variable

@@ -127,6 +127,11 @@ pub(crate) fn set_window_title(window: tauri::Window, title: String) -> Result<(
 /// Postgres as a shared launchd service (see `desktop`). So all windows share
 /// one workspace stack. The WKWebView crash-recovery watchdog stays scoped to
 /// `main`.
+///
+/// **No remembered frame, deliberately.** This is a SECOND window on the
+/// workspace you are already looking at, and the record holds one frame per
+/// workspace. Handing it that frame would drop the new window exactly on top of
+/// the one it was opened from. The declared default, centred, is the answer.
 pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     open_app_window(app, new_window_url(app), None)
 }
@@ -137,10 +142,15 @@ pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
 ///
-/// `frame` is the geometry a RESTORED window wants, in physical pixels. Such a
-/// window is built hidden, placed, and shown once it is right, so it never
-/// appears at the default size and jumps. A fresh window passes `None` and
-/// takes the declared default.
+/// `frame` is the geometry the window's WORKSPACE was last left at, in physical
+/// pixels. Such a window is built hidden, placed, and shown once it is right, so
+/// it never appears at the default size and jumps. `None` takes the declared
+/// default, centred: File > New Window, and a workspace nothing is remembered
+/// about.
+///
+/// The show is `set_visible(true)`, which is `makeKeyAndOrderFront` on macOS. So
+/// a window opened by a click still arrives key, and needs no focus call of its
+/// own.
 fn open_app_window(
     app: &tauri::AppHandle,
     url: WebviewUrl,
@@ -372,9 +382,13 @@ pub(crate) fn show_workspace_window(
             Ok(())
         }
         window_target::WorkspaceTarget::NewWindow { url } => {
-            // No frame: this is the user opening a window now, not a launch
-            // restoring one. The session records the size it ends up at.
-            open_app_window(&app, WebviewUrl::External(parse_window_url(&url)?), None)
+            // At the size and place this workspace was last left, which is the
+            // whole reason the record keeps geometry after a window closes
+            // (ADR 0123). Reached only when NO window is on the workspace, so
+            // the remembered frame cannot land on top of the window it came
+            // from. That is also why File > New Window takes no frame.
+            let frame = window_persist::remembered_frame(&url);
+            open_app_window(&app, WebviewUrl::External(parse_window_url(&url)?), frame)
         }
     }
 }
@@ -551,12 +565,17 @@ pub(crate) fn close_all_to_tray(app: &tauri::AppHandle) {
     enter_menu_bar_only_if_no_windows(app, None);
 }
 
-/// Show and focus the main window, recreating it if it was destroyed.
+/// Show and focus the main window, standing a fresh one in when it is gone.
 ///
 /// ONE window, deliberately. It backs a native-notification tap with no window
 /// to aim at, and the retry path an uninstall failure leaves the user on. The
 /// tray's "Open Lucidos" and the Dock click want the whole arrangement instead,
 /// and go through [`reopen_client`].
+///
+/// The stand-in is a `window-<n>`, not `main`: only tauri's config declares that
+/// label, and nothing can rebuild it. So this reads "a window" rather than "the
+/// main window", and a second call after a stand-in builds a second one. The
+/// packaged client never reaches it, since `main`'s close is prevented.
 pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     // By window, not webview window, per ADR 0140. Answer "gone" for a window
     // that merely has a URL preview open and a banner tap builds a SECOND one.
@@ -564,7 +583,7 @@ pub(crate) fn show_main_window(app: &tauri::AppHandle) {
         front_window(app, MAIN_WINDOW_LABEL);
         return;
     }
-    // Gone, so build a replacement. Leaving menu-bar-only first for the reason
+    // Gone, so stand one in. Leaving menu-bar-only first for the reason
     // `front_window` does: `Accessory` cannot front the new window either.
     activation::set_menu_bar_only(app, false);
     if let Err(e) = open_new_window(app) {
@@ -600,9 +619,16 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
     let plan = desktop::reopen_plan(&live, &window_persist::readable_window_session(), &origin);
 
     // Before the show, so an adrift `main` does not flash the picker on its way
-    // to the workspace it is owed.
-    if let Some(url) = &plan.navigate_main {
-        desktop::navigate_main_window(app, url);
+    // to the workspace it is owed, and so it is already the right size when it
+    // lands. Place then clamp, the pair `setup` uses. The clamp rides the frame
+    // here, unlike in `setup`: with no frame to place, `main` keeps the geometry
+    // launch already sanitised.
+    if let Some(planned) = &plan.navigate_main {
+        desktop::navigate_main_window(app, &planned.url);
+        if let Some(frame) = planned.frame {
+            window_persist::size_main_window_for_its_workspace(app, frame);
+            window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL);
+        }
     }
     // No `native-window-active` here: these land on screen unfocused, and a
     // page that believes it is active suppresses the OS banner for a toast
@@ -705,10 +731,14 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
             None
         }
         notifications::TapTarget::NewWindow { url } => {
+            // The remembered frame, for the reason the row-activation arm of
+            // `show_workspace_window` takes it: a tap on a banner from a
+            // workspace with no window is that workspace being reopened.
+            let frame = window_persist::remembered_frame(&url);
             match url.parse::<tauri::Url>() {
                 Ok(parsed) => {
                     activation::set_menu_bar_only(app, false);
-                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), None) {
+                    if let Err(e) = open_app_window(app, WebviewUrl::External(parsed), frame) {
                         eprintln!("[Tauri] Failed to open a window for {url}: {e}");
                     }
                     activation::activate_app_frontmost();

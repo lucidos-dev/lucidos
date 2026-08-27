@@ -32,7 +32,7 @@ export function PinThreadButton({ threadId, saved, stopPropagation, extraClass, 
       }}
       aria-pressed={saved}
       aria-label={saved ? 'Remove thread from Pinned section' : 'Pin thread'}
-      data-tooltip={saved ? 'Pinned — click to unpin' : 'Pin thread'}
+      data-tooltip={saved ? 'Pinned. Click to unpin' : 'Pin thread'}
     >
       <PinIcon filled={saved} />
     </button>

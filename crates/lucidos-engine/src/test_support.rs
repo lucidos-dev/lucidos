@@ -105,8 +105,31 @@ pub async fn aux_captures(pool: &PgPool, thread_id: Uuid, purpose: &str) -> Vec<
 /// Connection URL for a throwaway database created by `setup_test_db`. Lets a
 /// test open its own dedicated connection to the same DB (e.g. the startup-lease
 /// tests, which contend a Postgres advisory lock across independent connections).
+///
+/// Swaps the database name, the path segment after the authority, and keeps
+/// any query string. A blanket `replace("/postgres", ..)` also rewrites the
+/// `//postgres` inside an authority like `postgres://postgres@host:5432/postgres`.
+/// The URL then connects as a role named after the throwaway database, which
+/// does not exist. That is the canonical local-Postgres URL, so a contributor
+/// pointing `TEST_DATABASE_URL` at their own server hits it first.
 pub fn test_db_url(db_name: &str) -> String {
-    admin_url().replace("/postgres", &format!("/{}", db_name))
+    let base = admin_url();
+    let (before_query, query) = match base.split_once('?') {
+        Some((head, q)) => (head, Some(q)),
+        None => (base.as_str(), None),
+    };
+    // Start looking after the `//` that opens the authority. A URL naming no
+    // database then keeps its host, rather than losing everything before the
+    // last slash.
+    let authority_start = before_query.find("//").map(|i| i + 2).unwrap_or(0);
+    let swapped = match before_query[authority_start..].find('/') {
+        Some(i) => format!("{}/{}", &before_query[..authority_start + i], db_name),
+        None => format!("{}/{}", before_query, db_name),
+    };
+    match query {
+        Some(q) => format!("{}?{}", swapped, q),
+        None => swapped,
+    }
 }
 
 pub async fn setup_test_db() -> (PgPool, String) {

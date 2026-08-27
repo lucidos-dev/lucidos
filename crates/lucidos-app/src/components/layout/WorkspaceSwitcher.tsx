@@ -60,6 +60,7 @@ import {
 } from '../../utils/workspaceWindow';
 import { workspaceActionRow } from './WorkspaceActionRow';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
+import { errorDetail } from '../../utils/errorDetail';
 import { replaceOnPlainClick } from '../../utils/documentNavigation';
 import { rememberLastWorkspaceCount, recallLastWorkspaceCount } from '../../utils/lastWorkspace';
 import { workspaceState, workspaceStateLabel } from '../../utils/workspaceState';
@@ -538,7 +539,7 @@ export function WorkspacesMenuRow({ onClose }: { onClose: () => void }) {
     contextId.value = null;
     onClose();
     void openWorkspaceIn(mode, w.id).catch((e: unknown) => {
-      showToast(`Could not open ${w.name}: ${e}`, 'error');
+      showToast(`Could not open ${w.name}: ${errorDetail(e)}`, 'error');
     });
   };
 

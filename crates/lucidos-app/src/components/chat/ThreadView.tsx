@@ -21,8 +21,8 @@ import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
 import { showThreadSkeletonNow, threadIsLoadingNow, type ThreadLoadingState } from './threadSkeletonGate';
-import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
-import { isIOS } from '../../utils/platform';
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle } from '../../utils/webkitRepaint';
+import { isWebKit } from '../../utils/platform';
 import { onPageResume } from '../../utils/pageResume';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { refreshClient } from '../../hooks/sw-update';
@@ -136,7 +136,7 @@ export function resetRevealTracking() {
 /** Timeout (ms) before showing "Tap to reload" in loading state. */
 const RELOAD_TIMEOUT = 8000;
 
-/** Minimum gap (ms) between forced iOS repaints while a thread streams. ~5/sec
+/** Minimum gap (ms) between forced WebKit repaints while a thread streams. ~5/sec
  *  keeps the compositor layer from getting stuck blank without thrashing it on
  *  every token. */
 const STREAM_REPAINT_THROTTLE_MS = 200;
@@ -597,18 +597,18 @@ export function ThreadView() {
         return () => clearTimeout(timer);
     }, [threadId, threadInMap, eventsLoaded, eventsLoadFailed]);
 
-    // Force iOS Safari repaint of the scroll container — invalidates iOS's
-    // cached compositor texture so DOM-present-but-black content shows.
+    // Force a WebKit repaint of the scroll container: it invalidates the stale
+    // cached compositor texture so DOM-present-but-blank content shows.
     // Called on data changes AND on resume from background.
-    const forceRepaint = () => forceIOSRepaint(areaRef.current);
+    const forceRepaint = () => forceWebKitRepaint(areaRef.current);
     // Drop-resilient variant for the thread-OPEN path: a single toggle there has
     // no retry (unlike the streaming throttle and the resume re-fires), so a
-    // cold open whose two rAF frames iOS drops/coalesces stays blank until a
+    // cold open whose two rAF frames WebKit drops/coalesces stays blank until a
     // manual scroll. The burst spreads several toggles over a few hundred ms.
-    const forceRepaintBurst = () => forceIOSRepaintBurst(areaRef.current);
+    const forceRepaintBurst = () => forceWebKitRepaintBurst(areaRef.current);
 
-    // Force iOS repaint on every threadId change (not just eventsLoaded).
-    // iOS Safari's compositor caches layer textures inside scroll-snap parents.
+    // Force a repaint on every threadId change (not just eventsLoaded).
+    // WebKit's compositor caches layer textures inside scroll-snap parents.
     // After many thread switches, it stops repainting already-loaded threads.
     // Triggering on threadId alone covers threads where eventsLoaded was already
     // true (no transition to trigger the effect).
@@ -676,16 +676,16 @@ export function ThreadView() {
             // for an idle thread — once content is in the DOM no eventsBump tick
             // re-fires the streaming throttle, and the thread may never go to
             // background to trigger the resume path. A cold open whose one toggle
-            // iOS drops/coalesces (or fires before the layer blanks) would then
-            // stay black until a manual scroll. The burst's spaced retries
+            // WebKit drops/coalesces (or fires before the layer blanks) would
+            // then stay blank until a manual scroll. The burst's spaced retries
             // recover it. cleanup cancels any pending retries on dep change.
             return forceRepaintBurst();
         }
     }, [threadId, eventsLoaded, hasExchanges]);
 
-    // iOS PWA resume: force repaint when returning from background.
+    // Page resume: force repaint when returning from background.
     // Signal values don't change on resume (same thread, same events), so no
-    // re-render produces DOM changes. iOS Safari's compositor may have recycled
+    // re-render produces DOM changes. WebKit's compositor may have recycled
     // the layer texture while backgrounded — content is in the DOM but invisible
     // (renders black). Subscribing to the shared resume signal fires the repaint
     // on visibilitychange / pageshow / focus, not just visibilitychange: iOS
@@ -693,18 +693,19 @@ export function ThreadView() {
     // visibilitychange, which left the old handler silent and the content black
     // until a tap — and that tap could land on an invisible question / permission
     // and answer it (see utils/pageResume, which also swallows that wake-tap).
-    // forceRepaint is iOS-gated and null-safe.
+    // forceRepaint is WebKit-gated and null-safe. The resume listeners are too,
+    // so the packaged desktop app repaints on a window it comes back to.
     useEffect(() => onPageResume(forceRepaint), []);
 
-    // Sustained-streaming repaint (iOS): entering a *running* thread, the rapid
+    // Sustained-streaming repaint (WebKit): entering a *running* thread, the rapid
     // streaming DOM mutations can make WKWebView blank the .thread-content
     // compositor layer AFTER the one-shot entry/load repaint above has already
     // fired — the content stays in the DOM (still scrollable, chevron shows) but
     // renders black until a manual scroll. eventsBump ticks on every append to
     // THIS thread (tokens, tool events, CC text), so repaint on a throttle as
     // content streams in. The gate keeps the LEADING edge to one repaint per
-    // ~200ms (forceIOSRepaint supersedes an overlapping toggle so nothing
-    // accumulates; forceRepaint is iOS-gated and null-safe), and its TRAILING
+    // ~200ms (forceWebKitRepaint supersedes an overlapping toggle so nothing
+    // accumulates; forceRepaint is WebKit-gated and null-safe), and its TRAILING
     // edge fires once after the stream pauses — load-bearing for the "click Less
     // on the last running result blanks the pane" report: the toggle's own
     // restore() repaints the collapse shrink, but the next streamed mutation
@@ -746,19 +747,19 @@ export function ThreadView() {
         return () => clearTimeout(timer);
     }, [threadId, eventsLoaded, exchanges.length, eventCount]);
 
-    // Settle probe + late repaint (iOS): a fixed delay after a thread is focused,
+    // Settle probe + late repaint (WebKit): a fixed delay after a thread is focused,
     // sample the render state and re-fire the open repaint burst ONCE. Armed on
     // threadId alone (NOT eventsLoaded), and reads fresh store/DOM at fire time, so
     // it still runs when a post-load store write failed to re-render this view —
     // the "summary present, body empty, recovers on scroll" report. The probe
-    // breadcrumb (iOS-PWA-only, skips genuinely-empty threads) records whether the
+    // breadcrumb (skips genuinely-empty threads) records whether the
     // body is missing in the DOM (render gap), stale vs. the store (missed
     // re-render), or present-and-laid-out (compositor paint loss). The extra burst
     // is a transform-only, supersede-safe toggle — harmless on a healthy layer,
     // and it recovers a layer that WKWebView blanked after the open burst's window
     // under prolonged use. One-shot per focus; the cleanup clears it on switch.
     useEffect(() => {
-        if (!threadId || !isIOS()) return;
+        if (!threadId || !isWebKit()) return;
         const timer = setTimeout(() => {
             const thread = threadMap.value.get(threadId);
             if (!thread) return;
@@ -776,7 +777,7 @@ export function ThreadView() {
                 contentChildCount: areaRef.current?.childElementCount ?? null,
                 contentScrollHeight: areaRef.current?.scrollHeight ?? null,
             });
-            forceIOSRepaintBurst(areaRef.current);
+            forceWebKitRepaintBurst(areaRef.current);
         }, SETTLE_PROBE_DELAY_MS);
         return () => clearTimeout(timer);
     }, [threadId]);

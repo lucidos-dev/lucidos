@@ -400,6 +400,24 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** resolved (2026-06-30)
 - **Investigation:** `ios-pwa-blackout`
 
+### The render probe's WebKit surface
+
+- **Added:** 2026-08-26
+- **Lives in:** `crates/lucidos-app/src/utils/threadRenderProbe.ts`, at
+  `reportThreadRenderProbe`'s `isWebKit()` gate. The probe module itself is
+  retained tooling (see the row above); this row covers only how WIDE its
+  reporting surface is set.
+- **Impermanent because:** the gate was `isIOSPwa()`, which held the breadcrumb
+  to the one surface the blank was reported on. The blank came back on the
+  packaged Mac app, whose Tauri window is a WKWebView. So the surface widened to
+  every WebKit client, to catch it there too. The price is one engine.log line
+  per thread open on such a client, which buys a diagnosis and nothing else.
+- **Removal / resolution condition:** when `webkit-desktop-blank-thread` closes,
+  narrow the gate back to `isIOSPwa()`. Verify by confirming no open work reads
+  a `[Client/render] thread_render_probe` line from a desktop client.
+- **Status:** open
+- **Investigation:** `webkit-desktop-blank-thread`
+
 ### Click-lag main-thread blocker probe
 
 - **Added:** 2026-06-24 (registered 2026-06-29 by the nightly harden sweep — the
@@ -1642,8 +1660,32 @@ measure now eligible for removal** — search this file for the id to find them 
   reusable client-stability tooling rather than blackout-only dead weight, so this
   close deviates from the original "delete the modules" step.
 - **Status:** resolved (2026-06-30)
+- **Recurrence:** the same paint loss surfaced on the packaged Mac app, which is
+  WKWebView. The root cause here stands; what was missing was coverage, because
+  every recovery lever was gated on iOS. See `webkit-desktop-blank-thread` below.
 - **Measures referencing this investigation:** iOS-PWA liveness diagnostic (§1),
   Thread-render blank-body probe (§1) — both resolved 2026-06-30, code retained.
+
+### `webkit-desktop-blank-thread`: a thread opens blank in the packaged Mac app
+
+- **Opened:** 2026-08-26
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. A thread opens with an empty transcript in the packaged macOS app,
+  around three opens in ten, and the content appears on the first scroll. The
+  title, the up chevron and the composer all draw, so the transcript is in the
+  DOM and scrollable. That is the signature `ios-pwa-blackout` closed on, which
+  is WebKit serving a stale layer texture. The fix widened every repaint gate
+  from iOS to the engine
+  (`docs/plans/2026-08-26-the-repaint-recovery-covers-every-webkit-client.md`).
+- **Removal / resolution condition:** no blank open over a representative usage
+  window, on a packaged build carrying the widened gate. If one DOES survive,
+  the widened probe's class decides the next move. A `content-present` line
+  means the nudge needs escalating on this surface. Any render-side class moves
+  the hunt back into the store.
+- **Status:** open
+- **Measures referencing this investigation:** The render probe's WebKit
+  surface (§1).
 
 ### `cc-reasoning-dormant` — CC coding-agent "Thinking" step shows nothing
 

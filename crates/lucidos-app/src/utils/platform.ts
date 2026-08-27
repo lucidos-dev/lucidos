@@ -104,10 +104,40 @@ export function isTauriPreGatewayEntry(): boolean {
 /** Check if running on a Mac or iOS device */
 export const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
 
+/** An Apple handheld, by the name it puts in its user-agent. Read by both
+ *  {@link isIOS} and {@link isWebKitUserAgent}, which ask it for different
+ *  reasons: one wants the OS, the other wants the engine every browser on that
+ *  OS is obliged to use. */
+const APPLE_DEVICE_UA = /iPad|iPhone|iPod/;
+
 /** Check if running on iOS (iPhone/iPad) — cached, never changes in a session */
-const _isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+const _isIOS = APPLE_DEVICE_UA.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 export function isIOS(): boolean { return _isIOS; }
+
+/** Is this client's rendering ENGINE WebKit: Safari on any Apple OS, the
+ *  packaged desktop app's WKWebView, or WebKitGTK on Linux?
+ *
+ *  Pure, so every client shape is answerable from its user-agent alone.
+ *
+ *  It exists because a compositor bug belongs to an engine, not to an OS. The
+ *  repaint recovery in `utils/webkitRepaint.ts` was gated on {@link isIOS}, so
+ *  it never ran in the packaged Mac app. That app is WKWebView, and it blanks a
+ *  laid-out transcript exactly as the phone does.
+ *
+ *  Blink carries `AppleWebKit` in its own user-agent for historical reasons, so
+ *  the Chromium tokens are excluded by name. Gecko carries neither token. */
+export function isWebKitUserAgent(ua: string): boolean {
+  if (APPLE_DEVICE_UA.test(ua)) return true;
+  if (!/AppleWebKit/.test(ua)) return false;
+  return !/Chrom(e|ium)|Edg\/|OPR\//.test(ua);
+}
+
+/** Live-wired {@link isWebKitUserAgent}, cached: the engine never changes in a
+ *  session. {@link isIOS} is ORed in for the iPad that reports "Macintosh" in
+ *  Safari's desktop mode, which the string test alone cannot see. */
+const _isWebKit = _isIOS || isWebKitUserAgent(navigator.userAgent);
+export function isWebKit(): boolean { return _isWebKit; }
 
 /** Check if running on Android (cached, never changes in a session).
  *

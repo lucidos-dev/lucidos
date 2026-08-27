@@ -17,9 +17,10 @@
 //!
 //! `.claude/rules/rust.md` says boxed trait objects unless a typed error is
 //! consumed structurally. `ChildFollowUpError` is: `status_code()` is the HTTP
-//! mapping a future route uses without re-deriving the taxonomy, and the LLM
-//! layer turns each variant into a distinct, actionable tool-error string. The
-//! caller never merely formats it into one message.
+//! mapping `api/threads/follow_up.rs` and `api/threads/archive.rs` use rather
+//! than re-deriving the taxonomy, and the LLM layer turns each variant into a
+//! distinct, actionable tool-error string. The caller never merely formats it
+//! into one message.
 //!
 //! ## The mirror image
 //!
@@ -61,8 +62,8 @@ pub enum ChildFollowUpError {
 }
 
 impl ChildFollowUpError {
-    /// HTTP status for a future route. Kept beside the taxonomy so the mapping
-    /// cannot drift from it.
+    /// HTTP status for the `/threads/follow-up` and `/threads/archive` routes.
+    /// Kept beside the taxonomy so the mapping cannot drift from it.
     pub fn status_code(&self) -> u16 {
         match self {
             Self::UnknownChild(_) => 404,

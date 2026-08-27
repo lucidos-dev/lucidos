@@ -63,7 +63,17 @@ impl LucidosEngine {
             log!("[Chat] Skipping file list context (not needed for this query)");
             String::new()
         } else {
-            let all_files = self.artifact_manager.list_artifacts().unwrap_or_default();
+            // A walk that FAILED is not a workspace with no files, and the
+            // section renders the two identically. The turn still goes out
+            // (the agent can fall back to `list_files`), but the reason has
+            // to reach the log.
+            let all_files = match self.artifact_manager.list_artifacts() {
+                Ok(files) => files,
+                Err(e) => {
+                    log!("[Chat] Cannot list artifacts for the file-list section: {}. The turn goes out without it", e);
+                    Vec::new()
+                }
+            };
             super::workspace_payload::build_file_list_section(&all_files)
         }; // end file_list_context if/else
 
@@ -95,7 +105,14 @@ impl LucidosEngine {
                         .collect();
                     format!("[CONFIGURED API CREDENTIALS - auth headers are auto-injected for these services]\n{}\nYou can use http_request directly with these APIs - credentials are automatically added.\n[END CREDENTIALS]", cred_list.join("\n"))
                 }
-                _ => String::new(),
+                Ok(_) => String::new(),
+                // A read that failed is not "no credentials configured", and
+                // the prompt renders the two identically. The agent will tell
+                // the user to set up what they already have, so say why here.
+                Err(e) => {
+                    log!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
+                    String::new()
+                }
             }
         };
 
@@ -114,7 +131,11 @@ impl LucidosEngine {
                 section.push_str("[END EMAIL ACCOUNTS]");
                 section
             }
-            _ => String::new(),
+            Ok(_) => String::new(),
+            Err(e) => {
+                log!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
+                String::new()
+            }
         };
 
         // Add connected OAuth accounts to context
@@ -129,7 +150,11 @@ impl LucidosEngine {
                     .collect();
                 format!("\n[CONNECTED OAUTH ACCOUNTS - auth tokens are auto-injected and refreshed for these providers]\n{}\nYou can use http_request with these providers' APIs — OAuth tokens are automatically added.\n[END OAUTH ACCOUNTS]", account_list.join("\n"))
             }
-            _ => String::new(),
+            Ok(_) => String::new(),
+            Err(e) => {
+                log!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
+                String::new()
+            }
         };
 
         // Active app context — tell the LLM which app UI is open so it can read files as needed

@@ -329,21 +329,42 @@ pub(crate) async fn continue_retry_input(
 }
 
 /// Remove a stale (duplicate-recovery) worktree, deleting its branch ONLY when
-/// fully merged (no unique commits). NEVER force-deletes a branch that still
-/// holds work: this is the duplicate-branch recovery path (two branches map to
-/// one thread from stale-resume retries), and the duplicate's unique commits
-/// must survive. Delegates to the cron's safe helper — which keeps a branch with
-/// unique commits (and keeps on error, conservative).
+/// fully merged (no unique commits). This is the duplicate-branch recovery path
+/// (two branches map to one thread from stale-resume retries), and the
+/// duplicate's unique commits must survive. It delegates to the cron's safe
+/// helper, which keeps a branch with unique commits and keeps it on error too.
 ///
-/// 2026-07-02: replaced an unconditional `git worktree remove --force` +
-/// `branch -D` that could silently lose a duplicate branch's commits, per the
-/// "never delete a possibly-useful worktree/branch" invariant.
-/// Best-effort — a failure just means the worktree is skipped again next restart.
+/// The dirtiness gate is the same one every `WorktreeCleanup` caller applies
+/// before that helper, and it belongs here for the same reason. Which of the
+/// two worktrees is stale is a guess. The helper opens with
+/// `git worktree remove --force`, so an uncommitted edit in the loser goes with
+/// it. `is_worktree_dirty` answers "dirty" when git could not say, so an
+/// unreadable tree is kept. Keeping it costs one skipped cleanup, and the next
+/// restart tries again.
 pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
-    let _ = crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch(
+    if crate::engine::worktree_cleanup::is_worktree_dirty(wt_path).await {
+        log!(
+            "[Recovery] Keeping duplicate worktree {}: it has uncommitted changes",
+            wt_path.display()
+        );
+        return;
+    }
+    match crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch(
         wt_path, None,
     )
-    .await;
+    .await
+    {
+        Some(outcome) => log!(
+            "[Recovery] Removed duplicate worktree {} ({} bytes, branch_deleted={})",
+            wt_path.display(),
+            outcome.freed_bytes,
+            outcome.branch_deleted
+        ),
+        None => log!(
+            "[Recovery] Could not remove duplicate worktree {}: it is skipped until the next restart",
+            wt_path.display()
+        ),
+    }
 }
 
 /// Resolve which thread an orphaned coding-agent worktree (found by the

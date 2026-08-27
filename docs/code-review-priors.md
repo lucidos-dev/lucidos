@@ -745,6 +745,40 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   and `a_stored_grant_never_covers_a_path_qualified_head`.
   (`crates/lucidos-engine/src/engine/command_guard.rs`.)
 
+- **`reset_worktree_and_idle` resetting to a literal `main` is deliberate, not
+  a missed default-branch resolution.** A reviewer sees `default_local_branch`
+  used elsewhere in the same file. The literal then reads as an oversight that
+  breaks an external repo defaulting to `master`. A 2026-08 hardening round
+  changed it and had to change it back.
+
+  The apply pipeline that runs immediately before it publishes to `main`:
+  `catchup_and_ff_to_main` and `ff_main_to` both take the literal. Resolving
+  the real default here makes the reset base disagree with where the work
+  landed. On a repo carrying both `main` and a different `origin/HEAD`, the
+  reset then rewinds the session branch off the applied commits. A wrong base
+  is worse than a stale one, because this call moves a branch ref and then runs
+  `clean -fd`.
+
+  The whole family moves together or not at all:
+  `reset_worktree_to_main_after_apply`, `reset_worktree_to_main_after_discard`,
+  `settle_discarded_branch`'s `git branch -f`, and the merge helpers. That is
+  tracked as `harden-hardcoded-main-branch-in-change-ops`. Re-flag only as part
+  of migrating all of them, never one site.
+  (`crates/lucidos-engine/src/engine/agent_session/apply_now.rs`.)
+
+- **`git_failure_reason` sitting beside `git_ran_ok` is not duplication to
+  collapse.** The two match the same three arms and differ only in keeping
+  stdout, so a reuse pass flags one as redundant.
+
+  Stdout is the whole point. `git commit` announces "nothing to commit" there
+  rather than on stderr, and `stage_and_commit_logged` has to tell that
+  expected case apart from a real failure. `git_ran_ok` discards stdout by
+  design, because a mutating call's caller wants the error and nothing else.
+  Merging them hands every `git_ran_ok` caller a message with git's chatter in
+  it. Re-flag only if the "nothing to commit" discrimination moves elsewhere.
+  (`crates/lucidos-engine/src/engine/git_ops/commits.rs`,
+  `crates/lucidos-engine/src/engine/git_ops/mod.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate

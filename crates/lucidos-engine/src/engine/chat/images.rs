@@ -81,9 +81,28 @@ pub(super) fn build_user_content_with_images(
     // shrunk under the remaining budget is skipped — the provider would reject
     // it anyway — while smaller later images still get their chance.
     for hashes in history_image_hashes.iter() {
-        for blob in hashes.iter().filter_map(|h| resolve_blob(workspace, h)) {
-            let Ok(bytes) = std::fs::read(&blob.path) else {
+        for hash in hashes.iter() {
+            // A blob that will not resolve or will not read is dropped from the
+            // content, but the history text still says `[attached image ...]`.
+            // The model then answers about a picture it never received, so the
+            // two skips are logged rather than silent.
+            let Some(blob) = resolve_blob(workspace, hash) else {
+                log!(
+                    "[Chat] History image {} has no blob on disk, so the model sees the text without it",
+                    hash
+                );
                 continue;
+            };
+            let bytes = match std::fs::read(&blob.path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log!(
+                        "[Chat] Cannot read history image blob {}: {}. The model sees the text without it",
+                        blob.path.display(),
+                        e
+                    );
+                    continue;
+                }
             };
             let fitted = crate::api::ChatImage {
                 base64: base64::engine::general_purpose::STANDARD.encode(&bytes),

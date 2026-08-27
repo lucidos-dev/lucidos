@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // platform.ts touches navigator/window at import time (no jsdom here), so mock
-// it outright — the helper only consumes isIOS().
-let iosValue = true;
-vi.mock('./platform', () => ({ isIOS: () => iosValue }));
+// it outright. The helper only consumes isWebKit().
+//
+// isIOS is pinned FALSE, so the whole suite runs as a Mac: a WebKit client that
+// is not iOS. That is the packaged desktop app, which the gate used to lock out
+// of the recovery entirely. Re-gate the module on isIOS and every case here
+// fails rather than silently passing on the phone alone.
+let webKitValue = true;
+vi.mock('./platform', () => ({ isWebKit: () => webKitValue, isIOS: () => false }));
 
 // scrollState owns the notification deep-link scroll claim. The repaint now gates
 // its scrollTop nudge on hasPendingEventScroll() so it stops fighting a deep-link's
@@ -21,7 +26,7 @@ vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => 
 let userScrolling = false;
 vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
 
-import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR } from './iosRepaint';
+import { forceWebKitRepaint, forceWebKitRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS, PINNED_SHIFT_PROP, SCROLLER_PINNED_ATTR } from './webkitRepaint';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
   it('starts with an immediate (0ms) attempt', () => {
@@ -58,7 +63,7 @@ function flushFrame() {
 }
 
 beforeEach(() => {
-  iosValue = true;
+  webKitValue = true;
   pendingEventScroll = false;
   userScrolling = false;
   rafQueue = [];
@@ -150,10 +155,10 @@ function paintedShiftPx(el: any, from: number): number {
   return translateYPx(el.style.transform) - (el.scrollTop - from);
 }
 
-describe('forceIOSRepaint', () => {
+describe('forceWebKitRepaint', () => {
   it('toggles a translateZ across two frames then restores the prior transform', () => {
     const el = fakeEl();
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     expect(el.style.transform).toBe(''); // nothing yet — deferred to rAF
 
     flushFrame(); // frame 1: set the nudge
@@ -165,17 +170,17 @@ describe('forceIOSRepaint', () => {
 
   it('preserves an existing inline transform', () => {
     const el = fakeEl('rotate(2deg)');
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('rotate(2deg) translateZ(0.1px)');
     flushFrame();
     expect(el.style.transform).toBe('rotate(2deg)');
   });
 
-  it('is a no-op off iOS', () => {
-    iosValue = false;
+  it('is a no-op off WebKit', () => {
+    webKitValue = false;
     const el = fakeEl();
-    const cleanup = forceIOSRepaint(el);
+    const cleanup = forceWebKitRepaint(el);
     expect(cleanup).toBeUndefined();
     flushFrame();
     flushFrame();
@@ -185,13 +190,13 @@ describe('forceIOSRepaint', () => {
   it('is a no-op for a detached node', () => {
     const el = fakeEl();
     el.isConnected = false;
-    const cleanup = forceIOSRepaint(el);
+    const cleanup = forceWebKitRepaint(el);
     expect(cleanup).toBeUndefined();
   });
 
   it('skips the restore if the element detaches mid-toggle', () => {
     const el = fakeEl();
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: applies the nudge
     expect(el.style.transform).toBe('translateZ(0.1px)');
     el.isConnected = false;
@@ -201,20 +206,20 @@ describe('forceIOSRepaint', () => {
 
   it('coalesces overlapping calls so no stale transform accumulates', () => {
     // A single iOS resume can fire visibilitychange + pageshow + focus in one
-    // tick. Each calls forceIOSRepaint; a superseding call reuses the first
+    // tick. Each calls forceWebKitRepaint; a superseding call reuses the first
     // call's captured baseline, so the net effect stays one repaint per burst
     // without a growing `translateZ(0.1px) translateZ(0.1px) …` cruft.
     const el = fakeEl();
-    forceIOSRepaint(el);
-    forceIOSRepaint(el); // in-flight → supersedes, same baseline
-    forceIOSRepaint(el); // in-flight → supersedes, same baseline
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // in-flight → supersedes, same baseline
+    forceWebKitRepaint(el); // in-flight → supersedes, same baseline
     flushFrame();
     expect(el.style.transform).toBe('translateZ(0.1px)');
     flushFrame();
     expect(el.style.transform).toBe(''); // restored to the true baseline
 
     // Once the toggle finishes the element is repaintable again.
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('translateZ(0.1px)');
     flushFrame();
@@ -230,13 +235,13 @@ describe('forceIOSRepaint', () => {
     // the thread content stayed black until the element was recreated. The
     // up-chevron-but-blank screenshot is this state.
     const el = fakeEl();
-    forceIOSRepaint(el); // schedules frame 1, which never runs (page frozen)
+    forceWebKitRepaint(el); // schedules frame 1, which never runs (page frozen)
     // Simulate the OS dropping the queued frame: clear without running it.
     rafQueue = [];
 
     // Resume fires another repaint on the SAME element — it must supersede the
     // dropped toggle and actually paint, not skip.
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('translateZ(0.1px)');
     flushFrame();
@@ -248,12 +253,12 @@ describe('forceIOSRepaint', () => {
     // suspend. A superseding call must restore the TRUE baseline and toggle
     // again — not read the nudged value as the new baseline and accumulate.
     const el = fakeEl('rotate(1deg)');
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('rotate(1deg) translateZ(0.1px)');
     rafQueue = []; // page freezes — the restore frame is dropped
 
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('rotate(1deg) translateZ(0.1px)');
     flushFrame();
@@ -262,7 +267,7 @@ describe('forceIOSRepaint', () => {
 
   it('cleanup cancels pending frames so no transform is applied', () => {
     const el = fakeEl();
-    const cleanup = forceIOSRepaint(el)!;
+    const cleanup = forceWebKitRepaint(el)!;
     cleanup();
     flushFrame();
     flushFrame();
@@ -273,7 +278,7 @@ describe('forceIOSRepaint', () => {
 
   it('nudges scrollTop by 1px then restores it across two frames (scrollable)', () => {
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     expect(el.scrollTop).toBe(500); // deferred to rAF — nothing yet
 
     flushFrame(); // frame 1: nudge up by 1 (re-tiles the frozen layer)
@@ -287,7 +292,7 @@ describe('forceIOSRepaint', () => {
     // The documented reliable repaint trigger — a layout read flushes the nudged
     // state so it actually paints instead of being coalesced with the restore.
     const el = fakeEl('', { scrollTop: 100, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     expect(el.offsetReads).toBe(0); // deferred to rAF
     flushFrame(); // frame 1 applies the nudge AND reads offsetHeight
     expect(el.offsetReads).toBeGreaterThanOrEqual(1);
@@ -299,7 +304,7 @@ describe('forceIOSRepaint', () => {
     // restore. The restore must yield, only undoing OUR nudge if scrollTop is
     // still the value we left, so it can't snap them back to a stale position.
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: nudge to 499
     expect(el.scrollTop).toBe(499);
     el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore) moves it
@@ -308,14 +313,14 @@ describe('forceIOSRepaint', () => {
   });
 
   it('nudges from the LIVE position, not a stale call-time baseline (streaming growth)', () => {
-    // On iOS the streaming-repaint throttle calls forceIOSRepaint while the
+    // On iOS the streaming-repaint throttle calls forceWebKitRepaint while the
     // reader is at the bottom, and they can move between the call and the rAF
     // nudge (a chevron tap landing them on the grown bottom). A call-time
     // baseline would then write (oldBottom - 1), dragging them back up by
     // however far they got. The nudge must be ±1 from the CURRENT position so
     // it stays inside the 2px chevron slack and moves nobody.
     const el = fakeEl('', { scrollTop: 1200, scrollHeight: 2000, clientHeight: 800 }); // at bottom (2000-800)
-    forceIOSRepaint(el); // call-time baseline would capture 1200
+    forceWebKitRepaint(el); // call-time baseline would capture 1200
     // Streaming grows the transcript and the reader chevrons to the new bottom:
     el.scrollHeight = 3000;
     el.scrollTop = 2200; // new bottom (3000-800)
@@ -327,7 +332,7 @@ describe('forceIOSRepaint', () => {
 
   it('nudges DOWN then restores when at the very top (direction-safe, scrollTop 0)', () => {
     const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: can't go below 0, so nudge +1
     expect(el.scrollTop).toBe(1);
     flushFrame(); // frame 2: restore to 0 (not at bottom)
@@ -336,7 +341,7 @@ describe('forceIOSRepaint', () => {
 
   it('does not touch scrollTop on a non-scrollable element (transform-only fallback)', () => {
     const el = fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still fires
     expect(el.scrollTop).toBe(0); // scroll untouched
@@ -350,12 +355,12 @@ describe('forceIOSRepaint', () => {
     // nudge to the TRUE baseline (not read the nudged 499 as the new baseline)
     // and round-trip again — no 1px-per-burst drift.
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // nudge to 499
     expect(el.scrollTop).toBe(499);
     rafQueue = []; // page freezes — the restore frame is dropped
 
-    forceIOSRepaint(el); // supersede — immediately restores the true baseline
+    forceWebKitRepaint(el); // supersede: immediately restores the true baseline
     expect(el.scrollTop).toBe(500);
     flushFrame(); // fresh nudge
     expect(el.scrollTop).toBe(499);
@@ -363,10 +368,10 @@ describe('forceIOSRepaint', () => {
     expect(el.scrollTop).toBe(500);
   });
 
-  it('is a no-op off iOS for a scrollable element (no scrollTop write, no layout read)', () => {
-    iosValue = false;
+  it('is a no-op off WebKit for a scrollable element (no scrollTop write, no layout read)', () => {
+    webKitValue = false;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    const cleanup = forceIOSRepaint(el);
+    const cleanup = forceWebKitRepaint(el);
     expect(cleanup).toBeUndefined();
     flushFrame();
     flushFrame();
@@ -383,7 +388,7 @@ describe('forceIOSRepaint', () => {
     // which the reader saw on the iOS PWA as a rapid small shake. The layer
     // still gets its offset change; the reader must not see it.
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: nudged to 499, compensated by translateY(-1px)
     expect(el.scrollTop).toBe(499); // the offset change the re-tile needs
     expect(paintedShiftPx(el, 500)).toBe(0); // and nothing the reader can see
@@ -396,7 +401,7 @@ describe('forceIOSRepaint', () => {
 
   it('cancels a downward nudge too (at scrollTop 0, where the direction flips)', () => {
     const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: can't go below 0, so nudge +1 and compensate +1
     expect(el.scrollTop).toBe(1);
     expect(paintedShiftPx(el, 0)).toBe(0);
@@ -412,7 +417,7 @@ describe('forceIOSRepaint', () => {
     // move two viewport pixels and over-cancel a one-pixel scroll. Leading keeps
     // it the pixel the scroll took, and leaves the caller's own transform alone.
     const el = fakeEl('scale(2)', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.transform).toBe('translateY(-1px) scale(2) translateZ(0.1px)');
     expect(paintedShiftPx(el, 500)).toBe(0);
@@ -426,7 +431,7 @@ describe('forceIOSRepaint', () => {
     // position it was compensating is gone. Leaving the translateY behind would
     // offset the pane by a pixel for as long as the element lives.
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
     flushFrame(); // frame 2: the scroll restore yields, the transform still resets
@@ -436,12 +441,12 @@ describe('forceIOSRepaint', () => {
 
   it('leaves no compensation stranded when a supersede undoes a dropped restore', () => {
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // nudged and compensated
     expect(translateYPx(el.style.transform)).toBe(-1);
     rafQueue = []; // the page freezes, so the restore frame is dropped
 
-    forceIOSRepaint(el); // a supersede restores the true baseline of BOTH
+    forceWebKitRepaint(el); // a supersede restores the true baseline of BOTH
     expect(el.scrollTop).toBe(500);
     expect(el.style.transform).toBe('');
     flushFrame();
@@ -450,7 +455,7 @@ describe('forceIOSRepaint', () => {
 
   it('leaves no compensation stranded when the cleanup runs mid-toggle', () => {
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    const cleanup = forceIOSRepaint(el)!;
+    const cleanup = forceWebKitRepaint(el)!;
     flushFrame(); // nudged and compensated
     cleanup();
     expect(el.scrollTop).toBe(500);
@@ -467,7 +472,7 @@ describe('forceIOSRepaint', () => {
   it('hands a pinned child exactly the shift the container moved it by', () => {
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1
     expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
@@ -485,7 +490,7 @@ describe('forceIOSRepaint', () => {
     const turn = fakePlainChild();
     const second = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, first, turn, second);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame();
     expect(pinnedShiftPx(first)).toBe(-1);
@@ -500,7 +505,7 @@ describe('forceIOSRepaint', () => {
   it('hands over a downward shift too (at scrollTop 0, where the direction flips)', () => {
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 0, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame();
     expect(pinnedShiftPx(pinned)).toBe(translateYPx(el.style.transform));
@@ -512,7 +517,7 @@ describe('forceIOSRepaint', () => {
     // for the whole transcript per nudge, five a second while streaming.
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(el.style.props.has(PINNED_SHIFT_PROP)).toBe(false);
     expect(pinnedShiftPx(pinned)).toBe(-1);
@@ -522,20 +527,20 @@ describe('forceIOSRepaint', () => {
     // No scroll leg means no compensation, so a counter here would displace the
     // row by exactly the pixel nothing moved it.
     const unscrollable = fakePinnedChild();
-    forceIOSRepaint(fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 }, unscrollable));
+    forceWebKitRepaint(fakeEl('', { scrollTop: 0, scrollHeight: 800, clientHeight: 800 }, unscrollable));
     flushFrame();
     expect(pinnedShiftPx(unscrollable)).toBeNull();
 
     pendingEventScroll = true;
     const claimed = fakePinnedChild();
-    forceIOSRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, claimed));
+    forceWebKitRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, claimed));
     flushFrame();
     expect(pinnedShiftPx(claimed)).toBeNull();
     pendingEventScroll = false;
 
     userScrolling = true;
     const dragging = fakePinnedChild();
-    forceIOSRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, dragging));
+    forceWebKitRepaint(fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, dragging));
     flushFrame();
     expect(pinnedShiftPx(dragging)).toBeNull();
     userScrolling = false;
@@ -546,7 +551,7 @@ describe('forceIOSRepaint', () => {
     // counter has nothing left to undo.
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     el.scrollTop = 2000; // a concurrent writer (useScrollMemory restore)
     flushFrame();
@@ -557,12 +562,12 @@ describe('forceIOSRepaint', () => {
   it('retires the counter when a supersede undoes a dropped restore', () => {
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     expect(pinnedShiftPx(pinned)).toBe(-1);
     rafQueue = []; // the page freezes, so the restore frame is dropped
 
-    forceIOSRepaint(el); // the supersede restores the baseline of all three
+    forceWebKitRepaint(el); // the supersede restores the baseline of all three
     expect(el.style.transform).toBe('');
     expect(pinnedShiftPx(pinned)).toBeNull();
     flushFrame();
@@ -572,7 +577,7 @@ describe('forceIOSRepaint', () => {
   it('retires the counter when the cleanup runs mid-toggle', () => {
     const pinned = fakePinnedChild();
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 }, pinned);
-    const cleanup = forceIOSRepaint(el)!;
+    const cleanup = forceWebKitRepaint(el)!;
     flushFrame();
     cleanup();
     expect(pinnedShiftPx(pinned)).toBeNull();
@@ -590,7 +595,7 @@ describe('forceIOSRepaint', () => {
     // compositor re-commit (transform round-trip + forced layout read) still runs.
     pendingEventScroll = true;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1: NO scroll nudge — defer to the deep-link
     expect(el.scrollTop).toBe(500);
@@ -607,7 +612,7 @@ describe('forceIOSRepaint', () => {
     // user-confirmed compositor recovery and must keep working exactly as before.
     pendingEventScroll = false;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1: nudge
     expect(el.scrollTop).toBe(499);
@@ -622,7 +627,7 @@ describe('forceIOSRepaint', () => {
     // the nudged value.
     pendingEventScroll = false; // burst starts with no claim → nudge decided ON
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1: nudge applied
     expect(el.scrollTop).toBe(499);
@@ -637,7 +642,7 @@ describe('forceIOSRepaint', () => {
     // was never moved, so neither frame may touch it.
     pendingEventScroll = true; // burst starts with a claim → nudge decided OFF
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1: no nudge
     expect(el.scrollTop).toBe(500);
@@ -648,13 +653,13 @@ describe('forceIOSRepaint', () => {
 
   it('reuses the burst nudge decision across a superseding call (claim held → no nudge)', () => {
     // A single iOS resume fires visibilitychange + pageshow + focus → three
-    // forceIOSRepaint calls in one tick. The first captures the decision; the
+    // forceWebKitRepaint calls in one tick. The first captures the decision; the
     // supersedes reuse it. With a claim held the whole burst must skip the nudge.
     pendingEventScroll = true;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
-    forceIOSRepaint(el); // supersede — reuses the captured (skip) decision
-    forceIOSRepaint(el); // supersede
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // supersede: reuses the captured (skip) decision
+    forceWebKitRepaint(el); // supersede
 
     flushFrame();
     expect(el.scrollTop).toBe(500); // still no nudge
@@ -676,7 +681,7 @@ describe('forceIOSRepaint', () => {
     // committed), while the cheaper transform round-trip + forced layout read run.
     userScrolling = true;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     flushFrame(); // frame 1: NO scroll nudge — don't cancel momentum
     expect(el.scrollTop).toBe(500);
@@ -697,7 +702,7 @@ describe('forceIOSRepaint', () => {
     // skipping here leaves scrollTop untouched on BOTH frames.
     userScrolling = false; // idle at call → burst decision would allow the nudge
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     userScrolling = true; // a drag begins before the deferred write frame runs
 
     flushFrame(); // rAF1: re-check sees the drag → NO scrollTop write
@@ -715,7 +720,7 @@ describe('forceIOSRepaint', () => {
     // user-confirmed compositor recovery and must keep working exactly as before.
     userScrolling = false;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: nudge
     expect(el.scrollTop).toBe(499);
     flushFrame(); // frame 2: restore
@@ -728,9 +733,9 @@ describe('forceIOSRepaint', () => {
     // is in flight the whole burst must skip the nudge (and never strand scrollTop).
     userScrolling = true;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
-    forceIOSRepaint(el); // supersede — reuses the captured (skip) decision
-    forceIOSRepaint(el); // supersede
+    forceWebKitRepaint(el);
+    forceWebKitRepaint(el); // supersede: reuses the captured (skip) decision
+    forceWebKitRepaint(el); // supersede
     flushFrame();
     expect(el.scrollTop).toBe(500); // still no nudge
     expect(el.style.transform).toBe('translateZ(0.1px)'); // transform still repaints
@@ -746,7 +751,7 @@ describe('forceIOSRepaint', () => {
     // scrollTop write — scrollTop was never moved, so neither frame may touch it.
     userScrolling = true; // burst starts mid-drag → nudge decided OFF
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame(); // frame 1: no nudge
     expect(el.scrollTop).toBe(500);
     userScrolling = false; // momentum ends before the restore frame
@@ -772,7 +777,7 @@ describe('isRepaintNudging', () => {
     // through moves the header (the iOS PWA "header shakes at rest" report).
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
     const t0 = performance.now();
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
 
     // Scheduling alone writes nothing, so nothing to hide from the hook yet.
     expect(nudgedSince(t0)).toBe(false);
@@ -789,7 +794,7 @@ describe('isRepaintNudging', () => {
 
   it('closes the window once it has elapsed, so a real scroll is never swallowed', () => {
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     const atNudge = performance.now();
     // A finger scroll one window later must reach the header untouched.
@@ -802,7 +807,7 @@ describe('isRepaintNudging', () => {
     // a nudge here would blind the header to real scrolls for no reason.
     const el = fakeEl();
     const t0 = performance.now();
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     flushFrame();
     expect(nudgedSince(t0)).toBe(false);
@@ -815,15 +820,15 @@ describe('isRepaintNudging', () => {
     userScrolling = true;
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
     const t0 = performance.now();
-    forceIOSRepaint(el);
+    forceWebKitRepaint(el);
     flushFrame();
     flushFrame();
     expect(nudgedSince(t0)).toBe(false);
   });
 });
 
-describe('forceIOSRepaintBurst', () => {
-  // The file-level beforeEach already installs the manual rAF stub + iosValue.
+describe('forceWebKitRepaintBurst', () => {
+  // The file-level beforeEach already installs the manual rAF stub and the WebKit flag.
   // Add ONLY setTimeout/clearTimeout fakes so the burst's spaced retries are
   // driven deterministically while rAF stays the manual queue.
   beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
@@ -831,7 +836,7 @@ describe('forceIOSRepaintBurst', () => {
 
   it('fires an immediate toggle then setTimeout-spaced retries', () => {
     const el = fakeEl();
-    forceIOSRepaintBurst(el);
+    forceWebKitRepaintBurst(el);
 
     // Immediate attempt: deferred to rAF, nothing applied yet.
     expect(el.style.transform).toBe('');
@@ -862,7 +867,7 @@ describe('forceIOSRepaintBurst', () => {
     // scroll. The burst's spaced setTimeout retry lands a fresh toggle that
     // actually paints.
     const el = fakeEl();
-    forceIOSRepaintBurst(el);
+    forceWebKitRepaintBurst(el);
     rafQueue = []; // OS drops the immediate toggle's frames without running them
     expect(el.style.transform).toBe(''); // immediate attempt never painted
 
@@ -875,7 +880,7 @@ describe('forceIOSRepaintBurst', () => {
 
   it('preserves an existing inline transform across the burst', () => {
     const el = fakeEl('rotate(2deg)');
-    forceIOSRepaintBurst(el);
+    forceWebKitRepaintBurst(el);
     flushFrame();
     expect(el.style.transform).toBe('rotate(2deg) translateZ(0.1px)');
     flushFrame();
@@ -887,10 +892,10 @@ describe('forceIOSRepaintBurst', () => {
     expect(el.style.transform).toBe('rotate(2deg)'); // no cruft accumulates
   });
 
-  it('is a no-op off iOS', () => {
-    iosValue = false;
+  it('is a no-op off WebKit', () => {
+    webKitValue = false;
     const el = fakeEl();
-    const cleanup = forceIOSRepaintBurst(el);
+    const cleanup = forceWebKitRepaintBurst(el);
     expect(cleanup).toBeUndefined();
     vi.advanceTimersByTime(1000);
     flushFrame();
@@ -901,13 +906,13 @@ describe('forceIOSRepaintBurst', () => {
   it('is a no-op for a detached node', () => {
     const el = fakeEl();
     el.isConnected = false;
-    const cleanup = forceIOSRepaintBurst(el);
+    const cleanup = forceWebKitRepaintBurst(el);
     expect(cleanup).toBeUndefined();
   });
 
   it('cleanup cancels the immediate frames and all pending retries', () => {
     const el = fakeEl();
-    const cleanup = forceIOSRepaintBurst(el)!;
+    const cleanup = forceWebKitRepaintBurst(el)!;
     cleanup();
     // Immediate frames canceled — no nudge applied.
     flushFrame();
@@ -923,7 +928,7 @@ describe('forceIOSRepaintBurst', () => {
 
 describe('createRepaintThrottle', () => {
   // Fake only the timers the throttle uses — leaving the file-level rAF stubs
-  // (set by the root beforeEach for the forceIOSRepaint suite) untouched.
+  // (set by the root beforeEach for the forceWebKitRepaint suite) untouched.
   beforeEach(() => { vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }); });
   afterEach(() => { vi.useRealTimers(); });
 

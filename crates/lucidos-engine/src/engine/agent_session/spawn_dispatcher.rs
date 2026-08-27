@@ -178,12 +178,6 @@ impl SpawnDispatcher {
         }
     }
 
-    /// Test/observability accessor — number of dispatch attempts (gated or not).
-    #[allow(dead_code)]
-    pub(crate) fn dispatch_count(&self) -> usize {
-        self.dispatch_count.load(Ordering::SeqCst)
-    }
-
     /// Build dispatcher and start the run loop on a tokio task. Returns the
     /// receiver end of the `SpawnRequest` channel so the caller can wire it
     /// to the engine-side actuator.

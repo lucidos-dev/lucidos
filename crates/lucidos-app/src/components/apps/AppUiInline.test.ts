@@ -27,12 +27,12 @@ import { fileURLToPath } from 'node:url';
 // The cover is a SIBLING div, deliberately not `opacity: 0` on the iframe itself:
 // an app frame WebKit has to re-composite up from fully transparent is the same
 // shape as the iOS paint-loss bugs this pane keeps hitting (see
-// utils/iosRepaint.ts and ContentPane's resume repaint), and the frame's own
+// utils/webkitRepaint.ts and ContentPane's resume repaint), and the frame's own
 // layer is the one thing we must not make fragile.
 //
 // The frontend test environment is deliberately non-jsdom, so there is no
 // rendered DOM to assert against. Pin the wiring in source, the same approach as
-// content-pane-ios-repaint.test.ts.
+// content-pane-webkit-repaint.test.ts.
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const src = readFileSync(resolve(here, 'AppUiInline.tsx'), 'utf-8');

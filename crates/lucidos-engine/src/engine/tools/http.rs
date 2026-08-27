@@ -77,7 +77,18 @@ impl LucidosEngine {
 
         // Always inject stored credentials when available (overrides LLM-provided
         // auth headers which may contain stale tokens or template placeholders).
-        if let Ok(Some(cred)) = CredentialStore::find_by_url(&self.pool, url).await {
+        //
+        // A lookup that FAILED is not "no credential is configured for this
+        // URL". The request would then go out unauthenticated and the agent
+        // would report the resulting 401 as a bad API key, so say why here.
+        let stored_credential = match CredentialStore::find_by_url(&self.pool, url).await {
+            Ok(found) => found,
+            Err(e) => {
+                log!(@http_request, "Cannot look up stored credentials for {}: {}. Sending unauthenticated", url, e);
+                None
+            }
+        };
+        if let Some(cred) = stored_credential {
             let auth_value = match cred.auth_type {
                 AuthType::Bearer => format!("Bearer {}", cred.auth_value),
                 AuthType::Basic => format!("Basic {}", cred.auth_value),

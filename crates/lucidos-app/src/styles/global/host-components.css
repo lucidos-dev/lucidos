@@ -701,7 +701,7 @@ html[data-theme="dark"] .split-button.open::before {
  * upward and clamps to the top margin once the option list outgrows the space
  * above it. Being a <body> child is what makes the number reachable at all,
  * since inside a pane it is capped by that pane's stacking context. It ties
- * with `.collapsed-thread-actions` and wins on DOM order (the portal appends
+ * with `.thread-toggle-slot` and wins on DOM order (the portal appends
  * after `.app-shell`), the same footing as `.thread-overflow-menu` /
  * `.thread-info-popover`.
  *

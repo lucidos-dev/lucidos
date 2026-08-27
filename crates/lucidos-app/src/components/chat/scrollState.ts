@@ -147,7 +147,7 @@ function cancelScrollAnim() {
 /** When one of our own navigations last wrote `scrollTop`, and to WHICH element.
  *  Every such write goes through `markNavigationScroll`, so these cannot fall
  *  out of sync with the writes they describe. Same construction, and the same
- *  reason, as `lastNudgeAt` in utils/iosRepaint.ts.
+ *  reason, as `lastNudgeAt` in utils/webkitRepaint.ts.
  *
  *  The element is half the answer rather than bookkeeping. `useScrollMemory`
  *  positions three containers and marks all of them here: the transcript, the

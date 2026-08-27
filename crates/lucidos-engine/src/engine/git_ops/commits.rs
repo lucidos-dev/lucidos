@@ -522,8 +522,55 @@ pub(crate) async fn proposal_files_for_branch(
 pub(crate) async fn auto_commit_worktree(worktree_path: &Path, message: &str) {
     let has_changes = worktree_dirtiness(worktree_path).await.or_unknown(true);
     if has_changes {
-        let _ = git_cmd(&["add", "-A"], worktree_path).await;
-        let _ = git_cmd(&["commit", "-m", message], worktree_path).await;
+        stage_and_commit_logged(worktree_path, message).await;
+    }
+}
+
+/// Why a git call did not succeed, or `None` when it did.
+///
+/// Local rather than [`git_ran_ok`] because it keeps STDOUT: `git commit`
+/// announces "nothing to commit" there, and the caller below has to tell that
+/// apart from a real failure.
+async fn git_failure_reason(args: &[&str], dir: &Path) -> Option<String> {
+    match git_cmd(args, dir).await {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!(
+            "{} {}",
+            String::from_utf8_lossy(&o.stdout).trim(),
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Some(e),
+    }
+}
+
+/// Stage everything and commit, logging a failure instead of returning it.
+///
+/// Shared by the two fire-and-forget auto-commit helpers, neither of which has
+/// anywhere to hand an error back. A dropped commit costs the user the edits
+/// their coding agent left uncommitted, so the failure has to reach the log.
+/// The `or_unknown(true)` probe above expects a clean tree sometimes, and git
+/// reports that as a non-zero exit, so that one arm stays quiet.
+///
+/// A failed `add` still commits. `git add -A` reports per-path errors and
+/// exits non-zero while having staged everything it could, so returning early
+/// would drop the paths that DID stage. One unreadable path in the worktree
+/// would then cost the user every other edit in it.
+async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
+    if let Some(reason) = git_failure_reason(&["add", "-A"], worktree_path).await {
+        log!(
+            "[Git] git add -A reported a failure in {}: {}. Committing whatever staged",
+            worktree_path.display(),
+            reason
+        );
+    }
+    if let Some(reason) = git_failure_reason(&["commit", "-m", message], worktree_path).await {
+        if !reason.contains("nothing to commit") {
+            log!(
+                "[Git] Auto-commit failed at git commit in {}: {}",
+                worktree_path.display(),
+                reason
+            );
+        }
     }
 }
 
@@ -612,8 +659,7 @@ pub(crate) async fn auto_commit_preserving_marker(
         return;
     }
     let marker_fresh = is_harden_marker_fresh(pool, repo_root, branch_name).await;
-    let _ = git_cmd(&["add", "-A"], worktree_path).await;
-    let _ = git_cmd(&["commit", "-m", message], worktree_path).await;
+    stage_and_commit_logged(worktree_path, message).await;
     if marker_fresh {
         if let Some(sha) = current_head_sha(worktree_path).await {
             if let Err(e) = record_hardened(pool, repo_root, branch_name, &sha).await {

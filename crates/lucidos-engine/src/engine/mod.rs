@@ -116,7 +116,7 @@ use crate::runtime::{
     AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent,
     HeadlessBlocklist, PythonRuntime,
 };
-use git_ops::{auto_commit_safe_files_if_dirty, git_cmd};
+use git_ops::auto_commit_safe_files_if_dirty;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -397,7 +397,11 @@ pub struct LucidosEngine {
     /// scripts call back into the HTTP API being torn down — `lucidos ...` gets
     /// connection-refused and the script dies, surfacing a spurious
     /// "<trigger> failed" push. Never reset; the process is on its way out.
-    shutting_down: AtomicBool,
+    /// An `Arc` so a detached task can hold it. The background-bash completion
+    /// watcher outlives its turn and holds no engine handle. It must not wake a
+    /// coding-agent session on an engine that is leaving. See
+    /// `tools/bash.rs::spawn_bash_completion_watcher`.
+    shutting_down: Arc<AtomicBool>,
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
     pub backup_in_progress: AtomicBool,

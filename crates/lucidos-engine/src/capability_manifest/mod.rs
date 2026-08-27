@@ -1876,7 +1876,8 @@ const MEMORY_OPS: &[Operation] = &[
         cli_name: "stats",
         sdk_name: "stats",
         mutating: false,
-        // CLI-only read: no LLM tool reads memory (it's injected into context).
+        // CLI-only. A row count tells the agent nothing it can act on, unlike
+        // the `source` and `search` ops below, which ARE on the LLM surface.
         llm_alias: None,
         llm_schema: None,
         llm: Some(false),

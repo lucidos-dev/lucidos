@@ -241,7 +241,7 @@ export function MobileThreadTitleBar() {
     // data-scroller-pinned: the transcript's iOS repaint nudge compensates its
     // own 1px scroll with a transform on the scroll container, which is exact
     // for content the scroll moved. Sticky means the scroll moved this row not
-    // at all, so it undoes that compensation itself (utils/iosRepaint.ts).
+    // at all, so it undoes that compensation itself (utils/webkitRepaint.ts).
     <div
       class={`mobile-thread-title-row${scrolledFromTop.value ? ' scrolled' : ''}`}
       data-scroller-pinned

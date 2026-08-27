@@ -500,7 +500,7 @@ describe('attachScrollMemory teardown', () => {
 
   it('reads the app\'s own writes as untouched, gesture-less as they are', () => {
     // Every mechanism that moves this container without the reader. The iOS
-    // compositor nudge (`utils/iosRepaint.ts`). A clamp when shorter content
+    // compositor nudge (`utils/webkitRepaint.ts`). A clamp when shorter content
     // swaps into the shared element. `restoreAfterReflow`'s correction across a
     // pane resize. The render window's compensation for prepended height. None
     // of them emits an input event, which is why the question is asked so.

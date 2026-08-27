@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.31.1 — 2026-08-27
+
+### Changed
+
+- A connection notice claims only what a failed health poll proves. It reads "Cannot reach the dev engine", and scopes the consequence to threads and messages in that one window.
+
+### Fixed
+
+- A background task always reaches a terminal event. When the engine stops, restarts or crashes, the task is recorded with the output it had buffered, so an event wait on it resolves and `bash_output` returns a real verdict instead of an unknown task id.
+- A coding agent resumed after a restart hears about a background task that finished while it was away. The note carries the full task id, the task's spawn time, and whether it timed out, was cancelled or was lost.
+- A background task that exited on its own keeps its own verdict. A shutdown no longer relabels a successful run as abandoned, and a task the user cancelled is not attributed to the shutdown.
+- A blank transcript repairs itself in the packaged Mac app. The repaint recovery watches every WebKit client.
+- A reopened workspace wears the frame it was left at. A picker row, a switcher row and a notification tap all read the remembered geometry. Window state is scoped to the main window, so a new window no longer comes up fullscreen from an earlier session.
+- A git call that cannot answer stops authorizing destruction. A branch check that times out refuses the resume, a stale worktree holding uncommitted edits is not force-removed, a failed reset holds back the clean that follows it, and a failed merge cleanup no longer reports success.
+- A refusal inside a coding-agent session stops adopting a branch it never switched to, and a partly failed `git add` still commits everything that staged.
+- A failed read is no longer reported as an empty result. A credential lookup, an environment-variable list, an artifact walk, an OAuth account list and an unreadable history image each say what went wrong.
 ## v0.31.0 — 2026-08-26
 
 ### Added

@@ -100,6 +100,30 @@ You can also subscribe explicitly with `await_event` when you want to watch
 something *other* than the task's completion. For the completion itself you do
 not need to: it is armed for you.
 
+### A restart ends the task, and you will be told so
+
+A background task is a child of the engine process, so an engine restart, crash
+or OOM ends it mid-flight. There is no way to survive that, and nothing you can
+do about it from the thread.
+
+What is guaranteed is that you hear. The engine records the task's
+`BackgroundBashCompleted` itself, carrying `abandoned: true`, no `exit_code` and
+no `signal`. Your subscription therefore resolves on the next boot rather than
+waiting out its own deadline.
+
+**The two ways it ends differ, and the `stderr` line says which.** A graceful
+stop kills the task and then records it, so the output is everything the task
+wrote. A crash records only that the loss happened, and no output survives.
+
+**Neither promises the work stopped.** A crash kills nothing. A graceful stop
+signals the task's own shell, and that does not reach a pipeline or a command
+list behind it. Either can leave a child running under init.
+
+So on `abandoned: true`, read it as "the engine stopped and the work did not
+finish". Nobody cancelled it, and the missing `exit_code` is not a failure of
+the command. Never report the task as done. Before starting the same work
+again, check it is not still running rather than launching a second copy.
+
 ### Never estimate elapsed time — read it
 
 Every drain reports two clocks, and they are the only ones you have:
@@ -148,8 +172,13 @@ The success test is **`exit_code == 0`**, nothing weaker. Specifically:
   `exit_code: null, signal: 9` — never `0`, never `137`, never `-1`.
 - `timed_out: true` (watchdog) and `killed: true` (`bash_kill`) mean the engine
   ended the task. Both also carry `signal: 9`, since that is how it ended it.
-- While the task runs, all three are `null` / absent. Absence of a status is not
-  a passing status.
+- `abandoned: true` means the engine STOPPED while the task ran. Nothing
+  cancelled the work, and no status was ever reaped, so `exit_code` and `signal`
+  are `null` and `status` reads `"exit code unknown"`. **`abandoned` overrides
+  the rule above**: this unknown status is an interruption, not a failure.
+  Report the run as interrupted, never as failed and never as done.
+- While the task runs, every one of these is `null` / absent. Absence of a
+  status is not a passing status.
 
 **A failing pipeline stage is never masked by a later succeeding one.** The
 engine runs commands under `bash -o pipefail`, so `pytest … | tee run.log`

@@ -633,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn env_pairs_round_trips_and_filters_reserved() {
-        let (pool, _db) = crate::test_support::setup_test_db().await;
+        let (pool, db) = crate::test_support::setup_test_db().await;
 
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         EnvironmentVariableStore::upsert(&pool, &bus, "MY_FLAG", "1", None)
@@ -664,11 +664,13 @@ mod tests {
             !pairs.iter().any(|(k, _)| k == "PGUSER"),
             "reserved engine-owned name must never reach injection"
         );
+
+        crate::test_support::teardown_test_db(&db).await;
     }
 
     #[tokio::test]
     async fn upsert_replaces_value_and_update_requires_existing() {
-        let (pool, _db) = crate::test_support::setup_test_db().await;
+        let (pool, db) = crate::test_support::setup_test_db().await;
 
         let (bus, _callback_rx) = EventBus::new(pool.clone());
         EnvironmentVariableStore::upsert(&pool, &bus, "FOO", "one", None)
@@ -702,5 +704,7 @@ mod tests {
             .await
             .expect("get after delete")
             .is_none());
+
+        crate::test_support::teardown_test_db(&db).await;
     }
 }

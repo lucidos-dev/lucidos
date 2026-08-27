@@ -4,6 +4,7 @@ import type { EngineVersionStatus, PendingCommits } from '../../api/client';
 import { initiateEngineRestart } from './chat-changes';
 import { noteAnnouncedEngineVersion, wasEngineVersionDismissed } from '../../hooks/sw-update';
 import { syncBackgroundActivityToast } from './backgroundActivity';
+import { errorDetail } from '../../utils/errorDetail';
 
 /** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
  *  pending / build-failed toasts. The version-status poll (and the
@@ -15,7 +16,9 @@ async function triggerRebuild(): Promise<void> {
   try {
     await rebuildEngine();
   } catch (e) {
-    showToast(`Failed to start rebuild: ${e instanceof Error ? e.message : String(e)}`, 'error');
+    // A bare `e.message` prints the raw browser string for a cancelled or
+    // timed-out fetch, which is the shape an iOS suspend gives this click.
+    showToast(`Failed to start rebuild: ${errorDetail(e)}`, 'error');
   }
 }
 

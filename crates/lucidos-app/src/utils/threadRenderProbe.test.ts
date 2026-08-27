@@ -1,8 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // platform.ts touches navigator/window at import time (no jsdom here) — mock it.
-let iosPwa = true;
-vi.mock('./platform', () => ({ isIOSPwa: () => iosPwa }));
+//
+// isIOSPwa is pinned FALSE, so the suite runs as a WebKit client that is NOT the
+// phone: the packaged Mac app, where the blank came back. Re-narrow the probe to
+// the PWA and the emitting cases here go silent.
+let webKit = true;
+vi.mock('./platform', () => ({ isWebKit: () => webKit, isIOSPwa: () => false }));
 // liveness.ts touches the network / DOM at import time — stub postClientLog so we
 // can assert what the probe would emit without a real fetch.
 const postClientLog = vi.fn();
@@ -100,7 +104,7 @@ describe('shouldReportThreadRender', () => {
 });
 
 describe('reportThreadRenderProbe', () => {
-  beforeEach(() => { postClientLog.mockClear(); iosPwa = true; });
+  beforeEach(() => { postClientLog.mockClear(); webKit = true; });
 
   it('emits a [render] breadcrumb with the class + raw fields for a suspect thread', () => {
     reportThreadRenderProbe(probe({ renderedExchangesLen: 0, freshExchangesLen: 4 }));
@@ -116,8 +120,8 @@ describe('reportThreadRenderProbe', () => {
     expect(postClientLog).not.toHaveBeenCalled();
   });
 
-  it('does not emit off iOS PWA (keeps desktop / dev logs quiet)', () => {
-    iosPwa = false;
+  it('does not emit off WebKit (a Blink or Gecko client logs nothing)', () => {
+    webKit = false;
     reportThreadRenderProbe(probe({ renderedExchangesLen: 0, freshExchangesLen: 4 }));
     expect(postClientLog).not.toHaveBeenCalled();
   });

@@ -330,7 +330,21 @@ impl LucidosEngine {
                             // when its history contains our last commit.
                             // Internal threads keep the strict refusal so
                             // Apply has a stable engine-named branch.
-                            let adopted = if is_external_repo {
+                            //
+                            // Adoption needs git to have NAMED a different
+                            // branch. `Unanswered` means the probe timed out or
+                            // could not run, so nothing is known. Sending it
+                            // here would re-run the same `rev-parse`, and a
+                            // second attempt that answers reports the branch we
+                            // already expected. Adoption then "succeeds" onto
+                            // the branch we were on, and the agent is told its
+                            // worktree was switched when it never was.
+                            let probe_named_a_branch = matches!(
+                                mismatch,
+                                crate::engine::agent_session::external_edits::BranchMismatch::OnOtherBranch { .. }
+                                    | crate::engine::agent_session::external_edits::BranchMismatch::Detached { .. }
+                            );
+                            let adopted = if is_external_repo && probe_named_a_branch {
                                 crate::engine::agent_session::external_edits::try_adopt_renegade_branch(
                                     existing,
                                     last_idle_sha.as_deref(),

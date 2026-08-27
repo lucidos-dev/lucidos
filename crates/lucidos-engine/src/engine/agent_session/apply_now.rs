@@ -5,7 +5,7 @@ use crate::engine::git_ops::{
     auto_commit_preserving_marker, auto_commit_safe_files_if_dirty, auto_commit_worktree,
     branch_changed_files, catchup_and_ff_to_main, commits_in_range, consume_harden_marker,
     consume_plan_marker, default_local_branch, describe_branch_changes, files_have_client_update,
-    files_require_restart, git_cmd, has_branch_commits, push_main_in_background,
+    files_require_restart, git_cmd, git_ran_ok, has_branch_commits, push_main_in_background,
 };
 use crate::engine::thread_events::{EventChannel, MessageOrigin};
 use crate::engine::{AgentUserInput, LucidosEngine};
@@ -1102,9 +1102,34 @@ impl LucidosEngine {
     /// `reset --hard main` moves that BRANCH REF and `clean -fd` wipes the
     /// tree. On a path where the change is still pending, call
     /// [`Self::mark_session_idle`] instead.
+    ///
+    /// The `clean` waits on the reset landing, because the reset is what makes
+    /// deleting untracked files safe: run it alone and the branch keeps its
+    /// commits while the agent's untracked work is gone.
+    ///
+    /// The base stays the literal `main`, deliberately. Resolving the repo's
+    /// real default here would make this line disagree with the apply pipeline
+    /// that runs immediately before it: `catchup_and_ff_to_main` publishes to
+    /// `main`, so a reset onto anything else rewinds the session branch off the
+    /// work just applied. The whole family has to move together, which is
+    /// tracked as `harden-hardcoded-main-branch-in-change-ops`.
     pub(crate) async fn reset_worktree_and_idle(&self, thread_id: Uuid, worktree_path: &Path) {
-        let _ = git_cmd(&["reset", "--hard", "main"], worktree_path).await;
-        let _ = git_cmd(&["clean", "-fd"], worktree_path).await;
+        match git_ran_ok(&["reset", "--hard", "main"], worktree_path).await {
+            Ok(()) => {
+                if let Err(e) = git_ran_ok(&["clean", "-fd"], worktree_path).await {
+                    log!(
+                        "[ApplyNow] git clean -fd failed in {}: {}",
+                        worktree_path.display(),
+                        e
+                    );
+                }
+            }
+            Err(e) => log!(
+                "[ApplyNow] git reset --hard main failed in {}: {}. Leaving the tree alone, so the worktree still holds whatever was there",
+                worktree_path.display(),
+                e
+            ),
+        }
         self.mark_session_idle(thread_id, worktree_path).await;
     }
 

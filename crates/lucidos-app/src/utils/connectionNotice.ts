@@ -21,6 +21,17 @@
  * reach THIS workspace's engine", decided solely by the `/api/v1/health` poll in
  * `store/actions/connection.ts`. Merging them would force one of the two to say
  * something it cannot know.
+ *
+ * A failed poll proves one thing: this client got no answer. It cannot tell an
+ * engine that stopped from a client that cannot reach a healthy one. So every
+ * sentence here claims the reach, and nothing here blames the engine. A
+ * packaged desktop window once sat unreachable while a phone on the same
+ * gateway kept working.
+ *
+ * That boundary is also why nothing below separates "the gateway answers, the
+ * engine poll does not" from "nothing answers". Telling those apart needs the
+ * gateway's reading, which this module has no business holding. So it takes the
+ * weaker claim one failed poll does support.
  */
 
 import type { ConnectionStatus } from '../store/types';
@@ -29,9 +40,10 @@ import type { ConnectionStatus } from '../store/types';
  *  this workspace, not the workspace itself.
  *
  *  A workspace is a place the user keeps things, and it is still there. Its
- *  engine is a process, and that is what stopped answering. "Disconnected from
- *  dev" reads as having lost the workspace, which is alarming and untrue: the
- *  gateway keeps listing and switching workspaces throughout.
+ *  engine is the process this client reaches for, so the engine is what the
+ *  sentence names. "Cannot reach dev" reads as having lost the workspace, which
+ *  is alarming and untrue: the gateway keeps listing and switching workspaces
+ *  throughout.
  *
  *  Before `/health` first answers there is no name, so the target is the bare
  *  noun. A title of one bare state word would leave the sentence under it with
@@ -53,13 +65,15 @@ function connectionTarget(workspace: string | null): string {
  *  the mark hides itself when the pane is narrow, so this is what answers
  *  "connected to what?" at any width.
  *
- *  Each state brings its own preposition rather than sharing one, because
- *  "disconnected to dev" is not English. What they share is the target, composed
- *  once in `connectionTarget`. */
+ *  Each state brings its own verb rather than sharing one, and the degraded one
+ *  is deliberately weak. "Disconnected from" reads as a link the engine dropped,
+ *  which one failed poll cannot support. "Cannot reach" says the part it does
+ *  support: nothing got through from here. What the three share is the target,
+ *  composed once in `connectionTarget`. */
 const CONNECTION_PHRASE: Record<string, (target: string) => string> = {
   connected: (target) => `connected to ${target}`,
   connecting: (target) => `connecting to ${target}`,
-  disconnected: (target) => `disconnected from ${target}`,
+  disconnected: (target) => `cannot reach ${target}`,
 };
 
 export function connectionPhrase(status: string, workspace: string | null): string {
@@ -101,19 +115,22 @@ export type NoticeLength = 'short' | 'full';
  *  take it away exactly where it is worth most. */
 const CONNECTION_DETAIL: Record<string, { consequence: string; recovery: string }> = {
   connecting: {
-    consequence: 'Nothing in this workspace loads or sends yet.',
+    consequence: 'Threads and messages will not load or send in this window yet.',
     recovery: 'Waiting for an answer.',
   },
-  // The consequence claims THIS WORKSPACE rather than the app. A bare "nothing
-  // loads or sends" is refuted by the Workspaces row in the menu. That row
-  // reaches the GATEWAY, a different process, and keeps working through this.
+  // The consequence scopes on two axes, because a refutation waits on each. It
+  // names the engine's own content. The Workspaces row in the menu reaches the
+  // GATEWAY, keeps listing and switching, and does it from inside this window.
+  // It also names this window, because another client on the same workspace can
+  // load and send fine. A phone did exactly that through the outage this
+  // wording came from.
   //
   // The recovery names no remedy, on purpose. Restart posts to an engine we
   // cannot reach, and Refresh reloads a client that is not what broke. The 5s
   // health poll in `store/actions/connection.ts` does recover on its own, so
   // the line promises that instead, at the interval it runs at.
   disconnected: {
-    consequence: 'Nothing in this workspace loads or sends.',
+    consequence: 'Threads and messages will not load or send in this window.',
     recovery: 'Retrying every few seconds.',
   },
 };

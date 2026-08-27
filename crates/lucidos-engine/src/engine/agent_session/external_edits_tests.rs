@@ -297,8 +297,13 @@ async fn verify_branch_errors_when_user_checked_out_different_branch() {
     let err = verify_branch(&repo, "main")
         .await
         .expect_err("branch mismatch should produce error");
-    assert_eq!(err.expected, "main");
-    assert_eq!(err.found.as_deref(), Some("user-feature"));
+    assert_eq!(
+        err,
+        BranchMismatch::OnOtherBranch {
+            expected: "main".to_string(),
+            found: "user-feature".to_string(),
+        }
+    );
     let msg = format!("{}", err);
     assert!(msg.contains("user-feature"));
     assert!(msg.contains("main"));
@@ -322,8 +327,12 @@ async fn verify_branch_errors_on_detached_head() {
     let err = verify_branch(&repo, "main")
         .await
         .expect_err("detached HEAD should not match");
-    assert_eq!(err.expected, "main");
-    assert_eq!(err.found, None);
+    assert_eq!(
+        err,
+        BranchMismatch::Detached {
+            expected: "main".to_string(),
+        }
+    );
     let msg = format!("{}", err);
     assert!(msg.contains("detached HEAD"), "msg: {}", msg);
 }
@@ -333,6 +342,24 @@ async fn verify_branch_ok_when_worktree_missing() {
     let missing = std::path::PathBuf::from("/nonexistent/wt-for-verify");
     // Nothing to verify → no error (let downstream handle the missing dir).
     assert!(verify_branch(&missing, "main").await.is_ok());
+}
+
+/// A directory that exists but is not a git work tree makes `rev-parse` exit
+/// non-zero. That is the shape a 30s timeout also takes, and the gate decides
+/// where the agent's next commits land, so an unanswered probe must refuse.
+#[tokio::test]
+async fn verify_branch_refuses_when_git_cannot_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let err = verify_branch(tmp.path(), "main")
+        .await
+        .expect_err("an unanswerable probe must refuse the spawn");
+    assert_eq!(
+        err,
+        BranchMismatch::Unanswered {
+            expected: "main".to_string(),
+        }
+    );
+    assert!(format!("{}", err).contains("could not say"));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-import { isIOS } from './platform';
+import { isIOS, isWebKit } from './platform';
 
 /** Live action buttons whose tap mutates state irreversibly — answering a CC
  *  question (`.question-option`) or granting/denying a permission (the
@@ -71,7 +71,7 @@ export function reduceResumeGuard(
   }
 }
 
-// --- DOM wiring (iOS only) -------------------------------------------------
+// --- DOM wiring (WebKit, with an iOS-only wake-tap guard) ------------------
 
 const repaintSubscribers = new Set<() => void>();
 let armed = false;
@@ -92,7 +92,7 @@ function step(ev: ResumeEvent, domEvent?: Event): void {
   }
 }
 
-/** Disarm once the post-resume repaint has painted. `forceIOSRepaint` un-blanks
+/** Disarm once the post-resume repaint has painted. `forceWebKitRepaint` un-blanks
  *  the layer across a double rAF, so we wait the same span: by the time the
  *  second frame runs the content is visible and any tap is deliberate. rAF only
  *  advances while the page actually renders, so a stalled iOS repaint defers the
@@ -122,7 +122,7 @@ function onClickCapture(e: MouseEvent): void {
 }
 
 function install(): void {
-  if (installed || !isIOS()) return;
+  if (installed || !isWebKit()) return;
   installed = true;
   // Match useStartup's canonical resume set — iOS often restores a PWA via
   // `pageshow` (bfcache) or `focus` with no `visible` `visibilitychange`, which
@@ -131,17 +131,23 @@ function install(): void {
   document.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('pageshow', onResume);
   window.addEventListener('focus', onResume);
+  // The wake-tap guard is iOS ONLY, unlike the repaint above. A desktop window
+  // is raised BY a click, so swallowing the first one there would eat an
+  // ordinary click-to-focus. The phone has no such gesture: its first tap
+  // arrives on a layer that may still be blank.
+  //
   // Capture phase so the wake-tap is swallowed before it reaches the option /
   // permission button's own onClick — the same swallow pattern as
   // useAnchoredPopover's outside-click handler.
-  document.addEventListener('click', onClickCapture, true);
+  if (isIOS()) document.addEventListener('click', onClickCapture, true);
 }
 
 /** Subscribe a callback fired whenever the page returns to the foreground (and
- *  on the first wake-tap after one) so the caller can force an iOS repaint.
- *  Lazily installs the resume listeners. Returns an unsubscribe. No-op off iOS:
- *  the bug it guards against is iOS-compositor-specific, and arming the
- *  click-swallow on desktop would eat a legitimate click-to-focus tap. */
+ *  on the first wake-tap after one) so the caller can force a WebKit repaint.
+ *  Lazily installs the resume listeners. Returns an unsubscribe.
+ *
+ *  No-op off WebKit, since the compositor bug is that engine's. The wake-tap
+ *  swallow inside it stays narrower still, at iOS alone: see `install`. */
 export function onPageResume(cb: () => void): () => void {
   install();
   repaintSubscribers.add(cb);

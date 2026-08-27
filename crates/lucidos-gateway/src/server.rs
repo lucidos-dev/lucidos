@@ -2883,11 +2883,14 @@ async fn serve(
     // listener and the cookie's `Secure` flag cannot disagree. Matching on bare
     // `Some` took the TLS arm for a set-but-empty value, which is how a launch
     // script spells "unset". `from_pem_file("", "")` then errored and the
-    // gateway never served, leaving the picker on its boot splash.
+    // gateway never served, leaving the picker on its boot splash. Trimmed for
+    // the same reason: `serves_tls` trims before deciding and `from_pem_file`
+    // does not, so a padded path would pick TLS and then fail on a file the
+    // user does have.
     let tls = if state.serves_tls() {
         let cert = std::env::var("LUCIDOS_TLS_CERT").unwrap_or_default();
         let key = std::env::var("LUCIDOS_TLS_KEY").unwrap_or_default();
-        Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?)
+        Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(cert.trim(), key.trim()).await?)
     } else {
         None
     };

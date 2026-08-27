@@ -28,32 +28,44 @@ use crate::engine::git_ops::{
     git_answer, git_answer_with, git_cmd, worktree_current_branch, GitAnswer,
 };
 
-/// Result of [`verify_branch`] when the worktree's checked-out branch
-/// doesn't match the engine's expected branch.
+/// Why [`verify_branch`] would not let the spawn proceed.
 ///
 /// Custom error type (exception to the `Box<dyn Error>` convention in
-/// CLAUDE.md) because the spawn dispatcher needs the structured fields
-/// (`expected`, `found`) to surface a precise mismatch to the user.
+/// CLAUDE.md) because the spawn-context path branches on the case, not only on
+/// the wording: only a NAMED branch may go on to renegade-branch adoption, so
+/// `Unanswered` has to stay distinguishable from the other two. The tests
+/// assert the case for the same reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BranchMismatch {
-    pub expected: String,
-    pub found: Option<String>,
+pub(crate) enum BranchMismatch {
+    /// git named a branch, and it is not the one the engine expected.
+    OnOtherBranch { expected: String, found: String },
+    /// git ran and reported a detached HEAD.
+    Detached { expected: String },
+    /// git could not be asked: it failed to spawn, timed out, or exited
+    /// non-zero. Nothing is known about the checked-out branch.
+    Unanswered { expected: String },
 }
 
 impl std::fmt::Display for BranchMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.found {
-            Some(actual) => write!(
+        match self {
+            Self::OnOtherBranch { expected, found } => write!(
                 f,
                 "worktree is on branch '{}' but expected '{}'. Resolve manually \
                  (e.g. `git checkout {}` in the worktree) before continuing.",
-                actual, self.expected, self.expected
+                found, expected, expected
             ),
-            None => write!(
+            Self::Detached { expected } => write!(
                 f,
                 "worktree has a detached HEAD but expected branch '{}'. Resolve \
                  manually before continuing.",
-                self.expected
+                expected
+            ),
+            Self::Unanswered { expected } => write!(
+                f,
+                "git could not say which branch the worktree is on, so it cannot be \
+                 confirmed as '{}'. Send the message again to retry.",
+                expected
             ),
         }
     }
@@ -206,12 +218,19 @@ pub(crate) async fn compute_external_edit_note(
 }
 
 /// Verify that the worktree's currently checked-out branch matches the
-/// engine's expected branch. Returns `Ok(())` when they match (or when the
-/// worktree path doesn't exist — there's nothing to verify).
+/// engine's expected branch. Returns `Ok(())` when they match, and when the
+/// worktree path doesn't exist, since there is then nothing to verify.
 ///
 /// Returns `Err(BranchMismatch)` when the user has externally checked out
 /// a different branch (or detached HEAD) — the caller should refuse to
 /// spawn CC, since continuing would silently commit to the wrong ref.
+///
+/// A probe that could not run answers `Unanswered`, which also refuses. This
+/// gate decides where the agent's commits land, so the unknown side has to be
+/// the one that keeps the user's work. `git_cmd` returns `Err` on its 30s
+/// timeout, and a saturated host can take that long over `rev-parse`.
+/// Reading the timeout as "the branch matches" would let a resume commit into
+/// whatever the user checked out. A refusal costs one resend.
 pub(crate) async fn verify_branch(
     worktree_path: &Path,
     expected_branch: &str,
@@ -219,31 +238,42 @@ pub(crate) async fn verify_branch(
     if !worktree_path.exists() {
         return Ok(());
     }
-    let found = match git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], worktree_path).await {
+    match git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], worktree_path).await {
         Ok(o) if o.status.success() => {
-            let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if b == "HEAD" {
-                None
+            let found = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if found == expected_branch {
+                Ok(())
+            } else if found == "HEAD" {
+                Err(BranchMismatch::Detached {
+                    expected: expected_branch.to_string(),
+                })
             } else {
-                Some(b)
+                Err(BranchMismatch::OnOtherBranch {
+                    expected: expected_branch.to_string(),
+                    found,
+                })
             }
         }
-        _ => {
-            // Couldn't read the branch (e.g. corrupt git state). Better to
-            // proceed than to permanently wedge the thread on a transient
-            // failure — `git_head_sha` will also return None and the worst
-            // case is a missing edit-note, not data loss.
-            return Ok(());
+        Ok(o) => {
+            log!(
+                "[AgentSession] `git rev-parse --abbrev-ref HEAD` failed in {}: {}",
+                worktree_path.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            Err(BranchMismatch::Unanswered {
+                expected: expected_branch.to_string(),
+            })
         }
-    };
-
-    if found.as_deref() == Some(expected_branch) {
-        Ok(())
-    } else {
-        Err(BranchMismatch {
-            expected: expected_branch.to_string(),
-            found,
-        })
+        Err(e) => {
+            log!(
+                "[AgentSession] cannot read the checked-out branch in {}: {}",
+                worktree_path.display(),
+                e
+            );
+            Err(BranchMismatch::Unanswered {
+                expected: expected_branch.to_string(),
+            })
+        }
     }
 }
 

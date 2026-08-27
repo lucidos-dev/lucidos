@@ -103,7 +103,7 @@ fn rustfmt_source(src: String) -> String {
         });
 
     // The write runs on its own thread because rustfmt streams its result back
-    // while we are still feeding it. The generated module is ~34 KB today, close
+    // while we are still feeding it. The generated module is ~44 KB today, close
     // enough to a typical 64 KB pipe buffer that adding a couple of domains would
     // turn a straight-line write into a deadlock.
     let mut stdin = child
@@ -267,15 +267,12 @@ fn generate_cli_rs_unformatted() -> String {
                             "            if {0} {{ query.push((\"{0}\", \"true\".to_string())); }}\n",
                             a.name
                         )),
-                        // Optional bool = `Option<bool>`.
-                        (ArgType::Bool, false) => out.push_str(&format!(
-                            "            if let Some(v) = {0} {{ query.push((\"{0}\", v.to_string())); }}\n",
-                            a.name
-                        )),
                         (_, true) => out.push_str(&format!(
                             "            query.push((\"{0}\", {0}.to_string()));\n",
                             a.name
                         )),
+                        // Every optional arg is an `Option<T>`, bool included,
+                        // so one arm covers them all.
                         (_, false) => out.push_str(&format!(
                             "            if let Some(v) = {0} {{ query.push((\"{0}\", v.to_string())); }}\n",
                             a.name

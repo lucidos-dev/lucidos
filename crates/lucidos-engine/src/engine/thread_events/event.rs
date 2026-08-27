@@ -292,6 +292,15 @@ pub enum ThreadEvent {
         /// `bash_kill` killed the task explicitly.
         #[serde(default, skip_serializing_if = "is_false")]
         killed: bool,
+        /// The engine that owned this task stopped while it was running, so the
+        /// child died with the process and nobody watched it exit. Distinct
+        /// from `killed`, which means a person or an agent cancelled the work:
+        /// a reader that conflates the two concludes the task was called off.
+        /// `exit_code` and `signal` are both `None` here, because no status was
+        /// ever reaped. Written by the teardown emit or by the boot sweep, in
+        /// `engine/tools/bash_background_recovery.rs`.
+        #[serde(default, skip_serializing_if = "is_false")]
+        abandoned: bool,
     },
     ResponseGenerated {
         #[serde(default, skip_serializing_if = "is_empty_str")]

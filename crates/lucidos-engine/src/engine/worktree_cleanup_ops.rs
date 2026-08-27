@@ -268,8 +268,12 @@ pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
 }
 
 /// Remove a worktree directory and (when its branch is fully merged into
-/// main) delete the branch. Reused by the background cleanup worker (Tier 2)
-/// and by the user-facing close + disk-usage endpoints.
+/// main) delete the branch.
+///
+/// It opens with `git worktree remove --force`, so a caller gates it on
+/// [`is_worktree_dirty`] first. Only the disk-usage endpoint's Tier 3 skips
+/// the gate, where the user confirmed a force. Add a caller and you add the
+/// gate with it. `rg is_worktree_dirty` lists the current set.
 ///
 /// `pre_size` lets the Tier 2 worker pass the directory size it already
 /// surveyed at the top of `run_once`, avoiding a second walk of the same

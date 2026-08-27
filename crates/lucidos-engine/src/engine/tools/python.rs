@@ -270,7 +270,7 @@ impl LucidosEngine {
         // wake text refers to "Background task" (language-agnostic, not
         // "Background bash task") so the LLM sees the right framing for
         // both bash- and python-spawned tasks.
-        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), safe_command, finish_rx);
+        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), finish_rx);
 
         Ok(serde_json::json!({
             "task_id": task_id,

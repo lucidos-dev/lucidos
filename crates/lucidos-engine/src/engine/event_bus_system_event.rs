@@ -1724,7 +1724,22 @@ impl SystemEvent {
                 merge_actor(payload.clone(), actor)
             }
             Self::DomainEvent { payload, actor, .. } => merge_actor(payload.clone(), actor),
-            _ => serde_json::to_value(self).unwrap_or_default(),
+            // This value is bound straight into the `events` INSERT, so a
+            // silent `Null` here persists an event with no content: no
+            // projection, no SSE detail, no trigger match, and nothing in the
+            // log saying why. Same reasoning as the actor drop in
+            // `merge_actor` below.
+            _ => match serde_json::to_value(self) {
+                Ok(v) => v,
+                Err(e) => {
+                    crate::log!(
+                        "[EventBus] WARNING: {} payload would not serialize ({}), persisting it empty",
+                        self.event_type(),
+                        e
+                    );
+                    serde_json::Value::Null
+                }
+            },
         }
     }
 }

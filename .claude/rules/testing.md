@@ -2,7 +2,6 @@
 paths:
   - "crates/lucidos-app/e2e/**"
   - "crates/lucidos-app/src/**/*.test.ts"
-  - "crates/lucidos-app/src/**/*.spec.ts"
   - "crates/lucidos-engine/tests/**"
   - "crates/lucidos-e2e/tests/**"
   - "crates/lucidos-app/src/generated/**"

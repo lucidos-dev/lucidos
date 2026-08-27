@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, auto_commit_worktree, catchup_and_ff_to_main,
+    auto_commit_safe_files_if_dirty, auto_commit_worktree, branch_head_sha, catchup_and_ff_to_main,
     commits_in_range, ff_main_to, files_have_client_update, find_branch_merge_in_main,
     find_worktree_for_branch, has_branch_commits, is_harden_marker_present,
     push_main_in_background, recover_no_commits_branch, worktree_add, worktrees_dir,
@@ -988,13 +988,9 @@ impl LucidosEngine {
         // Fast path: branch may already be a descendant of main
         {
             let _merge_guard = MERGE_MUTEX.lock().await;
-            let main_sha = git_cmd(&["rev-parse", "main"], repo_root)
+            let main_sha = branch_head_sha(repo_root, "main").await.unwrap_or_default();
+            let branch_sha = branch_head_sha(repo_root, &change.branch_name)
                 .await
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            let branch_sha = git_cmd(&["rev-parse", &change.branch_name], repo_root)
-                .await
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
 
             if let Ok(shas) = ff_main_to(repo_root, &branch_sha, &main_sha).await {

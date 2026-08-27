@@ -30,6 +30,7 @@ import { peerWorkspaces } from '../../store/actions/app-badge';
 import { switchMenuItem } from '../../store/actions/menu';
 import { showToast, unreadCount, visibleWorkspaceName } from '../../store/store';
 import { WORKSPACE_ID } from '../../utils/basePath';
+import { errorDetail } from '../../utils/errorDetail';
 import {
   alternateOpenMode,
   middleClickActivates,
@@ -268,7 +269,7 @@ export function NotificationsMenuGroup({ onClose }: { onClose: () => void }) {
     // there comes from the control listing.
     if (!row.id) return;
     void openWorkspaceIn(mode, row.id, 'notifications').catch((e: unknown) => {
-      showToast(`Could not open ${row.name}: ${e}`, 'error');
+      showToast(`Could not open ${row.name}: ${errorDetail(e)}`, 'error');
     });
   };
 

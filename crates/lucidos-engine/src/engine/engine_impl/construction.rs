@@ -576,37 +576,16 @@ impl LucidosEngine {
         // the startup stale-merge cleanup keys on them, so any recorded
         // Tier-3 temp state must be removed NOW or the temp worktree +
         // branch leak with no pointer left anywhere (the completion Abort
-        // arm deletes them for the same reason). These delete only what the
-        // merge attempt created (the temp pair recorded by
-        // MergeResolutionStarted — never the thread worktree/branch), and
-        // every outcome is logged so a refused deletion is triageable
-        // (rust.md failure-path-cleanup rule). The extra merge --abort is a
-        // harmless no-op when this is the same path as `merge_worktree`.
+        // arm deletes them for the same reason). The extra merge --abort
+        // inside the helper is a harmless no-op when this is the same path
+        // as `merge_worktree`.
         if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
-            let repo = std::path::Path::new(&change.repo_root);
-            let _ =
-                crate::engine::git_ops::git_cmd(&["merge", "--abort"], std::path::Path::new(wt))
-                    .await;
-            match crate::engine::git_ops::git_cmd(&["worktree", "remove", "--force", wt], repo)
-                .await
-            {
-                Ok(_) => crate::log!(
-                    "[SpawnConsumer] Removed stranded temp merge worktree {}",
-                    wt
-                ),
-                Err(e) => crate::log!(
-                    "[SpawnConsumer] Failed to remove stranded temp merge worktree {}: {} — needs manual cleanup (merge columns are cleared below)",
-                    wt,
-                    e
-                ),
-            }
-            match crate::engine::git_ops::git_cmd(&["branch", "-D", tb], repo).await {
-                Ok(_) => crate::log!("[SpawnConsumer] Deleted stranded temp branch {}", tb),
-                Err(e) => crate::log!(
-                    "[SpawnConsumer] Failed to delete stranded temp branch {}: {}",
-                    tb,
-                    e
-                ),
+            let repo = std::path::PathBuf::from(&change.repo_root);
+            if !remove_temp_merge_state(&repo, wt, tb, "[SpawnConsumer]").await {
+                log!(
+                    "[SpawnConsumer] Temp merge state for change {} needs manual cleanup: the merge columns are cleared below, so nothing points at it any more",
+                    change.id
+                );
             }
         }
         let actor = self.pending_apply_actors.take(change.id);
@@ -1071,10 +1050,7 @@ impl LucidosEngine {
         for change in stale_merges {
             if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
                 let change_repo = std::path::PathBuf::from(&change.repo_root);
-                // git_cmd cleanup is best-effort — the worktree/branch may already be gone.
-                let _ = git_cmd(&["merge", "--abort"], std::path::Path::new(wt)).await;
-                let _ = git_cmd(&["worktree", "remove", "--force", wt], &change_repo).await;
-                let _ = git_cmd(&["branch", "-D", tb], &change_repo).await;
+                let removed = remove_temp_merge_state(&change_repo, wt, tb, "[Startup]").await;
                 if let Some(tid) = change.thread_id {
                     event_bus
                         .emit_or_log(
@@ -1089,10 +1065,17 @@ impl LucidosEngine {
                         )
                         .await;
                 }
-                log!(
-                    "[Startup] Cleaned up stale merge worktree for change {}",
-                    change.id
-                );
+                if removed {
+                    log!(
+                        "[Startup] Cleaned up stale merge worktree for change {}",
+                        change.id
+                    );
+                } else {
+                    log!(
+                        "[Startup] Stale merge state for change {} needs manual cleanup: the merge columns are cleared, so nothing points at it any more",
+                        change.id
+                    );
+                }
             }
         }
 
@@ -1260,7 +1243,7 @@ impl LucidosEngine {
             summarizing_threads: Default::default(),
             rebuilding_memory: AtomicBool::new(false),
             cancel_rebuild: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             backup_in_progress: AtomicBool::new(false),
             // `true`, not `false`: reaching here means the pool connected and the
             // migrator ran, so the database WAS answering a moment ago. Starting
@@ -1403,4 +1386,80 @@ impl LucidosEngine {
             Err(_) => HashMap::new(),
         }
     }
+}
+
+/// Delete the Tier-3 temp merge state a crashed apply left behind: abort the
+/// merge, remove the temp worktree, delete the temp branch. Returns whether
+/// both deletions landed.
+///
+/// Both callers null the row's `merge_worktree_path` / `merge_temp_branch`
+/// straight afterwards, and those columns are the only pointer at this state.
+/// A deletion that quietly failed therefore leaks a whole worktree nothing
+/// will look for again. So every outcome is logged, and the caller learns
+/// whether it may claim success (rust.md failure-path-cleanup rule). This
+/// removes only what the merge attempt created, the pair
+/// `MergeResolutionStarted` recorded, never the thread's own worktree.
+///
+/// Already gone counts as gone. Most of the time the state IS half-cleared: a
+/// previous pass removed the pair and then died before nulling the columns.
+/// Reading git's refusal to delete a missing thing as a failure would print a
+/// manual-cleanup warning on every boot, for nothing.
+async fn remove_temp_merge_state(
+    repo: &std::path::Path,
+    worktree: &str,
+    temp_branch: &str,
+    tag: &str,
+) -> bool {
+    let _ = crate::engine::git_ops::git_cmd(&["merge", "--abort"], std::path::Path::new(worktree))
+        .await;
+    let worktree_gone = match crate::engine::git_ops::git_ran_ok(
+        &["worktree", "remove", "--force", worktree],
+        repo,
+    )
+    .await
+    {
+        Ok(()) => {
+            log!("{} Removed temp merge worktree {}", tag, worktree);
+            true
+        }
+        // A stat, not a git probe: the directory is either there or it is not.
+        Err(_) if !std::path::Path::new(worktree).exists() => true,
+        Err(e) => {
+            log!(
+                "{} Failed to remove temp merge worktree {}: {}",
+                tag,
+                worktree,
+                e
+            );
+            false
+        }
+    };
+    let branch_gone =
+        match crate::engine::git_ops::git_ran_ok(&["branch", "-D", temp_branch], repo).await {
+            Ok(()) => {
+                log!("{} Deleted temp merge branch {}", tag, temp_branch);
+                true
+            }
+            Err(e) => {
+                // `or_unknown(true)` keeps an unanswered probe on the "still
+                // there" side, so an unreachable git never buys a claim of
+                // success.
+                let still_there = crate::engine::git_ops::git_answer(
+                    &["rev-parse", "--verify", "--quiet", temp_branch],
+                    repo,
+                )
+                .await
+                .or_unknown(true);
+                if still_there {
+                    log!(
+                        "{} Failed to delete temp merge branch {}: {}",
+                        tag,
+                        temp_branch,
+                        e
+                    );
+                }
+                !still_there
+            }
+        };
+    worktree_gone && branch_gone
 }

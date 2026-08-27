@@ -475,10 +475,23 @@ pub(crate) async fn emit_background_task_failure(
     error: impl std::fmt::Display,
     label: &str,
 ) {
-    if thread_is_running(engine.pool(), thread_id)
-        .await
-        .unwrap_or(false)
-    {
+    // A read that failed is not "the thread already settled". The conservative
+    // side avoids a double terminal. It also drops the very failure this
+    // function exists to report, so the reason has to reach the log.
+    let still_running = match thread_is_running(engine.pool(), thread_id).await {
+        Ok(running) => running,
+        Err(e) => {
+            log!(
+                "[ClaudeCode] Cannot tell whether thread {} is still running ({}), so {} goes unreported: {}",
+                thread_id,
+                e,
+                label,
+                error
+            );
+            false
+        }
+    };
+    if still_running {
         engine
             .event_bus
             .emit_or_log(

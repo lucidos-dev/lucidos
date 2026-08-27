@@ -1,10 +1,11 @@
 //! Remembering the user's windows across a launch, and the gates on writing.
 //!
-//! Two records, complementary rather than redundant. The window-state plugin
-//! keeps one per window LABEL, which restores `main` before anything knows what
-//! it will show. The session record is per WORKSPACE: which ones had a window,
-//! and how big each was. Only the second survives a label that changes between
-//! launches.
+//! Two records, and they do not overlap. The window-state plugin covers `main`
+//! ALONE, which is the one label that means the same thing every launch. It
+//! restores that window before anything knows what it will show, and it is
+//! where maximized and fullscreen live. The session record is per WORKSPACE:
+//! which ones had a window, and how big each was. Every other window is its
+//! business, and [`plugin_tracks`] is what holds the split.
 //!
 //! Both are written together, so a window recorded in one is recorded in the
 //! other. Two gates decide whether a write happens at all: a teardown is not
@@ -33,6 +34,23 @@ use crate::{desktop, window_restore, window_session};
 ///   reclaimed title-bar band back into an opaque bar.
 pub(crate) fn window_state_flags() -> StateFlags {
     StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+/// Which windows `tauri-plugin-window-state` may restore and save: `main`, and
+/// nothing else. Passed to its builder as the tracking filter.
+///
+/// The plugin keys on the window LABEL, and `window-<n>` comes off a counter
+/// that resets each process. So that key names a different window every launch,
+/// which is the whole reason ADR 0123 keys the session by workspace instead.
+/// Unfiltered, the plugin restored one runtime window's geometry onto an
+/// unrelated one, and `MAXIMIZED` and `FULLSCREEN` with it. Placing a frame
+/// undoes neither, so a fresh window could come up fullscreen inherited from a
+/// past life.
+///
+/// This is the "for `main` only" the ADR already promised. `main` is declared in
+/// `tauri.conf.json`, so its label does mean one window across launches.
+pub(crate) fn plugin_tracks(label: &str) -> bool {
+    label == crate::app_window::MAIN_WINDOW_LABEL
 }
 
 /// How long the window must sit still (no move/resize) before the debounced
@@ -173,21 +191,45 @@ pub(crate) fn readable_window_session() -> window_session::WindowSession {
         .unwrap_or_default()
 }
 
+/// The frame the workspace `url` serves was last left at, for a window about to
+/// be built for it. `None` asks for the declared default.
+///
+/// Reads the record fresh rather than the memoized launch plan. The two answer
+/// different questions: that one is what THIS launch owed, and this is where a
+/// workspace was left, which the user has been rearranging ever since.
+///
+/// A file read per call is right here. Every caller is a click or a banner tap,
+/// and a stale answer would place the window wrong.
+pub(crate) fn remembered_frame(url: &str) -> Option<window_restore::Rect> {
+    window_session::frame_for_url(&readable_window_session(), url)
+}
+
 /// Put `main` at the frame the workspace it will open remembers.
 ///
 /// Before the show, so the window appears at its size rather than jumping to it
 /// a second later. The clamp runs after and sanitises whatever this leaves.
 ///
+/// This is the one placement that can meet an ALREADY arranged window. It runs
+/// from `setup` after the plugin restored `main`, and from a reopen pointing an
+/// adrift `main` at a workspace. So it is the one that has to skip a fullscreen
+/// window, for the reason `window_restore::clamp_restored_geometry` gives: macOS
+/// owns that frame, and sizing it fights the AppKit transition. A window built
+/// for a frame cannot be fullscreen yet, so no other caller needs the test.
+///
 /// By window, not webview window, per ADR 0140. Sizing and placing are window
-/// operations. This runs in `setup`, before any preview can exist, so the
-/// flavour is the rule rather than a fix.
+/// operations, and by the time a reopen runs `main` is the likeliest window of
+/// all to be hosting a URL preview.
 pub(crate) fn size_main_window_for_its_workspace(
     app: &tauri::AppHandle,
     frame: window_restore::Rect,
 ) {
-    if let Some(window) = app.get_window(crate::app_window::MAIN_WINDOW_LABEL) {
-        crate::app_window::place_window(&window, frame, "the main window for its workspace");
+    let Some(window) = app.get_window(crate::app_window::MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    if window.is_fullscreen().unwrap_or(false) {
+        return;
     }
+    crate::app_window::place_window(&window, frame, "the main window for its workspace");
 }
 
 /// Set once the client has begun a deliberate teardown: a quit, a restart, or
@@ -381,6 +423,18 @@ mod tests {
             true,
             GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(1)
         ));
+    }
+
+    // The plugin keys on the label, and only `main`'s means one window across
+    // launches. Tracking a `window-<n>` restored a past session's second window
+    // onto whatever this session's second window turned out to be, fullscreen
+    // flag included.
+    #[test]
+    fn the_plugin_tracks_main_and_nothing_else() {
+        assert!(plugin_tracks(crate::app_window::MAIN_WINDOW_LABEL));
+        for label in ["window-0", "window-7", "url-preview-1", "lucidos-tray", ""] {
+            assert!(!plugin_tracks(label), "{label:?} is tracked");
+        }
     }
 
     #[test]
