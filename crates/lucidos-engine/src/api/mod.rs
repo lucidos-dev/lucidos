@@ -19,6 +19,7 @@ pub(crate) mod error;
 mod file_response;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
+pub(crate) mod handshake_scripts;
 pub(crate) mod hex;
 mod history;
 mod images;
@@ -1183,6 +1184,7 @@ pub fn create_router(
         .merge(plugins::router())
         .merge(webhooks::router())
         .merge(workspace_label::router())
+        .merge(handshake_scripts::router())
         .merge(proxy::router())
         .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
         // Axum's 2 MiB default rejects mobile screenshots in chat/app-capture

@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.32.0 — 2026-08-28
+
+### Added
+
+- Settings > Webhooks can make a signed webhook. Pick GitHub, Slack or Stripe and the signature is configured for you, or choose Custom and set the fields yourself. The form also obtains the shared secret: it generates one for GitHub, which lets you choose it, and takes a pasted one from Slack and Stripe, which issue their own. A generated secret is shown once, with a Copy button, to paste into the sender's own webhook form.
+- A webhook's signature can be changed, rotated and removed, keeping its delivery URL. A rotated credential or a wrong signature header no longer means deleting the hook and re-pointing the sender at a new address. Also on `lucidos webhooks update`, as `--hmac` and `--signing-secret`. A hook carries exactly one verifier, so adding a signature drops its token and removing one mints a fresh token, shown once.
+- A shared secret is its own credential type. Every other type says how a value is sent, and this one is sent nowhere: it is signed with. It takes no base URL, and a webhook signing secret is the first of them.
+- The Webhooks page reports whether the public ingress is reachable. Every resolved address is probed from outside the machine, and each address family is judged on its own, so an IPv4 route that refuses connections while IPv6 answers is named rather than averaged away. A standing outage shows on the page, in a bar, and on the hook's own row, with its age counting up.
+- Discuss a notification that has no thread. The notification detail gains a Discuss button, shown when the notification reaches no thread of its own. One tap starts a Lucidos Agent thread with the notification quoted and sends it.
+- Turn off in-app notification toasts. Settings > Notifications gains an In-app toasts switch. Off, a notification still counts on the bell badge and waits in the Notifications panel, and no OS push arrives in its place. The switch covers every device, so one write silences them all.
+- A link can name a place inside an app. Write `[Some report](app:pr-understanding#pr-1645)` and the app opens on that item, because the fragment reaches the iframe as its `location.hash`. It works from a chat transcript, a notification tap, `navigate_ui`, `lucidos.ui.navigate` and `lucidos notify --fragment`.
+- The menu items are search results. Search Everywhere finds Files, Apps, Plugins, Triggers, Settings, Changes and Notifications themselves, so typing "plugins" offers a way to open the page rather than only what is on it.
+- Each workspace row in the picker states when it last backed up, beside its name and health dot.
+
+### Changed
+
+- A signed webhook's row names the credential it verifies with, as a link into Settings > Accounts, beside its signature header and digest. A credential that no longer exists says so on the row rather than linking nowhere. That is the state which makes the hook refuse every delivery.
+- A signed webhook is described as verified by "signature" rather than "token and signature". It never had a token: a sender that signs cannot present one.
+- An auth handshake script runs only once it is approved. Approval records who wrote the script and the exact bytes checked, so an edit after approval stops it running until it is approved again. Approve one with `lucidos handshake approve`, which a browser cannot call, and the Files panel warns when an open handshake script will not run as it stands.
+- A stored credential is presented only inside its own scope. A config entry naming a credential it has no claim on cannot make the engine forward that credential to an address of its choosing.
+- One SSE event stream per workspace, held by a shared worker, however many tabs, windows and app iframes are open. An app attaches to the shared stream and falls back to its own when it cannot. Presence now means an active shell, which is what decides whether a notification arrives as a push or a toast.
+- The model picker's filter box waits to be typed into rather than appearing on open, and it follows touch rather than screen width.
+- A publisher-model 404 from Vertex names the region and both ways to fix it, and a failed request names the project it was billed to.
+
+### Fixed
+
+- The transcript reopens on the turn you left. A reading position names a turn rather than a pixel, so a reload, a revisit or a re-render lands on the same place instead of near it, and the render window walks its way to that turn.
+- A turn control holds the element you pressed. Expanding or collapsing a turn's steps keeps the control under your finger where it was, including when the browser's own scroll clamp eats part of the correction.
+- A long thread opens filled, and an edge past the end still draws one turn. The render window holds its top edge rather than its size.
+- On iOS, Cancel survives the keyboard. A press that the system took as a scroll or a keyboard dismissal no longer aborts a running turn, and a touch that never becomes a click still cancels.
+- The composer sends the draft it is showing. A send reads the text its button was lit from, so a Send that looks ready dispatches what is in the box.
+- A deep link lands on its target, waiting for that target to be drawn, and says what happened when it cannot.
+- A thread tap leaves app fullscreen, so the thread it opens is on screen.
+- Thread events order by instant rather than by timestamp text, so two events inside the same second no longer swap places.
+- The mobile header recognises an anchor write by position, so it stops hiding on a scroll the reader did not make.
+- A multi-value cron field renders as the several times it means, not one.
+- The Thread Queue panel fetches on open and refreshes on wake, and a cancel waits for output already kept.
+- The workspace picker's animations, three UI transitions and every raw CSS duration honour the reduced-motion scale.
+- The picker's status dot sits on the name, and a row holds its backup line open rather than jumping as it loads.
+- A toast wraps a long path instead of clipping it.
+- Settings > System answers every shape the update route sends it, a release marked newer always carries the route to it, and a running update keeps its own control.
+- A drawer list is one tab stop, not two.
+- Eight correctness defects in the engine found by a project-wide sweep, including two logs that could not name what they dropped and a plugin trigger slug rejected by the create-path guard.
+- A directly-launched engine stays on loopback.
+- A coding-agent session adopts a branch only once it proves the branch is its own, and a failed anchor lookup refuses adoption rather than reading as no commit.
+
+### Removed
+
+- The workspace-root fallback for a `script_handshake` script. A handshake runs only from `<workspace>/data/<script>` now, the documented and git-tracked location. A script still sitting at the workspace root no longer runs, and the call says so, naming the `data/` path to move it to.
 ## v0.31.1 — 2026-08-27
 
 ### Changed

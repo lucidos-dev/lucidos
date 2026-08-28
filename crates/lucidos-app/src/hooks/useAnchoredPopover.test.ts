@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { computeAnchorPosition, isOutsidePointerTarget, makeDismissHandlers, installPairedSwallow } from './useAnchoredPopover';
+import { notePressOutcome, takePressOutcome } from '../utils/tapGesture';
 
 function fakeAnchor(rect: { top: number; bottom: number; left: number; right: number }): HTMLElement {
   return { getBoundingClientRect: () => rect } as unknown as HTMLElement;
@@ -973,5 +974,78 @@ describe('installPairedSwallow', () => {
     dispatch('touchcancel');
     const touch = dispatch('touchend');
     expect(touch.stopPropagation).not.toHaveBeenCalled();
+  });
+
+  // The arm belongs to ONE gesture. Its paired event can strand: a touchend
+  // dispatched to a node the dismiss REMOVED never reaches document, and no
+  // cancel fires. A stranded arm that survives eats the user's next tap, which
+  // is a dead button (docs/plans/2026-08-28-a-swallowed-tap-says-so.md).
+  it('a new gesture tears down an arm whose paired event never arrived', () => {
+    installPairedSwallow();
+    // No touchend, no cancel: the gesture ended on a detached node. The next
+    // tap opens with its own pointerdown, which must kill the stale arm.
+    dispatch('pointerdown');
+    const touch = dispatch('touchend');
+    expect(touch.stopPropagation).not.toHaveBeenCalled();
+    expect(touch.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it('the arming pointerdown itself does not tear the arm down', () => {
+    // The document stub dispatches to the LIVE listener list, so the arming
+    // event reaches the teardown listener it just installed. A real browser
+    // iterates a copy and never does. Identity holds in both.
+    const arming = { type: 'pointerdown', stopPropagation: vi.fn(), preventDefault: vi.fn() };
+    installPairedSwallow(arming as unknown as Event);
+    (document as unknown as { dispatchEvent: (e: unknown) => boolean }).dispatchEvent(arming);
+    const touch = dispatch('touchend');
+    expect(touch.stopPropagation).toHaveBeenCalledTimes(1);
+  });
+
+  it('names the swallow, so an observer cannot read it as a dead press', () => {
+    takePressOutcome(1000);
+    installPairedSwallow();
+    dispatch('touchend');
+    expect(takePressOutcome(1000)).toBe('swallowed');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// The press outcome, read back. `installPairedSwallow` above writes the
+// 'swallowed' half; `touchActivated` writes 'served'. Both stop an observer
+// downstream of a stopPropagation from calling a live press dead.
+// ──────────────────────────────────────────────────────────────────────────
+describe('takePressOutcome', () => {
+  it('is null when nobody claimed the press', () => {
+    takePressOutcome(1000);
+    expect(takePressOutcome(1000)).toBeNull();
+  });
+
+  it('consumes, so one press cannot describe the next', () => {
+    notePressOutcome('served', 100);
+    expect(takePressOutcome(1000, 100)).toBe('served');
+    expect(takePressOutcome(1000, 100)).toBeNull();
+  });
+
+  it('forgets an outcome older than the window', () => {
+    notePressOutcome('served', 100);
+    expect(takePressOutcome(500, 900)).toBeNull();
+  });
+
+  it('a window measured from a press start excludes an EARLIER press', () => {
+    // How the probe reads it: `takePressOutcome(now - armedAt)`. A second
+    // composer touch inside the first one's grace window supersedes it without
+    // consuming its claim. Reading that stale claim would call the second
+    // press served and suppress the report it was owed.
+    notePressOutcome('served', 100);   // the first press was taken at t=100
+    const armedAt = 200;               // the second press began at t=200
+    const now = 800;
+    expect(takePressOutcome(now - armedAt, now)).toBeNull();
+  });
+
+  it('a window measured from a press start keeps that press own claim', () => {
+    const armedAt = 200;
+    notePressOutcome('swallowed', 250);
+    const now = 800;
+    expect(takePressOutcome(now - armedAt, now)).toBe('swallowed');
   });
 });

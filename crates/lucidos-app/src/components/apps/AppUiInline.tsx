@@ -5,7 +5,7 @@ import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
-import { navigateAppIframe } from './iframeNav';
+import { navigateAppIframe, setAppFrameHash, splitFrameSrc } from './iframeNav';
 import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 
 /** The load cover's CSS opacity transition at 1x (var(--duration-normal)). The
@@ -59,6 +59,16 @@ function AppFrame({ src }: { src: string }) {
     const iframe = iframeRef.current;
     if (!iframe) return;
     if (lastSrcRef.current === src) return;
+    const previous = splitFrameSrc(lastSrcRef.current);
+    const next = splitFrameSrc(src);
+    // Same document, new target: hand the frame the hash and raise NO cover.
+    // The app is already on screen and stays on screen. An emptied fragment is
+    // not a target, so it moves nobody: the reader keeps their place.
+    if (previous.doc === next.doc) {
+      if (next.fragment) setAppFrameHash(iframe, next.fragment);
+      lastSrcRef.current = src;
+      return;
+    }
     // Skip lastSrcRef update on failure so the next render retries against a
     // freshly-mounted iframe rather than thinking the URL is already in place.
     // Stable key dedups the toast across rapid app switches that re-fire the

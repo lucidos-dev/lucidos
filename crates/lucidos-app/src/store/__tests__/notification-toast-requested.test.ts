@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { toasts, focusedThreadId, TOAST_AUTO_DISMISS_MS } from '../store';
+import { toasts, focusedThreadId, preferences, TOAST_AUTO_DISMISS_MS } from '../store';
 
 vi.mock('../actions/threads', () => ({
   focusThread: vi.fn(),
@@ -11,6 +11,9 @@ vi.mock('../actions/apps', () => ({
   openAppById: vi.fn(),
   refreshAppUI: vi.fn(),
   captureAppUI: vi.fn(),
+  // A `thread` navigate leaves fullscreen before it focuses, so the app the
+  // reader is inside cannot hide the conversation the tap lands in.
+  exitAppFullscreen: vi.fn(() => false),
 }));
 const markReadOptimistic = vi.fn();
 vi.mock('../actions/notifications', () => ({
@@ -34,7 +37,7 @@ vi.mock('../actions/devices', () => ({ getDeviceId: () => 'dev-test' }));
 import type { Tap } from '@lucidos/sdk';
 import { handleGlobalEvent } from '../actions/thread-sync';
 import { focusThreadOrBootstrap } from '../actions/threads';
-import { viewNotification } from '../actions/notifications';
+import { viewNotification, handleNotificationSSE } from '../actions/notifications';
 import {
   handleNotificationToastRequested,
   TOAST_REQUEST_STALE_AFTER_MS,
@@ -486,5 +489,127 @@ describe('notification toasts persist (no auto-dismiss)', () => {
 
     vi.advanceTimersByTime(TOAST_AUTO_DISMISS_MS * 2);
     expect(toasts.value.find(t => t.key === 'notification-modal-stick')).toBeTruthy();
+  });
+});
+
+describe('notification_toasts = false silences the pop-up', () => {
+  // The workspace-wide switch behind Settings → Notifications → In-app toasts.
+  // Off, the notification waits on the bell badge and in the panel instead of
+  // interrupting. Every other block in this file leaves the preference unloaded,
+  // which is the default-on path, so those cover the unchanged half.
+  function setToastsPreference(value: string): void {
+    preferences.value = { status: 'loaded', data: { notification_toasts: value } };
+  }
+
+  beforeEach(() => {
+    toasts.value = [];
+    focusedThreadId.value = null;
+    localStorage.removeItem('lucidos-notification-toasts');
+    isEventInViewport.mockReset().mockReturnValue(false);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(null, { status: 200 }))));
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    preferences.value = { status: 'not-loaded' };
+    localStorage.removeItem('lucidos-notification-toasts');
+  });
+
+  it('renders no toast for a Row 2 / 3 notification', () => {
+    setToastsPreference('false');
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-quiet', thread_id: 'thread-A', event_id: 'evt-1' });
+
+    expect(toasts.value).toHaveLength(0);
+    // Deferred, not dismissed: the row has to stay unread for the panel.
+    expect(markReadOptimistic).not.toHaveBeenCalled();
+  });
+
+  it('renders no overflow toast either', () => {
+    setToastsPreference('false');
+    for (let i = 1; i <= 7; i++) emitToast({ notification_id: `quiet-${i}` });
+
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('still bumps the bell badge, which is a different SSE handler', () => {
+    // The gate lives in showInAppNotificationToast, below the badge's own path.
+    // Silencing the toast must not silence the count the panel is found by.
+    setToastsPreference('false');
+    handleGlobalEvent('NotificationCreated', {
+      id: 'notif-badge',
+      title: 'Still counted',
+      message: 'on the bell',
+      thread_id: 't-source',
+      event_id: 'evt-1',
+    });
+
+    expect(handleNotificationSSE).toHaveBeenCalled();
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('still auto-marks read when the user is looking at the source event (Row 1)', () => {
+    // Row 1 is about attention, not about the toast, so the switch leaves it be.
+    setToastsPreference('false');
+    focusedThreadId.value = 'thread-A';
+    isEventInViewport.mockReturnValue(true);
+
+    emitToast({ notification_id: 'notif-seen', thread_id: 'thread-A', event_id: 'evt-2' });
+
+    expect(toasts.value).toHaveLength(0);
+    expect(markReadOptimistic).toHaveBeenCalledWith('notif-seen');
+  });
+
+  it('renders the toast again when the preference is explicitly true', () => {
+    setToastsPreference('true');
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-loud', thread_id: 'thread-A', event_id: 'evt-3' });
+
+    expect(toasts.value).toHaveLength(1);
+  });
+
+  it('holds while preferences are still loading, from the device-local mirror', () => {
+    // The SSE stream connects before the preferences GET returns, and on an
+    // iOS PWA that gap is a whole round trip. Answering "on" there pops the
+    // exact toast the user turned off, so the last known value answers instead.
+    localStorage.setItem('lucidos-notification-toasts', 'false');
+    preferences.value = { status: 'loading' };
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-cold', thread_id: 'thread-A', event_id: 'evt-4' });
+
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('holds when the preferences load failed, which never resolves on its own', () => {
+    localStorage.setItem('lucidos-notification-toasts', 'false');
+    preferences.value = { status: 'failed', error: 'unreachable' };
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-failed', thread_id: 'thread-A', event_id: 'evt-5' });
+
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('lets the served value beat a stale mirror once preferences load', () => {
+    localStorage.setItem('lucidos-notification-toasts', 'false');
+    setToastsPreference('true');
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-fresh-on', thread_id: 'thread-A', event_id: 'evt-6' });
+
+    expect(toasts.value).toHaveLength(1);
+  });
+
+  it('pops as before with no preference and no mirror, the untouched default', () => {
+    preferences.value = { status: 'loading' };
+    focusedThreadId.value = 'thread-B';
+
+    emitToast({ notification_id: 'notif-default', thread_id: 'thread-A', event_id: 'evt-7' });
+
+    expect(toasts.value).toHaveLength(1);
   });
 });

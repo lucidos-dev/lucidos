@@ -26,3 +26,20 @@ export async function saveDataFile(path: string, content: string): Promise<SaveD
   await throwIfNotOk(res);
   return res.json();
 }
+
+export interface HandshakeScriptState {
+  /** Workspace-relative, e.g. `data/scripts/auth/comfort-cloud.py`. */
+  path: string;
+  exists: boolean;
+  approved: boolean;
+}
+
+/** Which auth handshake scripts may run (GET /api/v1/handshake-scripts).
+ *  Read-only: approving one is refused to a browser and belongs to
+ *  `lucidos handshake approve` (ADR 0144). */
+export async function fetchHandshakeScripts(): Promise<HandshakeScriptState[]> {
+  const res = await fetch(`${API}/handshake-scripts`);
+  await throwIfNotOk(res);
+  const body = await res.json();
+  return body.scripts ?? [];
+}

@@ -284,6 +284,36 @@ fn command_execution_pairs_tool_use_and_result() {
 }
 
 #[test]
+fn a_missing_exit_code_reads_as_unknown_not_success() {
+    // A killed command carries no `exitCode` key at all. Reporting `0` here
+    // would tell the model the command succeeded.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    note(
+        &mut t,
+        "item/started",
+        serde_json::json!({"item": {
+            "id": "i9", "type": "commandExecution", "command": "sleep 99",
+            "commandActions": [], "cwd": "/wt", "status": "inProgress"
+        }}),
+    );
+    let evs = note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {
+            "id": "i9", "type": "commandExecution", "command": "sleep 99",
+            "commandActions": [], "cwd": "/wt", "status": "failed",
+            "aggregatedOutput": ""
+        }}),
+    );
+    assert!(matches!(
+        &evs[..],
+        [AgentEvent::ToolResult { id, output, .. }]
+            if id == "i9" && output == "exit_code: unknown"
+    ));
+}
+
+#[test]
 fn declined_command_maps_to_error_status() {
     // `declined` = the user denied the approval; the command never ran.
     let mut t = AppServerTracker::new(Some("t-1".into()));

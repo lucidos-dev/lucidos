@@ -293,7 +293,7 @@ async fn execute_script_task(
             // non-zero exit). See `crate::triggers::summary`.
             let summary = if output.trim().is_empty() {
                 crate::triggers::script_fallback_summary(&output, &config.name, 0)
-            } else if output.len() > 500 {
+            } else if output.chars().count() > 500 {
                 format!("{}...", output.chars().take(497).collect::<String>())
             } else {
                 output
@@ -417,7 +417,7 @@ async fn execute_llm_task(
         }
     };
 
-    let event_summary = if result.response.len() > 500 {
+    let event_summary = if result.response.chars().count() > 500 {
         format!(
             "{}...",
             result.response.chars().take(497).collect::<String>()

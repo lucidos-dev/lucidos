@@ -9,7 +9,7 @@ import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attenti
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
-import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt } from './thread-loading';
+import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt, threadEventsStillArriving } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
@@ -103,19 +103,25 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // `revealPane: false` opts out for a bookkeeping focus change (see the option).
   if (options?.revealPane !== false) revealThreadPane();
 
-  // A deep-link whose target never renders (the event isn't in this thread, it
-  // renders nothing, or the thread was still loading when the resolve deadline
-  // closed) used to end in silence, so the notification tap just looked broken.
-  // scrollState calls back here for the words: it stays free of the `store`
-  // import that `showToast` would drag in.
+  // A deep-link whose target never renders used to end in silence, so the tap
+  // just looked broken. Either the event is not in this thread, or it renders
+  // nothing. scrollState calls back here for the words, staying free of the
+  // `store` import that `showToast` would drag in.
   //
   // The message deliberately does NOT claim where the user was taken, because
   // they are not taken anywhere: the transcript stays exactly where it was, and
   // the toast is the whole recovery. It does not name the SOURCE either: a notification tap is no longer the only way in, since the event-wait
   // card's "show it" (`showEventWhereItLives`) lands here too, and telling that
   // user about a notification they never received would be a plain lie.
+  //
+  // A THIRD case is not a failure and no longer reports: this thread's events
+  // were still arriving. The message is a VERDICT about what the thread holds.
+  // The calls above started that load, so the deadline used to race a fetch
+  // this function had just issued. See `DeepLinkOptions.stillArriving`.
+  const stillArriving = () => threadEventsStillArriving(threadId);
   if (targetEventId) {
     scrollToEventAndPulse(targetEventId, {
+      stillArriving,
       onUnresolved: () => showToast(
         'That event is not shown in this thread.',
         'warning',
@@ -123,6 +129,7 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
     });
   } else if (targetChangeId) {
     scrollToChangeAndPulse(targetChangeId, {
+      stillArriving,
       onUnresolved: () => showToast(
         'That change is not shown in this thread.',
         'warning',

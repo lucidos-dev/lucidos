@@ -252,7 +252,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
                 body.insert(
                     "cron_expressions".into(),
                     serde_json::from_str::<serde_json::Value>(&v)
-                        .map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?,
+                        .map_err(|e| format!("--cron-expressions must be valid JSON: {}", e))?,
                 );
             }
             if let Some(v) = on {
@@ -275,7 +275,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
                 body.insert(
                     "side_effect_grant".into(),
                     serde_json::from_str::<serde_json::Value>(&v)
-                        .map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?,
+                        .map_err(|e| format!("--side-effect-grant must be valid JSON: {}", e))?,
                 );
             }
             if let Some(v) = slug {
@@ -328,7 +328,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
                 body.insert(
                     "cron_expressions".into(),
                     serde_json::from_str::<serde_json::Value>(&v)
-                        .map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?,
+                        .map_err(|e| format!("--cron-expressions must be valid JSON: {}", e))?,
                 );
             }
             if let Some(v) = on {
@@ -354,7 +354,7 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
                 body.insert(
                     "side_effect_grant".into(),
                     serde_json::from_str::<serde_json::Value>(&v)
-                        .map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?,
+                        .map_err(|e| format!("--side-effect-grant must be valid JSON: {}", e))?,
                 );
             }
             if let Some(v) = slug {
@@ -972,9 +972,12 @@ pub enum WebhooksCmd {
         /// The domain event every delivery emits, PascalCase past tense (e.g. 'DeployFinished'). Pinned: a caller cannot change it.
         #[arg(long)]
         event_type: String,
-        /// Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here.
+        /// Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here. Pass `--signing-secret` alongside to save that credential in the same call.
         #[arg(long)]
         hmac: Option<String>,
+        /// Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{"mode":"generate"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{"mode":"provided","value":"..."}` stores a secret the sender issued, which is the only option for Slack and Stripe. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.
+        #[arg(long)]
+        signing_secret: Option<String>,
         /// Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.
         #[arg(long)]
         dedupe: Option<String>,
@@ -996,6 +999,12 @@ pub enum WebhooksCmd {
         /// false stops the endpoint accepting deliveries, without deleting it.
         #[arg(long)]
         enabled: Option<bool>,
+        /// Change what this hook verifies with, keeping its delivery URL. Same object `create` takes. Pass `null` to stop signing, which mints a bearer token and prints it ONCE, since a hook always carries exactly one verifier. Setting a signature drops any token for the same reason: a sender that signs attaches no bearer token, so a hook holding both would refuse every real delivery.
+        #[arg(long)]
+        hmac: Option<String>,
+        /// Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{"mode":"generate"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{"mode":"provided","value":"..."}` stores a secret the sender issued, which is the only option for Slack and Stripe. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.
+        #[arg(long)]
+        signing_secret: Option<String>,
         /// Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.
         #[arg(long)]
         dedupe: Option<String>,
@@ -1023,6 +1032,7 @@ pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxErro
             name,
             event_type,
             hmac,
+            signing_secret,
             dedupe,
             headers,
         } => {
@@ -1035,6 +1045,13 @@ pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxErro
                     "hmac".into(),
                     serde_json::from_str::<serde_json::Value>(&v)
                         .map_err(|e| format!("--hmac must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = signing_secret {
+                body.insert(
+                    "signing_secret".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--signing-secret must be valid JSON: {}", e))?,
                 );
             }
             if let Some(v) = dedupe {
@@ -1059,6 +1076,8 @@ pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxErro
             name,
             event_type,
             enabled,
+            hmac,
+            signing_secret,
             dedupe,
             headers,
         } => {
@@ -1072,6 +1091,20 @@ pub fn dispatch_webhooks(ws: &Workspace, cmd: WebhooksCmd) -> Result<(), BoxErro
             }
             if let Some(v) = enabled {
                 body.insert("enabled".into(), serde_json::json!(v));
+            }
+            if let Some(v) = hmac {
+                body.insert(
+                    "hmac".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--hmac must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = signing_secret {
+                body.insert(
+                    "signing_secret".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--signing-secret must be valid JSON: {}", e))?,
+                );
             }
             if let Some(v) = dedupe {
                 body.insert(

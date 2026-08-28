@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setTheme, setFontFamily, setChatModelSelection, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentBackgroundReasoning, saveModelSelection, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -1361,7 +1361,11 @@ export function SettingsView() {
    *  per device, and the switch someone reaches for is the one governing the
    *  device in their hand, which is behaviour of this client rather than a fact
    *  about the fleet; Devices stays the place to see and manage the others.
-   *  Both rows call `setDevicePushEnabled`, so they cannot disagree. */
+   *  Both rows call `setDevicePushEnabled`, so they cannot disagree.
+   *
+   *  In-app toasts is one workspace-wide preference. It sits OUTSIDE the
+   *  device-list branch. A failed device list says nothing about it, and
+   *  hiding the row there would take the switch away. */
   function notificationsSection() {
     const currentId = getDeviceId();
     const current = loadable.status === 'loaded'
@@ -1423,6 +1427,30 @@ export function SettingsView() {
             )}
           </>
         )}
+        <div class="settings-row" data-search-anchor="appearance:in-app-toasts">
+          <span class="settings-row-label">
+            In-app toasts
+            <Explainer title="In-app toasts">
+              <p>
+                The pop-up that appears over Lucidos when a notification arrives
+                while you are using it.
+              </p>
+              <p>
+                Turn it off and the notification goes straight to the bell and the
+                Notifications panel, so you find it when you are ready. No push
+                arrives instead: a device you are already using never gets one.
+              </p>
+              <p>
+                Unlike the switch above, this one covers every device.
+              </p>
+            </Explainer>
+          </span>
+          <LoadableToggle
+            loaded={preferences.value.status === 'loaded'}
+            checked={currentNotificationToasts()}
+            onChange={(c) => void setNotificationToasts(c)}
+          />
+        </div>
       </div>
     );
   }

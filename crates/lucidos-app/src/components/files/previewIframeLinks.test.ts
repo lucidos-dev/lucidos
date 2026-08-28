@@ -140,6 +140,25 @@ describe('classifyPreviewLink', () => {
     expect(classifyPreviewLink('app:habit-tracker', ctx())).toEqual({
       kind: 'app',
       appId: 'habit-tracker',
+      fragment: undefined,
+    });
+  });
+
+  it('carries an app fragment through to the action', () => {
+    // A published report citing one item inside a shared app. Without the
+    // fragment the citation opens the app on whatever the reader saw last.
+    expect(classifyPreviewLink('app:pr-understanding#pr-1645', ctx())).toEqual({
+      kind: 'app',
+      appId: 'pr-understanding',
+      fragment: 'pr-1645',
+    });
+  });
+
+  it('keeps an in-page anchor an in-page anchor, not an app fragment', () => {
+    // `#x` names a place in THIS document. The app arm must never see it.
+    expect(classifyPreviewLink('#pr-1645', ctx())).toEqual({
+      kind: 'fragment',
+      id: 'pr-1645',
     });
   });
 

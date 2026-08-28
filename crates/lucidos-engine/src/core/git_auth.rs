@@ -84,7 +84,8 @@ impl StoredGitCredential {
     ///
     /// `bearer` and `api_key` hold a bare token. `basic` holds the
     /// `username:password` pair its own form asks for. `password` holds that
-    /// pair as JSON. The rest carry no secret a git remote could use.
+    /// pair as JSON. The rest carry no secret a git remote could use, `secret`
+    /// included: it is signed with rather than sent.
     ///
     /// The stored value is presented byte for byte, because a password may
     /// legitimately start or end with a space. Trimming decides emptiness and
@@ -103,7 +104,10 @@ impl StoredGitCredential {
                 let password = parsed["password"].as_str()?.to_string();
                 (Some(username), password)
             }
-            AuthType::OauthClient | AuthType::EmailPassword | AuthType::Unknown => return None,
+            AuthType::OauthClient
+            | AuthType::EmailPassword
+            | AuthType::Secret
+            | AuthType::Unknown => return None,
         };
         (!secret.trim().is_empty()).then(|| Self {
             service_name: credential.service_name,

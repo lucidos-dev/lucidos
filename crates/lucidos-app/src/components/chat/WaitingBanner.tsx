@@ -3,6 +3,8 @@ import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadI
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
+import { useTouchActivated } from '../../hooks/useTouchActivated';
+import { blurPromptInputIfFocused } from './promptFocus';
 
 /** The close-set kinds the banner renders. Two other kinds come from the same
  *  selector and live elsewhere, so both are excluded. Discard-draft is a
@@ -214,22 +216,43 @@ function ChangeActionSplitButton({
   );
 }
 
-/** Shared Diff-button JSX. Rendered in two places: inside the banner via
+/** The Diff button. Rendered in two places: inside the banner via
  *  `getBannerSlots`, and as a standalone slot via `getStandaloneCcDiffButton`.
  *  Both call sites only render it when the branch has a diff to show, so the
- *  button is always clickable — no disabled form. Same key in both so Preact
- *  treats it as one node across banner ↔ standalone transitions. */
-function renderDiffButton(threadId: string): ComponentChildren {
+ *  button is always clickable, with no disabled form. Same key in both so Preact
+ *  treats it as one node across banner and standalone transitions.
+ *
+ *  TOUCH ACTIVATED, like the composer's Send and its answer Submit beside it.
+ *  This button sits in the prompt row, so the user reaches it with the mobile
+ *  keyboard up, and there WebKit drops the synthetic click. It was reported dead
+ *  in exactly that state. Diff is non-destructive and idempotent, so it takes
+ *  the touch path with none of the reasons Stop and Cancel decline it.
+ *
+ *  A component rather than a function returning JSX, because it holds a hook and
+ *  `getBannerSlots` is called conditionally from `PromptInput`'s render.
+ *
+ *  The action blurs the composer itself. `touchActivated` suppresses the click,
+ *  and `installActionBtnBlurListener` listens on `click`, so the shared keyboard
+ *  drop never runs for a touch-activated face. */
+export function DiffButton({ threadId }: { threadId: string }) {
+  const activate = useTouchActivated(() => {
+    blurPromptInputIfFocused();
+    void viewThreadCcDiff(threadId);
+  });
   return (
     <button
-      key="diff"
       class="action-btn"
       data-row-item
-      onClick={() => void viewThreadCcDiff(threadId)}
+      onTouchEnd={activate.onTouchEnd}
+      onClick={activate.onClick}
     >
       Diff
     </button>
   );
+}
+
+function renderDiffButton(threadId: string): ComponentChildren {
+  return <DiffButton key="diff" threadId={threadId} />;
 }
 
 /** Diff button decoupled from waitingState: appears whenever the focused

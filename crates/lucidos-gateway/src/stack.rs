@@ -104,6 +104,31 @@ pub struct StackRuntime {
     /// when the engine isn't healthy / hasn't been polled yet — a stopped
     /// workspace contributes no badge. Refreshed by the supervise loop.
     pub last_unread: Option<u64>,
+    /// What this engine last said about its backups (the picker's per-row backup
+    /// line). `None` when unknown, on exactly the terms `last_unread` is: no
+    /// healthy engine to ask, or a poll that did not answer. Refreshed by the
+    /// supervise loop.
+    pub last_successful_backup: Option<LastSuccessfulBackup>,
+}
+
+/// What one workspace's engine reports about its backups, from
+/// `GET /api/v1/backup/last-successful`. Forwarded to the picker verbatim as
+/// part of [`WorkspaceStatus`].
+///
+/// The gateway holds no database handle (ADR 0014 §1), so this HTTP read is the
+/// only way it can know any of it. It re-serializes rather than re-deciding:
+/// staleness is the engine's call, made against the one threshold in
+/// `core::backup::BACKUP_STALE_AFTER_SECONDS`.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LastSuccessfulBackup {
+    /// When the newest successful backup run finished, or `None` when this
+    /// workspace has never produced one.
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The engine's verdict that `at` is too old (or absent).
+    pub stale: bool,
+    /// Whether backups are set up at all. It is what separates "the schedule has
+    /// never produced an archive" from "nobody set backups up here".
+    pub configured: bool,
 }
 
 /// Serializable status view for the control API / picker.
@@ -123,6 +148,11 @@ pub struct WorkspaceStatus {
     /// count, so the picker shows no badge rather than a misleading zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unread_count: Option<u64>,
+    /// This workspace's backup line. Omitted when unknown, for the same reason
+    /// the count is: with no healthy engine to ask, the picker must say nothing
+    /// rather than report a workspace as never backed up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_successful_backup: Option<LastSuccessfulBackup>,
 }
 
 impl StackRuntime {
@@ -135,6 +165,7 @@ impl StackRuntime {
             autostart: self.ws.autostart,
             last_error: self.last_error.clone(),
             unread_count: self.last_unread,
+            last_successful_backup: self.last_successful_backup,
         }
     }
 }
@@ -161,6 +192,18 @@ fn engine_env_overrides(
         // gateway to restart this one stack in place (dev Apply path).
         ("LUCIDOS_WORKSPACE_ID", ws.id.clone().into()),
         ("LUCIDOS_GATEWAY_PORT", gateway_port.to_string().into()),
+        // The port a webhook delivery arrives on, resolved once here so the
+        // engine never re-derives it. The engine has no dependency on this
+        // crate, so a second derivation would be a second source of truth: it
+        // would still say 5261 the day the offset changes. "0" states there is
+        // no hook socket, which the ingress probe reads as nothing to probe.
+        (
+            "LUCIDOS_HOOK_PORT",
+            crate::hook_socket::resolved_hook_port(gateway_port)
+                .unwrap_or(0)
+                .to_string()
+                .into(),
+        ),
     ]
 }
 
@@ -603,6 +646,54 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
     json.get("unread_count")?.as_u64()
 }
 
+/// Fetch a running engine's backup line, for the picker's per-row note.
+/// Best-effort on the same terms as [`fetch_unread_count`], and for the same
+/// reason: the gateway holds no database handle (ADR 0014 §1), so a stopped
+/// workspace has no backup fact and its row says nothing.
+///
+/// Every failure returns `None`, including a malformed `at`. A row that says
+/// nothing is honest; a row that reports a nightly-backed-up workspace as never
+/// backed up is not. Older engines have no such route, so a 404 lands here too
+/// and leaves those rows quiet. Deliberately no `provider` parameter and no
+/// cloud call, so this is cheap enough for the 2s supervise pass.
+pub async fn fetch_last_successful_backup(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+) -> Option<LastSuccessfulBackup> {
+    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/backup/last-successful");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+    parse_last_successful_backup(&body)
+}
+
+/// Read the backup line out of an engine's answer. Split from the request so the
+/// tolerated shapes are testable without a socket.
+///
+/// `at` is parsed rather than forwarded as text, so an unreadable timestamp
+/// becomes "unknown" here instead of an `Invalid Date` in the picker. A missing
+/// or null `at` is a real answer (never backed up), so only a present-but-
+/// unparseable one discards the whole reading.
+fn parse_last_successful_backup(body: &str) -> Option<LastSuccessfulBackup> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let at = match json.get("at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => Some(
+            chrono::DateTime::parse_from_rfc3339(v.as_str()?)
+                .ok()?
+                .with_timezone(&chrono::Utc),
+        ),
+    };
+    Some(LastSuccessfulBackup {
+        at,
+        stale: json.get("stale")?.as_bool()?,
+        configured: json.get("configured")?.as_bool()?,
+    })
+}
+
 /// Header the engine reads the originating device off. Mirrors
 /// `api::actor::HEADER_DEVICE_ID` in `lucidos-engine`, which the gateway cannot
 /// depend on. Rename one and the other must follow in lockstep, the same rule
@@ -898,6 +989,7 @@ mod tests {
             last_spawn: None,
             last_error: None,
             last_unread: None,
+            last_successful_backup: None,
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["autostart"], serde_json::json!(true));
@@ -1050,9 +1142,118 @@ mod tests {
             last_spawn: None,
             last_error: None,
             last_unread: Some(4),
+            last_successful_backup: None,
         };
         let json = serde_json::to_value(stack.status()).unwrap();
         assert_eq!(json["unread_count"], serde_json::json!(4));
+        // Unknown backup line → key omitted, so a row with no answer draws no
+        // note rather than reporting the workspace as never backed up.
+        assert!(json.get("last_successful_backup").is_none());
+    }
+
+    // ── The picker's backup line ─────────────────────────────────────────────
+    //
+    // See `docs/plans/2026-08-27-picker-last-successful-backup.md`.
+
+    fn healthy_stack(backup: Option<LastSuccessfulBackup>) -> StackRuntime {
+        StackRuntime {
+            ws: Workspace {
+                id: "dev".into(),
+                name: "Dev".into(),
+                dir: "/ws/dev".into(),
+                port: 5173,
+                database_url: None,
+                autostart: false,
+            },
+            resolved_dir: PathBuf::from("/ws/dev"),
+            pg: PgHandle::External,
+            engine: None,
+            keeper: EngineKeeper::Gateway,
+            health: Health::Healthy,
+            restart_attempts: 0,
+            health_misses: 0,
+            last_spawn: None,
+            last_error: None,
+            last_unread: None,
+            last_successful_backup: backup,
+        }
+    }
+
+    /// A polled backup line reaches the picker whole, timestamp included.
+    #[test]
+    fn workspace_status_serializes_the_backup_line_when_known() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-26T02:00:07Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stack = healthy_stack(Some(LastSuccessfulBackup {
+            at: Some(at),
+            stale: false,
+            configured: true,
+        }));
+        let json = serde_json::to_value(stack.status()).unwrap();
+        let line = &json["last_successful_backup"];
+        assert_eq!(line["stale"], serde_json::json!(false));
+        assert_eq!(line["configured"], serde_json::json!(true));
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(line["at"].as_str().unwrap())
+                .unwrap()
+                .timestamp(),
+            at.timestamp(),
+        );
+    }
+
+    /// Never backed up is a real ANSWER, not a missing one, so the line is
+    /// present with a null `at`. The picker states it in words; the omitted-key
+    /// case above is the one that means "we could not ask".
+    #[test]
+    fn a_workspace_that_never_backed_up_still_reports_a_line() {
+        let stack = healthy_stack(Some(LastSuccessfulBackup {
+            at: None,
+            stale: true,
+            configured: false,
+        }));
+        let json = serde_json::to_value(stack.status()).unwrap();
+        let line = &json["last_successful_backup"];
+        assert_eq!(line["at"], serde_json::Value::Null);
+        assert_eq!(line["stale"], serde_json::json!(true));
+        assert_eq!(line["configured"], serde_json::json!(false));
+    }
+
+    /// The engine's answer, read the way the poll reads it.
+    #[test]
+    fn a_backup_answer_parses_with_and_without_a_timestamp() {
+        let dated = parse_last_successful_backup(
+            r#"{"at":"2026-08-26T02:00:07Z","stale":false,"configured":true}"#,
+        )
+        .expect("a dated answer");
+        assert_eq!(dated.at.unwrap().to_rfc3339(), "2026-08-26T02:00:07+00:00");
+        assert!(!dated.stale);
+        assert!(dated.configured);
+
+        let never = parse_last_successful_backup(r#"{"at":null,"stale":true,"configured":true}"#)
+            .expect("never backed up is an answer");
+        assert!(never.at.is_none());
+        assert!(never.stale);
+    }
+
+    /// Anything the gateway cannot read whole is UNKNOWN, so the row stays
+    /// quiet. A garbled timestamp is the sharp case: forwarded as text it would
+    /// reach the picker as an `Invalid Date`, and a missing `stale` would have
+    /// the row guess. An older engine 404s instead, which never gets this far.
+    #[test]
+    fn an_unreadable_backup_answer_is_no_answer() {
+        for body in [
+            "not json",
+            r#"{"at":"yesterday","stale":false,"configured":true}"#,
+            r#"{"at":null,"configured":true}"#,
+            r#"{"at":null,"stale":true}"#,
+            r#"{"at":null,"stale":"no","configured":true}"#,
+        ] {
+            assert!(
+                parse_last_successful_backup(body).is_none(),
+                "expected no answer from {body}",
+            );
+        }
     }
 
     // ── Finding an engine somebody else started ──────────────────────────────
@@ -1133,8 +1334,39 @@ mod tests {
                 "LUCIDOS_API_PORT",
                 "LUCIDOS_WORKSPACE_ID",
                 "LUCIDOS_GATEWAY_PORT",
+                "LUCIDOS_HOOK_PORT",
             ],
             "the workspace-specific set changed: add the new variable here deliberately"
+        );
+    }
+
+    /// The engine probes its own public ingress, so it must be told the port a
+    /// delivery actually lands on. Deriving it a second time in the engine would
+    /// keep answering 5261 the day `HOOK_PORT_OFFSET` moves.
+    #[test]
+    fn a_spawned_engine_is_told_the_port_its_deliveries_arrive_on() {
+        let ws = Workspace {
+            id: "dev".into(),
+            name: "Dev".into(),
+            dir: "/ws/dev".into(),
+            port: 5173,
+            database_url: None,
+            autostart: false,
+        };
+        let overrides =
+            engine_env_overrides(&ws, Path::new("/ws/dev"), "postgres://local/dev", 5251);
+        let handed = overrides
+            .iter()
+            .find(|(k, _)| *k == "LUCIDOS_HOOK_PORT")
+            .map(|(_, v)| v.to_string_lossy().to_string())
+            .expect("the engine is handed a hook port");
+
+        assert_eq!(
+            handed,
+            crate::hook_socket::resolved_hook_port(5251)
+                .unwrap_or(0)
+                .to_string(),
+            "the engine must be handed the port this gateway itself resolved"
         );
     }
 

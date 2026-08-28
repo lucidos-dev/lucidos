@@ -122,6 +122,11 @@ if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
     trap stop_e2e_background_guards EXIT
 fi
 
+# Every invocation of a project appends its output here, so the project can be
+# added up into one verdict (report_playwright_totals). Truncated per project,
+# removed on the way out.
+PW_TALLY_LOG="$(mktemp -t lucidos-pw-tally)"
+
 # Every exit path funnels through here so the sampler is drained and the run is
 # classified exactly once, whichever branch below ran.
 finish() {
@@ -130,11 +135,30 @@ finish() {
     report_host_load_saturation "$rc"
     report_memory_stop
     report_webkit_excluded "$SKIP_WEBKIT"
+    rm -f "$PW_TALLY_LOG"
     exit "$rc"
 }
 
+# Run one Playwright invocation: straight to the terminal as before, and into
+# the project's tally. `tee` puts Playwright in a pipeline, so PIPESTATUS is
+# what carries ITS exit code. Reading `$?` there would read tee's, which is the
+# false-green the repo's own "never pipe a test command" rule warns about.
+run_playwright() {
+    local rc=0
+    set +e
+    "$@" 2>&1 | tee -a "$PW_TALLY_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
+    return "$rc"
+}
+
 CMD=(npx playwright test)
-[ -n "$TEST_FILE" ] && CMD+=("$TEST_FILE")
+# Anchor -f, for the reason the chunk loop anchors its own filenames: Playwright
+# reads a positional as an unanchored regex over the test file path rather than
+# as a filename. A bare basename drags in every sibling whose path contains it,
+# so `-f chat.spec.ts` also ran app-coding-agent-spawn-from-chat.spec.ts. See
+# playwright_file_filter in scripts/lib/e2e.sh.
+[ -n "$TEST_FILE" ] && CMD+=("$(playwright_file_filter "$TEST_FILE")")
 [ ${#PW_ARGS[@]} -gt 0 ] && CMD+=("${PW_ARGS[@]}")
 
 # Detect whether the caller already pinned a project (via --webkit or `-- --project=`).
@@ -181,26 +205,14 @@ set_output_dir() {
     [ -n "$USER_PINNED_OUTPUT" ] || OUTPUT_ARG=(--output="$PW_OUTPUT_ROOT/$1")
 }
 
-# ── Host memory ceiling between mobile-webkit chunks ──────────────────
-# Chunking resets WebContent accumulation. The cost it leaves behind lands in the
-# macOS VM compressor, which nothing else in this harness reads. On a cold host
-# mobile-webkit drove the compressor from 12 GB to 17 GB in ten minutes, with
-# unused memory down to 78 MB. The WebKit reaper fired zero times through that
-# climb. Many short-lived WebContent processes carry the cost between them, so no
-# single RSS approaches the reaper's per-process cap.
+# ── Host memory between mobile-webkit chunks ──────────────────────────
+# The stop condition, the thresholds and the readers all live in
+# scripts/lib/host_memory_guard.sh, sourced by lib/e2e.sh: HOST_MEMORY_STOP_EXIT,
+# MEMORY_STOPPED, check_host_memory_at_boundary, report_host_memory_start and
+# report_memory_stop. That file carries the rationale, including why the old fixed
+# compressor ceiling was the wrong instrument.
 #
-# `kern.memorystatus_vm_pressure_level` is no use as a stop condition either. It
-# stayed at "normal" for the whole climb. The compressor is the one number that
-# moves in time to act on.
-#
-# The ceiling defaults to 12 GB. LUCIDOS_E2E_COMPRESSOR_MAX_GB overrides it, the
-# same shape as LUCIDOS_E2E_WEBKIT_CHUNK.
-#
-# A memory stop must never read as a red project, so it carries its own exit
-# code. 71 is sysexits' EX_OSERR: an OS resource condition, not a test verdict.
-# It sits beside the host-load guard's 75 (EX_TEMPFAIL). Playwright exits 0, 1 or
-# 130, so 71 can never collide with a Playwright code.
-HOST_MEMORY_STOP_EXIT=71
+# What stays here is exit-code aggregation, which is this script's own job.
 
 # Fold one phase or chunk exit code into an aggregate, and echo the winner. A
 # memory stop is the WEAKEST non-zero code: it says the run was cut short, never
@@ -219,83 +231,6 @@ merge_rc() {
     else
         echo "$incoming"
     fi
-}
-
-# Set to the project name at the boundary that tripped the ceiling. The phase
-# split and the project loop both read it. Neither starts more work on a host we
-# have already refused to load further.
-MEMORY_STOPPED=""
-MEMORY_STOP_DETAIL=""
-
-# Compressor size in GB, from vm_stat. The page size comes from vm_stat's own
-# header rather than a constant, because it is 16 KB on Apple silicon and 4 KB on
-# Intel. Echoes nothing when it cannot read; the caller then fails open, the same
-# posture as the host-load guard and the reaper. A guard that cannot measure must
-# never stop the suite.
-read_compressor_gb() {
-    vm_stat 2>/dev/null | awk '
-        /page size of/ { for (i = 1; i < NF; i++) if ($i == "of") page = $(i + 1) + 0 }
-        /^Pages occupied by compressor:/ { pages = $NF + 0 }
-        END { if (page > 0 && pages > 0) printf "%.2f", pages * page / 1073741824 }
-    '
-}
-
-# Report the compressor at one chunk boundary. Returns non-zero when it is over
-# the ceiling, and records the reason for the final verdict. Every boundary
-# prints a line, so an unattended run leaves the whole curve in its log instead
-# of only the point where it stopped.
-check_compressor_at_boundary() {
-    local where="$1"
-    local max="${LUCIDOS_E2E_COMPRESSOR_MAX_GB:-12}"
-    # An override that is not a positive number falls back to the default. A
-    # garbage ceiling would otherwise stop the suite at the first boundary.
-    awk -v m="$max" 'BEGIN { exit (m + 0 > 0) ? 0 : 1 }' || max=12
-
-    local gb over
-    gb="$(read_compressor_gb)"
-    if [ -z "$gb" ]; then
-        echo "[e2e-mem] after $where: compressor unreadable, ceiling check skipped"
-        return 0
-    fi
-    echo "[e2e-mem] after $where: compressor $gb GB"
-
-    over="$(awk -v g="$gb" -v m="$max" 'BEGIN { print (g > m) ? 1 : 0 }')"
-    [ "$over" = 1 ] || return 0
-
-    MEMORY_STOP_DETAIL="At $where the compressor was $gb GB, over the $max GB ceiling."
-    echo ""
-    echo "[e2e-mem] STOP: compressor $gb GB is over the $max GB ceiling."
-    echo "[e2e-mem] Stopping here rather than pushing the host further."
-    return 1
-}
-
-# Print the compressor without judging it, once, before any browser work.
-# mobile-webkit needs roughly 15 GB to finish, so what the phase STARTED from
-# decides how far it gets, and nothing else in the log records that number.
-report_compressor_start() {
-    local gb
-    gb="$(read_compressor_gb)"
-    if [ -z "$gb" ]; then
-        echo "[e2e-mem] browser phase start: compressor unreadable"
-    else
-        echo "[e2e-mem] browser phase start: compressor $gb GB"
-    fi
-}
-
-# Final verdict for a run the ceiling cut short. finish calls it, so every exit
-# path says this once, last, where an unattended reader looks.
-report_memory_stop() {
-    [ -n "$MEMORY_STOPPED" ] || return 0
-    echo ""
-    echo "[e2e-mem] STOPPED ON HOST MEMORY during $MEMORY_STOPPED."
-    echo "[e2e-mem] $MEMORY_STOP_DETAIL"
-    echo "[e2e-mem] Coverage is incomplete: work after that point did not run."
-    echo "[e2e-mem] Exit $HOST_MEMORY_STOP_EXIT marks a memory stop, never a failing test."
-    echo "[e2e-mem] Compare this against the browser phase start line above."
-    echo "[e2e-mem] A smaller LUCIDOS_E2E_WEBKIT_CHUNK cannot buy headroom that"
-    echo "[e2e-mem] was never there. mobile-webkit needs a cold host: rerun it"
-    echo "[e2e-mem] alone with ./scripts/e2e-browser.sh --webkit."
-    echo "[e2e-mem] LUCIDOS_E2E_COMPRESSOR_MAX_GB raises the ceiling if you must."
 }
 
 # Run a browser project. For mobile-webkit, split the run into two ordered
@@ -327,7 +262,7 @@ report_memory_stop() {
 # this project. The nightly died here twice, before the wasm and embedder
 # projects ever started. More boundaries is the only lever this loop has on that
 # curve. Each boundary BETWEEN chunks also checks the compressor (see
-# check_compressor_at_boundary) and stops the loop when the host is over the
+# check_host_memory_at_boundary) and stops the loop when the host is over the
 # ceiling. The boundary after the last chunk is the caller's: only it knows
 # whether another phase or another project follows, and a stop with nothing
 # left to stop would report a finished run as a cut-short one.
@@ -343,10 +278,18 @@ run_specs_chunked() {
         chunk_no=$(( chunk_no + 1 ))
         local chunk=("${specs[@]:start:size}")
         echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
+        # Anchor each filename, because Playwright reads a positional argument as
+        # an unanchored regex over the file path. A bare basename therefore drags
+        # in every sibling containing it, across the nav/CC phase boundary
+        # included. See playwright_file_filter in scripts/lib/e2e.sh.
+        local filters=() spec
+        for spec in "${chunk[@]}"; do
+            filters+=("$(playwright_file_filter "$spec")")
+        done
         # Own output dir per chunk (see set_output_dir) — otherwise each chunk
         # would erase the previous chunk's failure traces/screenshots.
         set_output_dir "$project-$label-$chunk_no"
-        "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${chunk[@]}" || rc=$?
+        run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" "${filters[@]}" || rc=$?
         start=$(( start + size ))
         # BETWEEN chunks only. The boundary after the LAST one belongs to the
         # caller, which is the only code that knows whether another phase or
@@ -354,7 +297,7 @@ run_specs_chunked() {
         # mobile-webkit running last, an unconditional check here would report a
         # run that finished everything as a run that was cut short.
         [ "$start" -lt "$total" ] || break
-        if ! check_compressor_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
+        if ! check_host_memory_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
             MEMORY_STOPPED="$project"
             # MEMORY_STOPPED carries the stop on its own, so merge_rc can keep a
             # failing chunk's code and neither signal hides the other.
@@ -365,7 +308,23 @@ run_specs_chunked() {
     return "$rc"
 }
 
+# One verdict per project, however many invocations it took to get there.
+# `_run_browser_project_body` does the running; this wraps it so the tally is
+# reported on EVERY exit path out of it, the memory-stop early return included.
 run_browser_project() {
+    local project="$1"
+    local rc=0 tally_rc=0
+    : > "$PW_TALLY_LOG"
+    _run_browser_project_body "$project" || rc=$?
+    # merge_rc, so a tally that does not add up can only ADD a failure. It is a
+    # harness verdict: it says the project was not measured, which must not read
+    # green, and must not overwrite a real test failure either.
+    report_playwright_totals "$project" "$PW_TALLY_LOG" || tally_rc=$?
+    rc="$(merge_rc "$rc" "$tally_rc")"
+    return "$rc"
+}
+
+_run_browser_project_body() {
     local project="$1"
     local rc=0
     local f base
@@ -402,7 +361,7 @@ run_browser_project() {
             # The nav/CC boundary, which the chunk loop deliberately leaves to
             # its caller. Phase 2 is what follows, so there is real work to stop.
             if [ -z "$MEMORY_STOPPED" ] \
-                && ! check_compressor_at_boundary "$project phase 1/2 (nav)"; then
+                && ! check_host_memory_at_boundary "$project phase 1/2 (nav)"; then
                 MEMORY_STOPPED="$project"
                 nav_rc="$(merge_rc "$nav_rc" "$HOST_MEMORY_STOP_EXIT")"
             fi
@@ -424,7 +383,7 @@ run_browser_project() {
     # Own output dir per project (see set_output_dir) — otherwise the NEXT
     # project's invocation would wipe this one's, chunk dirs included.
     set_output_dir "$project"
-    "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
+    run_playwright "${CMD[@]}" --project="$project" "${OUTPUT_ARG[@]}" || rc=$?
     return "$rc"
 }
 
@@ -439,7 +398,7 @@ if [ -n "$USE_WEBKIT" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; th
     # run whose STARTING compressor matters most: it decides how far the project
     # gets, and no other line records it.
     echo ""
-    report_compressor_start
+    report_host_memory_start
     webkit_rc=0
     run_browser_project mobile-webkit || webkit_rc=$?
     finish "$webkit_rc"
@@ -480,7 +439,7 @@ else
     PROJECT_RCS=()
     overall_rc=0
     echo ""
-    report_compressor_start
+    report_host_memory_start
     for i in "${!PROJECTS[@]}"; do
         project="${PROJECTS[$i]}"
         if [ -n "$MEMORY_STOPPED" ]; then
@@ -517,7 +476,7 @@ else
         # follows: a stop needs something left to stop. This project's own rc
         # stays untouched either way, because it finished.
         if [ -z "$MEMORY_STOPPED" ] && [ "$i" -lt "$(( ${#PROJECTS[@]} - 1 ))" ] \
-            && ! check_compressor_at_boundary "the boundary after project $project"; then
+            && ! check_host_memory_at_boundary "the boundary after project $project"; then
             MEMORY_STOPPED="$project"
             overall_rc="$(merge_rc "$overall_rc" "$HOST_MEMORY_STOP_EXIT")"
         fi

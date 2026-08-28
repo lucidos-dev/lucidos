@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewEditing, showToast } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -9,7 +9,9 @@ import { SlidesPreview } from './SlidesPreview';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
-import { ApiError, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
+import { ApiError, fetchHandshakeScripts, fetchKnowhowEntries, knowhowPreviewPath, saveDataFile, type KnowhowEntry } from '../../api/client';
+import { handshakeWarningFor, type HandshakeScriptState } from './handshakeApproval';
+import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { openFilePreview, refreshFilePreview } from '../../store/actions/artifacts';
 import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
 import { errorDetail } from '../../utils/errorDetail';
@@ -70,6 +72,7 @@ export function FilePreviewInline({ path, layout }: Props) {
   return (
     <div class="file-preview-inline">
       <div class="file-preview-content">
+        <HandshakeApprovalNotice path={path} />
         {editing && <FileEditor path={path} url={url} />}
         {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <PreviewImage src={url} alt={path} />}
         {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
@@ -87,6 +90,41 @@ export function FilePreviewInline({ path, layout }: Props) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Warn when the open file is an auth handshake script the engine will not run.
+ *
+ *  Saving a script here cannot record authorship, because an HTTP write is
+ *  indistinguishable from an app UI's (ADR 0144). So the edit silently stops
+ *  the script working, and this is where the user finds out.
+ *
+ *  Reading approval state is safe for any caller; only approving is gated. It
+ *  re-reads on `handshakeScriptsVersion`, so an approval made from the CLI,
+ *  or on another device, clears the notice here (ADR 0118).
+ */
+function HandshakeApprovalNotice({ path }: { path: string }) {
+  const [scripts, setScripts] = useState<HandshakeScriptState[]>([]);
+  const load = () => {
+    fetchHandshakeScripts()
+      .then(setScripts)
+      // Best-effort telemetry: this is a WARNING about someone else's state,
+      // not the file the user asked for. A toast here would interrupt an
+      // ordinary file open over a notice that has nothing to say most of the
+      // time. The proxy's own 502 names the same fix if it ever matters.
+      .catch((e) => console.warn('[files] handshake approval state unavailable', e));
+  };
+  useEffect(load, [path]);
+  useVersionedRefresh(handshakeScriptsVersion.value, false, load);
+
+  const unapproved = handshakeWarningFor(path, scripts);
+  if (!unapproved) return null;
+  return (
+    <div class="file-preview-notice" role="status">
+      <strong>This handshake script will not run.</strong> Its content is not
+      approved, so the proxy refuses it. Ask the Lucidos Agent to make the
+      change, or run <code>lucidos handshake approve {unapproved}</code>.
     </div>
   );
 }

@@ -470,11 +470,15 @@ impl LucidosEngine {
         };
 
         let workspace_name = self.workspace_name();
-        let last_idle_sha = crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
+        // The tri-state matters only to spawn-time branch adoption, which reads
+        // "no idle recorded one" and "could not ask" differently. Everything
+        // else below wants the sha or nothing.
+        let idle_anchor = crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
             self.pool(),
             thread_id,
         )
         .await;
+        let last_idle_sha = idle_anchor.found().map(str::to_string);
         let SpawnWorktreeContext {
             cwd,
             system_prompt,
@@ -498,7 +502,7 @@ impl LucidosEngine {
                 &workspace_name,
                 &repo_root,
                 &repo_id,
-                &last_idle_sha,
+                &idle_anchor,
                 resume_worktree_path,
                 resume_branch,
                 resume_session_id,

@@ -641,7 +641,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: opacity 0.15s;
+    transition: opacity var(--duration-fast);
 }
 
 @media (hover: hover) {
@@ -782,7 +782,8 @@
     justify-content: center;
     opacity: 0;
     pointer-events: none;
-    transition: opacity 0.2s, background-color 0.15s, color 0.15s, border-color 0.15s;
+    transition: opacity var(--duration-normal), background-color var(--duration-fast),
+        color var(--duration-fast), border-color var(--duration-fast);
     z-index: calc(var(--z-float) + 1);
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }

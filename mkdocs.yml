@@ -1,6 +1,6 @@
 site_name: Lucidos
 site_url: https://docs.lucidos.dev
-site_description: Documentation for Lucidos, a local AI OS that keeps the apps you describe running, and acts when something happens.
+site_description: Documentation for Lucidos, which builds and runs the apps and automations you describe on your own machine, and acts when something happens.
 repo_url: https://github.com/lucidos-dev/lucidos
 repo_name: lucidos-dev/lucidos
 

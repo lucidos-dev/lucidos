@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting } from './linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractTriggerIdFromHref, browserHandlesHref, _resetLinkifyCacheForTesting } from './linkifyPaths';
 
 describe('extractNavTargetFromHref', () => {
   it.each([
@@ -45,7 +45,14 @@ describe('extractNavTargetFromHref', () => {
   });
 });
 
-describe('extractAppIdFromHref', () => {
+/** The app id the extractor resolves, with its target dropped. The inventory
+ *  of id shapes below is pinned unchanged. It reads the id the way any caller
+ *  that ignores a target would. */
+function appIdOf(href: string): string | null {
+  return extractAppTargetFromHref(href)?.appId ?? null;
+}
+
+describe('extractAppTargetFromHref: the app id', () => {
   it.each([
     // Entry-point shapes — these mean "open the app"
     ['apps/todo', 'todo'],
@@ -72,7 +79,7 @@ describe('extractAppIdFromHref', () => {
     ['app:todo#section', 'todo'],
     ['app:habit-tracker', 'habit-tracker'],
   ])('extracts %s -> %s', (href, expected) => {
-    expect(extractAppIdFromHref(href)).toBe(expected);
+    expect(appIdOf(href)).toBe(expected);
   });
 
   it.each([
@@ -101,8 +108,79 @@ describe('extractAppIdFromHref', () => {
     ['apple:todo', null],
     ['application:todo', null],
   ])('returns null for %s', (href, expected) => {
-    expect(extractAppIdFromHref(href)).toBe(expected);
+    expect(appIdOf(href)).toBe(expected);
   });
+});
+
+describe('extractAppTargetFromHref', () => {
+  it.each([
+    // The reported shape: a link naming one report inside a shared app.
+    ['app:pr-understanding#pr-1645', 'pr-understanding', 'pr-1645'],
+    ['app:todo#section', 'todo', 'section'],
+    ['app:todo/#section', 'todo', 'section'],
+    // The path forms carry a fragment too: same destination, same rule.
+    ['apps/todo#section', 'todo', 'section'],
+    ['apps/todo/#section', 'todo', 'section'],
+    ['apps/todo/index.html#anchor', 'todo', 'anchor'],
+    ['/apps/todo/index.html#anchor', 'todo', 'anchor'],
+    ['data/apps/todo/index.html#anchor', 'todo', 'anchor'],
+    ['/data/apps/todo/index.html#anchor', 'todo', 'anchor'],
+    // The ENTRY POINT's query is dropped: only the fragment survives the
+    // engine's WIP-preview rewrite.
+    ['app:todo?v=2#frag', 'todo', 'frag'],
+    ['apps/todo/index.html?v=2#frag', 'todo', 'frag'],
+    // A `?` AFTER the `#` is part of the fragment by URL syntax, not a query,
+    // so it reaches the app whole. Truncating it would hand the app a target
+    // it never named.
+    ['app:todo#frag?v=2', 'todo', 'frag?v=2'],
+    ['app:viewer#report?tab=files', 'viewer', 'report?tab=files'],
+    ['app:todo?v=2#frag?tab=x', 'todo', 'frag?tab=x'],
+    // A `#` with nothing after it is not a target, so it must read as absent
+    // rather than as the empty string.
+    ['app:todo#', 'todo', null],
+    ['apps/todo/index.html#', 'todo', null],
+    // No fragment at all: every shape the id table covers keeps answering null
+    // here, which is what leaves an already-open app where the reader put it.
+    ['app:todo', 'todo', null],
+    ['app:todo/', 'todo', null],
+    ['app:todo?refresh=1', 'todo', null],
+    ['apps/todo', 'todo', null],
+    ['apps/todo/', 'todo', null],
+    ['apps/todo/index.html', 'todo', null],
+  ])('extracts %s -> %s at %s', (href, appId, fragment) => {
+    expect(extractAppTargetFromHref(href)).toEqual({ appId, fragment });
+  });
+
+  it.each([
+    // Every href the id table rejects is rejected whole: a fragment never
+    // rescues a shape that names no app.
+    [''],
+    ['apps/'],
+    ['apps'],
+    ['notapps/foo'],
+    ['https://example.com/apps/foo/index.html'],
+    ['/some/other/path'],
+    ['#anchor'],
+    ['mailto:user@example.com'],
+    ['apps/todo/styles.css'],
+    ['apps/todo/styles.css#L10'],
+    ['apps/todo/scripts/run.sh'],
+    ['apps/todo/main.html'],
+    ['apps/todo/nested/deep/file.json'],
+    ['app:'],
+    ['app:/'],
+    ['app:#frag'],
+    ['app:todo/styles.css'],
+    ['app:todo/index.html'],
+    ['app:todo/index.html#frag'],
+    ['app:todo/scripts/run.sh'],
+    ['apple:todo'],
+    ['apple:todo#frag'],
+    ['application:todo'],
+  ])('returns null for %s', (href) => {
+    expect(extractAppTargetFromHref(href)).toBeNull();
+  });
+
 });
 
 describe('extractTriggerIdFromHref', () => {
@@ -797,6 +875,58 @@ describe('linkifyPaths', () => {
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
     expect(result).toContain('class="app-link"');
     expect(result).toContain('data-app-id="todo"');
+  });
+
+  it.each([
+    // The reported shape, plus the path form of the same destination.
+    ['app:habit-tracker#week-3', 'habit-tracker', 'week-3'],
+    ['apps/habit-tracker/index.html#week-3', 'habit-tracker', 'week-3'],
+    ['data/apps/habit-tracker#week-3', 'habit-tracker', 'week-3'],
+    // The query goes, the fragment stays.
+    ['app:habit-tracker?v=2#week-3', 'habit-tracker', 'week-3'],
+  ])('carries the fragment of %s onto data-app-fragment', (href, id, fragment) => {
+    const html = `<p><a href="${href}">Habit Tracker</a></p>`;
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain(`data-app-id="${id}"`);
+    expect(result).toContain(`data-app-fragment="${fragment}"`);
+  });
+
+  it.each([
+    'app:habit-tracker',
+    'app:habit-tracker#',
+    'apps/habit-tracker/index.html',
+    'apps/habit-tracker/',
+  ])('emits NO data-app-fragment for %s', (href) => {
+    // Absent, not empty: an empty attribute would read as "go to the top" and
+    // move an already-open app off whatever the reader was looking at.
+    const html = `<p><a href="${href}">Habit Tracker</a></p>`;
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('data-app-fragment');
+  });
+
+  it('strips a stale data-app-fragment off the incoming tag', () => {
+    // The rewrite owns both attributes, so one already on the tag must not
+    // outlive the href it came from.
+    const html = '<p><a data-app-fragment="stale" href="app:todo">Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('data-app-id="todo"');
+    expect(result).not.toContain('stale');
+  });
+
+  it('strips a stale data-app-fragment from a bare app href too', () => {
+    // The bare-ref recovery carries no fragment by design, so a leftover one
+    // would be the only thing left saying where to go.
+    const html = '<p><a data-app-fragment="stale" href="habit-tracker">Habit Tracker</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
+    expect(result).toContain('data-app-id="habit-tracker"');
+    expect(result).not.toContain('stale');
+  });
+
+  it('escapes a quote in the fragment', () => {
+    const html = '<p><a href=\'app:todo#a"b\'>Todo</a></p>';
+    const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
+    expect(result).toContain('data-app-fragment="a&quot;b"');
   });
 
   it.each([

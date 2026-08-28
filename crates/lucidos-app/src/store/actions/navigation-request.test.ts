@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '@lucidos/sdk';
-import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource } from '../store';
+import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, pluginScrollTarget, selectedLines, lineScrollTarget, filePreviewSource, panelOverlay } from '../store';
 
 // Spy on showToast but keep the rest of the store real — navigation-request.ts
 // reads the nav lists + settingsSubviewLabel at module load to build its
@@ -323,6 +323,106 @@ describe('handleNavigationRequest: file target at a line', () => {
     expect(selectedLines.value).toBeNull();
     expect(lineScrollTarget.value).toBeNull();
     expect(showToast).toHaveBeenCalledWith('Navigation target missing file_path', 'error');
+  });
+});
+
+// The reported bug: a notification tap could not name a place inside the app it
+// opened. A radar notification about one item landed on a board sorted by score.
+// Chat links and file-preview links already carried a fragment.
+describe('handleNavigationRequest: app target at a fragment', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('hands the fragment to openAppById as its third argument', () => {
+    handleNavigationRequest(
+      { target: 'app', app_id: 'habit-tracker', fragment: 'habit-hydration' },
+      { source: 'a notification' },
+    );
+
+    expect(openAppById).toHaveBeenCalledWith(
+      'habit-tracker',
+      'a notification',
+      'habit-hydration',
+    );
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  // Absent is not empty: `openApp` leaves an already-open app where the reader
+  // put it only when it gets nothing, so `''` here would move them.
+  it('passes undefined when the navigate names no place inside the app', () => {
+    handleNavigationRequest({ target: 'app', app_id: 'habit-tracker' });
+
+    expect(openAppById).toHaveBeenCalledWith('habit-tracker', undefined, undefined);
+  });
+
+  // `app-ui` is the historical alias, still carried by stored notification rows.
+  it('carries the fragment through the app-ui alias too', () => {
+    handleNavigationRequest({
+      target: 'app-ui',
+      app_id: 'habit-tracker',
+      fragment: 'habit-hydration',
+    });
+
+    expect(openAppById).toHaveBeenCalledWith('habit-tracker', undefined, 'habit-hydration');
+  });
+
+  it('still reports a navigate with no app_id, fragment or not', () => {
+    handleNavigationRequest({ target: 'app', fragment: 'habit-hydration' });
+
+    expect(openAppById).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith('Navigation target missing app_id', 'error');
+  });
+
+  // The off-focus jump offer is keyed per source thread, so a second navigate
+  // replaces the first. Two destinations in one app must not read identically.
+  it('names the fragment in the jump offer, the way the file case names a line', () => {
+    expect(
+      describeNavTarget({ target: 'app', app_id: 'habit-tracker', fragment: 'habit-hydration' }),
+    ).toBe('app "habit-tracker#habit-hydration"');
+    expect(describeNavTarget({ target: 'app', app_id: 'habit-tracker' }))
+      .toBe('app "habit-tracker"');
+    expect(describeNavTarget({ target: 'app', fragment: 'habit-hydration' })).toBe('an app');
+  });
+});
+
+// A notification tap is the ordinary way into this branch, and the reader is
+// often inside an app when it arrives. A fullscreen app panel is the whole
+// viewport. The thread the tap navigates to therefore lands behind it, and the
+// tap reads as having done nothing.
+describe('handleNavigationRequest: thread target', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    panelOverlay.value = null;
+  });
+
+  it('leaves app fullscreen so the conversation it lands in is on screen', () => {
+    handleNavigationRequest({ target: 'thread', id: 't-1', event_id: 'e-7' });
+
+    expect(exitAppFullscreen).toHaveBeenCalledTimes(1);
+    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-1', { targetEventId: 'e-7' });
+  });
+
+  // Only fullscreen goes. The split gives the conversation its own pane beside
+  // the content one, so closing the app would cost the reader what they were
+  // working in. It would reveal something that was never hidden. Same
+  // distinction the `new-chat` branch draws.
+  it('keeps the app the reader had open', () => {
+    const overlay = { type: 'app-ui' as const, app: { id: 'habit-tracker', name: 'Habit Tracker' } };
+    panelOverlay.value = overlay as never;
+
+    handleNavigationRequest({ target: 'thread', id: 't-1' });
+
+    expect(panelOverlay.value).toBe(overlay as never);
+    expect(revealContentPane).not.toHaveBeenCalled();
+  });
+
+  it('reports a thread target with no id, and navigates nowhere', () => {
+    handleNavigationRequest({ target: 'thread' });
+
+    expect(showToast).toHaveBeenCalledWith('Navigation target missing thread id', 'error');
+    expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+    expect(exitAppFullscreen).not.toHaveBeenCalled();
   });
 });
 

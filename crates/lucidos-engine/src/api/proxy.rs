@@ -122,6 +122,68 @@ pub struct ProxyConfigLoad {
 }
 
 impl ProxyConfigLoad {
+    /// Every `script_handshake` script these providers name, as
+    /// workspace-relative paths (`data/scripts/auth/foo.py`).
+    ///
+    /// The runner keys approvals that way, and the startup seed needs the same
+    /// spelling. A rejected entry contributes nothing: it will never run.
+    pub fn handshake_script_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .providers
+            .values()
+            .filter_map(|cfg| cfg.auth.as_ref())
+            .flat_map(|pipeline| pipeline.pipeline.iter())
+            .filter_map(|layer| match layer {
+                crate::api::proxy_pipeline_config::LayerConfig::ScriptHandshake {
+                    script, ..
+                } => Some(format!("data/{}", script.trim_start_matches('/'))),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Which `base_url` each named credential is used against, across every
+    /// entry that names it.
+    ///
+    /// The startup pass reads this to give a scope to a credential that has
+    /// none. One entry naming it is an answer. Two entries disagreeing is not,
+    /// which is why the values are a set rather than the first one seen.
+    pub fn credential_scopes(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        use crate::api::proxy_pipeline_config::LayerConfig;
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            Default::default();
+        for cfg in self.providers.values() {
+            let Some(pipeline) = cfg.auth.as_ref() else {
+                continue;
+            };
+            for layer in &pipeline.pipeline {
+                let names: Vec<&String> = match layer {
+                    LayerConfig::StaticCredential { credential, .. } => vec![credential],
+                    LayerConfig::ScriptHandshake { credential, .. } => credential.iter().collect(),
+                    LayerConfig::HmacSigned {
+                        key_credential,
+                        secret_credential,
+                        ..
+                    } => vec![key_credential, secret_credential],
+                    LayerConfig::WasmSigner {
+                        credential_handles, ..
+                    } => credential_handles.iter().map(|h| &h.credential).collect(),
+                };
+                for name in names {
+                    out.entry(name.clone())
+                        .or_default()
+                        .insert(cfg.base_url.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// The reason this name is refused, if it is. A file-level rejection
     /// answers for EVERY name: an unreadable file may have overridden a
     /// builtin, and routing that traffic to the builtin instead would be a
@@ -558,6 +620,46 @@ pub(crate) async fn lookup_credential_value(
         .map(|c| c.auth_value)
 }
 
+/// Refuse to present `name` to a provider whose `base_url` its scope does not
+/// cover (ADR 0144).
+///
+/// `data/config/apis.json` is writable over the API, so `base_url` is caller
+/// data. Without this, an entry naming `github` and pointing at an attacker
+/// host makes the engine attach that credential and forward it. The rule is
+/// already applied to git: `core::git_auth` re-checks the same predicate on
+/// every credential callback, so a redirect cannot carry a secret off.
+///
+/// A credential with no scope is refused rather than presented anywhere. The
+/// startup pass infers a scope for one that predates this rule, so what reaches
+/// here unscoped is a row nothing in `apis.json` explains.
+pub(crate) async fn check_credential_scope(
+    pool: &sqlx::PgPool,
+    name: &str,
+    base_url: &str,
+) -> Result<(), (StatusCode, String)> {
+    let credential = fetch_required_credential(pool, name).await?;
+    if credential.base_url.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "credential '{}' has no base_url, so it will not be sent anywhere. \
+                 Set its base_url in Settings to the API it belongs to",
+                name
+            ),
+        ));
+    }
+    if !crate::core::credentials::credential_base_url_matches(&credential.base_url, base_url) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "credential '{}' is scoped to {} and will not be sent to {}",
+                name, credential.base_url, base_url
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Forward a request to the configured upstream and return the upstream
 /// response (headers + body + status). Pure with respect to AppState: takes
 /// only the data it needs, so the integration tests can spin up a tiny axum
@@ -973,6 +1075,7 @@ async fn build_pipeline_layers(
         workspace_path: Arc::new(engine.workspace_path().to_path_buf()),
         token_cache: engine.proxy_token_cache_arc(),
         proxy_name: name,
+        base_url: &config.base_url,
         proxy_modules: &modules_snapshot,
         wasm_engine: engine.wasm_engine().clone(),
     };

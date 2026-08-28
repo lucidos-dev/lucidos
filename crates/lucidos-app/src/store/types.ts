@@ -1,5 +1,6 @@
 import { errorDetail } from '../utils/errorDetail';
 import type { PluginLocalChangesResult } from '../api/client/apps';
+import type { WebhookIngress } from '../api/client/webhooks';
 import type {
   AnswerKind,
   EventSubscription,
@@ -50,9 +51,53 @@ export function loadingIfFresh<T>(prev: Loadable<T>): Loadable<T> {
   return prev.status === 'loaded' ? prev : { status: 'loading' };
 }
 
+/** The failure half of `loadingIfFresh`: a refetch that fails keeps the value
+ *  it already had, and only a first load records the failure.
+ *
+ *  Use it where dropping the loaded value would itself make a claim. A surface
+ *  reading "loaded, or else nothing" announces all-clear on a failed refresh,
+ *  when all that failed is the refresh. */
+export function failedIfFresh<T>(prev: Loadable<T>, error: unknown): Loadable<T> {
+  return prev.status === 'loaded' ? prev : toFailed(error);
+}
+
+// --- Webhook ingress ---
+
+/** One read of the webhook ingress state, stamped when it landed.
+ *
+ *  Postgres measures `down_secs` and the app re-reads it only on a
+ *  `WebhookIngress*` frame, which an outage does not send while it stands. An
+ *  eight-hour silence would keep reading "for 2 minutes", the exact failure this
+ *  feature exists to report.
+ *
+ *  `receivedAt` is the browser clock when the answer arrived. The age adds a gap
+ *  between two readings of that one clock, so nothing subtracts a server instant
+ *  from a browser one (ADR 0053). */
+export interface IngressReading {
+  ingress: WebhookIngress;
+  receivedAt: number;
+}
+
 // Menu item names (drawer navigation)
 export const MENU_ITEMS = ['files', 'apps', 'plugins', 'triggers', 'settings', 'changes', 'notifications'] as const;
 export type MenuItem = typeof MENU_ITEMS[number];
+
+/** What each menu item is CALLED, for every surface that names one: the menu
+ *  drawer's rows, the content-pane header title, the back/forward history menu,
+ *  and Search Everywhere's menu results. Three of those held a copy of the name
+ *  before, and the drawer's covered only the four rows it renders.
+ *
+ *  `Record<MenuItem, string>` rather than a partial map, so a new menu item
+ *  cannot ship nameless. */
+export const MENU_ITEM_LABELS: Record<MenuItem, string> = {
+  files: 'Files',
+  apps: 'Apps',
+  plugins: 'Plugins',
+  triggers: 'Triggers',
+  settings: 'Settings',
+  changes: 'Changes',
+  notifications: 'Notifications',
+};
 
 // Connection status. 'connecting' is the initial state before the first
 // /health poll resolves — it renders the dot neutral grey (no red, no blink),
@@ -547,7 +592,10 @@ export function deriveTriggerType(trigger: TriggerInfo): TriggerType {
   return 'schedule';
 }
 
-export type AuthType = 'api_key' | 'bearer' | 'basic' | 'password' | 'oauth_client' | 'email_password';
+/** How a stored credential is used. Every value but `secret` says how the
+ *  credential is SENT. A `secret` is sent nowhere: it is a shared secret with no
+ *  transport role, fed to a computation such as a webhook's HMAC. */
+export type AuthType = 'api_key' | 'bearer' | 'basic' | 'password' | 'oauth_client' | 'email_password' | 'secret';
 
 // A credential
 export interface CredentialInfo {

@@ -1,8 +1,13 @@
 # Lucidos
 
-[![A half-marathon training app, described in chat and running live beside it, reading this morning's Oura readiness](docs/screenshots/readme-hero.png)](https://lucidos.dev)
+<a href="https://lucidos.dev">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.png">
+    <img src="docs/images/readme-banner-light.png" alt="Lucidos. On your machine: you describe it, it is running, and you change it while it keeps running. Open standards: a Postgres event store, git-versioned artifacts, HTML apps with no build step.">
+  </picture>
+</a>
 
-<sub>Described in chat, running seconds later in the same window, wired to the user's own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux.</sub>
+<sub>Described in chat, running seconds later in the same window, wired to your own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux.</sub>
 
 <!--intro-start-->
 Lucidos builds and runs the apps and automations you describe. Describe one in chat and you are using it seconds later, in the same window, wired to your own data. Ask for a change and it changes while it keeps running. No build step, no deploy, no separate service to stand up.
@@ -15,6 +20,10 @@ Chat sits beside the work in a split view on desktop, and as a pane you swipe to
 
 You own the data. It lives in a local Postgres event store, or as git-versioned artifacts you can read without Lucidos. Nothing happens without your intent: you can automate anything, on a schedule or on an event, but Lucidos does not act on its own.
 <!--intro-end-->
+
+[![A half-marathon training app, described in chat and running live beside it, reading this morning's Oura readiness](docs/screenshots/readme-hero.png)](https://www.youtube.com/watch?v=hNN5bL1nq7k)
+
+<sub>The same loop on a personal app: a training plan described in chat, running beside it, reading this morning's Oura readiness.</sub>
 
 ---
 

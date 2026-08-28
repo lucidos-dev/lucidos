@@ -195,3 +195,20 @@ describe('settings search: the Paired devices row', () => {
       .toBe(false);
   });
 });
+
+describe('settings search: the In-app toasts row', () => {
+  it('resolves to the Appearance subview and its anchor', () => {
+    const entry = findSettingsEntry('appearance:in-app-toasts');
+    expect(entry?.subview).toBe('appearance');
+    expect(entry?.anchor).toBe('appearance:in-app-toasts');
+  });
+
+  it.each(['toast', 'banner', 'popup', 'distracting'])(
+    'is found by "%s", not only by the canonical word',
+    (term) => {
+      const hit = getSettingsSearchResults(term, 20)
+        .some((r) => r.id === 'appearance:in-app-toasts');
+      expect(hit).toBe(true);
+    },
+  );
+});

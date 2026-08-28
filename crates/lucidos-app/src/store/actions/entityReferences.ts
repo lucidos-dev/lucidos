@@ -5,7 +5,7 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders, mcpServersVersion, webhooksVersion, permissionGrantsVersion, handshakeScriptsVersion } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
@@ -21,6 +21,7 @@ import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices, getDeviceId } from './devices';
+import { loadWebhookIngress } from './webhookIngress';
 
 export const RECENTS_KEY = 'lucidos-search-recents';
 export const NAV_KEY = 'lucidos-nav-history';
@@ -338,6 +339,9 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'CredentialCreated':
     case 'CredentialUpdated':
     case 'CredentialDeleted':
+    // The startup pass gave an unscoped credential the base_url its own
+    // apis.json entry uses, which is a field the credential list shows.
+    case 'CredentialScopeInferred':
       if (credentials.value.status === 'loaded') void loadCredentials();
       // A provider credential change rebuilds + swaps the engine's active LLM
       // provider at runtime (no restart). Re-probe /health so `llmConfigured`
@@ -368,12 +372,28 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'WebhookUpdated':
     case 'WebhookDeleted':
       webhooksVersion.value++;
+      // Enabling or disabling a hook changes whether a standing ingress outage
+      // still counts. The last hook switched off retracts the bar, because a
+      // path nothing delivers over cannot be reported as broken.
+      void loadWebhookIngress();
+      break;
+    // The public delivery path went down, or came back. Edge-triggered by the
+    // engine's 15-minute probe, so a re-read costs one request per outage.
+    case 'WebhookIngressDegraded':
+    case 'WebhookIngressRecovered':
+      void loadWebhookIngress();
       break;
     // The agent grants a command or tool pattern by writing the allowlist file,
     // which is exactly what the Permissions editors show. Both files bump the
     // one counter; see the signal's own note for why it is not keyed.
     case 'PermissionGrantsChanged':
       permissionGrantsVersion.value++;
+      break;
+    // A handshake script became runnable. The file preview warns on one that
+    // is not. That warning has to clear when an approval lands, including one
+    // made from the CLI, or on another device.
+    case 'HandshakeScriptApproved':
+      handshakeScriptsVersion.value++;
       break;
     // Settings → Accounts. Both halves of the pair matter: connecting used to
     // emit nothing at all (the engine wrote the row straight from the OAuth

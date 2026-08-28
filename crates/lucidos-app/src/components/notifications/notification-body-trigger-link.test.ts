@@ -62,3 +62,23 @@ describe('a trigger link in a notification body', () => {
     expect(bodyClickSource()).toContain("closest<HTMLAnchorElement>('a.app-link')");
   });
 });
+
+describe('an app link in a notification body', () => {
+  it('renders its app fragment onto the anchor', () => {
+    const html = linkifyPaths(
+      renderMarkdown('[Some report](app:pr-understanding#pr-1645)'),
+      [],
+      [{ name: 'PR Understanding', id: 'pr-understanding' }],
+    );
+    expect(html).toContain('data-app-id="pr-understanding"');
+    expect(html).toContain('data-app-fragment="pr-1645"');
+  });
+
+  it('hands that fragment to openAppById, so the link lands on its target', () => {
+    // Without it the notification opens the app on whatever the reader saw
+    // last, which is the reported bug on this surface.
+    expect(bodyClickSource()).toContain(
+      "openAppById(appId, 'a notification', link.dataset.appFragment)",
+    );
+  });
+});

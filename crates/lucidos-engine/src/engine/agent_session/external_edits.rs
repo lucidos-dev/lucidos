@@ -24,9 +24,8 @@
 
 use std::path::Path;
 
-use crate::engine::git_ops::{
-    git_answer, git_answer_with, git_cmd, worktree_current_branch, GitAnswer,
-};
+use crate::engine::agent_session::resume::IdleAnchor;
+use crate::engine::git_ops::{git_answer, git_answer_with, git_cmd, worktree_current_branch};
 
 /// Why [`verify_branch`] would not let the spawn proceed.
 ///
@@ -284,12 +283,12 @@ pub(crate) async fn is_ancestor(
     descendant_ref: &str,
 ) -> bool {
     // `or_unknown(false)`: a probe that could not run must never claim
-    // ancestry. The only caller (`try_adopt_renegade_branch`) reads a `false`
-    // as "unsafe to adopt" and lets the spawn refuse loudly on the branch
-    // mismatch, whereas an unverified `true` would silently retarget the
-    // thread onto a branch that may not contain its work. The rule is in
-    // `.claude/rules/rust.md`: an unanswered probe is UNKNOWN, never a "no",
-    // and never the answer that authorizes losing work.
+    // ancestry. Every caller reads a `false` as "this proof does not hold",
+    // which costs at most a loud spawn refusal on the branch mismatch. An
+    // unverified `true` would instead retarget the thread onto a branch that
+    // may not contain its work. The rule is in `.claude/rules/rust.md`: an
+    // unanswered probe is UNKNOWN, never a "no", and never the answer that
+    // authorizes losing work.
     git_answer(
         &["merge-base", "--is-ancestor", ancestor_sha, descendant_ref],
         worktree_path,
@@ -298,24 +297,61 @@ pub(crate) async fn is_ancestor(
     .or_unknown(false)
 }
 
-/// Decide whether the worktree's current branch can be safely adopted as
-/// the new tracked branch. Safe means HEAD's history contains
-/// `last_sha` — proving the new branch was created on top of our prior
-/// state, so adoption preserves all our commits.
+/// Decide whether the worktree's current branch can be safely adopted as the
+/// new tracked branch, at the **spawn** boundary. Safe means adoption keeps
+/// every commit the thread already had. `None` when the worktree is already on
+/// `tracked_branch`, its branch cannot be read, or a proof below fails.
 ///
-/// Returns `Some((new_branch_name, note_for_cc))` when adoption is safe.
-/// Returns `None` when there's no last SHA, the worktree HEAD can't be
-/// read, or HEAD has diverged from our state.
+/// Adoption always needs [`branch_provenance`], because containment says
+/// nothing while the tracked ref sits at the base: every branch cut from that
+/// base contains it, so an unrelated sibling would qualify.
+///
+/// The `anchor` then decides which containment proof applies:
+///
+/// - [`IdleAnchor::Found`]: the worktree HEAD must contain that sha. A failure
+///   is a VETO, because adopting would drop commits the thread had.
+/// - [`IdleAnchor::Absent`]: no idle ever recorded a sha, so there is no
+///   containment to test. [`tracked_branch_continues_into_head`] stands in.
+/// - [`IdleAnchor::Unknown`]: refuse. The weaker proof must not stand in for an
+///   anchor that may exist and may disagree.
+///
+/// The `Absent` arm carries a thread no idle ever recorded a sha for. A restart
+/// kills the turn before `CodingAgentIdled` records the branch switch. Without
+/// that arm the mismatch refusal is permanent.
 pub(crate) async fn try_adopt_renegade_branch(
+    repo_root: &Path,
     worktree_path: &Path,
-    last_sha: Option<&str>,
+    tracked_branch: &str,
+    anchor: &IdleAnchor,
 ) -> Option<(String, String)> {
-    let last = last_sha?;
-    let new_branch = worktree_current_branch(worktree_path).await?;
-    if !is_ancestor(worktree_path, last, "HEAD").await {
+    // Read the branch ONCE and gate that value. A re-read can approve one
+    // branch and hand the caller another, as `try_adopt_branch_at_idle` says.
+    let current = worktree_current_branch(worktree_path).await?;
+    if current == tracked_branch {
         return None;
     }
-    Some((new_branch.clone(), build_adoption_note(&new_branch)))
+    let proved = match anchor {
+        // Refuse before probing anything. The weaker proof must not stand in
+        // for an anchor that may exist and may disagree. A provenance probe
+        // here would also log a refusal reason that is not the operative one.
+        IdleAnchor::Unknown => false,
+        IdleAnchor::Found(sha) => {
+            is_ancestor(worktree_path, sha, "HEAD").await
+                && branch_provenance(repo_root, worktree_path, &current, tracked_branch)
+                    .await
+                    .is_proven()
+        }
+        IdleAnchor::Absent => {
+            let provenance =
+                branch_provenance(repo_root, worktree_path, &current, tracked_branch).await;
+            tracked_branch_continues_into_head(worktree_path, tracked_branch, provenance).await
+        }
+    };
+    if !proved {
+        return None;
+    }
+    let note = build_adoption_note(&current);
+    Some((current, note))
 }
 
 /// [`try_adopt_renegade_branch`] for the **idle** boundary rather than the
@@ -337,20 +373,14 @@ pub(crate) async fn try_adopt_renegade_branch(
 ///    HEAD must descend from `anchor_sha`, where this session last knew itself
 ///    to be. No anchor means no check to make, so no adoption.
 /// 2. [`tracked_branch_continues_into_head`]: the current branch must be
-///    provably a continuation of the tracked one, either because git's own
-///    reflog records the rename, or because the tracked ref is still an
-///    ancestor of HEAD.
+///    provably a continuation of the tracked one.
 ///
-/// Gate 2 is what the spawn path doesn't need and this one does. At spawn,
-/// `anchor_sha` is the previous idle's HEAD, which already contains the
-/// thread's commits. On a session's FIRST idle there is no previous idle, so
-/// the anchor is the worktree's HEAD at spawn, which for a fresh branch is just
-/// the base tip: on its own, gate 1 would then accept ANY branch forked from
-/// the same base. Gate 2 is what makes that anchor safe, and it is why "the
-/// tracked ref is gone" is not accepted as evidence of a rename: an agent that
-/// checks out a sibling branch and then deletes the tracked one produces the
-/// same absence, and adopting there would point the thread's Diff (and a later
-/// Discard, which deletes the branch) at work that was never ours.
+/// The spawn path picks its containment proof by what it has; this one takes
+/// both. At spawn, `anchor_sha` is the previous idle's HEAD, which already
+/// contains the thread's commits. A session's FIRST idle has no previous idle.
+/// Its anchor is the worktree's HEAD at spawn, which for a fresh branch is just
+/// the base tip. On its own, gate 1 would then accept ANY branch forked from
+/// the same base. Gate 2 is what makes that anchor safe.
 ///
 /// Every probe involved refuses adoption on `GitAnswer::Unknown`: the question
 /// was not answered, and an unanswered probe must never authorize retargeting a
@@ -373,8 +403,8 @@ pub(crate) async fn try_adopt_branch_at_idle(
     if current == tracked_branch {
         return None;
     }
-    if !tracked_branch_continues_into_head(repo_root, worktree_path, &current, tracked_branch).await
-    {
+    let provenance = branch_provenance(repo_root, worktree_path, &current, tracked_branch).await;
+    if !tracked_branch_continues_into_head(worktree_path, tracked_branch, provenance).await {
         return None;
     }
     if !is_ancestor(worktree_path, anchor, "HEAD").await {
@@ -384,53 +414,84 @@ pub(crate) async fn try_adopt_branch_at_idle(
     Some((current, note))
 }
 
-/// Gate 2 of [`try_adopt_branch_at_idle`]: is `current_branch` provably a
-/// continuation of `tracked_branch`?
+/// How the worktree's current branch came to be the branch it is on. EVERY arm
+/// of both boundaries needs one of the two proofs below. A containment proof
+/// says nothing once all the thread has is the base commit, because every
+/// branch cut from that base contains it.
 ///
-/// Two ways to prove it, and both are positive evidence:
-///
-/// - The tracked ref is still there and is reachable from HEAD, so whatever the
-///   agent created was built on top of our work (`git checkout -b`).
-/// - git's own reflog for the current branch records the rename. `git branch -m`
-///   moves the old ref's reflog onto the new name and appends a
-///   `Branch: renamed refs/heads/<old> to refs/heads/<new>` entry, so the new
-///   branch carries proof of where it came from.
-///
-/// The absence of the tracked ref is deliberately NOT evidence. An agent that
-/// checks out a sibling branch and then deletes the tracked one leaves exactly
-/// the same absence, and a first idle's anchor can be no stronger than the
-/// shared base, so accepting absence would let an unrelated branch pass both
-/// gates. That branch would then own the thread's Diff and, on an explicit
-/// Discard, be the branch deleted.
-///
-/// A repo with reflogs disabled (`core.logAllRefUpdates=false`) yields no
-/// evidence and therefore no adoption. That is the safe direction: the thread
-/// keeps its tracked branch and the next spawn re-derives.
-async fn tracked_branch_continues_into_head(
+/// Both proofs are git's own account of what happened, never an inference from
+/// what is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchProvenance {
+    /// This worktree's HEAD moved onto the branch in the same git operation
+    /// that created it: `git checkout -b`, or `git switch -c`.
+    CreatedHere,
+    /// git's reflog records `git branch -m` from the tracked branch.
+    RenamedFromTracked,
+    /// Neither holds, or git could not be asked.
+    Unproven,
+}
+
+impl BranchProvenance {
+    /// True when git accounts for how the branch became this thread's.
+    fn is_proven(self) -> bool {
+        !matches!(self, BranchProvenance::Unproven)
+    }
+}
+
+async fn branch_provenance(
     repo_root: &Path,
     worktree_path: &Path,
     current_branch: &str,
     tracked_branch: &str,
+) -> BranchProvenance {
+    if worktree_created_the_branch(worktree_path, current_branch).await {
+        BranchProvenance::CreatedHere
+    } else if branch_reflog_records_rename_from(repo_root, current_branch, tracked_branch).await {
+        BranchProvenance::RenamedFromTracked
+    } else {
+        // The only place a provenance refusal is visible. Both boundaries are
+        // otherwise silent about it, and this rules out more than the ancestry
+        // check it replaced: reflogs off, and a branch created before the
+        // checkout that moved onto it.
+        log!(
+            "[AgentSession] No reflog shows how branch '{}' came from '{}', refusing adoption",
+            current_branch,
+            tracked_branch
+        );
+        BranchProvenance::Unproven
+    }
+}
+
+/// Is `current_branch` provably a continuation of `tracked_branch`? Both
+/// adoption boundaries use it: [`try_adopt_renegade_branch`] as its no-anchor
+/// fallback, [`try_adopt_branch_at_idle`] as its second gate.
+///
+/// What is left to prove depends on how the branch became ours:
+///
+/// - Renamed: git says this branch IS the tracked one, so nothing else is left
+///   to contain.
+/// - Created here: the tracked ref must still be reachable from HEAD, so what
+///   the agent created was built on our work.
+/// - Unproven: refuse, whatever shape the history has.
+///
+/// Ancestry is also what refuses a tracked ref that was merely DELETED, since
+/// `merge-base --is-ancestor` answers no for a ref that is not there. Absence
+/// is deliberately not evidence of a rename: deleting the tracked branch after
+/// checking out a sibling leaves exactly the same absence. That sibling would
+/// own the thread's Diff and be what an explicit Discard deletes.
+async fn tracked_branch_continues_into_head(
+    worktree_path: &Path,
+    tracked_branch: &str,
+    provenance: BranchProvenance,
 ) -> bool {
-    let tracked_ref = format!("refs/heads/{}", tracked_branch);
-    match git_answer(
-        &["rev-parse", "--verify", "--quiet", &tracked_ref],
-        repo_root,
-    )
-    .await
-    {
-        GitAnswer::Yes => is_ancestor(worktree_path, &tracked_ref, "HEAD").await,
-        GitAnswer::No => {
-            branch_reflog_records_rename_from(repo_root, current_branch, tracked_branch).await
+    match provenance {
+        BranchProvenance::RenamedFromTracked => true,
+        BranchProvenance::CreatedHere => {
+            let tracked_ref = format!("refs/heads/{}", tracked_branch);
+            is_ancestor(worktree_path, &tracked_ref, "HEAD").await
         }
-        // Could not ask. Never retarget on an unanswered probe.
-        GitAnswer::Unknown => {
-            log!(
-                "[AgentSession] Could not verify whether ref {} still exists, refusing idle branch adoption",
-                tracked_ref
-            );
-            false
-        }
+        BranchProvenance::Unproven => false,
     }
 }
 
@@ -455,6 +516,100 @@ async fn branch_reflog_records_rename_from(
     )
     .await
     .or_unknown(false)
+}
+
+/// Did THIS worktree create `branch`, in the git operation that moved its HEAD
+/// onto it? `git checkout -b` and `git switch -c` do exactly that. It is the
+/// only thing separating an agent's own ticket branch from a pre-existing
+/// sibling while the tracked ref sits at the base. The two leave the same
+/// static git state, so the evidence has to be git's reflogs.
+///
+/// Two conditions, both required:
+///
+/// - the branch's OLDEST reflog entry is its creation (`branch: Created from`);
+/// - this worktree's own HEAD reflog carries a `checkout: moving from <x> to
+///   <branch>` entry whose timestamp AND resulting sha both equal that one's.
+///
+/// One git process stamps every reflog entry it writes with one cached
+/// timestamp, so the pair matches exactly however long the checkout runs. A
+/// pre-existing branch was created earlier, at a sha that is where it started
+/// rather than the tip we landed on. Reflog timestamps have one-second
+/// resolution, and the residual that leaves is measured in
+/// `docs/plans/2026-08-27-branch-adoption-proves-the-branch-is-ours.md`.
+///
+/// The HEAD reflog is per-worktree, so this reads it in the worktree.
+async fn worktree_created_the_branch(worktree_path: &Path, branch: &str) -> bool {
+    const CREATED: &str = "branch: Created from ";
+    const MOVED: &str = "checkout: moving from ";
+
+    let Some(branch_log) = reflog_entries(worktree_path, branch).await else {
+        return false;
+    };
+    // `git reflog show` prints newest first, so the creation is last. An
+    // expired reflog leaves something else there, and proves nothing.
+    let Some(created) = branch_log.last().filter(|e| e.subject.starts_with(CREATED)) else {
+        return false;
+    };
+    let Some(head_log) = reflog_entries(worktree_path, "HEAD").await else {
+        return false;
+    };
+    let landed_here = format!(" to {}", branch);
+    head_log.iter().any(|e| {
+        e.subject.starts_with(MOVED)
+            && e.subject.ends_with(&landed_here)
+            && e.at == created.at
+            && e.new_sha == created.new_sha
+    })
+}
+
+/// One line of the reflog, as [`reflog_entries`] formats it.
+struct ReflogEntry {
+    /// What the ref pointed at after this entry.
+    new_sha: String,
+    /// When it was written, in unix seconds. Only ever compared, so it stays
+    /// the string git printed.
+    at: String,
+    /// git's own description, e.g. `checkout: moving from a to b`.
+    subject: String,
+}
+
+/// Every reflog entry for `reference`, newest first. `None` when git could not
+/// be asked, or the ref has no reflog. Both callers read that as "no proof",
+/// which refuses adoption, so the unanswered side keeps the user's work
+/// (`.claude/rules/rust.md`).
+async fn reflog_entries(dir: &Path, reference: &str) -> Option<Vec<ReflogEntry>> {
+    let args = [
+        "reflog",
+        "show",
+        "--date=unix",
+        "--format=%H %gd %gs",
+        reference,
+    ];
+    match git_cmd(&args, dir).await {
+        Ok(o) if o.status.success() => Some(
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(parse_reflog_line)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Split `<sha> <ref>@{<unix seconds>} <subject>`. Splitting on spaces is safe
+/// because git forbids a space in a ref name. Reading the timestamp after the
+/// LAST `@{` is safe because it forbids that sequence too.
+fn parse_reflog_line(line: &str) -> Option<ReflogEntry> {
+    let mut fields = line.splitn(3, ' ');
+    let new_sha = fields.next()?.to_string();
+    let selector = fields.next()?;
+    let subject = fields.next().unwrap_or_default().to_string();
+    let at = selector.rsplit_once("@{")?.1.strip_suffix('}')?.to_string();
+    Some(ReflogEntry {
+        new_sha,
+        at,
+        subject,
+    })
 }
 
 fn build_adoption_note(new_branch: &str) -> String {

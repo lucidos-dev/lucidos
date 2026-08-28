@@ -5,16 +5,17 @@ import { searchEverywhere, type SearchCategory, type SearchResultItem } from '..
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
-import { openSettingsSubview } from '../../store/actions/menu';
+import { openSettingsSubview, switchMenuItem } from '../../store/actions/menu';
 import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { focusPaneMainControl } from '../layout/paneFocus';
-import { searchResultDestinationPane } from './searchEverywhereActions';
+import { searchResultDestinationPane, searchResultIconCategory } from './searchEverywhereActions';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { RECENTS_KEY } from '../../store/actions/entityReferences';
 import { SearchIcon, CloseIcon, ClearIcon } from '../shared/icons';
 import { CategoryIcon } from '../shared/CategoryIcon';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
+import { getMenuSearchResults, findMenuSearchEntry } from './menuIndex';
 import { errorDetail } from '../../utils/errorDetail';
 import './SearchEverywhere.css';
 
@@ -26,7 +27,24 @@ const CATEGORIES: { id: SearchCategory; label: string }[] = [
   { id: 'threads', label: 'Threads' },
   { id: 'triggers', label: 'Triggers' },
   { id: 'changes', label: 'Changes' },
+  // Last, because a search is nearly always for a thing rather than for the
+  // page it lives on. The pages are a short fixed list, so the tab is where you
+  // go to read them all rather than the one you land on.
+  { id: 'menu', label: 'Menu' },
 ];
+
+type LocalCategory = 'settings' | 'menu';
+
+/** The two categories the frontend answers itself, never the engine. */
+function isLocalCategory(category: SearchCategory): category is LocalCategory {
+  return category === 'settings' || category === 'menu';
+}
+
+function localSection(section: LocalCategory, query: string, limit: number): SearchResultItem[] {
+  return section === 'settings'
+    ? getSettingsSearchResults(query, limit)
+    : getMenuSearchResults(query, limit);
+}
 
 const MAX_RECENTS = 15;
 
@@ -71,6 +89,11 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
         // the same silent dead end the persisted nav stack got
         // `migrateSettingsSubview` for. Drop the row instead of listing it.
         return findSettingsEntry(item.id) !== undefined;
+      case 'menu':
+        // Same dead end as a retired settings id: a menu item dropped from
+        // MENU_ITEMS outlives the build that had it, and `handleSelect` would
+        // close the palette and navigate nowhere.
+        return findMenuSearchEntry(item.id) !== undefined;
       case 'changes':
         return true;
     }
@@ -82,7 +105,9 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
   return validated;
 }
 
-const SECTION_ORDER = ['apps', 'files', 'settings', 'threads', 'triggers', 'changes'];
+// `menu` last, for the reason CATEGORIES gives, and so the tab strip and the
+// All tab put the pages in the same place.
+const SECTION_ORDER = ['apps', 'files', 'settings', 'threads', 'triggers', 'changes', 'menu'];
 
 /** Flatten results by section order into a single indexed list for keyboard navigation. */
 function flattenResults(
@@ -133,7 +158,7 @@ function ResultRow({ item, index, selected, onSelect, onHover }: {
       onClick={() => onSelect(item)}
     >
       <span class="search-everywhere-result-icon">
-        <CategoryIcon category={item.category} />
+        <CategoryIcon category={searchResultIconCategory(item)} />
       </span>
       <span class="search-everywhere-result-info">
         <span class="search-everywhere-result-title">{item.title}</span>
@@ -186,8 +211,8 @@ export function SearchEverywhere() {
       return;
     }
 
-    if (category === 'settings') {
-      setResults({ settings: getSettingsSearchResults(query, 50) });
+    if (isLocalCategory(category)) {
+      setResults({ [category]: localSection(category, query, 50) });
       setSelectedIndex(-1);
       setLoading(false);
       return;
@@ -205,7 +230,11 @@ export function SearchEverywhere() {
         const data = await searchEverywhere(query, category, controller.signal);
         if (!controller.signal.aborted) {
           const merged = category === 'all'
-            ? { ...data.results, settings: getSettingsSearchResults(query, 5) }
+            ? {
+                ...data.results,
+                settings: localSection('settings', query, 5),
+                menu: localSection('menu', query, 5),
+              }
             : data.results;
           setResults(merged);
           setSelectedIndex(-1);
@@ -295,6 +324,16 @@ export function SearchEverywhere() {
         break;
       }
       case 'changes': void viewChangeDiffById(item.id).then(focusDest); break;
+      case 'menu': {
+        const entry = findMenuSearchEntry(item.id);
+        if (!entry) break;
+        // The id IS the destination, and switchMenuItem owns the data load, the
+        // nav push and the pane reveal. Resolving the entry first keeps a
+        // recents row from a retired build out of `activeMenuItem`.
+        switchMenuItem(entry.id);
+        focusDest();
+        break;
+      }
     }
   }
 

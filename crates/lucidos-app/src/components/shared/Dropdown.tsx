@@ -5,6 +5,7 @@ import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
 import { SkeletonProvider, SkText } from './Skeleton';
+import { isTypeaheadSeedKey } from './typeahead';
 
 export interface DropdownOption {
   value: string;
@@ -54,20 +55,6 @@ interface DropdownProps {
 export function filterDropdownOptions(options: DropdownOption[], query: string): DropdownOption[] {
   const q = query.trim().toLowerCase();
   return q ? options.filter(o => o.label.toLowerCase().includes(q)) : options;
-}
-
-/** Whether a keydown should START type-to-search (reveal + seed the filter box)
- *  rather than navigate/select: a single printable char (not Space), no
- *  modifiers, on a non-freeText dropdown that isn't already searching. Once
- *  searching, the focused filter input owns subsequent input, so this returns
- *  false and the keystroke flows into it natively. Pure — exported for testing. */
-export function isTypeaheadSeedKey(
-  e: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'altKey'>,
-  opts: { freeText: boolean; searching: boolean },
-): boolean {
-  return !opts.freeText && !opts.searching
-    && e.key.length === 1 && e.key !== ' '
-    && !e.metaKey && !e.ctrlKey && !e.altKey;
 }
 
 /** Which element must hold focus while the menu is open. Whatever has focus

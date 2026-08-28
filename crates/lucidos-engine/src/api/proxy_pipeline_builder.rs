@@ -3,7 +3,7 @@
 //! reloads (`POST /api/v1/proxy-modules/reload`) are picked up without
 //! restarting the engine.
 
-use crate::api::proxy::lookup_credential_value;
+use crate::api::proxy::{check_credential_scope, lookup_credential_value};
 use crate::api::proxy_auth_layer::AuthLayer;
 use crate::api::proxy_hmac_layer::HmacSignedLayer;
 use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig, StaticKind};
@@ -29,6 +29,10 @@ pub struct PipelineBuildContext<'a> {
     pub workspace_path: Arc<PathBuf>,
     pub token_cache: Arc<ProxyTokenCache>,
     pub proxy_name: &'a str,
+    /// Where this provider's requests go. Every credential the pipeline
+    /// resolves is checked against it. So a rewritten `apis.json` cannot point
+    /// a credential at a host the user never scoped it to (ADR 0144).
+    pub base_url: &'a str,
     pub proxy_modules: &'a HashMap<String, Arc<CompiledModule>>,
     pub wasm_engine: Arc<Engine>,
 }
@@ -51,6 +55,7 @@ pub async fn build_pipeline(
                 header,
                 param_name,
             } => {
+                check_credential_scope(&ctx.pool, credential, ctx.base_url).await?;
                 let value = lookup_credential_value(&ctx.pool, credential).await?;
                 let layer: Arc<dyn AuthLayer> = match kind {
                     StaticKind::Bearer => Arc::new(StaticHeaderLayer::bearer(namespace, value)),
@@ -94,6 +99,14 @@ pub async fn build_pipeline(
                 script,
                 oauth_providers,
             } => {
+                // The script reads this credential from its environment, and
+                // then talks to whoever it likes. Checked all the same: the
+                // layer exists to authenticate THIS provider. An OAuth token
+                // from `oauth_providers` carries no such scope, and the script
+                // approval is what stands behind it.
+                if let Some(name) = credential {
+                    check_credential_scope(&ctx.pool, name, ctx.base_url).await?;
+                }
                 let oauth_lookup: Arc<dyn crate::api::proxy_script_layer::OAuthLookup> = Arc::new(
                     crate::api::proxy_script_layer::DbOAuthLookup::new(ctx.pool.clone()),
                 );
@@ -118,6 +131,8 @@ pub async fn build_pipeline(
                 signature_param,
                 timestamp_param,
             } => {
+                check_credential_scope(&ctx.pool, key_credential, ctx.base_url).await?;
+                check_credential_scope(&ctx.pool, secret_credential, ctx.base_url).await?;
                 layers.push(Arc::new(HmacSignedLayer::new(
                     namespace,
                     key_credential.clone(),
@@ -143,6 +158,11 @@ pub async fn build_pipeline(
                         ),
                     )
                 })?;
+                // The module never sees the bytes, but the signature it
+                // produces travels to `base_url`, so the same scope decides.
+                for handle in credential_handles {
+                    check_credential_scope(&ctx.pool, &handle.credential, ctx.base_url).await?;
+                }
                 let resolver: Arc<dyn SecretResolver> = Arc::new(PgPoolSecretResolver {
                     pool: ctx.pool.clone(),
                 });

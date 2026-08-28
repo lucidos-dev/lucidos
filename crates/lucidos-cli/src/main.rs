@@ -34,6 +34,7 @@ mod frontend_preview;
 /// AUTO-GENERATED content; wire each enum below. See
 /// `crates/lucidos-engine/src/capability_manifest/`.
 mod generated;
+mod handshake;
 mod hardened;
 mod http;
 mod knowhow;
@@ -253,6 +254,12 @@ enum Command {
     /// stdout; exit 0 by default even on 4xx/5xx. Use `--fail` to mirror
     /// `curl --fail`, `--include` to mirror `curl -i`.
     Proxy(ProxyCliArgs),
+    /// Approve an auth handshake script, or list which ones may run.
+    ///
+    /// The engine runs a `script_handshake` script only when it recorded who
+    /// wrote it (ADR 0144). Its own file tools record as they write, so this is
+    /// for a script edited outside Lucidos.
+    Handshake(HandshakeCliArgs),
     /// Send a push notification via the parent workspace. Persists to the
     /// inbox AND pushes to subscribed devices, identical to the
     /// `send_notification` LLM tool. Use from scripts that need to nudge the
@@ -649,6 +656,29 @@ pub(crate) struct NotifyArgs {
     /// when the tap lands. Ignored without `--thread-id`.
     #[arg(long = "event-id")]
     pub(crate) event_id: Option<String>,
+    /// The place INSIDE the app the tap lands on, e.g. the one item the
+    /// notification is about. It arrives as the app's `location.hash`, so
+    /// only an app that routes on the hash moves. Needs `--tap navigate` on
+    /// the `--app-id` branch; ignored on a thread deep-link.
+    #[arg(long = "fragment")]
+    pub(crate) fragment: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct HandshakeCliArgs {
+    #[command(subcommand)]
+    pub(crate) action: HandshakeAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum HandshakeAction {
+    /// Every handshake script `apis.json` names, and whether it may run.
+    List,
+    /// Record a script's current content as approved.
+    Approve {
+        /// `scripts/auth/<name>.py`, or the workspace-relative path.
+        path: String,
+    },
 }
 
 #[derive(Args)]
@@ -1140,6 +1170,14 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 },
             )
         }
+        Command::Handshake(args) => {
+            let ws = resolve_from_env()?;
+            match args.action {
+                HandshakeAction::List => handshake::cmd_list(&ws)?,
+                HandshakeAction::Approve { path } => handshake::cmd_approve(&ws, &path)?,
+            }
+            Ok(0)
+        }
         Command::Pair {
             port,
             label,
@@ -1202,6 +1240,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     tap: args.tap,
                     thread_id: args.thread_id.as_deref(),
                     event_id: args.event_id.as_deref(),
+                    fragment: args.fragment.as_deref(),
                 },
             )?;
             Ok(0)

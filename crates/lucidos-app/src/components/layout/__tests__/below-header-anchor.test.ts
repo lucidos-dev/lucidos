@@ -74,6 +74,16 @@ describe('below-header anchor (--app-header-bottom)', () => {
     expect(decl(rootTokens, '--app-header-bottom')!).toContain('var(--app-conn-banner-height');
   });
 
+  /**
+   * The webhook ingress bar is the third, and it is up on a condition neither
+   * of the other two can see: the workspace is reachable from this client and
+   * still unreachable from the public internet. So it can stack on either.
+   */
+  it('the anchor carries the ingress banner as a third, distinct term', () => {
+    expect(decl(rootTokens, '--app-ingress-banner-height')).not.toBeNull();
+    expect(decl(rootTokens, '--app-header-bottom')!).toContain('var(--app-ingress-banner-height');
+  });
+
   it('.app-header sizes itself from the same height token', () => {
     expect(decl(block(shellCss, '.app-header {'), 'height')).toBe('var(--app-header-height)');
   });

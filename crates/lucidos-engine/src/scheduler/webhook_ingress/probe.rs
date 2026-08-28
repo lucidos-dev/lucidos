@@ -1,0 +1,264 @@
+//! One request per public address, over the public path.
+//!
+//! A loopback self-probe would have passed all night through the outage this
+//! feature exists to catch. So every request leaves the machine and comes back
+//! in through the funnel.
+//!
+//! Each address gets its own client, with the funnel hostname pinned to that
+//! one address. TLS and SNI still see the hostname, so the far side answers as
+//! it would for a real sender. Three A records mean three requests, because a
+//! dual-stack client would have picked the one healthy family and reported the
+//! ingress fine.
+//!
+//! The request carries a bearer this cycle minted. It is refused like any wrong
+//! token, and `api::webhooks::stamp_refused` recognises it and leaves the
+//! hook's refusal stamp alone.
+
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::time::Duration;
+
+use crate::core::webhook_ingress::{classify_status, AddressProbe, Family, Stage};
+
+/// How long one request gets, connect and read together.
+///
+/// The scheduler runs this every 15 minutes, so a slow answer costs nothing.
+/// A wedged relay must still give up long before the next cycle.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Longest `detail` line a payload carries. A TLS stack can hand back a
+/// paragraph, and this is read on a settings row.
+const DETAIL_MAX_CHARS: usize = 160;
+
+/// Where the route lookup points, per family.
+///
+/// Both are documentation ranges (RFC 5737 and RFC 3849), so no real host is
+/// named. Port 9 is discard. Nothing is ever sent to either.
+const ROUTE_PROBE_V4: &str = "203.0.113.1:9";
+const ROUTE_PROBE_V6: &str = "[2001:db8::1]:9";
+
+/// Which families this host can reach at all.
+///
+/// Passed in rather than looked up inside the probe, so the skip is testable
+/// without a network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRoutes {
+    pub ipv4: bool,
+    pub ipv6: bool,
+}
+
+impl LocalRoutes {
+    /// Ask the routing table, sending nothing.
+    pub fn detect() -> Self {
+        Self {
+            ipv4: has_local_route(Family::Ipv4),
+            ipv6: has_local_route(Family::Ipv6),
+        }
+    }
+
+    fn covers(&self, family: Family) -> bool {
+        match family {
+            Family::Ipv4 => self.ipv4,
+            Family::Ipv6 => self.ipv6,
+        }
+    }
+}
+
+/// The public front door, and what one probe presents to it.
+#[derive(Debug, Clone)]
+pub struct ProbeTarget {
+    /// The funnel hostname. Stays in the URL, so TLS and SNI see it.
+    pub host: String,
+    /// The public funnel port, not the loopback port behind it.
+    pub port: u16,
+    /// The gateway's delivery path, `/<slug>/<hook id>`.
+    pub path: String,
+    /// This cycle's bearer, so the engine knows its own probe.
+    pub token: String,
+}
+
+impl ProbeTarget {
+    fn url(&self) -> String {
+        format!("https://{}:{}{}", self.host, self.port, self.path)
+    }
+}
+
+/// Probe every address, one request each.
+///
+/// An address whose family this host cannot reach gets no request at all, and
+/// reads `local-stack-unavailable`. That reading is not degraded: a machine with
+/// no IPv6 egress would otherwise report a permanent outage of an ingress that
+/// is fine.
+pub async fn probe_all(
+    target: &ProbeTarget,
+    addresses: &[IpAddr],
+    routes: LocalRoutes,
+) -> Vec<AddressProbe> {
+    let mut results = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let address = normalize(*address);
+        let family = family_of(&address);
+        if routes.covers(family) {
+            results.push(probe_one(target, address, family).await);
+        } else {
+            results.push(AddressProbe {
+                address: address.to_string(),
+                family,
+                stage: Stage::LocalStackUnavailable,
+                status: None,
+                detail: Some(format!("this host has no {} route", family_word(family))),
+            });
+        }
+    }
+    results
+}
+
+/// One request to one address.
+async fn probe_one(target: &ProbeTarget, address: IpAddr, family: Family) -> AddressProbe {
+    let client = match build_client(&target.host, target.port, address) {
+        Ok(client) => client,
+        Err(e) => {
+            // Nothing left this machine, so this says nothing about the
+            // ingress.
+            return AddressProbe {
+                address: address.to_string(),
+                family,
+                stage: Stage::LocalStackUnavailable,
+                status: None,
+                detail: Some(detail_line("no client", &e.to_string())),
+            };
+        }
+    };
+
+    let sent = client
+        .post(target.url())
+        .header("authorization", format!("Bearer {}", target.token))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await;
+
+    match sent {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let stage = classify_status(status);
+            AddressProbe {
+                address: address.to_string(),
+                family,
+                stage,
+                status: Some(status),
+                detail: (stage != Stage::Healthy).then(|| format!("answered HTTP {status}")),
+            }
+        }
+        Err(e) => AddressProbe {
+            address: address.to_string(),
+            family,
+            stage: Stage::IngressUnreachable,
+            status: None,
+            detail: Some(transport_detail(&e)),
+        },
+    }
+}
+
+/// A client that dials exactly one address and nothing else.
+///
+/// Certificate validation stays on. A bad cert is a real diagnosis, and turning
+/// it off would report a hijacked ingress as healthy.
+fn build_client(host: &str, port: u16, address: IpAddr) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        // The pin. The URL keeps the hostname, so SNI and the certificate are
+        // checked against it while the connection goes to this address.
+        .resolve(host, SocketAddr::new(address, port))
+        // A followed redirect would resolve its new host through the system
+        // resolver, which is the one lookup this feature must never make.
+        .redirect(reqwest::redirect::Policy::none())
+        // A proxy would dial on our behalf and the pin would mean nothing.
+        .no_proxy()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+}
+
+/// Does this host have any route for the family?
+///
+/// A UDP `connect` picks a source address and sends no packet, so this reads
+/// the routing table without touching the address it names.
+fn has_local_route(family: Family) -> bool {
+    let (bind, probe) = match family {
+        Family::Ipv4 => ("0.0.0.0:0", ROUTE_PROBE_V4),
+        Family::Ipv6 => ("[::]:0", ROUTE_PROBE_V6),
+    };
+    UdpSocket::bind(bind)
+        .and_then(|socket| socket.connect(probe))
+        .is_ok()
+}
+
+/// The address as it is dialled and reported.
+///
+/// An IPv4-mapped IPv6 literal goes out over IPv4, so it is unwrapped here and
+/// judged as IPv4.
+fn normalize(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
+
+/// Which family a request to this address uses.
+pub fn family_of(address: &IpAddr) -> Family {
+    match normalize(*address) {
+        IpAddr::V4(_) => Family::Ipv4,
+        IpAddr::V6(_) => Family::Ipv6,
+    }
+}
+
+fn family_word(family: Family) -> &'static str {
+    match family {
+        Family::Ipv4 => "IPv4",
+        Family::Ipv6 => "IPv6",
+    }
+}
+
+/// What a transport failure says, short enough to read on a row.
+fn transport_detail(error: &reqwest::Error) -> String {
+    let class = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not connect"
+    } else {
+        "request failed"
+    };
+    detail_line(class, &innermost_cause(error))
+}
+
+/// The bottom of the error chain, which is where the diagnosis lives.
+///
+/// The outer message repeats the URL, and the payload already carries the
+/// address and the port.
+fn innermost_cause(error: &reqwest::Error) -> String {
+    let mut cause: &dyn std::error::Error = error;
+    while let Some(next) = cause.source() {
+        cause = next;
+    }
+    cause.to_string()
+}
+
+/// One line, capped. Multi-line causes are common from a TLS stack.
+fn detail_line(class: &str, cause: &str) -> String {
+    let cause = cause.lines().next().unwrap_or_default().trim();
+    if cause.is_empty() {
+        return class.to_string();
+    }
+    let line = format!("{class}: {cause}");
+    // Counted in characters, not bytes. A TLS cause can carry a hostname in any
+    // script, and a byte budget would cut it far shorter than the row allows.
+    match line.char_indices().nth(DETAIL_MAX_CHARS) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line,
+    }
+}
+
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod tests;

@@ -90,8 +90,17 @@ pub fn replay_trigger_group_events(
 
         match row.event_type.as_str() {
             "TriggerGroupCreated" => {
-                if let Ok(g) = TriggerGroup::from_created_payload(&row.payload, row.created) {
-                    groups.insert(group_id, g);
+                match TriggerGroup::from_created_payload(&row.payload, row.created) {
+                    Ok(g) => {
+                        groups.insert(group_id, g);
+                    }
+                    // Every trigger pointing at this group renders as
+                    // "Ungrouped" instead. Say why, rather than dropping it.
+                    Err(e) => crate::log!(
+                        "[TriggerReplay] TriggerGroupCreated payload for {} did not parse: {}",
+                        group_id,
+                        e
+                    ),
                 }
             }
             "TriggerGroupRenamed" => {

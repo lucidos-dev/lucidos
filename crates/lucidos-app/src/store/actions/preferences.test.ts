@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -1443,5 +1443,74 @@ describe('estimateTurnDuration', () => {
 
   it('never reads as zero for the smallest allowed cap', () => {
     expect(estimateTurnDuration(MAX_TOOL_CALLS_MIN)).toBe('1 min');
+  });
+});
+
+/**
+ * The in-app toast switch is the one preference whose pre-load answer is not a
+ * harmless default: a toast cannot be taken back, so guessing "on" before the
+ * GET returns interrupts exactly the user who turned it off. Hence a
+ * device-local mirror, kept honest at both points the value becomes known.
+ */
+describe('notification_toasts: the mirror that survives a cold start', () => {
+  const KEY = 'lucidos-notification-toasts';
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('answers from the mirror while preferences are still loading', () => {
+    localStorage.setItem(KEY, 'false');
+    preferences.value = { status: 'loading' };
+    expect(currentNotificationToasts()).toBe(false);
+  });
+
+  it('answers from the mirror when the load failed', () => {
+    localStorage.setItem(KEY, 'false');
+    preferences.value = { status: 'failed', error: 'unreachable' };
+    expect(currentNotificationToasts()).toBe(false);
+  });
+
+  it('lets the served value beat the mirror', () => {
+    localStorage.setItem(KEY, 'false');
+    preferences.value = { status: 'loaded', data: { notification_toasts: 'true' } };
+    expect(currentNotificationToasts()).toBe(true);
+  });
+
+  it('is on with neither a preference nor a mirror', () => {
+    expect(currentNotificationToasts()).toBe(true);
+  });
+
+  // Driven through `loadPreferences` rather than the cache step directly: a
+  // mirror nothing refreshes is the way this whole fix goes quietly dead, so
+  // the wiring is the part worth pinning.
+  it('takes the mirror from what the engine served', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({
+      preferences: { notification_toasts: 'false' },
+    });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBe('false');
+  });
+
+  it('clears the mirror when the engine serves no value', async () => {
+    // Unset means the default. A mirror left behind would outlive a reset and
+    // keep silencing toasts for a preference nobody holds any more.
+    localStorage.setItem(KEY, 'false');
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(localStorage.getItem(KEY)).toBeNull();
+  });
+
+  it('writes the mirror on the user pick, before the round trip', () => {
+    // savePreference applies locally first and delivers after, so the mirror
+    // must not wait on the network: the next cold start reads it.
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    void setNotificationToasts(false);
+    expect(localStorage.getItem(KEY)).toBe('false');
   });
 });

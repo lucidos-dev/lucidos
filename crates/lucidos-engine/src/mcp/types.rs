@@ -130,6 +130,12 @@ pub enum ToolCallContent {
     },
     #[serde(rename = "resource")]
     Resource { resource: serde_json::Value },
+    /// Any block type this build does not know, such as `audio` or
+    /// `resource_link` from a later MCP revision. We advertise one revision but
+    /// never refuse a newer server, so these arrive. Without this arm, a single
+    /// unknown block fails the result and discards the usable text beside it.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -181,6 +187,25 @@ mod tests {
         match &result.content[0] {
             ToolCallContent::Text { text } => assert_eq!(text, "Object created"),
             _ => panic!("Expected text content"),
+        }
+    }
+
+    /// A block type from a later MCP revision must not fail the whole result.
+    /// Before the catch-all arm, the text beside it was discarded and the tool
+    /// call reported a parse error.
+    #[test]
+    fn an_unknown_content_block_keeps_the_text_beside_it() {
+        let json = r#"{"content":[
+            {"type":"audio","data":"AAAA","mimeType":"audio/wav"},
+            {"type":"text","text":"still useful"}
+        ]}"#;
+        let result: ToolCallResult = serde_json::from_str(json).unwrap();
+
+        assert_eq!(result.content.len(), 2);
+        assert!(matches!(result.content[0], ToolCallContent::Unknown));
+        match &result.content[1] {
+            ToolCallContent::Text { text } => assert_eq!(text, "still useful"),
+            other => panic!("expected the text block, got {other:?}"),
         }
     }
 }

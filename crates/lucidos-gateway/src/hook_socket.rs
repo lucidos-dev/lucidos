@@ -68,6 +68,18 @@ pub fn hook_port(configured: Option<&str>, gateway_port: u16) -> Option<u16> {
     }
 }
 
+/// The same answer, read from this process's environment.
+///
+/// The bind site and the engine spawn both need it, and they must agree. The
+/// engine probes its own public ingress against this port. A disagreement would
+/// send that probe at a port nothing listens on.
+pub fn resolved_hook_port(gateway_port: u16) -> Option<u16> {
+    hook_port(
+        std::env::var("LUCIDOS_HOOK_PORT").ok().as_deref(),
+        gateway_port,
+    )
+}
+
 /// The hook socket's router: one route, and 404 for all else.
 pub fn router(state: GatewayState) -> Router {
     let routes = Router::new()

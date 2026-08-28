@@ -30,7 +30,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -94,6 +94,10 @@ type Callbacks = {
   openImage: (src: string, target: any) => void;
   openArtifact: (path: string) => void;
   openApp: (app: App) => void;
+  /** `fragment` is the app fragment the link named, undefined when it named
+   *  none. The real handler passes it as openAppById's third argument, after
+   *  the navigate source this surface never sets. */
+  openAppById: (id: string, fragment?: string) => void;
   openTrigger: (id: string) => void;
   navigate: (req: { target: string }) => void;
   osOpen: (target: string) => void;
@@ -108,8 +112,10 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
   const app = t.closest('.app-link');
   if (app) {
     e.preventDefault();
+    // openAppById, not a cache lookup: it re-fetches on a miss, matching the
+    // real handler's fix for the "app exists but cache is stale" bug.
     const id = (app as any).dataset.appId;
-    if (id) { const a = apps.find(x => x.id === id); if (a) cb.openApp(a); }
+    if (id) cb.openAppById(id, (app as any).dataset.appFragment);
     return;
   }
   const trig = t.closest('.trigger-link');
@@ -130,10 +136,13 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
   const anchor = t.closest('a');
   if (anchor) {
     const href = anchor.getAttribute('href') || '';
-    const id = extractAppIdFromHref(href);
-    if (id) {
-      const a = apps.find(x => x.id === id);
-      if (a) { e.preventDefault(); cb.openApp(a); return; }
+    const appRef = extractAppTargetFromHref(href);
+    // Unconditional: openAppById re-fetches on a miss, so a recognized `apps/`
+    // or `app:` shape must never fall through to the terminal guard below.
+    if (appRef) {
+      e.preventDefault();
+      cb.openAppById(appRef.appId, appRef.fragment ?? undefined);
+      return;
     }
     const triggerId = extractTriggerIdFromHref(href);
     if (triggerId) {
@@ -180,6 +189,7 @@ describe('chat link click — the bug-report scenario', () => {
     openImage: ReturnType<typeof vi.fn>;
     openArtifact: ReturnType<typeof vi.fn>;
     openApp: ReturnType<typeof vi.fn>;
+    openAppById: ReturnType<typeof vi.fn>;
     openTrigger: ReturnType<typeof vi.fn>;
     navigate: ReturnType<typeof vi.fn>;
     osOpen: ReturnType<typeof vi.fn>;
@@ -191,6 +201,7 @@ describe('chat link click — the bug-report scenario', () => {
       openImage: vi.fn() as Callbacks['openImage'] & ReturnType<typeof vi.fn>,
       openArtifact: vi.fn() as Callbacks['openArtifact'] & ReturnType<typeof vi.fn>,
       openApp: vi.fn() as Callbacks['openApp'] & ReturnType<typeof vi.fn>,
+      openAppById: vi.fn() as Callbacks['openAppById'] & ReturnType<typeof vi.fn>,
       openTrigger: vi.fn() as Callbacks['openTrigger'] & ReturnType<typeof vi.fn>,
       navigate: vi.fn() as Callbacks['navigate'] & ReturnType<typeof vi.fn>,
       osOpen: vi.fn() as Callbacks['osOpen'] & ReturnType<typeof vi.fn>,
@@ -198,31 +209,33 @@ describe('chat link click — the bug-report scenario', () => {
     };
   });
 
-  it('PRIMARY: pre-rewritten <a class="app-link"> click → openApp', () => {
+  it('PRIMARY: pre-rewritten <a class="app-link"> click → openAppById', () => {
     const a = mkAnchor('#', 'app-link', { appId: 'work-tracker' });
     const e = mkEvent(a);
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', undefined);
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it('PRIMARY: .app-link with unknown id → preventDefault but no openApp', () => {
-    // Real handler unconditionally preventDefaults inside the .app-link
-    // branch even when the id doesn't resolve, to avoid a stale anchor
-    // navigating to "#" and scrolling to top. The mirror mirrors that.
+  it('PRIMARY: .app-link with an id not in the cached apps list still routes to openAppById', () => {
+    // The reported bug: the cache is stale (a suspended iOS PWA missed the
+    // AppCreated SSE frame), so the id is absent even though the app exists.
+    // openAppById re-fetches before concluding it's gone, so this must never
+    // be swallowed.
     const a = mkAnchor('#', 'app-link', { appId: 'unknown-app' });
     const e = mkEvent(a);
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(cb.openAppById).toHaveBeenCalledWith('unknown-app', undefined);
+    expect(cb.toast).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it('FALLBACK: plain <a href="apps/<id>/index.html"> click → openApp', () => {
+  it('FALLBACK: plain <a href="apps/<id>/index.html"> click → openAppById', () => {
     // The shape that survives if linkifyPaths didn't rewrite.
     const a = mkAnchor('apps/work-tracker/index.html');
     const e = mkEvent(a);
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', undefined);
     expect(e.defaultPrevented).toBe(true);
   });
 
@@ -233,18 +246,50 @@ describe('chat link click — the bug-report scenario', () => {
     'apps/work-tracker',
     'apps/work-tracker/',
     'apps/work-tracker/index.html?v=2',
-    'apps/work-tracker/index.html#section',
     // `app:<id>` custom-scheme shorthand. The Habit Tracker-app bug report:
     // LLM wrote `[Habit Tracker app](app:habit-tracker)`, which fell through to the
     // browser and dead-ended on macOS Chrome.
     'app:work-tracker',
     'app:work-tracker/',
     'app:work-tracker?refresh=1',
-    'app:work-tracker#section',
-  ])('FALLBACK entry-point: %s → openApp', (href) => {
+  ])('FALLBACK entry-point: %s → openAppById with no target', (href) => {
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', undefined);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it.each([
+    // The reported bug. A link naming one item inside a shared app opened it
+    // on whatever the reader saw last: the fragment was thrown away.
+    ['app:work-tracker#pr-1645', 'pr-1645'],
+    ['apps/work-tracker/index.html#section', 'section'],
+    ['apps/work-tracker#section', 'section'],
+    ['app:work-tracker?v=2#section', 'section'],
+    // A bare `#` names no place, so it must arrive as absent.
+    ['app:work-tracker#', undefined],
+  ])('FALLBACK entry-point: %s → openAppById at %s', (href, fragment) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', fragment);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it('PRIMARY: a pre-rewritten .app-link carries its data-app-fragment', () => {
+    const a = mkAnchor('#', 'app-link', { appId: 'work-tracker', appFragment: 'pr-1645' });
+    const e = mkEvent(a);
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', 'pr-1645');
+  });
+
+  it('REGRESSION: app:<id> not in the cached apps list routes to openAppById, never the dead-link toast', () => {
+    // Exact shape of the reported bug: [Pulse](app:pulse) toasted "uses a
+    // scheme nothing here can open" because `pulse` was missing from the
+    // stale cache. The scheme was understood; only the id lookup failed.
+    const e = mkEvent(mkAnchor('app:pulse'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openAppById).toHaveBeenCalledWith('pulse', undefined);
+    expect(cb.toast).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(true);
   });
 
@@ -260,11 +305,14 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it('unknown app id → previews the file, never navigates away', () => {
+  it('unknown app id (apps/<id>/index.html shape) → routes to openAppById, never falls through to file preview', () => {
+    // Old behavior fell through to the file preview on a cache miss. The
+    // fix makes this unconditional: openAppById decides "gone" for itself,
+    // after a re-fetch, rather than the click site guessing from the cache.
     const e = mkEvent(mkAnchor('apps/no-such-app/index.html'));
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).not.toHaveBeenCalled();
-    expect(cb.openArtifact).toHaveBeenCalledWith('apps/no-such-app/index.html');
+    expect(cb.openAppById).toHaveBeenCalledWith('no-such-app', undefined);
+    expect(cb.openArtifact).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(true);
   });
 
@@ -516,10 +564,10 @@ describe('chat link click — the bug-report scenario', () => {
 
   it('OS-OPEN: an absolute /apps/<id>/index.html still opens the app (not OS-open)', () => {
     // Regression guard: the app extractor runs first, so an entry-point under
-    // an absolute /apps/ path routes to openApp, never to the OS opener.
+    // an absolute /apps/ path routes to openAppById, never to the OS opener.
     const e = mkEvent(mkAnchor('/apps/work-tracker/index.html'));
     runHandleLinkClick(e, APPS, cb);
-    expect(cb.openApp).toHaveBeenCalledWith(APPS[0]);
+    expect(cb.openAppById).toHaveBeenCalledWith('work-tracker', undefined);
     expect(cb.osOpen).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(true);
   });
@@ -609,6 +657,7 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
     expect(cb.toast).toHaveBeenCalledOnce();
     expect(cb.openApp).not.toHaveBeenCalled();
+    expect(cb.openAppById).not.toHaveBeenCalled();
     expect(cb.navigate).not.toHaveBeenCalled();
     expect(cb.openArtifact).not.toHaveBeenCalled();
     expect(cb.osOpen).not.toHaveBeenCalled();
@@ -701,8 +750,8 @@ describe('chat link click — handler structure pin', () => {
   });
 
   it('handleLinkClick uses all six href extractors in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*extractTriggerIdFromHref.*from.*linkifyPaths/);
-    expect(chatExchangeSource).toMatch(/extractAppIdFromHref\(rawHref\)/);
+    expect(chatExchangeSource).toMatch(/import.*extractAppTargetFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*extractTriggerIdFromHref.*from.*linkifyPaths/);
+    expect(chatExchangeSource).toMatch(/extractAppTargetFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractTriggerIdFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractBareAppRef\(rawHref\)/);
@@ -710,16 +759,30 @@ describe('chat link click — handler structure pin', () => {
     expect(chatExchangeSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openApp, handleNavigationRequest, openFilePreview and openLocalFile with preventDefault', () => {
+  it('fallback branch calls openAppById, openApp, handleNavigationRequest, openFilePreview and openLocalFile with preventDefault', () => {
     const m = chatExchangeSource.match(/closest\('a'\)[\s\S]*?\n  \}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
+    // The extractAppTargetFromHref arm resolves through openAppById, not a
+    // cache lookup. That is the bug fix this file guards. It hands over the
+    // app fragment too, so a link can name a place inside the app.
+    expect(body).toContain(
+      'openAppById(appTargetRef.appId, undefined, appTargetRef.fragment ?? undefined)',
+    );
     expect(body).toContain('openApp(app)');
     expect(body).toContain('navigateToTrigger(triggerId)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
     expect(body).toContain('openFilePreview(dataPath)');
     expect(body).toContain('openLocalFile(localFile)');
     expect(body).toContain('e.preventDefault()');
+  });
+
+  it('the app extractor arm never gates on the cached apps list before opening', () => {
+    // Pins the fix. A cache gate here would let a miss fall through to the
+    // terminal guard, which blames the href's SCHEME for a stale cache.
+    const m = chatExchangeSource.match(/const appTargetRef = extractAppTargetFromHref\(rawHref\);[\s\S]*?\n      const triggerId/);
+    expect(m, 'extractAppTargetFromHref arm not found').not.toBeNull();
+    expect(m![0]).not.toContain('apps.find');
   });
 
   it('the fallback extractors run in order: app, trigger, nav, bare-app-ref, data-path, OS-open', () => {
@@ -734,7 +797,7 @@ describe('chat link click — handler structure pin', () => {
     // than a disk path.
     // The trigger extractor claims `trigger:` and nothing else, so its slot is
     // for narrative order rather than for resolving a collision.
-    const appIdx = chatExchangeSource.indexOf('extractAppIdFromHref(rawHref)');
+    const appIdx = chatExchangeSource.indexOf('extractAppTargetFromHref(rawHref)');
     const trigIdx = chatExchangeSource.indexOf('extractTriggerIdFromHref(rawHref)');
     const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = chatExchangeSource.indexOf('extractBareAppRef(rawHref)');

@@ -6,15 +6,16 @@
  * `.whats-new-notes` styled its padding and stopped and the block fell all the
  * way through to the root, which is `--font-size-xl`, a section heading.
  *
- * Desktop-only, and the reason is the navigation rather than the layout. It is
- * reached through `POST /api/v1/ui/navigate`, the same route the agent's
- * `navigate_ui` uses, which arrives over SSE and therefore needs
- * `waitForEventStream` first. Every other spec in the suite that waits on the
- * event stream is likewise `-desktop`, and under the `mobile-webkit` project
- * that wait times out. The engine-agnostic half of the coverage (the defaults
- * themselves, and the thread-view walk) runs on all three projects in
- * `type-scale.spec.ts`, so nothing about the CSS goes unchecked on WebKit: what
- * is desktop-only is the route to this panel, not the assertion about it.
+ * Desktop-only, and the reason is the viewport rather than the engine. The
+ * spec pins 1280x900 and walks a settings panel laid out at that width. The
+ * `-desktop` name is what keeps it out of the mobile-webkit project.
+ *
+ * It is NOT the `waitForEventStream` that `POST /api/v1/ui/navigate` needs.
+ * That wait works under `mobile-webkit`, as `scroll-memory`, `thread-queue`
+ * and `ui-scale-slider-mobile` all show. The engine-agnostic half of the
+ * coverage runs on all three projects in `type-scale.spec.ts`: the defaults
+ * themselves, and the thread-view walk. So nothing about the CSS goes
+ * unchecked on WebKit.
  */
 import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp, waitForEventStream } from './helpers';

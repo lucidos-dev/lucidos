@@ -17,6 +17,8 @@ This file is the **base layer**. `docs/glossary.md` extends it with dev-only int
 
 ### Active device
 A device currently reporting itself visible to the engine. On desktop: `document.visibilityState === 'visible'` AND `document.hasFocus()` (the tab is in the foreground stack AND the browser window has OS focus). On iOS PWA standalone: `visibilityState === 'visible'` only (Safari leaves `hasFocus()` false even when the PWA is fully foregrounded). On the Tauri desktop client this is additionally gated on the *native window* being active (focused AND on-screen): the embedded WKWebView can't observe macOS `orderOut:` (a window trayed to the menu bar keeps `visibilityState='visible'` / `hasFocus()=true`), so the authoritative AppKit state is bridged to the page via a `native-window-active` event and a trayed/unfocused client correctly reports inactive. When at least one device is active at notification time, no OS push fires anywhere — the active device gets the *in-app surface* via the `NotificationCreated` SSE channel instead. Determined per-notification by the PresenceCheck protocol, not by a stale heartbeat window.
+A device with an app in *fullscreen* is NOT active, in either the native or the pseudo mode. Presence asks whether the user can be reached without a push, and only the Lucidos shell can show them a toast. It also makes a fullscreen app agree with an app opened in its own window. The two look the same to the user, and a windowed one has always taken the push.
+
 See also: `system-knowhow/notifications.md` §§1, 3.
 
 ### Active (thread state)
@@ -184,7 +186,8 @@ See also: *Model registry*, *Provider*.
 
 ### Credential
 A secret Lucidos stores on the user's behalf: an API key, bearer token, username
-and password, mailbox password, or an OAuth client registration. Listed under
+and password, mailbox password, a plain **secret**, or an OAuth client
+registration. Listed under
 **Settings → Accounts → Credentials**, keyed by a **service name**, and injected
 into every subprocess Lucidos spawns as `CRED_<NAME>` (plus an optional custom
 env var name as an extra alias). Also what the proxy auth pipeline
@@ -203,7 +206,13 @@ unique to itself, because that name is what `CRED_<NAME>` and `apis.json` resolv
 provider or the mailbox account.) An OAuth Client is the one type NOT injected as
 `CRED_<NAME>`: only the OAuth flow reads it, and it reads it from the database.
 A secret is never a *preference*.
-See also: *connected account*, *environment variable*, *config*.
+
+**The `secret` type is the one that names no transport.** Every other type says
+how the value is sent: as a key, a bearer token, basic auth, an app
+registration. A `secret` is sent nowhere. It is a shared secret something signs
+with, so it takes no base URL and no header. A *webhook* signing secret is the
+first of them, and generating one from **Settings > Webhooks** saves it here.
+See also: *connected account*, *environment variable*, *config*, *webhook*.
 
 ### Disabled tool
 One tool on an *MCP* server that the user switched off, so the *Lucidos Agent*
@@ -281,7 +290,8 @@ The `data/imported/` directory where imported external repositories land (via `R
 
 ### In-app surface
 The notification surface inside the Lucidos UI: the bell badge (unread count, top bar) and transient toast popups. Driven by the `NotificationCreated` SSE message landing on a connected page; decided locally by the page based on its own visibility, focused thread, and viewport state. Independent from the *OS surface* — a single notification can hit either, both, or (when auto-marked-read on the *source event*) neither.
-See also: `system-knowhow/notifications.md` §§1, 4.
+The toast half is switchable: the `notification_toasts` preference, workspace-wide and on by default, silences it. The bell badge is not switchable, so a silenced notification still counts there and waits in the Notifications panel. Turning toasts off does not hand the notification to the *OS surface* instead: the device is present, so the push stays withheld.
+See also: `system-knowhow/notifications.md` §§1, 4, `system-knowhow/preferences.md`.
 
 ### Intent
 What the user wants, in their words — stable, non-technical prose the LLM can read aloud back to the user without sounding like a script. Lives in `data/apps/<app>/intents/<name>.md` or, for triggers, in the `TriggerCreated` event payload's `run.intent` field. Length is whatever fits; never contains imperative *how* verbs (hit, parse, retry, fall back) — those belong in *knowhow*.
@@ -471,7 +481,10 @@ What differs is what the host can paint. A natively fullscreen element is painte
 The transient SSE event the *Lucidos Engine* broadcasts on every `NotificationCreated` to ask every connected page for its live presence. A **pure pong trigger** — it carries `notification_id`, `event_id` (so the pong can report `event_in_viewport`), a `deadline_ms` the page reads off the payload (set by `scheduler::push::DEADLINE_MS`, currently 2 s — sized to cover an iOS PWA's first packet after Tailscale wake-from-idle, where Tailscale's userspace WireGuard renegotiation pushes the round-trip into the 1100–1800 ms band), and `sent_at_ms`. It carries NO toast content: the in-app toast is driven separately by *NotificationToastRequested*, so it can no longer race the push decision. Each page answers with a *PresencePong*. The engine collects pongs up to the deadline and uses them to decide whether to send an *OS surface* push. Skipped entirely only when nobody is reachable — no page holds an open SSE connection AND no device has pinged visible within `PRESENCE_STALE_AFTER` (120 s, `core::device_presence`). The live SSE-connection count is the primary gate (`engine.sse_connections`); the heartbeat candidates are secondary (`expected_pong_count` in `scheduler::push`). The SSE count is what makes this robust — iOS suspends the 30 s heartbeat while a PWA is foregrounded, so the heartbeat row goes stale even though the page is connected and would pong; gating on the open connection lets the active page still suppress the push. See `system-knowhow/notifications.md` §3.
 
 ### PresencePong
-The page's response to a *PresenceCheck*. POSTed to `/api/v1/presence-pong` with `notification_id`, `device_id`, `is_active`, `focused_thread_id`, `event_in_viewport`. The engine's decision: an OS push goes out iff NO pong reports `is_active`; multi-tab pongs on the same device OR within the device. Late pongs (after the deadline) ack 200 and are dropped — the race is normal. See `system-knowhow/notifications.md` §3.
+The page's response to a *PresenceCheck*. POSTed to `/api/v1/presence-pong` with `notification_id`, `device_id`, `is_active`, `focused_thread_id`, `event_in_viewport`. The engine's decision: an OS push goes out iff NO pong reports `is_active`; multi-tab pongs on the same device OR within the device. Late pongs (after the deadline) ack 200 and are dropped, since the race is normal. One pong is owed per open SSE connection, so documents sharing one through the *shared SSE holder* are ORed into a single POST. See `system-knowhow/notifications.md` §3.
+
+### Shared SSE holder
+The one `SharedWorker` per *workspace* per browser profile that owns that workspace's `GET /api/v1/events` connection. It relays every frame to the documents attached to it: the Lucidos shell, each app iframe, and each app opened in its own tab. So the number of open apps no longer sets the number of connections. Keyed for free by its script URL (`/<slug>/api/v1/sse-worker.js`), which carries the workspace prefix, so no document can receive another workspace's frames. It also ORs its documents' *PresencePong* answers into the single pong its connection owes. A browser without `SharedWorker` (Chromium on Android, Android WebView) falls back to one private `EventSource` per document, which is what every document used to do.
 
 ### NotificationToastRequested
 The transient SSE event the *Lucidos Engine* emits to drive the *in-app surface* toast. Emitted from the `NotificationCreated` fan-out **only on the push-suppressed branch** — i.e. when the *PresenceCheck* pongs say an *active device* exists, so the *OS surface* push is withheld. Carries the toast content (`title`, `body`, `thread_id`, `event_id`, `app_id`, `tap`, `sent_at_ms`) so the page renders without a re-fetch; active pages render the toast (or auto-read when looking at the *source event*), hidden pages ignore it. Because it and the OS push hang off opposite branches of one decision, a device never receives both for one notification — the in-app toast and the OS push are mutually exclusive by construction, not by a page-side timing race. See `system-knowhow/notifications.md` §4.
@@ -780,6 +793,10 @@ An endpoint you point a third party at, so their service can tell Lucidos someth
 
 A delivery has to prove itself. An unsigned webhook carries a **token**, shown once when you create it, that the sender sends back as `Authorization: Bearer <token>`. A webhook can instead carry a **signature** configuration, which is how GitHub, Stripe and Slack authenticate: they sign the request body with a shared secret. Those senders attach no token, so a signed webhook gets none. That secret is a *credential* you save once and name here, never a copy kept beside the webhook.
 
+**Which side invents that shared secret depends on the sender**, and the form follows it. GitHub takes whatever secret you put in its own webhook form. So Lucidos offers to generate one and shows it once, for you to paste there. Slack and Stripe issue their own, shown in their console, so those are pasted in. Either way you may instead name a credential you already saved.
+
+**A signature can be changed, and removed, without changing the URL.** A rotated secret or a wrong signature header is fixed in place. The alternative was deleting the webhook and re-pointing the sender at a new address. A webhook carries exactly one of the two verifiers, so adding a signature drops the token. Removing one mints a fresh token, shown once as before.
+
 A delivery becomes an event shaped `{summary, headers, payload}`. The sender's own body is under `payload`, so a trigger condition reads `payload.action`; the request headers you allow-listed are under `headers`, read as `headers.X-GitHub-Event`.
 
 **A sender will resend the same delivery**, and by default that emits the event again. GitHub retries a slow response and offers a Redeliver button, Stripe retries for days. Leaving it that way is a real choice: every arrival stays on the event log, so you can see how often a sender repeats itself. Switch on *delivery deduping* when you would rather each delivery counted once.
@@ -797,6 +814,16 @@ The window defaults to an hour and can go up to seven days. Setting it to `0` tu
 
 Only *this* endpoint's deliveries are compared, so two webhooks fed by the same sender both fire, as two subscriptions should.
 See also: *webhook*, *domain event*.
+
+### Ingress probe
+Lucidos knocking on its own public webhook address from outside, every 15 minutes, to check that a sender could still reach it. It sends one unsigned POST to a real *webhook* and expects to be turned away. A refusal is the good answer: it proves the whole path is alive, from the public relay through the *hook socket* to the verifier that said no.
+
+**It leaves the machine, and it probes every address on its own.** A check that talked to itself over loopback would pass while the outside world got nothing. The public name usually has several addresses, and a sender reaches exactly one of them, so each is probed separately and judged per address family. An IPv4 outage is an outage even while IPv6 answers perfectly, which is the failure this exists to catch.
+
+It runs only when there is something to protect: at least one enabled webhook, and a funnel actually serving the hook port. Two failed rounds in a row declare an outage, and one good round ends it. You see it as a bar across the app and a line on every enabled row in **Settings > Webhooks**.
+
+Lucidos reports and stops there. It emits `WebhookIngressDegraded` and `WebhookIngressRecovered`, once each per outage rather than per round, and a *trigger* is where you decide what to do about them. It never re-arms the funnel for you: that is your tailnet, and the fix depends on who was supposed to be delivering.
+See also: *webhook*, *trigger*, `system-knowhow/remote-access.md`.
 
 ### Workspace
 A user's complete Lucidos instance: one PostgreSQL database inside the shared

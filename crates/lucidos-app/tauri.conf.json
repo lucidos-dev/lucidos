@@ -32,7 +32,7 @@
     "category": "Productivity",
     "copyright": "© 2026 Kenneth Tiller",
     "shortDescription": "Your AI-native workspace",
-    "longDescription": "Lucidos is a local AI OS that keeps the apps you describe running, and acts when something happens. Talk, build, run, automate, and remember together in one place.",
+    "longDescription": "Lucidos builds and runs the apps and automations you describe, on your own machine, and acts when something happens. Talk, build, run, automate, and remember together in one place.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

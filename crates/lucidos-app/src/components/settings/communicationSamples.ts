@@ -11,6 +11,7 @@ import { restartDialogState, appUpdateDialogState } from '../../store/progressDi
 import type { ProgressDialogState } from '../../store/types';
 import type { AppUpdateRunning } from '../../utils/tauri';
 import type { DropdownOption } from '../shared/Dropdown';
+import type { WebhookIngressOutage } from '../../api/client';
 
 /** Everything the communication-surface gallery fires, kept out of the page so
  *  the page is layout and this is content.
@@ -92,6 +93,26 @@ export function sampleToastBurst(): void {
   setTimeout(sampleErrorToast, 600);
   setTimeout(sampleActionToast, 900);
 }
+
+// --- Banners ---
+
+/** The outage the ingress bar draws, at the shape of the real one.
+ *
+ *  One family down and the other healthy, because that is the case the bar
+ *  exists for. A both-families sample would read as an obvious outage. The
+ *  wording that matters is the wording for a path half of the internet still
+ *  reaches. Eight hours is the span the real failure ran for.
+ *
+ *  The other two banners take their sample inline on the page: each is a couple
+ *  of literal props. This one is a record, so it lives here with the rest of the
+ *  content. */
+export const SAMPLE_INGRESS_OUTAGE: WebhookIngressOutage = {
+  host: 'node.tailnet.ts.net',
+  port: 8443,
+  families: ['ipv4'],
+  down_since: '2026-08-26T22:10:00Z',
+  down_secs: 28_800,
+};
 
 // --- Dialogs ---
 

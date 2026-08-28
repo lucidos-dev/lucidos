@@ -47,7 +47,7 @@
     height: 100%;
     min-width: 0.125rem;
     cursor: pointer;
-    transition: opacity 0.15s ease;
+    transition: opacity var(--duration-fast) ease;
 }
 
 .memory-importance-segment.dimmed { opacity: 0.2; }

@@ -68,9 +68,10 @@ carried only while the agent is live, because a quiet thread has nothing to be
 carried toward.
 
 > **A turn control's reveal is the app's own rendering too.** Showing the step
-> log grows every turn. The anchor correction holds the reader's topmost line,
-> which pushes the end of the thread off the bottom. The two readings of "hold
-> them still" disagree only here, and the reader on the edge asked for the end.
+> log grows every turn. The anchor correction holds the control the reader
+> pressed, which pushes the end of the thread off the bottom. The two readings
+> of "hold them still" disagree only here, and the reader on the edge asked for
+> the end.
 > So the reveal reads the same two terms the growth branch does, ARMED and ON
 > THE EDGE (`readerKeepsTheLiveEdge`).
 

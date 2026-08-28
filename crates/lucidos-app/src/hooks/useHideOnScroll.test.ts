@@ -40,8 +40,10 @@ describe('--mobile-header-offset stays off the document root', () => {
 
   // The scroll-delta logic below is a hand-written MIRROR of the hook, so these
   // two keep the mirror honest about the anchored-reveal behaviour it pins.
-  it('gates the navigation reveal on the anchor kind', () => {
-    expect(hookSource).toMatch(/if \(!isAnchorScroll\(\)\) headerOffset = 0;/);
+  it('gates the navigation reveal on the anchor kind and the anchored position', () => {
+    expect(hookSource).toMatch(
+      /if \(!isAnchorScroll\(\) && !atAnchoredTop\) headerOffset = 0;/,
+    );
   });
 
   it('re-takes its baseline at the anchor write, not on the scroll event', () => {
@@ -84,6 +86,7 @@ function createScrollTracker(
 ) {
   let prevScrollTop = 0;
   let headerOffset = 0;
+  let anchoredTop = -1;
   const cachedHeight = 48;
   let currentPane: string | null = null;
   let currentViewKey: string | null = null;
@@ -100,25 +103,6 @@ function createScrollTracker(
   }
 
   function applyScrollDelta(scrollTop: number, scrollHeight: number, clientHeight: number) {
-    // One of our own navigations is writing scrollTop frame by frame (a chevron
-    // tap, turn-nav, a deep-link glide). Reset the header to visible rather than
-    // hiding it on the way down: those scroll events are not the reader.
-    if (isNavigationScroll()) {
-      const maxScroll = Math.max(0, scrollHeight - clientHeight);
-      prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
-      // An ANCHOR write is the exception: the app moved the container so the
-      // reader's own line would NOT move, so the chrome stays where they left
-      // it. Revealing it there covers that line.
-      if (!isAnchorScroll()) headerOffset = 0;
-      return;
-    }
-
-    const active = getActiveElement();
-    if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.tagName === 'SELECT')) {
-      // Only suppress if the focused input is in the same pane as the scroll container
-      if (active.pane === currentPane) return;
-    }
-
     // The iOS compositor-recovery nudge writes ±1px and puts it back a frame
     // later. Skip WITHOUT advancing prevScrollTop, so the round trip leaves the
     // baseline exactly where the user left it. A live drag overrides the window:
@@ -128,6 +112,31 @@ function createScrollTracker(
 
     const maxScroll = Math.max(0, scrollHeight - clientHeight);
     const clamped = Math.min(Math.max(0, scrollTop), maxScroll);
+
+    // Within a pixel of where the last anchor write left us. Anywhere else the
+    // reader has really moved, so the stamp is spent.
+    const atAnchoredTop = anchoredTop >= 0 && Math.abs(clamped - anchoredTop) <= 1;
+    if (!atAnchoredTop) anchoredTop = -1;
+
+    // One of our own navigations is writing scrollTop frame by frame (a chevron
+    // tap, turn-nav, a deep-link glide). Reset the header to visible rather than
+    // hiding it on the way down: those scroll events are not the reader.
+    if (isNavigationScroll()) {
+      prevScrollTop = clamped;
+      // An ANCHOR write is the exception: the app moved the container so the
+      // reader's own line would NOT move, so the chrome stays where they left
+      // it. Revealing it there covers that line. The kind is read from module
+      // state a later mark can overwrite, so the position answers it too.
+      if (!isAnchorScroll() && !atAnchoredTop) headerOffset = 0;
+      return;
+    }
+
+    const active = getActiveElement();
+    if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.tagName === 'SELECT')) {
+      // Only suppress if the focused input is in the same pane as the scroll container
+      if (active.pane === currentPane) return;
+    }
+
     const delta = clamped - prevScrollTop;
     headerOffset = clampOffset(headerOffset - delta);
     prevScrollTop = clamped;
@@ -139,6 +148,8 @@ function createScrollTracker(
     if (currentViewKey) {
       paneState[currentViewKey] = { headerOffset, prevScrollTop };
     }
+    // Stamped against the container we just left, so it says nothing here.
+    anchoredTop = -1;
 
     if (containerScrollTop !== null) {
       const key = viewKey ?? `pane-${Object.keys(paneState).length}`;
@@ -161,10 +172,12 @@ function createScrollTracker(
 
   /** The app re-based the container to hold the reader on the same content
    *  (`onAnchorScroll`). Re-take the baseline at the write, so the scroll event
-   *  it fires carries a delta of zero whenever it lands. */
+   *  it fires carries a delta of zero whenever it lands, and stamp the position
+   *  so the navigation path can recognise that event too. */
   function rebaseAnchor(scrollTop: number, scrollHeight: number, clientHeight: number) {
     const maxScroll = Math.max(0, scrollHeight - clientHeight);
     prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
+    anchoredTop = prevScrollTop;
   }
 
   /** Sync header to match container scroll position (used after keyboard dismiss). */
@@ -1068,14 +1081,14 @@ describe('useHideOnScroll recovery re-applies header transform', () => {
 
 describe('useHideOnScroll across an anchored reveal correction', () => {
   /* The step-log toggle changes the height of every turn. `withScrollAnchor`
-   * re-bases `scrollTop` by whatever grew or went away above the reader, so
-   * their own line does not move. That re-base is not the reader scrolling, and
-   * the header must not spend it.
+   * re-bases `scrollTop` by whatever grew or went away above the control the
+   * reader pressed, so that control does not move. That re-base is not the
+   * reader scrolling, and the header must not spend it.
    *
    * It is the one navigation that must NOT reveal the header either. The other
    * three land content on `.chat-exchange`'s `scroll-margin-top`, which clears
    * a VISIBLE header. This one lands the reader exactly where they already
-   * were, so revealing covers their own line by a header plus a thread title.
+   * were, so revealing covers what they pressed by a header and a thread title.
    *
    * Both halves are pinned, because each covers a case the other cannot. The
    * FLAG covers the scroll event that arrives inside the navigation window. The
@@ -1151,5 +1164,62 @@ describe('useHideOnScroll across an anchored reveal correction', () => {
     t.applyScrollDelta(2030, 8000, 800);
 
     expect(t.headerOffset).toBe(-18);
+  });
+
+  it('keeps the header hidden when a later mark has stolen the anchor kind', () => {
+    // The third half, and the one the other two cannot cover. The event lands
+    // inside the navigation window, so the re-based baseline is never read.
+    // Something marked after the anchor write, so the flag says placement. Only
+    // the POSITION still knows: the container sits where the anchor left it.
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+    expect(t.headerOffset).toBe(-48);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    navigating = true;
+    anchoring = false;
+    t.applyScrollDelta(2060, 8000, 800);
+
+    expect(t.headerOffset).toBe(-48);
+  });
+
+  it('spends the 1px repaint nudge without reading it as the reader moving', () => {
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    navigating = true;
+    t.applyScrollDelta(2059, 8000, 800);
+
+    expect(t.headerOffset).toBe(-48);
+  });
+
+  it('still reveals for a navigation that lands somewhere else', () => {
+    // The stamp must not outlive the position it was taken at. The next chevron
+    // tap would find the header stuck wherever the reader left it.
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    navigating = true;
+    t.applyScrollDelta(400, 8000, 800);
+
+    expect(t.headerOffset).toBe(0);
+  });
+
+  it('spends the stamp once the reader scrolls off the anchored position', () => {
+    const t = tracker();
+    t.switchContainer(0, 'thread');
+    t.applyScrollDelta(3000, 12000, 800);
+
+    t.rebaseAnchor(2060, 8000, 800);
+    t.applyScrollDelta(2400, 8000, 800); // the reader moves, of their own accord
+    navigating = true;
+    t.applyScrollDelta(2060, 8000, 800); // a navigation happens to come back
+
+    expect(t.headerOffset).toBe(0);
   });
 });

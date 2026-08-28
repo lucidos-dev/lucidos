@@ -1,4 +1,4 @@
-import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, releaseCheck } from '../store';
+import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, releaseCheck, settingsScrollTarget } from '../store';
 // The READ lives a layer up, where a surface can ask "is there an update?"
 // without importing this module's toasts, IPC and menu navigation.
 import { packagedUpdateVersion } from '../packagedUpdate';
@@ -23,6 +23,10 @@ import {
  *  a different one, so it owns the progress dialog instead
  *  (docs/plans/2026-08-13-toast-banner-dialog-taxonomy.md). */
 const UPDATE_TOAST_KEY = 'app-update-available';
+
+/** Why a check could not run, when the INSTALL is the reason rather than the
+ *  session. A source checkout is the everyday case, and it never polls. */
+const NO_CHECK_HERE = 'this install has no update check';
 
 let installing = false;
 /** Unsubscribe for the progress event, or `null` when not subscribed. */
@@ -67,24 +71,26 @@ export type UpdateCheckVerdict =
 
 /** Surface the "Lucidos <v> available" offer.
  *
- *  The install action appears only where an install is possible: a Tauri client
- *  fronting a `desktop-app` install. A browser or PWA session can install
- *  nothing, so it gets the version and no button. A headless install gets a
- *  route to the command instead, which lives in Settings, System.
+ *  It always carries an action, which is the rule this whole module keeps: no
+ *  surface may announce a release without saying how to get it. Which action is
+ *  {@link updateRoute}'s answer, so the toast, What's New and Settings cannot
+ *  disagree about what taking this update takes.
+ *
+ *  The wording is sentence case, as every other toast action is. The buttons in
+ *  Settings are Title Case, as every other `.action-btn` is. One route, two
+ *  typographic conventions.
  *
  *  Extracted so the cancel path can put the offer straight back: abandoning a
  *  download abandons the attempt, not the update. */
-function offerAppUpdate(version: string, install?: string | null): void {
-  // One derivation of what this session can do about the offer. Two spreads
-  // that both wrote `action` could not express that.
-  const action = isTauri() && install !== 'installer-rerun'
-    ? { label: 'Update & restart', onClick: () => { void installAppUpdate(); } }
-    : install === 'installer-rerun'
-      ? { label: 'How to update', onClick: () => { openSettingsSubview('system'); } }
-      : null;
+function offerAppUpdate(version: string): void {
+  const route = updateRoute(true);
+  const action = {
+    label: route === 'install' ? 'Update & restart' : 'How to update',
+    onClick: () => { void followUpdateRoute(route); },
+  };
   showToast(`Lucidos ${version} available`, 'info', {
     key: UPDATE_TOAST_KEY,
-    ...(action ? { action } : {}),
+    action,
     // "What is in it?" is the question an update offer raises, and answering it
     // is not the same click as taking the update. Rendered only when notes are
     // known, so the control never opens onto nothing. The gateway carries none,
@@ -116,7 +122,7 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
     // Nothing was written to disk, so the update is still available — re-offer it
     // rather than leaving the user with a silently vanished toast.
     const version = frame.version ?? packagedUpdateVersion();
-    if (version) offerAppUpdate(version, releaseCheck.value?.latest?.install ?? null);
+    if (version) offerAppUpdate(version);
     else removeToast(UPDATE_TOAST_KEY);
     return;
   }
@@ -224,6 +230,11 @@ export async function refreshReleaseCheck(force = false): Promise<UpdateCheckVer
   // Available row cannot end up describing a different release. The origin may
   // carry none, and then there is simply no link.
   latestTauriAppNotes.value = latest?.notes ?? null;
+  // A gateway that MAY not poll returns an untouched snapshot, and reading that
+  // as "up to date" is a claim nothing supports: it never asked. `supported` is
+  // false for a source checkout, and for a target we publish nothing for.
+  // `may_poll` refuses both however hard the caller forces (ADR 0108).
+  if (!releaseCheck.value.supported) return { kind: 'failed', reason: NO_CHECK_HERE };
   if (!latest) {
     // A stale answer plus a failed poll is not "up to date": the gateway has
     // nothing newer to report BECAUSE it could not ask.
@@ -238,7 +249,7 @@ export async function refreshReleaseCheck(force = false): Promise<UpdateCheckVer
   // asking again after dismissing the toast produced nothing at all.
   if (lastOfferedVersion !== latest.version || force) {
     lastOfferedVersion = latest.version;
-    offerAppUpdate(latest.version, latest.install);
+    offerAppUpdate(latest.version);
   }
   return { kind: 'available', version: latest.version };
 }
@@ -264,7 +275,60 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
   return inFlightCheck;
 }
 
-/** The label an update control wears, in all three of its states.
+/** What a surface can offer about a release newer than the one running.
+ *
+ *  Three answers, and deliberately never "nothing" (ADR 0142). A surface may
+ *  not say a newer release exists and then leave the reader no way to get it.
+ *  That is what What's New did for every release the updater had not offered.
+ *
+ *  - `install`: take it here. A Tauri client fronting a bundle.
+ *  - `check`: no offer yet, and this session has a check it can run.
+ *  - `guide`: the answer is on Settings, System. It carries the installer
+ *    command for a headless install, and the rebuild for a source checkout. */
+export type UpdateRoute = 'install' | 'check' | 'guide';
+
+/** Could this session install an offer, if one existed?
+ *
+ *  A Tauri client fronting a bundle can. A browser or PWA session has no IPC to
+ *  invoke, and a headless install is updated by re-running `install.sh`.
+ *
+ *  It SUBTRACTS `installer-rerun` rather than requiring `desktop-app`, and the
+ *  asymmetry is deliberate. `install` describes the GATEWAY's own layout, while
+ *  `isTauri()` is what answers "can this session install". A Tauri client is a
+ *  bundle by construction. Requiring `desktop-app` would only withhold a working
+ *  button: from a layout the gateway failed to recognise, and from a dev client
+ *  with no `latest`. See `docs/code-review-priors.md`. */
+export function sessionCanInstall(): boolean {
+  return isTauri() && releaseCheck.value?.latest?.install !== 'installer-rerun';
+}
+
+/** Can this session ask, right now, whether a newer release is published?
+ *
+ *  The gateway is authoritative once it has answered. `supported` is false for a
+ *  source checkout and for a target Lucidos publishes nothing for, and
+ *  `may_poll` refuses either way (ADR 0108). Offering a check there would be a
+ *  button that errors every time it is pressed.
+ *
+ *  With no gateway answer at all, the client's own updater is the ADR 0105
+ *  fallback. That covers a gateway too old to carry the field, and a direct
+ *  engine port with no gateway in front of it. */
+export function canCheckForUpdatesHere(): boolean {
+  const check = releaseCheck.value;
+  return check ? check.supported : isTauri();
+}
+
+/** Which route this session takes to a newer release.
+ *
+ *  `offered` says whether there is an offer to act on. It defaults to the
+ *  updater's own answer, and a caller holding an offer already passes `true`.
+ *  That matters on the client-check path, where the offer is in hand before the
+ *  signals it would be re-derived from have settled. */
+export function updateRoute(offered: boolean = packagedUpdateVersion() !== null): UpdateRoute {
+  if (offered) return sessionCanInstall() ? 'install' : 'guide';
+  return canCheckForUpdatesHere() ? 'check' : 'guide';
+}
+
+/** The label an update BUTTON wears, in all four of its states.
  *
  *  Every word here, so Settings and What's New cannot drift apart. Handing each
  *  surface its own idle string is what let them ship as "Check for Updates" and
@@ -272,9 +336,28 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
  *
  *  Paired with `disabled`, the in-flight word is also the whole of the feedback
  *  a fast check needs. A spinner would be a second gate on top of this one. */
-export function updateControlLabel(checking: boolean, canInstall: boolean): string {
+export function updateControlLabel(route: UpdateRoute, checking: boolean): string {
   if (checking) return 'Checking…';
-  return canInstall ? 'Update & Restart' : 'Check for Updates';
+  if (route === 'install') return 'Update & Restart';
+  return route === 'check' ? 'Check for Updates' : 'How to Update';
+}
+
+/** Do what a route says. The click behind every label above.
+ *
+ *  `guide` lands on Settings, System and scrolls to Maintenance, which is where
+ *  the installer command, the update button and the rebuild control all live.
+ *  Nothing else in the app holds the whole account of how an install updates. */
+export async function followUpdateRoute(route: UpdateRoute): Promise<void> {
+  if (route === 'install') {
+    await installAppUpdate();
+    return;
+  }
+  if (route === 'check') {
+    reportUpdateCheck(await checkForUpdatesNow());
+    return;
+  }
+  settingsScrollTarget.value = 'system:maintenance';
+  openSettingsSubview('system');
 }
 
 /** Say what a user-initiated check concluded.
@@ -329,7 +412,7 @@ export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
     latestTauriAppVersion.value = offer.version;
     latestTauriAppNotes.value = offer.notes;
     clientOwnsLatestVersion = true;
-    offerAppUpdate(offer.version, 'desktop-app');
+    offerAppUpdate(offer.version);
     return { kind: 'available', version: offer.version };
   }
   if (clientOwnsLatestVersion) {
@@ -343,21 +426,11 @@ export async function checkAppUpdateViaClient(): Promise<UpdateCheckVerdict> {
 /** Can THIS session install the offered update itself?
  *
  *  An offer exists for every install shape, but only a Tauri client fronting a
- *  bundle can act on one. A browser or PWA session has no IPC to invoke, and a
- *  headless install is updated by re-running `install.sh`. Both would otherwise
- *  reach the Tauri updater through a button labelled "Check for Updates".
- *
- *  One derivation, shared by the button's label and by what its click does.
- *
- *  It SUBTRACTS `installer-rerun` rather than requiring `desktop-app`, and the
- *  asymmetry is deliberate. `install` describes the GATEWAY's own layout, while
- *  `isTauri()` is what answers "can this session install". A Tauri client is a
- *  bundle by construction. Requiring `desktop-app` would only withhold a working
- *  button: from a layout the gateway failed to recognise, and from a dev client
- *  with no `latest`. See `docs/code-review-priors.md`. */
+ *  bundle can act on one. Both halves: there must BE an offer, and the session
+ *  must be able to take it. {@link sessionCanInstall} owns the second half and
+ *  documents why it subtracts `installer-rerun`. */
 export function canInstallUpdateHere(): boolean {
-  if (!packagedUpdateVersion() || !isTauri()) return false;
-  return releaseCheck.value?.latest?.install !== 'installer-rerun';
+  return packagedUpdateVersion() !== null && sessionCanInstall();
 }
 
 /** Install the available packaged update and restart the whole stack. This runs on

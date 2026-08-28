@@ -32,6 +32,30 @@ export interface WorkspaceStatus {
    *  for a RUNNING (healthy, polled) engine — the gateway has no DB handle, so a
    *  stopped workspace reports no count. Omitted (not 0) when unknown. */
   unread_count?: number;
+  /** What this workspace's engine says about its backups, for the picker's
+   *  per-row backup line. Present only for a RUNNING engine, on exactly the
+   *  terms `unread_count` is: the gateway holds no DB handle, so with nothing to
+   *  ask it reports nothing rather than calling a workspace un-backed-up.
+   *
+   *  Absent ALSO means an engine too old to answer, which reads the same way.
+   *  A present object with a null `at` is the opposite: a real answer saying
+   *  this workspace has never backed up. */
+  last_successful_backup?: LastSuccessfulBackup;
+}
+
+/** One workspace's backup line. Mirrors the gateway's `LastSuccessfulBackup`,
+ *  which forwards the engine's `/backup/last-successful` answer verbatim. */
+export interface LastSuccessfulBackup {
+  /** When the newest successful backup run finished (RFC 3339), or null when
+   *  there has never been one. */
+  at: string | null;
+  /** The ENGINE's verdict that `at` is too old, or absent. Read rather than
+   *  re-derived: the threshold lives once, in `core::backup`. */
+  stale: boolean;
+  /** Whether backups are set up here at all (a destination and an active
+   *  schedule). It separates a schedule that has never produced an archive from
+   *  a workspace nobody set backups up for. */
+  configured: boolean;
 }
 
 async function controlJson<T>(path: string, init?: RequestInit): Promise<T> {

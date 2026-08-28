@@ -372,6 +372,51 @@ describe('same overlay with different menuItem is treated as duplicate', () => {
   });
 });
 
+describe('an app fragment is a move in place, not a nav entry', () => {
+  const app = { id: 'pr-understanding' } as any;
+
+  it('opening the same app at a different fragment adds no entry', () => {
+    // Back must never walk a step that changes nothing on screen. Moving
+    // inside an open panel is a mutation in place, like the diff split-view.
+    const stack = [
+      makeEntry(),
+      makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1645' } }),
+    ];
+    const result = pushEntry(stack, 1, makeEntry({
+      overlay: { type: 'app-ui', app, fragment: 'pr-1700' },
+    }));
+    expect(result).toBeNull();
+  });
+
+  it('a deduped push followed by a replace keeps the NEWEST fragment', () => {
+    // What `openApp` does when the app was already open. Without the replace a
+    // reload would restore the first target the reader followed, not the last.
+    const stack = [
+      makeEntry(),
+      makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1645' } }),
+    ];
+    const moved = makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1700' } });
+    expect(pushEntry(stack, 1, moved)).toBeNull();
+
+    const replaced = [...stack];
+    replaced[1] = moved;
+    expect(replaced).toHaveLength(2);
+    expect(replaced[1].overlay).toEqual({ type: 'app-ui', app, fragment: 'pr-1700' });
+  });
+
+  it('a different app still pushes, fragment or not', () => {
+    const stack = [
+      makeEntry(),
+      makeEntry({ overlay: { type: 'app-ui', app, fragment: 'pr-1645' } }),
+    ];
+    const result = pushEntry(stack, 1, makeEntry({
+      overlay: { type: 'app-ui', app: { id: 'habit-tracker' } as any, fragment: 'pr-1645' },
+    }));
+    expect(result).not.toBeNull();
+    expect(result!.stack).toHaveLength(3);
+  });
+});
+
 describe('overlay-only changes are accepted by pushEntry (regression guard)', () => {
   it('pushEntry accepts a url-preview-only change as a new entry', () => {
     const stack = [

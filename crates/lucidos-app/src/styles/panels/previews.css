@@ -166,6 +166,31 @@
     padding: 0.75rem;
 }
 
+/* Warns that the open handshake script will not run (ADR 0144). Tinted with
+   the accent rather than a warning colour, because there is no warning token
+   and inventing one for a single notice would be a theme decision made in the
+   wrong place. */
+.file-preview-notice {
+    margin-bottom: var(--space-md);
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border-color));
+    border-radius: 0.375rem;
+    background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+}
+
+.file-preview-notice code {
+    /* The command is meant to be selected and pasted, so it keeps the mono
+       face and a background that separates it from the sentence. */
+    padding: 0 0.25rem;
+    border-radius: 0.25rem;
+    background: var(--bg-secondary);
+    font-family: var(--font-mono);
+    word-break: break-all;
+}
+
 /* The image body of any file preview (components/files/PreviewImage.tsx). It
    is scaled to fit the pane, so the cursor advertises the click that opens it
    full size in the image popup. */
@@ -701,7 +726,7 @@
     cursor: pointer;
     border-radius: 0.25rem;
     padding: 0.125rem 0.375rem;
-    transition: background-color 0.15s;
+    transition: background-color var(--duration-fast);
 }
 
 @media (hover: hover) {
@@ -735,7 +760,7 @@
        (chat/input-messages.css `.prompt-row .prompt-textarea`). */
     border: var(--prompt-box-border-width) solid color-mix(in srgb, var(--border-color) 50%, transparent);
     border-radius: 1rem;
-    transition: border-color 0.5s ease;
+    transition: border-color var(--duration-emphasis) ease;
 }
 
 .prompt-box:focus-within {

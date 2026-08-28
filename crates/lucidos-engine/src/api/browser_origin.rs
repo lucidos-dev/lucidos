@@ -5,16 +5,30 @@
 //!
 //! # This is not an authorizer
 //!
-//! Nothing here decides *who* is calling. The gateway owns that (ADR 0094), and
-//! an engine binds loopback, so its callers are processes on this machine. The
-//! one caller it cannot otherwise tell apart is a page on another origin,
-//! driving that loopback port out of the user's own browser. CORS does not stop
-//! such a request. It only stops the page reading the reply.
+//! Nothing here decides *who* is calling. The gateway owns that (ADR 0094).
+//! Every engine binds loopback by default, so its callers are processes on this
+//! machine. The one caller it cannot otherwise tell apart is a page on another
+//! origin, driving that loopback port out of the user's own browser. CORS does
+//! not stop such a request. It only stops the page reading the reply.
 //!
 //! So the question is narrow: did this come from our own origin?
 //! `Sec-Fetch-Site` answers it unforgeably, since a browser sets it and page
 //! JavaScript cannot. A caller with no fetch metadata is not a browser, and is
 //! left to the bind topology.
+
+//! # What a wide bind costs
+//!
+//! "Left to the bind topology" holds only while the bind IS loopback. Three
+//! settings widen it: `LUCIDOS_BIND_ALL` and `LUCIDOS_BIND_ADDR` on the engine,
+//! and `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` on the gateway that spawns it.
+//! ADR 0096 made loopback the default for dev and packaged alike, and nothing
+//! in the repo sets any of the three.
+//!
+//! Widen it and this gate defends nothing extra. A network client sends no
+//! fetch metadata, so it reads exactly like the CLI and passes. Nor is there a
+//! second lock behind this one. The API is unauthenticated by design, on the
+//! premise that reaching it proves you are local. A wide bind retires that
+//! premise, so it opens the whole API to that network.
 
 //! # An app iframe passes, deliberately
 //!
@@ -60,9 +74,10 @@ pub fn browser_request_allowed(headers: &HeaderMap) -> bool {
     }
 
     // No fetch metadata. Either a non-browser client (also no Origin) → allow,
-    // the bind topology is its boundary, or a legacy pre-fetch-metadata browser
-    // that still sends `Origin`. Those are HTTP/1.1, so a plain `Host` header is
-    // present; fall back to the same-origin comparison.
+    // with the bind as its only boundary (module doc, "What a wide bind costs"),
+    // or a legacy pre-fetch-metadata browser that still sends `Origin`. Those
+    // are HTTP/1.1, so a plain `Host` header is present; fall back to the
+    // same-origin comparison.
     let Some(origin) = origin else {
         return true;
     };

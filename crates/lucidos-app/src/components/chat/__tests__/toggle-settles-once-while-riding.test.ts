@@ -254,10 +254,10 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
    *  want to see what they expanded.
    *
    *  A reader sitting ON the live edge is the exception, and the two answers
-   *  cannot both be given. Rows revealed between their topmost line and the end
-   *  of the thread push that end off the bottom. So holding the line is what
-   *  moves them. ADR 0064 decides it: an armed reader on the live edge is kept
-   *  there, running thread or quiet one.
+   *  cannot both be given. Rows revealed between the pressed control and the
+   *  end of the thread push that end off the bottom. So holding the control is
+   *  what moves them. ADR 0064 decides it: an armed reader on the live edge is
+   *  kept there, running thread or quiet one.
    *
    *  BOTH halves have to agree, or the reader gets neither treatment. The snap
    *  lives in `honourAnchoredMutation` and the skip lives in `withScrollAnchor`.

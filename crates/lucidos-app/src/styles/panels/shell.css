@@ -37,7 +37,7 @@
     background: var(--titlebar-strip-bg);
 }
 
-/* ─── App-shell banners (backup reminder, connection) ─── */
+/* ─── App-shell banners (backup reminder, connection, webhook ingress) ─── */
 
 /* A persistent bar between the header and the panes, for a condition that stays
    true until something changes. Deliberately not a toast, which reads as
@@ -48,14 +48,15 @@
    flow sibling would sit behind the header. These rules serve both, since the
    mobile header is already a stretch column.
 
-   Both wear a soft wash of their state colour over the surface with the neutral
-   border kept, matching the Settings backup health card's warning state. NO
-   colored left stripe on either: banned outright by
+   All three wear a soft wash of their state colour over the surface with the
+   neutral border kept, matching the Settings backup health card's warning state.
+   NO colored left stripe on any of them: banned outright by
    .claude/rules/frontend-css.md. The wash strength is one shared token, so the
-   two bars cannot drift apart and the live style remote has one knob for the
+   bars cannot drift apart and the live style remote has one knob for the
    family. */
 .backup-reminder,
-.connection-banner {
+.connection-banner,
+.ingress-banner {
     flex: none;
     display: flex;
     align-items: center;
@@ -142,6 +143,41 @@
     color: var(--accent-red);
 }
 
+/* The webhook ingress bar. Red, on the same wash as a settled disconnect,
+   because the fault is LIVE rather than a risk for later. A delivery sent
+   right now never reaches the workspace. The backup reminder's amber would
+   file it beside a nag, which is how eight hours of silence went unnoticed in
+   the first place.
+
+   No dot. The .status-dot scale is the connection light's vocabulary, and this
+   bar says nothing about whether THIS client can reach the workspace. */
+.ingress-banner {
+    background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
+    line-height: var(--banner-line-height);
+}
+
+/* Takes the slack so the button sits at the trailing edge, and wraps rather
+   than truncating: the sentence names the address family, which is the one
+   thing a half-read version would drop. */
+.ingress-banner-text {
+    flex: 1;
+    min-width: 0;
+}
+
+/* The headline at full strength, so the sentence after it reads as the
+   explanation. Matches the connection bar's treatment of the same two halves. */
+.ingress-banner b {
+    font-weight: 600;
+    color: var(--accent-red);
+}
+
+/* The button keeps its width against a wrapping sentence. .action-btn sets
+   white-space: nowrap and a 3.5rem min-width, so a shrinking flex item would
+   clip its own label rather than wrap it. */
+.ingress-banner .action-btn {
+    flex: none;
+}
+
 /* ─── Content row (thread drawer + split layout) ─── */
 
 .content-row {
@@ -207,7 +243,7 @@
     flex-shrink: 0;
     position: relative;
     z-index: 2;
-    transition: background-color 0.15s;
+    transition: background-color var(--duration-fast);
     touch-action: none;
 }
 

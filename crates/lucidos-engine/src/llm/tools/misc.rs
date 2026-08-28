@@ -92,6 +92,10 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "Required when target is 'app'."
                 },
+                "fragment": {
+                    "type": "string",
+                    "description": "A place inside the app; 'app' only. Arrives as its location.hash, so the app routes to that item. Pass it whenever you name one."
+                },
                 "file_path": {
                     "type": "string",
                     "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). In a registered repository clone: 'repo:<repoId>:file:<path>' at HEAD, or 'repo:<repoId>:file#<ref>:<path>' for a branch, tag or sha."

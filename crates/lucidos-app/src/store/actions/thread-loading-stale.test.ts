@@ -38,6 +38,7 @@ import {
   markLoadedThreadsStale,
   refreshStaleThreadEvents,
   refreshThreadEvents,
+  threadEventsStillArriving,
 } from './thread-loading';
 import { focusThread } from './threads';
 import { fetchThreadEvents } from '../../api/threads';
@@ -290,5 +291,72 @@ describe('focusThread', () => {
     await settle();
 
     expect(fetchEvents).not.toHaveBeenCalled();
+  });
+});
+
+describe('threadEventsStillArriving', () => {
+  // What a *deep link* asks before calling its target missing. A change tapped
+  // from the Changes panel was reported as "not shown in this thread" four
+  // seconds after the tap. The fetch that would show it was still running.
+  it('is true for a thread whose events have never loaded', () => {
+    putThreads([['t1', makeThreadState('t1')]]);
+    expect(threadEventsStillArriving('t1')).toBe(true);
+  });
+
+  it('is true through a load that is still retrying', async () => {
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockRejectedValue(new Error('boom'));
+
+    void loadThreadEvents('t1');
+    await settle();
+
+    // Sitting in the backoff between attempts, and more events are still coming.
+    expect(threadEventsStillArriving('t1')).toBe(true);
+  });
+
+  it('is true with no claim standing, when the events are simply not loaded', async () => {
+    // A resume clears every fetch guard, so a request WebKit left hanging holds
+    // no claim. `eventsLoaded` false is the term that covers it.
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockImplementation(() => new Promise(() => {})); // never settles
+    void loadThreadEvents('t1');
+    await settle();
+
+    clearThreadFetchGuards();
+
+    expect(threadEventsStillArriving('t1')).toBe(true);
+  });
+
+  it('is true while a REFRESH catches up a thread already loaded', async () => {
+    // The iOS PWA wake shape: the transcript is on screen, and the events the
+    // device missed are still on their way.
+    putThreads([['t1', loaded('t1')]]);
+    let release: (() => void) | null = null;
+    fetchEvents.mockImplementation(() => new Promise((resolve) => {
+      release = () => resolve({ events: [], currentAggregate: null });
+    }));
+    markLoadedThreadsStale();
+
+    void refreshThreadEvents('t1');
+    expect(threadEventsStillArriving('t1')).toBe(true);
+
+    release!();
+    await settle();
+    expect(threadEventsStillArriving('t1')).toBe(false);
+  });
+
+  it('is false once the events are loaded and nothing is in flight', () => {
+    putThreads([['t1', loaded('t1')]]);
+    expect(threadEventsStillArriving('t1')).toBe(false);
+  });
+
+  it('is false when the load gave up and said so', () => {
+    // A verdict is owed here: nothing more is coming.
+    putThreads([['t1', makeThreadState('t1', { eventsLoadFailed: true })]]);
+    expect(threadEventsStillArriving('t1')).toBe(false);
+  });
+
+  it('is false for a thread that has left the map', () => {
+    expect(threadEventsStillArriving('gone')).toBe(false);
   });
 });

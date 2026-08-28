@@ -55,6 +55,53 @@ export function formatTimeAgo(date: Date): string {
   return formatShortDate(date);
 }
 
+/** "just now", "3 minutes ago", "8 hours ago", "5 days ago": the same fact as
+ *  `formatTimeAgo`, spelled out for the middle of a sentence.
+ *
+ *  Both exist because the two registers read wrong in each other's place. "3h
+ *  ago" is right in a dense column and wrong inside a clause, where the reader
+ *  is already reading words.
+ *
+ *  It takes `now` rather than reading the clock, so a caller can test what it
+ *  says. It never falls back to a date: a caller that wants one past some age
+ *  asks for it itself. */
+export function formatAgoPhrase(then: Date, now: Date): string {
+  const seconds = Math.max(0, Math.floor((now.getTime() - then.getTime()) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return agoWords(minutes, 'minute');
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return agoWords(hours, 'hour');
+  return agoWords(Math.floor(hours / 24), 'day');
+}
+
+function agoWords(count: number, unit: string): string {
+  return `${countWords(count, unit)} ago`;
+}
+
+/** "under a minute", "3 minutes", "8 hours", "5 days": a SPAN, spelled out for
+ *  the middle of a sentence.
+ *
+ *  The word half of `formatElapsed`, which is a dense live counter. This one is
+ *  read once inside a clause, so it drops the smaller unit instead of carrying
+ *  both.
+ *
+ *  It takes seconds, not milliseconds, because a caller reads a span the server
+ *  measured. Inventing a precision it never sent would be a lie about the
+ *  measurement. */
+export function formatDurationPhrase(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 60) return 'under a minute';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return countWords(minutes, 'minute');
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return countWords(hours, 'hour');
+  return countWords(Math.floor(hours / 24), 'day');
+}
+
+function countWords(count: number, unit: string): string {
+  return `${count} ${unit}${count === 1 ? '' : 's'}`;
+}
+
 /** "14:30" — short HH:MM time in user's timezone */
 export function formatShortTime(date: Date): string {
   const tz = getUserTimezone();

@@ -27,7 +27,7 @@
 import { WORKSPACE_ID } from '../../utils/basePath';
 import { escapeHtmlAttr } from '../../utils/markedConfig';
 import {
-  extractAppIdFromHref,
+  extractAppTargetFromHref,
   extractNavTargetFromHref,
   extractLocalFileTarget,
   extractTriggerIdFromHref,
@@ -69,7 +69,9 @@ export interface PreviewLinkContext {
 export type PreviewLinkAction =
   | { kind: 'fragment'; id: string }
   | { kind: 'thread'; workspace: string | undefined; threadId: string }
-  | { kind: 'app'; appId: string }
+  /** `fragment` is the app fragment the link named, absent when it named
+   *  none. An artifact citing one item inside a shared app carries it. */
+  | { kind: 'app'; appId: string; fragment?: string }
   | { kind: 'trigger'; triggerId: string }
   | { kind: 'nav'; target: string }
   | { kind: 'local-file'; target: string }
@@ -208,8 +210,8 @@ export function classifyPreviewLink(
     return { kind: 'external', url: href };
   }
 
-  const appId = extractAppIdFromHref(href);
-  if (appId) return { kind: 'app', appId };
+  const appTarget = extractAppTargetFromHref(href);
+  if (appTarget) return { kind: 'app', appId: appTarget.appId, fragment: appTarget.fragment ?? undefined };
   // `trigger:` is a scheme, so without this arm the guard below hands it back
   // to the browser and the link dead-ends. Same shape as the `repo:` arm.
   const triggerId = extractTriggerIdFromHref(href);
@@ -289,7 +291,7 @@ function runPreviewLinkAction(action: PreviewLinkAction, doc: Document): void {
       openThreadAcrossWorkspaces(action.workspace, action.threadId);
       return;
     case 'app':
-      void openAppById(action.appId, 'a file preview');
+      void openAppById(action.appId, 'a file preview', action.fragment);
       return;
     case 'trigger':
       handleNavigationRequest(

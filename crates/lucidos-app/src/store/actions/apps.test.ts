@@ -14,11 +14,15 @@ const mockListAppsApi = vi.fn().mockResolvedValue([]);
 vi.mock('../../api/client', () => ({
   postAppCapture: (...args: unknown[]) => mockPostAppCapture(...args),
   listAppsApi: (...args: unknown[]) => mockListAppsApi(...args),
-  appUrl: vi.fn((id: string) => `/app/${id}/`),
+  appUrl: vi.fn((id: string, tid?: string, fragment?: string) =>
+    `/app/${id}/${tid ? `?thread_id=${tid}` : ''}${fragment ? `#${fragment}` : ''}`),
 }));
 
+const mockPushNavState = vi.fn();
+const mockReplaceNavState = vi.fn();
 vi.mock('./navigation', () => ({
-  pushNavState: vi.fn(),
+  pushNavState: (...args: unknown[]) => mockPushNavState(...args),
+  replaceNavState: (...args: unknown[]) => mockReplaceNavState(...args),
 }));
 
 const notesApp: App = {
@@ -341,6 +345,137 @@ describe('openAppById', () => {
 
     expect(panelOverlay.value).toEqual({ type: 'app-ui', app: notesApp });
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+});
+
+const APP_DOC = 'https://host.example/ws/app/notes-app/';
+
+describe('openApp carries an app fragment', () => {
+  let origQuerySelectorAll: typeof document.querySelectorAll;
+  let frameLocation: { href: string; replace: ReturnType<typeof vi.fn> };
+
+  /** One mounted app iframe whose live URL can drift, the way a real app moves
+   *  itself with `history.replaceState`. */
+  function mountFrame(hash: string): void {
+    frameLocation = {
+      href: `${APP_DOC}${hash}`,
+      replace: vi.fn((url: string) => { frameLocation.href = url; }),
+    };
+    const frame = {
+      contentWindow: { location: frameLocation },
+      getBoundingClientRect: () => ({ width: 800, height: 600, top: 0, left: 0, bottom: 600, right: 800 }),
+      closest: () => null,
+    };
+    document.querySelectorAll = vi.fn().mockReturnValue([frame]);
+  }
+
+  beforeEach(() => {
+    panelOverlay.value = null;
+    inputMode.value = { type: 'do' };
+    wipPreviewThreadId.value = null;
+    appRefreshKey.value = 0;
+    mockPushNavState.mockClear();
+    mockReplaceNavState.mockClear();
+    origQuerySelectorAll = document.querySelectorAll;
+    document.querySelectorAll = vi.fn().mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    document.querySelectorAll = origQuerySelectorAll;
+    panelOverlay.value = null;
+  });
+
+  it('stores the fragment on the overlay and feeds it to the frame src', async () => {
+    const { openApp, getAppFrameSrc } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+
+    expect(panelOverlay.value).toEqual({ type: 'app-ui', app: notesApp, fragment: 'pr-1645' });
+    expect(getAppFrameSrc()).toBe('/app/notes-app/#pr-1645');
+  });
+
+  it('leaves the src fragment-free when the link named no target', async () => {
+    const { openApp, getAppFrameSrc } = await import('./apps');
+    openApp(notesApp);
+
+    expect(getAppFrameSrc()).toBe('/app/notes-app/');
+  });
+
+  it('puts the fragment after the WIP-preview query', async () => {
+    // Only the fragment survives the engine's WIP-preview rewrite, so the
+    // order is what makes a target reach an app served from a worktree.
+    // Seeded the way the preserveWip tests are: the wipPreview effect clears
+    // WIP for a thread the map does not hold.
+    const thread = makeOptimisticThreadState({
+      id: 'wip-thread-9',
+      title: 'fix it',
+      channel: 'claude_code',
+      initiator: 'user',
+      eventsLoaded: true,
+      codingAgentKind: 'app',
+      codingAgentFolder: '/data/apps/notes-app',
+    });
+    threadMap.value = new Map([['wip-thread-9', thread]]);
+    threadsLoaded.value = true;
+    focusedThreadId.value = 'wip-thread-9';
+
+    const { openApp, getAppFrameSrc } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+    wipPreviewThreadId.value = 'wip-thread-9';
+
+    expect(getAppFrameSrc()).toBe('/app/notes-app/?thread_id=wip-thread-9#pr-1645');
+
+    focusedThreadId.value = null;
+    threadsLoaded.value = false;
+    threadMap.value = new Map();
+  });
+
+  it('does not touch a mounted frame on a COLD open', async () => {
+    // A cold open navigates the frame to a src that already carries the
+    // fragment. Moving it here as well would be a second, pointless move.
+    mountFrame('#pr-1700');
+    const { openApp } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+
+    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1700`);
+    expect(mockReplaceNavState).not.toHaveBeenCalled();
+  });
+
+  it('hands the fragment to the live frame when the app was ALREADY open', async () => {
+    // The same link clicked twice. The app reflected its own selection back, so
+    // the src is unchanged and no render-driven delivery would ever fire.
+    const { openApp } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+    mountFrame('#pr-1700');
+
+    openApp(notesApp, 'pr-1645');
+
+    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1645`);
+  });
+
+  it('moves nobody when the second open names no target', async () => {
+    // A plain app link leaves an open app on whatever the reader was reading.
+    // That is why an absent fragment is not the empty string.
+    const { openApp } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+    mountFrame('#pr-1700');
+
+    openApp(notesApp);
+
+    expect(frameLocation.href).toBe(`${APP_DOC}#pr-1700`);
+    expect(frameLocation.replace).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the kept nav entry instead of adding one for a move in place', async () => {
+    // `pushNavState` dedupes on app id, so without the replace the stack would
+    // keep the FIRST fragment and a reload would land on a stale report.
+    const { openApp } = await import('./apps');
+    openApp(notesApp, 'pr-1645');
+    expect(mockReplaceNavState).not.toHaveBeenCalled();
+
+    openApp(notesApp, 'pr-1700');
+
+    expect(mockReplaceNavState).toHaveBeenCalledTimes(1);
+    expect(panelOverlay.value).toEqual({ type: 'app-ui', app: notesApp, fragment: 'pr-1700' });
   });
 });
 

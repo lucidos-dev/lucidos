@@ -226,10 +226,6 @@ pub async fn list_backups(
     Ok(Json(entries))
 }
 
-/// A backup is "stale" once the newest cloud backup is older than this (or none
-/// exists at all). 24h matches the most aggressive built-in schedule.
-const BACKUP_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
-
 /// Aggregated backup health for the Settings → Backup page. Answers: is a backup
 /// running right now, did the last run succeed or fail (and when), and how old is
 /// the last good cloud backup. Survives engine restarts because `last_run` and
@@ -272,7 +268,7 @@ fn build_backup_status(
         .as_ref()
         .map(|b| (now - b.created_at).num_seconds());
     // No backup at all is the worst kind of stale (engine down at cron time).
-    let stale = age_seconds.is_none_or(|age| age > BACKUP_STALE_AFTER_SECONDS);
+    let stale = age_seconds.is_none_or(|age| age > backup::BACKUP_STALE_AFTER_SECONDS);
 
     BackupStatusResponse {
         running,
@@ -304,6 +300,71 @@ pub async fn get_backup_status(
         running,
         last_run,
         list_result,
+        chrono::Utc::now(),
+    )))
+}
+
+/// One workspace's backup posture, in the three facts a LIST needs: when it last
+/// backed up successfully, whether that is stale, and whether backups are set up
+/// at all.
+///
+/// The gateway polls this for every running workspace on its 2s supervise pass.
+/// It reports the answer as part of `WorkspaceStatus`, so the picker can put a
+/// backup line on each row. It is therefore deliberately CHEAP: one indexed
+/// event read and two preference reads, and never a call to the cloud provider.
+/// That last part is what separates it from [`get_backup_status`], which lists
+/// the provider's folder over the network for one workspace's Settings page.
+#[derive(Serialize)]
+pub struct LastSuccessfulBackupResponse {
+    /// When the newest successful run finished, or null when there has never
+    /// been one.
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when there is no successful backup at all, or the newest one is
+    /// older than `backup::BACKUP_STALE_AFTER_SECONDS`.
+    pub stale: bool,
+    /// True when a destination AND an active schedule are both set. It is what
+    /// separates a workspace whose backups are set up but have never produced an
+    /// archive from one where nobody set them up.
+    pub configured: bool,
+}
+
+/// Pure assembly of the response, so the staleness arithmetic is unit-testable
+/// without a pool. Mirrors [`build_backup_status`].
+fn build_last_successful(
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    configured: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> LastSuccessfulBackupResponse {
+    let stale = at.is_none_or(|t| (now - t).num_seconds() > backup::BACKUP_STALE_AFTER_SECONDS);
+    LastSuccessfulBackupResponse {
+        at,
+        stale,
+        configured,
+    }
+}
+
+/// GET /api/v1/backup/last-successful: the per-workspace backup line the
+/// gateway's picker draws.
+///
+/// Takes no `provider`, unlike the rest of this surface. The question is about
+/// this workspace's own run history, not about a destination.
+pub async fn get_last_successful_backup(
+    State(state): State<AppState>,
+) -> Result<Json<LastSuccessfulBackupResponse>, ApiError> {
+    // Both reads propagate. A 500 leaves the gateway with no answer, so the row
+    // stays silent, which is honest. Degrading either read to a default would
+    // put "never backed up" on a workspace that backs up nightly.
+    let at = backup::load_last_successful_backup(&state.pool)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("Failed to read the last successful backup: {e}"))
+        })?;
+    let configured = backup::backups_are_configured(&state.pool)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to read the backup schedule: {e}")))?;
+    Ok(Json(build_last_successful(
+        at,
+        configured,
         chrono::Utc::now(),
     )))
 }
@@ -344,10 +405,11 @@ pub async fn get_schedule(
 /// also requires both.
 fn schedule_response(cron: Option<String>, provider: Option<String>) -> ScheduleResponse {
     let provider = provider.filter(|p| !p.is_empty());
+    // The same predicate the picker's row reads, so the two surfaces cannot
+    // disagree about whether this install is set up.
+    let will_run = backup::schedule_will_run(cron.as_deref(), provider.as_deref());
     ScheduleResponse {
-        schedule: cron
-            .filter(|c| backup::is_schedule_active(c))
-            .filter(|_| provider.is_some()),
+        schedule: cron.filter(|_| will_run),
         provider,
     }
 }
@@ -446,6 +508,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/backup", post(create_backup))
         .route("/backup/list", get(list_backups))
         .route("/backup/status", get(get_backup_status))
+        .route("/backup/last-successful", get(get_last_successful_backup))
         .route("/backup/key", get(get_backup_key).post(generate_backup_key))
         .route("/backup/key/exists", get(backup_key_exists))
         .route("/backup/providers", get(list_providers))
@@ -505,6 +568,53 @@ mod tests {
             .unwrap();
             assert_eq!(v["missing_scopes"], serde_json::json!([]));
         }
+    }
+
+    /// The picker's line reads a boolean, so the staleness threshold lives in
+    /// exactly one place and both surfaces sit on the same side of it.
+    #[test]
+    fn the_picker_line_goes_stale_on_the_shared_threshold() {
+        let now = Utc::now();
+        let fresh = build_last_successful(Some(now - Duration::hours(3)), true, now);
+        assert!(!fresh.stale);
+        assert!(fresh.configured);
+
+        let old = build_last_successful(
+            Some(now - Duration::seconds(backup::BACKUP_STALE_AFTER_SECONDS + 60)),
+            true,
+            now,
+        );
+        assert!(old.stale, "past the shared threshold");
+    }
+
+    /// Never backed up is the worst kind of stale, and it is NOT the same fact
+    /// as "nobody set backups up". The picker says a different sentence for
+    /// each, so both fields travel.
+    #[test]
+    fn never_backed_up_is_stale_whether_or_not_it_is_configured() {
+        let now = Utc::now();
+        for configured in [true, false] {
+            let s = build_last_successful(None, configured, now);
+            assert!(s.stale, "no backup at all is stale");
+            assert_eq!(s.configured, configured);
+            let v = serde_json::to_value(&s).unwrap();
+            assert_eq!(v["at"], serde_json::Value::Null);
+        }
+    }
+
+    /// The timestamp goes out as RFC 3339, which is what the gateway parses and
+    /// what the picker hands to `new Date()`.
+    #[test]
+    fn the_wire_carries_an_rfc_3339_timestamp() {
+        let at = Utc::now();
+        let v = serde_json::to_value(build_last_successful(Some(at), true, at)).unwrap();
+        let s = v["at"].as_str().expect("a string timestamp");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .expect("parses")
+                .timestamp(),
+            at.timestamp(),
+        );
     }
 
     /// Pull the SSE `type` discriminator off a broadcast event via its public
@@ -658,7 +768,7 @@ mod tests {
             now,
         );
         assert!(status.stale);
-        assert!(status.age_seconds.unwrap() > BACKUP_STALE_AFTER_SECONDS);
+        assert!(status.age_seconds.unwrap() > backup::BACKUP_STALE_AFTER_SECONDS);
     }
 
     /// No backups at all → stale with null latest/age. This is the "engine was

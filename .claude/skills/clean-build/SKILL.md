@@ -142,7 +142,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-27. Anything not
+The currently-accepted categories, counted as of 2026-08-28. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 79 sites across 49 files,
@@ -156,11 +156,12 @@ on this list is fair game to remove and re-fix:
   One of the 79 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
   reports 78 across 48 files. Both numbers here count the shared attribute.
-- **`#[allow(dead_code)]`**, 5 sites: intentionally-unused dispatcher
-  variants (`agent_session/spawn_dispatcher.rs`, two of them) and test
+- **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
+  (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
   `change_ops_engine_origin_stamping_tests.rs`, `tools/plugins/mod.rs`).
-  One-line comment required at each site.
+  One-line comment required at each site. The count was 5 until 2026-08-28,
+  when the second `spawn_dispatcher.rs` site turned out to be gone.
 - **`#[allow(clippy::large_enum_variant)]`**, 1 site: `BusEvent` in
   `engine/event_bus/mod.rs`. The variant size is dominated by the inner
   event payload; boxing every variant to flatten the enum would hurt
@@ -176,8 +177,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 491 sites across 172 files, every one of them
-  test-only code: 164 `*.test.ts`, seven `*.test.tsx`
+  `@types/node` in project**, 500 sites across 175 files, every one of them
+  test-only code: 167 `*.test.ts`, seven `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -274,8 +275,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
   the vitest include list, so `/run-tests` runs them.
 
-- **Phase 4's entry chunk is 676.98 kB against its 600 kB ceiling, and the
-  2026-08-27 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 685.81 kB against its 600 kB ceiling, and the
+  2026-08-28 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -295,12 +296,12 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.11 kB, against a 76.98 kB gap:
+  attribution now puts the whole list at 38.10 kB, against an 85.81 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.52 |
+  | `CodingAgentControlMenu` | 8.51 |
   | `ThreadFilterPanel` | 5.91 |
   | `WorkspaceSwitcher` | 4.36 |
   | `QuestionCard` | 3.98 |
@@ -308,17 +309,34 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | `OverflowMenu` | 2.38 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave nearly 39 kB of it. The next
+  leave the advisory firing, and would now leave nearly 48 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
-  Growth is diffuse rather than one mistake. The 2026-08-27 run added 5.31 kB
+  Growth is diffuse rather than one mistake. The 2026-08-28 run added 8.83 kB
   and re-ran the check for the usual culprit, a component gone from lazy to
-  eager. There was none, for the second run running: no module appears in
-  both the entry chunk and a separately emitted chunk. The rest of the top is
-  `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.84 and `store.ts` at
-  17.06. The three thread-event exchange modules add 42.8 kB between them. A
-  first paint reaches all of them.
+  eager. There was none, for the third run running.
+
+  **That check is two questions, not one.** Does any module sit in both the
+  entry chunk and a separately emitted chunk? And does any target of a
+  `lazy(() => import(...))` sit in the entry chunk at all? The second catches
+  a lazy view that a static import has quietly pulled forward. That shape
+  leaves no duplicate, so the first question misses it. All 34 view targets
+  were absent.
+
+  The top is unchanged: `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.82
+  and `store.ts` at 17.18. The three thread-event exchange modules add
+  42.81 kB between them. A first paint reaches all of them. The 8.83 kB came
+  from ordinary fixes to first-paint chat code (`scrollState.ts`,
+  `threadWindow.ts`, `PromptInput.tsx`, `deadPressProbe.ts`,
+  `thread-loading.ts`).
+
+  **The SDK's `tooltip.ts` is 6.22 kB of the entry chunk and is NOT a cut**,
+  measured on the 2026-08-28 run. It looks like one. `ui.ts` pulls the whole
+  module in for `disableTooltips`, and `ui` rides the `lucidos` barrel that
+  `api/client/settings.ts` imports at first paint. But the host shell installs
+  tooltips itself, through `hooks/useTooltip.ts`. So the bytes are used rather
+  than dragged, and moving the opt-out to its own module would free none.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
   the lever.** A barrel is the one shape that splits with no loading flash.

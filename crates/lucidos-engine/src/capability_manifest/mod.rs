@@ -2331,6 +2331,19 @@ const WEBHOOK_DEDUPE_ARG: Arg = Arg {
     description: "Recognise a resend instead of emitting twice: {header?, window_secs?}. `header` names the header carrying the sender's delivery id (e.g. 'X-GitHub-Delivery'); with none, the key is a digest of the body. `window_secs` defaults to 3600, is capped at 604800, and 0 switches deduping off. Omit the whole block and every arrival emits, which is what keeps a sender's retries visible on the log.",
 };
 
+/// Where the signing secret comes from, when the request brings one.
+///
+/// Shared between create and update. On update it is a rotation, which the
+/// description says, because the two read the same JSON.
+const WEBHOOK_SIGNING_SECRET_ARG: Arg = Arg {
+    name: "signing_secret",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description: "Save the secret the `hmac` block names, instead of pointing at one you saved earlier. `{\"mode\":\"generate\"}` mints 32 bytes and prints them ONCE, which is right for GitHub, where you choose the secret. `{\"mode\":\"provided\",\"value\":\"...\"}` stores a secret the sender issued, which is the only option for Slack and Stripe. The value is stored byte for byte, so a value with surrounding whitespace is refused rather than trimmed. On `create` it refuses to overwrite an existing credential; on `update` it replaces the value, which is how you rotate.",
+};
+
 /// Request headers copied into the event payload, under `headers`.
 const WEBHOOK_HEADERS_ARG: Arg = Arg {
     name: "headers",
@@ -2385,8 +2398,9 @@ const WEBHOOKS_OPS: &[Operation] = &[
                 enum_values: &[],
                 required: false,
                 loc: ArgIn::Body,
-                description: "Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here.",
+                description: "Signature config: {credential, signature_header, prefix?, signature_key?, timestamp_header?, timestamp_key?, template?, algorithm?, encoding?, tolerance_secs?}. `credential` names a saved credential; the secret is never copied here. Pass `--signing-secret` alongside to save that credential in the same call.",
             },
+            WEBHOOK_SIGNING_SECRET_ARG,
             WEBHOOK_DEDUPE_ARG,
             WEBHOOK_HEADERS_ARG,
         ],
@@ -2430,6 +2444,15 @@ const WEBHOOKS_OPS: &[Operation] = &[
                 loc: ArgIn::Body,
                 description: "false stops the endpoint accepting deliveries, without deleting it.",
             },
+            Arg {
+                name: "hmac",
+                ty: ArgType::Json,
+                enum_values: &[],
+                required: false,
+                loc: ArgIn::Body,
+                description: "Change what this hook verifies with, keeping its delivery URL. Same object `create` takes. Pass `null` to stop signing, which mints a bearer token and prints it ONCE, since a hook always carries exactly one verifier. Setting a signature drops any token for the same reason: a sender that signs attaches no bearer token, so a hook holding both would refuse every real delivery.",
+            },
+            WEBHOOK_SIGNING_SECRET_ARG,
             WEBHOOK_DEDUPE_ARG,
             WEBHOOK_HEADERS_ARG,
         ],

@@ -356,6 +356,11 @@ export default defineConfig({
       // Mirrored in tsconfig.json `paths` so tsc resolves them too.
       '@lucidos/geometry': resolve(__dirname, '../../packages/lucidos-sdk/src/geometry.ts'),
       '@lucidos/tooltip': resolve(__dirname, '../../packages/lucidos-sdk/src/tooltip.ts'),
+      // The event-stream transport, shared so the shell and an app iframe
+      // attach to one connection through the same code. Reached WITHOUT the
+      // barrel, for the same reason as the three above.
+      // Mirrored in tsconfig.json `paths` so tsc resolves it too.
+      '@lucidos/event-stream': resolve(__dirname, '../../packages/lucidos-sdk/src/eventStream.ts'),
     },
   },
   server: {

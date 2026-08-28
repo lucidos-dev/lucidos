@@ -548,6 +548,31 @@ const lastRefreshReport = new Map<string, number>();
  *  suspension. */
 const forcedRetries = new Set<string>();
 
+/** Are more of this thread's events still on their way?
+ *
+ *  A *deep link* asks it before calling its target missing. Absence proves
+ *  nothing while the transcript is still arriving, and the load path routinely
+ *  outruns a few seconds: `loadThreadEvents` retries twice behind a 1s then 2s
+ *  backoff, ThreadView's watchdog force-retries a silent thread at 2s, and its
+ *  own "Taking too long?" fuse waits 8s. A link that gave up first reported a
+ *  change the reader could see on screen a moment later.
+ *
+ *  THREE terms, because a fetch in flight is only the commonest of them.
+ *  `eventsLoaded` false covers the gaps BETWEEN attempts, where the retry
+ *  backoff and the watchdog's restart leave no claim standing. The two claims
+ *  cover the opposite shape, a thread already loaded and being caught up by a
+ *  refresh. That is what an iOS PWA wake leaves on the thread the reader opens.
+ *
+ *  False for a thread that has left the map, and for one whose load gave up and
+ *  said so. Nothing more is coming for either, so the caller may conclude. */
+export function threadEventsStillArriving(threadId: string): boolean {
+  const thread = threadMap.value.get(threadId);
+  if (!thread || thread.eventsLoadFailed) return false;
+  return !thread.eventsLoaded
+    || loadingThreads.has(threadId)
+    || refreshAttempts.has(threadId);
+}
+
 /** Threads whose events this device may have missed while it was not listening.
  *  See `docs/glossary.md` § "Stale thread events".
  *

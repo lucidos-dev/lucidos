@@ -1,7 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import type { Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
-import { useEffect, useMemo, useRef } from 'preact/hooks';
+import { useEffect, useMemo } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
@@ -11,7 +11,7 @@ import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
 import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
-import { openApp } from '../../store/actions/apps';
+import { openApp, openAppById } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
@@ -20,7 +20,7 @@ import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, hasVi
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
+import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
@@ -152,8 +152,22 @@ export function exchangeMarksThreadLive(
   return isLast && isStatusActive(status) && !threadIdle;
 }
 
+/** Run `fn` with the control the reader pressed pinned exactly where it is.
+ *
+ *  The anchor is `currentTarget`, the element carrying this handler, so it IS
+ *  the control. A turn control only ever changes heights. The reader asked for
+ *  that by pressing one named thing, so that thing is what must not move. See
+ *  `withScrollAnchor`.
+ *
+ *  Read before `fn` runs, because the mutation can take the node away: the `⋯`
+ *  stub is replaced by the body it reveals. `withScrollAnchor` then writes
+ *  nothing, which is exact for that press. An unfold changes nothing above its
+ *  own turn, so the freeze has already left the reader where they belong. */
+function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
+  return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
+}
+
 function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson }: Props) {
-  const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -246,10 +260,13 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     if (appTarget) {
       e.preventDefault();
       const appId = appTarget.dataset.appId;
-      if (appId) {
-        const app = apps.find((a) => a.id === appId);
-        if (app) openApp(app);
-      }
+      // openAppById, not a `apps.find(...)` on the cached list: it re-fetches
+      // the registry on a miss before concluding the app is gone, matching the
+      // trigger branch below. A suspended iOS PWA can miss the AppCreated SSE
+      // frame, so the cache lags a freshly created app until this refetch.
+      // `data-app-fragment` is the app fragment the link named, absent when it
+      // named none, so a plain app link leaves an open app where it was.
+      if (appId) void openAppById(appId, undefined, appTarget.dataset.appFragment);
       return;
     }
 
@@ -284,14 +301,14 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     const anchorTarget = (e.target as HTMLElement).closest('a') as HTMLAnchorElement | null;
     if (anchorTarget) {
       const rawHref = anchorTarget.getAttribute('href') || '';
-      const appId = extractAppIdFromHref(rawHref);
-      if (appId) {
-        const app = apps.find((a) => a.id === appId);
-        if (app) {
-          e.preventDefault();
-          openApp(app);
-          return;
-        }
+      const appTargetRef = extractAppTargetFromHref(rawHref);
+      // Unconditional, like the .app-link branch above: openAppById re-fetches
+      // on a cache miss. A recognized `app:` href must never fall through to
+      // the terminal guard, which would blame the SCHEME for a stale cache.
+      if (appTargetRef) {
+        e.preventDefault();
+        void openAppById(appTargetRef.appId, undefined, appTargetRef.fragment ?? undefined);
+        return;
       }
       const triggerId = extractTriggerIdFromHref(rawHref);
       if (triggerId) {
@@ -307,7 +324,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       }
       // A bare app-id/name href like `habit-tracker` — the LLM writes
       // `[Habit Tracker](habit-tracker)` by analogy to `[Notifications](notifications)`.
-      // Not caught by extractAppIdFromHref (no apps/ prefix, no app: scheme);
+      // Not caught by extractAppTargetFromHref (no apps/ prefix, no app: scheme);
       // resolve it against the loaded apps list by id OR name. Runs AFTER nav so
       // reserved panel names still route to their panel. Without this the
       // browser navigates to the relative href, the SPA fallback serves the
@@ -372,12 +389,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     }
   }
 
-  // Both turn controls change the height of every turn in the transcript, so
-  // `withScrollAnchor` holds the reader still across it. The `.chat-exchange`
-  // ROOT is handed over as its LAST resort, not as the anchor. A turn taller
-  // than the screen has its top out of sight. Holding a point the reader cannot
-  // see is what let a reveal carry them back up the thread. See
-  // `anchorCandidates`, which prefers their own topmost line.
+  // Both turn controls change the height of every turn in the transcript. The
+  // control the reader pressed is what holds still across it, via
+  // `heldOnThePress`.
   //
   // Turning either ON also lifts THIS turn's fold, and only this turn's. A
   // folded turn draws no body. A reveal clicked from its header would land on
@@ -394,14 +408,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // instant its steps become drawable. `expandExchange` no-ops when the key is
   // absent, so the unconditional call costs nothing on an unfolded turn.
   function reveal(setting: Signal<boolean>) {
-    withScrollAnchor(rootRef.current, () => {
-      setting.value = !setting.value;
-      if (setting.value) expandExchange(threadId, exchange.userSeq);
-    });
+    setting.value = !setting.value;
+    if (setting.value) expandExchange(threadId, exchange.userSeq);
   }
 
-  const toggleDetails = () => reveal(detailsExpanded);
-  const toggleSteps = () => reveal(stepsExpanded);
+  const toggleDetails = heldOnThePress(() => reveal(detailsExpanded));
+  const toggleSteps = heldOnThePress(() => reveal(stepsExpanded));
 
   const exchangeActive = isStatusActive(status);
   const isEmptyContinued = isEmptyContinuedExchange(status, hasResponse, events, isLast);
@@ -429,7 +441,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
 
   // Folding this turn. One definition, because the header's collapse control
   // and the `⋯` stub the fold leaves behind are two ways into the same action.
-  const toggleCollapsed = () => toggleExchangeCollapsed(threadId, exchange.userSeq);
+  // Anchored like the other two: a fold that shrinks the transcript past its
+  // own pane clamps the offset, and the reader is owed their control back.
+  const toggleCollapsed = heldOnThePress(() => toggleExchangeCollapsed(threadId, exchange.userSeq));
+  const toggleInitiator = heldOnThePress(() => toggleInitiatorCollapsed(threadId, exchange.userSeq));
 
   // The header's three controls, rendered in every state (see `turnControls`):
   // the collapse control is one of them, so a collapsed turn needs the group
@@ -651,7 +666,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const collapseKind = canCollapse ? 'response' : canCollapseInitiator ? 'initiator' : undefined;
 
   return (
-    <div class="chat-exchange" ref={rootRef} data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}
+    <div class="chat-exchange" data-event-id={exchange.userEvent._eventId} data-change-id={changeId || undefined}
          data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}>
       <InitiatorPanel
         initiator={isQueuedUserMessage
@@ -666,9 +681,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         chromeless={isChromeless}
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
-        onToggle={canCollapseInitiator
-          ? () => toggleInitiatorCollapsed(threadId, exchange.userSeq)
-          : undefined}
+        onToggle={canCollapseInitiator ? toggleInitiator : undefined}
       />
 
       {showResponsePanel && (

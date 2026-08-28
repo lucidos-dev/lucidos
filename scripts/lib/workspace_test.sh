@@ -1588,6 +1588,124 @@ test_gateway_scope_ignores_the_optin
 test_stack_scope_still_honours_the_optin
 test_gateway_scope_allows_a_real_checkout
 
+# ── direct-engine network bind ─────────────────────────────────────────
+# Nothing authenticates a directly-launched engine's port, so what this helper
+# pins IS the security boundary. Before ADR 0096's gap was closed it forced
+# all-interfaces, and every e2e run put that port on the network.
+
+reset_bind_env() {
+    unset LUCIDOS_BIND_ADDR LUCIDOS_BIND_ALL LUCIDOS_BIND_LOOPBACK SCRIPT_NAME
+    rm -f "$HOME/.lucidos/network.toml"
+}
+
+test_e2e_pins_the_engine_to_loopback() {
+    echo "test: apply_dev_engine_bind pins e2e to loopback"
+    reset_bind_env
+    SCRIPT_NAME=e2e
+    apply_dev_engine_bind
+
+    if [ "${LUCIDOS_BIND_ADDR:-}" = "127.0.0.1" ]; then
+        pass "e2e pins LUCIDOS_BIND_ADDR to loopback"
+    else
+        fail "expected 127.0.0.1, got ${LUCIDOS_BIND_ADDR:-<unset>}"
+    fi
+    if [ -z "${LUCIDOS_BIND_ALL:-}" ]; then
+        pass "e2e sets no all-interfaces flag"
+    else
+        fail "LUCIDOS_BIND_ALL leaked: $LUCIDOS_BIND_ALL"
+    fi
+}
+
+test_e2e_pin_survives_a_developers_network_toml() {
+    echo "test: a personal network.toml does not move the e2e bind"
+    reset_bind_env
+    mkdir -p "$HOME/.lucidos"
+    printf '[gateway]\nbind = "all"\n' > "$HOME/.lucidos/network.toml"
+    SCRIPT_NAME=e2e
+    apply_dev_engine_bind
+
+    # The pin outranks the file in net_config.rs. That is what keeps a
+    # tailnet-bound developer's e2e run reachable on localhost.
+    if [ "${LUCIDOS_BIND_ADDR:-}" = "127.0.0.1" ]; then
+        pass "e2e still pins loopback with a network.toml present"
+    else
+        fail "expected 127.0.0.1, got ${LUCIDOS_BIND_ADDR:-<unset>}"
+    fi
+    rm -f "$HOME/.lucidos/network.toml"
+}
+
+test_the_bind_pin_never_claims_to_be_behind_a_gateway() {
+    echo "test: apply_dev_engine_bind never sets the behind_gateway signal"
+    reset_bind_env
+    SCRIPT_NAME=e2e
+    apply_dev_engine_bind
+
+    # LUCIDOS_BIND_LOOPBACK would bind loopback too. It would also tell the
+    # engine it is fronted, which moves the API base URL handed to subprocesses
+    # and suppresses the lucidos.toml port pin.
+    if [ -z "${LUCIDOS_BIND_LOOPBACK:-}" ]; then
+        pass "LUCIDOS_BIND_LOOPBACK stays unset"
+    else
+        fail "behind_gateway signal set: $LUCIDOS_BIND_LOOPBACK"
+    fi
+}
+
+test_a_direct_launch_widens_nothing_by_default() {
+    echo "test: a non-e2e direct launch opts into no network bind"
+    reset_bind_env
+    apply_dev_engine_bind
+
+    if [ -z "${LUCIDOS_BIND_ALL:-}" ] && [ -z "${LUCIDOS_BIND_ADDR:-}" ]; then
+        pass "the engine's own loopback default is left to apply"
+    else
+        fail "launch widened the bind: ALL=${LUCIDOS_BIND_ALL:-<unset>} ADDR=${LUCIDOS_BIND_ADDR:-<unset>}"
+    fi
+}
+
+test_a_direct_launch_keeps_an_explicit_bind() {
+    echo "test: a developer's own bind export survives a direct launch"
+    reset_bind_env
+    # The network.toml is what makes this case discriminate. The old helper
+    # unset LUCIDOS_BIND_ALL on exactly this branch, so without the file the
+    # assertion below would hold against the old code too.
+    mkdir -p "$HOME/.lucidos"
+    printf '[gateway]\nbind = "loopback"\n' > "$HOME/.lucidos/network.toml"
+    export LUCIDOS_BIND_ALL=1
+    apply_dev_engine_bind
+
+    # Widening a direct engine is the developer's call, and net_config.rs
+    # already ranks an env var above the file.
+    if [ "${LUCIDOS_BIND_ALL:-}" = "1" ]; then
+        pass "an exported LUCIDOS_BIND_ALL is left alone"
+    else
+        fail "the launch dropped an explicit bind: ${LUCIDOS_BIND_ALL:-<unset>}"
+    fi
+    unset LUCIDOS_BIND_ALL
+    rm -f "$HOME/.lucidos/network.toml"
+}
+
+test_a_direct_launch_defers_to_network_toml() {
+    echo "test: a direct launch leaves network.toml to the engine resolver"
+    reset_bind_env
+    mkdir -p "$HOME/.lucidos"
+    printf '[gateway]\nbind = "100.64.0.1"\n' > "$HOME/.lucidos/network.toml"
+    apply_dev_engine_bind
+
+    if [ -z "${LUCIDOS_BIND_ALL:-}" ] && [ -z "${LUCIDOS_BIND_ADDR:-}" ]; then
+        pass "no env var masks the configured bind"
+    else
+        fail "env masked the file: ALL=${LUCIDOS_BIND_ALL:-<unset>} ADDR=${LUCIDOS_BIND_ADDR:-<unset>}"
+    fi
+    rm -f "$HOME/.lucidos/network.toml"
+}
+
+test_e2e_pins_the_engine_to_loopback
+test_e2e_pin_survives_a_developers_network_toml
+test_the_bind_pin_never_claims_to_be_behind_a_gateway
+test_a_direct_launch_widens_nothing_by_default
+test_a_direct_launch_keeps_an_explicit_bind
+test_a_direct_launch_defers_to_network_toml
+
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

@@ -779,6 +779,65 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-engine/src/engine/git_ops/commits.rs`,
   `crates/lucidos-engine/src/engine/git_ops/mod.rs`.)
 
+- **An unauthenticated caller writing `last_refused_at` is the point of the
+  column, not an unguarded write.** `POST /webhooks/:id/deliver` is public by
+  construction, so a reviewer reads `stamp_refused` as letting anybody on the
+  internet write the `webhooks` table. A refusal nobody records is the
+  eight-hour silent outage the ingress work exists to catch. The whole value of
+  the column is that it separates arrived and was turned away from never
+  arrived.
+
+  The write is narrow. It updates two columns on one existing row, never an
+  insert, so there is nothing to grow. The reason string is engine-authored,
+  from `verify`'s refusal enum plus two literals, and never carries sender
+  bytes. The probe's own refusal is skipped by `is_probe_token`, so a healthy
+  workspace does not stamp itself every 15 minutes. A stamp that fails is logged
+  and dropped, because a lost observation must never fail a delivery that
+  already verified.
+
+  The flood cost is bounded and accepted. An unsigned POST already costs a row
+  read and an HMAC verify. The stamp adds one UPDATE to a request that already
+  hit the database. Re-flag only if the reason string starts carrying
+  sender-supplied text, or if the stamp becomes an insert.
+  (`crates/lucidos-engine/src/api/webhooks.rs`,
+  `crates/lucidos-engine/src/core/webhooks.rs`, ADR 0143.)
+
+- **The refusal stamp deliberately emits no event, so a live page does not learn
+  about a refusal until it refetches.** `webhooksVersion` bumps on
+  `WebhookCreated`, `WebhookUpdated` and `WebhookDeleted` only
+  (`entityReferences.ts`). A reviewer sees the new timestamps sitting outside
+  that set and proposes a fourth frame for the stamp.
+
+  It would hand an unauthenticated caller an event-emission primitive. Anybody
+  who can reach the funnel could append to the events table on demand, and every
+  SSE client and every trigger would see it.
+
+  The stamps are forensics, read when somebody goes looking, and the page
+  refetches when it opens. The live signal for a dead ingress is the scheduler's
+  own declaration, which no caller can provoke. Re-flag only if the stamp moves
+  behind authentication, or if a live refusal counter becomes a stated
+  requirement. (`crates/lucidos-app/src/store/actions/entityReferences.ts`,
+  `crates/lucidos-engine/src/api/webhooks.rs`, ADR 0143.)
+
+- **`AuthType::Secret` stays in the `CRED_*` fan-out, unlike `oauth_client`.** A
+  reviewer reads the one exclusion in `credential_env_vars` and proposes a
+  second. A webhook signing secret has exactly one reader, `verify`, which reads
+  the table. So the `oauth_client` reasoning looks to apply: broadcast into
+  every `run_bash` / `run_python` / scheduled script for no reader.
+
+  The premise is wrong for this type. `secret` is deliberately GENERIC, a shared
+  secret with no transport role, and a webhook signing secret is only its first
+  user. Reading one as `CRED_<NAME>` from a script is the ordinary reason to
+  save it. Excluding it would make a credential the user saved go missing with
+  no error. That is the failure the same module's doc comment names, when it
+  explains why `credential_env_vars_for` filters nothing.
+
+  The webhook half of the exposure is also not new: before this type existed the
+  same secret was saved as `api_key`, which is in the fan-out too. Re-flag only
+  if `secret` stops being general (a webhook-only type would take the
+  `oauth_client` treatment), or if the fan-out itself moves to an opt-in.
+  (`crates/lucidos-engine/src/core/credentials.rs`.)
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -936,8 +995,9 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   only if a toast or the confirm dialog grows a Tab cycle that includes its
   scroll box.
 
-- **`canInstallUpdateHere` subtracts `installer-rerun` rather than requiring
-  `desktop-app`, and that asymmetry is deliberate.** A reviewer reads the
+- **`sessionCanInstall` subtracts `installer-rerun` rather than requiring
+  `desktop-app`, and that asymmetry is deliberate.** (It was inside
+  `canInstallUpdateHere` until ADR 0142 split the session half out.) A reviewer reads the
   release check's `install` field as "what can act on this offer". They then
   propose `install === 'desktop-app'`, so an unrecognised layout
   (`install: null`) offers no action. Codex flagged exactly this on the branch
@@ -2042,6 +2102,120 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   suite starts resetting the database between specs. Either would make a failed
   restore harmless.
   (`crates/lucidos-app/e2e/helpers.ts`.)
+
+- **A reveal-on-type filter box answers a bare printable key and nothing else,
+  which is the whole design, not a gap.** A reviewer notes that a hidden filter
+  takes no paste and no IME key (`key: 'Process'`), one being a modifier chord.
+  The search then reads as unreachable for those users.
+
+  Neither reaches a box that is not there. Composition needs a focused editable
+  target. An IME therefore does not start on the list div: the raw latin key
+  comes through, reveals the box, and composes from the second character. Paste
+  with nothing focused to paste into is a no-op wherever it lands, and the model
+  list is short enough to arrow through. `Dropdown` has shipped this shape
+  across every menu in the app since 2026-06, and `ModelSelectionPicker` matches
+  it on purpose (`components/shared/typeahead.ts`).
+
+  Re-flag with a report from a real IME user, or if a menu grows a list long
+  enough that arrowing stops being an answer. Fix it in `typeahead.ts` for both
+  menus, never in one.
+
+- **A disabled `touchActivated` returning WITHOUT spending the tap gate is the
+  contract, not a leak.** `onTouchEnd` bails on `!enabled()` before it touches
+  the gate, so a press the gate recorded at `pointerdown` is still held. Codex
+  flagged that as P2 and asked for a spend or a cancel on the way out.
+
+  Spending there is the bug, not the fix. `enabled` means the touch path stands
+  down and **the click path is left whole**, which
+  `stands the touch path down while disabled, leaving the click path whole`
+  asserts. Ruling on the gate is that path's job. A press spent on the way out
+  hands it a clean slate, and the scroll the gate exists to catch then activates
+  the button.
+
+  The residue Codex describes is real and documented. `ActivationGate`'s own doc
+  names it: an unspent press rules on the next activation arriving with none of
+  its own, such as a keyboard Enter. Four things must line up to reach it:
+
+  - the press goes past the threshold
+  - the mode flips between the pointerdown and the lift
+  - no click arrives
+  - a keyboard or programmatic activation beats the next finger to the button
+
+  A later `down()` overwrites the press outright, so an ordinary tap clears it.
+  Re-flag with a fix that clears the residue and still leaves the click path a
+  press to rule on. A report of a real dead keyboard activation does it too.
+
+- **`useHideOnScroll`'s `anchoredTop` stamp has no explicit expiry, and must not
+  grow one.** A reviewer sees a stamp set on an anchor write and never
+  `-1`-ed on a timer, and reads it as state that outlives its event: a later
+  navigation landing at the same offset would be misread as the old anchor, so
+  the header would stay hidden instead of revealing.
+
+  It cannot. The stamp is spent by POSITION, on any scroll event landing more
+  than a pixel away, and again when the container changes. A scroll event fires
+  only when `scrollTop` actually changes. An event AT the stamped offset
+  therefore means the container moved away and back inside one coalesced frame.
+  The intervening write's own kind is then what `isAnchorScroll` reads. The 1px
+  tolerance is there to let the iOS repaint nudge spend it.
+
+  Expiring it eagerly would defeat the thing it was added for. An anchor
+  correction's scroll event can arrive LATE, after the navigation window has
+  closed and after another mark overwrote the kind. The position is the only
+  evidence left that the write was ours.
+
+  Re-flag with a reproduction: a header that stays hidden after a real
+  navigation, with the offset it landed on.
+
+- **`readScrollAnchor` scanning the transcript's children is NOT a duplicate of
+  `recordAnchor`'s scan, and unifying them was weighed and declined.** Both walk
+  `.thread-content`'s children against the container's top and skip boxless
+  ones, so a reviewer reads the second as copy-paste of the first.
+
+  They answer different questions, and the difference is load-bearing both ways.
+  `recordAnchor` (`scrollState.ts`, inside `makeScrollObservers`) wants ANY
+  child to hold the reader still across a reflow, chrome included. Above the
+  first one it deliberately answers null, so the correction is a no-op there.
+  `readScrollAnchor` (`scrollAnchor.ts`) must name a child that survives a
+  reload, so it takes only a `data-event-id` one. It falls back to the earliest
+  turn, because "above the first turn" is a real reading position.
+
+  They differ in shape too. One keeps the element, the other a rounded offset.
+  Rounding `recordAnchor`'s would put sub-pixel error into a correction that
+  ADR 0078 rounds at the write instead.
+
+  Two turns being named differently by the two is therefore correct, not drift.
+  Re-flag only if a THIRD scan appears, or if one grows a skip rule the other
+  needs (see ADR 0152 for what each is for).
+
+- **`anchorTargetTop`'s SUBTREE `querySelector` is deliberate, not a missed
+  `:scope >`.** `readScrollAnchor` only ever names a direct child of
+  `.thread-content`, so scoping the lookup to children reads as strictly
+  cheaper: the walk's calls are all misses, and a miss over the subtree visits
+  every element under it.
+
+  It would also stop resolving a real anchor. A single queued follow-up is a
+  direct child; once a second joins it, both move inside
+  `<details class="queued-message-group">`. An anchor recorded before that move
+  still names the turn, and only the subtree form finds it.
+
+  The nested `data-event-id` a reviewer worries about (`.exchange-error`) cannot
+  be returned instead. It carries a `ResponseFailed` id, which is not in
+  `EXCHANGE_START_TYPES`, so no recorded anchor can name it. The exchange root
+  precedes it in document order anyway.
+
+  Re-flag with a measurement on a real thread, not with the asymptotics.
+
+- **`windowReachesIndex` having no caller outside `threadWindow.ts` is the
+  module's convention, not dead code.** Its only production caller is
+  `windowMustReachIndex` fourteen lines below it, so an export reads as
+  unnecessary surface.
+
+  `countWithinBudget` has exactly the same shape: exported, called in-module by
+  `seedRenderCount` and `expandRenderCount`, tested directly. The file header
+  says why, the helpers existing so the window arithmetic is unit-tested without
+  a component. Narrowing one of the pair and not the other is the drift.
+
+  Re-flag only if the module stops testing its arithmetic directly.
 
 ## Scripts (bash)
 
@@ -3200,3 +3374,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the popup's image loses that CSS containment, or if a caller starts
   passing an `imgW` measured somewhere the container does not bound.
+
+## Product copy
+
+- **"apps and automations you describe" is the settled positioning line, and
+  "automations" there is not a stray synonym for *trigger*.** A glossary-minded
+  reviewer reads the word as a near-synonym the canonical-term rule bans, since
+  `system-knowhow/glossary.md` names **trigger** and **scheduled task** and
+  defines no *automation*.
+
+  The word is the plain-English umbrella in marketing copy, not a competing name
+  for the `Trigger` type. It leads `README.md`, which is the canonical
+  positioning, and the same phrase carries the welcome message, the setup
+  interview and the compose copy. The maintainer restored "builds and runs" to
+  that line deliberately, to match the hero line on lucidos.dev.
+
+  Re-flag only where **trigger** is the canonical word: technical prose, a tool
+  schema, a type name, a DB column.

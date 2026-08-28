@@ -425,20 +425,72 @@ The reaper below cannot see it. `webkit_reaps` was **0** across a climb from
 11.93 GB to 17.27 GB. The reaper caps per-process RSS at 6 GB and no single
 WebContent process comes near that, because the cost is spread over many
 short-lived ones. `kern.memorystatus_vm_pressure_level` is no use either: it
-read normal for the whole climb. Only the compressor moves in time to act on,
-so `run_specs_chunked` and the project loop both read it. Both stop over
-`LUCIDOS_E2E_COMPRESSOR_MAX_GB` (12 GB).
+read normal for the whole climb.
 
 Three levers were tried, in order of cost.
 
 1. **Smaller chunks.** `LUCIDOS_E2E_WEBKIT_CHUNK` went 8 to 3. It bounds the
    per-chunk delta and it is not enough: a run at 3 still hit the ceiling,
    because it started from 5.90 GB instead of a cold 1.9 GB.
-2. **A ceiling between chunks.** Stops the loop at a safe boundary rather than
-   riding the climb into a host freeze. This host has no swap, so a harness that
-   keeps going into a rising compressor is a machine lock, not a slow test.
+2. **A stop condition between chunks.** Ends the loop at a safe boundary rather
+   than riding the climb into a host freeze. `run_specs_chunked` and the project
+   loop both check it, via `scripts/lib/host_memory_guard.sh`.
 3. **Its own run**, which is this section. The other two bound the damage; only
    this one stops the damage landing on somebody else's coverage.
+
+**Removing the chunking was tried, and reverted** (ADR 0145). A full unfiltered
+pass measures flat: 342 tests in 20.4 minutes, compressor near 5 GB. Two such
+runs completed at exit 0. A third met an external load burst and showed what the
+chunking is actually for. Two things bite, and the second is structural.
+
+- **Only a fresh browser clears a wedged one.** A wedged WebContent holds its
+  RSS and does not exit. A chunk boundary kills the browser every three specs
+  and takes those children with it. One pass reclaims nothing until it ends, so
+  the wedge compounds: 15 tests at the 120-second timeout and 18 preflight
+  discards, still failing when the run was killed.
+- **The guard loses every boundary it could act at.** Lever 2 fires BETWEEN
+  invocations, and an unfiltered `--webkit` is one invocation. So the longest,
+  heaviest project runs with the memory guard inert from start to finish.
+
+**Chunking is not the same problem as chunked reporting**, and conflating them
+is what made removal look right. See "one verdict per project" below.
+
+**Lever 2 measures swap, not the compressor.** It used to be one number: a fixed
+12 GB of compressor. That number is what kept the unfiltered mobile-webkit
+project from ever reaching a verdict. Compressor size is how much idle memory
+macOS has squeezed, so it tracks total host demand rather than danger. It is also
+host-cumulative and does not drain (see below), so a run was charged for whatever
+was already compressed when it started.
+
+That made the outcome structural. A full pass costs roughly 8 GB of growth, so it
+completed only from a host under about 4 GB and was cut short otherwise. The
+growth rate is not constant either: two identical passes grew 0.22 and 0.46 GB
+per chunk, the second on a busier host. No byte budget can be calibrated against
+that, and a delta budget fails the same way.
+
+So the stop condition is **swap in use**, over `LUCIDOS_E2E_SWAP_MAX_GB` (1 GB).
+macOS compresses before it swaps, so swap is the point where compression stopped
+keeping up and the run began costing the host.
+
+The compressor survives as a runaway backstop, now a share of RAM
+(`LUCIDOS_E2E_COMPRESSOR_MAX_PCT`, 50). A fixed 12 GB is 75% of a 16 GB Mac and
+25% of a 48 GB one. It could not mean the same thing on both.
+`LUCIDOS_E2E_COMPRESSOR_MAX_GB` still sets an absolute backstop when given.
+
+**This host has swap; it has simply never needed it.** `vm.swapusage` reporting
+`total = 0.00M` was read as swap being off. Nothing disables it: macOS grows
+swapfiles on demand, and the pile-up recorded in `scripts/lib/e2e_lock.sh` reached
+23.5 GB compressed **and 14 GB of swap**. Swap is the half of that pair which says
+it went wrong, and the old guard ignored it.
+
+- **Test.** `scripts/lib/host_memory_guard_test.sh` (run directly, no harness,
+  same convention as `host_load_guard_test.sh`). Readings are injected through
+  the `HOST_COMPRESSOR_GB_OVERRIDE` / `HOST_SWAP_USED_GB_OVERRIDE` /
+  `HOST_PHYSMEM_GB_OVERRIDE` seams. It covers the regression directly: 12.25 GB
+  of compressor with no swap on a 48 GB host must run on. It also covers swap
+  stopping the run, the backstop scaling with RAM, and both knobs. Finally,
+  garbage knobs falling back, failing open on an unreadable host, and the
+  `vm.swapusage` unit parse.
 
 **The compressor does not drain between projects.** It fell 0.55 GB at WebKit
 teardown and then stayed within 0.7 GB of its high-water mark for three more
@@ -469,6 +521,40 @@ CC-subprocess churn. That reasoning is weaker than it looks. The wedge it
 targeted is fixed at the source, by the explicit `proxy` on the mobile-webkit
 project. The projects run sequentially, so the churn was never concurrent with
 it. And the phase split inside the project remains the real mitigation.
+
+### One verdict per project, however many invocations it took
+
+A chunked project prints a summary per invocation and none for itself. Nobody
+adds 36 of them up. So a green run was 36 small green runs stacked up. An
+invocation that died before printing its summary looked exactly like one that
+passed. That is what "chunked green is not green" names, and it is a REPORTING
+defect rather than an argument against chunks (ADR 0145).
+
+So the harness adds them up. `summarise_playwright_log` sums every summary in a
+project's captured output and `report_playwright_totals` prints the project's own
+line: planned, passed, failed, flaky, skipped, interrupted, did not run.
+
+**The banner is the control.** Every planned test lands in exactly one outcome
+bucket, retries included, so a test that fails then passes is counted once, as
+flaky. The buckets must therefore sum to the `Running N tests` banners. When they
+do not, an invocation ended without reporting, and the run is not a verdict: the
+report returns non-zero and `merge_rc` folds it in, so it can only ADD a failure
+and never mask a test one.
+
+Two details are load-bearing rather than incidental.
+
+- **`tee`, and `PIPESTATUS`.** Capturing the output puts Playwright in a
+  pipeline, whose exit status is `tee`'s. Reading `$?` there is the false green
+  the "never pipe a test command" rule warns about, so `run_playwright` reads
+  `PIPESTATUS[0]`.
+- **Colour is stripped before counting.** Playwright emits SGR codes to a
+  terminal, and an escape before the digits would leave every count at zero.
+
+Both helpers live in `scripts/lib/e2e.sh` beside `report_project_exit_codes`, for
+its reason: what they guard against is a harness misreport, and a guard with no
+test is the bet that produced the misreport. `scripts/lib/e2e_test.sh` covers the
+sum, the colour strip, the per-test lines that must not be counted, and the
+regression itself, an invocation that never reported.
 
 ### Host-load backpressure guard — refuse to launch onto a saturated host
 

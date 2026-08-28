@@ -1966,31 +1966,36 @@ start_caffeinate() {
 }
 
 # ── Network bind (dev) ───────────────────────────────────────────────────
-# Post the loopback-default security flip, a directly-launched engine and the
-# dev gateway default to 127.0.0.1 only. Dev needs network access (the picker +
-# the direct engine reachable over Tailscale / LAN), so these helpers opt into
-# all-interfaces — UNLESS the user has created ~/.lucidos/network.toml, in which
-# case they STEP ASIDE and let the Rust resolvers (+ each workspace's own
-# `network_bind` preference) derive the configured bind (a specific tailnet IP,
-# or a loopback lockdown). The file is the single source of truth for the
-# address; the shell only chooses "force all-interfaces vs defer to the file".
+# The engine and the gateway both default to loopback. Only the GATEWAY opts
+# back into the network here: it authenticates every caller (ADR 0094), so it is
+# the one process that may face one. A directly-launched engine authenticates
+# nobody, so it stays where the engine's own resolver puts it.
+# ~/.lucidos/network.toml owns the address when it exists. The shell only
+# chooses between pinning a bind and deferring to that resolver.
 network_toml_exists() {
     [ -f "$HOME/.lucidos/network.toml" ]
 }
 
-# Bind for a directly-launched engine (start_engine). e2e must stay reachable on
-# localhost regardless of a developer's personal network.toml, so it always
-# forces all-interfaces.
+# Bind for a directly-launched engine (start_engine): legacy no-gateway dev,
+# tauri-dev, and e2e. Nothing authenticates this port, so widening it is a
+# deliberate act by the developer, never a launch-script default.
+#
+# e2e pins loopback instead of deferring, because both suites address the engine
+# as `localhost` and must not inherit a developer's tailnet bind.
+# LUCIDOS_BIND_ADDR rather than LUCIDOS_BIND_LOOPBACK, because the latter
+# doubles as the `behind_gateway` signal. That signal moves the API base URL
+# handed to subprocesses (api/actor.rs) and suppresses the lucidos.toml port pin
+# (engine_impl/construction.rs). LUCIDOS_BIND_ADDR outranks LUCIDOS_BIND_ALL and
+# network.toml alike (crates/lucidos-engine/src/net_config.rs), and carries no
+# second meaning.
 apply_dev_engine_bind() {
     if [ "${SCRIPT_NAME:-}" = "e2e" ]; then
-        export LUCIDOS_BIND_ALL=1
-        return
+        export LUCIDOS_BIND_ADDR=127.0.0.1
+        return 0
     fi
-    if network_toml_exists; then
-        unset LUCIDOS_BIND_ALL   # engine resolver reads ~/.lucidos/network.toml
-    else
-        export LUCIDOS_BIND_ALL=1
-    fi
+    # Set nothing. The engine resolves its own bind: an explicit LUCIDOS_BIND_*
+    # from the developer's shell, else ~/.lucidos/network.toml, else loopback.
+    return 0
 }
 
 # Bind for the dev gateway (start_gateway). Same rule, gateway-scoped var.
@@ -2008,12 +2013,10 @@ apply_dev_gateway_bind() {
 # Sets ENGINE_PID.
 start_engine() {
     # Direct-front launch (legacy no-gateway dev, tauri-dev, e2e): the engine IS
-    # the user-facing door on its own port. The engine now defaults to LOOPBACK
-    # (security: a directly-launched engine has no API auth), so opt into the
-    # network here — deferring to ~/.lucidos/network.toml when the user set an
-    # explicit bind there. The gateway path does NOT use this function — it
-    # spawns engines itself with the right bind (see gateway stack.rs
-    # spawn_engine).
+    # the user-facing door on its own port, and nothing authenticates it. So it
+    # stays on loopback unless the developer widens it deliberately. The gateway
+    # path does NOT use this function. It spawns engines itself with the right
+    # bind (see gateway stack.rs spawn_engine).
     apply_dev_engine_bind
 
     # Check if an existing engine is already healthy on our port

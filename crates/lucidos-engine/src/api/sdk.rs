@@ -45,12 +45,44 @@ fn sdk_iframe_css() -> &'static str {
 /// it via `<script src="/api/v1/sdk-iframe-audio.js"></script>` early in `<head>`.
 pub(super) const SDK_IFRAME_AUDIO_JS: &str = include_str!("sdk_iframe_audio.js");
 
+/// The shared SSE worker: one `EventSource` per workspace, per browser profile.
+///
+/// A `SharedWorker` is keyed by its resolved script URL. This route sits under
+/// the workspace's `/<slug>` prefix, so two workspaces get two workers and
+/// neither can see the other's frames.
+///
+/// `include_str!` of a CHECKED-IN esbuild artifact, like the appearance boot
+/// bundle beside it, so `cargo build` needs no prior npm run.
+/// `sseWorker.staleness.test.ts` fails if the committed bundle drifts from its
+/// TypeScript source.
+const SSE_WORKER_JS: &str =
+    include_str!("../../../../packages/lucidos-sdk/src/generated/sse-worker.js");
+
 /// GET /api/v1/sdk-iframe.css — serve the iframe stylesheet (iframe tokens/
 /// defaults + the shared component layer).
 pub(super) async fn serve_sdk_iframe_css() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         sdk_iframe_css(),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/sse-worker.js: serve the shared SSE worker.
+///
+/// `no-cache` so a revalidation happens per load. A stale worker keeps relaying
+/// frames correctly while quietly running the previous pong aggregation, which
+/// is the failure hardest to notice.
+pub(super) async fn serve_sse_worker_js() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        SSE_WORKER_JS,
     )
         .into_response()
 }
@@ -205,6 +237,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/sdk.js", get(serve_sdk_js))
         .route("/sdk-iframe.css", get(serve_sdk_iframe_css))
         .route("/sdk-iframe-audio.js", get(serve_sdk_iframe_audio_js))
+        .route("/sse-worker.js", get(serve_sse_worker_js))
         .route("/ui/navigate", post(ui_navigate))
 }
 

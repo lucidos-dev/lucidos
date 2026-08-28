@@ -253,6 +253,18 @@ impl AuthLayer for ScriptHandshakeLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write the fixture script AND record it as approved, which is what an
+    /// in-process file tool does when the agent authors one. Without the
+    /// record the runner refuses it before the spawn (ADR 0144). Every test
+    /// here would then fail on the guard rather than on what it checks.
+    fn write_approved_script(ws: &std::path::Path, body: &str) {
+        let rel = "data/scripts/auth/echo.py";
+        let abs = ws.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, body).unwrap();
+        crate::core::handshake_approvals::record(ws, rel, body.as_bytes()).unwrap();
+    }
     use crate::api::proxy_auth_layer::*;
     use axum::http::{HeaderName, HeaderValue, Method};
     use bytes::Bytes;
@@ -458,8 +470,7 @@ print(json.dumps({
 "#;
 
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("scripts/auth")).unwrap();
-        std::fs::write(tmp.path().join("scripts/auth/echo.py"), ECHO_SCRIPT).unwrap();
+        write_approved_script(tmp.path(), ECHO_SCRIPT);
 
         let (pool, db_name) = setup_test_db().await;
 
@@ -572,8 +583,7 @@ print(json.dumps({
 }))
 "#;
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("data/scripts/auth")).unwrap();
-        std::fs::write(tmp.path().join("data/scripts/auth/echo.py"), ECHO_SCRIPT).unwrap();
+        write_approved_script(tmp.path(), ECHO_SCRIPT);
 
         let layer = ScriptHandshakeLayer::new(
             "script_handshake".into(),

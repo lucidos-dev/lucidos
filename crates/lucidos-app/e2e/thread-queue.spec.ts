@@ -60,6 +60,12 @@ test.describe('thread queue panel', () => {
   test('queued trigger fire shows in the panel and Drop removes it', async ({ page }) => {
     await navigateToApp(page);
     await assertHealthy(page);
+    // Before the first write, not just before the panel opens. Every write
+    // below announces itself over SSE, and the page refetches the queue from
+    // those announcements alone. A stream that connects later misses all of
+    // them, so the panel keeps its boot snapshot and the queued row never
+    // arrives.
+    await waitForEventStream(page);
 
     // Hold ALL background admission so the fire queues instead of running.
     const policyResp = await page.request.put('/api/v1/thread-queue/policy', {

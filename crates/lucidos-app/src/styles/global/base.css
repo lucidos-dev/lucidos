@@ -145,7 +145,7 @@ html {
        var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
        Mobile redefines this in mobile.css: its header is fixed at the viewport
        top instead, so the anchor there is the measured header height alone. */
-    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px));
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px));
     /* The breathing room a surface HUNG FROM the header leaves below that edge,
        so it reads as coming out of the row it was opened from rather than as
        welded to it. The other half of the anchor above, and it lives beside it
@@ -169,9 +169,14 @@ html {
        whichever measured last wins, and retracting either would clear the
        reservation for both. */
     --app-conn-banner-height: 0px;
+    /* The webhook ingress bar's own height, a THIRD property on the same terms.
+       It is up whenever the public delivery path has failed for two probe
+       cycles, which is independent of both bars above: a workspace this client
+       reaches perfectly well can still be unreachable from the internet. */
+    --app-ingress-banner-height: 0px;
     /* How much of a state colour an app-shell banner washes over its surface.
-       Shared by both bars so they read as one family, and named so the live
-       style remote can retune the wash without reaching into two rules. */
+       Shared by all three bars so they read as one family, and named so the live
+       style remote can retune the wash without reaching into three rules. */
     --banner-tint-strength: 10%;
     /* The connection banner's line-height, stated rather than inherited and
        named rather than written into the rule, because the dot's offset is

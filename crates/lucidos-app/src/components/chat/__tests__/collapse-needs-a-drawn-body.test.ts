@@ -118,15 +118,30 @@ describe('turning a reveal on lifts this turn\'s fold', () => {
   });
 
   it('routes both reveals through it, so the two cannot drift', () => {
-    expect(source).toMatch(/const toggleDetails = \(\) => reveal\(detailsExpanded\)/);
-    expect(source).toMatch(/const toggleSteps = \(\) => reveal\(stepsExpanded\)/);
+    expect(source).toMatch(/const toggleDetails = heldOnThePress\(\(\) => reveal\(detailsExpanded\)\)/);
+    expect(source).toMatch(/const toggleSteps = heldOnThePress\(\(\) => reveal\(stepsExpanded\)\)/);
   });
 
   it('keeps the scroll anchor around the whole thing', () => {
     // The reveal grows the turn the reader is looking at, and the unfold grows
-    // it further. Both have to happen inside one `withScrollAnchor` or the
-    // anchor measures a height the second half then changes.
-    const fn = source.match(/function reveal\(setting: Signal<boolean>\)[\s\S]*?\n  \}/)![0];
-    expect(fn).toMatch(/withScrollAnchor\(rootRef\.current, \(\) => \{[\s\S]*expandExchange/);
+    // it further. Both have to happen inside one anchor or it measures a height
+    // the second half then changes. `heldOnThePress` wraps the WHOLE callback,
+    // so a caller cannot split them.
+    const fn = source.match(/function heldOnThePress[\s\S]*?\n\}/);
+    expect(fn, '`heldOnThePress` not found').not.toBeNull();
+    expect(fn![0]).toMatch(/withScrollAnchor\(e\.currentTarget as HTMLElement \| null, fn\)/);
+  });
+
+  it('anchors every control that changes a turn\'s height', () => {
+    // The two reveals are transcript-wide; the two folds are this turn's. All
+    // four move content, so all four hold the control the reader pressed.
+    for (const held of [
+      'const toggleDetails = heldOnThePress(',
+      'const toggleSteps = heldOnThePress(',
+      'const toggleCollapsed = heldOnThePress(',
+      'const toggleInitiator = heldOnThePress(',
+    ]) {
+      expect(source, `${held} is not anchored`).toContain(held);
+    }
   });
 });

@@ -4,7 +4,7 @@ import {
   assertHealthy, pickComposeDestination, newThread,
   waitForCCToStart, waitForCCToFinish, waitForExchangeCount,
   cancelStreamingResponse, countVisibleResponses, dismissCCSession,
-  waitForStreamingToStart, waitForActionPanel, USER_MSG_SELECTOR,
+  waitForKeptOutputToStart, waitForActionPanel, USER_MSG_SELECTOR,
 } from './helpers';
 import { psql } from './db-helpers';
 
@@ -30,7 +30,7 @@ test.describe('Claude Code cancel and stop', () => {
 
     // Wait for CC to start and produce some visible response text
     await waitForCCToStart(page, 60_000);
-    await waitForStreamingToStart(page, 1, 60_000);
+    await waitForKeptOutputToStart(page, 1, 60_000);
 
     await cancelStreamingResponse(page);
 
@@ -47,7 +47,7 @@ test.describe('Claude Code cancel and stop', () => {
     await sendMessage(page, BUSY_BASH_PROMPT);
 
     await waitForCCToStart(page, 60_000);
-    await waitForStreamingToStart(page, 1, 60_000);
+    await waitForKeptOutputToStart(page, 1, 60_000);
 
     await cancelStreamingResponse(page);
 
@@ -78,7 +78,7 @@ test.describe('Claude Code cancel and stop', () => {
 
     await sendMessage(page, BUSY_BASH_PROMPT);
     await waitForCCToStart(page, 60_000);
-    await waitForStreamingToStart(page, 1, 60_000);
+    await waitForKeptOutputToStart(page, 1, 60_000);
 
     // Cancel = Esc: interrupt the turn but keep the session resumable.
     await cancelStreamingResponse(page);

@@ -9,6 +9,13 @@ import {
   reorderTriggerGroups as apiReorder,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
+import { instantMicros } from '../../utils/isoInstant';
+
+/** Panel order: `order` ascending, oldest first inside a tie. Both sorts below
+ *  take it, so the optimistic reorder cannot drift from the upsert. */
+function byPanelOrder(a: TriggerGroup, b: TriggerGroup): number {
+  return a.order - b.order || (instantMicros(a.created) ?? 0) - (instantMicros(b.created) ?? 0);
+}
 
 /** Fetch the trigger-group registry from the engine. Called from `useStartup`
  *  and re-fetched after group mutations to keep the panel in sync. */
@@ -36,8 +43,7 @@ export function upsertTriggerGroup(group: TriggerGroup): void {
   const idx = next.findIndex(g => g.id === group.id);
   if (idx >= 0) next[idx] = { ...next[idx], ...group };
   else next.push(group);
-  // Always keep panel order stable (asc).
-  next.sort((a, b) => a.order - b.order || a.created.localeCompare(b.created));
+  next.sort(byPanelOrder);
   triggerGroups.value = { status: 'loaded', data: next };
 }
 
@@ -103,7 +109,7 @@ export async function reorderTriggerGroups(
       const next = current.data.map(g =>
         byId.has(g.id) ? { ...g, order: byId.get(g.id)! } : g,
       );
-      next.sort((a, b) => a.order - b.order || a.created.localeCompare(b.created));
+      next.sort(byPanelOrder);
       triggerGroups.value = { status: 'loaded', data: next };
     }
   } catch (error) {

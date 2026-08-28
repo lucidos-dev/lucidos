@@ -1,4 +1,5 @@
-import { apiUrl } from './_fetch';
+import { apiBase } from './_fetch';
+import { eventStreamTargets, openEventStream, type EventStream } from './eventStream';
 
 export interface SseThreadEvent {
   type: 'ThreadEvent';
@@ -20,14 +21,50 @@ export type SseEvent = SseThreadEvent | SseSystemEvent;
 
 type SseCallback = (data: unknown, raw: SseEvent) => void;
 
-let eventSource: EventSource | null = null;
+let stream: EventStream | null = null;
 const listeners = new Map<string, Set<SseCallback>>();
+
+/** Where this app's SDK reaches the engine. Derived per call rather than at
+ *  module load, so `lucidos.configure({ baseUrl })` still takes effect. */
+function targets() {
+  return eventStreamTargets(apiBase());
+}
 
 function dispatch(eventType: string, data: unknown, raw: SseEvent) {
   const set = listeners.get(eventType);
   if (set) {
     for (const cb of set) cb(data, raw);
   }
+}
+
+/** Route one frame's `data` payload to its listeners.
+ *
+ *  Exported for the transport-equivalence test: a direct frame and a relayed
+ *  frame both land here, so asserting on this function is what proves the two
+ *  transports are indistinguishable. */
+export function handleFrame(data: string): void {
+  try {
+    const parsed = JSON.parse(data) as SseEvent;
+    const outerType = parsed?.type;
+    if (!outerType) return;
+
+    if (outerType === 'ThreadEvent') {
+      // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
+      const threadEvent = parsed as SseThreadEvent;
+      const innerType = threadEvent.data?.event?.type;
+      if (innerType) {
+        dispatch(innerType, threadEvent.data, parsed);
+      }
+      // Also dispatch to "ThreadEvent" listeners (for generic thread watchers)
+      dispatch('ThreadEvent', threadEvent.data, parsed);
+    } else {
+      // System events: { type: "NotificationCreated", data: { ... } }
+      dispatch(outerType, parsed.data ?? parsed, parsed);
+    }
+
+    // Wildcard listeners get the full raw envelope
+    dispatch('*', parsed, parsed);
+  } catch { /* malformed SSE data */ }
 }
 
 export const sse = {
@@ -57,43 +94,35 @@ export const sse = {
     };
   },
 
-  /** Open the SSE connection to the Lucidos event stream. */
+  /** Open the SSE connection to the Lucidos event stream.
+   *
+   *  Idempotent, and one connection fans out to every `on(...)` listener in
+   *  this document. Given `SharedWorker`, the connection is shared with every
+   *  other document of this workspace. Ten open apps then cost one stream
+   *  rather than ten. */
   connect(): void {
-    if (eventSource) return;
-
-    eventSource = new EventSource(apiUrl('/events'));
-
-    eventSource.onmessage = (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as SseEvent;
-        const outerType = parsed?.type;
-        if (!outerType) return;
-
-        if (outerType === 'ThreadEvent') {
-          // Thread events: { type: "ThreadEvent", data: { thread_id, event: { type, ... } } }
-          const threadEvent = parsed as SseThreadEvent;
-          const innerType = threadEvent.data?.event?.type;
-          if (innerType) {
-            dispatch(innerType, threadEvent.data, parsed);
-          }
-          // Also dispatch to "ThreadEvent" listeners (for generic thread watchers)
-          dispatch('ThreadEvent', threadEvent.data, parsed);
-        } else {
-          // System events: { type: "NotificationCreated", data: { ... } }
-          dispatch(outerType, parsed.data ?? parsed, parsed);
-        }
-
-        // Wildcard listeners get the full raw envelope
-        dispatch('*', parsed, parsed);
-      } catch { /* malformed SSE data */ }
-    };
+    if (stream) return;
+    stream = openEventStream(
+      targets(),
+      {
+        onFrame: handleFrame,
+        // An app has no resync to run and no status chrome to repaint, so both
+        // are no-ops here. Whichever transport it got reconnects for it.
+        onOpen: () => {},
+        onError: () => {},
+      },
+      // An app has no presence voice, exactly as it has none today. It holds a
+      // port and never answers a PresenceCheck, so the worker does not count it
+      // among the documents it waits for.
+      { pongs: false },
+    );
   },
 
   /** Close the SSE connection. */
   disconnect(): void {
-    if (eventSource) {
-      eventSource.close();
-      eventSource = null;
+    if (stream) {
+      stream.close();
+      stream = null;
     }
   },
 };

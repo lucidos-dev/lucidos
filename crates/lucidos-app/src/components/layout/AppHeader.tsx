@@ -11,6 +11,7 @@ import { focusPromptNow } from '../chat/promptFocus';
 import { MobileAppHeader } from './MobileAppHeader';
 import { BackupReminderBanner } from './BackupReminderBanner';
 import { ConnectionBanner } from './ConnectionBanner';
+import { IngressBanner } from './IngressBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -388,6 +389,7 @@ export function AppHeader() {
             words: the mark carries it as strength and motion, and `data-tooltip`
             is a desktop-only surface. */}
         <ConnectionBanner layout="mobile" />
+        <IngressBanner layout="mobile" />
         <BackupReminderBanner layout="mobile" />
       </header>
     </>

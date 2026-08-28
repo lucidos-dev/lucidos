@@ -1,5 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { syncTextareaValue, shouldSkipSyncWhileEditing } from '../promptValueSync';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+import {
+  syncTextareaValue,
+  shouldSkipSyncWhileEditing,
+  requestPromptOverrideSync,
+  promptOverrideSyncSeq,
+  promptOverrideReplacesDraft,
+} from '../promptValueSync';
 
 function makeTextarea(initial: { value: string; selectionStart: number; selectionEnd: number }) {
   const el = {
@@ -128,5 +140,31 @@ describe('shouldSkipSyncWhileEditing', () => {
     const unfocusedEl = makeEl('stale-from-prior-sync');
     expect(shouldSkipSyncWhileEditing(focusedEl, true, true)).toBe(true);
     expect(shouldSkipSyncWhileEditing(unfocusedEl, true, false)).toBe(false);
+  });
+});
+
+describe('requestPromptOverrideSync', () => {
+  it('bumps the ticket and records that the override replaced the draft', () => {
+    const before = promptOverrideSyncSeq.value;
+    requestPromptOverrideSync('replace');
+    expect(promptOverrideSyncSeq.value).toBe(before + 1);
+    expect(promptOverrideReplacesDraft.value).toBe(true);
+  });
+
+  it('records an append, so the caret the user left in their own text survives', () => {
+    requestPromptOverrideSync('replace');
+    requestPromptOverrideSync('append');
+    expect(promptOverrideReplacesDraft.value).toBe(false);
+  });
+
+  // The two halves above only matter if PromptInput's sync effect reads them.
+  // It derives `preserveCursor` and hands that to `syncTextareaValue`. Passing
+  // the bare `sameThread` back is the regression: it lands the caret inside a
+  // seeded sentence the user did not write.
+  it('is wired into the sync effect, which passes the derived preserveCursor', () => {
+    const here: string = dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(resolve(here, '../PromptInput.tsx'), 'utf-8');
+    expect(source).toContain('syncTextareaValue(el, composeText, preserveCursor)');
+    expect(source).toContain('promptOverrideReplacesDraft.value');
   });
 });

@@ -706,13 +706,44 @@ export async function waitForCCToFinish(page: Page, timeout = 120_000): Promise<
   }, undefined, { timeout });
 }
 
-/** Wait for streaming to start (visible response-content with text above minLength) */
+/** Wait for streaming to start (visible response-content with text above minLength).
+ *
+ *  The turn is producing output, scaffolding included. Reach for this when the
+ *  test needs the turn ALIVE, e.g. to hit Cancel while it still runs. Waiting
+ *  for prose instead can miss a short mock answer entirely. */
 export async function waitForStreamingToStart(page: Page, minLength = 5, timeout = 30_000): Promise<void> {
   await page.waitForFunction((min) => {
     const els = document.querySelectorAll('.response-content');
     return Array.from(els).some(el => {
       const rect = el.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').length > min;
+    });
+  }, minLength, { timeout });
+}
+
+/** Wait until the turn holds output a cancel would KEEP: the same measure, with
+ *  the `Thinking` marker taken out.
+ *
+ *  That row is DERIVED by the projection (ADR 0066), not carried by an event.
+ *  It opens the moment the session starts, before the agent has produced
+ *  anything, and a cancel keeps nothing of it. Counting it let
+ *  `coding-agent-cancel` stop a turn that had said nothing, then assert the
+ *  turn kept partial output. Every other row here is event-backed and survives.
+ *
+ *  Deliberately NOT the default. A short answer can finish between the first
+ *  prose and this returning, which takes the Cancel button away with it. */
+export async function waitForKeptOutputToStart(page: Page, minLength = 1, timeout = 30_000): Promise<void> {
+  await page.waitForFunction((min) => {
+    const els = document.querySelectorAll('.response-content');
+    return Array.from(els).some(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const settled = el.cloneNode(true) as HTMLElement;
+      settled.querySelectorAll('[data-role="inline-step"]').forEach((step) => {
+        const name = step.querySelector('.step-description')?.textContent?.trim();
+        if (name === 'Thinking') step.remove();
+      });
+      return (settled.textContent ?? '').length > min;
     });
   }, minLength, { timeout });
 }
@@ -1049,4 +1080,36 @@ export async function expectNoPushSent(
         JSON.stringify(log),
     );
   }
+}
+
+/** Wait until the transcript has stopped moving under the reader.
+ *
+ *  A turn control changes the height of every turn. `withScrollAnchor` then
+ *  writes its correction across the frames after the render commits: a restore,
+ *  then a next-frame re-assert. A fixed sleep stood in for that and was the one
+ *  flaky reading in the scroll specs. On a loaded WebKit host a frame runs long,
+ *  so the correction landed after the sleep and a measurement caught the reader
+ *  mid-flight.
+ *
+ *  Three equal readings in a row, so a settle is a position the layout has KEPT
+ *  rather than one frame that happened to match. A host that never settles
+ *  fails on the timeout, instead of on a measurement nobody can trust.
+ *
+ *  It reads the VISIBLE transcript. Mobile mounts every pane at once, and the
+ *  compose view reuses the class. So a bare `querySelector` can answer with a
+ *  box nobody is looking at. Mirrors `findVisibleThreadContent`. */
+export async function waitForScrollSettled(page: Page): Promise<void> {
+  const read = () => page.evaluate(() => {
+    const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
+      .find(c => c.getBoundingClientRect().height > 0);
+    return el ? `${Math.round(el.scrollTop)}:${Math.round(el.scrollHeight)}` : 'gone';
+  });
+  let previous = await read();
+  let stable = 0;
+  await expect.poll(async () => {
+    const now = await read();
+    stable = now === previous ? stable + 1 : 0;
+    previous = now;
+    return stable;
+  }, { timeout: 15_000, intervals: [50, 50, 100] }).toBeGreaterThanOrEqual(2);
 }

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import type { AppUpdateProgress, AppUpdateRunning } from '../../utils/tauri';
 import type { ReleaseCheck, ReleaseOffer } from '../../api/client/control';
+import type { UpdateRoute } from './app-update';
 // The real copy module, not a mock: these tests are about what the user reads,
 // and it is pure, so there is nothing to stub.
 import { appUpdateNarration, appUpdateDialogState } from '../progressDialogCopy';
@@ -50,6 +51,7 @@ const storeSignals = vi.hoisted(() => ({
   appUpdateCheckInFlight: { value: false },
   appUpdateProgress: { value: null as AppUpdateProgress | null },
   releaseCheck: { value: null as ReleaseCheck | null },
+  settingsScrollTarget: { value: null as string | null },
 }));
 
 /** What `check_app_update` resolves to. Notes default to absent, which is the
@@ -57,6 +59,10 @@ const storeSignals = vi.hoisted(() => ({
 function offer(version: string, notes: string | null = null) {
   return { version, notes };
 }
+
+/** Every route. A case added to the union with no label fails here, rather than
+ *  shipping a button with no words on it. */
+const ROUTES: UpdateRoute[] = ['install', 'check', 'guide'];
 
 vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
 // The offer toast's secondary action navigates; the navigation itself belongs to
@@ -84,18 +90,22 @@ vi.mock('../store', () => ({
   appUpdateCheckInFlight: storeSignals.appUpdateCheckInFlight,
   appUpdateProgress: storeSignals.appUpdateProgress,
   releaseCheck: storeSignals.releaseCheck,
+  settingsScrollTarget: storeSignals.settingsScrollTarget,
 }));
 
 const {
+  canCheckForUpdatesHere,
   canInstallUpdateHere,
   checkAppUpdateViaClient,
   checkForUpdatesNow,
+  followUpdateRoute,
   installAppUpdate,
   refreshReleaseCheck,
   reportUpdateCheck,
   startAppUpdateProgress,
   stopAppUpdateProgress,
   updateControlLabel,
+  updateRoute,
 } = await import('./app-update');
 // The read lives a layer up, and is exercised here because the actions above
 // all branch on it. It reads the same mocked signals.
@@ -142,6 +152,7 @@ beforeEach(() => {
   storeSignals.appUpdateCheckInFlight.value = false;
   storeSignals.appUpdateProgress.value = null;
   storeSignals.releaseCheck.value = null;
+  storeSignals.settingsScrollTarget.value = null;
 });
 
 afterEach(() => {
@@ -588,16 +599,31 @@ describe('refreshReleaseCheck', () => {
   });
 
   // A browser or PWA session can install nothing, so an Update button there
-  // would be a control that cannot do what it says.
-  it('offers no install action in a browser or PWA session', async () => {
+  // would be a control that cannot do what it says. It is still owed a route:
+  // announcing a release and offering nothing is the whole defect this fixes.
+  it('routes a browser or PWA session instead of offering an install', async () => {
     mocks.isTauri.mockReturnValue(false);
     mocks.requestUpdateCheck.mockResolvedValue(
       releaseCheckOf({ version: '9.3.0', install: 'desktop-app', command: null }),
     );
     await refreshReleaseCheck();
     expect(lastToast().message).toBe('Lucidos 9.3.0 available');
-    expect(lastToastOpts().action).toBeUndefined();
+    const opts = lastToastOpts() as { action: { label: string; onClick: () => void } };
+    expect(opts.action.label).toBe('How to update');
+    opts.action.onClick();
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  // The gateway never asked, so its untouched snapshot is not an answer. This
+  // is what said "Lucidos is up to date" on a checkout whose changelog listed a
+  // newer release.
+  it('refuses to read an unpollable gateway as up to date', async () => {
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null, { supported: false }));
+    expect(await refreshReleaseCheck(true)).toEqual({
+      kind: 'failed',
+      reason: 'this install has no update check',
+    });
   });
 
   // A headless install updates by re-running the installer, so the toast routes
@@ -858,15 +884,142 @@ describe('reportUpdateCheck', () => {
 
 describe('updateControlLabel', () => {
   it('reports the check while one is running, whatever the control does', () => {
-    expect(updateControlLabel(true, false)).toBe('Checking…');
-    expect(updateControlLabel(true, true)).toBe('Checking…');
+    for (const route of ROUTES) {
+      expect(updateControlLabel(route, true), route).toBe('Checking…');
+    }
   });
 
-  // Both idle words live here, so Settings and What's New cannot ship as
+  // Every idle word lives here, so Settings and What's New cannot ship as
   // "Check for Updates" and "Check for updates" at once, which they did.
-  it('owns both idle labels rather than taking one from the caller', () => {
-    expect(updateControlLabel(false, false)).toBe('Check for Updates');
-    expect(updateControlLabel(false, true)).toBe('Update & Restart');
+  it('owns every idle label rather than taking one from the caller', () => {
+    expect(updateControlLabel('install', false)).toBe('Update & Restart');
+    expect(updateControlLabel('check', false)).toBe('Check for Updates');
+    expect(updateControlLabel('guide', false)).toBe('How to Update');
+  });
+
+  // The invariant, restated as the thing a caller can rely on: whatever the
+  // route, there are words for it. A route with no label is a button with no
+  // text, which is the silence this whole change removes.
+  it('names every route', () => {
+    for (const route of ROUTES) {
+      expect(updateControlLabel(route, false), route).not.toBe('');
+    }
+  });
+});
+
+/**
+ * What this session can do about a release newer than the one running.
+ *
+ * The rule the panel leans on: there is always an answer. What's New used to
+ * mark a release `Newer` and offer nothing at all, which left the reader
+ * looking at an update they could not reach.
+ */
+describe('updateRoute', () => {
+  it('installs here in a Tauri client fronting a bundle', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.40.0',
+      install: 'desktop-app',
+    });
+    expect(updateRoute()).toBe('install');
+  });
+
+  // The offer is real and this session cannot take it. Settings, System carries
+  // the whole account of how this install updates.
+  it('routes a browser or PWA session to the page that can answer', () => {
+    mocks.isTauri.mockReturnValue(false);
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.41.0',
+      install: 'desktop-app',
+    });
+    expect(updateRoute()).toBe('guide');
+  });
+
+  it('routes a headless install to its installer command', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf({
+      version: '9.42.0',
+      install: 'installer-rerun',
+      command: 'curl …',
+    });
+    expect(updateRoute()).toBe('guide');
+  });
+
+  // The changelog is fetched from the public mirror, and the offer comes from
+  // an hourly poll. So knowing about a release the updater has not offered is
+  // the ordinary state, and asking is the honest next step.
+  it('offers a check when a release is known but none is offered', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    expect(updateRoute()).toBe('check');
+  });
+
+  // A source checkout never polls (ADR 0108), so a check button there would
+  // error on every press.
+  it('routes a source checkout to the page instead of a check it cannot run', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null, { supported: false });
+    expect(updateRoute()).toBe('guide');
+  });
+
+  // The client-check path holds the offer before the signals it would be
+  // re-derived from have settled, so it says so rather than being re-read.
+  it('takes the word of a caller already holding an offer', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    expect(updateRoute(true)).toBe('install');
+  });
+
+  it('always answers, whatever the session is', () => {
+    for (const tauri of [true, false]) {
+      for (const check of [null, releaseCheckOf(null), releaseCheckOf(null, { supported: false })]) {
+        mocks.isTauri.mockReturnValue(tauri);
+        storeSignals.releaseCheck.value = check;
+        expect(ROUTES).toContain(updateRoute());
+      }
+    }
+  });
+});
+
+describe('canCheckForUpdatesHere', () => {
+  // The gateway is authoritative once it has answered: it knows whether this
+  // deployment may poll at all.
+  it('follows the gateway when it has answered', () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    expect(canCheckForUpdatesHere()).toBe(true);
+    storeSignals.releaseCheck.value = releaseCheckOf(null, { supported: false });
+    expect(canCheckForUpdatesHere()).toBe(false);
+  });
+
+  // ADR 0105: a gateway too old to carry the field, or a direct engine port.
+  it('falls back to the client updater when the gateway said nothing', () => {
+    storeSignals.releaseCheck.value = null;
+    expect(canCheckForUpdatesHere()).toBe(true);
+    mocks.isTauri.mockReturnValue(false);
+    expect(canCheckForUpdatesHere()).toBe(false);
+  });
+});
+
+describe('followUpdateRoute', () => {
+  it('installs on the install route', async () => {
+    storeSignals.latestTauriAppVersion.value = '9.43.0';
+    mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
+    await followUpdateRoute('install');
+    expect(mocks.installAppUpdateAndRestart).toHaveBeenCalledTimes(1);
+  });
+
+  // The click is owed a reply, which is the whole reason the check reports its
+  // verdict rather than leaving the button to look dead.
+  it('checks and reports on the check route', async () => {
+    storeSignals.releaseCheck.value = releaseCheckOf(null);
+    mocks.requestUpdateCheck.mockResolvedValue(releaseCheckOf(null));
+    await followUpdateRoute('check');
+    expect(mocks.requestUpdateCheck).toHaveBeenCalledWith(true);
+    expect(lastToast().message).toBe('Lucidos is up to date');
+  });
+
+  // Landing on the page is not enough: the installer command, the update button
+  // and the rebuild control all live in Maintenance, further down it.
+  it('lands on the Maintenance section on the guide route', async () => {
+    await followUpdateRoute('guide');
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
+    expect(storeSignals.settingsScrollTarget.value).toBe('system:maintenance');
+    expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
   });
 });
 

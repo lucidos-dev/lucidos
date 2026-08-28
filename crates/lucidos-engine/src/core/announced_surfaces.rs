@@ -469,7 +469,24 @@ pub const TABLES: &[TableRule] = &[
         owners: &["core/webhooks.rs"],
         announcement: Announcement::Announced {
             events: &["WebhookCreated", "WebhookUpdated", "WebhookDeleted"],
-            exempt: &[],
+            exempt: &[
+                ExemptWriter {
+                    function: "record_accepted",
+                    why: "Stamps when a delivery last verified, which is an \
+                          observation rather than a decision. The delivery \
+                          already emitted the hook's own pinned domain event, \
+                          and WebhookUpdated would put an edit nobody made on \
+                          the timeline.",
+                },
+                ExemptWriter {
+                    function: "record_refused",
+                    why: "Stamps when a delivery was last turned away. Same \
+                          shape as record_accepted, and the refusal reaches \
+                          the owner through the row rather than through an \
+                          event, since a public endpoint receives thousands of \
+                          unsigned probes and each one would be a timeline row.",
+                },
+            ],
         },
     },
 ];

@@ -65,6 +65,13 @@ export function apiUrl(suffix: string): string {
   return `${_baseUrl}${API_V1}${normalized}`;
 }
 
+/** The versioned API root, with NO trailing slash, for a caller that builds
+ *  several sibling URLs from one base. Prefer `apiUrl` for a single path:
+ *  `apiUrl('')` is not this, it yields a trailing slash. */
+export function apiBase(): string {
+  return `${_baseUrl}${API_V1}`;
+}
+
 export class SdkError extends Error {
   constructor(
     public readonly httpCode: number,

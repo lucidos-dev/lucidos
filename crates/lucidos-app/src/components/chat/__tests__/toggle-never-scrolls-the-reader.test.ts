@@ -128,12 +128,15 @@ describe('no transcript toggle scrolls the reader', () => {
    *  wearing a smaller hat. Adding or removing a toggle means changing these
    *  numbers deliberately, in the same commit. */
   const EXPECTED_PANEL_TOGGLES = 2;    // ChatExchange: the initiator panel, the response panel
-  // ChatExchange's `reveal`, which the full-response and steps turn controls
-  // both route through. It was one anchored site per control until they grew a
-  // shared second half (turning either ON also lifts this turn's fold), which
-  // has to happen inside the SAME anchor or the anchor measures a height the
-  // unfold then changes.
-  const EXPECTED_ANCHORED_TOGGLES = 1;
+  // The four turn controls, each wrapped by `heldOnThePress`: the full
+  // response, the steps, this turn's fold, and its user message's fold.
+  //
+  // The wrapper is what the scan follows, and following it is not optional.
+  // Every control routes through ONE `withScrollAnchor` call inside a two-line
+  // helper that can never hold a scroll call itself. Scanning THAT call's
+  // enclosing function reads the wrapper, and passes whatever the handlers do.
+  // It is the whole failure this suite exists to catch.
+  const EXPECTED_ANCHORED_TOGGLES = 4;
 
   it('no onToggle handler moves the transcript', () => {
     const offenders: string[] = [];
@@ -161,20 +164,55 @@ describe('no transcript toggle scrolls the reader', () => {
     ).toEqual([]);
   });
 
+  /** The balanced parenthesised expression starting at `open` (the index of a
+   *  `(`), or `null` if the parens never balance. The paren twin of `braced`,
+   *  and `null` for the same reason: a tail would sweep in the rest of the file.
+   *
+   *  Reading to the end of the LINE instead is what this replaces, and it was
+   *  the scan's own silent pass wearing a smaller hat. A handler written as
+   *  `heldOnThePress(() => {` puts its calls on later lines. The argument read
+   *  that way is three characters long and names nothing. */
+  function parenthesised(src: string, open: number): string | null {
+    let depth = 0;
+    for (let i = open; i < src.length; i++) {
+      if (src[i] === '(') depth++;
+      else if (src[i] === ')' && --depth === 0) return src.slice(open, i + 1);
+    }
+    return null;
+  }
+
+  /** The whole of what a `heldOnThePress(...)` press runs: the argument itself,
+   *  plus the body of any local function that argument names.
+   *
+   *  Two hops, because the handlers are written as `heldOnThePress(() =>
+   *  reveal(x))`. The argument alone holds a call, never the work. */
+  function pressedWork(src: string, arg: string): string {
+    let body = arg;
+    for (const [, name] of arg.matchAll(/([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const at = src.search(new RegExp(`\\bfunction ${name}\\s*\\(`));
+      if (at < 0) continue;
+      body += '\n' + (braced(src, src.indexOf('{', at)) ?? '');
+    }
+    return body;
+  }
+
   it('no scroll-anchored toggle moves the transcript', () => {
     const offenders: string[] = [];
     let seen = 0;
     for (const { file, src } of sources) {
-      const re = /withScrollAnchor\(/g;
+      // The WRAPPER's call sites, not `withScrollAnchor`'s own. Every control
+      // shares one call of it, so the anchored sites are where the wrapper is
+      // applied. See `EXPECTED_ANCHORED_TOGGLES`.
+      const re = /heldOnThePress\(/g;
       for (let m = re.exec(src); m !== null; m = re.exec(src)) {
         if (isDefinition(src, m.index)) continue;
         seen++;
-        // Look back to the top of the enclosing handler. Both shapes count: a
-        // `function` declaration and an arrow body, whichever starts closer, so
-        // writing the next toggle as `const toggleX = () => {` cannot resolve
-        // back past it into an earlier function.
-        const start = Math.max(src.lastIndexOf('function ', m.index), src.lastIndexOf('=> {', m.index));
-        const body = start < 0 ? '' : braced(src, src.indexOf('{', start)) ?? src.slice(start, m.index);
+        const arg = parenthesised(src, m.index + 'heldOnThePress'.length);
+        if (arg === null) {
+          offenders.push(`${file}: <unparseable press at offset ${m.index}>`);
+          continue;
+        }
+        const body = pressedWork(src, arg);
         const call = SCROLL_CALLS.find((c) => body.includes(c));
         if (call) offenders.push(`${file}: ${call} in ${body.replace(/\s+/g, ' ').slice(0, 100)}`);
       }
@@ -183,7 +221,7 @@ describe('no transcript toggle scrolls the reader', () => {
     expect(
       offenders,
       'withScrollAnchor call(s) whose handler also moves the transcript. withScrollAnchor '
-      + 'already holds the reader on their own topmost line across the growth; a scroll '
+      + 'already holds the control the reader pressed across the growth; a scroll '
       + `beside it undoes exactly that:\n${offenders.join('\n')}`,
     ).toEqual([]);
   });

@@ -21,6 +21,7 @@ import {
 import { _resetPageVisitForTesting } from '../utils/pageVisit';
 import { USER_ACTION_EVENTS } from '../utils/userAction';
 import { installFakePage } from '../utils/__tests__/fakePage';
+import { mockTranscript } from '../components/chat/__tests__/scroll-test-helpers';
 
 /** Pin the *follow seed* off around every test in this file.
  *
@@ -1466,6 +1467,14 @@ describe('attachScrollMemory teardown', () => {
     };
   }
 
+  /** A document holding no match, so a real deep link keeps its claim and waits.
+   *  The mirror of `withFindableTarget` above. */
+  function withUnfindableTarget() {
+    const origQSA = (globalThis.document as any).querySelectorAll;
+    (globalThis.document as any).querySelectorAll = () => [];
+    return () => { (globalThis.document as any).querySelectorAll = origQSA; };
+  }
+
   it('defers the top RESET to a deep-link too, then rescues a dead one', async () => {
     // The reset stands down for the same reason the restore does: the attach
     // cannot be assumed to precede the landing. It is parked on `paused` until
@@ -1491,6 +1500,41 @@ describe('attachScrollMemory teardown', () => {
 
       expect(el.scrollTop).toBe(0); // the link was dead, so the open is ours after all
       detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits out a link still holding its claim, then rescues once it lets go', async () => {
+    // The link's budget is ELASTIC: it re-arms its deadline while the thread's
+    // events are still arriving. The rescue used to fire on a fixed 4.5s, so on
+    // a slow thread it positioned the reader over a landing still to come. The
+    // held claim is what tells it the link has not concluded.
+    vi.useFakeTimers();
+    try {
+      localStorage.setItem('k', '3200');
+      const el = makeEl(4200, 20000); // the outgoing thread's offset
+      const link = withDeepLink();
+      const detach = attachScrollMemory(el, 'k', { live: link.live, resetOnEmpty: true });
+
+      // A real claim, held open by a thread that keeps saying more is coming.
+      const restoreDom = withUnfindableTarget();
+      scrollToEventAndPulse('e-slow', { stillArriving: () => true });
+
+      try {
+        await vi.advanceTimersByTimeAsync(9000); // twice the old rescue deadline
+        expect(hasPendingEventScroll()).toBe(true);
+        expect(el.scrollTop).toBe(4200); // untouched: the link may still land
+
+        clearPendingEventScroll(); // the link concluded
+        link.release();
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(el.scrollTop).toBe(3200); // rescued, once there was a verdict
+      } finally {
+        restoreDom();
+        detach();
+      }
     } finally {
       vi.useRealTimers();
     }
@@ -2152,5 +2196,414 @@ describe('attachScrollMemory teardown', () => {
       expect(el.scrollTop).toBe(4200); // the event, not the new live edge
       detach();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A READING POSITION THAT NAMES A TURN.
+//
+// The transcript's height is not reproducible: ThreadView renders a trailing
+// slice, and the slice's top edge is session state re-seeded on every reload.
+// A pixel offset recorded against one slice measures from an edge that has
+// moved. It overshoots the next slice, which used to park the reader at the
+// top. Or it lands on different content, once the thread has grown. So the transcript records the TURN it sat
+// on plus that turn's exact offset from the viewport top.
+//
+// The container here is `mockTranscript`, which clamps `scrollTop` on write the
+// way a real one does. That is what makes the "the write was clamped, so the
+// turns below have not rendered" branch reachable.
+// ---------------------------------------------------------------------------
+describe('a reading position that names a turn', () => {
+  const IDS = ['t0', 't1', 't2', 't3', 't4', 't5'];
+  const TURN = 400;
+  let origRO: unknown;
+  let origMO: unknown;
+
+  beforeEach(() => {
+    localStorage.clear();
+    origRO = (globalThis as any).ResizeObserver;
+    origMO = (globalThis as any).MutationObserver;
+  });
+  afterEach(() => {
+    (globalThis as any).ResizeObserver = origRO;
+    (globalThis as any).MutationObserver = origMO;
+  });
+
+  function inertObservers() {
+    class Inert {
+      observe() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    }
+    (globalThis as any).ResizeObserver = Inert;
+    (globalThis as any).MutationObserver = Inert;
+  }
+
+  /** Observers that hand the test their callbacks, so a window GROWING can be
+   *  delivered rather than waited for. */
+  function liveObservers() {
+    const callbacks: Array<() => void> = [];
+    class Capturing {
+      cb: () => void;
+      constructor(cb: () => void) { this.cb = cb; callbacks.push(cb); }
+      observe() {}
+      disconnect() {
+        const i = callbacks.indexOf(this.cb);
+        if (i >= 0) callbacks.splice(i, 1);
+      }
+      takeRecords() { return []; }
+    }
+    (globalThis as any).ResizeObserver = Capturing;
+    (globalThis as any).MutationObserver = Capturing;
+    return { fire: () => { for (const cb of [...callbacks]) cb(); }, armed: () => callbacks.length };
+  }
+
+  const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
+
+  it('records the turn and its exact offset, not the scroll position', () => {
+    inertObservers();
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN });
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    el.scrollTop = 950; // the reader scrolls down to turn 2
+    el.fireScroll();
+    detach();
+
+    expect(localStorage.getItem('k')).toBe('anchor:-150:t2');
+    expect(parseSavedScroll(localStorage.getItem('k')))
+      .toEqual({ kind: 'anchor', eventId: 't2', relTop: -150 });
+  });
+
+  it('opens on the same turn in a window too short to hold the old offset', () => {
+    // The reported bug. 950 was the reader's offset with the whole thread
+    // rendered. The re-seeded window's own maximum is 800, so the number is out
+    // of reach, and it used to leave them at the top. The anchor puts turn 2
+    // back on the line it was on.
+    inertObservers();
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const el = mockTranscript({ ids: IDS, renderFrom: 2, turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    expect(el.scrollTop).toBe(150);
+    detach();
+  });
+
+  it('opens on the same turn after the thread gained newer ones', () => {
+    // The other half, and the reason a bottom-relative offset is no answer
+    // either. Two turns arrived while the reader was away, so every distance
+    // measured from the end now points somewhere else. The turn does not move.
+    inertObservers();
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const grown = mockTranscript({ ids: [...IDS, 't6', 't7'], turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(grown, 'k', opts);
+
+    expect(grown.scrollTop).toBe(950);
+    detach();
+  });
+
+  it('waits for the window to reach the turn, then lands on it', () => {
+    // ThreadView walks its render window up to the anchored turn one budgeted
+    // round per commit, so the turn is absent when this attaches. The wait is
+    // the point: a restore that gave up here is the approximation the whole
+    // form refuses.
+    const obs = liveObservers();
+    localStorage.setItem('k', 'anchor:-150:t1');
+    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, scrollTop: 0 });
+
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(0); // parked at the top for the wait
+    expect(obs.armed()).toBeGreaterThan(0);
+
+    el.growWindowTo(2); // one round: t2 and t3 join
+    obs.fire();
+    expect(el.scrollTop).toBe(0); // still not t1, so still waiting
+    expect(obs.armed()).toBeGreaterThan(0);
+
+    el.growWindowTo(1); // the round that reaches it
+    obs.fire();
+    expect(el.scrollTop).toBe(150);
+    expect(obs.armed()).toBe(0); // the restore is done and retired
+    detach();
+  });
+
+  it('writes NOTHING until the content below the anchor has its height', () => {
+    // The anchored turn is rendered, but the turns below it have not settled.
+    // The transcript therefore cannot hold the offset that turn needs. An image
+    // or a font decoding is the ordinary cause. The reader stays at the top of
+    // what is rendered and the wait goes on.
+    //
+    // Detecting the browser's CLAMP after writing is NOT the same test, and is
+    // the bug this replaces. A clamped write comes to rest at the container's
+    // maximum. That is the live edge (ADR 0064), and at the two sites that
+    // write once and stop it rests there for good.
+    const obs = liveObservers();
+    localStorage.setItem('k', 'anchor:-150:t4'); // needs scrollTop 150
+    const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: 200, clientHeight: 400 });
+
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(0);            // never the live edge, never partway
+    expect(obs.armed()).toBeGreaterThan(0);  // still waiting for the height
+
+    el.setTurnHeight(400); // the content below settles
+    obs.fire();
+    expect(el.scrollTop).toBe(150);
+    expect(obs.armed()).toBe(0);
+    detach();
+  });
+
+  it('extends the wait across a SHRINK, not only across growth', async () => {
+    // Progress is any CHANGE in height. The walk prepends turns, but the
+    // transcript shrinks under it too, a live Thinking row folding into its
+    // summary being the ordinary case. Measured against a high-water mark,
+    // every round after such a shrink reads as no progress, and the reader is
+    // abandoned mid-walk.
+    vi.useFakeTimers();
+    try {
+      const obs = liveObservers();
+      localStorage.setItem('k', 'anchor:-150:t1');
+      const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, scrollTop: 0 });
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      await vi.advanceTimersByTimeAsync(2000);
+      el.setTurnHeight(200); // the transcript gets SHORTER, mid-walk
+      obs.fire();
+      await vi.advanceTimersByTimeAsync(2000); // past the deadline it started with
+      el.growWindowTo(0);
+      obs.fire();
+
+      expect(el.scrollTop).toBe(350); // t1 back on its line, not the top
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lands a RESOLVED anchor the content shrank under, rather than the top', async () => {
+    // The turn is found and measured; only the content BELOW it got shorter, so
+    // the offset it wants is now past the container's maximum. Refusing gives
+    // the top of the window, which is further from that turn than the clamp is.
+    // No growth can help either: the walk is over, the turn being in the window.
+    //
+    // Distinct from the offset form, which keeps refusing. An offset that
+    // overshoots names no content, so clamping it invents the live edge
+    // (ADR 0064). A located turn taller than the part scrolled past is still on
+    // screen at the clamp. ADR 0152 (docs/adr/) carries the distinction.
+    vi.useFakeTimers();
+    try {
+      inertObservers();
+      // Parked at the bottom of six 400px turns: at 1600, t4's top is exactly
+      // on the viewport top.
+      localStorage.setItem('k', 'anchor:0:t4');
+      const el = mockTranscript({ ids: IDS, renderFrom: 0, turnHeight: TURN, clientHeight: 800 });
+      el.setTurnHeightOf('t5', 100); // its live Thinking row folded away
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      expect(el.scrollTop).toBe(0); // the wait parks at the top
+
+      await vi.advanceTimersByTimeAsync(4000);
+
+      // t4 still wants 1600, and the shortened transcript can only reach 1300.
+      expect(el.scrollHeight).toBe(2100);
+      expect(el.scrollTop).toBe(1300);
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lands a bottom-parked anchor at once when only ROUNDING puts it out of reach', async () => {
+    // Heights and `relTop` are whole numbers read off a fractional layout. So a
+    // reader at the true bottom can measure a pixel past the reported edge.
+    // Treating that as "the content below has not rendered" would park them at
+    // the top for the whole deadline before landing them correctly.
+    vi.useFakeTimers();
+    try {
+      inertObservers();
+      const el = mockTranscript({ ids: IDS, renderFrom: 0, turnHeight: TURN, clientHeight: 800 });
+      // One pixel past the maximum of 1600: t4 sits at 1600 and wants 1601.
+      localStorage.setItem('k', 'anchor:-1:t4');
+
+      const detach = attachScrollMemory(el, 'k', opts);
+
+      expect(el.scrollTop).toBe(1600); // landed on attach, no wait at all
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(el.scrollTop).toBe(1600);
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the record when a scroll arrives on a transcript nobody can measure', async () => {
+    // A collapsed desktop split leaves `.thread-content` mounted with all-zero
+    // rects, and swapping content in clamps `scrollTop`, which fires a scroll.
+    // Nothing on screen can be named there, and the offset that fallback would
+    // record is the clamp itself. Writing it would replace the reader's turn
+    // with a number, and the next open would honour the number.
+    vi.useFakeTimers();
+    try {
+      inertObservers();
+      localStorage.setItem('k', 'anchor:-150:t2');
+      const el = mockTranscript({ ids: IDS, renderFrom: 0, turnHeight: TURN, clientHeight: 800 });
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      await vi.advanceTimersByTimeAsync(4000); // the restore lands and retires
+
+      el.collapse();
+      el.fireScroll();
+      await vi.advanceTimersByTimeAsync(1000);
+      detach();
+
+      expect(localStorage.getItem('k')).toBe('anchor:-150:t2');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a deep-link stand-down does not SETTLE the restore; the rescue does', async () => {
+    // `onRestoreSettled` stops work done on the restore's behalf, which for the
+    // transcript is ThreadView walking its render window up to the anchored
+    // turn. Handing the open to a deep-link is not the end of that: the rescue
+    // that covers a link turning out dead reads the same record and needs the
+    // same turn rendered. So the walk outlives the hand-over, and the rescue is
+    // what finally says nobody else will place the reader.
+    vi.useFakeTimers();
+    try {
+      inertObservers();
+      localStorage.setItem('k', 'anchor:-150:t2');
+      const el = mockTranscript({ ids: IDS, renderFrom: 0, turnHeight: TURN, scrollTop: 0 });
+      let claimHeld = true;
+      let settled = 0;
+
+      const detach = attachScrollMemory(el, 'k', {
+        live: () => ({ shouldRestore: () => !claimHeld, onRestoreSettled: () => { settled++; } }),
+        resetOnEmpty: true,
+        anchorsToContent: true,
+      });
+
+      expect(settled).toBe(0); // the link owns the open, the walk carries on
+
+      claimHeld = false; // its deadline passed with nothing found
+      await vi.advanceTimersByTimeAsync(5000);
+
+      expect(settled).toBe(1); // the rescue ran, so now nothing else will
+      detach();
+      expect(settled).toBe(1); // and it is said once
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds the wait open while the pane has NO BOX, and lands when it is revealed', async () => {
+    // A collapsed desktop split persists across a reload, so the transcript can
+    // mount unmeasurable. Nothing can be placed there, and an unmeasured height
+    // never changes, so the ordinary progress test is silent for it. Spending
+    // the last look then throws the position away while the reader is not even
+    // looking at the pane.
+    vi.useFakeTimers();
+    try {
+      const obs = liveObservers();
+      localStorage.setItem('k', 'anchor:-150:t2');
+      const el = mockTranscript({ ids: IDS, renderFrom: 0, turnHeight: TURN, clientHeight: 800 });
+      el.collapse();
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      await vi.advanceTimersByTimeAsync(9000); // long past the ordinary deadline
+      expect(obs.armed()).toBeGreaterThan(0);  // still waiting for a box
+
+      el.reveal(800); // the reader expands the pane again
+      obs.fire();
+
+      expect(el.scrollTop).toBe(950); // t2 back on its line
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops re-arming at the CEILING, so a growing transcript cannot wait for ever', async () => {
+    // Progress re-arms the deadline, and a live thread changes height on every
+    // streamed step. Without a ceiling the restore holds its observers for the
+    // life of the thread, and `restoring` suppresses every save with it.
+    vi.useFakeTimers();
+    try {
+      const obs = liveObservers();
+      localStorage.setItem('k', 'anchor:-150:gone'); // a turn that never renders
+      const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, scrollTop: 0 });
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      // A step lands every second, so every round makes "progress".
+      for (let second = 0; second < 25; second++) {
+        el.setTurnHeight(TURN + second);
+        obs.fire();
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+
+      expect(obs.armed()).toBe(0); // the wait gave up rather than riding along
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the reader at the TOP, never the live edge, when the turn never renders', async () => {
+    // Same promise the offset form makes (ADR 0064). A position that cannot be
+    // honoured opens the thread where a thread with no position opens.
+    vi.useFakeTimers();
+    try {
+      inertObservers();
+      localStorage.setItem('k', 'anchor:-150:gone');
+      const el = mockTranscript({ ids: IDS, renderFrom: 4, turnHeight: TURN, scrollTop: 0 });
+
+      const detach = attachScrollMemory(el, 'k', opts);
+      await vi.advanceTimersByTimeAsync(4000);
+
+      expect(el.scrollTop).toBe(0);
+      detach();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a container that cannot name its children ignores an anchor record', () => {
+    // The content pane and the thread drawer share this hook and stamp no id on
+    // anything. An anchor there is a value they did not write. The honest
+    // answer is no saved position, not a turn that names nothing here.
+    inertObservers();
+    localStorage.setItem('k', 'anchor:-150:t2');
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN, scrollTop: 640 });
+
+    const detach = attachScrollMemory(el, 'k', { live: () => ({}), resetOnEmpty: true });
+
+    expect(el.scrollTop).toBe(0); // the no-position branch, not a restore
+    el.fireScroll();
+    detach();
+    expect(localStorage.getItem('k')).toBe('0'); // and it records a number
+  });
+
+  it('an armed follow still records the live edge, never a turn', () => {
+    // The live edge leads in `currentPosition`, and must: every growth round
+    // writes `scrollTop`, so recording where the follow left the reader would
+    // overwrite the request they made.
+    //
+    // Reduced motion, like every other follow test here: the toggle's glide
+    // re-requests a frame per step, and this environment runs rAF callbacks
+    // synchronously.
+    inertObservers();
+    const origMatchMedia = (globalThis as any).matchMedia;
+    (globalThis as any).matchMedia = () => ({ matches: true });
+    const el = mockTranscript({ ids: IDS, turnHeight: TURN });
+    setActiveScrollElement(el);
+    const detach = attachScrollMemory(el, 'k', { ...opts, followsLiveEdge: true });
+    setFollowLiveEdge(true);
+
+    el.fireScroll();
+    detach();
+
+    expect(localStorage.getItem('k')).toBe(LIVE_EDGE_VALUE);
+    setActiveScrollElement(null);
+    (globalThis as any).matchMedia = origMatchMedia;
   });
 });

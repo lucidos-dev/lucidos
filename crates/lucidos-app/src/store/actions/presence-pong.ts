@@ -10,11 +10,13 @@
  *  push-suppressed branch — so the two surfaces are mutually exclusive by the
  *  engine's single decision, not by a page-side timing race. */
 
-import { API } from '../../api/client';
+import type { PongAnswer } from '@lucidos/event-stream';
 import { isPageActive } from '../../utils/pageActive';
 import { isInViewport } from '../../utils/viewport';
-import { focusedThreadId } from '../store';
+import { appFullscreenHost } from '../appFullscreenHost';
+import { appPseudoFullscreen, focusedThreadId } from '../store';
 import { getDeviceId } from './devices';
+import { submitPong } from './event-stream';
 
 /** Wall-clock slack on top of `deadline_ms` before a PresenceCheck is
  *  considered stale (iOS PWA SSE-queue flush after a push tap). A late ping
@@ -31,31 +33,55 @@ export interface PresenceCheckPayload {
   sent_at_ms: number;
 }
 
+/** Whether the SHELL is the surface in front of the user.
+ *
+ *  Presence answers "can we reach this person here, instead of pushing?", and
+ *  only the shell can show them a toast. An app filling the screen means they
+ *  are looking at the app, so the notification belongs to the OS.
+ *
+ *  That also makes a fullscreen app agree with a popped-out app window. The two
+ *  look identical to the user, and a popped-out one has always taken the push.
+ *  Before this they were opposite, for no reason anybody had chosen.
+ *
+ *  Pure over its three inputs, so it is testable without a DOM. */
+export function isShellActive(
+  pageActive: boolean,
+  nativeFullscreen: boolean,
+  pseudoFullscreen: boolean,
+): boolean {
+  return pageActive && !nativeFullscreen && !pseudoFullscreen;
+}
+
+/** `isShellActive` against the live signals. */
+export function shellIsActive(): boolean {
+  return isShellActive(
+    isPageActive(),
+    appFullscreenHost.value !== null,
+    appPseudoFullscreen.value,
+  );
+}
+
+/** This document's answer to a `PresenceCheck`, before any aggregation.
+ *
+ *  Deliberately NOT the device-presence heartbeat's view. That one reports
+ *  whether the page is visible, which it still is under a fullscreen app. The
+ *  engine reads the heartbeat only to count how many pongs to wait for, and
+ *  reads the push decision from `is_active` here. */
+export function buildPongAnswer(payload: PresenceCheckPayload): PongAnswer {
+  return {
+    device_id: getDeviceId(),
+    is_active: shellIsActive(),
+    focused_thread_id: focusedThreadId.value,
+    event_in_viewport: payload.event_id ? isInViewport(payload.event_id) : false,
+  };
+}
+
 export function handlePresenceCheck(payload: PresenceCheckPayload): void {
   if (Date.now() - payload.sent_at_ms > payload.deadline_ms + STALE_GRACE_MS) {
     return;
   }
-
-  const body = {
-    notification_id: payload.notification_id,
-    device_id: getDeviceId(),
-    is_active: isPageActive(),
-    focused_thread_id: focusedThreadId.value,
-    event_in_viewport: payload.event_id ? isInViewport(payload.event_id) : false,
-  };
-
-  // `keepalive: true` so the pong still flushes if the user navigates away
-  // mid-send (e.g. notification fires as the tab is closing).
-  fetch(`${API}/presence-pong`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    keepalive: true,
-  }).catch((e) => {
-    // Telemetry carve-out (.claude/rules/frontend.md): pong runs in response
-    // to the engine's broadcast, not user intent. Engine's deadline-then-
-    // default-to-push fallback covers a missed pong — the user still gets
-    // the OS push instead of the in-app surface; no silent dead-end.
-    console.warn('[PresencePong] Failed to POST:', e);
-  });
+  // Through the transport, not straight to the engine. On a shared connection
+  // the worker ORs this with its other documents' answers. It then POSTs one
+  // pong, which is the one the engine is waiting for.
+  submitPong(payload.notification_id, buildPongAnswer(payload));
 }

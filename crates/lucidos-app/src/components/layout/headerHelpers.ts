@@ -1,16 +1,11 @@
 import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, settingsSubviewShortLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
 import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm, type SettingsNavKey } from '../../store/store';
+import { MENU_ITEM_LABELS } from '../../store/types';
 import type { NavEntry } from '../../store/actions/navigation';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
 import { previewFileName } from '../../utils/previewPath';
 import { PENDING_TITLE_PLACEHOLDER } from '../../store/thread-events';
-
-const menuLabels: Record<string, string> = {
-  files: 'Files', apps: 'Apps', plugins: 'Plugins', triggers: 'Triggers',
-  changes: 'Changes', notifications: 'Notifications',
-  settings: 'Settings',
-};
 
 export const CHANNEL_OPTIONS: { value: ThreadChannel; label: string }[] = [
   { value: 'chat', label: formatChannel('chat') },
@@ -100,7 +95,7 @@ function contentTitle(short: boolean): string {
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
     return settingsLabel(settingsSubview.value) || '';
   }
-  return menuLabels[active] || '';
+  return MENU_ITEM_LABELS[active] || '';
 }
 
 /** The full title, for every surface with room for it: the tap-tooltip on the
@@ -138,7 +133,10 @@ export function navEntryTitle(entry: NavEntry): string {
   if (!overlay && entry.menuItem === 'settings' && entry.settingsSubview !== 'main') {
     return settingsSubviewLabel(entry.settingsSubview) || 'Settings';
   }
-  return menuLabels[entry.menuItem] || entry.menuItem;
+  // The fallback is not dead. `parseNavEntry` casts a persisted string to
+  // `MenuItem` unchecked, so an old stack can carry a retired menu item this
+  // map has no name for.
+  return MENU_ITEM_LABELS[entry.menuItem] || entry.menuItem;
 }
 
 /** Content-pane category for a captured `NavEntry` — drives the icon shown

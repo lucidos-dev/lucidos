@@ -11,8 +11,8 @@ use crate::workspace::{BoxError, Workspace};
 /// (`docs/plans/2026-07-02-remove-notification-tap-none.md`).
 ///
 /// The CLI flag only picks the discriminant; the target/sub-field shape for
-/// `Navigate` is implied by the other flags (`--app-id` → navigate-to-app;
-/// `--thread-id` → navigate-to-thread).
+/// `Navigate` is implied by the other flags (`--app-id` → navigate-to-app,
+/// refined by `--fragment`; `--thread-id` → navigate-to-thread).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum CliTap {
     Modal,
@@ -28,6 +28,9 @@ pub(crate) struct NotifyExtras<'a> {
     pub tap: Option<CliTap>,
     pub thread_id: Option<&'a str>,
     pub event_id: Option<&'a str>,
+    /// The place inside the app a navigate tap lands on. Only the app branch
+    /// reads it, since a thread target names no app.
+    pub fragment: Option<&'a str>,
 }
 
 /// Build the JSON body the CLI POSTs to `/api/v1/notifications`.
@@ -53,10 +56,10 @@ pub(crate) fn build_request_body(title: &str, message: &str, extras: &NotifyExtr
 
 /// Build the structured `Tap` JSON the server's `Tap` enum decodes from.
 /// `Modal` is a kind-only object. `Navigate` infers the target from the other
-/// extras: presence of `--app-id` → `target=app`, presence of `--thread-id` →
-/// `target=thread` (carrying `event_id` if set). The caller has already
-/// validated that at least one of those is present when `--tap navigate` was
-/// passed (see `cmd_notify`).
+/// extras: presence of `--app-id` → `target=app` (carrying `fragment` if set),
+/// presence of `--thread-id` → `target=thread` (carrying `event_id` if set).
+/// The caller has already validated that at least one of those is present when
+/// `--tap navigate` was passed (see `cmd_notify`).
 fn build_tap_value(tap: CliTap, extras: &NotifyExtras) -> Value {
     match tap {
         CliTap::Modal => json!({"kind": "modal"}),
@@ -74,10 +77,13 @@ fn build_tap_value(tap: CliTap, extras: &NotifyExtras) -> Value {
                 }
                 json!({"kind": "navigate", "to": Value::Object(to)})
             } else if let Some(aid) = trim_nonempty(extras.app_id) {
-                json!({
-                    "kind": "navigate",
-                    "to": {"target": "app", "app_id": aid}
-                })
+                let mut to = serde_json::Map::new();
+                to.insert("target".into(), Value::String("app".into()));
+                to.insert("app_id".into(), Value::String(aid.to_string()));
+                if let Some(frag) = trim_nonempty(extras.fragment) {
+                    to.insert("fragment".into(), Value::String(frag.to_string()));
+                }
+                json!({"kind": "navigate", "to": Value::Object(to)})
             } else {
                 // cmd_notify rejects this combo before we get here; fall back
                 // to modal so a future caller can't accidentally produce an
@@ -214,6 +220,43 @@ mod tests {
         assert_eq!(body["tap"]["kind"], json!("navigate"));
         assert_eq!(body["tap"]["to"]["target"], json!("app"));
         assert_eq!(body["tap"]["to"]["app_id"], json!("habit-tracker"));
+        // No `--fragment` writes no key, so the shape is the one every script
+        // written before the flag existed already produces.
+        assert!(body["tap"]["to"].get("fragment").is_none());
+    }
+
+    #[test]
+    fn body_navigate_app_carries_the_fragment() {
+        let body = build_request_body(
+            "Time to log",
+            "Daily check-in",
+            &NotifyExtras {
+                tap: Some(CliTap::Navigate),
+                app_id: Some("habit-tracker"),
+                fragment: Some("day-2026-08-28"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["tap"]["to"]["target"], json!("app"));
+        assert_eq!(body["tap"]["to"]["fragment"], json!("day-2026-08-28"));
+    }
+
+    #[test]
+    fn body_navigate_thread_ignores_the_fragment() {
+        // A thread target names no app, so there is nothing for a fragment to
+        // address. Dropping it beats sending a field the router would ignore.
+        let body = build_request_body(
+            "x",
+            "y",
+            &NotifyExtras {
+                tap: Some(CliTap::Navigate),
+                thread_id: Some("00000000-0000-0000-0000-000000000010"),
+                fragment: Some("day-2026-08-28"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["tap"]["to"]["target"], json!("thread"));
+        assert!(body["tap"]["to"].get("fragment").is_none());
     }
 
     #[test]
@@ -254,10 +297,25 @@ mod tests {
                 tap: None,
                 thread_id: Some(""),
                 event_id: Some("\t  "),
+                fragment: Some("  "),
             },
         );
         for key in ["app_id", "tap", "thread_id", "event_id"] {
             assert!(body.get(key).is_none(), "expected {key} absent: {body}");
         }
+
+        // The fragment lives inside the tap, so its own empty-is-absent rule
+        // needs a navigate tap to be visible at all.
+        let navigated = build_request_body(
+            "t",
+            "m",
+            &NotifyExtras {
+                app_id: Some("habit-tracker"),
+                tap: Some(CliTap::Navigate),
+                fragment: Some("  "),
+                ..Default::default()
+            },
+        );
+        assert!(navigated["tap"]["to"].get("fragment").is_none());
     }
 }

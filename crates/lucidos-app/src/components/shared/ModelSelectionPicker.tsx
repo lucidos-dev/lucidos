@@ -5,10 +5,12 @@ import {
 } from '../../store/modelSelection';
 import type { ModelSelection } from '../../hooks/useModelSelection';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
-import { focusIfNeeded } from '../../utils/dom';
+import { focusIfNeeded, isTextInput } from '../../utils/dom';
+import { isTouchDevice } from '../../utils/viewport';
 import {
   ControlOptionList, selectedOptionIndex, wrapHighlight, type ControlOption,
 } from './ControlOptionList';
+import { isTypeaheadKey } from './typeahead';
 
 /** The MODEL step's rows.
  *
@@ -57,6 +59,33 @@ export function pickerKeyAction(key: string): 'choose' | 'next' | 'prev' | null 
   return null;
 }
 
+/** Whether the model step draws its filter box.
+ *
+ *  Typing brings it out, the way every other dropdown reveals its filter. A
+ *  panel opened to click one row should not greet the user with an empty box
+ *  and a blinking caret.
+ *
+ *  A touch device always has it, because a box that waits to be typed into is
+ *  a box a finger can never reach. `touch` is the capability, NOT the mobile
+ *  width breakpoint: a phone held in landscape is over 768px wide and has no
+ *  more keyboard than it had upright. */
+export function pickerShowsFilter(opts: { searching: boolean; touch: boolean }): boolean {
+  return opts.searching || opts.touch;
+}
+
+/** Which element must hold focus, since whatever holds it owns the keystrokes.
+ *
+ *  The list, until a keystroke starts the search: the list's key handler is
+ *  what turns that key into the query. The tier step has no filter, so it is
+ *  always the list there.
+ *
+ *  So the box a touch device always shows OPENS unfocused, and that is the
+ *  point: the panel would otherwise be half covered by the on-screen keyboard
+ *  before the user has asked to search. A tap on the box is the asking. */
+export function pickerFocusTarget(opts: { tierStep: boolean; searching: boolean }): 'filter' | 'list' {
+  return opts.searching && !opts.tierStep ? 'filter' : 'list';
+}
+
 let pickerIdCounter = 0;
 
 /** The one picker for a *model selection*, on every surface.
@@ -98,6 +127,9 @@ export function ModelSelectionPicker({
   /** The model whose tiers are showing, or `null` on the model step. */
   const openModel = useSignal<string | null>(null);
   const filter = useSignal('');
+  // Latches on the first printable keystroke, and dies with the panel. It is
+  // what the filter box waits for, exactly as `Dropdown`'s does.
+  const searching = useSignal(false);
   const highlight = useSignal(0);
   // Seeded lazily: `useRef(expr)` evaluates `expr` on every render, so a
   // template in the argument would bump the counter forever and keep only the
@@ -110,17 +142,29 @@ export function ModelSelectionPicker({
   const openRow = selection.rows.find((r) => r.value === openModel.value) ?? null;
   const tierOptions = openRow ? tierStepOptions(openRow) : [];
   const rows = openRow ? tierOptions : modelOptions;
+  const showsFilter = pickerShowsFilter({
+    searching: searching.value, touch: isTouchDevice(),
+  });
 
   // Land on the model in force, so a long registry opens where the user is.
   useEffect(() => {
     highlight.value = selectedOptionIndex(modelOptions, selection.model ?? '');
   }, []);
 
-  // Whichever step is showing owns the keystrokes, so focus has to follow it.
+  // Whichever element owns the keystrokes has to hold focus, so focus follows
+  // the step, and follows the filter box the moment typing reveals it.
+  //
+  // The effect asks twice. A host that places its own panel (the Settings
+  // field) opens it `visibility: hidden`, and a hidden element cannot take
+  // focus, which the frame-late retry covers. The first call wins on a panel
+  // already on screen, which is every reveal, and there the next keystroke is
+  // already on its way.
   useEffect(() => {
-    if (openRow) focusIfNeeded(listRef.current);
-    else requestAnimationFrame(() => focusIfNeeded(filterRef.current));
-  }, [openModel.value]);
+    const target = pickerFocusTarget({ tierStep: !!openRow, searching: searching.value });
+    const ref = target === 'filter' ? filterRef : listRef;
+    focusIfNeeded(ref.current);
+    requestAnimationFrame(() => focusIfNeeded(ref.current));
+  }, [openModel.value, searching.value]);
 
   // The model step can overflow the panel, and it opens scrolled part-way down.
   useEffect(() => {
@@ -179,7 +223,21 @@ export function ModelSelectionPicker({
    *  over this one, and while the picker is up those keys are the picker's. */
   function handleKeyDown(e: KeyboardEvent) {
     const action = pickerKeyAction(e.key);
-    if (action === null) return;
+    if (action === null) {
+      // A printable key reaching the LIST is one the box does not own, so this
+      // both reveals the box and types into it. The box takes focus a frame
+      // later, and the keys pressed inside that frame land here.
+      //
+      // The target is the whole gate. Keys typed INTO the box bubble through
+      // here too, and the box handles those itself.
+      if (openRow || isTextInput(e.target) || !isTypeaheadKey(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      searching.value = true;
+      filter.value += e.key;
+      highlight.value = 0;
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     if (action === 'choose') {
@@ -216,12 +274,12 @@ export function ModelSelectionPicker({
       disabled={disabled}
       listRef={listRef}
       back={back}
-      filter={{
+      filter={showsFilter ? {
         value: filter.value,
         placeholder: 'Filter models...',
         inputRef: filterRef,
         onInput: (value) => { filter.value = value; highlight.value = 0; },
-      }}
+      } : undefined}
       onKeyDown={handleKeyDown}
       onPick={choose}
       onHighlight={(i) => { highlight.value = i; }}

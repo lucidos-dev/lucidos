@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
 import {
+  appUpdateCheckInFlight,
   appUpdateProgress,
   changelogReleases,
   latestTauriAppNotes,
@@ -9,9 +10,10 @@ import {
 } from '../../store/store';
 import { loadChangelog, markWhatsNewSeen } from '../../store/actions/whatsNew';
 import {
-  canInstallUpdateHere,
-  installAppUpdate,
+  followUpdateRoute,
   updateControlLabel,
+  updateRoute,
+  type UpdateRoute,
 } from '../../store/actions/app-update';
 import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -107,39 +109,70 @@ export function releaseRowStatus(
 }
 
 /**
- * What a row lets the reader DO about its release.
+ * The row that carries the panel's update control, or `null` when the reader is
+ * on the newest release the panel knows.
  *
- * One action, on one row. The updater installs whatever the manifest resolves,
- * so a row cannot ask for a version by name.
+ * A route is a GLOBAL answer, so a control on every ahead row would repeat
+ * itself down the list and say nothing new each time.
  *
- * No row offers a CHECK. A check is a global question, so per row it repeats
- * itself down the list. It also answers nothing the Available row above has
- * not answered already. The one check lives in Settings, System.
+ * **The OFFER wins wherever it sits, and only then does the newest ahead row.**
+ * The two sources move independently. The published changelog reaches the
+ * mirror before the update-check origin announces the same release, and the
+ * origin can stage a rollout deliberately (ADR 0108). So the list can carry a
+ * release the updater will not install. A control above the offer would then
+ * install a version its own row does not name.
  *
- * `canInstall` is `canInstallUpdateHere`, so a browser or PWA session and a
- * headless install both fall through to no action. Their route is Settings,
- * System, which carries the installer command.
+ * The synthesized offered row is not passed here. It sits above this list and
+ * the caller takes it as the lead, since a release absent from the list cannot
+ * be found in it.
  */
-export function releaseRowAction(
+export function leadAheadVersion(
+  releases: readonly ChangelogRelease[],
+  running: string | null,
+  offered: string | null,
+): string | null {
+  if (offered && releases.some((r) => r.version === offered)) return offered;
+  const lead = releases.find((r) => {
+    const status = releaseRowStatus(r.version, running, offered);
+    return status === 'available' || status === 'newer';
+  });
+  return lead?.version ?? null;
+}
+
+/**
+ * What a row lets the reader DO about its release, or `null` for nothing.
+ *
+ * **A row the panel marks as ahead of you always gets a route** (ADR 0142).
+ * That is the whole point of this function: the panel may not say a release is
+ * newer and then leave the reader with no way to get it. `route` is
+ * `updateRoute()`, so every install shape gets the answer that fits it.
+ *
+ * Only the LEAD row carries it, for the reason {@link leadAheadVersion} gives.
+ */
+export function releaseRowRoute(
   status: ReleaseRowStatus,
-  canInstall: boolean,
-): 'install' | null {
-  return status === 'available' && canInstall ? 'install' : null;
+  isLead: boolean,
+  route: UpdateRoute,
+): UpdateRoute | null {
+  if (!isLead) return null;
+  return status === 'available' || status === 'newer' ? route : null;
 }
 
 /**
  * Which chip a row wears, or `null` for none.
  *
- * The control supersedes the chip. An Update button already says the release is
- * available, so an `Available` chip beside it states one fact twice. A session
- * that cannot install keeps the chip, which is then the only thing on the row
- * saying so.
+ * An Update button supersedes the chip: it already says the release is
+ * available, so an `Available` chip beside it states one fact twice.
+ *
+ * Every other route keeps the chip, because it states a different fact. "Newer"
+ * says this release is published and you are not on it. "Check for Updates" and
+ * "How to update" say what to do next, and neither implies the first.
  */
 export function releaseRowMark(
   status: ReleaseRowStatus,
-  action: 'install' | null,
+  route: UpdateRoute | null,
 ): ReleaseRowMarkKind | null {
-  if (status === 'none' || action) return null;
+  if (status === 'none' || route === 'install') return null;
   return status;
 }
 
@@ -306,6 +339,11 @@ export function offeredRelease(
  * the one you are running open and marked, and any release being offered above
  * it. Arriving from an update offer opens the release that offer announced
  * instead.
+ *
+ * **A release marked ahead of you always carries the route to it.** The panel
+ * lists the PUBLISHED changelog and the updater polls on its own schedule, so
+ * it knows about releases no offer has named. It used to mark those and stop
+ * there, leaving an update on screen and out of reach.
  */
 export function WhatsNewPage() {
   const loadable = changelogReleases.value;
@@ -371,10 +409,19 @@ export function WhatsNewPage() {
   // Derived from the list, not just above it: the list can now carry a release
   // newer than the running one, the offered one included.
   const offered = offeredRelease(offeredVersion, latestTauriAppNotes.value, releases);
-  const canInstall = canInstallUpdateHere();
+  // What this session can do about a release ahead of the running one. One
+  // answer for the whole panel, so the control it renders is the same one
+  // Settings, System would render.
+  const route = updateRoute();
+  // The row that carries it. The offered row wins when it exists, since it sits
+  // above the list and nothing published can postdate it.
+  const lead = offered?.version ?? leadAheadVersion(releases, release, offeredVersion);
   // An install already under way owns every update control: the progress dialog
   // narrates it, and a row offering to start another would be a lie.
   const installing = appUpdateProgress.value !== null;
+  // A check the USER started, so the control says so and refuses a second. The
+  // same signal Settings, System reads, for the same reason.
+  const checking = appUpdateCheckInFlight.value;
   // A running release with no section of its own marks nothing, rather than
   // marking the newest and claiming something untrue. Reachable whenever RELEASE
   // is bumped ahead of its changelog entry.
@@ -412,14 +459,19 @@ export function WhatsNewPage() {
 
   /** The one control a row can offer. Its wording and its click are both
    *  Settings → System's, so the two surfaces cannot disagree about what taking
-   *  the update does. */
-  function installButton(): VNode {
+   *  the update does.
+   *
+   *  That includes reporting a check in flight and refusing a second one. The
+   *  verdict arrives as an unkeyed toast, so a button that stayed live through
+   *  the round trip stacked one copy per press. */
+  function routeButton(rowRoute: UpdateRoute): VNode {
     return (
       <button
         class="action-btn whats-new-release-action"
-        onClick={() => { void installAppUpdate(); }}
+        onClick={() => { void followUpdateRoute(rowRoute); }}
+        disabled={checking}
       >
-        {updateControlLabel(false, true)}
+        {updateControlLabel(rowRoute, checking)}
       </button>
     );
   }
@@ -430,14 +482,14 @@ export function WhatsNewPage() {
     // own heading, which can name something `packagedUpdateVersion` does not,
     // and that row is the offer whatever the two say. See {@link offeredRelease}.
     const status = forced ?? releaseRowStatus(r.version, release, offeredVersion);
-    const action = installing ? null : releaseRowAction(status, canInstall);
-    const markKind = releaseRowMark(status, action);
+    const rowRoute = installing ? null : releaseRowRoute(status, r.version === lead, route);
+    const markKind = releaseRowMark(status, rowRoute);
     return (
       <ReleaseRow
         key={r.version}
         release={r}
         mark={markKind ? markFor(markKind, r.version) : undefined}
-        action={action ? installButton() : null}
+        action={rowRoute ? routeButton(rowRoute) : null}
         open={open}
         onToggle={() => setToggled({ ...toggled, [r.version]: !open })}
       />

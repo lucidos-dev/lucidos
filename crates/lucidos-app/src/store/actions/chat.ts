@@ -691,7 +691,9 @@ function appendQueuedTextToCompose(threadId: string, texts: string[]): void {
   const addition = texts.join('\n\n');
   const combined = existing.trim().length > 0 ? `${existing}\n\n${addition}` : addition;
   updateCompose(threadId, { text: combined });
-  requestPromptOverrideSync();
+  // `'append'` rather than `'replace'`: the draft the user was writing keeps its
+  // prefix, so their caret still points at the character it did and stays put.
+  requestPromptOverrideSync('append');
 }
 
 /** On a user Stop of a chat thread, return un-injected queued follow-ups to the

@@ -642,29 +642,20 @@ impl LucidosEngine {
             );
         }
 
-        // First-ever boot for this workspace: pin the allocated vite port to
-        // `lucidos.toml` and commit it. Means the workspace never goes through
-        // an untracked-and-dirty state, and the port survives any future
-        // `~/.lucidos/port-registry` drift caused by sibling workspaces
-        // collision-walking past it.
+        // First-ever boot: pin the allocated vite port to `lucidos.toml` and
+        // commit it. That keeps the workspace out of an untracked-and-dirty
+        // state, and survives later `~/.lucidos/port-registry` drift.
         //
-        // Tauri / Docker installs run with `LUCIDOS_API_PORT` unset (the
-        // engine binds the default 3000 internally and there is no
-        // shell-driven port allocation), so the `None` arm fires and the
-        // workspace stays unpinned — that's intentional, `lucidos.toml` is
-        // a dev-mode concept that `scripts/lib/ports.sh` consumes.
+        // Skipped in three cases. Tauri / Docker run with `LUCIDOS_API_PORT`
+        // unset, and `lucidos.toml` is a dev-mode concept `ports.sh` consumes.
+        // A sub-5173 value is one `_validate_vite_port` would later reject.
+        // And a gateway-fronted engine's port is not the user-facing one, so
+        // pinning it would poison the next allocation.
         //
-        // The 5173 minimum mirrors `_validate_vite_port` in `ports.sh`
-        // (a sub-5173 value yields negative API/PG offsets). Writing a
-        // value the script will later reject would self-inflict a
-        // bootblock on the next dev-mode launch.
-        // A PACKAGED gateway engine binds a LOOPBACK port (LUCIDOS_BIND_LOOPBACK=1)
-        // that is NOT the user-facing vite port — pinning it into lucidos.toml
-        // would poison the next `scripts/lib/ports.sh` allocation (it reads
-        // lucidos.toml as the vite pin), so skip it. A DEV gateway engine (ADR
-        // 0014 "Dev runtime topology") binds the user-facing vite port DIRECTLY
-        // and does NOT set LUCIDOS_BIND_LOOPBACK, so `behind_gateway` is false and
-        // it pins the real port — correct, that IS the workspace's vite port.
+        // `LUCIDOS_BIND_LOOPBACK` is that gateway signal, set for dev and
+        // packaged alike since ADR 0096. See the Open Questions in
+        // docs/plans/2026-08-27-direct-engine-binds-loopback.md: dev's port IS
+        // the vite port, so this skip may now be wrong for dev.
         let behind_gateway = std::env::var("LUCIDOS_BIND_LOOPBACK")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);

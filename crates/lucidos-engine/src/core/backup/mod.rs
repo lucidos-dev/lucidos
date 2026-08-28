@@ -44,9 +44,47 @@ pub const DEFAULT_BACKUP_RETENTION: usize = 5;
 /// restart — terminal outcome otherwise lives only in ephemeral SSE events.
 pub const PREF_BACKUP_LAST_RUN: &str = "backup_last_run";
 
+/// A backup is "stale" once the newest good one is older than this. 24h matches
+/// the most aggressive built-in schedule.
+///
+/// The ONE definition of stale, so no two surfaces can disagree about the word.
+/// The Settings page's health card measures the newest archive the provider
+/// holds; the picker's row line measures the newest successful RUN. Both read
+/// the threshold here (`api::backup::build_backup_status` and
+/// `api::backup::build_last_successful`), and the frontend renders the boolean
+/// rather than re-deriving 24h of its own.
+pub const BACKUP_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
+
 /// Check whether a backup schedule value represents an active (enabled) schedule.
 pub fn is_schedule_active(value: &str) -> bool {
     !value.is_empty() && value != "off"
+}
+
+/// Will a backup actually run, given the stored `(schedule, provider)` pair?
+///
+/// Both halves are required, which is what `Scheduler::reload_backup_schedule`
+/// asks before it registers a job: an active cron with no destination has
+/// nowhere to upload, and a destination with the cron off runs nothing.
+///
+/// The ONE place that rule is written. `api::backup::schedule_response` decides
+/// which cron to REPORT with it, and [`backups_are_configured`] decides what the
+/// picker's row says. Two copies of it would let the Backup page and the picker
+/// disagree about whether an install is set up.
+pub fn schedule_will_run(schedule: Option<&str>, provider: Option<&str>) -> bool {
+    provider.is_some_and(|p| !p.is_empty()) && schedule.is_some_and(is_schedule_active)
+}
+
+/// Are this workspace's backups set up: [`schedule_will_run`] against what is
+/// stored?
+///
+/// A read failure propagates rather than reading as `false`. "Not set up" is a
+/// verdict the picker states out loud, so a transient `sqlx` failure must not be
+/// dressed up as one.
+pub async fn backups_are_configured(pool: &PgPool) -> Result<bool, BoxError> {
+    use crate::core::PreferenceStore;
+    let provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await?;
+    let schedule = PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await?;
+    Ok(schedule_will_run(schedule.as_deref(), provider.as_deref()))
 }
 
 /// Read the backup retention count from preferences. A missing or unparseable
@@ -458,6 +496,39 @@ pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary
             backup_run_from_event(&event_type, &payload, created)
         })
         .collect()
+}
+
+/// When the newest SUCCESSFUL backup run finished, or `None` when this workspace
+/// has never produced one.
+///
+/// The `BackupCompleted` row is the evidence, so a failure since the last good
+/// run cannot hide it. `PREF_BACKUP_LAST_RUN` would: it holds the last run
+/// whatever its outcome. `idx_events_type_created` covers the lookup, so this is
+/// one indexed read, cheap enough for the gateway's per-workspace poll.
+///
+/// A query failure is an `Err`, NOT an empty answer. `None` means "never backed
+/// up", which the picker states out loud in its warning colour. A transient
+/// `sqlx` failure reported as `None` would therefore be a wrong answer rather
+/// than a missing one. [`load_recent_runs`] degrades instead, because an empty
+/// history list says nothing false.
+pub async fn load_last_successful_backup(pool: &PgPool) -> Result<Option<DateTime<Utc>>, BoxError> {
+    use sqlx::Row;
+
+    let Some(row) = sqlx::query(
+        "SELECT payload, created FROM events \
+         WHERE event_type = 'BackupCompleted' \
+         ORDER BY created DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let payload: serde_json::Value = row.get("payload");
+    let created: DateTime<Utc> = row.get("created");
+    // Through the same reader the history list uses, so the two cannot disagree
+    // about where a run's finish time lives in the payload.
+    Ok(backup_run_from_event("BackupCompleted", &payload, created).map(|run| run.finished_at))
 }
 
 /// Reconstruct a [`BackupRunSummary`] from one persisted backup event row. Pure

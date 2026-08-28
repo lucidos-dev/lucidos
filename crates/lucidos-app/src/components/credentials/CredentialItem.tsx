@@ -5,6 +5,7 @@ import { getCredentialValue } from '../../api/client';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { copyToClipboard } from '../../utils/clipboard';
+import { credentialAnchor } from './credentialAnchor';
 
 interface Props {
   credential: CredentialInfo;
@@ -18,6 +19,7 @@ function formatAuthType(authType: AuthType): string {
     case 'password': return 'Password';
     case 'oauth_client': return 'OAuth Client';
     case 'email_password': return 'Email Password';
+    case 'secret': return 'Secret';
     default: return authType;
   }
 }
@@ -49,6 +51,9 @@ export function credentialRowLabel(
   if (authType === 'email_password') {
     return { title: serviceName, note: 'Mailbox password' };
   }
+  if (authType === 'secret') {
+    return { title: serviceName, note: 'Shared secret, signed with rather than sent' };
+  }
   return { title: serviceName, note: null };
 }
 
@@ -70,6 +75,7 @@ const COPY_TARGETS: Record<AuthType, CopyTarget[]> = {
     { label: 'Secret', jsonField: 'client_secret' },
   ],
   email_password: [{ label: 'Password' }],
+  secret: [{ label: 'Secret' }],
 };
 
 async function copyCredential(id: string, target: CopyTarget) {
@@ -98,11 +104,13 @@ export function CredentialItem({ credential }: Props) {
   const { title, note } = credentialRowLabel(credential.service_name, credential.auth_type);
 
   return (
-    <div class="list-row credential-row">
+    <div class="list-row credential-row" data-search-anchor={credentialAnchor(credential.id)}>
       <div class="list-row-info">
         <div class="title list-row-name">{title}</div>
         <div class="list-row-details">
-          <span class="list-row-url">{credential.base_url}</span>
+          {/* Gated: a `secret` has no base URL, and `.list-row-details` is a
+              flex row whose gap would render the empty span as a hole. */}
+          {credential.base_url && <span class="list-row-url">{credential.base_url}</span>}
           <span class="list-row-type">{formatAuthType(credential.auth_type)}</span>
         </div>
         {/* A sentence, so `.list-row-details-prose` (the bare class is a flex

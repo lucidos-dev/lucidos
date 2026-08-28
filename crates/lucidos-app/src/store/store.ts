@@ -30,6 +30,7 @@ import type {
   PluginInstallReceipt,
   PluginUninstallRequest,
   PluginUninstallReceipt,
+  IngressReading,
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
@@ -84,7 +85,10 @@ export type PluginUninstallForm = Extract<InlineForm, { type: 'plugin-uninstall'
 // --- Panel overlay (discriminated union replacing 6 independent signals) ---
 export type PanelOverlay =
   | { type: 'form'; form: InlineForm }
-  | { type: 'app-ui'; app: App }
+  /** `fragment` is the app fragment (docs/glossary.md): the place inside the
+   *  app a link named, delivered to the iframe as `location.hash`. It lives on
+   *  the overlay so a target that outlives its app open is unrepresentable. */
+  | { type: 'app-ui'; app: App; fragment?: string }
   | { type: 'file-preview'; path: string }
   | { type: 'url-preview'; url: string }
   | { type: 'notification-detail'; notification: Notification }
@@ -100,6 +104,11 @@ export const activeInlineForm = computed(() => {
 export const currentApp = computed(() => {
   const o = panelOverlay.value;
   return o?.type === 'app-ui' ? o.app : null;
+});
+/** The app fragment of the open app, or null when the link named no target. */
+export const currentAppFragment = computed(() => {
+  const o = panelOverlay.value;
+  return o?.type === 'app-ui' ? o.fragment ?? null : null;
 });
 export const previewFile = computed(() => {
   const o = panelOverlay.value;
@@ -2316,6 +2325,19 @@ export const mcpServersVersion = signal(0);
  *  otherwise stale for the whole session. */
 export const webhooksVersion = signal(0);
 
+/** Whether the public path a webhook delivery arrives on is reachable, per
+ *  address family.
+ *
+ *  Read by two surfaces: the app bar that shows while a family is down, and
+ *  every enabled row on the Webhooks page. Loaded at startup, because the bar
+ *  has to be able to raise itself, and rewritten by the two `WebhookIngress*`
+ *  frames while the app is open.
+ *
+ *  Nothing here is this client's own connectivity. `connectionStatus` says
+ *  whether the engine answers THIS browser. An ingress outage is the opposite
+ *  case: the app is fine and the machine cannot be reached from outside. */
+export const webhookIngress = signal<Loadable<IngressReading>>({ status: 'not-loaded' });
+
 /** Bumped on every `PermissionGrantsChanged` frame. The allowlist editors in
  *  Settings → Permissions re-read their file on it, unless the user has
  *  unsaved patterns in the editor: a draft outranks the disk (ADR 0118).
@@ -2325,6 +2347,11 @@ export const webhooksVersion = signal(0);
  *  put a routing decision in the arm, which is one more thing to keep in
  *  sync. */
 export const permissionGrantsVersion = signal(0);
+
+/** Bumped on every `HandshakeScriptApproved` frame. The file preview re-reads
+ *  which auth handshake scripts may run. So the warning on an unapproved one
+ *  clears the moment an approval lands, on every open client (ADR 0118). */
+export const handshakeScriptsVersion = signal(0);
 
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
 export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);

@@ -62,11 +62,118 @@ pub fn read_location(handle: &LocationHandle) -> String {
 /// - Any specific region (e.g. `europe-west1`) →
 ///   `{location}-aiplatform.googleapis.com`.
 pub fn vertex_host(location: &str) -> String {
-    match location {
-        "global" => "aiplatform.googleapis.com".to_string(),
-        "us" | "eu" => format!("aiplatform.{}.rep.googleapis.com", location),
-        _ => format!("{}-aiplatform.googleapis.com", location),
+    if location == "global" {
+        "aiplatform.googleapis.com".to_string()
+    } else if is_multi_region(location) {
+        format!("aiplatform.{}.rep.googleapis.com", location)
+    } else {
+        format!("{}-aiplatform.googleapis.com", location)
     }
+}
+
+/// Is `location` one of Vertex's two multi-regions?
+///
+/// They carry Anthropic publisher models but no Google ones. So `vertex_region
+/// = eu` is both the right setting to reach Claude there and a guaranteed 404
+/// for any Gemini model. [`vertex_host`] branches on this, so the host
+/// derivation and the advice cannot name different sets.
+fn is_multi_region(location: &str) -> bool {
+    matches!(location, "us" | "eu")
+}
+
+/// The segment after `/<name>/` in an endpoint this module built.
+///
+/// Read back from the URL rather than from the inputs that shaped it. A failure
+/// message then cannot name a project or location the request did not use. A
+/// pinned endpoint reports the location it pinned.
+fn segment_after(url: &str, name: &str) -> Option<String> {
+    url.split(&format!("/{name}/"))
+        .nth(1)?
+        .split('/')
+        .next()
+        .map(str::to_string)
+}
+
+/// The `locations/<name>` segment of an endpoint this module built.
+///
+/// `location` here, `region` in anything the user reads: this parses a URL
+/// segment Google spells `locations`, while the Settings label and the
+/// `VERTEX_REGION` env var both say region.
+fn location_from_endpoint(url: &str) -> Option<String> {
+    segment_after(url, "locations")
+}
+
+/// The `projects/<id>` segment of an endpoint this module built.
+///
+/// The one Vertex input with no Settings field. It resolves from
+/// `VERTEX_PROJECT_ID`, then the quota project in the gcloud ADC file, then
+/// `gcloud config`. So a user reading a 404 cannot otherwise see which project
+/// the request was billed to.
+fn project_from_endpoint(url: &str) -> Option<String> {
+    segment_after(url, "projects")
+}
+
+/// Rewrite Vertex's publisher-model 404 into advice the user can act on.
+///
+/// That 404 has several causes and Vertex names no fix for any of them. The
+/// project may be one that never enabled Claude, the model may need enabling in
+/// Model Garden, or the region may be wrong. The message names the project and
+/// the region it actually used, then the fixes that apply.
+///
+/// Naming the project is the load-bearing half. It is the one Vertex input with
+/// no Settings field, so a user who is on the wrong one has nothing to compare
+/// against.
+///
+/// Returns `None` for every other failure, so an unrelated error keeps its own
+/// wording. The message appends the raw Vertex sentence, so nothing is lost.
+pub(crate) fn explain_publisher_model_404(
+    status: u16,
+    body: &str,
+    model: &str,
+    url: &str,
+) -> Option<String> {
+    // Every live sample spells it `Publisher model`, on the Anthropic and the
+    // Google publisher alike. Matched case-insensitively anyway. No other 404
+    // body carries the phrase, so a wider match cannot misfire. A casing change
+    // at Google would otherwise drop the advice in silence.
+    if status != 404 || !body.to_ascii_lowercase().contains("publisher model") {
+        return None;
+    }
+    let location = location_from_endpoint(url)?;
+    let project = project_from_endpoint(url)?;
+    let mut advice =
+        format!("Vertex has no `{model}` in region `{location}` for project `{project}`.");
+
+    let is_claude = VertexProvider::is_claude_model(model);
+    if is_claude {
+        advice.push_str(
+            " Enable the model for that project in Vertex AI Model Garden, \
+             or point Lucidos at a project that has it. \
+             The project comes from VERTEX_PROJECT_ID, then the quota project in your gcloud \
+             ADC file.",
+        );
+    }
+
+    // Sending the user to the region setting is only honest when changing it
+    // could help. Two cases where it cannot, and naming the setting would point
+    // at a control that must not move.
+    if VertexProvider::region_is_pinned(model) {
+        advice.push_str(&format!(
+            " This model always runs in `{location}`, whatever the region setting says."
+        ));
+    } else if !is_claude && is_multi_region(&location) {
+        advice.push_str(
+            " The `eu` and `us` multi-regions serve Anthropic models but no Google ones. \
+             A region that reaches this model may move Claude off the one it needs.",
+        );
+    } else {
+        advice.push_str(
+            " Check the region in Settings, Models, Providers, Vertex AI. \
+             That setting overrides the VERTEX_REGION environment variable.",
+        );
+    }
+
+    Some(format!("{advice} Vertex said: {body}"))
 }
 
 /// Get a cached Vertex access token, refreshing only when expired (50 min TTL).
@@ -268,6 +375,17 @@ impl VertexProvider {
         )
     }
 
+    /// Does this model's endpoint ignore the configured region?
+    ///
+    /// True only for `gemini-3*`, which is published globally. Named rather
+    /// than spelled inline because two things must agree: which endpoint the
+    /// request takes, and whether a failure may tell the user to change the
+    /// region. [`endpoint_for_model`](Self::endpoint_for_model) branches on
+    /// this, so the two cannot drift.
+    fn region_is_pinned(model: &str) -> bool {
+        !Self::is_claude_model(model) && model.starts_with("gemini-3")
+    }
+
     fn endpoint_for_model(&self, model: &str) -> String {
         let location = self.current_location();
         let host = vertex_host(&location);
@@ -276,7 +394,7 @@ impl VertexProvider {
                 "https://{}/v1/projects/{}/locations/{}/publishers/anthropic/models/{}:streamRawPredict",
                 host, self.project_id, location, model
             )
-        } else if model.starts_with("gemini-3") {
+        } else if Self::region_is_pinned(model) {
             self.global_gemini_endpoint(model)
         } else {
             format!(
@@ -435,6 +553,266 @@ mod tests {
             .await
             .expect("a fast command must not be treated as wedged");
         assert!(output.status.success());
+    }
+
+    /// The project and region in the message come from the URL the request
+    /// used, for every endpoint shape this module builds. `gemini-3*` is the
+    /// sharp case: it pins `global` and ignores the configured region.
+    #[test]
+    fn the_project_and_region_are_read_back_out_of_every_endpoint_shape() {
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-5".into()).unwrap();
+        for (model, expected) in [
+            ("claude-opus-5@default", "eu"),
+            ("gemini-2.5-flash", "eu"),
+            ("gemini-3-flash-preview", "global"),
+        ] {
+            let url = provider.endpoint_for_model(model);
+            assert_eq!(
+                location_from_endpoint(&url),
+                Some(expected.to_string()),
+                "{model}"
+            );
+            assert_eq!(
+                project_from_endpoint(&url),
+                Some("my-project".to_string()),
+                "{model}"
+            );
+        }
+        let junk = "https://example.com/v1/nope";
+        assert_eq!(location_from_endpoint(junk), None);
+        assert_eq!(project_from_endpoint(junk), None);
+    }
+
+    /// The reported incident: a user pointed at a Google Cloud project that
+    /// never enabled Claude, on a region that serves it fine elsewhere. Every
+    /// Anthropic model 404s there, so the region is a red herring.
+    ///
+    /// The project is the one Vertex input with no Settings field, so a message
+    /// that does not name it leaves nothing to compare against.
+    #[test]
+    fn the_message_names_the_project_the_request_was_billed_to() {
+        let url = "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project\
+                   /locations/europe-west1/publishers/anthropic/models/claude-opus-5@default\
+                   :streamRawPredict";
+        let body = "Publisher model `projects/example-project/locations/europe-west1/publishers\
+                    /anthropic/models/claude-opus-5@default` was not found or your project does \
+                    not have access to it.";
+
+        let message = explain_publisher_model_404(404, body, "claude-opus-5@default", url)
+            .expect("a publisher-model 404 must be rewritten");
+
+        assert!(message.contains("`example-project`"), "{message}");
+        assert!(message.contains("VERTEX_PROJECT_ID"), "{message}");
+        assert!(
+            message.contains("quota project in your gcloud ADC file"),
+            "{message}"
+        );
+    }
+
+    /// The 404 a fresh Vertex setup meets. Google's own sentence names neither
+    /// fix, so the rewrite has to name the region, where to change it, and the
+    /// per-project Model Garden step. The raw sentence is kept.
+    #[test]
+    fn a_claude_publisher_model_404_names_the_region_and_both_fixes() {
+        let body = concat!(
+            r#"[{ "error": { "code": 404, "message": "Publisher model "#,
+            "`projects/example-project/locations/europe-west1/publishers/anthropic",
+            r#"/models/claude-opus-5@default` was not found or your project does "#,
+            r#"not have access to it.", "status": "NOT_FOUND" } } ]"#
+        );
+        let url = "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project\
+                   /locations/europe-west1/publishers/anthropic/models/claude-opus-5@default\
+                   :streamRawPredict";
+
+        let message = explain_publisher_model_404(404, body, "claude-opus-5@default[1m]", url)
+            .expect("a publisher-model 404 must be rewritten");
+
+        assert!(message.contains("`europe-west1`"), "{message}");
+        assert!(message.contains("claude-opus-5@default[1m]"), "{message}");
+        assert!(
+            message.contains("Settings, Models, Providers, Vertex AI"),
+            "{message}"
+        );
+        assert!(message.contains("VERTEX_REGION"), "{message}");
+        assert!(message.contains("Model Garden"), "{message}");
+        assert!(message.contains(body), "the raw Vertex text must survive");
+    }
+
+    /// A `gemini-3*` endpoint pins `global` and ignores the region setting.
+    /// Pointing the user at that setting would name a control that cannot move
+    /// the request. It reports the pin instead.
+    #[test]
+    fn a_pinned_model_never_sends_the_user_to_the_region_setting() {
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-5".into()).unwrap();
+        let model = "gemini-3-flash-preview";
+        let url = provider.endpoint_for_model(model);
+        let body = "Publisher model `x` was not found";
+
+        let message = explain_publisher_model_404(404, body, model, &url)
+            .expect("a publisher-model 404 must be rewritten");
+
+        assert!(message.contains("`global`"), "{message}");
+        assert!(
+            !message.contains("Settings, Models, Providers, Vertex AI"),
+            "a pinned model must not be blamed on the region setting: {message}"
+        );
+        assert!(
+            message.contains("whatever the region setting says"),
+            "{message}"
+        );
+    }
+
+    /// The pin rule has one spelling. `endpoint_for_model` and the advice both
+    /// branch on it, so a model routed to `global` is exactly a model the
+    /// advice calls pinned.
+    #[test]
+    fn the_pin_predicate_agrees_with_where_the_request_goes() {
+        let provider =
+            VertexProvider::new("my-project".into(), "eu".into(), "claude-opus-5".into()).unwrap();
+        for model in [
+            "claude-opus-5@default",
+            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
+            "gemini-3.5-flash",
+        ] {
+            let went_global = location_from_endpoint(&provider.endpoint_for_model(model))
+                .as_deref()
+                == Some("global");
+            assert_eq!(
+                VertexProvider::region_is_pinned(model),
+                went_global,
+                "{model}"
+            );
+        }
+    }
+
+    /// A Gemini model on `eu` or `us` 404s by construction: those multi-regions
+    /// carry no Google publisher models. Telling the user to change the region
+    /// is wrong, because `eu` is often exactly what Claude needs.
+    #[test]
+    fn a_gemini_404_in_a_multi_region_does_not_ask_for_the_region_setting() {
+        for region in ["eu", "us"] {
+            let provider =
+                VertexProvider::new("my-project".into(), region.into(), "claude-opus-5".into())
+                    .unwrap();
+            let model = "gemini-2.5-flash";
+            let url = provider.endpoint_for_model(model);
+            let message =
+                explain_publisher_model_404(404, "Publisher model `x` was not found", model, &url)
+                    .expect("a publisher-model 404 must be rewritten");
+
+            assert!(
+                !message.contains("Check the region in Settings"),
+                "{region}: changing the region would move Claude: {message}"
+            );
+            assert!(message.contains("no Google ones"), "{region}: {message}");
+        }
+    }
+
+    /// The same model in an ordinary region DOES take the region advice: there
+    /// the setting is the thing to look at, and nothing else depends on it.
+    #[test]
+    fn a_gemini_404_in_an_ordinary_region_still_asks_for_the_region_setting() {
+        let provider = VertexProvider::new(
+            "my-project".into(),
+            "europe-west1".into(),
+            "claude-opus-5".into(),
+        )
+        .unwrap();
+        let model = "gemini-2.5-flash";
+        let url = provider.endpoint_for_model(model);
+        let message =
+            explain_publisher_model_404(404, "Publisher model `x` was not found", model, &url)
+                .expect("a publisher-model 404 must be rewritten");
+
+        assert!(
+            message.contains("Check the region in Settings"),
+            "{message}"
+        );
+    }
+
+    /// `vertex_host` and the advice read the same multi-region set, so neither
+    /// can start naming a location the other does not.
+    #[test]
+    fn the_multi_region_set_is_the_one_the_host_derivation_uses() {
+        for location in ["eu", "us"] {
+            assert!(is_multi_region(location), "{location}");
+            assert_eq!(
+                vertex_host(location),
+                format!("aiplatform.{location}.rep.googleapis.com")
+            );
+        }
+        for location in ["global", "europe-west1", "us-central1"] {
+            assert!(!is_multi_region(location), "{location}");
+            assert!(
+                !vertex_host(location).contains(".rep.googleapis.com"),
+                "{location}"
+            );
+        }
+    }
+
+    /// A Google publisher model needs no Model Garden opt-in, so that sentence
+    /// would be wrong advice. The region half still applies.
+    #[test]
+    fn a_gemini_publisher_model_404_omits_the_model_garden_step() {
+        let body = "Publisher model `projects/example-project/locations/eu/publishers\
+                    /google/models/gemini-2.5-flash` was not found";
+        let url = "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project\
+                   /locations/eu/publishers/google/models/gemini-2.5-flash:generateContent";
+
+        let message = explain_publisher_model_404(404, body, "gemini-2.5-flash", url)
+            .expect("a publisher-model 404 must be rewritten");
+
+        assert!(message.contains("`eu`"), "{message}");
+        assert!(!message.contains("Model Garden"), "{message}");
+    }
+
+    /// The match is on the phrase, not on Google's casing of it. Every live
+    /// sample says `Publisher model`, so a capitalised variant would drop the
+    /// advice silently, with the 404 looking untouched.
+    #[test]
+    fn the_phrase_is_matched_whatever_google_capitalises() {
+        let url = "https://aiplatform.eu.rep.googleapis.com/v1/projects/example-project\
+                   /locations/eu/publishers/anthropic/models/claude-opus-5@default\
+                   :streamRawPredict";
+        for body in [
+            "Publisher model `x` was not found",
+            "Publisher Model `x` was not found",
+            "PUBLISHER MODEL `x` was not found",
+        ] {
+            assert!(
+                explain_publisher_model_404(404, body, "claude-opus-5@default", url).is_some(),
+                "{body}"
+            );
+        }
+    }
+
+    /// The distinction the rewrite exists to keep. A project that HAS access
+    /// but no quota answers 429 in the same region. Reading that as a region
+    /// problem would send the user to change a setting that is already right.
+    /// A 404 from anything else keeps its own wording too.
+    #[test]
+    fn only_a_publisher_model_404_is_rewritten() {
+        let url = "https://europe-west1-aiplatform.googleapis.com/v1/projects/example-project\
+                   /locations/europe-west1/publishers/anthropic/models/claude-opus-5@default\
+                   :streamRawPredict";
+        let quota = "Quota exceeded for aiplatform.googleapis.com\
+                     /online_prediction_input_tokens_per_minute_per_base_model";
+
+        assert_eq!(
+            explain_publisher_model_404(429, quota, "claude-opus-5@default", url),
+            None
+        );
+        assert_eq!(
+            explain_publisher_model_404(404, "Not found: some other thing", "x", url),
+            None
+        );
+        assert_eq!(
+            explain_publisher_model_404(500, "Publisher model blew up", "x", url),
+            None
+        );
     }
 
     #[test]

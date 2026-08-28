@@ -987,3 +987,50 @@ fn an_empty_old_string_is_refused_rather_than_matching_everywhere() {
         );
     }
 }
+
+/// The rule that decides whether a write can make a handshake script runnable
+/// (ADR 0144). Both halves matter, and the second is the one a refactor could
+/// lose without any test noticing.
+#[test]
+fn only_an_in_process_write_under_data_scripts_records_authorship() {
+    assert!(records_script_authorship(
+        WriteAuthorship::InProcessTool,
+        "data/scripts/auth/comfort-cloud.py"
+    ));
+    // The HTTP data surface, which an app UI reaches with the user's
+    // authority. It may write the file; it may not bless it.
+    assert!(!records_script_authorship(
+        WriteAuthorship::ApiCaller,
+        "data/scripts/auth/comfort-cloud.py"
+    ));
+    // Nothing outside the tree the runner reads is a handshake script.
+    for elsewhere in [
+        "data/artifacts/notes.md",
+        "data/config/apis.json",
+        "data/apps/habit-tracker/scripts/x.py",
+        "scripts/auth/x.py",
+    ] {
+        assert!(
+            !records_script_authorship(WriteAuthorship::InProcessTool, elsewhere),
+            "{elsewhere} is not a handshake script"
+        );
+    }
+}
+
+/// The HTTP layer must never claim in-process authorship. The compiler forces
+/// every call site to name one, so what is left to protect is which one the
+/// API surface names.
+#[test]
+fn no_http_handler_claims_in_process_authorship() {
+    let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
+        .into_iter()
+        .filter(|(rel, text)| {
+            rel.starts_with("api/") && text.contains("WriteAuthorship::InProcessTool")
+        })
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "an HTTP handler cannot vouch for a handshake script: {offenders:?}"
+    );
+}

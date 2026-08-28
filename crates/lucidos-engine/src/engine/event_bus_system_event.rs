@@ -5,6 +5,7 @@
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::core::webhook_ingress::{AddressProbe, Family, FamilyVerdict};
 use crate::core::AuthType;
 use crate::engine::thread_events::MessageOrigin;
 use crate::scheduler::notifications::Tap;
@@ -805,12 +806,15 @@ pub enum SystemEvent {
         actor: Option<MessageOrigin>,
     },
     /// A webhook's configuration changed. `enabled` is carried because turning
-    /// one off is the thing a reader most often wants to date.
+    /// one off is the thing a reader most often wants to date. `signed` joins
+    /// it because a signature can be added, changed and removed, and this event
+    /// is the only record of when.
     WebhookUpdated {
         webhook_id: String,
         name: String,
         event_type: String,
         enabled: bool,
+        signed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -820,6 +824,47 @@ pub enum SystemEvent {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
+    },
+    /// An address family stopped answering on the public webhook path.
+    ///
+    /// Emitted on the edge, after two consecutive cycles see the same failure.
+    /// The engine reports and never repairs: a workspace trigger decides what
+    /// to do, and `docs/adr/0143-webhook-ingress-probed-per-address-family.md`
+    /// pins this payload for it. No actor, because nobody asked for it.
+    WebhookIngressDegraded {
+        webhook_id: String,
+        webhook_name: String,
+        /// The funnel hostname that was probed.
+        host: String,
+        /// The public funnel port, not the loopback port behind it.
+        port: u16,
+        /// Which families are down. A healthy sibling family does not save
+        /// them: senders reach one family each, and a dead one is an outage.
+        degraded_families: Vec<Family>,
+        /// Both families, always, so a reader can tell healthy from never
+        /// asked.
+        families: Vec<FamilyVerdict>,
+        /// Every address probed, with the stage each one reached.
+        addresses: Vec<AddressProbe>,
+    },
+    /// The public webhook path answers again on every family that was down.
+    ///
+    /// One clean cycle is enough. Being wrong in this direction costs a second
+    /// declaration, while waiting costs a workspace that thinks it is still
+    /// blind.
+    WebhookIngressRecovered {
+        webhook_id: String,
+        webhook_name: String,
+        host: String,
+        port: u16,
+        /// Which families came back.
+        recovered_families: Vec<Family>,
+        families: Vec<FamilyVerdict>,
+        addresses: Vec<AddressProbe>,
+        /// When the outage was declared, RFC 3339.
+        down_since: String,
+        /// How long it lasted, in seconds.
+        down_secs: i64,
     },
     /// An MCP server was registered, or an existing one re-registered with a
     /// new command / args / env. The `mcp_servers` table drives which external
@@ -1045,6 +1090,28 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A `script_handshake` script became runnable: its path and content hash
+    /// were recorded in `<workspace>/.lucidos/approved-handshake-scripts`
+    /// (ADR 0144). Persisted because it is the moment a file gained the right
+    /// to run as the engine user, and `source` says on whose authority.
+    HandshakeScriptApproved {
+        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
+        path: String,
+        /// Authored by a file tool, named by the CLI, or seeded on first start.
+        source: crate::core::handshake_approvals::ApprovalSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A credential that carried no `base_url` was bound to one, so the proxy's
+    /// scope check has something to enforce (ADR 0144). The scope comes from
+    /// the `apis.json` entry naming it. Once per credential, at startup.
+    CredentialScopeInferred {
+        service_name: String,
+        /// The scope now recorded on the credential.
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A background spawn entered the *Thread Queue* (admission control).
     /// Emitted for EVERY background spawn — entries that fit capacity are
     /// admitted immediately (a `ThreadQueueAdmitted` follows in the same
@@ -1205,6 +1272,8 @@ impl SystemEvent {
         "WebhookCreated",
         "WebhookUpdated",
         "WebhookDeleted",
+        "WebhookIngressDegraded",
+        "WebhookIngressRecovered",
         "McpServerRegistered",
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
@@ -1220,6 +1289,8 @@ impl SystemEvent {
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
+        "HandshakeScriptApproved",
+        "CredentialScopeInferred",
         "ThreadQueued",
         "ThreadQueueAdmitted",
         "ThreadQueueDropped",
@@ -1332,6 +1403,8 @@ impl SystemEvent {
             Self::WebhookCreated { .. } => "WebhookCreated",
             Self::WebhookUpdated { .. } => "WebhookUpdated",
             Self::WebhookDeleted { .. } => "WebhookDeleted",
+            Self::WebhookIngressDegraded { .. } => "WebhookIngressDegraded",
+            Self::WebhookIngressRecovered { .. } => "WebhookIngressRecovered",
             Self::McpServerRegistered { .. } => "McpServerRegistered",
             Self::McpServerUpdated { .. } => "McpServerUpdated",
             Self::McpServerDisabledToolsChanged { .. } => "McpServerDisabledToolsChanged",
@@ -1347,6 +1420,8 @@ impl SystemEvent {
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
+            Self::HandshakeScriptApproved { .. } => "HandshakeScriptApproved",
+            Self::CredentialScopeInferred { .. } => "CredentialScopeInferred",
             Self::ThreadQueued { .. } => "ThreadQueued",
             Self::ThreadQueueAdmitted { .. } => "ThreadQueueAdmitted",
             Self::ThreadQueueDropped { .. } => "ThreadQueueDropped",
@@ -1458,6 +1533,8 @@ impl SystemEvent {
         "WebhookCreated",
         "WebhookUpdated",
         "WebhookDeleted",
+        "WebhookIngressDegraded",
+        "WebhookIngressRecovered",
         "McpServerRegistered",
         "McpServerUpdated",
         "McpServerDisabledToolsChanged",
@@ -1473,6 +1550,8 @@ impl SystemEvent {
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
+        "HandshakeScriptApproved",
+        "CredentialScopeInferred",
         "ThreadQueued",
         "ThreadQueueAdmitted",
         "ThreadQueueDropped",
@@ -1552,7 +1631,8 @@ impl SystemEvent {
             Self::CredentialCreated { .. }
             | Self::CredentialUpdated { .. }
             | Self::CredentialDeleted { .. }
-            | Self::CredentialRevealed { .. } => "credential",
+            | Self::CredentialRevealed { .. }
+            | Self::CredentialScopeInferred { .. } => "credential",
             Self::EnvironmentVariableSet { .. } | Self::EnvironmentVariableDeleted { .. } => {
                 "environment_variable"
             }
@@ -1561,7 +1641,9 @@ impl SystemEvent {
             }
             Self::WebhookCreated { .. }
             | Self::WebhookUpdated { .. }
-            | Self::WebhookDeleted { .. } => "webhook",
+            | Self::WebhookDeleted { .. }
+            | Self::WebhookIngressDegraded { .. }
+            | Self::WebhookIngressRecovered { .. } => "webhook",
             Self::McpServerRegistered { .. }
             | Self::McpServerUpdated { .. }
             | Self::McpServerDisabledToolsChanged { .. }
@@ -1585,6 +1667,7 @@ impl SystemEvent {
             | Self::EngineBuildStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
+            Self::HandshakeScriptApproved { .. } => "handshake_script",
             Self::ThreadQueued { .. }
             | Self::ThreadQueueAdmitted { .. }
             | Self::ThreadQueueDropped { .. }
@@ -1667,7 +1750,8 @@ impl SystemEvent {
             Self::CredentialCreated { service_name, .. }
             | Self::CredentialUpdated { service_name, .. }
             | Self::CredentialDeleted { service_name, .. }
-            | Self::CredentialRevealed { service_name, .. } => service_name.clone(),
+            | Self::CredentialRevealed { service_name, .. }
+            | Self::CredentialScopeInferred { service_name, .. } => service_name.clone(),
             Self::EnvironmentVariableSet { name, .. }
             | Self::EnvironmentVariableDeleted { name, .. } => name.clone(),
             Self::ReleaseNoticeResolved { notice_id, .. } => notice_id.clone(),
@@ -1676,7 +1760,9 @@ impl SystemEvent {
             | Self::ModelDeleted { id, .. } => id.clone(),
             Self::WebhookCreated { webhook_id, .. }
             | Self::WebhookUpdated { webhook_id, .. }
-            | Self::WebhookDeleted { webhook_id, .. } => webhook_id.clone(),
+            | Self::WebhookDeleted { webhook_id, .. }
+            | Self::WebhookIngressDegraded { webhook_id, .. }
+            | Self::WebhookIngressRecovered { webhook_id, .. } => webhook_id.clone(),
             Self::McpServerRegistered { server_id, .. }
             | Self::McpServerUpdated { server_id, .. }
             | Self::McpServerDisabledToolsChanged { server_id, .. }
@@ -1686,7 +1772,8 @@ impl SystemEvent {
             | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
-            | Self::DataFileEdited { path, .. } => path.clone(),
+            | Self::DataFileEdited { path, .. }
+            | Self::HandshakeScriptApproved { path, .. } => path.clone(),
             Self::ApplyAllBatchStarted { batch_id, .. }
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),

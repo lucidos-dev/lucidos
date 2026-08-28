@@ -21,7 +21,7 @@
     bottom: 0;
     background-color: var(--bg-tertiary);
     border-radius: 1.25rem;
-    transition: background-color 0.2s;
+    transition: background-color var(--duration-normal);
 }
 
 .toggle-slider::before {
@@ -33,7 +33,7 @@
     bottom: 0.1875rem;
     background-color: var(--text-muted);
     border-radius: 50%;
-    transition: transform 0.2s, background-color 0.2s;
+    transition: transform var(--duration-normal), background-color var(--duration-normal);
 }
 
 .toggle-switch input:checked + .toggle-slider {

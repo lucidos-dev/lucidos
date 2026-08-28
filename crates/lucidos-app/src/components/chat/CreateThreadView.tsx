@@ -20,7 +20,8 @@ import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
 import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
-import { forceWebKitRepaint, SCROLLER_PINNED_ATTR } from '../../utils/webkitRepaint';
+import { forceWebKitRepaint } from '../../utils/webkitRepaint';
+import { opensSoftwareKeyboard } from '../../utils/dom';
 
 /** First line of a change's description and its file count, keyed by change_id.
  *  Harvested from the `ChangeProposed` events riding a thread's coding-agent
@@ -322,259 +323,21 @@ function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
   return el.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
 }
 
-/* --- What the reader is actually looking at -------------------------------
+/* --- What the correction holds still ---------------------------------------
  *
- * The correction holds ONE element still, so which element it is decides who
- * is held. The pressed turn was the obvious candidate and is the wrong one. A
- * coding-agent turn runs to several phone screens, so a reader reading its
- * tail has its top far above the viewport. Each step row revealed between that
- * top and their first visible line pushes them down by its height. That is the
- * reported drift, of a screen or two back up the thread.
+ * THE ELEMENT THE READER CLICKED, and nothing else. A turn control changes
+ * heights and nothing else, and the reader asked for that by pressing one named
+ * thing. So that thing is what must not move. `ChatExchange`'s `heldOnThePress`
+ * hands it over, as the click's own `currentTarget`.
  *
- * So the anchor is the reader's OWN topmost line: the first row with any part
- * still on screen. Browsers pick their scroll anchor the same way, and a row
- * ENTIRELY above the edge is excluded for the reason the turn is. Anything
- * revealed between it and the screen displaces the reader by that much.
+ * The anchor used to be a RANKING, preferring the reader's topmost visible line
+ * and taking the pressed turn last. It is what left a reader at the top of the
+ * thread for pressing the second turn's control. The sweep that produced the
+ * ranking presses through `btn.click()` on controls it never scrolls into view,
+ * and no finger can reach those: the controls live in a header that is not
+ * sticky. Full account, and what the ranking cost:
+ * docs/plans/2026-08-28-a-turn-control-holds-what-you-pressed.md
  */
-
-/** A turn's response is a run of ROWS, one per rendered event, each keyed by
- *  that event (`renderResponseEvents`). So a row keeps its identity across the
- *  reveal, and it is the finest thing worth holding: the reader's own line. */
-const ANCHOR_ROW_SELECTOR = '.response-content > *';
-/** A turn's two halves, for the reader parked on one with no row of its own to
- *  offer, such as a plain message bubble. */
-const ANCHOR_PANEL_SELECTOR = '.initiator-panel, .response-panel';
-/** How much of a row has to be on screen before it counts as the reader's own.
- *
- *  A SEAM correction rests a row's bottom exactly on the reader's edge, and that
- *  is the very boundary this scan tests. The next press measures that row a hair
- *  either side of it. Which side it lands on decides the reader's line, and a
- *  sliver that thin shows them nothing, so it must not be allowed to decide.
- *
- *  It must therefore EXCEED the residue the correction itself leaves, and the
- *  floor for that is a whole pixel: the target is rounded to one (ADR 0078,
- *  `reachableScrollTop`), so a pixel of error is expressible by design. Device
- *  pixel snapping adds a fraction on top. At 1px the boundary was straddled by
- *  1.13px on WebKit. It held the row above, putting a 40-step run the reader had
- *  just revealed back under their eye. Two clears the rounding with room, and is
- *  still nothing to read.
- *
- *  Deliberately NOT the 1px of `isWhereWeHeldIt` in scrollState. That one asks
- *  whether the reader has moved, and nothing rounds against it. */
-const ANCHOR_SLIVER_PX = 2;
-
-/** Index of the first element in `list` that still REACHES `top`, i.e. whose
- *  bottom edge is below the transcript's top edge by more than a sliver. In
- *  document order, so the answer is the topmost one the reader can see, whether
- *  it starts on screen or straddles the edge. Elements with no box are skipped,
- *  as they are in `recordAnchor`. */
-function firstIndexReaching(
-  list: ArrayLike<Element>,
-  top: number,
-  accept: (el: HTMLElement) => boolean = () => true,
-): number {
-  for (let i = 0; i < list.length; i++) {
-    const el = list[i] as HTMLElement;
-    if (typeof el.getBoundingClientRect !== 'function') continue;
-    const r = el.getBoundingClientRect();
-    if (r.height <= 0 || r.bottom <= top + ANCHOR_SLIVER_PX) continue;
-    if (accept(el)) return i;
-  }
-  return -1;
-}
-
-function firstRowReaching(
-  list: ArrayLike<Element>,
-  top: number,
-  accept: (el: HTMLElement) => boolean = () => true,
-): HTMLElement | null {
-  const i = firstIndexReaching(list, top, accept);
-  return i < 0 ? null : (list[i] as HTMLElement);
-}
-
-/** The first line of the transcript the reader can actually READ, as a viewport
- *  y. The container's own top edge, unless a scrollport-pinned child is drawn
- *  over it. On mobile the sticky thread title covers the top of the transcript.
- *  A row hidden behind it is no more the reader's line than one scrolled off.
- *  It tracks the app header's hide-on-scroll through its own transform, so its
- *  measured bottom is right in both states. Zero height means it is not drawn,
- *  which is every desktop layout.
- *
- *  The LOWEST of them, not the first. The marker invites a second pinned row,
- *  and reading only one would leave the edge above chrome that is drawn over
- *  it. `publishPinnedShift` in utils/webkitRepaint.ts serves them all for the same
- *  reason. */
-function readerTopEdge(container: HTMLElement): number {
-  const top = container.getBoundingClientRect().top;
-  let edge = top;
-  for (const child of Array.from(container.children) as HTMLElement[]) {
-    if (typeof child.getBoundingClientRect !== 'function') continue;
-    if (!child.matches?.(`[${SCROLLER_PINNED_ATTR}]`)) continue;
-    const r = child.getBoundingClientRect();
-    if (r.height > 0 && r.bottom > edge) edge = r.bottom;
-  }
-  return edge;
-}
-
-/** How far the reader's first readable line sits below the container's own top,
- *  i.e. what the mobile sticky title covers.
- *
- *  Read at the moment a seam is written, never carried over from before the
- *  mutation. The title tracks the app header's hide-on-scroll through its own
- *  transform. A reading taken a frame earlier can describe a different edge,
- *  and the seam would land off by that much. */
-function readerEdgeInset(container: HTMLElement): number {
-  if (typeof container.getBoundingClientRect !== 'function' || !container.children) return 0;
-  return readerTopEdge(container) - container.getBoundingClientRect().top;
-}
-
-/* --- What the correction owes a reader whose own line is REMOVED ------------
- *
- * Holding an element where it was only holds the READER while nothing between
- * that element and their edge changes. It is exact for their own line, which is
- * why that line is the first choice. It is wrong by the removed height for
- * anything else, and hiding the log removes a whole run at once.
- *
- * A coding-agent turn is the shape that makes it hurt: dozens of tool calls in
- * a row with nothing said between them, so the reader is parked INSIDE the run.
- * Anchored on the turn's response panel, they move by the whole run above them.
- * That is the reported jump of several screens.
- *
- * The run collapses to ONE point, the seam: the bottom of the nearest surviving
- * row above them, which is also the top of the nearest one below. The reader
- * belongs on it, so the correction puts the seam on their edge rather than
- * holding anything where it was.
- */
-type AnchorChoice =
-  /** Put this element back exactly where it was. */
-  | { kind: 'hold'; el: HTMLElement }
-  /** Land the reader on the seam their own line collapsed into. Resolved after
-   *  the mutation, by `resolveSeam`. */
-  | { kind: 'seam'; rows: ArrayLike<Element>; lineIndex: number };
-
-/** Which row names the seam, and which of its edges it is.
- *
- *  Walked outward from the reader's own line and read AFTER the mutation. So
- *  the test is whether a row is still THERE, rather than whether a selector
- *  says the reveal spares it.
- *
- *  That distinction is the whole point. The step log owns the rows carrying its
- *  marker, but the full-response control removes PROSE. A rule keyed on the
- *  marker picks a row that the reveal has just taken away.
- *
- *  Nothing survives between the answer and the reader by construction, which is
- *  what makes its edge the seam. ABOVE is preferred: the reader has read past
- *  it, so landing under it leaves the collapse behind them. */
-function resolveSeam(
-  rows: ArrayLike<Element>,
-  lineIndex: number,
-): { el: HTMLElement; atBottom: boolean } | null {
-  const drawn = (el: HTMLElement) =>
-    el.isConnected
-    && typeof el.getBoundingClientRect === 'function'
-    && el.getBoundingClientRect().height > 0;
-  for (let i = lineIndex - 1; i >= 0; i--) {
-    const el = rows[i] as HTMLElement;
-    if (drawn(el)) return { el, atBottom: true };
-  }
-  for (let i = lineIndex + 1; i < rows.length; i++) {
-    const el = rows[i] as HTMLElement;
-    if (drawn(el)) return { el, atBottom: false };
-  }
-  return null;
-}
-
-/** The reader's own topmost line, and the turn it belongs to.
- *
- *  It walks the transcript's children from the reader's edge DOWN, taking the
- *  first that owns a row reaching that edge. The walk is what a turn's shape
- *  forces. A turn ends in chrome below its last row, so a reader resting there
- *  is inside a turn whose every row is above them. Asking that one turn alone
- *  answered "no line", and the correction fell back to the turn's own top: a
- *  point screens above them, with the whole reveal landing between the two.
- *
- *  It stops at the first turn holding a row, which is the one the reader is
- *  looking into. So it reads the rows of at most one turn that has any. A turn
- *  with none is a change or a divider, skipped for the same reason: there is
- *  nothing in it to hold.
- *
- *  A scrollport-PINNED child is never a turn. It rides the reader's edge
- *  whatever the offset, so it matches every scan and describes nobody's reading
- *  position. It is what SETS that edge instead (`readerTopEdge`). */
-function readersLine(
-  container: HTMLElement,
-  top: number,
-): { turn: HTMLElement; rows: ArrayLike<Element>; lineIndex: number } | null {
-  const children = container.children;
-  for (let i = 0; i < children.length; i++) {
-    const turn = children[i] as HTMLElement;
-    if (typeof turn.getBoundingClientRect !== 'function') continue;
-    const r = turn.getBoundingClientRect();
-    if (r.height <= 0 || r.bottom <= top + ANCHOR_SLIVER_PX) continue;
-    if (turn.matches?.(`[${SCROLLER_PINNED_ATTR}]`)) continue;
-    const rows = turn.querySelectorAll?.(ANCHOR_ROW_SELECTOR);
-    if (!rows || rows.length === 0) continue;
-    const lineIndex = firstIndexReaching(rows, top);
-    if (lineIndex >= 0) return { turn, rows, lineIndex };
-  }
-  return null;
-}
-
-/** What the correction may act on, best first, ending with `fallback`.
- *
- *  More than one, because a reveal can take the reader's own line away. Hiding
- *  the log removes step rows, and the reader may be parked on one. So the list
- *  carries their line, the seam it would collapse into, the panel and turn
- *  around them, and the pressed turn. `restore` takes the first the mutation
- *  left standing, which is the finest answer still on offer.
- *
- *  A container with no `children` is a test double, as elsewhere in the scroll
- *  code, and gets the fallback alone. */
-function anchorCandidates(container: HTMLElement, fallback: HTMLElement): AnchorChoice[] {
-  const out: AnchorChoice[] = [];
-  const hold = (el: HTMLElement | null) => {
-    if (el && !out.some(c => c.kind === 'hold' && c.el === el)) out.push({ kind: 'hold', el });
-  };
-  if (typeof container.getBoundingClientRect === 'function' && container.children) {
-    const top = readerTopEdge(container);
-    const found = readersLine(container, top);
-    // No row reaches the reader's edge anywhere below it: they are in the
-    // transcript's tail, past the newest turn's last row. Hold that turn.
-    const turn = found ? found.turn : firstRowReaching(
-      container.children,
-      top,
-      el => !el.matches?.(`[${SCROLLER_PINNED_ATTR}]`),
-    );
-    if (found) {
-      const { rows, lineIndex } = found;
-      const line = rows[lineIndex] as HTMLElement;
-      hold(line);
-      // A seam answers only where NOTHING SURVIVING sits between the reader's
-      // edge and the line the reveal took. Two shapes qualify. Their edge is
-      // inside the line, so there is no room for anything. Or the line has a
-      // row above it in this same turn, so the only thing between is the margin
-      // those two rows share.
-      //
-      // The line being this turn's FIRST row is the shape that does not. The
-      // reader is then above the turn's whole body, on their own message or on
-      // the response header, and those survive. A seam there drags them down to
-      // the first row that lived.
-      //
-      // The sliver is the same one the scan takes, for the same reason: a
-      // reader parked on a row's top measures a hair either side of it. A
-      // strict test refused the seam on Chromium while allowing it on mobile.
-      if (lineIndex > 0 || line.getBoundingClientRect().top <= top + ANCHOR_SLIVER_PX) {
-        out.push({ kind: 'seam', rows, lineIndex });
-      }
-    }
-    const panels = turn?.querySelectorAll?.(ANCHOR_PANEL_SELECTOR);
-    if (panels) hold(firstRowReaching(panels, top));
-    hold(turn);
-  }
-  hold(fallback);
-  return out;
-}
-
 /** The correction to write, snapped to a whole pixel because that is all a
  *  scroll offset can hold. The tween deliberately does the opposite, and both
  *  measurements are in ADR 0078.
@@ -613,6 +376,14 @@ function landingScrollTop(container: HTMLElement, top: number): number {
  * clamp was never chosen by the reader. So the deficit is remembered and paid
  * back by the next anchored mutation on the same container.
  *
+ * IT IS OWED TO THE ELEMENT IT WAS MEASURED FOR, and to no other. The
+ * correction holds the control the reader pressed, so a deficit is a deficit in
+ * THAT control's offset. Pay it out on a press of a different control and the
+ * reader is moved by a number that describes somebody else's turn. That is the
+ * reported "it goes back to where it was when the steps were open": hide from
+ * one turn's control, show from another's, and the second press spent the
+ * first's clamp.
+ *
  * It is dropped the moment the reader scrolls. `anchorDebtAt` records where our
  * write landed, and a container sitting anywhere else has been moved by somebody
  * whose position now counts. `anchorDebtHeight` is the other half of that test, and
@@ -625,13 +396,15 @@ function landingScrollTop(container: HTMLElement, top: number): number {
  * One container's worth, not a per-container map: a reveal is transcript-wide
  * and there is one transcript. */
 let anchorDebtEl: HTMLElement | null = null;
+let anchorDebtAnchor: HTMLElement | null = null;
 let anchorDebt = 0;
 let anchorDebtAt = -1;
 let anchorDebtHeight = -1;
 
-/** What a previous reveal still owes this container, or 0. */
-function carriedAnchorDebt(container: HTMLElement): number {
-  if (anchorDebtEl !== container || container.scrollHeight !== anchorDebtHeight) return 0;
+/** What a previous reveal still owes `anchor` on this container, or 0. */
+function carriedAnchorDebt(container: HTMLElement, anchor: HTMLElement): number {
+  if (anchorDebtEl !== container || anchorDebtAnchor !== anchor) return 0;
+  if (container.scrollHeight !== anchorDebtHeight) return 0;
   // 1px of slack for a browser re-rounding a fractional offset, matching
   // `isWhereWeHeldIt` in scrollState.ts.
   return Math.abs(container.scrollTop - anchorDebtAt) <= 1 ? anchorDebt : 0;
@@ -658,6 +431,7 @@ function clearAnchorDebt(): void {
     anchorDebtEl.removeEventListener('scroll', anchorDebtScrolled);
   }
   anchorDebtEl = null;
+  anchorDebtAnchor = null;
   anchorDebt = 0;
   anchorDebtAt = -1;
   anchorDebtHeight = -1;
@@ -673,12 +447,13 @@ function clearAnchorDebt(): void {
  *  Clears first unconditionally. Re-recording on the same container cannot then
  *  leave two watchers on it. A debt moving to another container takes its
  *  watcher off the old one. */
-function rememberAnchorDebt(container: HTMLElement, wanted: number): void {
+function rememberAnchorDebt(container: HTMLElement, anchor: HTMLElement, wanted: number): void {
   clearAnchorDebt();
   const landed = landingScrollTop(container, wanted);
   const debt = wanted - landed;
   if (Math.abs(debt) <= 1) return;
   anchorDebtEl = container;
+  anchorDebtAnchor = anchor;
   anchorDebt = debt;
   anchorDebtAt = landed;
   anchorDebtHeight = container.scrollHeight;
@@ -689,30 +464,35 @@ function rememberAnchorDebt(container: HTMLElement, wanted: number): void {
   }
 }
 
-/** Keep the reader visually still while `fn` mutates the DOM. `anchor` is the
- *  turn the control was pressed on, and the LAST resort: see
- *  `anchorCandidates`, which prefers the reader's own topmost line. */
+/** Hold `anchor` exactly where it is while `fn` mutates the DOM around it.
+ *  `anchor` is THE ELEMENT THE READER CLICKED, per the block above. */
 export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
   const container = anchor?.closest('.thread-content') as HTMLElement | null;
   if (!container || !anchor) { fn(); return; }
 
-  // Blur focused element inside container — iOS auto-scrolls to keep focus visible.
+  // Blur a focused KEYBOARD FIELD inside the container: iOS scrolls one into
+  // view to clear the soft keyboard, and that scroll fights the correction.
+  //
+  // A field, not any focused element. Every turn control is a button, and the
+  // reader reaches one by Tab. Blurring it drops them out of the transcript, so
+  // the press that folds a turn takes away the control that unfolds it.
+  //
+  // `opensSoftwareKeyboard` is the question exactly, and `utils/dom.ts` already
+  // owns it. A checkbox, a range or a file input is an `INPUT` that opens no
+  // keyboard, so a tag test would blur one for nothing.
   const focused = document.activeElement;
-  if (focused instanceof HTMLElement && container.contains(focused)) {
+  if (focused instanceof HTMLElement && container.contains(focused) && opensSoftwareKeyboard(focused)) {
     focused.blur();
   }
 
-  // Measured BEFORE the mutation, all of them, because which one survives it is
-  // not knowable yet. Each carries its own reading, so whichever `restore` picks
-  // has a pair taken of the same element.
-  const candidates = anchorCandidates(container, anchor as HTMLElement);
-  // Only a HOLD needs a reading from before: it is the pair the correction
-  // subtracts. A seam is read out of the layout the mutation leaves.
-  const offsetsBefore = candidates.map(c => (c.kind === 'hold' ? contentOffsetTop(container, c.el) : 0));
+  // Half of the pair the correction subtracts, taken while the old layout still
+  // stands. The other half is read after the mutation, in `targetNow`.
+  const held = anchor as HTMLElement;
+  const offsetBefore = contentOffsetTop(container, held);
   const scrollBefore = container.scrollTop;
   // Read BEFORE the mutation, while the container is still where the last
   // correction left it: after `fn` a shrink may have clamped it somewhere else.
-  const carried = carriedAnchorDebt(container);
+  const carried = carriedAnchorDebt(container, held);
   // Also before, and for a sharper reason: growth moves the live edge away
   // while leaving `scrollTop` exactly where it was, so afterwards nothing can
   // tell that the reader was resting on it. See `readerKeepsTheLiveEdge`.
@@ -742,48 +522,27 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // reader clicking around a finished thread gets neither the correction nor
     // the snap otherwise, and drifts on whatever grew above them.
     const keepsTheLiveEdge = followIsCarrying() || onTheLiveEdge;
-    // The first candidate the mutation left standing. A detached element does
-    // not say so: it measures as a zero rect, which reads as a turn that moved
-    // to the top of the thread and moves the reader somewhere meaningless. With
-    // every candidate gone there is nothing to hold them on, so leave them where
-    // the freeze kept them. The next-frame re-check stands down on this same
-    // test, and a correction that asks for no move is never scheduled at all.
+    // Did the anchor survive the mutation? A detached element does not say so by
+    // measuring nothing: it answers an all-zero rect, which reads as content
+    // that moved to the top of the thread and would send the reader there.
     //
-    // Resolved ONCE, so the next-frame re-check cannot pick a different row and
-    // write somewhere else. A seam that resolves to nothing is no answer, so it
-    // falls through to the candidates behind it.
-    const settled = ((): { el: HTMLElement; hold: number | null; atBottom: boolean } | null => {
-      for (let i = 0; i < candidates.length; i++) {
-        const c = candidates[i];
-        if (c.kind === 'hold') {
-          if (c.el.isConnected) return { el: c.el, hold: offsetsBefore[i], atBottom: false };
-          continue;
-        }
-        const seam = resolveSeam(c.rows, c.lineIndex);
-        if (seam) return { el: seam.el, hold: null, atBottom: seam.atBottom };
-      }
-      return null;
-    })();
-    const anchored = settled !== null;
-    const el = settled ? settled.el : null;
+    // One press detaches it, the `⋯` stub replaced by the body it reveals. That
+    // reveal changes nothing ABOVE its own turn, so the freeze has already left
+    // the reader exactly right and there is nothing to correct.
+    const anchored = held.isConnected;
     // Where the correction wants the container, read from the layout the
     // mutation left. One definition, because the next-frame re-check has to ask
-    // the same question a frame later.
-    //
-    // `carried` repays what a previous reveal's clamp ate, and belongs to the
-    // HOLD arm alone: it is a deficit in the offset that arm derives from. A
-    // seam is read fresh out of the new layout and owes nothing to the old one.
+    // the same question a frame later. `carried` repays what a previous reveal's
+    // clamp ate out of the offset this derives from.
     const targetNow = (): number => {
-      if (!settled) return scrollBefore;
-      const offset = contentOffsetTop(container, settled.el);
-      if (settled.hold !== null) return reachableScrollTop(scrollBefore + carried + (offset - settled.hold));
-      const height = settled.atBottom ? settled.el.getBoundingClientRect().height : 0;
-      return reachableScrollTop(offset + height - readerEdgeInset(container));
+      if (!anchored) return scrollBefore;
+      const offset = contentOffsetTop(container, held);
+      return reachableScrollTop(scrollBefore + carried + (offset - offsetBefore));
     };
     // A reader kept on the live edge owes and is owed nothing: that edge is
-    // always reachable, and they are about to be put on it. Nor does a reader
-    // whose every candidate left the DOM, since declining to correct is
-    // declining to know what the clamp would have eaten.
+    // always reachable, and they are about to be put on it. Nor does a press
+    // whose anchor left the DOM, since declining to correct is declining to
+    // know what the clamp would have eaten.
     const wanted = targetNow();
     // The unfreeze is the one step that MUST happen, so it goes in a `finally`.
     // `restored` is already true and the observer already gone, so the rAF
@@ -797,7 +556,7 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
         clearAnchorDebt();
       } else {
         markAnchorScroll(container, wanted);
-        rememberAnchorDebt(container, wanted);
+        rememberAnchorDebt(container, held, wanted);
       }
     } finally {
       container.style.overflow = overflowBefore;
@@ -823,16 +582,16 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // jitter for a correction the tween makes moot. Skipped for a reader kept on
     // the live edge, for the stronger version of the same reason: there was no
     // correction to re-assert, and asserting one would drag them off it.
-    if (wanted !== scrollBefore && !keepsTheLiveEdge && el) {
+    if (wanted !== scrollBefore && !keepsTheLiveEdge && anchored) {
       requestAnimationFrame(() => {
-        if (!el.isConnected || isOtherNavigationScroll(container)) return;
+        if (!held.isConnected || isOtherNavigationScroll(container)) return;
         const target = targetNow();
         if (Math.abs(container.scrollTop - target) > 1) {
           markAnchorScroll(container, target);
           // Re-assert the debt against where this write comes to rest. Without
           // it, a target the clamp cannot reach would be re-written every frame
           // AND recorded against a stale position.
-          rememberAnchorDebt(container, target);
+          rememberAnchorDebt(container, held, target);
           honourAnchoredMutation(container);
         }
       });
@@ -844,13 +603,8 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
 
   fn();
 
-  // Synchronous check (if DOM changed synchronously). Asked of the best
-  // candidate alone: it is the reader's own line, so anything that moved the
-  // rest moved it too. A seam names no element yet, and never leads the list
-  // while a line does, so there is nothing to ask it.
-  const best = candidates[0];
-  if (!restored && best?.kind === 'hold'
-      && contentOffsetTop(container, best.el) !== offsetsBefore[0]) restore();
+  // Synchronous check, for a `fn` that changed the DOM before returning.
+  if (!restored && contentOffsetTop(container, held) !== offsetBefore) restore();
 
   // After Preact's Promise microtask render
   queueMicrotask(() => queueMicrotask(restore));

@@ -36,6 +36,7 @@ import {
   assertHealthy,
   navigateToApp,
   isMobileViewport,
+  waitForEventStream,
 } from './helpers';
 import { clearNotifications } from './db-helpers';
 
@@ -79,6 +80,12 @@ test.describe('Mobile pane-swipe — every navigation source reveals the content
       // + form overlay, openSettingsSubview); every content-landing branch
       // MUST end with the pane on `content`.
       await navigateToApp(page);
+      // The stream must be OPEN before the POST. `NavigationRequested` is a
+      // transient event: the engine broadcasts it over SSE and never replays
+      // it. A page still connecting misses it outright, and no amount of
+      // polling recovers it. That is what flaked here on a cold WebKit start,
+      // where `data-mobile-view` sat on `thread` for the whole wait.
+      await waitForEventStream(page);
       await expectMobileView(page, 'thread');
 
       const res = await page.request.post('/api/v1/ui/navigate', {

@@ -160,13 +160,14 @@ export function FilePreviewModal() {
           </button>
         </div>
       </div>
-      {/* A declared scroll region, mirroring `.content-pane-body`. Nothing
-          traps Tab in this modal, so a keyboard user genuinely reaches the body
-          and scrolls a long preview with it. Chrome gave that for free by
-          promoting an overflowing scroller, but only while the preview holds no
-          link, and it arrived unnamed wearing the browser's own ring. Declaring
-          the stop makes it every browser's and names it, and components.css
-          gives it our inset ring in place of the browser's. */}
+      {/* A declared scroll region, mirroring `.content-pane-body`. The modal's
+          Tab trap cycles its own controls, and `tabIndex={0}` puts the body
+          among them. So a keyboard user reaches it and scrolls a long preview.
+          Chrome gave that for free by promoting an overflowing scroller, but
+          only while the preview holds no link, and it arrived unnamed wearing
+          the browser's own ring. Declaring the stop makes it every browser's
+          and names it, and components.css gives it our inset ring in place of
+          the browser's. */}
       <div
         class="file-preview-modal-body"
         tabIndex={0}

@@ -89,6 +89,9 @@ mod client_log_test;
 #[path = "api_support/restart_intent_test.rs"]
 mod restart_intent_test;
 
+#[path = "api_support/handshake_approval_test.rs"]
+mod handshake_approval_test;
+
 #[path = "api_support/proxy_test.rs"]
 mod proxy_test;
 
@@ -152,6 +155,9 @@ mod backup_key_test;
 #[path = "api_support/backup_schedule_test.rs"]
 mod backup_schedule_test;
 
+#[path = "api_support/backup_last_successful_test.rs"]
+mod backup_last_successful_test;
+
 #[path = "api_support/network_config_test.rs"]
 mod network_config_test;
 
@@ -175,3 +181,6 @@ mod mcp_servers_test;
 
 #[path = "api_support/webhook_delivery_test.rs"]
 mod webhook_delivery_test;
+
+#[path = "api_support/webhook_ingress_test.rs"]
+mod webhook_ingress_test;

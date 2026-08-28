@@ -1,4 +1,5 @@
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
+import { instantMicros } from '../../utils/isoInstant';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
 import { isUserStoppedWait } from './thread-event-types';
@@ -61,7 +62,7 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
   const canAppendTrailing =
     !!cache &&
     cache.cacheable &&
-    compareSortKeys(first.event.created, first.seq, cache.lastCreated, cache.lastSeq) >= 0;
+    compareSortKeys(instantMicros(first.event.created), first.seq, cache.lastCreatedMicros, cache.lastSeq) >= 0;
 
   if (canAppendTrailing) {
     const exchanges = [...base];
@@ -374,11 +375,15 @@ function findExchangeByAnchorId(exchanges: Exchange[], anchorId: string): Exchan
 export function sortEventsChronologically(
   events: Map<number, StoredEvent>,
 ): SequencedEvent[] {
-  return [...events.entries()]
-    .sort(([aSeq, aEvt], [bSeq, bEvt]) =>
-      compareSortKeys(aEvt.created, aSeq, bEvt.created ?? null, bSeq),
-    )
-    .map(([seq, event]) => ({ seq, event }));
+  // Parse each `created` once, up front: the sort itself makes O(n log n)
+  // comparisons over O(n) events.
+  const keyed = [...events.entries()].map(([seq, event]) => ({
+    seq,
+    event,
+    micros: instantMicros(event.created),
+  }));
+  keyed.sort((a, b) => compareSortKeys(a.micros, a.seq, b.micros, b.seq));
+  return keyed.map(({ seq, event }) => ({ seq, event }));
 }
 
 /** Event types that, as a step of an unanswered `UserQuestionAsked` divider,
@@ -524,9 +529,9 @@ interface IncrementalCache {
   /** Entries folded so far. New events are exactly the iteration-order
    *  suffix past this count (Map preserves insertion order). */
   processedCount: number;
-  /** Sort key (created, seq) of the last folded event — appended events must
-   *  not sort before it. */
-  lastCreated: string | null;
+  /** Sort key (created instant, seq) of the last folded event. Appended
+   *  events must not sort before it. */
+  lastCreatedMicros: number | null;
   lastSeq: number;
   /** Flipped false when an event lacks `created` (legacy rows). The sort
    *  comparator is then no longer a total order to append-check against, so
@@ -539,17 +544,18 @@ const incrementalCache = new WeakMap<Map<number, StoredEvent>, IncrementalCache>
 /** The sort comparator of `sortEventsChronologically`, as a key compare:
  *  created (when both present) with seq as tiebreak, else seq. */
 function compareSortKeys(
-  aCreated: string | undefined,
+  aMicros: number | null,
   aSeq: number,
-  bCreated: string | null,
+  bMicros: number | null,
   bSeq: number,
 ): number {
-  // Fixed-width Zulu ISO-8601 timestamps sort identically under a plain lexical
-  // compare, which is far cheaper than the Intl collator `String.localeCompare`
-  // spins up. This comparator runs O(n log n) times per fold. Equal timestamps,
-  // and the legacy missing-`created` case, fall through to the `seq` tiebreak.
-  if (aCreated && bCreated && aCreated !== bCreated) {
-    return aCreated < bCreated ? -1 : 1;
+  // Instants, never the raw strings: `instantMicros` documents why a lexical
+  // compare of a server timestamp is wrong. Callers parse ONCE per event
+  // rather than once per comparison, this running O(n log n) times per fold.
+  // Same-millisecond events, and the legacy missing-`created` case, fall
+  // through to the `seq` tiebreak.
+  if (aMicros !== null && bMicros !== null && aMicros !== bMicros) {
+    return aMicros < bMicros ? -1 : 1;
   }
   return aSeq - bSeq;
 }
@@ -569,7 +575,7 @@ function rebuildIncrementalCache(events: Map<number, StoredEvent>): Exchange[] {
   incrementalCache.set(events, {
     fold,
     processedCount: events.size,
-    lastCreated: last?.event.created ?? null,
+    lastCreatedMicros: instantMicros(last?.event.created),
     lastSeq: last?.seq ?? Number.MIN_SAFE_INTEGER,
     cacheable,
   });
@@ -596,23 +602,26 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
     if (i++ < cache.processedCount) continue;
     appended.push({ seq, event });
   }
-  appended.sort((a, b) => compareSortKeys(a.event.created, a.seq, b.event.created ?? null, b.seq));
+  appended.sort((a, b) =>
+    compareSortKeys(instantMicros(a.event.created), a.seq, instantMicros(b.event.created), b.seq),
+  );
 
   // Validation pass. Every appended event must keep the fold resumable.
   // `batchAbortReqIds` covers the abort-then-terminal pair arriving INSIDE one
   // batch. The abort is not in `cache.fold.abortReqIds` yet, that set being fed
   // only by foldEvent, so checking the cache set alone would miss the
   // retro-classification.
-  let prevCreated = cache.lastCreated;
+  let prevMicros = cache.lastCreatedMicros;
   let prevSeq = cache.lastSeq;
   const batchAbortReqIds = new Set<string>();
   for (const { seq, event } of appended) {
-    if (!event.created) {
+    const micros = instantMicros(event.created);
+    if (micros === null) {
       // Legacy row without a timestamp — give up on caching this map.
       cache.cacheable = false;
       return groupIntoExchanges(events);
     }
-    if (compareSortKeys(event.created, seq, prevCreated, prevSeq) < 0) {
+    if (compareSortKeys(micros, seq, prevMicros, prevSeq) < 0) {
       // Out-of-order arrival (e.g. a refresh replay delivering a missed
       // event): its sorted position is in the middle, not the end.
       return rebuildIncrementalCache(events);
@@ -630,7 +639,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
       // already-folded (or same-batch) ResponseAborted as a superseded step.
       return rebuildIncrementalCache(events);
     }
-    prevCreated = event.created;
+    prevMicros = micros;
     prevSeq = seq;
   }
 
@@ -648,7 +657,7 @@ function groupIntoExchangesCached(events: Map<number, StoredEvent>): Exchange[] 
     exchange.revision = (exchange.revision ?? 0) + 1;
   }
   cache.processedCount = events.size;
-  cache.lastCreated = prevCreated;
+  cache.lastCreatedMicros = prevMicros;
   cache.lastSeq = prevSeq;
   return [...cache.fold.exchanges];
 }

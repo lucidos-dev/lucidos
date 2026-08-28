@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton } from '../WaitingBanner';
+import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, DiffButton } from '../WaitingBanner';
 import {
   threadMap,
   focusedThreadId,
@@ -87,13 +87,29 @@ function vnodeText(n: ComponentChildren): string {
   return vnodeText((n as VNode<{ children?: ComponentChildren }>).props.children);
 }
 
+// Diff is a COMPONENT rather than a bare <button>, because it holds a
+// touch-activation hook. A vnode walker cannot look inside one without a
+// renderer, so it is matched by identity and answers for its own label. What it
+// DOES on a press is covered by `diff-button-touch.test.tsx`, which renders it.
+// These slots are about composition: which face lands where.
 function buttonLabels(node: ComponentChildren): string[] {
   if (node === null || node === undefined || typeof node === 'boolean') return [];
   if (typeof node === 'string' || typeof node === 'number') return [];
   if (Array.isArray(node)) return node.flatMap(buttonLabels);
   const v = node as VNode<{ children?: ComponentChildren }>;
+  if (v.type === DiffButton) return ['Diff'];
   if (v.type === 'button') return [vnodeText(v.props.children).trim()];
   return buttonLabels(v.props.children);
+}
+
+/** The Diff faces in a slot, matched by component identity. */
+function diffNodes(node: ComponentChildren): VNode<{ threadId: string }>[] {
+  if (node === null || node === undefined || typeof node === 'boolean') return [];
+  if (typeof node === 'string' || typeof node === 'number') return [];
+  if (Array.isArray(node)) return node.flatMap(diffNodes);
+  const v = node as VNode<{ children?: ComponentChildren }>;
+  if (v.type === DiffButton) return [v as unknown as VNode<{ threadId: string }>];
+  return diffNodes(v.props.children);
 }
 
 function buttonNodes(node: ComponentChildren): VNode<{ disabled?: boolean }>[] {
@@ -189,9 +205,9 @@ describe('getBannerSlots', () => {
 
     expect(buttonLabels(slots.liftable)).toEqual(['Diff']);
     expect(buttonLabels(slots.primary)).toEqual(['Archive']);
-    const [diffBtn] = buttonNodes(slots.liftable);
-    expect(diffBtn.props.disabled).toBeFalsy();
-    expect(typeof (diffBtn.props as { onClick?: unknown }).onClick).toBe('function');
+    // Diff has no disabled form: both call sites render it only when the branch
+    // has a diff to show. The component takes a thread id and nothing else.
+    expect(diffNodes(slots.liftable).map((v) => v.props.threadId)).toEqual(['tid']);
   });
 
   it('archiving state puts a disabled Archive... in primary; nothing liftable', () => {
@@ -347,13 +363,9 @@ describe('showDiff is driven by codingAgentHasDiff alone', () => {
       showDiff: true,
     });
 
-    const [diffBtn] = buttonNodes(slots.liftable);
-    const onClick = (diffBtn.props as { onClick?: () => void }).onClick;
-    expect(typeof onClick).toBe('function');
-    onClick!();
-
-    expect(viewThreadCcDiff).toHaveBeenCalledTimes(1);
-    expect(viewThreadCcDiff).toHaveBeenCalledWith('tid');
+    // One face, carrying the THREAD id. What it calls with that id is asserted
+    // against the rendered component in `diff-button-touch.test.tsx`.
+    expect(diffNodes(slots.liftable).map((v) => v.props.threadId)).toEqual(['tid']);
     expect(viewChangeDiff).not.toHaveBeenCalled();
   });
 });
@@ -376,8 +388,7 @@ describe('getStandaloneCcDiffButton', () => {
 
     const node = getStandaloneCcDiffButton();
     expect(buttonLabels(node)).toEqual(['Diff']);
-    const [btn] = buttonNodes(node);
-    expect(btn.props.disabled).toBeFalsy();
+    expect(diffNodes(node).map((v) => v.props.threadId)).toEqual(['t1']);
   });
 
   it('returns null when codingAgentHasDiff=false', () => {
@@ -409,7 +420,9 @@ describe('getStandaloneCcDiffButton', () => {
     expect(getStandaloneCcDiffButton()).toBeNull();
   });
 
-  it('Diff click routes to viewThreadCcDiff for the focused thread', () => {
+  it('hands the FOCUSED thread id to the Diff face', () => {
+    // The standalone path resolves the thread itself, where the banner path is
+    // handed one. Both must reach the same face with the same id.
     const thread = makeCCThread('tid', {
       status: 'running',
       codingAgentHasDiff: true,
@@ -417,12 +430,7 @@ describe('getStandaloneCcDiffButton', () => {
     threadMap.value = new Map([['tid', thread]]);
     focusedThreadId.value = 'tid';
 
-    const node = getStandaloneCcDiffButton();
-    const [btn] = buttonNodes(node);
-    const onClick = (btn.props as { onClick?: () => void }).onClick;
-    expect(typeof onClick).toBe('function');
-    onClick!();
-    expect(viewThreadCcDiff).toHaveBeenCalledTimes(1);
-    expect(viewThreadCcDiff).toHaveBeenCalledWith('tid');
+    expect(diffNodes(getStandaloneCcDiffButton()).map((v) => v.props.threadId)).toEqual(['tid']);
+    expect(viewChangeDiff).not.toHaveBeenCalled();
   });
 });

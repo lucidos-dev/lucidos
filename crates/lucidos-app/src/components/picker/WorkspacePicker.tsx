@@ -88,6 +88,7 @@ import { workspaceFaultNote, workspaceState, workspaceStateLabel, type Workspace
 import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 import {
   applyRestoreFile,
+  backupNote,
   createNote as buildCreateNote,
   isFirstRun,
   nameTakenBy,
@@ -144,6 +145,14 @@ const MORE_BUTTON = '[data-role="ws-row-more"]';
 const SPARK_D =
   'M0 -19 C2.5 -6 5.5 -2.5 18.5 0 C5.5 2.5 2.5 6 0 19 C-2.5 6 -5.5 2.5 -18.5 0 C-5.5 -2.5 -2.5 -6 0 -19 Z';
 
+/** One tile's start offset, scaled by the animation-speed slider.
+ *
+ *  The keyframes in picker.css run on scaled durations. A raw delay would keep
+ *  its 1x offset while they stretch, so a square would land before its own
+ *  sparkle at any speed below 1x. */
+const revealDelay = (seconds: number) =>
+  `animation-delay:calc(${seconds}s * var(--duration-scale))`;
+
 function LucidosMark() {
   // The app icon (from public/favicon.svg) playing Logo Studio's "logo reveal":
   // a sparkle flashes at each tile in turn (TL → BL → BR → TR), leaving a square
@@ -159,16 +168,16 @@ function LucidosMark() {
       <rect x="0" y="0" width="100" height="100" rx="22" fill="url(#wsBrand)" />
       <g transform="translate(10 10) scale(0.8)" fill="#ffffff">
         <g transform="translate(31.5 31.5)">
-          <rect class="ws-rv-sq" style="animation-delay:0.45s" x="-14.5" y="-14.5" width="29" height="29" rx="7" />
-          <g transform="scale(0.6)"><path class="ws-rv-flash" style="animation-delay:0.15s" d={SPARK_D} /></g>
+          <rect class="ws-rv-sq" style={revealDelay(0.45)} x="-14.5" y="-14.5" width="29" height="29" rx="7" />
+          <g transform="scale(0.6)"><path class="ws-rv-flash" style={revealDelay(0.15)} d={SPARK_D} /></g>
         </g>
         <g transform="translate(31.5 68.5)">
-          <rect class="ws-rv-sq" style="animation-delay:0.85s" x="-14.5" y="-14.5" width="29" height="29" rx="7" />
-          <g transform="scale(0.6)"><path class="ws-rv-flash" style="animation-delay:0.55s" d={SPARK_D} /></g>
+          <rect class="ws-rv-sq" style={revealDelay(0.85)} x="-14.5" y="-14.5" width="29" height="29" rx="7" />
+          <g transform="scale(0.6)"><path class="ws-rv-flash" style={revealDelay(0.55)} d={SPARK_D} /></g>
         </g>
         <g transform="translate(68.5 68.5)">
-          <rect class="ws-rv-sq" style="animation-delay:1.25s" x="-14.5" y="-14.5" width="29" height="29" rx="7" />
-          <g transform="scale(0.6)"><path class="ws-rv-flash" style="animation-delay:0.95s" d={SPARK_D} /></g>
+          <rect class="ws-rv-sq" style={revealDelay(1.25)} x="-14.5" y="-14.5" width="29" height="29" rx="7" />
+          <g transform="scale(0.6)"><path class="ws-rv-flash" style={revealDelay(0.95)} d={SPARK_D} /></g>
         </g>
         <g transform="translate(68.5 31)">
           <path class="ws-rv-final" d={SPARK_D} />
@@ -295,6 +304,11 @@ function PickerSkeleton({ rows = 3 }: { rows?: number }) {
                 <SkBlock w="0.625rem" h="0.625rem" circle />
                 <div class="ws-picker-id">
                   <SkText class="ws-picker-name" w="9rem" />
+                  {/* The backup line, which every row draws whether or not it
+                      has a sentence for it. It is what makes the id cell the
+                      row's tallest, so a skeleton without it hands off one
+                      line short per row. */}
+                  <SkText class="ws-picker-backup" w="6rem" />
                 </div>
                 <div class="ws-picker-actions">
                   <SkBlock w="2rem" h="2rem" round />
@@ -947,6 +961,18 @@ export function WorkspacePicker() {
               // Non-null for the one state that is a fault, which is also the
               // one the dot draws in red. See `workspaceFaultNote`.
               const fault = workspaceFaultNote(w);
+              // Null only when the gateway could not ask. See `backupNote`.
+              const backup = backupNote(w);
+              // The row's whole accessible name. An `aria-label` REPLACES the
+              // element's content, so every sentence rendered inside has to be
+              // folded in here or it goes unread. Two can be: the fault note,
+              // and the backup line.
+              const rowLabel = [
+                fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`,
+                backup?.text,
+              ]
+                .filter(Boolean)
+                .join(' · ');
               const alternateMode = alternateOpenMode(state, WORKSPACE_ID, w.id);
               return (
                 <li class="ws-picker-row" key={w.id}>
@@ -998,10 +1024,9 @@ export function WorkspacePicker() {
                       role="button"
                       tabIndex={0}
                       // The row's own label, and with it the ONLY thing a screen
-                      // reader hears here: an `aria-label` replaces the element's
-                      // content, so the fault note rendered inside would go
-                      // unread if it were not folded in.
-                      aria-label={fault ? `Retry ${w.name} · ${fault}` : `Open ${w.name}`}
+                      // reader hears here. See `rowLabel` above for what it
+                      // folds in and why it has to.
+                      aria-label={rowLabel}
                       onClick={(e) => openOrRetry(w, state, openModeForClick(e))}
                       // Only where a middle press would open something beside.
                       // On an unhealthy row the primary action is a RESTART,
@@ -1057,6 +1082,30 @@ export function WorkspacePicker() {
                               {workspaceAddress(w.id)}
                             </span>
                           )}
+                          {/* When this workspace last backed up, under the name
+                              it belongs to. In the stacked id cell rather than
+                              on the row's line, which holds three cells and
+                              stays that way: a fourth item there would push the
+                              play and ⋯ buttons off the row.
+
+                              The slot is ALWAYS drawn, and stays empty until
+                              the gateway has a fact for it. The fact lands on
+                              the 2s poll, and a workspace the gateway could not
+                              ask has none at all. A slot that came and went
+                              would grow the row under the pointer, and shove
+                              every row below it down. Empty, it still says
+                              nothing: the picker never calls an unreachable
+                              workspace un-backed-up.
+
+                              `aria-hidden` because the row's own label already
+                              carries this sentence (see `rowLabel`), and a
+                              screen reader would otherwise read it twice. */}
+                          <span
+                            class={`ws-picker-backup${backup ? ` ws-picker-backup-${backup.level}` : ''}`}
+                            aria-hidden="true"
+                          >
+                            {backup?.text ?? ''}
+                          </span>
                         </div>
                         {typeof w.unread_count === 'number' && w.unread_count > 0 && (
                           <span

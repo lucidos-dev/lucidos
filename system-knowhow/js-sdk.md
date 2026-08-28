@@ -947,6 +947,9 @@ interface NavigateUi {
   target: NavigateTarget;
   settings_view?: SettingsViewTarget;
   app_id?: string;
+  /** The place INSIDE the app, delivered as the app iframe's `location.hash`.
+   *  Only used with `target: 'app'`. See § Navigation targets. */
+  fragment?: string;
   file_path?: string;
   /** 1-based line to open `file_path` at, and the inclusive last line of the
    *  range. See § Navigation targets for the degradation rules. */
@@ -1037,7 +1040,8 @@ await fetch(lucidos.apiUrl('/notifications'), {
   }),
 });
 
-// Navigate to an app's UI.
+// Navigate to an app's UI, at the one place the notification is about.
+// `fragment` arrives as the app's location.hash (§ Navigation targets).
 await fetch(lucidos.apiUrl('/notifications'), {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
@@ -1045,7 +1049,10 @@ await fetch(lucidos.apiUrl('/notifications'), {
     title: 'Habit tracker reminder',
     message: 'Tap to log today.',
     app_id: 'habit-tracker',
-    tap: { kind: 'navigate', to: { target: 'app', app_id: 'habit-tracker' } },
+    tap: {
+      kind: 'navigate',
+      to: { target: 'app', app_id: 'habit-tracker', fragment: 'today' },
+    },
   }),
 });
 ```
@@ -1226,13 +1233,39 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 | Target | Params | Description |
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
-| `app` | `id` (or `app_id`) | Open an app UI |
+| `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
 | `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System subpanel (`system`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging`). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
 | `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
+
+#### `fragment`: opening at a place inside the app
+
+**Whenever you name a specific item, pass it.** The app opens with that string as
+its `location.hash`, so an app that routes on the hash lands on the item. Without
+it the app opens on whatever the reader last looked at. On a sorted board that
+can be several cards away from the one you meant.
+
+```js
+// "the habit whose streak broke", not "the habit board".
+await lucidos.ui.navigate('app', {
+  app_id: 'habit-tracker',
+  fragment: 'habit-hydration',
+});
+```
+
+- Only used with `target: 'app'`. On any other target it is ignored.
+- Lucidos never inspects it: only the app knows what its own targets are.
+- An app that ignores the hash still opens, at whatever it shows by default.
+- **Absent is not empty.** Omitting it leaves an already-open app where the
+  reader put it; `''` would move them to the app's default view.
+- An app already on screen is **moved, never reloaded**: the hash change is a
+  same-document navigation, so the app sees a `hashchange` event.
+
+An `app:<id>#<fragment>` link carries the same string. So a chat link, a
+file-preview link and a notification tap all name a place the same way.
 
 #### `file_path` — workspace data vs a registered repository
 
@@ -1742,6 +1775,19 @@ lucidos.sse.on(eventType: string, callback: (data: unknown, raw: SseEvent) => vo
 ```
 
 `on()` returns an unsubscribe function. Subscribe by inner event name — the SDK unwraps the wire format.
+
+### One stream per workspace
+
+`connect()` is idempotent, and every `on()` listener in your app is fanned out from one connection. Ten subscriptions cost one stream.
+
+The connection is also shared **across documents**. Where the browser has `SharedWorker`, every document of a workspace attaches to one holder: the Lucidos shell, each app iframe, and each app opened in its own tab. So opening more apps does not open more connections.
+
+You do not opt in, and there is nothing to configure. Two things follow for an app author:
+
+- **A frame is identical either way.** A relayed frame is the same payload a private connection would deliver, so nothing in your handler changes.
+- **`disconnect()` detaches this document only.** It never takes the stream from another app or from the shell.
+
+Where `SharedWorker` is missing (Chromium on Android, and Android WebView), the SDK opens a private `EventSource` instead. Same events, same order, one connection per document. Nothing to handle.
 
 ### Types
 

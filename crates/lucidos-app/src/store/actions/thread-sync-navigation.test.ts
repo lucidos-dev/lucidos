@@ -132,14 +132,16 @@ describe('handleNavigationRequest', () => {
     expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
+  // The third argument is the app fragment. A navigate that names no place
+  // inside the app passes undefined, which leaves an open app where it was.
   it('opens app by id (delegates to openAppById, no stale-cache pre-check)', () => {
     handleNavigationRequest({ target: 'app', app_id: 'my-app' });
-    expect(openAppById).toHaveBeenCalledWith('my-app', undefined);
+    expect(openAppById).toHaveBeenCalledWith('my-app', undefined, undefined);
   });
 
   it('forwards the navigate source to openAppById for a sourced error', () => {
     handleNavigationRequest({ target: 'app', app_id: 'my-app' }, { source: 'thread "X"' });
-    expect(openAppById).toHaveBeenCalledWith('my-app', 'thread "X"');
+    expect(openAppById).toHaveBeenCalledWith('my-app', 'thread "X"', undefined);
   });
 
   it('opens file preview', () => {
@@ -297,14 +299,14 @@ describe('NavigationRequested scoping', () => {
   it('acts directly when the navigate comes from the focused thread', () => {
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEvent('thread-A'));
-    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String));
+    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
     expect(toasts.value).toHaveLength(0); // no jump offer for in-focus navigate
   });
 
   it('acts directly on a nil-thread (SDK app-iframe) navigate regardless of focus', () => {
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEvent(NIL_THREAD_ID));
-    expect(openAppById).toHaveBeenCalledWith('demo-director', 'an app');
+    expect(openAppById).toHaveBeenCalledWith('demo-director', 'an app', undefined);
     expect(toasts.value).toHaveLength(0);
   });
 
@@ -326,7 +328,7 @@ describe('NavigationRequested scoping', () => {
     handleThreadEvent(navEvent('thread-B'));
     toasts.value[0].action!.onClick();
     expect(focusThread).toHaveBeenCalledWith('thread-B');
-    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String));
+    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
   });
 
   // Agent navigate carries its originating device. It must act only on THAT
@@ -335,7 +337,7 @@ describe('NavigationRequested scoping', () => {
     getDeviceId.mockReturnValue('this-device');
     focusedThreadId.value = 'thread-A';
     handleThreadEvent(navEventFromDevice('thread-A', 'this-device'));
-    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String));
+    expect(openAppById).toHaveBeenCalledWith('demo-director', expect.any(String), undefined);
     expect(toasts.value).toHaveLength(0);
   });
 

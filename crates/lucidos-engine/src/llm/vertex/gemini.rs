@@ -146,18 +146,19 @@ impl VertexProvider {
 
         let access_token = self.get_access_token().await?;
 
+        // The failure branch reads the region back out of this binding, so the
+        // message names the region the request used.
+        let url = self.endpoint_for_model(model);
+
         let (status, body) = self
-            .request_with_retry(
-                model,
-                &self.endpoint_for_model(model),
-                &access_token,
-                &request,
-            )
+            .request_with_retry(model, &url, &access_token, &request)
             .await?;
 
         if !status.is_success() {
             log!("[Vertex] Gemini API error ({}): {}", status, body);
-            return Err(format!("Gemini API error ({}): {}", status, body).into());
+            let message = super::explain_publisher_model_404(status.as_u16(), &body, model, &url)
+                .unwrap_or_else(|| format!("Gemini API error ({}): {}", status, body));
+            return Err(message.into());
         }
 
         let parsed: VertexResponse = match serde_json::from_str(&body) {

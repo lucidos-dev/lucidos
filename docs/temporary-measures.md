@@ -88,32 +88,80 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   return nothing, and with the geometry test that phase adds for the winner.
 - **Status:** `active`
 
-### Dead-press probe on the composer's Send
+### Dead-press probe on the composer's action row
 
-- **Added:** 2026-08-26
+- **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28.
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, its
   install call in `src/main.tsx`, and
-  `src/components/chat/__tests__/dead-press-probe.test.ts`.
+  `src/components/chat/__tests__/dead-press-probe.test.ts`. The `PressOutcome`
+  pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
+  served press from a swallowed one, so each consumer says which it was.
 - **Impermanent because:** It chases one bug and produces no feature. On an iOS
-  PWA the composer's Send goes dead now and then, wherever the finger presses,
-  until the keyboard is dismissed. Three reports so far, each able to say only
-  "nothing happened", and three fixes shipped against three different readings
+  PWA the composer's buttons go dead now and then, wherever the finger presses,
+  until the keyboard is dismissed. Six reports so far, each able to say only
+  "nothing happened", and five fixes shipped against five different readings
   of that. No emulator reproduces it and the user cannot reproduce it on demand,
-  so the app itself has to report the next episode. The probe toasts which of
-  two families it was, with the geometry: the press never reached the button
-  (paint and hit-testing disagree), or it reached it and no path took it.
-- **Removal / resolution condition:** The next episode produces a toast, OR two
-  months pass with no report. Either way, delete the module, its install call,
-  its test, and this row. The cause the toast names goes into a plan and gets
-  fixed on its own evidence. Verify with a tree-wide search for
-  `deadPressProbe`, which must return nothing.
-- **Investigation:** none. It is narrow enough to stand alone, and the plan
-  behind it is
-  [`docs/plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md`](plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md).
-- **Status:** `active`
-- **Not a workaround.** It changes no behaviour and takes no gesture. Two real
-  fixes ship beside it in the same change, and this only decides what the user
-  is told when they fail.
+  so the app itself has to report the next episode.
+- **What it watches, and why that changed.** It first named ONE selector,
+  `.send-cancel-morph`. The fourth report was three other faces: Diff, the
+  answer Submit, and the lone Cancel. In answer mode the morph is not rendered
+  at all, so the probe returned at its first check on every tap. It now resolves
+  whichever `.action-btn` in `.prompt-actions-row` the press landed on, and
+  names it in the report.
+- **The five families it tells apart.** The button left the document under the
+  finger, which is Apple's documented cascade rule and settles it outright. The
+  press never reached the button, so paint and hit-testing disagree. The system
+  cancelled a stationary gesture. The face is not reachable at its own painted
+  centre, which the fifth round added. Or the press arrived intact and no path
+  took it. Every report carries the viewport numbers, the page scroll offset,
+  the `pointer-events` at the point, and the `data-keyboard-active` flag.
+- **What the fifth report changed.** The probe stayed silent through an episode.
+  Its `touchend` arm read `defaultPrevented` as proof a path had worked, and the
+  touch path cancels the default before running the action. The actions behind
+  it were fixed instead, so a press that runs and does nothing now speaks for
+  itself. Two of the probe's own silences went with it: a click landing anywhere
+  else no longer settles a press, and the reachability check answers without
+  needing the finger to land inside a painted rect.
+- **What the sixth report changed: the log, not the toast.** It stayed silent
+  again, and four of its own branches explain that. It returned on
+  `document.activeElement`, which excluded a keyboard iOS held up after focus
+  had moved. Its `touchend` arm still bubbled, so any capture-phase
+  `stopPropagation` on `document` skipped it, and the overlay contract's paired
+  swallow calls exactly that. A press landing in no face's painted rect returned
+  with the coordinates unlogged.
+
+  Its fourth silence was the channel itself: a toast reports only to a reader
+  who catches it. All four are gone, and `recordPress` now writes every watched
+  press to `engine.log` under `[Client/composer-press]`, carrying no draft text.
+- **What the seventh report found, and it is the first that names a cause.** The
+  probe logged `Cancel: dead` with the finger still, the node connected at the
+  lift, the row unchanged and the keyboard up. So WebKit dispatched the touch to
+  Cancel and dropped the click, and Cancel was click-only by decision. The fix
+  gives a destructive face a touch path that RULES on the tap gate, in
+  [`docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`](plans/2026-08-28-cancel-survives-the-ios-keyboard.md).
+- **Reading an episode.** Grep for `composer-press` in whichever log the
+  engine's stdout goes to. Under `web-dev.sh -b` that is the workspace's
+  `engine.log`, and for a gateway-launched engine it is
+  `~/.lucidos/gateway/gateway.log`. Check both, since the workspace file goes
+  quiet rather than missing. Each line names the face, the verdict (`served`,
+  `swallowed`, `clicked`, `canceled`, `missed` or `dead`), the travel, the
+  viewport block and the `data-keyboard-active` flag.
+- **Removal / resolution condition:** The Cancel face reports `served` after the
+  fix above, OR two months pass with no report. The cause is named, so the
+  probe's remaining job is to confirm the repair on the one device that
+  reproduces it. Then delete the module, its install call, its test, the
+  `PressOutcome` pair and its two callers, and flip this row to `removed`.
+  Verify with a tree-wide search for `deadPressProbe` and `notePressOutcome`,
+  which must return nothing.
+- **Investigation:** none. It is narrow enough to stand alone. The three plans
+  behind it are
+  [`docs/plans/2026-08-27-the-composer-row-reports-which-face-died.md`](plans/2026-08-27-the-composer-row-reports-which-face-died.md),
+  [`docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md`](plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md)
+  and
+  [`docs/plans/2026-08-28-a-swallowed-tap-says-so.md`](plans/2026-08-28-a-swallowed-tap-says-so.md).
+- **Status:** `active`, and now awaiting confirmation rather than evidence.
+- **Not a workaround.** It changes no behaviour and takes no gesture. Real fixes
+  ship beside it, and this only decides what the user is told when they fail.
 
 ### Recorded mirror-history exceptions
 
@@ -1511,7 +1559,15 @@ event that retires it.
   and remove `data_relative_preferred_over_workspace_root` (the root leg of the
   precedence test). This is a deliberate breaking change; schedule it with a release
   note.
-- **Status:** active
+- **Removed:** 2026-08-27. This removal discharged the condition first, across
+  every workspace on the release machine. One carried `script_handshake` entries,
+  and both of its scripts sat under `data/`, so nothing live depended on the fallback.
+  `run_handshake_script` now joins `data/` alone, and reports `NotFound` on that
+  path when the file is absent. `a_script_at_the_workspace_root_is_not_run` replaces
+  the precedence test, and the runner's two test helpers collapsed into one. The
+  release note is in `CHANGELOG.md`, and `system-knowhow/building-an-auth-handshake.md`
+  no longer names the root as a place a script may sit.
+- **Status:** removed (2026-08-27)
 
 ### Scheduler one-time startup migrations (`migrate_db_triggers_to_events`, `migrate_stale_trigger_prompts`)
 

@@ -27,14 +27,14 @@ import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { PromptRowControls } from './PromptRowControls';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { composeHandlers } from './promptFocus';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
-import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq } from './promptValueSync';
+import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
@@ -211,10 +211,17 @@ export function PromptInput() {
     showToast(`Tap ignored: it moved ${moved}px and read as a swipe. Try again.`, 'info');
     return false;
   }
-  /** The gate as `touchActivated` takes it. `spend` is `cancel`, which forgets
-   *  the in-flight press: a press the touch path served is spent, not ruled on.
-   *  Left unspent it would rule on the next activation with no press behind it. */
-  const morphActivationGate = { pass: morphTapPassed, spend: morphGate.cancel };
+  /** The gate as `touchActivated` takes it. A press the touch path served is
+   *  spent, not ruled on: left unspent it would rule on the next activation
+   *  with no press behind it.
+   *
+   *  `spend` is NOT `cancel`. Cancel means the system took the gesture, which
+   *  `aborted` then reports, and a served press must not raise that flag. */
+  const morphActivationGate = {
+    pass: morphTapPassed,
+    spend: morphGate.spend,
+    aborted: morphGate.wasAborted,
+  };
   // Watch for pending messages from other modules (e.g. new app modal)
   useSignalEffect(() => {
     const msg = pendingChatMessage.value;
@@ -262,8 +269,13 @@ export function PromptInput() {
     // this render sees both.
     const forceOverride = overrideSyncSeq !== lastOverrideSyncSeqRef.current;
     lastOverrideSyncSeqRef.current = overrideSyncSeq;
+    // An override that REPLACED the draft end-snaps the caret, the same as a
+    // thread switch: the old offset indexes text that is gone. An appending
+    // override keeps it, since the prefix it points into is untouched.
+    const preserveCursor = sameThread
+      && !(forceOverride && promptOverrideReplacesDraft.value);
     if ((forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))
-        && syncTextareaValue(el, composeText, sameThread)) {
+        && syncTextareaValue(el, composeText, preserveCursor)) {
       // A compose-view to compose-view switch keeps the centered layout put, so
       // the ThreadPane FLIP never fires and the textarea would insta-resize.
       // Ease its height from the previous view's to the new one instead.
@@ -367,7 +379,11 @@ export function PromptInput() {
     const draft = getDraft(threadId);
     const msg = thread.meta.state === 'composing' ? draft.text : draft.text.trim();
     const currentImages = getAttachedImages(threadId);
-    if (!msg.trim() && currentImages.length === 0) {
+    if (!composeHasContent(msg, currentImages.length, false)) {
+      // The user pressed Send and was told the send was waiting on the upload.
+      // Emptying the box in the meantime cancels it, so say so rather than let
+      // the promised send never arrive.
+      showToast('The queued send was dropped: the composer is empty now.', 'info');
       clearSubmittingThread(threadId);
       return Promise.resolve();
     }
@@ -381,13 +397,42 @@ export function PromptInput() {
 
   async function submit() {
     const el = inputRef.current;
-    if (!el) return;
-    const msg = el.value.trim();
     const threadId = focusedThreadId.value;
+    // ONE source for "is there anything to send": the draft the Send face was
+    // rendered from, and the value `sendCompose` goes on to send. The textarea
+    // only fills a gap the store has. See `resolveComposerText`.
+    //
+    // The node itself is no longer required. It is needed to clear the box and
+    // to reset its height, and both sit under a null check below. A missing node
+    // used to return here, which is a dead button that says nothing.
+    const draftText = getDraft(threadId).text;
+    const resolved = resolveComposerText(draftText, el ? el.value : null);
+    const msg = resolved.text;
     const currentImages = threadId ? getAttachedImages(threadId) : [];
     const pendingForThread = threadId ? getPendingUploads(threadId) : [];
     const uploadInFlight = threadId ? hasInFlightUploads(threadId) : false;
-    if (!msg && currentImages.length === 0 && !uploadInFlight) return;
+    // The same reading the Send face was lit from, so a press on a LIT face can
+    // never land here. What still reaches it is Enter on an empty desktop
+    // composer, and there is nothing to say about that.
+    //
+    // A box holding characters is a different thing. Nothing sendable and
+    // something on screen is the shape the user reports as a dead button, so it
+    // says which it is. Every other return below dispatches or speaks.
+    if (!composeHasContent(msg, currentImages.length, uploadInFlight)) {
+      const onScreen = (el?.value.length ?? 0) > 0 || draftText.length > 0;
+      if (onScreen) showToast('Nothing to send: the message is only spaces.', 'info');
+      return;
+    }
+    // Only with a thread to hold a draft. Without one there is no stored copy,
+    // so the box is the only source and there is nothing to disagree with.
+    const disagreement = threadId ? composerTextDisagreementToast(resolved) : null;
+    if (disagreement) showToast(disagreement, 'warning');
+    // Before every return below, and before the dispatch: a queued upload send
+    // re-reads the draft later, and `sendCompose` re-reads it now. Either would
+    // otherwise carry the empty copy the recovery just repaired.
+    if (threadId && resolved.storeWrite !== null) {
+      updateCompose(threadId, { text: resolved.storeWrite });
+    }
     // Backend reroutes typed text to the pending question's answer (see
     // chat/process/run.rs free-form path), but the answer payload drops images.
     // Refuse the send so the user can remove the images instead of silently
@@ -410,7 +455,7 @@ export function PromptInput() {
       showToast(UPLOAD_QUEUED_SEND_TOAST, 'info');
       return;
     }
-    el.value = '';
+    if (el) el.value = '';
     // In the centered compose layout the prompt re-docks on send. The height
     // collapse defers to the ThreadPane FLIP, so a tall draft shrinks *and*
     // slides into the docked state together rather than snapping short first.
@@ -419,7 +464,7 @@ export function PromptInput() {
     const inComposeLayout = !threadId || thread?.meta.state === 'composing';
     if (inComposeLayout) {
       promptSendCollapsing.value = true;
-    } else {
+    } else if (el) {
       el.style.height = 'auto';
     }
     // Show the reader what they just wrote being picked up. That rests them on
@@ -431,7 +476,7 @@ export function PromptInput() {
     // already at the live edge is not scrolled, and a send into a thread
     // entirely on screen writes nothing.
     followSentMessage();
-    if (isMobile()) el.blur();
+    if (isMobile()) el?.blur();
 
     // This constructive tap is about to morph the same button into the
     // destructive Cancel or Stop. Arm the settle window NOW, so a laggy repeat
@@ -591,7 +636,9 @@ export function PromptInput() {
   const pending = focusedTid ? getPendingUploads(focusedTid) : [];
   const uploadsBlocking = focusedTid ? hasInFlightUploads(focusedTid) : false;
   const uploadSendQueued = focusedTid ? queuedUploadSends.value.has(focusedTid) : false;
-  const hasContent = composeHasContent(hasText, images.length, pending.length);
+  // The same reading `submit()` dispatches on. See `composeHasContent`: two
+  // readings is what an enabled Send whose press does nothing is made of.
+  const hasContent = composeHasContent(composeText, images.length, uploadsBlocking);
   void multiSelectedByToolUse.value;
   const pendingAnswers = pendingAnswerByToolUse.value;
   // Gate the exchange walk by status — without it, every keystroke would
@@ -701,32 +748,45 @@ export function PromptInput() {
   // both the answer-control Cancel and the morph button below.
   const cancelSettling = isCancelSettling();
 
-  // TOUCH ACTIVATION for the row's constructive actions. The user presses these
-  // with the mobile keyboard up. A tap then blurs the textarea, the keyboard
-  // starts dismissing, and the button moves out from under the finger. WebKit
-  // drops the synthetic click, so the press reads as dead with nothing on
-  // screen to say why. `touchActivated` runs the action inside the gesture
-  // instead, and cancels the click.
+  // TOUCH ACTIVATION for the row's actions. The user presses these with the
+  // mobile keyboard up. A tap then blurs the textarea, the keyboard starts
+  // dismissing, and the button moves out from under the finger. WebKit drops
+  // the synthetic click, so the press reads as dead with nothing on screen to
+  // say why. `touchActivated` runs the action inside the gesture instead.
   //
-  // The morph button is ONE node that turns destructive, so the touch path is
-  // enabled only while it reads Send. Every other mode keeps the click path,
-  // which is what stops a tap aborting a live turn a gesture earlier.
+  // The morph button is ONE node that turns destructive. It keeps the touch
+  // path in both live modes. While it reads Cancel it passes `destructive`,
+  // which makes that path rule on the tap gate rather than spend it. Withheld
+  // entirely, the path left Cancel dead whenever the keyboard was up. See
+  // `docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`.
   //
-  // The gate goes to the CLICK path, not around the action. The spurious click
-  // after a scroll is what it exists to catch. In front of both paths it also
-  // vetoed the touch path, which on iOS with the keyboard up is the only one
-  // there is. See `touchActivated`.
+  // The settle window is the other half of the guard, and `disabled` alone is
+  // not it: a disabled element still receives touch events. So the destructive
+  // faces stand the touch path down while `cancelSettling`.
   //
-  // Both actions blur on their own (`submit`, `submitMultiAnswer`): the
-  // suppressed click never reaches `installActionBtnBlurListener`, which
+  // The constructive actions blur on their own (`submit`, `submitMultiAnswer`):
+  // the suppressed click never reaches `installActionBtnBlurListener`, which
   // listens on `click`.
-  const sendActivate = useTouchActivated(() => {
-    if (morphMode === 'send') void submit();
-    else if (morphMode === 'cancel') cancelExchangeForTarget();
-  }, morphMode === 'send', morphActivationGate);
+  const morphActivate = useTouchActivated(
+    () => {
+      if (morphMode === 'send') void submit();
+      else if (morphMode === 'cancel') cancelExchangeForTarget();
+    },
+    morphMode === 'send' || (morphMode === 'cancel' && !cancelSettling),
+    morphActivationGate,
+    morphMode === 'cancel',
+  );
   const answerSubmitActivate = useTouchActivated(() => {
     void submit();
   }, true, morphActivationGate);
+  // The lone answer Cancel is its own node, so it needs its own activation.
+  // Always destructive, and stood down for the same settle window.
+  const answerCancelActivate = useTouchActivated(
+    () => cancelExchangeForTarget(),
+    !cancelSettling,
+    morphActivationGate,
+    true,
+  );
 
   // Release the optimistic canceling flag once the cancel has landed. The set
   // survives component re-renders by design, since the button lives in the
@@ -813,7 +873,14 @@ export function PromptInput() {
     const focused = focusedThreadId.value;
     if (!focused) return;
     const el = inputRef.current;
-    const text = el?.value.trim() ?? '';
+    // The same one source as `submit`. This button's own count comes from
+    // `computeSubmitMultiCount(..., composeText)`, which is the draft, so
+    // reading the textarea here enabled it from one value and answered from
+    // another. See `resolveComposerText`.
+    const resolved = resolveComposerText(getDraft(focused).text, el ? el.value : null);
+    const text = resolved.text;
+    const disagreement = composerTextDisagreementToast(resolved);
+    if (disagreement) showToast(disagreement, 'warning');
     const ids = getMultiSelectedIds(pendingMultiQ.toolUseId);
     if (ids.length === 0 && text.length === 0) return;
     // Once answered, pendingMultiQ clears and the row falls to the lone Cancel —
@@ -965,11 +1032,13 @@ export function PromptInput() {
       onPointerDown={e => morphGate.down(e)}
       onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
-      // No touch path here, by the decision above, so the click is this
-      // button's only one. It used to cancel `mousedown` to hold focus and
-      // save that click. On iOS a cancelled event stops the rest of the
-      // synthesized sequence, `click` included, so the repair killed it.
-      onClick={() => { if (!morphTapPassed()) return; cancelExchangeForTarget(); }}
+      // The touch path runs the abort inside the gesture, because iOS drops
+      // the click when the keyboard dismisses under the finger. Being
+      // destructive, it rules on the gate: a press that travelled is refused
+      // on both paths. It must never cancel `mousedown` to hold that click.
+      // On iOS a cancelled event stops the rest of the synthesized sequence.
+      onTouchEnd={answerCancelActivate.onTouchEnd}
+      onClick={answerCancelActivate.onClick}
       aria-label="Cancel"
       // A pending question card gets the wording that says what Cancel does to
       // it; a permission card (same button, no typed-text escape) keeps "Stop".
@@ -998,8 +1067,8 @@ export function PromptInput() {
       onPointerDown={e => morphGate.down(e)}
       onPointerMove={e => morphGate.move(e)}
       onPointerCancel={() => morphGate.cancel()}
-      onTouchEnd={sendActivate.onTouchEnd}
-      onClick={sendActivate.onClick}
+      onTouchEnd={morphActivate.onTouchEnd}
+      onClick={morphActivate.onClick}
       aria-label={morphMode === 'cancel' || morphMode === 'canceling' ? 'Cancel' : 'Send message'}
       aria-hidden={morphMode === 'placeholder' ? 'true' : undefined}
       tabIndex={morphMode === 'send' || morphMode === 'cancel' ? undefined : -1}

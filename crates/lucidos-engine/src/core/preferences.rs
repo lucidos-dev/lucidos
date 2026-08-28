@@ -70,6 +70,11 @@ pub const DEFAULT_CHAT_MODEL: &str = "claude-opus-5@default";
 // Vertex AI configuration
 pub const PREF_VERTEX_REGION: &str = "vertex_region";
 
+/// Region used when neither the `vertex_region` preference nor the
+/// `VERTEX_REGION` env var is set. Mirrored on the frontend in
+/// `crates/lucidos-app/src/store/actions/preferences.ts`.
+pub const DEFAULT_VERTEX_REGION: &str = "europe-west1";
+
 // Local OpenAI-compatible provider base URL (also written by frontend Settings
 // UI). Points the `local` provider at Ollama / LM Studio / vLLM / llama.cpp.
 pub const PREF_LOCAL_BASE_URL: &str = "local_base_url";

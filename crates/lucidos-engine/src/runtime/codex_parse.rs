@@ -401,7 +401,13 @@ impl TurnTracker {
                     self.open_tool_ids.retain(|open| open != &id);
                     vec![AgentEvent::ToolResult {
                         output: if aggregated_output.is_empty() {
-                            format!("exit_code: {}", exit_code.unwrap_or_default())
+                            // A killed or abandoned command reports no code.
+                            // Never stand `0` in for that: the model reads this
+                            // line back and would take it as success.
+                            match exit_code {
+                                Some(code) => format!("exit_code: {}", code),
+                                None => "exit_code: unknown".to_string(),
+                            }
                         } else {
                             aggregated_output
                         },

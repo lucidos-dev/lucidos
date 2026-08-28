@@ -122,6 +122,7 @@ function rewriteArtifactAnchor(
 }
 
 const DATA_APP_ID_ATTR = /\sdata-app-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
+const DATA_APP_FRAGMENT_ATTR = /\sdata-app-fragment\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
@@ -434,32 +435,56 @@ function rewriteNavAnchor(tag: string): string | null {
   return stripped.replace(/^<a/i, `<a href="#" class="nav-link" data-nav-target="${escapedTarget}"`);
 }
 
-/** Extract a Lucidos app id from an href that points at an app's ENTRY POINT,
- *  meaning "open this app", not "preview a file inside it".
+/** An app entry point, plus the place inside the app a link named. */
+export interface AppHrefTarget {
+  appId: string;
+  /** The href's fragment without its `#`, or null when it carries none. The
+   *  app receives it as `location.hash`. */
+  fragment: string | null;
+}
+
+/** Extract a Lucidos app id and its target from an href pointing at an app's
+ *  ENTRY POINT. That means "open this app", not "preview a file inside it".
  *  Accepted (with an optional `data/` or `/data/` prefix):
  *    - `apps/<id>`, `apps/<id>/`, `apps/<id>/index.html`
  *    - `app:<id>`, the custom-scheme shorthand, with an optional `/`
- *  A query string or fragment is stripped before matching. Rejected: any other
- *  sub-path, external URLs, mailto and lookalike schemes (`apple:`).
+ *  Each may carry a fragment, so a link can name a place inside the app:
+ *  `[Some report](app:pr-understanding#pr-1645)`. The entry point's query is
+ *  dropped, because the engine's WIP-preview rewrite keeps only `thread_id`.
+ *  A `?` AFTER the `#` is part of the fragment by URL syntax, not a query, and
+ *  reaches the app whole. Rejected: any other sub-path, external URLs, mailto
+ *  and lookalike schemes (`apple:`).
  *
  *  Entry points only, because `lucidos.data.list()` returns EVERY file under
  *  `data/`, so the artifact path list always contains `apps/<id>/index.html`.
- *  A permissive extractor would pre-empt the artifact rewriter for sub-files
- *  the user wants to preview.
+ *  A permissive extractor would claim sub-files the user wants to preview.
  *
  *  `app:<id>` is accepted because LLMs invent it by analogy to the documented
  *  `thread:<UUID>` scheme, and no OS handler claims the unknown scheme.
  *
- *  Exported because `rewriteAppAnchor` and the chat click handler both need
- *  it. */
-export function extractAppIdFromHref(href: string): string | null {
+ *  Exported because `rewriteAppAnchor`, the chat click handler and the
+ *  preview-iframe router all need it. */
+export function extractAppTargetFromHref(href: string): AppHrefTarget | null {
+  // Cut the fragment off first, so every id rule below reads the string it
+  // always read and the fragment survives one shared split. Everything after
+  // the FIRST `#` is the fragment, so a `?` in there is the app's to read.
+  const hash = href.indexOf('#');
+  const fragment = hash === -1 ? '' : href.slice(hash + 1);
+  const appId = extractAppEntryPoint(hash === -1 ? href : href.slice(0, hash));
+  if (appId === null) return null;
+  return { appId, fragment: fragment.length === 0 ? null : fragment };
+}
+
+/** The id half of `extractAppTargetFromHref`, over an href whose fragment is
+ *  already cut off. Still strips a query, so `app:todo?refresh=1` gives
+ *  `todo`. */
+function extractAppEntryPoint(href: string): string | null {
   // `app:<id>` custom-scheme branch. Match before the path-based normalization
   // below so the leading-slash strip can't mangle it.
   if (href.startsWith('app:')) {
     const rest = href.slice('app:'.length);
     if (rest.length === 0) return null;
-    // Strip query / fragment first so `app:todo?refresh=1` resolves to `todo`.
-    const queryStart = rest.search(/[?#]/);
+    const queryStart = rest.indexOf('?');
     const trimmed = queryStart === -1 ? rest : rest.slice(0, queryStart);
     if (trimmed.length === 0) return null;
     const slash = trimmed.indexOf('/');
@@ -476,8 +501,7 @@ export function extractAppIdFromHref(href: string): string | null {
   if (!candidate.startsWith('apps/')) return null;
   const rest = candidate.slice('apps/'.length);
   if (rest.length === 0) return null;
-  // Strip query string / fragment so they don't bleed into id comparison.
-  const queryStart = rest.search(/[?#]/);
+  const queryStart = rest.indexOf('?');
   const trimmed = queryStart === -1 ? rest : rest.slice(0, queryStart);
   if (trimmed.length === 0) return null;
   const slash = trimmed.indexOf('/');
@@ -537,7 +561,7 @@ export function extractTriggerIdFromHref(href: string): string | null {
  *  match the app name. */
 export function extractBareAppRef(href: string): string | null {
   // Any URL scheme disqualifies a bare ref. `app:<id>` is handled upstream by
-  // extractAppIdFromHref; `http(s):`, `mailto:`, `tel:`, `file:` are real links.
+  // extractAppTargetFromHref; `http(s):`, `mailto:`, `tel:`, `file:` are real links.
   if (hasUrlScheme(href)) return null;
   let candidate = href;
   if (candidate.startsWith('/')) candidate = candidate.slice(1);
@@ -557,20 +581,44 @@ export function extractBareAppRef(href: string): string | null {
  *  Left alone the browser navigates to the file under the `/data/*` static
  *  mount, showing a file preview rather than the running app. An href whose
  *  `<id>` names no known app is rejected, so an unrelated `apps/...` URL is
- *  left alone. */
+ *  left alone.
+ *
+ *  `data-app-fragment` rides beside the id when the href named a place inside
+ *  the app, and is absent otherwise. So the click handler can tell "no target"
+ *  from "the empty target", and leaves an open app where the reader put it. */
 function rewriteAppAnchor(tag: string, appIds: Set<string>): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
   const href = m[1] ?? m[2];
   if (!href) return null;
-  const appId = extractAppIdFromHref(href);
-  if (!appId || !appIds.has(appId)) return null;
-  const escapedId = appId.replace(/"/g, '&quot;');
-  const stripped = tag
+  const target = extractAppTargetFromHref(href);
+  if (!target || !appIds.has(target.appId)) return null;
+  const fragmentAttr = target.fragment === null
+    ? ''
+    : ` data-app-fragment="${escapeAttr(target.fragment)}"`;
+  const stripped = stripAppLinkAttrs(tag);
+  return stripped.replace(
+    /^<a/i,
+    `<a href="#" class="app-link" data-app-id="${escapeAttr(target.appId)}"${fragmentAttr}`,
+  );
+}
+
+/** Drop the attributes an app-link rewrite replaces, the stale
+ *  `data-app-fragment` included: one already on the incoming tag must not
+ *  outlive the href it came from. */
+function stripAppLinkAttrs(tag: string): string {
+  return tag
     .replace(HREF_ATTR, '')
     .replace(CLASS_ATTR, '')
-    .replace(DATA_APP_ID_ATTR, '');
-  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
+    .replace(DATA_APP_ID_ATTR, '')
+    .replace(DATA_APP_FRAGMENT_ATTR, '');
+}
+
+/** Escape a value for a double-quoted HTML attribute. It comes from an href
+ *  the sanitizer already serialized, so `&` arrives encoded and the quote is
+ *  the only delimiter left that could break out. */
+function escapeAttr(value: string): string {
+  return value.replace(/"/g, '&quot;');
 }
 
 /** Mirror of `rewriteAppAnchor` for triggers. Unlike the app rewriter it does
@@ -641,12 +689,8 @@ function rewriteBareAppAnchorByText(
   if (!href || !BARE_APP_HREF.test(href.trim())) return null;
   const id = appTextToId.get(linkText.trim());
   if (!id) return null;
-  const escapedId = id.replace(/"/g, '&quot;');
-  const stripped = tag
-    .replace(HREF_ATTR, '')
-    .replace(CLASS_ATTR, '')
-    .replace(DATA_APP_ID_ATTR, '');
-  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
+  const stripped = stripAppLinkAttrs(tag);
+  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapeAttr(id)}"`);
 }
 
 /** Rewrite a bare app-id/name href (see `extractBareAppRef`) to an app-link.
@@ -664,12 +708,8 @@ function rewriteAppAnchorByBareRef(tag: string, appTextToId: Map<string, string>
   if (!token) return null;
   const id = appTextToId.get(token);
   if (!id) return null;
-  const escapedId = id.replace(/"/g, '&quot;');
-  const stripped = tag
-    .replace(HREF_ATTR, '')
-    .replace(CLASS_ATTR, '')
-    .replace(DATA_APP_ID_ATTR, '');
-  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapedId}"`);
+  const stripped = stripAppLinkAttrs(tag);
+  return stripped.replace(/^<a/i, `<a href="#" class="app-link" data-app-id="${escapeAttr(id)}"`);
 }
 
 /** The regex batches and lookups linkify needs for a given (paths, apps) set.

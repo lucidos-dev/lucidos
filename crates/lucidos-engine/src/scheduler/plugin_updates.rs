@@ -162,7 +162,7 @@ pub(crate) async fn run_plugin_marketplace_update_check(
             None,
             None,
             Tap::Navigate {
-                to: build_update_navigation(&candidates),
+                to: Box::new(build_update_navigation(&candidates)),
             },
             None,
         )

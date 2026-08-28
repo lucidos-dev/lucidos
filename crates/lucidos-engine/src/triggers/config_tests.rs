@@ -859,6 +859,58 @@ fn is_valid_trigger_slug_rejects_malformed() {
 }
 
 #[test]
+fn is_path_safe_trigger_slug_accepts_any_plain_segment() {
+    // A plugin trigger's slug is its installed directory name, so shapes
+    // `is_valid_trigger_slug` rejects still have to pass here.
+    assert!(is_path_safe_trigger_slug("daily_reflect"));
+    assert!(is_path_safe_trigger_slug("Has Capitals"));
+    assert!(is_path_safe_trigger_slug("-leading-dash"));
+    assert!(is_path_safe_trigger_slug(&"a".repeat(255)));
+}
+
+#[test]
+fn is_path_safe_trigger_slug_rejects_escapes() {
+    assert!(!is_path_safe_trigger_slug(""));
+    assert!(!is_path_safe_trigger_slug("."));
+    assert!(!is_path_safe_trigger_slug(".."));
+    assert!(!is_path_safe_trigger_slug("../../etc"));
+    assert!(!is_path_safe_trigger_slug("a/b"));
+    assert!(!is_path_safe_trigger_slug("a\\b"));
+    assert!(!is_path_safe_trigger_slug("a\0b"));
+    assert!(!is_path_safe_trigger_slug(&"a".repeat(256)));
+}
+
+#[test]
+fn from_created_payload_keeps_a_plugin_directory_slug() {
+    // The installed directory segment is authoritative for a plugin trigger
+    // (ADR 0019). Substituting a name-derived slug here would desync the
+    // install record, the knowhow dir and the projection key.
+    let payload = json!({
+        "trigger_id": "t1", "name": "Daily Reflect",
+        "slug": "daily_reflect",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(config.slug, "daily_reflect");
+}
+
+#[test]
+fn from_created_payload_drops_a_traversing_slug() {
+    let payload = json!({
+        "trigger_id": "t1", "name": "Escape Me",
+        "slug": "../../etc",
+        "schedule": ["0 0 8 * * *"], "timezone": "UTC",
+        "run": { "type": "intent", "text": "x" }
+    });
+    let config = TriggerConfig::from_created_payload(&payload).unwrap();
+    assert_eq!(
+        config.slug, "escape-me",
+        "a slug that escapes data/triggers/ falls back to the name"
+    );
+}
+
+#[test]
 fn from_created_payload_reads_explicit_group_id() {
     let payload = json!({
         "trigger_id": "t1", "name": "T",

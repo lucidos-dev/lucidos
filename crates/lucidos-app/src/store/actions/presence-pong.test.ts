@@ -1,10 +1,16 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 
-// Capture all calls to dependencies so we can assert the pong body shape.
+// Capture all calls to dependencies so we can assert the pong answer shape.
 const isPageActiveMock = vi.fn(() => true);
 const isInViewportMock = vi.fn(() => false);
 const getDeviceIdMock = vi.fn(() => 'dev-test');
 const focusedThreadIdSignal = { value: null as string | null };
+const pseudoFullscreenSignal = { value: false };
+const fullscreenHostSignal = { value: null as unknown };
+// The pong now goes through the TRANSPORT, not straight to fetch. On a shared
+// connection the worker ORs this answer with its peers' answers. It then POSTs
+// one pong, so the engine still gets one per open stream.
+const submitPongMock = vi.fn();
 // Regression guard: PresenceCheck must NEVER render a toast anymore — the
 // toast moved to NotificationToastRequested so it can't race the push
 // decision. presence-pong.ts no longer imports this; the mock just lets us
@@ -14,8 +20,13 @@ const showInAppNotificationToastMock = vi.fn();
 vi.mock('../../api/client', () => ({ API_BASE: 'http://test', API: 'http://test/api/v1' }));
 vi.mock('../../utils/pageActive', () => ({ isPageActive: isPageActiveMock }));
 vi.mock('../../utils/viewport', () => ({ isInViewport: isInViewportMock }));
-vi.mock('../store', () => ({ focusedThreadId: focusedThreadIdSignal }));
+vi.mock('../store', () => ({
+  focusedThreadId: focusedThreadIdSignal,
+  appPseudoFullscreen: pseudoFullscreenSignal,
+}));
+vi.mock('../appFullscreenHost', () => ({ appFullscreenHost: fullscreenHostSignal }));
 vi.mock('./devices', () => ({ getDeviceId: getDeviceIdMock, pendingDeviceRegistration: vi.fn() }));
+vi.mock('./event-stream', () => ({ submitPong: submitPongMock }));
 vi.mock('./in-app-notification-toast', () => ({
   showInAppNotificationToast: showInAppNotificationToastMock,
   handleNotificationToastRequested: vi.fn(),
@@ -25,24 +36,19 @@ vi.mock('./in-app-notification-toast', () => ({
 const importModule = async () => await import('./presence-pong');
 
 describe('handlePresenceCheck', () => {
-  let fetchMock: ReturnType<typeof vi.fn>;
-
   beforeEach(() => {
-    fetchMock = vi.fn(() => Promise.resolve(new Response(null, { status: 200 })));
-    vi.stubGlobal('fetch', fetchMock);
     isPageActiveMock.mockReset().mockReturnValue(true);
     isInViewportMock.mockReset().mockReturnValue(false);
     getDeviceIdMock.mockReset().mockReturnValue('dev-test');
     focusedThreadIdSignal.value = null;
+    pseudoFullscreenSignal.value = false;
+    fullscreenHostSignal.value = null;
+    submitPongMock.mockReset();
     showInAppNotificationToastMock.mockReset();
   });
 
   /** Wall-clock ms — handlers compare `sent_at_ms` against `Date.now()`. */
   const now = () => Date.now();
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
 
   test('s3_pong_body_carries_device_state_and_event_in_viewport', async () => {
     isPageActiveMock.mockReturnValue(true);
@@ -55,14 +61,10 @@ describe('handlePresenceCheck', () => {
       deadline_ms: 250,
       sent_at_ms: now(),
     });
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('http://test/api/v1/presence-pong');
-    expect(init.method).toBe('POST');
-    expect(init.keepalive).toBe(true);
-    const body = JSON.parse(init.body as string);
-    expect(body).toEqual({
-      notification_id: 'n-1',
+    expect(submitPongMock).toHaveBeenCalledOnce();
+    const [notificationId, answer] = submitPongMock.mock.calls[0];
+    expect(notificationId).toBe('n-1');
+    expect(answer).toEqual({
       device_id: 'dev-test',
       is_active: true,
       focused_thread_id: 't-1',
@@ -84,27 +86,8 @@ describe('handlePresenceCheck', () => {
       deadline_ms: 250,
       sent_at_ms: now(),
     });
-    const [, init] = fetchMock.mock.calls[0];
-    const body = JSON.parse(init.body as string);
-    expect(body.event_in_viewport).toBe(false);
+    expect(submitPongMock.mock.calls[0][1].event_in_viewport).toBe(false);
     expect(isInViewportMock).not.toHaveBeenCalled();
-  });
-
-  test('s3_pong_is_fire_and_forget_swallows_network_error', async () => {
-    // Spec §3 "Failure handling" — a missed pong is treated as not-active.
-    // The handler must not throw, since SSE dispatch can't recover.
-    fetchMock.mockRejectedValue(new Error('network down'));
-    const { handlePresenceCheck } = await importModule();
-    expect(() =>
-      handlePresenceCheck({
-        notification_id: 'n-1',
-        event_id: null,
-        deadline_ms: 250,
-        sent_at_ms: now(),
-      }),
-    ).not.toThrow();
-    // Give the .catch handler a chance to run.
-    await new Promise((r) => setTimeout(r, 0));
   });
 
   // §3 freshness check — iOS PWA buffers SSE messages while JS is suspended in
@@ -120,7 +103,7 @@ describe('handlePresenceCheck', () => {
       deadline_ms: 250,
       sent_at_ms: now() - 250 - STALE_GRACE_MS - 100,
     });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(submitPongMock).not.toHaveBeenCalled();
     expect(showInAppNotificationToastMock).not.toHaveBeenCalled();
   });
 
@@ -138,7 +121,7 @@ describe('handlePresenceCheck', () => {
       deadline_ms: 250,
       sent_at_ms: now() - 100, // well inside deadline + grace
     });
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(submitPongMock).toHaveBeenCalledOnce();
     expect(showInAppNotificationToastMock).not.toHaveBeenCalled();
   });
 
@@ -153,9 +136,58 @@ describe('handlePresenceCheck', () => {
       deadline_ms: 250,
       sent_at_ms: now(),
     });
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const [, init] = fetchMock.mock.calls[0];
-    expect(JSON.parse(init.body as string).is_active).toBe(false);
+    expect(submitPongMock).toHaveBeenCalledOnce();
+    expect(submitPongMock.mock.calls[0][1].is_active).toBe(false);
     expect(showInAppNotificationToastMock).not.toHaveBeenCalled();
+  });
+
+  test('a fullscreen app reports inactive, so the notification takes the OS', async () => {
+    isPageActiveMock.mockReturnValue(true);
+    fullscreenHostSignal.value = {} as unknown;
+    const { handlePresenceCheck } = await importModule();
+    handlePresenceCheck({
+      notification_id: 'n-1',
+      event_id: null,
+      deadline_ms: 250,
+      sent_at_ms: now(),
+    });
+    expect(submitPongMock.mock.calls[0][1].is_active).toBe(false);
+  });
+});
+
+describe('isShellActive', () => {
+  // Presence answers whether the SHELL can show a toast. An app filling the
+  // screen means the user is looking at the app, so the OS surface wins. That
+  // also makes a fullscreen app agree with a popped-out app window, which has
+  // always taken the push and looks identical to the user.
+
+  test('an ordinary visible shell is active', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, false, false)).toBe(true);
+  });
+
+  test('a hidden shell is inactive whatever the fullscreen state', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(false, false, false)).toBe(false);
+    expect(isShellActive(false, true, false)).toBe(false);
+  });
+
+  test('native fullscreen makes the shell inactive', async () => {
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, true, false)).toBe(false);
+  });
+
+  test('pseudo-fullscreen makes the shell inactive too', async () => {
+    // The iOS path is a CSS overlay rather than the Fullscreen API, so it sets
+    // a different signal. Both mean the same thing to the user.
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, false, true)).toBe(false);
+  });
+
+  test('an app merely open in the content pane leaves the shell active', async () => {
+    // The common case, and it must not regress: an app open but not fullscreen
+    // still has the shell around it to render a toast.
+    const { isShellActive } = await importModule();
+    expect(isShellActive(true, false, false)).toBe(true);
   });
 });

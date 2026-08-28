@@ -4,6 +4,8 @@ import { Dropdown } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
 import { backupReminderBody } from '../layout/BackupReminderBanner';
 import { connectionBannerBody } from '../layout/ConnectionBanner';
+import { ingressBannerBody } from '../layout/IngressBanner';
+import { SAMPLE_INGRESS_OUTAGE } from './communicationSamples';
 import {
   TOAST_PLACEMENT_OPTIONS,
   sampleShortToast,
@@ -106,6 +108,13 @@ export function CommunicationSurfacesPage() {
         </div>
         <div class="surfaces-banner-preview">
           {connectionBannerBody({ layout: 'desktop', status: 'connecting', workspace: 'dev' })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {ingressBannerBody({
+            layout: 'desktop',
+            outage: SAMPLE_INGRESS_OUTAGE,
+            onOpenWebhooks: () => {},
+          })}
         </div>
       </div>
 

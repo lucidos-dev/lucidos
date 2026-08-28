@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { clampWithin } from '../utils/dom';
+import { notePressOutcome } from '../utils/tapGesture';
 
 export interface AnchorPosition {
   top: number;
@@ -202,11 +203,12 @@ export function useAnchoredPosition(
  *  gesture. So the open-gated `onTouchEnd`/`onClickCapture` below are already
  *  gone by the time the paired event fires; the swallow has to live somewhere
  *  the unmount can't reach. These listeners aren't tied to any component, so
- *  they survive. The first swallowed event (or a `touchcancel`/`pointercancel`,
- *  or a short fuse if the gesture is canceled with no paired event) removes them
- *  all, so a later unrelated tap is never eaten. The `touchend` `preventDefault`
- *  also cancels the synthetic click. Exported for unit tests. */
-export function installPairedSwallow(): void {
+ *  they survive. The `touchend` `preventDefault` also cancels the synthetic
+ *  click. Exported for unit tests.
+ *
+ *  The arm belongs to ONE gesture, `arming`, and `onNewGesture` below is what
+ *  holds it to that. */
+export function installPairedSwallow(arming?: Event): void {
   if (typeof document === 'undefined') return;
   let done = false;
   let fuse: ReturnType<typeof setTimeout>;
@@ -217,19 +219,49 @@ export function installPairedSwallow(): void {
     document.removeEventListener('click', swallow, true);
     document.removeEventListener('touchcancel', teardown, true);
     document.removeEventListener('pointercancel', teardown, true);
+    document.removeEventListener('pointerdown', onNewGesture, true);
     clearTimeout(fuse);
   }
+  // `notePressOutcome` is what stops this reading as a DEAD press. The
+  // `stopPropagation` skips every bubble-phase observer on `document`, the
+  // dead-press probe included, so the swallow has to name itself.
   function swallow(e: Event) {
+    notePressOutcome('swallowed');
     e.stopPropagation();
     e.preventDefault();
+    teardown();
+  }
+  /** The bound on the arm, and the reason it is a gesture rather than a target
+   *  or a point. The paired event of a dismissing tap can land anywhere: the
+   *  node under the finger is often the one the dismiss just re-rendered. A new
+   *  `pointerdown` proves the arming gesture is over. The arm dies there, in
+   *  the capture phase, ahead of the new gesture's own `touchend`.
+   *
+   *  An arm that outlives its gesture eats an unrelated tap, which is a dead
+   *  button. The way it strands is ordinary: a `touchend` dispatched to a node
+   *  the dismiss REMOVED never reaches `document`, and no cancel fires either.
+   *  See `docs/plans/2026-08-28-a-swallowed-tap-says-so.md`.
+   *
+   *  The arming pointerdown is still being dispatched while this listener is
+   *  added. A DOM dispatch iterates a COPY of the listener list, so no browser
+   *  delivers it here. The test document stub iterates the live one, and
+   *  comparing the event object holds in both.
+   *
+   *  A SECOND finger is not a new gesture. Its pointerdown carries
+   *  `isPrimary: false`, and tearing down on it would let the first finger's
+   *  paired event through, which is the contract this whole one-shot upholds. */
+  function onNewGesture(e: Event) {
+    if (e === arming) return;
+    if ((e as PointerEvent).isPrimary === false) return;
     teardown();
   }
   document.addEventListener('touchend', swallow, { capture: true, passive: false });
   document.addEventListener('click', swallow, true);
   document.addEventListener('touchcancel', teardown, { capture: true });
   document.addEventListener('pointercancel', teardown, { capture: true });
-  // A canceled gesture may emit no paired event; the fuse keeps a stranded arm
-  // from eating a later unrelated tap. Longer than any real tap's down→up.
+  document.addEventListener('pointerdown', onNewGesture, { capture: true });
+  // Backstop for a page nobody touches again, not the bound. A reflexive
+  // second tap arrives long inside it, and `onNewGesture` catches that one.
   fuse = setTimeout(teardown, 1500);
 }
 
@@ -305,7 +337,7 @@ export function makeDismissHandlers(
   panelRef: { current: HTMLElement | null },
   anchor: HTMLElement | null,
   onDismiss: () => void | boolean,
-  onArm?: () => void,
+  onArm?: (arming: Event) => void,
   isTop: () => boolean = () => true,
 ): {
   onPointerDown(e: PointerEvent): void;
@@ -346,7 +378,9 @@ export function makeDismissHandlers(
         suppressNextClick = true;
         // Survives the unmount the dismiss is about to trigger — see
         // installPairedSwallow. No-op in unit tests that don't pass onArm.
-        onArm?.();
+        // The event goes with it: the arm belongs to THIS gesture and nothing
+        // later can identify it otherwise.
+        onArm?.(e);
       }
     },
     onTouchEnd(e) {
@@ -363,6 +397,10 @@ export function makeDismissHandlers(
       awaitingPairedClick = false;
       if (!suppressNextClick) return;
       suppressNextClick = false;
+      // Same reason as `installPairedSwallow`'s copy: this stops propagation at
+      // `document` in the capture phase, so the press has to name itself or it
+      // reads as dead to every observer downstream.
+      notePressOutcome('swallowed');
       e.stopPropagation();
       e.preventDefault();
     },

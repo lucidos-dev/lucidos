@@ -616,12 +616,13 @@ impl AppServerTracker {
                     self.open_tool_ids.retain(|open| open != &id);
                     let aggregated = str_field(item, "aggregatedOutput");
                     let output = if aggregated.is_empty() {
-                        format!(
-                            "exit_code: {}",
-                            item.get("exitCode")
-                                .and_then(|v| v.as_i64())
-                                .unwrap_or_default()
-                        )
+                        // A killed or abandoned command reports no code, and a
+                        // missing key reads the same. Never stand `0` in for
+                        // that: the model takes it as success.
+                        match item.get("exitCode").and_then(|v| v.as_i64()) {
+                            Some(code) => format!("exit_code: {}", code),
+                            None => "exit_code: unknown".to_string(),
+                        }
                     } else {
                         aggregated
                     };

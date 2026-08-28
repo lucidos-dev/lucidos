@@ -603,7 +603,7 @@ html[data-theme="dark"] .split-button.open::before {
     padding: 0.25rem 0.5rem;
     cursor: pointer;
     outline: none;
-    transition: border-color 0.2s, color 0.2s;
+    transition: border-color var(--duration-normal), color var(--duration-normal);
     display: flex;
     align-items: center;
     gap: 0.3125rem;
@@ -1003,7 +1003,10 @@ html[data-theme="dark"] .split-button.open::before {
     color: var(--text-primary);
     cursor: pointer;
     white-space: nowrap;
-    transition: background-color 0.1s;
+    /* Below the fast token on purpose: a hover tint that lags the pointer down
+       a long option list reads as sticky. Scaled, so the slider still reaches
+       it. */
+    transition: background-color calc(0.1s * var(--duration-scale));
 }
 
 @media (hover: hover) {

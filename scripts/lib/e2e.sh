@@ -90,6 +90,7 @@ source "$_E2E_LIB_DIR/workspace.sh"
 source "$_E2E_LIB_DIR/e2e_lock.sh"
 source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
+source "$_E2E_LIB_DIR/host_memory_guard.sh"
 
 # ── e2e_workspace_env ───────────────────────────────────────────────────
 # Resolve this workspace's globals (pidfiles, log path, PG_NAME), its ports and
@@ -450,6 +451,33 @@ stop_e2e_background_guards() {
     stop_host_load_sampler
 }
 
+# ── playwright_file_filter ───────────────────────────────────────────
+# Turn a spec path into a positional filter that selects exactly that file.
+#
+#   playwright_file_filter chat.spec.ts   # → /chat\.spec\.ts$
+#
+# Playwright reads a positional argument as an UNANCHORED, case-insensitive
+# REGEX over the test file path, never as a filename. So a bare basename selects
+# every sibling whose path merely CONTAINS it: `chat.spec.ts` also pulls in
+# `app-coding-agent-spawn-from-chat.spec.ts`, `cancel.spec.ts` pulls in
+# `coding-agent-cancel.spec.ts`, and `follow-ups.spec.ts` pulls in
+# `coding-agent-follow-ups.spec.ts`.
+#
+# This is a correctness fix rather than a tidy-up. The selected specs ran twice
+# and inflated the recorded pass count, and two of them spawn coding-agent
+# subprocesses, so a run asked for three quiet specs got those as well.
+# `scripts/e2e-browser.sh` routes its `-f <spec>` through here for that reason.
+#
+# The leading `/` is what makes the anchor a path boundary rather than a
+# suffix: `chat\.spec\.ts$` alone still matches `…-chat.spec.ts`. Escaping
+# covers every character that is not plainly literal in a regex, so a future
+# spec name carrying `+` or `(` cannot reopen this.
+playwright_file_filter() {
+    local escaped
+    escaped=$(printf '%s' "${1#./}" | sed 's|[^[:alnum:]/_-]|\\&|g')
+    printf '/%s$' "$escaped"
+}
+
 # ── report_project_exit_codes ────────────────────────────────────────
 # Print the per-project exit-code table for a multi-project browser run and
 # RETURN the umbrella exit code the caller must exit with.
@@ -526,6 +554,89 @@ report_project_exit_codes() {
     fi
 
     return "$overall"
+}
+
+# ── summarise_playwright_log ─────────────────────────────────────────
+# Add up every Playwright summary in a log and echo one tally line:
+#
+#   planned passed failed flaky skipped interrupted didnotrun invocations
+#
+# A project is run in chunks, so it prints a summary per invocation and never a
+# figure for itself. That is what "chunked green is not green" names: nobody adds
+# them up, so nothing notices an invocation whose result went missing. This is
+# the adding up, and `report_playwright_totals` below is the noticing.
+#
+# `planned` comes from the "Running N tests" banner and is the CONTROL. Every
+# planned test lands in exactly one outcome bucket, retries included: a test that
+# fails then passes is reported once, as flaky. So the buckets must sum to the
+# banner, and an invocation that died before printing its summary breaks that sum
+# rather than passing silently.
+#
+# Colour is stripped first. Playwright emits SGR codes when stdout is a terminal,
+# and a `\033[32m` before the digits would leave every count at zero.
+summarise_playwright_log() {
+    awk '
+        { gsub(/\033\[[0-9;]*m/, "") }
+        /^Running [0-9]+ tests? using/ { planned += $2; invocations++ }
+        /^ +[0-9]+ passed/            { passed += $1 }
+        /^ +[0-9]+ failed/            { failed += $1 }
+        /^ +[0-9]+ flaky/             { flaky += $1 }
+        /^ +[0-9]+ skipped/           { skipped += $1 }
+        /^ +[0-9]+ interrupted/       { interrupted += $1 }
+        /^ +[0-9]+ did not run/       { didnotrun += $1 }
+        END {
+            printf "%d %d %d %d %d %d %d %d",
+                planned, passed, failed, flaky, skipped,
+                interrupted, didnotrun, invocations
+        }
+    ' "$1" 2>/dev/null
+}
+
+# ── report_playwright_totals ─────────────────────────────────────────
+# Print ONE verdict line for a project run across many invocations, and RETURN
+# non-zero when the outcomes do not account for every planned test.
+#
+#   report_playwright_totals <project> <log>
+#
+# The return is a harness verdict, never a test one: the caller folds it in with
+# merge_rc so it can only ever ADD a failure. A project whose chunks do not add
+# up has not been measured, and must not read green for the same reason
+# report_project_exit_codes refuses to print a blank rc.
+report_playwright_totals() {
+    local project="$1" log="$2"
+    local tally planned passed failed flaky skipped interrupted didnotrun invocations accounted
+
+    if [ ! -s "$log" ]; then
+        echo ""
+        echo "ERROR: no Playwright output was captured for $project (harness bug)."
+        return 1
+    fi
+
+    tally="$(summarise_playwright_log "$log")"
+    # shellcheck disable=SC2086 # deliberate word split: the tally is eight fields
+    set -- $tally
+    planned="${1:-0}"; passed="${2:-0}"; failed="${3:-0}"; flaky="${4:-0}"
+    skipped="${5:-0}"; interrupted="${6:-0}"; didnotrun="${7:-0}"; invocations="${8:-0}"
+    accounted=$(( passed + failed + flaky + skipped + interrupted + didnotrun ))
+
+    echo ""
+    echo "── $project total: $planned tests over $invocations invocation(s) ──"
+    echo "   $passed passed, $failed failed, $flaky flaky, $skipped skipped," \
+        "$interrupted interrupted, $didnotrun did not run"
+
+    if [ "$invocations" -eq 0 ]; then
+        echo ""
+        echo "ERROR: $project printed no Playwright summary at all (harness bug)."
+        return 1
+    fi
+    if [ "$planned" -ne "$accounted" ]; then
+        echo ""
+        echo "ERROR: $project planned $planned tests but accounted for $accounted."
+        echo "       An invocation ended without reporting, so this run is not a"
+        echo "       verdict. Forcing a non-zero exit code."
+        return 1
+    fi
+    return 0
 }
 
 # ── kill_orphan_simulator ────────────────────────────────────────────

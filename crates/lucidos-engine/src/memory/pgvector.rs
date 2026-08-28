@@ -416,7 +416,10 @@ impl PgVectorIndex {
         min_importance: f32,
         limit: usize,
     ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
-        let like_pattern = format!("%{}%", keyword);
+        // The keyword is model-supplied, so its metacharacters must match
+        // literally: a bare `%` otherwise matches every row above the
+        // importance floor.
+        let like_pattern = format!("%{}%", crate::core::store::escape_like(keyword));
 
         let rows = sqlx::query(
             r#"

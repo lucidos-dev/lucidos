@@ -11,8 +11,11 @@
  * `installWorkspaceStorage` overrides `getItem`/`setItem`/`removeItem` on the
  * `localStorage` instance so every key is transparently prefixed with the
  * workspace id (`ws:<slug>:<key>`), EXCEPT the two cross-workspace picker keys
- * (see `GLOBAL_KEYS`). All ~40 existing call sites — and any future one — are
- * covered without per-callsite changes. EVERYTHING ELSE is workspace-scoped,
+ * (see `GLOBAL_KEYS`). Those three methods are what every call site uses, so
+ * all ~40 are covered without per-callsite changes. `clear()`, `key(i)` and
+ * `length` are NOT wrapped and still see the raw cross-workspace bucket. A
+ * production `localStorage.clear()` would therefore wipe every workspace, so
+ * keep those three to tests. EVERYTHING ELSE is workspace-scoped,
  * including the theme, fonts, scale, and the device id (each workspace gets its
  * own device identity). The only escape is the picker keys, which are
  * cross-workspace by definition (written inside a workspace, read by the picker

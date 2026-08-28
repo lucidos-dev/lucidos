@@ -471,7 +471,13 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
              // The single tab stop — but only while open. A collapsed drawer
              // (width 0) must not be a phantom tab stop, so it drops to -1.
              tabIndex={visible ? 0 : -1}>
-            <div class="thread-drawer-list" ref={listRef}>
+            {/* Not a tab stop. Chromium makes a scroll container keyboard
+                focusable when it holds no focusable children, and every row
+                control here is `tabindex=-1` by design. The drawer would then
+                have two tab stops, so a Tab meant to leave it landed on this
+                unlabelled div. The container above keeps the arrows, which move
+                the highlight and scroll its row into view. */}
+            <div class="thread-drawer-list" ref={listRef} tabIndex={-1}>
                 {renderContent && (
                     activeView === 'search' ? <SearchResults />
                     : activeView === 'drafts' ? <DraftsList />

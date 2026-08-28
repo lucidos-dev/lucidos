@@ -208,15 +208,24 @@ export function writeAppSourceApi(
   );
 }
 
+/** The iframe src for an app, optionally previewing a thread's worktree and
+ *  optionally targeting a place inside the app.
+ *
+ *  The target is a FRAGMENT rather than a query parameter, and that is not a
+ *  style choice: the engine's WIP-preview branch rebuilds the query and keeps
+ *  only `thread_id`, so a query parameter would be dropped on the way in. The
+ *  fragment goes last, after the query, as a URL requires. */
 export function appUrl(
   appId: string,
   threadId?: string,
+  fragment?: string,
 ): string {
   const base = `${API_BASE}/app/${encodeURIComponent(appId)}/`;
   // `thread_id` triggers the engine's WIP-preview branch (see
   // `api/apps.rs::serve_app_ui`) — content comes from the open
   // coding-agent thread's worktree instead of the live workspace data.
-  return threadId ? `${base}?thread_id=${encodeURIComponent(threadId)}` : base;
+  const withQuery = threadId ? `${base}?thread_id=${encodeURIComponent(threadId)}` : base;
+  return fragment ? `${withQuery}#${fragment}` : withQuery;
 }
 
 // --- App Capture ---

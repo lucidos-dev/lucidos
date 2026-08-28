@@ -84,7 +84,7 @@
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all var(--duration-fast);
 }
 
 @media (hover: hover) {

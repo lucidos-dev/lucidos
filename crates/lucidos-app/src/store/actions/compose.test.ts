@@ -25,8 +25,8 @@ vi.mock('../../api/threads', () => ({
 
 import { applySuggestion, clearSupersededDraft, composeEditedAt, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, applyRemoteCompose, _composeEpochForTesting, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, confirmState, focusedThreadId, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
-import { promptOverrideSyncSeq } from '../../components/chat/promptValueSync';
+import { connectionStatus, confirmState, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { promptOverrideSyncSeq, promptOverrideReplacesDraft } from '../../components/chat/promptValueSync';
 import { patchComposeSelection, getComposeSelectionOverride, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
@@ -251,6 +251,9 @@ describe('applySuggestion: seeding the compose input on the user\'s behalf', () 
     expect(getDraft(id).text).toBe('Build me an app that tracks my reading list.');
     // Force-sync ticket bumped so the textarea reflects the override.
     expect(promptOverrideSyncSeq.value).toBe(seqBefore + 1);
+    // Marked a REPLACEMENT, which end-snaps the caret. Restoring the old offset
+    // would drop the user inside a sentence they did not write.
+    expect(promptOverrideReplacesDraft.value).toBe(true);
     // Not sent — prefill is not a send.
     const chatCall = mockFetch.mock.calls.find(([url]) =>
       typeof url === 'string' && url.endsWith('/chat/stream'));
@@ -1878,6 +1881,11 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     connectionStatus.value = 'disconnected';
     focusedThreadId.value = null;
     threadMap.value = new Map();
+    // Resolving a confirm does not close it: the dialog component owns that, and
+    // no component is mounted here. Left standing, it reads as an open confirm to
+    // every later test in the file.
+    confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
+    focusedPane.value = 'thread';
     _resetComposeDraftsForTesting();
     _resetComposeSelectionsForTesting();
     vi.restoreAllMocks();
@@ -1904,6 +1912,41 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     await expect(started).resolves.toBe(false);
     expect(chatCalls(), 'chat POST fired despite the thread row failing').toHaveLength(0);
     expect(toasts.value.filter((t) => t.type === 'error').length).toBeGreaterThan(0);
+  });
+
+  // A seeded send starts a conversation, so it lands on a thread and must
+  // surface the thread pane. Its callers sit in the content pane (a release
+  // notice, a notification's Discuss), where the thread would otherwise be
+  // invisible. `sendCompose` passes an explicit thread id, so `sendMessage`'s
+  // raw-new reveal never runs.
+  it('surfaces the thread pane, before the send rather than after it', async () => {
+    focusedPane.value = 'content';
+    const started = startSetupInterview();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(focusedPane.value, 'thread pane still hidden while the send is in flight')
+      .toBe('thread');
+
+    releaseThreadStart!(new Response(null, { status: 200 }));
+    await expect(started).resolves.toBe(true);
+  });
+
+  it('leaves the pane alone when the user declines to replace their draft', async () => {
+    // The reveal sits AFTER the confirm, so a decline moves nothing. Reordering
+    // it above `applySuggestion` would swipe a mobile user off the surface they
+    // just said no from.
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeThread({ state: 'composing', composeText: 'my own idea' }));
+    threadMap.value = map;
+    focusedThreadId.value = 't-1';
+    focusedPane.value = 'content';
+
+    const started = startSetupInterview();
+    expect(confirmState.value.visible).toBe(true);
+    confirmState.value.resolve!(false);
+
+    await expect(started).resolves.toBe(false);
+    expect(focusedPane.value, 'declined confirm still moved the user').toBe('content');
   });
 });
 

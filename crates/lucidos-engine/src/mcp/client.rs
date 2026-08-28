@@ -381,6 +381,20 @@ impl McpClient {
                         }
                         output.push_str("[Resource content]");
                     }
+                    // A content kind this engine has no arm for. The model sees
+                    // a placeholder, so log which server and tool sent it: that
+                    // is the only trace of what the model was denied.
+                    ToolCallContent::Unknown => {
+                        crate::log!(
+                            "[MCP] Server '{}' tool '{}' returned an unsupported content block",
+                            self.server_label,
+                            name
+                        );
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str("[Unsupported content]");
+                    }
                 }
             }
 

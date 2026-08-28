@@ -1,6 +1,8 @@
 // Movement during a press that is treated as a scroll instead of a tap.
 // 8 px matches the swipe direction-lock threshold in `swipe.ts`.
-const TAP_MOVE_THRESHOLD_PX = 8;
+// Exported for `deadPressProbe`, which asks the same question of a cancelled
+// gesture: did the finger move, or did the system take a stationary press?
+export const TAP_MOVE_THRESHOLD_PX = 8;
 
 /** The fields everything in this file reads off a pointer or a touch: SCREEN
  *  coordinates, never client ones.
@@ -42,6 +44,12 @@ interface TapState {
  *  `onPointerCancel`, and call `isTap()` inside `onClick`. */
 export function createTapGate() {
   let state: TapState | null = null;
+  /** The SYSTEM took the gesture, so nothing may activate on it.
+   *
+   *  Held apart from `state` because clearing the press cannot say this. A
+   *  keyboard Enter has no press either and must still activate, so "the gate
+   *  holds nothing" has to keep meaning yes. Cleared by the next `down`. */
+  let aborted = false;
 
   /** Consumes the in-flight press and rules on it. `null` when it counts as a
    *  tap, otherwise how far it travelled in screen px. Consuming is what stops
@@ -56,6 +64,7 @@ export function createTapGate() {
   return {
     down(p: TapPointer): void {
       state = { startX: p.screenX, startY: p.screenY, movedPx: 0, canceled: false };
+      aborted = false;
     },
     move(p: TapPointer): void {
       // Keeps measuring after the press is already doomed, because the
@@ -69,8 +78,22 @@ export function createTapGate() {
       );
       if (state.movedPx > TAP_MOVE_THRESHOLD_PX) state.canceled = true;
     },
+    /** `onPointerCancel`: the system took the gesture for a scroll or a zoom.
+     *  The lift may still arrive, and nothing may activate on it. */
     cancel(): void {
       state = null;
+      aborted = true;
+    },
+    /** A path consumed the press. Forget it cleanly, leaving the gesture's
+     *  standing alone: this is the user's action running, not a scroll. */
+    spend(): void {
+      state = null;
+    },
+    /** Whether the system took the in-flight gesture. Asked by a path that
+     *  runs INSIDE the gesture, since the browser cannot withhold the lift the
+     *  way it withholds the click. */
+    wasAborted(): boolean {
+      return aborted;
     },
     /** True when no press was recorded (keyboard / programmatic click) or
      *  when the press's movement stayed within the threshold. */
@@ -91,6 +114,33 @@ export function createTapGate() {
  *  touch path serves every `touchend` it is given. */
 const TOUCH_CLICK_WINDOW_MS = 500;
 
+/** Who took a touch press, said by whoever took it.
+ *
+ *  `served` is a button running its action inside the gesture. `swallowed` is
+ *  the overlay contract eating the paired event of a dismissing tap.
+ *
+ *  The two are indistinguishable to an observer, which is the whole reason this
+ *  exists. Both cancel the default, and the swallow also stops propagation at
+ *  `document` in the capture phase. `deadPressProbe` read `defaultPrevented` as
+ *  proof a path had worked and was wrong about both. It now asks here. */
+export type PressOutcome = 'served' | 'swallowed';
+
+let lastPress: { outcome: PressOutcome; at: number } | null = null;
+
+/** Record who took the press currently being dispatched. */
+export function notePressOutcome(outcome: PressOutcome, now: number = Date.now()): void {
+  lastPress = { outcome, at: now };
+}
+
+/** The outcome recorded within `withinMs`, or null when nobody claimed the
+ *  press. Consuming, so one press's outcome can never describe the next. */
+export function takePressOutcome(withinMs: number, now: number = Date.now()): PressOutcome | null {
+  const press = lastPress;
+  lastPress = null;
+  if (press === null || now - press.at > withinMs) return null;
+  return press.outcome;
+}
+
 /** All the touch path needs off the event. Structural, like `TapPointer` above,
  *  so the helper unit-tests without a DOM. */
 export interface TouchEventLike {
@@ -107,6 +157,10 @@ export interface ActivationGate {
    *  then rule on the NEXT activation that arrives with no press of its own,
    *  such as a keyboard Enter on the same button. */
   spend(): void;
+  /** Did the system take this gesture? The click path never has to ask: a
+   *  browser that cancels a pointer sends no click either. A path running
+   *  inside the gesture does, because the lift arrives regardless. */
+  aborted?(): boolean;
 }
 
 export interface TouchActivateOptions {
@@ -117,6 +171,16 @@ export interface TouchActivateOptions {
   /** The scroll-vs-tap gate. See `onClick` for why the touch path spends the
    *  press rather than asking. Absent means every click activates. */
   gate?: ActivationGate;
+  /** A face whose action cannot be taken back. It RULES on the gate instead of
+   *  spending it, on the touch path as well as the click path.
+   *
+   *  The touch path otherwise takes every press it is given, which is right for
+   *  Send and wrong for Cancel: a scroll landing there would abort a live turn.
+   *  Withholding the touch path altogether was the earlier answer, and it left
+   *  Cancel with no path at all once iOS dropped the click.
+   *
+   *  A thunk, because one node serves Send and Cancel. Read at the lift. */
+  destructive?: () => boolean;
   /** Injected clock, so the twin window is testable without a real one. */
   now?: () => number;
 }
@@ -133,7 +197,7 @@ export interface TouchActivateOptions {
  *  programmatic click, and ignores the twin of a touch it already served. One
  *  `action` for both, since two callbacks would drift.
  *
- *  **The touch path takes every press it is given.** With a field focused on iOS
+ *  **The CONSTRUCTIVE touch path takes every press.** With a field focused on iOS
  *  it is the only path, so any test it can fail throws the press away in
  *  silence. Two such tests shipped and both were reported as a dead Send. Each
  *  asked whether the finger was still on the button at the lift. `TapPointer`
@@ -144,20 +208,38 @@ export interface TouchActivateOptions {
  *  now fires it. That is the trade, and the reasoning is in
  *  `docs/plans/2026-08-26-a-tap-that-stays-on-the-button-sends.md`.
  *
+ *  A DESTRUCTIVE face is the exception and asks the gate, so a scroll cannot
+ *  fire it. See `opts.destructive`.
+ *
  *  Local copies of this repair live in `promptFocus.ts` (`composeHandlers`,
  *  which adds focus-first) and `FileSearchModal.tsx`. */
 export function touchActivated(action: () => void, opts: TouchActivateOptions = {}) {
   const enabled = opts.enabled ?? (() => true);
+  const destructive = opts.destructive ?? (() => false);
   const clock = opts.now ?? Date.now;
   let lastTouchAt: number | null = null;
   return {
     onTouchEnd(e: TouchEventLike): void {
       if (!enabled()) return;
-      // Served, so the gate's press is spent rather than ruled on. See
-      // `ActivationGate.spend`.
-      opts.gate?.spend();
+      // Cancel and record the twin BEFORE the gate rules, so a refused press
+      // cannot return as a click. `pass()` consumes the press, so that click
+      // would arrive with none behind it and run what was just refused.
       lastTouchAt = clock();
       e.preventDefault();
+      // A destructive face asks; every other face serves the press and spends
+      // the gate's copy of it. See `ActivationGate` and `opts.destructive`.
+      if (destructive()) {
+        // A scroll makes the browser take the pointer, and the lift still
+        // arrives. The gate holds no press by then, which reads as a tap, so
+        // the abort has to be asked about separately.
+        if (opts.gate?.aborted?.()) return;
+        if (!(opts.gate?.pass() ?? true)) return;
+      } else {
+        opts.gate?.spend();
+      }
+      // Before the action, not after: a throwing action still means a path
+      // took this press, and the probe must not call it dead.
+      notePressOutcome('served');
       action();
     },
     onClick(): void {
@@ -168,9 +250,9 @@ export function touchActivated(action: () => void, opts: TouchActivateOptions = 
         lastTouchAt = null;
         return;
       }
-      // The gate is asked on this path alone. What it catches is the click iOS
-      // fires after a touch that was starting a scroll. In front of BOTH paths
-      // it would veto the touch path too, on the measurement named above.
+      // What the gate catches here is the click iOS fires after a touch that
+      // was starting a scroll. Unconditionally in front of BOTH paths it would
+      // veto a constructive touch too, on the measurement named above.
       if (opts.gate && !opts.gate.pass()) return;
       action();
     },

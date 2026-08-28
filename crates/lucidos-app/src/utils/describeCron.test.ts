@@ -211,6 +211,29 @@ describe('describeCron', () => {
   it('a stepped day of month with a month falls back', () => {
     expect(describeCron('0 0 12 */2 6 *')).toBe('0 0 12 */2 6 *');
   });
+
+  // An hour or minute field naming more than one value has the same hole: the
+  // label used to state the leading run and drop the rest.
+
+  it('an hour list falls back rather than dropping every hour but the first', () => {
+    expect(describeCron('0 30 9,17 * * *')).toBe('0 30 9,17 * * *');
+  });
+
+  it('an hour range falls back', () => {
+    expect(describeCron('0 0 9-17 * * *')).toBe('0 0 9-17 * * *');
+  });
+
+  it('an hour list beside a weekday falls back', () => {
+    expect(describeCron('0 0 9,17 * * 1-5')).toBe('0 0 9,17 * * 1-5');
+  });
+
+  it('a minute list falls back rather than dropping every minute but the first', () => {
+    expect(describeCron('0 1,15 * * * *')).toBe('0 1,15 * * * *');
+  });
+
+  it('a minute list on a daily time falls back', () => {
+    expect(describeCron('0 0,30 8 * * *')).toBe('0 0,30 8 * * *');
+  });
 });
 
 describe('validateCron', () => {

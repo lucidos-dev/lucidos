@@ -25,31 +25,46 @@ describe('notificationTriggerId', () => {
 });
 
 describe('notificationActions', () => {
-  it('offers no actions row for a plain informational notification', () => {
+  it('offers Discuss alone for a plain informational notification', () => {
+    // Nowhere to open, but the reader can still start a conversation about it.
     const a = notificationActions(n(), false);
-    expect(a.any).toBe(false);
-    expect(a).toMatchObject({ openThread: false, openTrigger: false, navTap: null });
+    expect(a).toMatchObject({
+      openThread: false,
+      discuss: true,
+      openTrigger: false,
+      navTap: null,
+    });
+  });
+
+  it('offers Discuss exactly when there is no thread to open', () => {
+    // The originating thread IS the discussion, so the two never both show.
+    expect(notificationActions(n({ thread_id: 'th-1' }), false)).toMatchObject({
+      openThread: true,
+      discuss: false,
+    });
+    expect(notificationActions(n({ task_id: 'trig-1' }), false).discuss).toBe(true);
+  });
+
+  it('drops Discuss when only a thread-targeted tap reaches the thread', () => {
+    // The column is empty, so the tap survives the dedup and the panel labels it
+    // "Open thread". Reading the column alone put Discuss right beside it.
+    const a = notificationActions(
+      n({ tap: { kind: 'navigate', to: { target: 'thread', id: 'th-9' } } }),
+      false,
+    );
+    expect(a.navTap).toEqual({ target: 'thread', id: 'th-9' });
+    expect(a.discuss).toBe(false);
   });
 
   it('offers "Open trigger" for a trigger-failure notification', () => {
     // The command-guard block case: the user reads what was tried, then jumps
     // to the trigger's settings to grant the side-effect it needs.
-    const a = notificationActions(n({ task_id: 'trig-1' }), false);
-    expect(a.openTrigger).toBe(true);
-    expect(a.any).toBe(true);
-  });
-
-  it('opens the actions row for a linked app even with no other button', () => {
-    // The panel narrows its own LinkedAppResult to render "Open <app>", so the
-    // helper only has to keep `any` true for it.
-    expect(notificationActions(n({ app_id: 'habit-tracker' }), true).any).toBe(true);
-    expect(notificationActions(n({ thread_id: 'th-1' }), true).openThread).toBe(true);
+    expect(notificationActions(n({ task_id: 'trig-1' }), false).openTrigger).toBe(true);
   });
 
   it('keeps a navigate tap that no dedicated button covers', () => {
     const a = notificationActions(n({ tap: { kind: 'navigate', to: { target: 'changes' } } }), false);
     expect(a.navTap).toEqual({ target: 'changes' });
-    expect(a.any).toBe(true);
   });
 
   it('drops a navigate tap duplicated by the dedicated thread button', () => {

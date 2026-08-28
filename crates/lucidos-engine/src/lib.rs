@@ -1,4 +1,4 @@
-//! Lucidos Engine - Core cognitive operating system engine
+//! Lucidos Engine - the core runtime behind a workspace
 //!
 //! This crate provides the core functionality for Lucidos including:
 //! - Event sourcing with PostgreSQL

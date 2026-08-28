@@ -121,7 +121,24 @@ For login dances. The engine caches the script's output until `expires_in` elaps
 
 ### Script contract
 
-- **Where the file lives.** `script` is resolved relative to `data/` — the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. Keep handshake scripts under `data/` so they're git-tracked. (A legacy script placed at the workspace root still resolves as a back-compat fallback, but move it under `data/`.)
+- **Where the file lives.** `script` is resolved relative to `data/`, and nowhere else: the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. A script placed anywhere else in the workspace tree does not run, and the call answers 500 naming the `data/` path it looked for. Keep handshake scripts under `data/`, where they are git-tracked.
+- **A script runs only if Lucidos recorded who wrote it.** `data/scripts/` is
+  writable over the API, and an app UI reaches that API with your authority. So
+  the engine will not run a handshake script just because the file is there
+  (ADR 0144). It records the content when its OWN file tools write it. That is
+  what happens when you ask the Lucidos Agent to write or edit the script.
+  Nothing else records: a save from the Files panel, an editor, or a plugin
+  install leaves the script unapproved.
+
+  An unapproved script answers 502 with
+  `auth handshake script '<path>' is not approved, so it will not run`. Two ways
+  back: ask the agent to make the change, or run
+  `lucidos handshake approve scripts/auth/<name>.py`. `lucidos handshake list`
+  shows the state of every script `apis.json` names. Opening one in the Files
+  panel shows the same warning before you hit the 502.
+
+  Editing the file changes its hash, so approval is per content, not per path.
+  Overwriting an approved script does not inherit its standing.
 - **The path must be relative, with no `..` anywhere in it.** Not just no `..` segment: any `..` substring is refused, because this is a filesystem path. A rejected value takes out that one entry, naming the provider and the value, and a call to it answers 502. See "A bad entry is rejected, never fatal" above.
 - **`credential` is optional.** When the layer config sets `credential`, that credential is injected as env vars (shape below) before the script runs. When it's omitted, no `CRED_*` env var is injected from this layer — the script must source its secret by other means (read a rotating token from the OS keychain, do an OAuth-only exchange, etc.). The env-var table below applies only when a credential is configured.
 - Reads the named credential from env vars. The shape depends on the credential's type — same convention `run_python` / `run_bash` already inject for their subprocesses, so a script you wrote for one works for the other:
@@ -136,6 +153,12 @@ For login dances. The engine caches the script's output until `expires_in` elaps
   Transform for `<NAME>`: uppercase the credential's `service_name`, then replace every character outside `A-Z 0-9 _` with `_`. So `comfort-cloud` (password) → `CRED_COMFORT_CLOUD_USERNAME` + `CRED_COMFORT_CLOUD_PASSWORD`; `firebase-web-api-key` (api_key) → `CRED_FIREBASE_WEB_API_KEY`; a namespaced name like `email:work` → `CRED_EMAIL_WORK`. The injected variable is therefore always a legal shell identifier. There is no type restriction: pick whichever credential type honestly describes the secret, and the script reads the matching env var.
 - **Optional OAuth env vars.** When the layer config lists `oauth_providers: ["<name>", ...]`, the engine looks up each provider's connected OAuth account (auto-refreshing the access token if expired) and injects `OAUTH_<UPPER>_ACCESS_TOKEN` (always) and `OAUTH_<UPPER>_EMAIL` (when known). Same name transform as `CRED_*`. So `oauth_providers: ["google"]` against a connected Google account exposes `OAUTH_GOOGLE_ACCESS_TOKEN` (and `OAUTH_GOOGLE_EMAIL` when the user's email is on the account). If the user hasn't connected the requested provider, the layer fails with a 502 naming the missing provider — the script never runs and the user gets a clear hint to invoke `connect_oauth_account` first.
 - **The script's whole environment is those credentials plus a fixed runtime allowlist.** It inherits nothing else from the engine, which is what stops a handshake reading the database password or another provider's key. The allowlist is `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and `LUCIDOS_WORKSPACE` (`RUNTIME_ENV_ALLOWLIST` in `api/proxy_script_runner.rs`). So `os.environ` holds no `LUCIDOS_*` setting beyond the workspace path, no `DATABASE_URL`, and no provider key. A script needing another value takes it as a credential.
+- **The script is self-contained.** It may import the standard library and
+  anything installed for `python3`, but not a module sitting beside it. Its own
+  directory is writable over the API. So a module there is unapproved code, and
+  a file named after a stdlib module would shadow the real one. Both would run
+  with this layer's credentials, so neither is importable. Put a helper inline,
+  or install it as a package.
 - Performs the login dance — any HTTP, any third-party library importable by system `python3`.
 - Prints exactly **one** JSON object on stdout:
   ```json
@@ -525,16 +548,23 @@ After every forwarded request, the pipeline asks each layer "did your `apply` co
 - **Not exporting `memory`.** The host looks up the standard name `memory` and 502s otherwise. `cdylib` builds emit one by default — but explicitly declaring it (`(memory (export "memory") 1)`) makes the contract obvious.
 - **`alloc` returning the same pointer twice.** Bump-allocate or you'll write SignOutput on top of SignInput before the host reads it.
 - **`expires_in` too long in a script_handshake.** Better to refresh more often than serve requests with a token that expired five minutes ago. The 401 retry helps but each one is a user-visible blip.
+- **Editing a handshake script outside Lucidos and expecting it to run.** The
+  save works and the script stops running, because nothing recorded the new
+  content. Ask the agent to make the edit, or approve it afterwards.
+- **A credential pointed at the wrong provider.** A credential is only sent to
+  the API its own `base_url` covers, so an entry whose `base_url` sits elsewhere
+  answers 502 naming both. Fix the credential's `base_url` in Settings, or the
+  entry's.
 - **Logging credentials inside a script_handshake.** Stderr is captured by the engine and surfaced. Don't `print(username)` or write secrets to a file.
 - **WASM module too big or too slow.** wasmtime instantiates per request. Keep the heap small (the binance-hmac signer uses 256KB) and avoid pulling heavy crates — `no_std` + `panic = "abort"` keeps it tight.
 - **Cryptic `incompatible import type` from wasmtime when the imports look right.** Almost always means the running engine binary pre-dates the host import you're calling — the source repo has the new function but the installed engine was built before the commit that added it (verify with `strings <engine-binary> | grep <import-name>`). Two fixes: rebuild + restart the engine, OR drop the host import and inline a pure-Rust replacement in the signer (see § Prefer pure-Rust crypto/encoding). The second is the more durable fix — the signer no longer depends on the engine's host-import revision.
 
 ## Testing locally
 
-- `cargo test -p lucidos-engine --lib proxy_` covers the pipeline runner, layer impls, config parsing, migration, and the WASM host imports.
-- The Rust-source signers live outside the workspace. Build with `./signers/build-all.sh` (or `./signers/build-all.sh binance-hmac` for one), then run the `#[ignore]`-marked end-to-end tests:
+- `./scripts/test-engine.sh -- -- proxy_` covers the pipeline runner, layer impls, config parsing, migration, and the WASM host imports. Several of those tests need Postgres, which the script provisions.
+- The Rust-source signers live outside the workspace, so their `.wasm` must exist before a test can load it. `./scripts/e2e-wasm.sh` does both halves: it runs `./signers/build-all.sh`, then the real-artifact tests in `crates/lucidos-e2e/tests/wasm_signers.rs`. No running workspace needed.
   ```bash
-  cargo test -p lucidos-engine --lib wasm_signer_layer_runs_binance_hmac_signer -- --ignored
-  cargo test -p lucidos-engine --lib wasm_signer_layer_runs_test_echo_wasm     -- --ignored
+  ./scripts/e2e-wasm.sh                                                # every signer, both tests
+  ./scripts/e2e-wasm.sh -- wasm_signer_layer_runs_binance_hmac_signer  # filter to one test
   ```
 - For a fresh signer template, `signers/test-echo/` is the smallest possible working module — copy it, change the response, build, drop into `data/auth-modules/`, call `reload_proxy_modules`.

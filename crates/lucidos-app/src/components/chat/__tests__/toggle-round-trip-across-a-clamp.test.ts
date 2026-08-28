@@ -213,6 +213,30 @@ describe('a turn-control toggle returns the reader across a clamp', () => {
     expect(el.scrollTop).toBe(SHORT_MAX + (ANCHOR_TALL - ANCHOR_SHORT));
   });
 
+  it('does not pay a debt earned by a DIFFERENT control', () => {
+    // The correction holds the control the reader pressed, so a clamp deficit
+    // is a deficit in THAT control's offset. Press one turn's control and then
+    // another's, and the second press must not spend the first's credit: the
+    // number describes somebody else's turn.
+    //
+    // The reported shape, and the one that survived the anchor rewrite. Hide
+    // from the last turn's control on a thread that collapses shorter than the
+    // pane, then show from a turn higher up. The second press wrote nothing at
+    // all, because the negative credit cancelled its whole correction.
+    const el = makeContainer(START, TALL);
+    const pressedFirst: any = makeAnchor(el, ANCHOR_TALL);
+    const pressedNext: any = makeAnchor(el, 900);
+    setActiveScrollElement(el);
+
+    toggle(el, pressedFirst, ANCHOR_SHORT, SHORT);
+    expect(el.scrollTop).toBe(SHORT_MAX);
+
+    // The second control's own delta, and nothing else. With the debt paid out
+    // here it would be 97px further on.
+    toggle(el, pressedNext, 1200, TALL);
+    expect(el.scrollTop).toBe(SHORT_MAX + (1200 - 900));
+  });
+
   it('derives the clamp from the extent, never from reading the write back', () => {
     // `wanted - container.scrollTop` is ONE read rather than a difference of
     // two, so it carries whatever the engine answers with. Reading `scrollTop`

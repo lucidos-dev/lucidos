@@ -260,8 +260,8 @@
 }
 
 .search-everywhere-result-icon {
-    width: 1rem;
-    height: 1rem;
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
     flex-shrink: 0;
     color: var(--text-muted);
 }

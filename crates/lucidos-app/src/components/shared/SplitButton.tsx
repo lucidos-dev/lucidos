@@ -42,8 +42,13 @@ export interface SplitButtonProps {
   /** Also fire the primary face on `touchend`, for a face the user reaches with
    *  the mobile keyboard up. Opt-in: WebKit drops the synthetic click when the
    *  tap blurs a focused field, and the composer's Submit is the face that
-   *  lives against the keyboard. The change-action banner's Apply is not, and
-   *  leaves this off. See `touchActivated`. */
+   *  lives against the keyboard.
+   *
+   *  The change-action banner's Apply leaves this OFF by choice, not by reach.
+   *  It renders into the same `.prompt-actions-row`, and Diff beside it was
+   *  reported dead with the keyboard up. But the touch path gives up the
+   *  did-the-finger-stay-on-the-button half, so a press sliding off Apply would
+   *  merge a branch. Diff only opens a view. See `touchActivated`. */
   primaryTouchActivate?: boolean;
   /** Full class for the caret button — usually identical to primaryClassName. */
   caretClassName: string;

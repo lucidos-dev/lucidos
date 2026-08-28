@@ -983,7 +983,7 @@ async fn idled_event_includes_worktree_head_sha() {
 
     let got = lookup_latest_worktree_head_sha(&pool, thread_id).await;
     assert_eq!(
-        got.as_deref(),
+        got.found(),
         Some(sha),
         "the SHA written to CodingAgentIdled must round-trip through the projection"
     );
@@ -993,7 +993,7 @@ async fn idled_event_includes_worktree_head_sha() {
 }
 
 #[tokio::test]
-async fn lookup_latest_worktree_head_sha_returns_none_for_legacy_events() {
+async fn lookup_latest_worktree_head_sha_answers_absent_for_legacy_events() {
     // Legacy CodingAgentIdled (Phase 8 not yet shipped) → no SHA field.
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -1002,7 +1002,11 @@ async fn lookup_latest_worktree_head_sha_returns_none_for_legacy_events() {
     emit_idled(&bus, thread_id, Some("sid-1"), None).await;
 
     let got = lookup_latest_worktree_head_sha(&pool, thread_id).await;
-    assert!(got.is_none(), "legacy idle must yield None");
+    assert_eq!(
+        got,
+        IdleAnchor::Absent,
+        "a legacy idle carries no sha, and the lookup must say so positively"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1021,7 +1025,7 @@ async fn lookup_latest_worktree_head_sha_picks_most_recent_idle() {
 
     let got = lookup_latest_worktree_head_sha(&pool, thread_id).await;
     assert_eq!(
-        got.as_deref(),
+        got.found(),
         Some(later),
         "the most recent CodingAgentIdled must win"
     );
@@ -1071,10 +1075,13 @@ async fn external_edits_produce_injected_note() {
 
     // Drive the same lookup → helper sequence run_direct_agent uses.
     let recorded_sha = lookup_latest_worktree_head_sha(&pool, thread_id).await;
-    assert!(recorded_sha.is_some(), "test setup must record a SHA");
+    assert!(
+        recorded_sha.found().is_some(),
+        "test setup must record a SHA"
+    );
     let note = super::super::external_edits::compute_external_edit_note(
         &repo_root,
-        recorded_sha.as_deref(),
+        recorded_sha.found(),
         false,
     )
     .await

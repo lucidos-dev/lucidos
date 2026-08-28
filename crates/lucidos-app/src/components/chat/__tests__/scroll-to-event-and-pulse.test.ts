@@ -1,7 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom, resumeFollowingBottom } from '../scrollState';
+// The engine-log breadcrumb channel. Mocked so the outcome line is assertable,
+// and so no test fires a real POST at an engine that is not there.
+const { postClientLog } = vi.hoisted(() => ({ postClientLog: vi.fn() }));
+vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
+
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, followingLiveEdge, isFollowScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setThreadLive, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
+
+/** The one `[Client/deeplink] outcome` payload this test drove, or null. */
+function outcomeLine(): Record<string, unknown> | null {
+  const calls = postClientLog.mock.calls.filter(
+    ([category, message]) => category === 'deeplink' && message === 'outcome',
+  );
+  expect(calls.length, 'a link says how it ended exactly once').toBeLessThanOrEqual(1);
+  return calls.length === 1 ? (calls[0][2] as Record<string, unknown>) : null;
+}
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
  *  writing scrollTop on the active container), NOT native scrollIntoView. Tests
@@ -32,6 +46,22 @@ class FakeMutationObserver {
   takeRecords() { return []; }
 }
 
+/** The deep link's second watch: the boxes keeping a match unmeasurable. A real
+ *  ResizeObserver delivers an initial observation per `observe` call, and that
+ *  is what makes re-observing one box a loop. The fake stays silent instead, so
+ *  a test drives every delivery itself. */
+type ROCallback = () => void;
+const roObserved: any[] = [];
+let roCallback: ROCallback | null = null;
+let roDisconnects = 0;
+
+class FakeResizeObserver {
+  constructor(cb: ROCallback) { roCallback = cb; }
+  observe(target: any) { roObserved.push(target); }
+  unobserve() {}
+  disconnect() { roDisconnects++; }
+}
+
 const fakeBody = { tagName: 'BODY' };
 
 function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[] } = {}) {
@@ -39,9 +69,11 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
     documentBody: (globalThis.document as any).body,
     documentQSA: (globalThis.document as any).querySelectorAll,
     MutationObserver: (globalThis as any).MutationObserver,
+    ResizeObserver: (globalThis as any).ResizeObserver,
     CSS: (globalThis as any).CSS,
     getComputedStyle: (globalThis as any).getComputedStyle,
   };
+  (globalThis as any).ResizeObserver = FakeResizeObserver;
 
   (globalThis.document as any).body = fakeBody;
   (globalThis.document as any).querySelectorAll = (sel: string) => {
@@ -62,14 +94,52 @@ function installFakeDom(opts: { threadContents?: any[]; dataEventMatches?: any[]
     (globalThis.document as any).body = orig.documentBody;
     (globalThis.document as any).querySelectorAll = orig.documentQSA;
     (globalThis as any).MutationObserver = orig.MutationObserver;
+    (globalThis as any).ResizeObserver = orig.ResizeObserver;
     (globalThis as any).CSS = orig.CSS;
     (globalThis as any).getComputedStyle = orig.getComputedStyle;
   };
 }
 
+/** Put a visible match at `absTop` in the fake document, for both deep-link
+ *  selectors. Its rect top is relative to the container, so the tween lands
+ *  `scrollTop` exactly on `absTop` (see `makeContainer`). */
+function showMatch(container: any, absTop: number) {
+  const el = {
+    parentElement: null,
+    getBoundingClientRect: () => ({
+      width: 200, height: 200,
+      top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200,
+      left: 0, right: 200,
+    }),
+    classList: { add: () => {}, remove: () => {} },
+    querySelector: () => null,
+  } as any;
+  (globalThis.document as any).querySelectorAll = (sel: string) =>
+    sel.startsWith('[data-event-id') || sel.startsWith('[data-change-id') ? [el] : [];
+  return el;
+}
+
+/** A node was added that IS the target: the retry's tree path. */
+function fireChildListMutation() {
+  const node = { nodeType: 1, matches: () => true, querySelector: () => null } as any;
+  lastMoCallback?.([{ addedNodes: [node], type: 'childList' } as unknown as MutationRecord], {} as MutationObserver);
+}
+
+/** A row already in the DOM gained the attribute the selector addresses it by. */
+function fireAttributeMutation(attributeName: string) {
+  lastMoCallback?.(
+    [{ type: 'attributes', attributeName, addedNodes: [] } as unknown as MutationRecord],
+    {} as MutationObserver,
+  );
+}
+
 beforeEach(() => {
   moObservations.length = 0;
   lastMoCallback = null;
+  roObserved.length = 0;
+  roCallback = null;
+  roDisconnects = 0;
+  postClientLog.mockClear();
   // Reset module-level deep-link claim state so a held claim (a sync resolve now
   // holds it across the smooth-scroll settle; an unresolved async path holds it
   // until its deadline) can't leak into the next test.
@@ -851,6 +921,474 @@ describe('deep-link deadline: a dead link reports without moving the transcript'
 
     expect(container.scrollTop).toBe(0);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('deep-link deadline: the report is a verdict, not a stopwatch', () => {
+  // Reported from a phone: tapping a Changes row said "That change is not shown
+  // in this thread" while the change was right there, Apply button and all.
+  //
+  // The deadline was flat wall-clock from the tap, and shorter than the load it
+  // was racing: retries behind a 1s then 2s backoff, a watchdog restart at 2s,
+  // and ThreadView's own "Taking too long?" fuse at 8s. It gave up mid-fetch,
+  // and the transcript painted a second later.
+  //
+  // A target's absence only means anything once the thread has finished
+  // arriving, so `stillArriving` holds the report until then.
+  let restore: (() => void) | null = null;
+  let container: any;
+  let onUnresolved: Mock<() => void>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+    onUnresolved = vi.fn<() => void>();
+  });
+  afterEach(() => {
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  it('says nothing while the thread is still arriving', () => {
+    restore = installFakeDom({}); // events still in flight, nothing rendered yet
+
+    scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => true });
+
+    // Three deadlines' worth, all of them inside the load.
+    vi.advanceTimersByTime(3 * EVENT_RESOLVE_DEADLINE_MS + 500);
+    expect(onUnresolved).not.toHaveBeenCalled();
+    // The claim is held with it: the link still owns where the reader lands.
+    expect(hasPendingEventScroll()).toBe(true);
+  });
+
+  it('lands the change that arrives after the old deadline would have fired', () => {
+    restore = installFakeDom({});
+    let arriving = true;
+
+    scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => arriving });
+    vi.advanceTimersByTime(6000); // past the flat 4s that used to report
+
+    showMatch(container, 3000);
+    fireChildListMutation();
+    arriving = false;
+
+    vi.advanceTimersByTime(6000);
+    expect(container.scrollTop).toBe(3000); // landed on the change
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  it('reports on the first deadline after the thread finishes arriving', () => {
+    restore = installFakeDom({}); // the change genuinely is not in this thread
+    let arriving = true;
+
+    scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => arriving });
+    vi.advanceTimersByTime(9000);
+    expect(onUnresolved).not.toHaveBeenCalled();
+
+    arriving = false; // the load landed, and the change is not among the events
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    expect(hasPendingEventScroll()).toBe(false);
+    expect(container.scrollTop).toBe(0); // still no late yank
+  });
+
+  it('reports at the cap when the thread never finishes', () => {
+    // A wedged load must not hold the link open for the life of the page.
+    restore = installFakeDom({});
+
+    scrollToChangeAndPulse('c-1', { onUnresolved, stillArriving: () => true });
+    vi.advanceTimersByTime(EVENT_RESOLVE_MAX_WAIT_MS - 100);
+    expect(onUnresolved).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    expect(hasPendingEventScroll()).toBe(false);
+  });
+
+  it('reports on the flat deadline when no caller answers for the thread', () => {
+    // Every other deep-link caller passes no predicate, and keeps the old shape.
+    restore = installFakeDom({});
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('deep-link retry: a turn STAMPED with the change id resolves', () => {
+  // The aggregate `ChangeProposed` renders nothing, so a turn already on screen
+  // gains its `data-change-id` as an ATTRIBUTE. A childList-only watch never
+  // woke for it, and the link died on a change the reader was looking at.
+  let restore: (() => void) | null = null;
+  let container: any;
+  let onUnresolved: Mock<() => void>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+    onUnresolved = vi.fn<() => void>();
+  });
+  afterEach(() => {
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  it('watches the attribute the selector addresses the target by', () => {
+    restore = installFakeDom({});
+    scrollToChangeAndPulse('c-1');
+    expect(moObservations[0].options).toMatchObject({
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['data-change-id'],
+    });
+
+    restore();
+    moObservations.length = 0;
+    restore = installFakeDom({});
+    scrollToEventAndPulse('e-7');
+    expect(moObservations[0].options).toMatchObject({ attributeFilter: ['data-event-id'] });
+  });
+
+  it('lands on a turn stamped after the link started waiting', () => {
+    restore = installFakeDom({}); // the turn is on screen, but carries no id yet
+
+    scrollToChangeAndPulse('c-1', { onUnresolved });
+    showMatch(container, 2400);
+    // No node was added: the id landed on a row already in the DOM.
+    fireAttributeMutation('data-change-id');
+
+    vi.advanceTimersByTime(6000);
+    expect(container.scrollTop).toBe(2400);
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+});
+
+describe('deep-link retry: a target that gains a BOX lands', () => {
+  // Reported as a notification tap that kept the reader's position and
+  // highlighted nothing. Both the scroll and the pulse live in `tryResolve`, so
+  // losing both means it never ran.
+  //
+  // `isElementVisible` rejects a target with no box, and gaining one is a
+  // LAYOUT change: no node is added and no attribute changes, so the
+  // childList/attribute watch never wakes. `focusThread` calls
+  // `revealThreadPane()` and the deep link in the same task, so the re-expand
+  // has not committed when the one synchronous attempt runs.
+  let restore: (() => void) | null = null;
+  let container: any;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+  });
+  afterEach(() => {
+    // Run out the mobile header pin and the claim's settle release, both of
+    // which a landing arms. `clearAllTimers` alone would leave the pin latched
+    // for the next block, which asserts it starts off.
+    vi.advanceTimersByTime(2000);
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  /** A match whose own box is `boxed` or nothing, sitting at `absTop`. Its rect
+   *  top is relative to the container, so the tween lands `scrollTop` exactly
+   *  on `absTop` (see `makeContainer`). */
+  function makeMatch(absTop: number, boxed: () => boolean, parent: any = null) {
+    return {
+      parentElement: parent,
+      getBoundingClientRect: () => (boxed()
+        ? {
+            width: 200, height: 200,
+            top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200,
+            left: 0, right: 200,
+          }
+        : { width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 }),
+      classList: { add: () => {}, remove: () => {} },
+      querySelector: () => null,
+    } as any;
+  }
+
+  it('watches the match itself when the collapsed pane zeroed its own rect', () => {
+    let expanded = false;
+    const target = makeMatch(3000, () => expanded);
+    restore = installFakeDom({ dataEventMatches: [target] });
+
+    scrollToEventAndPulse('e-7');
+
+    // Nothing landed, and the tree watch has nothing to wait for: the target is
+    // already in the DOM. The box is what the link is waiting on.
+    expect(container.scrollTop).toBe(0);
+    expect(roObserved).toEqual([target]);
+
+    expanded = true;
+    roCallback?.();
+    vi.advanceTimersByTime(800);
+
+    expect(container.scrollTop).toBe(3000);
+    expect(hasNavFocus()).toBe(true);
+  });
+
+  it('watches the CLIPPING ancestor when the match keeps a box of its own', () => {
+    // An ancestor clipped to nothing shows none of the match while the match
+    // itself measures full size throughout. Watching the match would therefore
+    // never fire, so the walk names the ancestor instead.
+    let expanded = false;
+    const clipper: any = {
+      parentElement: null,
+      getBoundingClientRect: () => (expanded
+        ? { width: 400, height: 800, top: 0, bottom: 800, left: 0, right: 400 }
+        : { width: 400, height: 0, top: 0, bottom: 0, left: 0, right: 400 }),
+    };
+    const target = makeMatch(3000, () => true, clipper);
+    restore = installFakeDom({ dataEventMatches: [target] });
+
+    scrollToEventAndPulse('e-7');
+
+    expect(container.scrollTop).toBe(0);
+    expect(roObserved).toEqual([clipper]);
+
+    expanded = true;
+    roCallback?.();
+    vi.advanceTimersByTime(800);
+
+    expect(container.scrollTop).toBe(3000);
+  });
+
+  it('watches one box once, however many times the link misses', () => {
+    // A real ResizeObserver delivers an initial observation per `observe`, so an
+    // ungated re-watch would call `tryResolve` forever.
+    const target = makeMatch(3000, () => false);
+    restore = installFakeDom({ dataEventMatches: [target] });
+
+    scrollToEventAndPulse('e-7');
+    roCallback?.();
+    roCallback?.();
+    fireChildListMutation();
+
+    expect(roObserved).toEqual([target]);
+  });
+
+  it('stops watching boxes once the link lands', () => {
+    let expanded = false;
+    const target = makeMatch(3000, () => expanded);
+    restore = installFakeDom({ dataEventMatches: [target] });
+
+    scrollToEventAndPulse('e-7');
+    expanded = true;
+    roCallback?.();
+
+    expect(roDisconnects).toBe(1);
+  });
+
+  it('stops watching boxes when the deadline gives up', () => {
+    const onUnresolved = vi.fn();
+    const target = makeMatch(3000, () => false);
+    restore = installFakeDom({ dataEventMatches: [target] });
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    expect(roDisconnects).toBe(1);
+    // A box arriving after the verdict moves nobody: the reader has read the
+    // toast and may have gone elsewhere.
+    expect(container.scrollTop).toBe(0);
+  });
+
+  it('waits for a box in an environment with no ResizeObserver, rather than throwing', () => {
+    // Not every WebView has one. The link keeps its tree watch and its deadline.
+    restore = installFakeDom({ dataEventMatches: [makeMatch(3000, () => false)] });
+    (globalThis as any).ResizeObserver = undefined;
+
+    expect(() => scrollToEventAndPulse('e-7')).not.toThrow();
+    expect(moObservations).toHaveLength(1);
+  });
+});
+
+describe('a deep link says how it ended', () => {
+  // A tap that appears to do nothing was unanswerable after the fact. The
+  // dispatch breadcrumb records that a navigate was ROUTED and stops there. So
+  // "not in this thread", "present but unmeasurable" and "landed and then
+  // undone" all read alike in engine.log.
+  let restore: (() => void) | null = null;
+  let container: any;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+  });
+  afterEach(() => {
+    vi.advanceTimersByTime(2000);
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  function makeVisibleEl(absTop: number) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({
+        width: 200, height: 200,
+        top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200,
+        left: 0, right: 200,
+      }),
+      classList: { add: () => {}, remove: () => {} },
+      querySelector: () => null,
+    } as any;
+  }
+
+  function makeBoxlessEl() {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 }),
+      classList: { add: () => {}, remove: () => {} },
+      querySelector: () => null,
+    } as any;
+  }
+
+  it('says it landed, from where and to where, on an already-rendered transcript', () => {
+    container.scrollTop = 500;
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
+
+    scrollToEventAndPulse('e-7');
+
+    expect(outcomeLine()).toMatchObject({
+      outcome: 'landed',
+      addressed_by: 'data-event-id',
+      dom_matches: 1,
+      visible_matches: 1,
+      had_container: true,
+      from_top: 500,
+      to_top: 3000,
+    });
+  });
+
+  // The two landings are told apart, because the wait is the interesting half:
+  // it means the transcript was not showing the target when the tap arrived.
+  it('says it landed AFTER WAITING when the target arrived late', () => {
+    restore = installFakeDom({});
+
+    scrollToEventAndPulse('e-7');
+    expect(outcomeLine()).toBeNull();
+
+    showMatch(container, 3000);
+    fireChildListMutation();
+
+    expect(outcomeLine()).toMatchObject({ outcome: 'landed-after-wait', to_top: 3000 });
+  });
+
+  // THE reading this whole breadcrumb exists for. One match with no box is a
+  // covered or collapsed transcript, and reads nothing like an event that is
+  // genuinely not in this thread.
+  it('separates a target that is missing from one that has no box', () => {
+    restore = installFakeDom({ dataEventMatches: [makeBoxlessEl()] });
+
+    scrollToEventAndPulse('e-7', { onUnresolved: () => {} });
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+
+    expect(outcomeLine()).toMatchObject({
+      outcome: 'unresolved',
+      dom_matches: 1,
+      visible_matches: 0,
+      from_top: null,
+      to_top: null,
+    });
+  });
+
+  it('says nothing matched when the event is not in this thread', () => {
+    restore = installFakeDom({});
+
+    scrollToEventAndPulse('e-7', { onUnresolved: () => {} });
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+
+    expect(outcomeLine()).toMatchObject({
+      outcome: 'unresolved',
+      dom_matches: 0,
+      visible_matches: 0,
+    });
+  });
+
+  it('says a newer tap took the claim, where the old link used to go silent', () => {
+    const matches: any[] = [];
+    restore = installFakeDom({ dataEventMatches: matches });
+
+    scrollToEventAndPulse('e-old');
+    // A second apart, so the two deadlines land in different advances and the
+    // newer link's own verdict cannot be mistaken for the older one's.
+    vi.advanceTimersByTime(1000);
+    scrollToEventAndPulse('e-new');
+
+    // The older link's deadline, with the claim no longer its own.
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS - 900);
+
+    expect(outcomeLine()).toMatchObject({ outcome: 'superseded' });
+  });
+
+  it('says nothing a second time when a landed link reaches its deadline', () => {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(3000)] });
+
+    scrollToEventAndPulse('e-7');
+    expect(outcomeLine()).toMatchObject({ outcome: 'landed' });
+
+    vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS + 100);
+
+    // `outcomeLine` asserts at most one line, so reaching this point IS the
+    // check. Reading it again keeps the intent visible.
+    expect(outcomeLine()).toMatchObject({ outcome: 'landed' });
+  });
+
+  // `to_top` is where the reader ENDS UP, so it is clamped the way the browser
+  // clamps a `scrollTop` write. A raw landing target falls outside `0 ..
+  // liveEdgeTop` at both ends: a turn near the top carries a
+  // `scroll-margin-top` that takes it negative, and the newest turn overshoots
+  // the edge. An unclamped field would name a position that never existed.
+  it('reports where the reader ends up, not the raw target, above the top', () => {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(-200)] });
+
+    scrollToEventAndPulse('e-7');
+
+    expect(outcomeLine()).toMatchObject({ outcome: 'landed', to_top: 0 });
+  });
+
+  it('reports where the reader ends up, not the raw target, past the live edge', () => {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(99_999)] });
+
+    scrollToEventAndPulse('e-7');
+
+    // 9200 is the container's max offset (scrollHeight 10000, clientHeight 800).
+    expect(outcomeLine()).toMatchObject({ outcome: 'landed', to_top: 9200 });
+  });
+
+  it('reports the change deep-link off the same helper', () => {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl(2400)] });
+
+    scrollToChangeAndPulse('c-1');
+
+    expect(outcomeLine()).toMatchObject({
+      outcome: 'landed',
+      addressed_by: 'data-change-id',
+      to_top: 2400,
+    });
   });
 });
 

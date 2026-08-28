@@ -71,6 +71,10 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let mutationRafId: number | null = null;
     /** The pending next-frame re-base after an anchor write (`onAnchorScroll`). */
     let anchorSettleRaf: number | null = null;
+    /** Where the last anchor write left this container, or -1 for none
+     *  outstanding. `onScroll` reads it to recognise that write's own event
+     *  however late it lands. See the reveal in `onScroll`. */
+    let anchoredTop = -1;
     let keyboardOpen = false; // true while a prompt input is focused
     let disabled = false;
     // Per-pane scroll state so each pane has independent header position
@@ -287,6 +291,12 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
 
       const scrollTop = clampedScrollTop(currentContainer);
 
+      // Within a pixel of where the last anchor write left us, which the 1px
+      // repaint nudge is allowed to spend. Anywhere else the reader has really
+      // moved, so the stamp is spent and cannot mute a later reveal.
+      const atAnchoredTop = anchoredTop >= 0 && Math.abs(scrollTop - anchoredTop) <= 1;
+      if (!atAnchoredTop) anchoredTop = -1;
+
       // One of OUR OWN navigations is writing scrollTop frame by frame (a
       // chevron tap, turn-nav, a deep-link glide). Those scroll events are not
       // the user reading, so reset the header to visible instead of hiding it on
@@ -300,9 +310,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // scrolled away, by up to a header plus a thread title. So the offset is
       // kept and only the baseline re-taken, which is what makes the correction
       // invisible instead of a jump. See `markAnchorScroll`.
+      // `isAnchorScroll` reads module state at EVENT time. Any later mark
+      // overwrites it, so a late anchor event arrives dressed as a placement
+      // and takes the reveal. The POSITION answers it exactly. An event that
+      // finds the container where the anchor write left it is that write's
+      // own, whoever marked in between.
       if (isNavigationScroll() || isHeaderPinnedForScroll()) {
         prevScrollTop = scrollTop;
-        if (!isAnchorScroll()) headerOffset = 0;
+        if (!isAnchorScroll() && !atAnchoredTop) headerOffset = 0;
         applyTransform();
         return;
       }
@@ -372,6 +387,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       currentContainer = container;
       currentContainerPane = container?.closest('.mobile-swipe-pane') ?? null;
       currentViewKey = view;
+      // Stamped against the container we just left, so it says nothing here.
+      anchoredTop = -1;
       refreshHeight();
       if (container) {
         // Restore this pane's saved scroll state, or derive from scroll position
@@ -571,14 +588,18 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     // reveal that shrinks the transcript is still settling, and the browser's
     // own clamp lands after. That clamp is a scroll nobody asked for, and the
     // header spent it as a reveal of the full title and bar.
+    // The baseline alone only settles the DELTA path. Stamp the position too,
+    // so the navigation path can recognise this write's own event.
     const unsubAnchor = onAnchorScroll((el) => {
       if (el !== currentContainer) return;
       prevScrollTop = clampedScrollTop(el);
+      anchoredTop = prevScrollTop;
       if (anchorSettleRaf !== null) cancelAnimationFrame(anchorSettleRaf);
       anchorSettleRaf = requestAnimationFrame(() => {
         anchorSettleRaf = null;
         if (el !== currentContainer) return;
         prevScrollTop = clampedScrollTop(el);
+        anchoredTop = prevScrollTop;
       });
     });
 

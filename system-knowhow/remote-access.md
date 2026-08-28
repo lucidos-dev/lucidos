@@ -200,6 +200,18 @@ header carrying the sender's delivery id and collapses the repeat. The CLI page
 covers it, along with the `--headers` allow-list that puts a chosen request
 header in the payload.
 
+**Lucidos watches this path, and only watches.** Every 15 minutes it knocks on
+the public webhook address from outside, once per public address, and expects a
+401. It reads `tailscale serve status --json` first, to learn which port the
+funnel actually serves, and reads nothing else from Tailscale. It never runs a
+mutating `tailscale` command, so nothing here re-arms a funnel you turned off.
+
+An address family that stops answering while the other still works is an outage.
+That is the failure it exists to catch, and one probe alone would miss it. You
+see it as a bar across the app and a line on the row in **Settings > Webhooks**.
+It emits `WebhookIngressDegraded` and `WebhookIngressRecovered` once each per
+outage, for a *trigger* to act on.
+
 ## Why HTTPS matters, and when it does not
 
 Browsers gate a set of features on a *secure context* (https, or anything on

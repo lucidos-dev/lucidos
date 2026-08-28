@@ -4,22 +4,22 @@ use crate::scheduler::notifications::{NavigateTarget, NavigateUi, Tap};
 
 fn nav_thread(id: &str, event_id: Option<&str>) -> Tap {
     Tap::Navigate {
-        to: NavigateUi {
+        to: Box::new(NavigateUi {
             target: NavigateTarget::Thread,
             id: Some(id.to_string()),
             event_id: event_id.map(str::to_string),
             ..Default::default()
-        },
+        }),
     }
 }
 
 fn nav_app(app_id: &str) -> Tap {
     Tap::Navigate {
-        to: NavigateUi {
+        to: Box::new(NavigateUi {
             target: NavigateTarget::App,
             app_id: Some(app_id.to_string()),
             ..Default::default()
-        },
+        }),
     }
 }
 

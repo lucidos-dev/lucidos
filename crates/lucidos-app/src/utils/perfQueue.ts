@@ -87,10 +87,15 @@ export function trimToCap<T>(buf: T[], cap: number): T[] {
   return buf.length > cap ? buf.slice(buf.length - cap) : buf;
 }
 
-/** Test-only: clear the buffer so re-buffering from one test can't leak into the
- *  next. Not part of the runtime surface. */
+/** Test-only: clear the buffer AND the flush interval, so neither a re-buffered
+ *  sample nor a live timer leaks from one test into the next. Not part of the
+ *  runtime surface. */
 export function _resetPerfQueueForTesting(): void {
   buffer = [];
+  if (timer !== null) {
+    clearInterval(timer);
+    timer = null;
+  }
 }
 
 function ensureTimer(): void {

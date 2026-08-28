@@ -196,7 +196,7 @@
 
 .drawer-item.active {
     color: var(--accent);
-    background: rgba(88, 166, 255, 0.08);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
     font-weight: 600;
 }
 
@@ -822,7 +822,7 @@
         height: var(--mobile-title-fade);
         background: linear-gradient(to bottom, var(--bg-primary), transparent);
         opacity: 0;
-        transition: opacity 0.2s ease;
+        transition: opacity var(--duration-normal) ease;
         pointer-events: none;
     }
 
@@ -940,7 +940,7 @@
         width: 300%;
         height: 100%;
         will-change: transform;
-        transition: transform 0.3s ease;
+        transition: transform var(--duration-slow) ease;
     }
 
     /* Edge swipe zones: transparent strips at screen edges that sit above
@@ -1391,9 +1391,12 @@
         /* The active dot "blooms on like a light": on activate the dot ITSELF
            swaps muted→fill, gains the glow, and brightens, so all three
            properties transition together (0.33s ease-out) to make the body + soft
-           glow rise together into the steady glow rather than snapping on. */
-        transition: opacity 0.33s ease-out, background 0.33s ease-out,
-                    box-shadow 0.33s ease-out;
+           glow rise together into the steady glow rather than snapping on.
+           Scaled by the animation-speed slider, like its twin on
+           `.header-focus-wash::before` (panels/shell.css). */
+        transition: opacity calc(0.33s * var(--duration-scale)) ease-out,
+                    background calc(0.33s * var(--duration-scale)) ease-out,
+                    box-shadow calc(0.33s * var(--duration-scale)) ease-out;
     }
 
     /* Active dot wears the per-theme active-pane fill + neon bloom

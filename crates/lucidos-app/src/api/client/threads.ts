@@ -133,7 +133,12 @@ export async function deleteThread(id: string): Promise<void> {
 }
 
 // --- Search Everywhere ---
-export type SearchCategory = 'all' | 'threads' | 'files' | 'apps' | 'triggers' | 'settings' | 'changes';
+export type SearchCategory = 'all' | 'threads' | 'files' | 'apps' | 'triggers' | 'settings' | 'changes' | 'menu';
+
+/** The categories the engine answers on. `settings` and `menu` are resolved in
+ *  the frontend (`components/search/searchIndex.ts` and `menuIndex.ts`). The
+ *  engine 400s on a category it does not know, so neither may be sent. */
+export type ServerSearchCategory = Exclude<SearchCategory, 'settings' | 'menu'>;
 
 export interface SearchResultItem {
   id: string;
@@ -148,7 +153,7 @@ export interface SearchResults {
   results: Record<string, SearchResultItem[]>;
 }
 
-export async function searchEverywhere(query: string, category: SearchCategory, signal?: AbortSignal): Promise<SearchResults> {
+export async function searchEverywhere(query: string, category: ServerSearchCategory, signal?: AbortSignal): Promise<SearchResults> {
   const params = new URLSearchParams({ category });
   if (query) params.set('q', query);
   return json<SearchResults>(`${API}/search?${params}`, { signal });

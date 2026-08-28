@@ -7,6 +7,7 @@ import {
   whatsNewTargetRelease,
 } from '../store';
 import { settingsViewKey } from '../../components/layout/contentViewKey';
+import { credentialAnchor } from '../../components/credentials/credentialAnchor';
 import { resetContentScroll } from '../../hooks/useScrollMemory';
 import type { PanelOverlay } from '../store';
 import { revealContentPane } from './pane';
@@ -134,6 +135,16 @@ export function openBackupSettings(): void {
   openSettingsSubview('backup');
 }
 
+/** Deep-link to Settings → Webhooks. One caller, the ingress bar's button.
+ *
+ *  It navigates and nothing else. The engine reports an ingress outage and never
+ *  repairs one. So the page is where the user reads which hooks are affected,
+ *  and when each last heard from its sender. No scroll target: the list is the
+ *  whole page. */
+export function openWebhookSettings(): void {
+  openSettingsSubview('webhooks');
+}
+
 /** Deep-link to Settings → System → What's New, opened on the release `release`
  *  names. The single way in, so every caller says what it is announcing.
  *
@@ -172,5 +183,16 @@ export function openWhatsNew(release?: string | null): void {
 export function openConnectedAccountsSettings(provider?: string, scopes?: string): void {
   oauthConnectPrefill.value = provider ? { provider, scopes } : null;
   settingsScrollTarget.value = 'accounts:connected';
+  openSettingsSubview('accounts');
+}
+
+/** Deep-link to one credential row in Settings > Accounts, and scroll to it.
+ *
+ *  The caller holds a credential id, never a name. A signed webhook stores the
+ *  NAME of its credential, so the webhooks page resolves that name to a row
+ *  first. A name it cannot resolve is the missing-credential state, which the
+ *  row reports instead of linking into nothing. */
+export function openCredentialSettings(credentialId: string): void {
+  settingsScrollTarget.value = credentialAnchor(credentialId);
   openSettingsSubview('accounts');
 }

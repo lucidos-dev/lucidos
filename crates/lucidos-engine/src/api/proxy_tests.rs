@@ -1298,3 +1298,187 @@ fn a_same_origin_redirect_is_re_anchored_under_the_prefix() {
     );
     assert!(build_contained_target_url(PREFIXED_BASE, "safe-prefix/next", None).is_ok());
 }
+
+/// The startup seed keys approvals the way the runner does, so the two
+/// spellings have to agree: config says `scripts/auth/x.py`, the record says
+/// `data/scripts/auth/x.py`.
+#[test]
+fn handshake_script_paths_are_workspace_relative_and_deduped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join("data/config")).unwrap();
+    std::fs::write(
+        ws.join("data/config/apis.json"),
+        r#"{
+          "one": {"base_url": "https://a.test", "auth": {"pipeline": [
+            {"type": "script_handshake", "script": "scripts/auth/shared.py"}
+          ]}},
+          "two": {"base_url": "https://b.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "k"},
+            {"type": "script_handshake", "script": "scripts/auth/shared.py"},
+            {"type": "script_handshake", "script": "scripts/auth/other.py"}
+          ]}},
+          "three": {"base_url": "https://c.test"}
+        }"#,
+    )
+    .unwrap();
+
+    let paths = load_proxy_config(ws).handshake_script_paths();
+    assert_eq!(
+        paths,
+        vec![
+            "data/scripts/auth/other.py".to_string(),
+            "data/scripts/auth/shared.py".to_string(),
+        ]
+    );
+}
+
+/// The credential-theft half of ADR 0144. `apis.json` is writable over the
+/// API, so `base_url` is caller data: an entry naming a real credential and
+/// pointing somewhere else must not get that credential attached.
+#[tokio::test]
+async fn a_credential_is_refused_for_a_provider_outside_its_scope() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    seed_credential(
+        &pool,
+        "scoped-key",
+        "https://api.example.test",
+        crate::core::AuthType::Bearer,
+        "sk-live-secret",
+    )
+    .await;
+
+    check_credential_scope(&pool, "scoped-key", "https://api.example.test")
+        .await
+        .expect("its own API is in scope");
+    // A path under the scoped prefix is still the same API.
+    check_credential_scope(&pool, "scoped-key", "https://api.example.test/v2")
+        .await
+        .expect("a deeper path on the same host is in scope");
+
+    for elsewhere in [
+        "https://evil.test",
+        // The classic near-miss a raw string prefix would wave through.
+        "https://api.example.test.evil.test",
+        "http://api.example.test",
+    ] {
+        let err = check_credential_scope(&pool, "scoped-key", elsewhere)
+            .await
+            .expect_err("out of scope must be refused");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("scoped-key"), "{}", err.1);
+        assert!(err.1.contains("will not be sent"), "{}", err.1);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// An unscoped credential goes nowhere, and the refusal says how to fix it.
+/// The startup pass gives a scope to any row `apis.json` explains, so one that
+/// still has none is a row nothing accounts for.
+#[tokio::test]
+async fn an_unscoped_credential_is_not_sent_anywhere() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    seed_credential(
+        &pool,
+        "unscoped-key",
+        "",
+        crate::core::AuthType::Bearer,
+        "sk-live-secret",
+    )
+    .await;
+
+    let err = check_credential_scope(&pool, "unscoped-key", "https://api.example.test")
+        .await
+        .expect_err("an unscoped credential must be refused");
+    assert!(err.1.contains("no base_url"), "{}", err.1);
+    assert!(err.1.contains("Settings"), "{}", err.1);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// What the startup scope inference reads. A credential used by exactly one
+/// entry has an answer; one used by two entries that disagree does not.
+#[test]
+fn credential_scopes_collect_every_naming_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join("data/config")).unwrap();
+    std::fs::write(
+        ws.join("data/config/apis.json"),
+        r#"{
+          "one": {"base_url": "https://a.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "only-here"},
+            {"type": "script_handshake", "credential": "shared", "script": "scripts/auth/x.py"}
+          ]}},
+          "two": {"base_url": "https://b.test", "auth": {"pipeline": [
+            {"type": "hmac_signed", "key_credential": "shared",
+             "secret_credential": "sec", "algorithm": "sha256",
+             "signed_payload": "query_string"},
+            {"type": "wasm_signer", "module": "m",
+             "credential_handles": [{"name": "h", "credential": "wasm-cred"}]}
+          ]}}
+        }"#,
+    )
+    .unwrap();
+
+    let scopes = load_proxy_config(ws).credential_scopes();
+    assert_eq!(
+        scopes
+            .get("only-here")
+            .map(|s| s.iter().collect::<Vec<_>>()),
+        Some(vec![&"https://a.test".to_string()])
+    );
+    // Named by both entries, so nothing here decides its scope.
+    assert_eq!(scopes.get("shared").map(|s| s.len()), Some(2));
+    // The HMAC secret and the WASM handle are credentials too.
+    assert_eq!(
+        scopes.get("sec").map(|s| s.iter().collect::<Vec<_>>()),
+        Some(vec![&"https://b.test".to_string()])
+    );
+    assert_eq!(
+        scopes
+            .get("wasm-cred")
+            .map(|s| s.iter().collect::<Vec<_>>()),
+        Some(vec![&"https://b.test".to_string()])
+    );
+}
+
+/// The inference is once. A row that already carries a scope is never
+/// rewritten, so a user's own correction survives every later start.
+#[tokio::test]
+async fn inferring_a_scope_leaves_an_existing_one_alone() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    seed_credential(
+        &pool,
+        "legacy-key",
+        "",
+        crate::core::AuthType::Bearer,
+        "sk-legacy",
+    )
+    .await;
+
+    assert!(
+        CredentialStore::infer_scope_if_empty(&pool, &bus, "legacy-key", "https://api.first.test")
+            .await
+            .unwrap(),
+        "an unscoped credential takes the inferred scope"
+    );
+    assert!(
+        !CredentialStore::infer_scope_if_empty(&pool, &bus, "legacy-key", "https://api.other.test")
+            .await
+            .unwrap(),
+        "a scoped credential is never re-scoped"
+    );
+    let stored = CredentialStore::get(&pool, "legacy-key").await.unwrap();
+    assert_eq!(stored.unwrap().base_url, "https://api.first.test");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

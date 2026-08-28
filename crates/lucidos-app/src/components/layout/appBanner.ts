@@ -3,12 +3,12 @@
  * the height it reserves for everything anchored below the header.
  *
  * A banner is a persistent bar between the header and the panes, for a condition
- * that stays true until something changes (backup is off; this workspace is
- * unreachable). Two of them exist, and both can be up at once, which is what
- * makes this a module rather than a pattern copied twice: the layout gate is the
- * same sentence in both, and the height reservation is a ResizeObserver whose
- * one subtlety (re-reading the root font size at measure time) is not worth
- * getting right in two places.
+ * that stays true until something changes: backup is off, this workspace is
+ * unreachable, webhook deliveries cannot reach it from outside. Three of them
+ * exist, and all three can be up at once. That is what makes this a module
+ * rather than a pattern copied. The layout gate is the same sentence in each.
+ * And the height reservation is a ResizeObserver whose one subtlety (re-reading
+ * the root font size at measure time) is not worth getting right three times.
  *
  * The hook lives here beside the pure halves rather than in `src/hooks/`,
  * because it is not a general capability: it publishes the specific contract
@@ -49,9 +49,9 @@ export function bannerHeightValue(px: number | null, remSize: number): string | 
  *  on its own.
  *
  *  Each banner owns a DIFFERENT property, and `--app-header-bottom` sums them.
- *  Sharing one would mean two observers writing one value: whichever bar
- *  measured last would win, and dismissing either would clear the reservation
- *  for both.
+ *  Sharing one would mean several observers writing one value: whichever bar
+ *  measured last would win, and retracting any of them would clear the
+ *  reservation the others still need.
  *
  *  Clearing on teardown is what stops a stale reservation from surviving a
  *  dismiss, a reconnect, or a switch to mobile. */

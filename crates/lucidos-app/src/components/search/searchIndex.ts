@@ -151,6 +151,9 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // are holding, someone hunting "devices" means the fleet.
   { id: 'appearance:notifications', label: 'Notifications', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:notifications', keywords: 'notifications push alerts banners this device' },
   { id: 'appearance:push-notifications', label: 'Push notifications', subview: 'appearance', path: 'Settings → Appearance & Behavior → Notifications', anchor: 'appearance:push-notifications', keywords: 'push notifications enable disable this device alerts banners buzz' },
+  // "banner" and "popup" are what people call a toast when they want it gone.
+  // Neither is the canonical word, and both have to find this row.
+  { id: 'appearance:in-app-toasts', label: 'In-app toasts', subview: 'appearance', path: 'Settings → Appearance & Behavior → Notifications', anchor: 'appearance:in-app-toasts', keywords: 'toast toasts banner banners popup pop-up in-app notifications disable turn off silence quiet distracting interruption' },
   // No entry for the Links SECTION itself: it renders only when one of the two
   // rows below does, and `visible` ANDs its flags, so a section entry could not
   // express "iOS PWA OR Tauri" without a one-off predicate. The rows carry the

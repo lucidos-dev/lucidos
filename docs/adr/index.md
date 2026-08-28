@@ -115,7 +115,7 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0105: A change spanning the engine and the gateway degrades on the older one, never fails closed](0105-engine-can-be-newer-than-the-gateway.md)
 - [0106: A parked thread's change cannot be applied: waiting gates change resolution](0106-a-parked-threads-change-is-not-applicable.md)
 - [0107: Every auxiliary model call owns one preference pair and a deadline that contains its retries](0107-aux-purpose-owns-its-preference-and-deadline.md)
-- [0108: The update check lives in the gateway, polls lucidos.dev, and covers every install type](0108-update-check-lives-in-the-gateway.md)
+- [0108: The update check lives in the gateway, polls lucidos.dev, and covers every install type](0108-update-check-lives-in-the-gateway.md) *(the first-run notice superseded by 0139; "no button for a session that cannot install" by 0142)*
 - [0109: The model writes notes and sees its own context: the panel, the scratchpad and the pin](0109-model-writes-notes-and-sees-its-own-context.md) *(amended 2026-08-24: the one-round rule becomes the swept window, the scratchpad becomes the working understanding, and the mode is renamed self-curated context mode)*
 - [0110: The context-mode eval is a single-configuration benchmark of context handling, scored on five absolute axes](0110-context-handling-benchmark.md)
 - [0111: App know-how is a pointer in the active app block, not a body](0111-app-know-how-is-a-pointer-not-a-body.md)
@@ -149,3 +149,10 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0139: An update check is functional, so it runs on notice rather than a first-run consent click](0139-update-check-runs-on-notice-not-a-click.md)
 - [0140: Never use tauri's WebviewWindow APIs: a URL preview's child webview makes them blind](0140-webview-window-apis-are-blind-to-a-child-webview.md)
 - [0141: A park hides its windows, and a reopen restores the arrangement](0141-a-park-hides-its-windows.md)
+- [0142: No surface names a newer release without giving the route to it](0142-no-newer-release-without-a-route.md)
+- [0143: Webhook ingress is checked from outside the machine, per resolved address and per address family](0143-webhook-ingress-probed-per-address-family.md)
+- [0144: App authority is accepted; the engine guards at the point of use, not the point of write](0144-app-authority-guard-at-use.md)
+- [0145: The mobile-webkit e2e project keeps its chunks and reports one verdict](0145-mobile-webkit-chunks-report-one-verdict.md)
+- [0146: One SSE stream per workspace, held by a SharedWorker; presence means an active shell](0146-one-sse-stream-per-workspace.md)
+- [0152: A reading position names a turn, never a pixel offset into a windowed transcript](0152-a-reading-position-names-a-turn.md)
+- [0147: A turn control's scroll anchor is the element the reader clicked](0147-a-turn-control-holds-what-you-pressed.md)

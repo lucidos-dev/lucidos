@@ -1,8 +1,10 @@
 # 0108: The update check lives in the gateway, polls lucidos.dev, and covers every install type
 
 - **Status**: Accepted (the first-run notice is superseded by
-  [0139](0139-update-check-runs-on-notice-not-a-click.md); every other gate,
-  the payload and announce-never-install all stand)
+  [0139](0139-update-check-runs-on-notice-not-a-click.md), and "no button for a
+  session that cannot install" by
+  [0142](0142-no-newer-release-without-a-route.md); every other gate, the
+  payload and announce-never-install all stand)
 - **Date**: 2026-08-23
 
 ## Context
@@ -113,6 +115,12 @@ stack, and it runs its own check, so it is self-contained. For an `install.sh`
 install the update is a re-run of the installer, and the gateway composes that
 command from the live instance. The UI offers it to copy. A browser or PWA
 session sees the version and no button, since it can install nothing.
+
+*Superseded in part 2026-08-27, for the last sentence only
+([ADR 0142](0142-no-newer-release-without-a-route.md)).* A session that cannot
+install still gets a route: "How to update", landing on Settings, System, which
+says where the install happens. Announcing a release and offering nothing is
+what that record forbids. Everything else here stands.
 
 ### Consent and the preference
 

@@ -15,6 +15,9 @@
  *    sentence twice.
  * 3. It lands on the name column and cannot squeeze the row's three cells.
  * 4. The line holding those cells never wraps, whatever a workspace is called.
+ *
+ * The backup line under the name is pinned the same four ways, and for the same
+ * reasons. See `docs/plans/2026-08-27-picker-last-successful-backup.md`.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -46,7 +49,10 @@ describe('the fault note is wired to the one state that is a fault', () => {
 describe('the note is announced, exactly once', () => {
   it('the row folds the fault into its own accessible name', () => {
     // An `aria-label` on the row replaces everything inside it, note included.
-    expect(source).toMatch(/aria-label=\{fault \? `Retry \$\{w\.name\} · \$\{fault\}`/);
+    // Composed once into `rowLabel`, because there are now two sentences to
+    // fold in and an inline ternary could carry only the fault.
+    expect(source).toMatch(/const rowLabel = \[\s*fault \? `Retry \$\{w\.name\} · \$\{fault\}`/);
+    expect(source).toContain('aria-label={rowLabel}');
   });
 
   it('the dot steps aside when the note is on screen', () => {
@@ -111,6 +117,67 @@ describe('the note takes its own line, on the name column', () => {
   });
 });
 
+describe('the backup line rides the stacked name column', () => {
+  it('is inside the id cell, so the row keeps its three cells', () => {
+    // The line holds dot, id and actions, and stays that way. A fourth item
+    // there pushes the buttons off the row. That is the same bug the fault
+    // note above was moved out of the line to fix.
+    const from = source.lastIndexOf('<div class="ws-picker-id">');
+    expect(from, 'the id cell is gone').toBeGreaterThanOrEqual(0);
+    const at = source.indexOf('class={`ws-picker-backup', from);
+    expect(at, 'the backup line is gone').toBeGreaterThan(from);
+    // Every `<div>` opened between the cell and the line closes again. So the
+    // line is still inside that cell rather than a sibling of it.
+    const between = source.slice(from, at);
+    expect(between.match(/<\/div>/g)?.length ?? 0).toBe(
+      (between.match(/<div\b/g)?.length ?? 0) - 1,
+    );
+  });
+
+  it('reads the shared rule rather than re-deriving what stale means', () => {
+    // `backupNote` decides the sentence and the level, and is unit-tested in
+    // workspace-forms.test.ts. It reads the ENGINE's `stale`, so the 24h
+    // threshold lives once, in core::backup.
+    expect(source).toContain('backupNote(w)');
+    expect(source).not.toMatch(/24 \* 60 \* 60|86400/);
+  });
+
+  it('is announced by the row and not a second time by itself', () => {
+    // The row's `aria-label` already carries the sentence (see `rowLabel`), so
+    // the visible copy is decorative to a screen reader.
+    const at = source.indexOf('class={`ws-picker-backup');
+    expect(source.slice(at, at + 200)).toContain('aria-hidden="true"');
+  });
+
+  it('holds its line open even with nothing to say', () => {
+    // The fact lands on the 2s poll, and a workspace the gateway could not ask
+    // never gets one. A slot that came and went grew the row under the pointer
+    // and pushed every row below it down.
+    expect(source).not.toContain('{backup && (');
+    expect(source).toContain("{backup?.text ?? ''}");
+    const line = block(pickerCss, '.ws-picker-backup {');
+    // `min-height` says nothing to a non-replaced inline, which a <span> is.
+    expect(decl(line, 'display')).toBe('block');
+    expect(decl(line, 'line-height')).toBe('var(--ws-picker-sub-line-height)');
+    // Reserved from the line it holds open, rather than from a second copy of
+    // the same two numbers.
+    const reserved = decl(line, 'min-height') ?? '';
+    expect(reserved).toContain('var(--font-size-sm)');
+    expect(reserved).toContain('var(--ws-picker-sub-line-height)');
+    expect(decl(line, 'font-size')).toBe('var(--font-size-sm)');
+    expect(decl(block(pickerCss, ':root'), '--ws-picker-sub-line-height')).not.toBeNull();
+  });
+
+  it('warns in the row\'s own coral, quiet otherwise', () => {
+    // One colour for "needs attention" on this surface, stated once on :root
+    // and worn by the dot, the fault note and this.
+    expect(decl(block(pickerCss, '.ws-picker-backup-warn {'), 'color'))
+      .toBe('var(--ws-picker-fault-color)');
+    expect(decl(block(pickerCss, '.ws-picker-backup {'), 'color'))
+      .not.toBe('var(--ws-picker-fault-color)');
+  });
+});
+
 describe('the row line holds its three cells on one line', () => {
   it('never wraps, so a long name cannot push the actions off the row', () => {
     // A workspace can carry a long name AND a long `/slug/` address, and a
@@ -157,6 +224,14 @@ describe('the row line holds its three cells on one line', () => {
     expect(offset).toContain('var(--ws-picker-name-line-height)');
     expect(offset).toContain('var(--ws-picker-dot-size)');
     expect(decl(block(pickerCss, ':root'), '--ws-picker-name-line-height')).not.toBeNull();
+  });
+
+  it('tops the name cell out with the dot, so the offset has one origin', () => {
+    // The dot's offset above measures from the LINE's top. Centred, this cell
+    // drops down the line whenever the actions are the taller item, so the dot
+    // floats above the name it marks. That is what a row with nothing under
+    // its name looked like.
+    expect(decl(block(pickerCss, '.ws-picker-id {'), 'align-self')).toBe('flex-start');
   });
 
   it('leaves the SHARED dot centred, for the in-app switcher', () => {

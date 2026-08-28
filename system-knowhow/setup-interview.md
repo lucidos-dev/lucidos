@@ -107,7 +107,7 @@ build; if an answer would not change the kit, skip that rung.
 | 4 | What they redo by hand | **yes** | The single best source of an app worth opening twice |
 | 5 | What slips through the cracks | **yes** | Turns into the trigger that watches or reminds |
 | 6 | What they wish happened without them having to remember | no | The one they will actually judge you on |
-| 7 | Where that lives today (email, calendar, a spreadsheet, a watch or fitness app, in their head) | no | Only ask if 4 to 6 implied an integration. Decides feasibility |
+| 7 | Where that lives today (email, calendar, a spreadsheet, a watch or fitness app, in their head) | no | Only ask if 4 to 6 implied an integration. Decides what to connect, not whether the kit is feasible |
 
 **Rung 2 is multi-select, and phrased as "where does it go" rather than "what
 takes up MOST of it", on purpose.** The superlative is what makes the card look
@@ -189,6 +189,10 @@ default, and half the people running this interview did not come about a job:
 | Running a household, appointments and paperwork, other people's schedules | App: what is due and who it belongs to. Trigger: a Sunday look at the week ahead. Knowhow: the recurring ones and their real lead times, so a renewal is raised early enough to act on |
 | Study or research, "things I meant to read" | App: a reading queue with what is unread. Trigger: weekly, pick one thing and say why now. Knowhow: their sources and what makes something worth their time |
 
+Some of these need an account they have not connected yet: invoices sitting in
+email, or a project tool behind the morning brief. Connecting it is part of
+building the kit, not a prerequisite the user arranges first. See §4.
+
 The pattern under all six: **the app is the thing they open, the trigger is the
 thing that saves them remembering, and the knowhow is what makes both stay
 right next month.** If a proposed piece does not fill one of those three roles,
@@ -216,13 +220,47 @@ just yes or no. Something like: build all of it / start with just the first one
 user, and it is a better outcome than a polite yes followed by three things they
 never open.
 
-## 4. Build it for real
+## 4. Connect an account, in the session
+
+Rung 7 sometimes points at an outside account: email, calendar, an accounting
+system, a fitness watch. Connecting it is part of the build, not a
+prerequisite the user arranges before you start. Do the setup WITH them, now.
+Never hand them a list of steps for later, and never say "come back once
+you've connected X".
+
+- **Load `system-knowhow/oauth-providers` before you collect anything, and
+  follow it rather than re-deriving the mechanics here.** It explains why
+  `connect_oauth_account` is the one call for the whole flow, and why a
+  separate `request_credential` call first only duplicates it.
+- **Read the provider's own row before you say anything about it.** The rows
+  in `system-knowhow/oauth-providers.json` carry a `setup_hint`, a
+  `permissions_hint` and a `console_url` per provider. Relay what the row
+  says, in the user's own words. Never invent a step for a provider whose row
+  you have not read.
+- **Say the cost before they commit.** Roughly how long it takes, whether
+  they will need to create an app in a developer console, and what Lucidos
+  will be able to see. Someone deciding whether to hand over their mail five
+  minutes into meeting this tool deserves the real number.
+- **Offer it as a card with a genuine decline.** Something like: connect it
+  now / build it by hand for now / skip that piece. A cautious newcomer
+  declining is a legitimate answer, not a failure to route around.
+- **If they decline, or the connection fails, build the manual version
+  anyway.** Say plainly what it will and will not do (it cannot know an
+  invoice was paid, and it needs typing). Record in the artifact that the
+  connected version is available, so a re-run leads with it.
+
+One warning worth its own line: an OAuth setup that goes wrong mid-interview
+can eat the whole session and lose the kit. If it stalls, park it, build the
+rest, and come back to it.
+
+## 5. Build it for real
 
 Use `todo_write` so they can watch it happen, one item per piece.
 
 Build in this session. "Here is what you could build" is a failure of this
-whole workflow, and so is anything that ends with the user needing to do the
-setup themselves.
+whole workflow, and so is handing the user homework: a list of steps for them
+to run later. Walking them through a connection now (§4) is the opposite of
+that, not an exception to it.
 
 - Load `system-knowhow/building-an-app` before the first app, and
   `system-knowhow/triggers` before the first trigger. Both have their own
@@ -241,7 +279,7 @@ mention of the name is not a link and they will not find it.
 Say plainly when the first trigger will fire. A trigger they do not expect is
 worse than no trigger.
 
-## 5. Persist what you learned
+## 6. Persist what you learned
 
 Two destinations, and the split matters.
 
@@ -278,6 +316,11 @@ is itself the useful part.
 - App `reading-queue`: what it is for
 - Trigger `weekly-reading-pick`: what it does, when it fires
 
+### Connected, declined, or blocked
+- Account `<provider>`: connected, declined, or failed and why
+- ...so a re-run leads with what is already connected, and does not re-offer
+  what they already turned down
+
 ### Considered and not built
 - ...and why, so a later thread does not re-propose it
 
@@ -311,7 +354,7 @@ emit_event("SetupInterviewCompleted", {
 })
 ```
 
-## 6. The exits
+## 7. The exits
 
 **They stop answering, or Cancel a card.** Do not keep asking and do not build
 in silence. Nothing has been created yet (see *Ground rules*: nothing is built
@@ -352,7 +395,13 @@ piece from "Considered and not built". Do not re-run the ladder.
   The interview is the cost; the kit is the product.
 - **Building before the confirm.** It removes their exit and it is the one
   irreversible thing in this whole workflow.
-- **Writing inferences to memory.** See §5.
-- **Proposing something you cannot actually build.** Check the data is reachable
-  before you offer it. A promise you retract two turns later costs more than the
+- **Writing inferences to memory.** See §6.
+- **Proposing something you cannot actually build.** This is about a genuinely
+  unreachable source: a closed practice system with no API, data that exists
+  nowhere Lucidos can reach. "No account connected yet" is not that. It is one
+  offer away (§4). A promise you retract two turns later costs more than the
   smaller thing you could have offered.
+- **Silently building the hand-typed version instead of offering to connect.**
+  The kit still looks finished, so nobody notices until the user is typing by
+  hand something they already have somewhere else. If a connection was
+  possible, offer it before you build around it.

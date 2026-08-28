@@ -413,7 +413,7 @@ export function changeActions(changeId?: string, suppress?: boolean, reserveWhil
 /** Shown in place of a collapsed panel's body, so a folded turn never reads as
  *  an empty row. A muted "⋯" on the turn's own left column, whichever panel is
  *  folded. Clicking it expands that panel. */
-function CollapsedIndicator({ onToggle }: { onToggle?: () => void }) {
+function CollapsedIndicator({ onToggle }: { onToggle?: (e: MouseEvent) => void }) {
   return (
     <div class="turn-collapsed" onClick={onToggle}>
       <span class="turn-collapsed-dots" aria-label="Collapsed. Click to expand">⋯</span>
@@ -438,7 +438,7 @@ function CollapsedIndicator({ onToggle }: { onToggle?: () => void }) {
  *  One object rather than two positional booleans and a callback: adjacent
  *  same-typed arguments mis-order with no type error. */
 function collapseControl(
-  { collapsed, collapsible, onToggle }: { collapsed: boolean; collapsible: boolean; onToggle: () => void },
+  { collapsed, collapsible, onToggle }: { collapsed: boolean; collapsible: boolean; onToggle: (e: MouseEvent) => void },
 ): ComponentChildren {
   const label = collapsed ? 'Expand this turn' : 'Collapse this turn';
   return (
@@ -464,7 +464,7 @@ interface InitiatorPanelProps {
   actions?: ComponentChildren;
   collapsible: boolean;
   collapsed: boolean;
-  onToggle?: () => void;
+  onToggle?: (e: MouseEvent) => void;
   /** User message → render the body as a right-aligned gray bubble. */
   bubble?: boolean;
   /** Drop the actor chip (icon + name) entirely — used for user messages and
@@ -603,9 +603,12 @@ interface TurnControlsProps {
    *  The store would otherwise take the fold and hold it. The click then looks
    *  dead and lands later, folding the turn as its first content arrives. */
   collapsible: boolean;
-  onToggleDetails: () => void;
-  onToggleSteps: () => void;
-  onToggleCollapsed: () => void;
+  /** Every one takes the click EVENT, not a bare notification. The correction
+   *  that holds the transcript still anchors on `currentTarget`, the control
+   *  the reader pressed (`heldOnThePress` in `ChatExchange.tsx`). */
+  onToggleDetails: (e: MouseEvent) => void;
+  onToggleSteps: (e: MouseEvent) => void;
+  onToggleCollapsed: (e: MouseEvent) => void;
 }
 
 /** The response header's `controls` slot: three icon buttons right of the
@@ -673,7 +676,7 @@ interface ResponsePanelProps {
   status: ComponentChildren;
   timestamp: string;
   collapsed: boolean;
-  onToggle?: () => void;
+  onToggle?: (e: MouseEvent) => void;
   hasBody: boolean;
   children: ComponentChildren;
 }

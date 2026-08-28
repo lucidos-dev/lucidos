@@ -11,6 +11,7 @@ import { describe, it, expect } from 'vitest';
 import type { WorkspaceStatus } from '../../../api/client/control';
 import {
   applyRestoreFile,
+  backupNote,
   collidingWorkspace,
   createNote,
   isFirstRun,
@@ -204,5 +205,52 @@ describe('showsAddress: quiet unless the address would surprise', () => {
   it('stays quiet in the ordinary case', () => {
     const plain = [ws('personal'), ws('work')];
     expect(plain.some((w) => showsAddress(w, plain))).toBe(false);
+  });
+});
+
+describe('backupNote: silent only when the gateway could not ask', () => {
+  /** A row carrying the engine's backup answer. */
+  function backedUp(
+    line: WorkspaceStatus['last_successful_backup'],
+  ): WorkspaceStatus {
+    return { ...ws('personal'), last_successful_backup: line };
+  }
+
+  it('says nothing when the field is absent', () => {
+    // A stopped or unhealthy workspace, and an engine too old to answer. The
+    // gateway holds no database handle, so it genuinely does not know, and a
+    // guess here would call a nightly-backed-up workspace unprotected.
+    expect(backupNote(ws('personal'))).toBeNull();
+  });
+
+  it('reads a recent backup as reassurance', () => {
+    const at = new Date(Date.now() - 3 * 3600_000).toISOString();
+    expect(backupNote(backedUp({ at, stale: false, configured: true }))).toEqual({
+      text: 'Backed up 3h ago',
+      level: 'ok',
+    });
+  });
+
+  it('warns on a backup the ENGINE called stale, without re-deriving why', () => {
+    // The threshold lives once, in core::backup. The same timestamp with
+    // `stale: false` is the case above, so nothing here reads the clock.
+    const at = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    expect(backupNote(backedUp({ at, stale: true, configured: true }))).toEqual({
+      text: 'Backed up 3d ago',
+      level: 'warn',
+    });
+  });
+
+  it('tells a broken schedule from a workspace nobody set up', () => {
+    // Both are unprotected and both warn, but they are different faults: one
+    // has a schedule that has never produced an archive, the other has none.
+    expect(backupNote(backedUp({ at: null, stale: true, configured: true }))).toEqual({
+      text: 'Never backed up',
+      level: 'warn',
+    });
+    expect(backupNote(backedUp({ at: null, stale: true, configured: false }))).toEqual({
+      text: 'Not backed up',
+      level: 'warn',
+    });
   });
 });

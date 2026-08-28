@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, gotoWithRetry, waitForEventStream } from './helpers';
+import { navigateToApp, waitForEventStream } from './helpers';
 
 // Regression: ResizeObserver alone doesn't fire when only the scroll
 // container's INNER content (not its own box) grows, which is the typical
@@ -35,12 +35,16 @@ test.describe('scroll position restore', () => {
     if (currentSize) {
       await page.setViewportSize({ width: currentSize.width, height: 320 });
     }
-    await gotoWithRetry(page, '/');
     // A modest offset: the bug isn't about exact pixel position but about
     // whether ANY restore occurs once the `Loadable<T>` model list renders.
     // Without the MutationObserver fallback, the ResizeObserver on a flex:1
     // container never fires for inner-content growth and scrollTop stays at 0.
-    await page.evaluate((key) => {
+    //
+    // Seeded through an init script, so the app boots exactly once. An earlier
+    // `goto` here just to own an origin left that boot in flight. WebKit then
+    // failed the real navigation with "interrupted by another navigation", and
+    // `gotoWithRetry` commits early by design, so it cannot wait the race out.
+    await page.addInitScript((key: string) => {
       localStorage.setItem(key, '40');
     }, SUBVIEW_SCROLL_KEY);
 

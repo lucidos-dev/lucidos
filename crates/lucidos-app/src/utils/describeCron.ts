@@ -20,14 +20,20 @@ function ordinal(n: number): string {
   return n + (s[(v - 20) % 10] || s[v] || s[0]);
 }
 
-/** The day of the month when the field names exactly one day, else null.
+/** Whether the field names exactly one value.
  *
  *  A step, a list (`1,15`) or a range names more than one, and `parseInt` reads
- *  only the leading token. A step field therefore rendered as `NaNth` and
- *  `1,15` as `1st`, dropping the 15. Callers fall back to the raw cron rather
- *  than state a schedule the expression does not have. */
+ *  only the leading token. A stepped day therefore rendered as `NaNth`, `1,15`
+ *  as `1st` dropping the 15, and an hour of `9,17` as `09:00` dropping the
+ *  17:00 run. Callers fall back to the raw cron rather than state a schedule
+ *  the expression does not have. */
+function namesOneValue(field: string): boolean {
+  return /^\d+$/.test(field);
+}
+
+/** The day of the month when the field names exactly one day, else null. */
 function bareDayOfMonth(dom: string): number | null {
-  return /^\d+$/.test(dom) ? parseInt(dom) : null;
+  return namesOneValue(dom) ? parseInt(dom) : null;
 }
 
 function formatTime(hour: string, minute: string): string {
@@ -77,9 +83,9 @@ export function describeCron(cron: string): string {
   }
 
   // Every hour at :MM
-  if (!minute.includes('*') && !minute.includes('/') && hour === '*' && dom === '*' && dow === '*') {
+  if (namesOneValue(minute) && hour === '*' && dom === '*' && dow === '*') {
     const m = parseInt(minute);
-    if (!isNaN(m)) return m === 0 ? 'Every hour' : `Every hour at :${String(m).padStart(2, '0')}`;
+    return m === 0 ? 'Every hour' : `Every hour at :${String(m).padStart(2, '0')}`;
   }
 
   // Every N hours
@@ -88,7 +94,7 @@ export function describeCron(cron: string): string {
     if (!isNaN(n)) return n === 1 ? 'Every hour' : `Every ${n} hours`;
   }
 
-  const hasTime = !hour.includes('*') && !hour.includes('/') && !minute.includes('*') && !minute.includes('/');
+  const hasTime = namesOneValue(hour) && namesOneValue(minute);
   const timeStr = hasTime ? formatTime(hour, minute) : '';
 
   // Specific month constraint

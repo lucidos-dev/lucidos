@@ -21,6 +21,7 @@
     "paths": {
       "@/*": ["src/*"],
       "@lucidos/appearance": ["../../packages/lucidos-sdk/src/appearance.ts"],
+      "@lucidos/event-stream": ["../../packages/lucidos-sdk/src/eventStream.ts"],
       "@lucidos/geometry": ["../../packages/lucidos-sdk/src/geometry.ts"],
       "@lucidos/tooltip": ["../../packages/lucidos-sdk/src/tooltip.ts"]
     }

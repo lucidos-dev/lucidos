@@ -68,7 +68,7 @@
   background: transparent;
   color: rgba(255, 255, 255, 0.55);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease, opacity var(--duration-fast) ease;
 }
 .ws-picker-reload svg {
   width: 1.125rem;
@@ -130,7 +130,7 @@
   background: transparent;
   color: rgba(255, 255, 255, 0.55);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 .ws-picker-net-btn svg {
   width: 1.125rem;
@@ -247,7 +247,7 @@
   font-weight: 500;
   line-height: 1.25;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 .ws-picker-net-mode:hover:not(.active) {
   background: rgba(255, 255, 255, 0.08);
@@ -361,7 +361,9 @@
 
 /* Logo reveal (Logo Studio): a sparkle flashes at each tile in turn, drops a
    square behind it, and rests as the spark at the top-right — TL → BL → BR → TR.
-   Each element shares keyframes; the per-tile order comes from inline delays. */
+   Each element shares keyframes; the per-tile order comes from inline delays.
+   Those delays scale too (see WorkspacePicker.tsx): scaling a duration without
+   its delay slides the tiles out of order at any speed but 1x. */
 .ws-rv-sq,
 .ws-rv-flash,
 .ws-rv-final {
@@ -371,13 +373,13 @@
 
 /* Squares settle in (base state visible, so reduced-motion shows the mark). */
 .ws-rv-sq {
-  animation: ws-rv-pop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  animation: ws-rv-pop var(--duration-emphasis) cubic-bezier(0.34, 1.56, 0.64, 1) both;
 }
 
 /* Transient sparkles burst then vanish as their square lands (base hidden). */
 .ws-rv-flash {
   opacity: 0;
-  animation: ws-rv-flash 0.5s ease-out both;
+  animation: ws-rv-flash var(--duration-emphasis) ease-out both;
 }
 
 /* The top-right spark lands last with one clean spring pop, then idles with a
@@ -386,8 +388,11 @@
    (scale 1, opacity untouched) so the hand-off is seamless — no jump. */
 .ws-rv-final {
   animation:
-    ws-rv-final-in 0.55s cubic-bezier(0.34, 1.56, 0.64, 1) 1.5s both,
-    ws-rv-pulse 3.4s ease-in-out 2.05s infinite;
+    ws-rv-final-in calc(0.55s * var(--duration-scale))
+      cubic-bezier(0.34, 1.56, 0.64, 1) calc(1.5s * var(--duration-scale)) both,
+    /* The pulse is indefinite, so its duration stays a literal. Its delay is
+       the hand-off point and scales with the landing that precedes it. */
+    ws-rv-pulse 3.4s ease-in-out calc(2.05s * var(--duration-scale)) infinite;
 }
 
 @keyframes ws-rv-pop {
@@ -435,10 +440,10 @@
 /* ── Loading skeleton ────────────────────────────────────────────────────────
    The list placeholder renders the real `.ws-picker-row`/`.ws-picker-open`
    markup via the shared self-skeletonizing primitives (Skeleton.tsx → `.sk-bar`
-   leaves), so each row's height is fixed by its tallest cell — the 2rem action
-   block, matching the real row's 2rem `.ws-picker-icon` — giving an identical
-   3.25rem row height (2rem + 1.25rem padding) so the skeleton→list handoff
-   doesn't reflow. The picker sits on the brand-blue gradient, so re-skin the
+   leaves), so its row height is the real row's by construction and the
+   skeleton→list handoff does not reflow. Every cell a loaded row always draws
+   therefore has a placeholder: the dot, the name, the backup line under it, and
+   the 2rem action block. The picker sits on the brand-blue gradient, so re-skin the
    shared `.sk-bar` fill (theme-token by default) to a white-on-blue translucent
    shimmer in this context; structure + the `shimmer` animation stay shared.
    Scoped to the whole picker so both the workspace-list rows and the Network
@@ -483,6 +488,10 @@
      the dot sits on the name's FIRST line, and a copy of this number there
      would drift the moment the name is retuned. */
   --ws-picker-name-line-height: 1.25;
+  /* The line-height of the quiet lines stacked under the name (the address,
+     the backup note). Named because the backup slot reserves its own height
+     from it, so the reservation is exactly the line it holds open. */
+  --ws-picker-sub-line-height: 1.4;
   /* The gap between the row and the fault note under it. Its own quantity
      rather than the row gap above, which is a column gap between three cells on
      one line and reads as a chasm when spent vertically. */
@@ -509,7 +518,7 @@
   padding: 0.625rem 0.625rem 0.625rem 0.75rem;
   border-radius: 0.625rem;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background var(--duration-fast) ease;
 }
 .ws-picker-open:hover,
 .ws-picker-open:focus-visible {
@@ -580,12 +589,18 @@
 /* Name over address, as one cell. They identify the same workspace, so they
    stack rather than compete for the row's one horizontal budget: side by side,
    a long name and a long address each ellipsised the other down to about half,
-   and two rows differing only in their tail read as the same row. */
+   and two rows differing only in their tail read as the same row.
+
+   It tops out with the dot, which gives the dot's offset above one origin to
+   measure from. Centred, this cell drops down the line whenever the ACTIONS
+   are the taller item. The dot stays pinned to the line's top, and floats
+   above the name it marks. */
 .ws-picker-id {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
+  align-self: flex-start;
 }
 
 /* The name is spelled WHOLE, however long, over as many lines as that needs.
@@ -609,9 +624,34 @@
 .ws-picker-address {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
-  line-height: 1.4;
+  line-height: var(--ws-picker-sub-line-height);
   color: rgba(255, 255, 255, 0.6);
   overflow-wrap: anywhere;
+}
+
+/* When this workspace last backed up successfully, stacked under the name (and
+   under the address when that shows). Quiet by default: it is reassurance, not
+   an announcement, and it sits on every row.
+
+   Warn wears the row's own coral, the same one the fault note and the unhealthy
+   dot use. So "something needs your attention" looks like one thing on this
+   surface, whatever raised it. Three states land there, and each is a real
+   warning: a stale backup, a schedule that has never produced one, and a
+   workspace with no backups at all.
+
+   The line stays open whether or not there is a sentence in it. That is what
+   makes every row one height, and keeps the row still when the poll answers.
+   A block, so the reservation applies: `min-height` says nothing to a
+   non-replaced inline. */
+.ws-picker-backup {
+  display: block;
+  font-size: var(--font-size-sm);
+  line-height: var(--ws-picker-sub-line-height);
+  min-height: calc(var(--font-size-sm) * var(--ws-picker-sub-line-height));
+  color: rgba(255, 255, 255, 0.6);
+}
+.ws-picker-backup-warn {
+  color: var(--ws-picker-fault-color);
 }
 
 /* Per-workspace unread-notification count. Sits between the (flex-grow) name and
@@ -656,7 +696,7 @@
   background: transparent;
   color: rgba(255, 255, 255, 0.8);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease, opacity var(--duration-fast) ease;
 }
 .ws-picker-icon svg {
   width: 1.125rem;
@@ -737,7 +777,7 @@
   font-weight: 500;
   text-align: left;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background var(--duration-fast) ease, color var(--duration-fast) ease;
 }
 .ws-picker-menu-item svg {
   flex: 0 0 auto;
@@ -845,7 +885,7 @@
   font-size: var(--font-size-lg);
   font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s ease;
+  transition: background var(--duration-fast) ease;
 }
 .ws-picker-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.24); }
 .ws-picker-btn:disabled { opacity: 0.45; cursor: default; }
@@ -885,7 +925,7 @@
   font-size: var(--font-size-md);
   font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
 .ws-picker-suggestion:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.2);
@@ -915,7 +955,7 @@
   font-size: var(--font-size-xl);
   font-weight: 500;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
 .ws-picker-new:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.12);
@@ -1018,7 +1058,7 @@
   font-size: var(--font-size-lg);
   text-align: center;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background var(--duration-fast) ease, border-color var(--duration-fast) ease;
 }
 .ws-picker-restore-drop:hover {
   background: rgba(255, 255, 255, 0.1);

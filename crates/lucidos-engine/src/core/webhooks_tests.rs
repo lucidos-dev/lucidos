@@ -16,6 +16,9 @@ fn hook_with(token: Option<&str>, hmac: Option<HmacConfig>) -> Webhook {
         enabled: true,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        last_accepted_at: None,
+        last_refused_at: None,
+        last_refusal_reason: None,
     }
 }
 
@@ -166,6 +169,93 @@ fn a_stripe_delivery_reads_both_fields_out_of_one_header() {
         timestamp_header: None,
         body,
         now_unix: now,
+    };
+    assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
+}
+
+// ── The digests the senders themselves publish ───────────────────────────
+//
+// The three tests above round-trip: they build the expected signature with our
+// own `sign`, so they prove the pieces agree with each other and nothing more.
+// A pinned digest is the other half. It fails if `sign`, `canonical_string` or
+// either extractor changes what it computes, however self-consistently.
+
+/// GitHub's own documented example, secret and payload both.
+#[test]
+fn the_github_vector_from_their_docs_verifies() {
+    let cfg = github_config();
+    let secret = "It's a Secret to Everybody";
+    let body = "Hello, World!";
+    let published = "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+    assert_eq!(sign(&cfg, secret, body), published);
+
+    let hook = hook_with(None, Some(cfg));
+    let header = format!("sha256={published}");
+    let presented = PresentedDelivery {
+        authorization: None,
+        signature_header: Some(&header),
+        timestamp_header: None,
+        body,
+        now_unix: 1_700_000_000,
+    };
+    assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
+}
+
+/// Slack's own documented example. The timestamp is signed with the body, so
+/// this pins the template as well as the digest.
+#[test]
+fn the_slack_vector_from_their_docs_verifies() {
+    let cfg = slack_config();
+    let secret = "8f742231b10e8888abcd99yyyzzz85a5";
+    let body = "token=xyzz0WbapA4vBCDEFasx0q6G&team_id=T1DC2JH3J&team_domain=testteamnow\
+                &channel_id=G8PSS9T3V&channel_name=foobar&user_id=U2CERLKJA\
+                &user_name=roadrunner&command=%2Fwebhook-collect&text=\
+                &response_url=https%3A%2F%2Fhooks.slack.com%2Fcommands%2FT1DC2JH3J\
+                %2F397700885554%2F96rGlfmibIGlgcZRskXaIFfN\
+                &trigger_id=398738663015.47445629121.803a0bc887a14d10d2c447fce8b6703c";
+    let signed_at = 1_531_420_618;
+    let published = "a2114d57b48eac39b9ad189dd8316235a7b4a8d21a10bd27519666489c69b503";
+    assert_eq!(
+        sign(
+            &cfg,
+            secret,
+            &canonical_string(&cfg.template, Some("1531420618"), body)
+        ),
+        published
+    );
+
+    let hook = hook_with(None, Some(cfg));
+    let header = format!("v0={published}");
+    let presented = PresentedDelivery {
+        authorization: None,
+        signature_header: Some(&header),
+        timestamp_header: Some("1531420618"),
+        body,
+        // Slack's example is from 2018, so a real clock would replay-refuse it.
+        now_unix: signed_at,
+    };
+    assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
+}
+
+/// Stripe publishes no vector, so this one is frozen rather than quoted. It
+/// still fails on a change to what the engine computes, which is the point.
+#[test]
+fn the_frozen_stripe_vector_verifies() {
+    let cfg = stripe_config();
+    let secret = "whsec_frozen_test_vector";
+    let body = r#"{"id":"evt_1"}"#;
+    let signed_at = 1_700_000_000;
+    let frozen = "266ac802ab1ec1286a6fd80dc96feee4f4d5291d5e3e6bec12d1aa2e366ba366";
+    assert_eq!(sign(&cfg, secret, &format!("{signed_at}.{body}")), frozen);
+
+    let hook = hook_with(None, Some(cfg));
+    let header = format!("t={signed_at},v1={frozen}");
+    let presented = PresentedDelivery {
+        authorization: None,
+        signature_header: Some(&header),
+        timestamp_header: None,
+        body,
+        now_unix: signed_at,
     };
     assert_eq!(verify(&hook, &presented, Some(secret)), Ok(()));
 }
@@ -456,7 +546,7 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
     };
     assert_eq!(verify(&stored, &presented, None), Ok(()));
 
-    WebhookStore::update(
+    let (_, no_token) = WebhookStore::update(
         &pool,
         &bus,
         hook.id,
@@ -469,6 +559,10 @@ async fn every_mutation_announces_and_the_row_holds_no_token() {
     .await
     .unwrap()
     .expect("the hook exists");
+    assert!(
+        no_token.is_none(),
+        "an update that left the verifier alone mints nothing"
+    );
     assert_eq!(emitted(&pool, "WebhookUpdated").await, 1);
     assert!(
         !WebhookStore::get(&pool, hook.id)
@@ -552,6 +646,121 @@ async fn a_signed_hook_gets_no_token_so_a_real_sender_can_reach_it() {
         now_unix: 1_700_000_000,
     };
     assert_eq!(verify(&stored, &delivery, Some(secret)), Ok(()));
+
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+/// The whole reason `hmac` became editable: a hook keeps its delivery URL
+/// across a change of verifier, so the sender it was given to keeps working.
+///
+/// Each transition also moves the OTHER verifier, because `verify` requires
+/// every one a row carries. A hook holding both would refuse every real signed
+/// delivery, and a hook holding neither cannot be stored at all.
+#[tokio::test]
+async fn changing_the_verifier_swaps_it_whole_and_keeps_the_url() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let secret = "It's a Secret to Everybody";
+    let body = r#"{"action":"opened"}"#;
+
+    let (hook, token) = WebhookStore::create(
+        &pool,
+        &bus,
+        "deploys",
+        "DeployFinished",
+        WebhookConfig::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(token.is_some(), "an unsigned hook authenticates by token");
+
+    // Unsigned to signed. The token has to go, or GitHub could never reach it.
+    let (signed, minted) = WebhookStore::update(
+        &pool,
+        &bus,
+        hook.id,
+        WebhookPatch {
+            hmac: HmacChange::Set(github_config()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the hook exists");
+    assert_eq!(signed.id, hook.id, "the delivery URL is the id");
+    assert!(minted.is_none(), "setting a signature mints nothing");
+    assert!(signed.token_hash.is_none(), "the old token is gone");
+    let header = format!("sha256={}", sign(&github_config(), secret, body));
+    let delivery = PresentedDelivery {
+        authorization: None,
+        signature_header: Some(&header),
+        timestamp_header: None,
+        body,
+        now_unix: 1_700_000_000,
+    };
+    assert_eq!(verify(&signed, &delivery, Some(secret)), Ok(()));
+
+    // A rotation: same hook, same URL, a different credential named.
+    let mut rotated_cfg = github_config();
+    rotated_cfg.credential = "example-repo-webhook-2026".into();
+    let (rotated, _) = WebhookStore::update(
+        &pool,
+        &bus,
+        hook.id,
+        WebhookPatch {
+            hmac: HmacChange::Set(rotated_cfg),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the hook exists");
+    assert_eq!(rotated.id, hook.id);
+    assert_eq!(
+        rotated.hmac.as_ref().unwrap().credential,
+        "example-repo-webhook-2026"
+    );
+
+    // Signed back to unsigned. A token is minted, or the row would carry no
+    // verifier and the table's CHECK would refuse it.
+    let (unsigned, fresh) = WebhookStore::update(
+        &pool,
+        &bus,
+        hook.id,
+        WebhookPatch {
+            hmac: HmacChange::Clear,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("the hook exists");
+    assert_eq!(unsigned.id, hook.id);
+    assert!(unsigned.hmac.is_none());
+    let fresh = fresh.expect("clearing a signature mints a token");
+    assert_eq!(fresh.len(), 64);
+    assert_ne!(
+        Some(&fresh),
+        token.as_ref(),
+        "a fresh token, not the one the hook was born with"
+    );
+    assert_eq!(
+        unsigned.token_hash.as_deref(),
+        Some(digest(&fresh).as_str())
+    );
+
+    // The row still holds no readable secret, after all of that.
+    let stored: String = sqlx::query_scalar("SELECT webhooks::text FROM webhooks WHERE id = $1")
+        .bind(hook.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!stored.contains(&fresh));
+    assert!(!stored.contains(secret));
 
     crate::test_support::teardown_test_db(&db).await;
 }

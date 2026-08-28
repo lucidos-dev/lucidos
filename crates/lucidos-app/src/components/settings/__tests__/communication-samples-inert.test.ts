@@ -82,5 +82,13 @@ describe('the communication-surface gallery is inert', () => {
     // what the app actually renders.
     expect(page).toContain('backupReminderBody(');
     expect(page).toContain('connectionBannerBody(');
+    expect(page).toContain('ingressBannerBody(');
+  });
+
+  it('gives the ingress bar an inert button, since its real one navigates', () => {
+    // The shipped bar opens Settings > Webhooks. That route is on the FORBIDDEN
+    // list above, so the preview has to hand the body a handler that does
+    // nothing. The two checks together are what keep the preview a preview.
+    expect(page).toContain('onOpenWebhooks: () => {}');
   });
 });

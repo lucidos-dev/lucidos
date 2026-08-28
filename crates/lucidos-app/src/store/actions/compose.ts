@@ -40,6 +40,7 @@ import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft
 import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError, type ComposePutResult } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
+import { instantMicros } from '../../utils/isoInstant';
 import { sendMessage } from './chat';
 // Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
 // this is a function declaration called at runtime, never at module init.
@@ -48,6 +49,11 @@ import { forgetThreadEventsFailures } from './thread-loading';
 // reason it is safe: called at runtime, never at module init.
 import { unfocusThread } from './threads';
 import type { ChatContext } from './chatContext';
+// Not a new edge at all: `./chat` above already imports this same function, so
+// `compose -> pane` was in the graph before this line. The property to re-check
+// is that nothing `pane` reaches comes back to `compose`. Its direct import list
+// is not that check: it pulls in 25 action modules through the drawer.
+import { revealThreadPane } from './pane';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
@@ -320,10 +326,15 @@ export function draftIsSuperseded(
   }
   const thread = threadMap.peek().get(threadId);
   if (!thread) return false;
+  // A thread that never reported an activity time carries an empty
+  // `updatedAt`, and the floor keeps what the string compare here used to do:
+  // every real timestamp is newer than it.
+  const watermarkMicros = instantMicros(watermark) ?? -Infinity;
   for (const event of thread.events.values()) {
     // Missing `created` (a backend bug `handleEvent` already warns about)
     // cannot be ordered against the watermark — never treat it as evidence.
-    if (!event.created || event.created <= watermark) continue;
+    const createdMicros = instantMicros(event.created);
+    if (createdMicros === null || createdMicros <= watermarkMicros) continue;
     const submitted = submittedUserInput(event);
     if (!submitted) continue;
     if (submitted.text.trim() === text && sameHashes(draft.image_hashes, submitted.imageHashes)) return true;
@@ -996,8 +1007,10 @@ function dropNonComposingFocus(): void {
 
 /** Apply a suggested sentence to the compose input on the user's behalf.
  *
- *  Its one caller is {@link sendSeededPrompt}. It stays a separate step because
- *  the send reuses every part of it and only adds the send itself.
+ *  Its one caller is {@link sendSeededPrompt}, which reuses every part of it and
+ *  only adds the send. It stays a separate step because the seeding and the send
+ *  fail independently: a declined confirm must stop before either the pane moves
+ *  or a message goes out.
  *
  *  A suggested sentence is conversational, so the destination is forced to the
  *  Lucidos Agent, a coding-agent draft flipping back to chat. It REPLACES the
@@ -1007,12 +1020,14 @@ function dropNonComposingFocus(): void {
  *  Declining keeps the draft untouched.
  *
  *  The override is force-synced into the textarea via
- *  `requestPromptOverrideSync`. The normal sync skips a focused, non-empty
- *  input, to protect in-flight typing. Without the force, the draft signal
- *  would update while the visible prompt stayed stale.
+ *  `requestPromptOverrideSync('replace')`. The normal sync skips a focused,
+ *  non-empty input, to protect in-flight typing. Without the force, the draft
+ *  signal would update while the visible prompt stayed stale. `'replace'` also
+ *  end-snaps the caret: the old offset indexes text that is gone, so restoring
+ *  it would drop the user inside the seeded sentence.
  *
  *  Returns true when the sentence was applied, false when the user declined the
- *  override. Does NOT send: that is `startSetupInterview`'s extra step. */
+ *  override. Does NOT send: that is {@link sendSeededPrompt}'s extra step. */
 export async function applySuggestion(text: string): Promise<boolean> {
   dropNonComposingFocus();
   const existingId = focusedThreadId.value;
@@ -1028,7 +1043,7 @@ export async function applySuggestion(text: string): Promise<boolean> {
   // the chat channel, and so an existing coding-agent draft flips back to chat.
   applyDestination(focusedThreadId.value, { kind: 'lucidos-agent' });
   prefillCompose(text);
-  requestPromptOverrideSync();
+  requestPromptOverrideSync('replace');
   return true;
 }
 
@@ -1074,9 +1089,17 @@ export async function startSetupInterview(): Promise<boolean> {
 /** Seed `text` into the composer and SEND it, as the user.
  *
  *  The gesture behind every button that starts a conversation on the user's
- *  behalf: the first-run welcome's setup interview, and a *release notice*
- *  action. Both hand the reader a sentence they can see, reword and re-send by
- *  typing, which is the prompt-first side of `docs/philosophy.md` principle 3.
+ *  behalf: the first-run welcome's setup interview, a *release notice* action,
+ *  and Discuss on a notification. Each hands the reader a sentence they can see,
+ *  reword and re-send by typing, which is the prompt-first side of
+ *  `docs/philosophy.md` principle 3.
+ *
+ *  It reveals the thread pane, because a send that starts a conversation lands
+ *  on a thread (`.claude/rules/frontend.md` § Navigation That Lands Content).
+ *  `applySuggestion` covers only the branch where it unfocuses, and `sendCompose`
+ *  passes an explicit thread id, so `sendMessage`'s raw-new reveal never fires.
+ *  Without this, a caller in the content pane sent into a thread the user could
+ *  not see.
  *
  *  `what` completes "Failed to …" in the error toast, so write it as a verb
  *  phrase. Returns false when the user declined the draft override, when no
@@ -1085,6 +1108,10 @@ export async function sendSeededPrompt(text: string, what: string): Promise<bool
   if (!(await applySuggestion(text))) return false;
   const threadId = focusedThreadId.value;
   if (!threadId) return false;
+  // Before the send, not after. `ensureFocusedComposeThread` allocated the id
+  // client-side, so the thread can be on screen while the request is still in
+  // flight, rather than after a round trip.
+  revealThreadPane();
   try {
     await sendCompose(threadId, { focus: true });
   } catch (err) {
@@ -1167,13 +1194,23 @@ export async function sendCompose(
   threadId: string,
   opts: { useCodingAgent?: boolean; context?: ChatContext | null; focus?: boolean },
 ): Promise<void> {
+  // Both guards below end a send the user asked for, so neither may be silent.
+  // A dispatched send that produces no message and no word is a dead button, and
+  // this is the path a compose-view Send takes. See
+  // docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md.
   const thread = threadMap.value.get(threadId);
-  if (!thread) return;
+  if (!thread) {
+    showToast('Could not send: that draft is no longer open.', 'error');
+    return;
+  }
   const draft = getDraft(threadId);
   const text = draft.text;
   const wireHashes = draft.image_hashes;
   const mode = draft.mode;
-  if (!text.trim() && wireHashes.length === 0) return;
+  if (!text.trim() && wireHashes.length === 0) {
+    showToast('Could not send: the saved draft was empty.', 'error');
+    return;
+  }
 
   cancelPendingPush(threadId);
   // Bind here so sendMessage need not detect first-send from follow-up (see

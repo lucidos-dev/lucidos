@@ -957,7 +957,7 @@
     background: none;
     color: var(--text-muted);
     cursor: pointer;
-    transition: color 0.2s;
+    transition: color var(--duration-normal);
 }
 
 .secret-input-toggle:hover {
@@ -991,7 +991,7 @@
     font-size: var(--font-size-xs);
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all var(--duration-fast);
 }
 
 @media (hover: hover) {
@@ -1014,7 +1014,7 @@
     font-size: var(--font-size-xs);
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all var(--duration-fast);
 }
 
 @media (hover: hover) {

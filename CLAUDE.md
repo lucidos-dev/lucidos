@@ -87,7 +87,7 @@ Engine must be restartable at any time without losing user-visible state. Postgr
 
 ## Core Architectural Principles
 
-Lucidos is a cognitive OS: prompt as primary interface, events as single source of truth, versioned artifacts in Git, resumable workflows.
+Lucidos is prompt-first: events as single source of truth, versioned artifacts in Git, resumable workflows.
 
 - Events are immutable, append-only, **named in past tense** (`MessageReceived`).
 - Git is the artifact store but **never the authority** — events are.

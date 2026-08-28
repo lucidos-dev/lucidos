@@ -156,7 +156,7 @@ type ChordLike = Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKe
 /** Whether a bare keydown that bubbled to <body> should type-to-focus the prompt
  *  textarea (desktop convenience: start typing anywhere → land in the prompt).
  *  False when an overlay is open — a dropdown / modal / popover owns keystrokes
- *  while up, so typing must search the dropdown (its auto-focused filter), never
+ *  while up, so typing must search the dropdown (its own typeahead), never
  *  leak into the prompt textarea behind the inert UI. Also false on mobile, for
  *  IME composition, when a text input already has focus, with a modifier held,
  *  or for non-printable keys. One extra carve-out: a Space press whose target is

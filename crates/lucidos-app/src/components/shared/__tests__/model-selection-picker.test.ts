@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-  modelStepCommit, modelStepOptions, pickerKeyAction, tierStepOptions,
+  modelStepCommit, modelStepOptions, pickerFocusTarget, pickerKeyAction,
+  pickerShowsFilter, tierStepOptions,
 } from '../ModelSelectionPicker';
 import type { ModelRow } from '../../../store/modelSelection';
 
@@ -104,5 +105,40 @@ describe('pickerKeyAction', () => {
   it('leaves every other key alone, so typing reaches the filter box', () => {
     expect(pickerKeyAction('o')).toBeNull();
     expect(pickerKeyAction('Tab')).toBeNull();
+  });
+});
+
+describe('pickerShowsFilter', () => {
+  it('draws no box on a freshly opened desktop panel', () => {
+    // The user opened it to click a row. A caret blinking in an empty box is
+    // the thing this replaced.
+    expect(pickerShowsFilter({ searching: false, touch: false })).toBe(false);
+  });
+
+  it('draws it once a keystroke has started the search', () => {
+    expect(pickerShowsFilter({ searching: true, touch: false })).toBe(true);
+  });
+
+  it('always draws it on a touch device, where no keystroke can reveal it', () => {
+    // The capability, never the mobile width breakpoint. A phone in landscape
+    // is wider than 768px, and has no more keyboard than it had upright. A
+    // width test would leave it a box it can never summon.
+    expect(pickerShowsFilter({ searching: false, touch: true })).toBe(true);
+  });
+});
+
+describe('pickerFocusTarget', () => {
+  it('gives the list the keystrokes before the search starts', () => {
+    // The list's own handler turns a printable key into the query, so it holds
+    // focus while there is no box to type into.
+    expect(pickerFocusTarget({ tierStep: false, searching: false })).toBe('list');
+  });
+
+  it('hands over to the box once the search has started', () => {
+    expect(pickerFocusTarget({ tierStep: false, searching: true })).toBe('filter');
+  });
+
+  it('keeps the tier step on the list, which has no filter to focus', () => {
+    expect(pickerFocusTarget({ tierStep: true, searching: true })).toBe('list');
   });
 });

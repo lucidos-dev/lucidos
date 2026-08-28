@@ -73,6 +73,9 @@ export function autoResizeTextarea(el: HTMLTextAreaElement | null) {
   if (!el) return;
   el.style.height = 'auto';
   const cs = getComputedStyle(el);
-  const borderY = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth);
+  // `|| 0` for the same reason `getRemPx` carries `|| 16`: getComputedStyle
+  // answers '' under SSR/JSDOM, and a NaN height is a silently dropped
+  // declaration that leaves the textarea stuck at `auto`.
+  const borderY = (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.borderBottomWidth) || 0);
   el.style.height = `${el.scrollHeight + borderY}px`;
 }

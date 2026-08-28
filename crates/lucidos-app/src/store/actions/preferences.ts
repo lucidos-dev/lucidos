@@ -648,6 +648,48 @@ export function currentNotificationsFilter(): 'all' | 'unread' {
   return currentPreference('notifications_filter', ['all', 'unread'], 'all', 'lucidos-notifications-filter');
 }
 
+// --- In-app notification toasts ---
+
+/** Device-local mirror of the served value, and the reason this preference is
+ *  not read straight off the signal like the other booleans here.
+ *
+ *  A toast is unsolicited and cannot be taken back, so the window before
+ *  preferences load is not a harmless default: it hands the interruption to
+ *  exactly the user who turned it off. That window is a whole round trip on an
+ *  iOS PWA over Tailscale, on an app the OS evicts constantly. A load that
+ *  FAILS never closes it at all. The cache answers from the last known value
+ *  instead, and the served value wins the moment it lands. */
+const NOTIFICATION_TOASTS_KEY = 'lucidos-notification-toasts';
+
+/** Whether a notification may pop a toast over what the user is doing. Only an
+ *  explicit `'false'` silences it, so unset behaves as it always has. */
+export function currentNotificationToasts(): boolean {
+  return currentPreference(
+    'notification_toasts', ['true', 'false'], 'true', NOTIFICATION_TOASTS_KEY,
+  ) === 'true';
+}
+
+/** Take the mirror from what the engine just served. An absent key CLEARS it
+ *  rather than leaving it: unset means the default, and a cache kept there
+ *  would outlive a reset and keep answering for a preference nobody holds. */
+function cacheNotificationToasts(): void {
+  const served = preferences.value.status === 'loaded'
+    ? preferences.value.data['notification_toasts']
+    : undefined;
+  if (served === 'true' || served === 'false') {
+    localStorage.setItem(NOTIFICATION_TOASTS_KEY, served);
+  } else {
+    localStorage.removeItem(NOTIFICATION_TOASTS_KEY);
+  }
+}
+
+export function setNotificationToasts(enabled: boolean): Promise<void> {
+  const value = enabled ? 'true' : 'false';
+  return savePreference('notification_toasts', value, () => {
+    localStorage.setItem(NOTIFICATION_TOASTS_KEY, value);
+  });
+}
+
 // --- Chat model & reasoning effort ---
 
 const REASONING_VALUES = REASONING_LEVELS.map(l => l.value);
@@ -817,6 +859,7 @@ export async function loadPreferences(): Promise<void> {
     currentModel.value = currentChatModel();
     reasoningEffort.value = clampEffortFor(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
+    cacheNotificationToasts();
     selectedCodingAgent.value = currentCodingAgentDefault();
     // LAST, deliberately: the three applies above write properties the remote
     // is allowed to override, so the overrides go on top of them.

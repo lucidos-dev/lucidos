@@ -1,7 +1,7 @@
 {
   "name": "Lucidos",
   "short_name": "Lucidos",
-  "description": "Personal cognitive operating system",
+  "description": "Builds and runs the apps and automations you describe, on your own machine",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

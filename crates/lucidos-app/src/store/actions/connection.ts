@@ -7,6 +7,7 @@ import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_FAILURE_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
+import { loadThreadQueue } from './threadQueue';
 import { loadPreferences } from './preferences';
 import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
@@ -193,6 +194,10 @@ function runResumeSync(): void {
   disconnectThreadEvents();
   connectThreadEvents();
   refreshChangesState();
+  // The queue panel reads a signal that only queue events move. A device that
+  // slept through those events wakes holding entries that have since drained.
+  // That panel is where an operator looks when background work seems stuck.
+  void loadThreadQueue();
 
   // Incrementally refresh the FOCUSED thread (append-only event log: existing
   // events stay, we just fetch what's new via ?after=maxSeq). It is the one

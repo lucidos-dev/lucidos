@@ -23,12 +23,14 @@ import {
 } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import {
+  canCheckForUpdatesHere,
   canInstallUpdateHere,
-  checkForUpdatesNow,
-  installAppUpdate,
-  reportUpdateCheck,
+  followUpdateRoute,
+  sessionCanInstall,
   updateControlLabel,
+  type UpdateRoute,
 } from '../../store/actions/app-update';
+import { updateGuidance } from './updateGuidance';
 import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
@@ -145,23 +147,6 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
     refreshClient();
   }, []);
 
-  /** Update now if one is known, otherwise ask for a check on demand.
-   *
-   *  The on-demand path matters because the gateway's own poll is periodic:
-   *  without it the only way to ask "is there something newer?" right now was to
-   *  quit and relaunch.
-   *
-   *  The check itself belongs to `checkForUpdatesNow`, which owns the in-flight
-   *  state and the single flight. This reports the verdict IT returned, rather
-   *  than re-reading signals a concurrent background poll also writes. */
-  const handleAppUpdate = useCallback(async () => {
-    if (canInstallUpdateHere()) {
-      await installAppUpdate();
-      return;
-    }
-    reportUpdateCheck(await checkForUpdatesNow());
-  }, []);
-
   /** Turn the machine-global release check off or back on. Writes
    *  `~/.lucidos/updates.toml` through the gateway, which re-reads it on every
    *  tick, so the change binds without a restart. */
@@ -178,10 +163,13 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
   // Shared with the Lucidos menu's identity row, which names the same thing.
   const clientVersion = clientVersionLabel();
-  // Both shared with the button's action, so the label and what the click does
-  // can never disagree.
+  // This page is where `updateRoute`'s `guide` SENDS people, so its own control
+  // is install-or-check and never a third thing pointing back here. Both the
+  // label and the click read this one route, so they cannot disagree.
   const offeredVersion = packagedUpdateVersion();
   const canInstallHere = canInstallUpdateHere();
+  const canCheckHere = canCheckForUpdatesHere();
+  const pageRoute: UpdateRoute = canInstallHere ? 'install' : 'check';
   const tauriHasUpdate = !!offeredVersion;
   const check = releaseCheck.value;
   // How this install takes an update, as the gateway read it from its own
@@ -201,6 +189,17 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const checking = appUpdateCheckInFlight.value;
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
   const clientBehindLabel = tauriClientVersion ? ` (latest: ${offeredVersion})` : ' (update available)';
+  // `packaged` reads false until /health answers. A user with a dead engine
+  // comes to this very page. So the guidance waits for the engine's own word
+  // rather than asserting a source checkout by default.
+  const guidance = updateGuidance({
+    engineAnswered: status === 'connected',
+    packaged: enginePackaged.value,
+    hasOffer: tauriHasUpdate,
+    sessionCanInstall: sessionCanInstall(),
+    canCheckHere,
+    install: offer?.install ?? null,
+  });
 
   function renderPanel() {
     switch (panel) {
@@ -388,6 +387,22 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
               </button>
             </div>
           )}
+          {/* What the controls on this page cannot say for themselves. It is
+              here because `updateRoute`'s `guide` lands people on this page
+              (ADR 0142), so it owes an answer to every install shape that
+              arrives. The rule is `updateGuidance`, which is pure. */}
+          {guidance === 'source-checkout' && (
+            <div class="system-notice">
+              This engine runs from a source checkout, so no update is
+              downloaded. Pull the release, then Rebuild &amp; Restart.
+            </div>
+          )}
+          {guidance === 'install-in-the-app' && (
+            <div class="system-notice">
+              An update installs from the Lucidos app on the machine that runs
+              this workspace, never from a browser session.
+            </div>
+          )}
           {/* A check that FAILED must not look like "you are up to date". */}
           {appUpdateCheckError.value && (
             <div class="system-notice">
@@ -400,16 +415,25 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             </button>
             {/* While a run is live this button must not offer to start another —
                 it reports the phase instead, and turns into the same Cancel the
-                toast offers for exactly as long as one is honest. */}
-            {(tauriClientVersion || check) && (updateNarration
+                toast offers for exactly as long as one is honest.
+
+                A LIVE run is its own reason to render, outside the capability
+                gate below it. That gate reads signals a background poll also
+                writes, so folding the two together would let a mid-run refresh
+                take the Cancel away from an install still downloading. */}
+            {updateNarration
               ? (updateNarration.cancellable
                   ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
                   : <button class="action-btn" disabled>Updating…</button>)
-              : (
-                <button class="action-btn" onClick={handleAppUpdate} disabled={checking}>
-                  {updateControlLabel(checking, canInstallHere)}
+              : (canInstallHere || canCheckHere) && (
+                <button
+                  class="action-btn"
+                  onClick={() => { void followUpdateRoute(pageRoute); }}
+                  disabled={checking}
+                >
+                  {updateControlLabel(pageRoute, checking)}
                 </button>
-              ))}
+              )}
             {ownsRestart && (
               <button class="action-btn" onClick={() => { void confirmAndRestartEngine(); }}>
                 Rebuild &amp; Restart

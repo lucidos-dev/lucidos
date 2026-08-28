@@ -253,6 +253,18 @@ fn failed_command_maps_to_error_status() {
 }
 
 #[test]
+fn a_null_exit_code_reads_as_unknown_not_success() {
+    // A killed or abandoned command reports no code. `exit_code: 0` here would
+    // tell the model the command succeeded.
+    let line = r#"{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"sleep 99","aggregated_output":"","exit_code":null,"status":"failed"}}"#;
+    let (events, _) = track(&[line]);
+    match &events[0] {
+        AgentEvent::ToolResult { output, .. } => assert_eq!(output, "exit_code: unknown"),
+        other => panic!("expected ToolResult, got {:?}", other),
+    }
+}
+
+#[test]
 fn mcp_tool_call_uses_cc_naming_convention() {
     let started = r#"{"type":"item.started","item":{"id":"item_5","type":"mcp_tool_call","server":"docs","tool":"search","arguments":{"q":"x"},"result":null,"error":null,"status":"in_progress"}}"#;
     let completed = r#"{"type":"item.completed","item":{"id":"item_5","type":"mcp_tool_call","server":"docs","tool":"search","arguments":{"q":"x"},"result":{"matches":3},"error":null,"status":"completed"}}"#;

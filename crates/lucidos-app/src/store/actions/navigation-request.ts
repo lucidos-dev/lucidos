@@ -50,6 +50,7 @@ function isRenderableSettingsView(view: string): boolean {
 export function describeNavTarget(nav: {
   target: string;
   app_id?: string;
+  fragment?: string;
   file_path?: string;
   purpose?: string;
   line?: number;
@@ -59,7 +60,12 @@ export function describeNavTarget(nav: {
   switch (nav.target) {
     case 'app':
     case 'app-ui':
-      return nav.app_id ? `app "${nav.app_id}"` : 'an app';
+      if (!nav.app_id) return 'an app';
+      // A named place inside the app is the point of the jump, so the offer
+      // names it the way the link did (`app "habit-tracker#habit-hydration"`).
+      // The offer is keyed per source thread, so a second navigate replaces the
+      // first: without the fragment two destinations in one app read the same.
+      return `app "${nav.app_id}${nav.fragment ? `#${nav.fragment}` : ''}"`;
     case 'thread':
       return 'a thread';
     case 'file': {
@@ -114,6 +120,10 @@ export function handleNavigationRequest(nav: {
   target: string;
   settings_view?: string;
   app_id?: string;
+  /** The place INSIDE the app, delivered as its iframe's `location.hash`. Only
+   *  meaningful with an `app` target. Absent is not empty: no fragment leaves
+   *  an already-open app where the reader put it. */
+  fragment?: string;
   file_path?: string;
   line?: number;
   line_end?: number;
@@ -208,7 +218,7 @@ export function handleNavigationRequest(nav: {
       // live app as "App no longer exists" — swallowing the real cause.
       // openAppById re-scans disk on a cache miss before erroring, and its
       // miss toast names the app id + where the navigate came from.
-      void openAppById(navAppId, opts?.source);
+      void openAppById(navAppId, opts?.source, nav.fragment);
       break;
     case 'file': {
       // file_path existence is server-checked at preview time; the API surface
@@ -269,6 +279,13 @@ export function handleNavigationRequest(nav: {
         showToast('Navigation target missing thread id', 'error');
         break;
       }
+      // A fullscreen app panel is the ONE case where the content pane is the
+      // whole viewport. The conversation this lands in would sit behind it, so
+      // the tap reads as having done nothing. Leaving fullscreen is all this
+      // takes: `panelOverlay` stays, because the split renders the conversation
+      // in its own pane and closing the app would cost the reader what they
+      // were working in. Same distinction the `new-chat` branch draws.
+      exitAppFullscreen();
       focusThreadOrBootstrap(nav.id, { targetEventId: nav.event_id ?? null });
       break;
     case 'new-app':

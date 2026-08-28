@@ -7,13 +7,16 @@ import type { Notification } from '../../store/types';
 export interface NotificationActions {
   /** "Open thread": the originating thread. */
   openThread: boolean;
+  /** "Discuss": start a chat with this notification quoted, and send it.
+   *  Offered exactly when nothing here reaches a thread, because a thread the
+   *  row already points at IS the discussion. So the row always has at least one
+   *  button, which is why the panel renders the actions row unconditionally. */
+  discuss: boolean;
   /** "Open trigger": the trigger this notification is about. */
   openTrigger: boolean;
   /** "View changes" / "Open settings" / etc: a `navigate`-kind tap that no
    *  dedicated button above already covers. `null` when there is none. */
   navTap: NavigateUi | null;
-  /** Whether to render the actions row at all. */
-  any: boolean;
 }
 
 /** The trigger a notification is about, or `null`.
@@ -39,7 +42,7 @@ export function notificationTriggerId(n: Pick<Notification, 'task_id'>): string 
  *  `appLinked` is an input rather than an output: the panel has to narrow its
  *  own `LinkedAppResult` to render "Open <app>" anyway, so returning the same
  *  boolean would only make the caller test it twice. It still participates here
- *  because both the app-tap dedup and `any` depend on it. */
+ *  because the app-tap dedup depends on it. */
 export function notificationActions(
   n: Pick<Notification, 'task_id' | 'thread_id'> & { tap?: Tap },
   appLinked: boolean,
@@ -52,10 +55,15 @@ export function notificationActions(
     (tapTo?.target === 'trigger' && openTrigger) ||
     (tapTo?.target === 'app' && appLinked);
   const navTap = tapTo && !duplicatesDedicated ? tapTo : null;
+  // A row reaches a thread two ways: its own `thread_id` column, or a
+  // thread-targeted tap, which survives the dedup above precisely when the
+  // column is empty. `navigateTapLabel` renders that tap as "Open thread" too,
+  // so reading only the column put Discuss next to a button of that name.
+  const reachesThread = openThread || tapTo?.target === 'thread';
   return {
     openThread,
+    discuss: !reachesThread,
     openTrigger,
     navTap,
-    any: appLinked || openThread || openTrigger || !!navTap,
   };
 }

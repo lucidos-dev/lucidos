@@ -34,19 +34,38 @@ describe('the update-check button', () => {
   const page = stripComments(PAGE);
 
   it('reports the in-flight check on its own label', () => {
-    expect(page).toContain('updateControlLabel(checking');
+    expect(page).toMatch(/updateControlLabel\([^)]*,\s*checking\)/);
+  });
+
+  // This page is where the `guide` route SENDS people, so its own button must
+  // never wear that route: it would point back here and go nowhere.
+  it('offers only what this page itself can do', () => {
+    expect(page).toContain("canInstallHere ? 'install' : 'check'");
+    expect(page).not.toContain("'guide'");
+  });
+
+  // A live run renders on its own, ahead of the capability gate. That gate
+  // reads signals a background poll also writes. Folding the two together
+  // would let a mid-run refresh take Cancel away from a live download.
+  it('keeps a live run outside the capability gate', () => {
+    expect(page).toMatch(/\{updateNarration\s*\n\s*\?/);
+    expect(page).toMatch(/:\s*\(canInstallHere \|\| canCheckHere\) &&/);
   });
 
   it('refuses a second check while one is running', () => {
-    expect(page).toMatch(/onClick=\{handleAppUpdate\}\s+disabled=\{checking\}/);
+    expect(page).toMatch(/disabled=\{checking\}/);
   });
 
   it('takes the in-flight state from the signal the action owns', () => {
     expect(page).toContain('appUpdateCheckInFlight.value');
   });
 
-  it('reports the verdict the check returned', () => {
-    expect(page).toContain('reportUpdateCheck(await checkForUpdatesNow())');
+  // The verdict-reporting itself moved into `followUpdateRoute`, where
+  // `store/actions/app-update.test.ts` pins it. What this page owes is the
+  // delegation: it must not re-implement the branch and drift from it.
+  it('reports the verdict through the one shared action', () => {
+    expect(page).toContain('followUpdateRoute(pageRoute)');
+    expect(page).not.toContain('checkForUpdatesNow');
   });
 
   // The regression itself. Both reads happened AFTER the await, against signals

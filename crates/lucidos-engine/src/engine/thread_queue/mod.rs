@@ -1843,10 +1843,10 @@ impl ThreadQueue {
                     // overflow-pause) is about queue state — tap lands on the
                     // Thread Queue panel so the user sees the backlog directly.
                     tap: crate::scheduler::notifications::Tap::Navigate {
-                        to: crate::scheduler::notifications::NavigateUi {
+                        to: Box::new(crate::scheduler::notifications::NavigateUi {
                             target: crate::scheduler::notifications::NavigateTarget::ThreadQueue,
                             ..Default::default()
-                        },
+                        }),
                     },
                     actor: None,
                 }),

@@ -40,6 +40,7 @@ paths:
   - "crates/lucidos-app/src/store/actions/device-presence.ts"
   - "crates/lucidos-app/src/store/actions/presence-pong.ts"
   - "crates/lucidos-app/src/store/actions/in-app-notification-toast.ts"
+  - "crates/lucidos-app/src/store/actions/notification-discuss.ts"
   - "crates/lucidos-app/src/store/actions/push.ts"
   - "crates/lucidos-engine/src/net_config.rs"
   - "crates/lucidos-gateway/src/net_config.rs"

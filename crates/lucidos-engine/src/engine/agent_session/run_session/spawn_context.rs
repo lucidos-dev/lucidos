@@ -110,7 +110,7 @@ impl LucidosEngine {
         workspace_name: &str,
         repo_root: &std::path::Path,
         repo_id: &Option<String>,
-        last_idle_sha: &Option<String>,
+        idle_anchor: &crate::engine::agent_session::resume::IdleAnchor,
         resume_worktree_path: Option<PathBuf>,
         resume_branch: Option<String>,
         mut resume_session_id: Option<String>,
@@ -327,18 +327,18 @@ impl LucidosEngine {
                             // External repos: a skill may legitimately have
                             // created a feature branch off our tracked one
                             // (e.g. `git checkout -b feature-1234`). Adopt it
-                            // when its history contains our last commit.
+                            // when its history contains our last commit, or
+                            // when it provably continues the tracked branch.
                             // Internal threads keep the strict refusal so
                             // Apply has a stable engine-named branch.
                             //
                             // Adoption needs git to have NAMED a different
                             // branch. `Unanswered` means the probe timed out or
                             // could not run, so nothing is known. Sending it
-                            // here would re-run the same `rev-parse`, and a
-                            // second attempt that answers reports the branch we
-                            // already expected. Adoption then "succeeds" onto
-                            // the branch we were on, and the agent is told its
-                            // worktree was switched when it never was.
+                            // here only re-runs the same `rev-parse` to guess.
+                            // The helper refuses a re-read that reports the
+                            // branch we already expected, so the cost is a
+                            // wasted probe rather than a false adoption.
                             let probe_named_a_branch = matches!(
                                 mismatch,
                                 crate::engine::agent_session::external_edits::BranchMismatch::OnOtherBranch { .. }
@@ -346,8 +346,10 @@ impl LucidosEngine {
                             );
                             let adopted = if is_external_repo && probe_named_a_branch {
                                 crate::engine::agent_session::external_edits::try_adopt_renegade_branch(
+                                    repo_root,
                                     existing,
-                                    last_idle_sha.as_deref(),
+                                    &branch_name,
+                                    idle_anchor,
                                 )
                                 .await
                             } else {

@@ -638,7 +638,222 @@ test_source_honors_pinned_workspace() {
     fi
 }
 
+# ── playwright_file_filter ────────────────────────────────────────────
+test_playwright_filter_anchors_the_basename() {
+    echo "test: playwright_file_filter anchors and escapes a spec name"
+    local got
+    got=$(playwright_file_filter "chat.spec.ts")
+    if [ "$got" = '/chat\.spec\.ts$' ]; then
+        pass "chat.spec.ts becomes /chat\\.spec\\.ts\$"
+    else
+        fail "expected /chat\\.spec\\.ts\$, got $got"
+    fi
+}
+
+test_playwright_filter_escapes_regex_metacharacters() {
+    echo "test: playwright_file_filter escapes metacharacters in a spec name"
+    local got
+    got=$(playwright_file_filter "a+b(c).spec.ts")
+    if [ "$got" = '/a\+b\(c\)\.spec\.ts$' ]; then
+        pass "metacharacters are escaped"
+    else
+        fail "expected /a\\+b\\(c\\)\\.spec\\.ts\$, got $got"
+    fi
+}
+
+# The concrete regression. A bare basename `chat.spec.ts` also selects
+# app-coding-agent-spawn-from-chat.spec.ts, so a run asked for one spec silently
+# got a coding-agent one too.
+test_playwright_filter_does_not_match_a_longer_sibling() {
+    echo "test: playwright_file_filter does not match a longer sibling path"
+    local re
+    re=$(playwright_file_filter "chat.spec.ts")
+    if [[ "/repo/e2e/chat.spec.ts" =~ $re ]]; then
+        pass "the filter still matches its own file"
+    else
+        fail "the filter no longer matches its own file"
+    fi
+    if [[ "/repo/e2e/app-coding-agent-spawn-from-chat.spec.ts" =~ $re ]]; then
+        fail "the filter still matches the longer sibling"
+    else
+        pass "the filter does not match the longer sibling"
+    fi
+}
+
+# The durable guard: run the REAL mobile-webkit inventory through the filter and
+# assert every pattern selects exactly its own file. This fails the day someone
+# adds a spec whose name is a path suffix of another, which is how nine tests
+# came to run twice with nothing reporting it.
+test_every_mobile_webkit_spec_filter_selects_exactly_one_file() {
+    echo "test: every mobile-webkit spec filter selects exactly one spec"
+    local repo_root e2e_dir f base re other collisions=0 n=0
+    repo_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    e2e_dir="$repo_root/crates/lucidos-app/e2e"
+    if [ ! -d "$e2e_dir" ]; then
+        fail "spec dir not found: $e2e_dir"
+        return
+    fi
+    local specs=()
+    for f in "$e2e_dir"/*.spec.ts; do
+        [ -e "$f" ] || continue
+        base="$(basename "$f")"
+        case "$base" in *-desktop.spec.ts) continue ;; esac
+        specs+=("$base")
+    done
+    if [ "${#specs[@]}" -eq 0 ]; then
+        fail "no mobile-webkit specs discovered (a disarmed check must not read as clean)"
+        return
+    fi
+    for base in "${specs[@]}"; do
+        n=$((n + 1))
+        re=$(playwright_file_filter "$base")
+        if ! [[ "$e2e_dir/$base" =~ $re ]]; then
+            fail "filter for $base does not match its own path"
+            collisions=$((collisions + 1))
+        fi
+        for other in "${specs[@]}"; do
+            [ "$other" = "$base" ] && continue
+            if [[ "$e2e_dir/$other" =~ $re ]]; then
+                fail "filter for $base also selects $other"
+                collisions=$((collisions + 1))
+            fi
+        done
+    done
+    if [ "$collisions" -eq 0 ]; then
+        pass "$n spec filters each select exactly one file"
+    fi
+}
+
+# ── summarise_playwright_log / report_playwright_totals ───────────────
+# A project runs in chunks and prints a summary per invocation, so its own
+# verdict exists only if the harness adds them up. These pin the adding up and
+# the guard on it.
+
+# Two chunks of a chunked project, the shape Playwright's list reporter emits.
+_write_two_chunk_log() {
+    cat > "$1" <<'LOG'
+Running 9 tests using 1 worker
+  1 flaky
+  8 passed (1.2m)
+Running 7 tests using 1 worker
+  2 skipped
+  5 passed (48.0s)
+LOG
+}
+
+test_tally_sums_every_chunk() {
+    echo "test: summarise_playwright_log adds up every chunk's summary"
+    local log tally
+    log="$SANDBOX/tally-two.log"
+    _write_two_chunk_log "$log"
+    tally=$(summarise_playwright_log "$log")
+    # planned passed failed flaky skipped interrupted didnotrun invocations
+    if [ "$tally" = "16 13 0 1 2 0 0 2" ]; then
+        pass "two chunks summed to 16 planned, 13 passed, 1 flaky, 2 skipped"
+    else
+        fail "expected '16 13 0 1 2 0 0 2', got '$tally'"
+    fi
+}
+
+test_tally_strips_colour() {
+    echo "test: summarise_playwright_log counts through ANSI colour"
+    local log tally esc
+    log="$SANDBOX/tally-colour.log"
+    esc=$(printf '\033')
+    {
+        echo "Running 3 tests using 1 worker"
+        printf '  %s[32m3 passed%s[39m (4.0s)\n' "$esc" "$esc"
+    } > "$log"
+    tally=$(summarise_playwright_log "$log")
+    if [ "$tally" = "3 3 0 0 0 0 0 1" ]; then
+        pass "colour codes did not hide the counts"
+    else
+        fail "expected '3 3 0 0 0 0 0 1', got '$tally'"
+    fi
+}
+
+test_tally_ignores_per_test_lines() {
+    echo "test: summarise_playwright_log ignores the per-test progress lines"
+    local log tally
+    log="$SANDBOX/tally-progress.log"
+    cat > "$log" <<'LOG'
+Running 2 tests using 1 worker
+  ✓   1 [mobile-webkit] › e2e/a.spec.ts:1:1 › passed once (1.0s)
+  ✘   2 [mobile-webkit] › e2e/b.spec.ts:2:2 › failed here (2.0s)
+  1 failed
+  1 passed (3.0s)
+LOG
+    tally=$(summarise_playwright_log "$log")
+    if [ "$tally" = "2 1 1 0 0 0 0 1" ]; then
+        pass "only the summary lines were counted"
+    else
+        fail "expected '2 1 1 0 0 0 0 1', got '$tally'"
+    fi
+}
+
+test_totals_report_one_verdict_for_the_project() {
+    echo "test: report_playwright_totals prints one verdict and returns 0"
+    local log out rc=0
+    log="$SANDBOX/tally-ok.log"
+    out="$SANDBOX/tally-ok.out"
+    _write_two_chunk_log "$log"
+    report_playwright_totals mobile-webkit "$log" > "$out" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        pass "a tally that adds up returns 0"
+    else
+        fail "returned $rc on a consistent tally"; cat "$out"
+    fi
+    if grep -q "mobile-webkit total: 16 tests over 2 invocation" "$out"; then
+        pass "printed the project's own total"
+    else
+        fail "no project total line"; cat "$out"
+    fi
+}
+
+# The regression this whole pair exists for: an invocation that died before
+# printing its summary. Chunked green was green precisely because nothing
+# noticed the missing numbers.
+test_totals_catch_an_invocation_that_never_reported() {
+    echo "test: report_playwright_totals fails when a chunk never reported"
+    local log out rc=0
+    log="$SANDBOX/tally-lost.log"
+    out="$SANDBOX/tally-lost.out"
+    cat > "$log" <<'LOG'
+Running 9 tests using 1 worker
+  9 passed (1.2m)
+Running 7 tests using 1 worker
+LOG
+    report_playwright_totals mobile-webkit "$log" > "$out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        pass "a chunk with no summary forces a non-zero return"
+    else
+        fail "returned 0 while 7 tests went unaccounted"; cat "$out"
+    fi
+    if grep -q "planned 16 tests but accounted for 9" "$out"; then
+        pass "named the shortfall"
+    else
+        fail "did not name the shortfall"; cat "$out"
+    fi
+}
+
+test_totals_refuse_an_empty_log() {
+    echo "test: report_playwright_totals refuses an empty capture"
+    local out rc=0
+    out="$SANDBOX/tally-empty.out"
+    : > "$SANDBOX/tally-empty.log"
+    report_playwright_totals mobile-webkit "$SANDBOX/tally-empty.log" > "$out" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        pass "no captured output is a harness bug, not a green run"
+    else
+        fail "returned 0 on an empty log"; cat "$out"
+    fi
+}
+
 test_source_honors_pinned_workspace
+test_playwright_filter_anchors_the_basename
+test_playwright_filter_escapes_regex_metacharacters
+test_playwright_filter_does_not_match_a_longer_sibling
+test_every_mobile_webkit_spec_filter_selects_exactly_one_file
 test_prune_removes_empty_dir
 test_prune_removes_dir_with_dangling_gitdir
 test_prune_keeps_live_worktree
@@ -657,6 +872,12 @@ test_webkit_exclusion_is_silent_when_it_ran
 test_report_blank_rc_is_unknown_and_fails
 test_report_non_numeric_rc_is_unknown
 test_report_non_numeric_overall_forced_nonzero
+test_tally_sums_every_chunk
+test_tally_strips_colour
+test_tally_ignores_per_test_lines
+test_totals_report_one_verdict_for_the_project
+test_totals_catch_an_invocation_that_never_reported
+test_totals_refuse_an_empty_log
 test_no_sourced_lib_leaks_a_loop_variable
 test_ensure_workspace_running_does_not_leak_loop_index
 test_ensure_workspace_running_builds_the_frontend_before_the_engine

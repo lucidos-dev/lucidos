@@ -15,6 +15,7 @@ import { loadRepositories } from '../store/actions/chat';
 import { loadPreferences, flushPendingPreferenceWrites } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
 import { loadReleaseNotices } from '../store/actions/releaseNotices';
+import { loadWebhookIngress } from '../store/actions/webhookIngress';
 import { loadWorkspaceDisplayName } from '../store/actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
@@ -170,6 +171,10 @@ export function useStartup(): void {
     // that started it, so the listener belongs at startup beside the updater's
     // rather than on the Mobile Access page.
     void subscribeToTailscaleServeProgress();
+    // Whether an inbound webhook can still reach this machine from outside. The
+    // bar has to be able to raise itself on a cold load. The declaration it
+    // reads may have been made hours ago, by a probe nothing has retracted.
+    void loadWebhookIngress();
     loadAllThreads().catch(() => {
       // Retry after 3s — covers transient network failures on initial load.
       // If this also fails, the 5s health poll will keep retrying.
@@ -630,6 +635,10 @@ export function useStartup(): void {
       // suspended PWA missed every transient status frame, so re-read the
       // snapshot rather than trusting the last one seen before backgrounding.
       void loadEmbeddingModelStatus();
+      // And the webhook ingress. Its two frames are edge-triggered and never
+      // replayed. A phone asleep through the outage would otherwise call the
+      // path healthy for as long as it stayed open.
+      void loadWebhookIngress();
       // And the name the user gave this workspace, which they may have changed
       // in the picker on another device while this one slept. Behind the
       // gateway the in-app switcher re-adopts on every unfold, so this is

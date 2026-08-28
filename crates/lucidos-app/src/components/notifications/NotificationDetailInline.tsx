@@ -8,8 +8,10 @@ import {
 import { openApp, openAppById } from '../../store/actions/apps';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { navigateAdjacentNotification } from '../../store/actions/notifications';
+import { discussNotification } from '../../store/actions/notification-discuss';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
+import { composeHandlers } from '../chat/promptFocus';
 import { formatNotificationDate } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
@@ -26,9 +28,10 @@ import { notificationActions, notificationTriggerId } from './notificationAction
  *  the floating prev/next chevrons that walk the inbox list (side-centered,
  *  styled like the thread-view scroll chevrons).
  *
- *  Source-level contract: this component must not write store signals directly —
- *  every mutation routes through actions/notifications.ts (prev/next) or the
- *  navigation actions (open app / thread / nav-tap). */
+ *  Source-level contract: this component must not write store signals directly.
+ *  Every mutation routes through actions/notifications.ts (prev/next),
+ *  actions/notification-discuss.ts (Discuss), or the navigation actions (open
+ *  app / thread / nav-tap). */
 export function NotificationDetailInline() {
   const sk = useSkeleton();
   const detail = viewingNotification.value;
@@ -73,6 +76,17 @@ export function NotificationDetailInline() {
     });
   }
 
+  // `composeHandlers` with NO focus nudge, the shape `HeaderMark`'s setup-
+  // interview item uses. The wrapper is here for its touch/click dedup. A tap
+  // with the iOS keyboard up can blur the field and shift the viewport, moving
+  // the button from under the finger. WebKit then drops the synthetic click.
+  // The focus half is dropped because Discuss sends, so a raised keyboard would
+  // only cover the reply.
+  const discussHandlers = composeHandlers(
+    () => { void discussNotification(detail!); },
+    () => {},
+  );
+
   function handleNavigateTap() {
     if (!actions.navTap) return;
     handleNavigationRequest(actions.navTap);
@@ -114,8 +128,9 @@ export function NotificationDetailInline() {
     // gone, so a link to an app written by a hint-less channel (run_bash /
     // run_python) — which the cached appsList may lag on — still opens instead
     // of falsely toasting "Unknown app". It also names the id + origin on a
-    // genuine miss.
-    void openAppById(appId, 'a notification');
+    // genuine miss. `data-app-fragment` is the app fragment the link named,
+    // absent when it named none.
+    void openAppById(appId, 'a notification', link.dataset.appFragment);
   }
 
   return (
@@ -152,30 +167,36 @@ export function NotificationDetailInline() {
         onClick={handleBodyClick}
         dangerouslySetInnerHTML={{ __html: content }}
       />
-      {actions.any && (
-        <div class="notification-detail-actions">
-          {linked.kind === 'linked' && (
-            <button class="action-btn" onClick={handleOpenApp}>
-              Open {linked.app.name}
-            </button>
-          )}
-          {actions.openThread && (
-            <button class="action-btn" onClick={handleOpenThread}>
-              Open thread
-            </button>
-          )}
-          {actions.openTrigger && (
-            <button class="action-btn" onClick={handleOpenTrigger}>
-              Open trigger
-            </button>
-          )}
-          {actions.navTap && (
-            <button class="action-btn" onClick={handleNavigateTap}>
-              {navigateTapLabel(actions.navTap)}
-            </button>
-          )}
-        </div>
-      )}
+      {/* Always rendered: a notification either has a thread to open or is
+       *  discussable, so the row always holds a button. Discuss takes the slot
+       *  "Open thread" occupies, which keeps the row's shape across the two. */}
+      <div class="notification-detail-actions">
+        {linked.kind === 'linked' && (
+          <button class="action-btn" onClick={handleOpenApp}>
+            Open {linked.app.name}
+          </button>
+        )}
+        {actions.openThread && (
+          <button class="action-btn" onClick={handleOpenThread}>
+            Open thread
+          </button>
+        )}
+        {actions.discuss && (
+          <button class="action-btn" {...discussHandlers}>
+            Discuss
+          </button>
+        )}
+        {actions.openTrigger && (
+          <button class="action-btn" onClick={handleOpenTrigger}>
+            Open trigger
+          </button>
+        )}
+        {actions.navTap && (
+          <button class="action-btn" onClick={handleNavigateTap}>
+            {navigateTapLabel(actions.navTap)}
+          </button>
+        )}
+      </div>
       {linked.kind === 'unknown' && (
         <div class="notification-detail-actions">
           <span class="error-text">Unknown app: {linked.appId}</span>

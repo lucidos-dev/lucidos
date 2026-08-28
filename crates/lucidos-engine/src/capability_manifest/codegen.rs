@@ -287,16 +287,20 @@ fn generate_cli_rs_unformatted() -> String {
             let body_clause = if !body_args.is_empty() {
                 out.push_str("            let mut body = serde_json::Map::new();\n");
                 for a in &body_args {
+                    // The field is snake_case and clap derives a kebab-case
+                    // flag from it, so an error naming the field names a flag
+                    // clap then refuses. Say what the user typed.
+                    let flag = a.name.replace('_', "-");
                     match (a.ty, a.required) {
                         // Json args arrive as a CLI string; parse them into a
                         // Value so they ride the body as real JSON (not a string).
                         (ArgType::Json, true) => out.push_str(&format!(
-                            "            body.insert(\"{0}\".into(), serde_json::from_str::<serde_json::Value>(&{0}).map_err(|e| format!(\"--{0} must be valid JSON: {{}}\", e))?);\n",
-                            a.name
+                            "            body.insert(\"{0}\".into(), serde_json::from_str::<serde_json::Value>(&{0}).map_err(|e| format!(\"--{1} must be valid JSON: {{}}\", e))?);\n",
+                            a.name, flag
                         )),
                         (ArgType::Json, false) => out.push_str(&format!(
-                            "            if let Some(v) = {0} {{ body.insert(\"{0}\".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!(\"--{0} must be valid JSON: {{}}\", e))?); }}\n",
-                            a.name
+                            "            if let Some(v) = {0} {{ body.insert(\"{0}\".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!(\"--{1} must be valid JSON: {{}}\", e))?); }}\n",
+                            a.name, flag
                         )),
                         (_, true) => out.push_str(&format!(
                             "            body.insert(\"{0}\".into(), serde_json::json!({0}));\n",

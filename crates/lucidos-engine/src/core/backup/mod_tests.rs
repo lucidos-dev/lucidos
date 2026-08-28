@@ -786,6 +786,128 @@ async fn last_run_failure_overwrites_success() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+// --- the last SUCCESSFUL backup, and whether backups are set up ----------
+//
+// What the gateway's picker draws a per-row backup line from. See
+// `docs/plans/2026-08-27-picker-last-successful-backup.md`.
+
+/// Emit one terminal backup event through the bus, which is the only sanctioned
+/// way a row reaches the events table.
+async fn emit_run(
+    pool: &sqlx::PgPool,
+    ok: bool,
+    finished_at: DateTime<Utc>,
+) -> Result<(), BoxError> {
+    use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+    let (bus, _parent_rx) = EventBus::new(pool.clone());
+    let started_at = finished_at - chrono::Duration::minutes(3);
+    let event = if ok {
+        SystemEvent::BackupCompleted {
+            filename: "lucidos-backup-myws-20260601-040254.enc".to_string(),
+            size_bytes: 1024,
+            started_at,
+            finished_at,
+        }
+    } else {
+        SystemEvent::BackupFailed {
+            error: "upload refused".to_string(),
+            started_at,
+            finished_at,
+        }
+    };
+    bus.emit(BusEvent::System(event)).await?;
+    Ok(())
+}
+
+/// A workspace that never backed up answers `None`, and that is a real answer:
+/// the picker states it as "Never backed up".
+#[tokio::test]
+async fn no_backup_run_reads_as_never() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    assert!(load_last_successful_backup(&pool).await.unwrap().is_none());
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The reported time is the newest SUCCESS, whatever has happened since. A
+/// failure after it must not hide it, which is the whole reason this reads the
+/// event log rather than the single-slot `backup_last_run` preference.
+#[tokio::test]
+async fn a_later_failure_does_not_hide_the_last_success() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let success_at = Utc::now() - chrono::Duration::hours(5);
+
+    emit_run(&pool, true, success_at).await.unwrap();
+    emit_run(&pool, false, Utc::now()).await.unwrap();
+
+    let at = load_last_successful_backup(&pool)
+        .await
+        .unwrap()
+        .expect("the success is still the answer");
+    assert!(
+        (at - success_at).num_seconds().abs() <= 1,
+        "expected the success at {success_at}, got {at}",
+    );
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Two successes: the newest wins.
+#[tokio::test]
+async fn the_newest_success_wins() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let newest = Utc::now() - chrono::Duration::minutes(10);
+
+    emit_run(&pool, true, Utc::now() - chrono::Duration::days(3))
+        .await
+        .unwrap();
+    emit_run(&pool, true, newest).await.unwrap();
+
+    let at = load_last_successful_backup(&pool).await.unwrap().unwrap();
+    assert!((at - newest).num_seconds().abs() <= 1, "got {at}");
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Configured needs BOTH halves, the same pair the scheduler requires before it
+/// registers a job. A destination with the cron off runs no backup, and a cron
+/// with no destination has nowhere to upload.
+#[tokio::test]
+async fn backups_are_configured_needs_a_destination_and_an_active_schedule() {
+    use crate::core::PreferenceStore;
+    use crate::engine::event_bus::EventBus;
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    // Both keys are user-facing, so the store refuses a silent write.
+    let (bus, _parent_rx) = EventBus::new(pool.clone());
+    let write = |key: &'static str, value: &'static str| {
+        let (pool, bus) = (pool.clone(), bus.clone());
+        async move {
+            PreferenceStore::set(&pool, &bus, key, value, None)
+                .await
+                .unwrap();
+        }
+    };
+
+    assert!(!backups_are_configured(&pool).await.unwrap(), "nothing set");
+
+    write(PREF_BACKUP_PROVIDER, "google_drive").await;
+    assert!(
+        !backups_are_configured(&pool).await.unwrap(),
+        "a destination alone backs nothing up",
+    );
+
+    write(PREF_BACKUP_SCHEDULE, "off").await;
+    assert!(!backups_are_configured(&pool).await.unwrap(), "cron off");
+
+    write(PREF_BACKUP_SCHEDULE, "0 0 3 * * *").await;
+    assert!(backups_are_configured(&pool).await.unwrap(), "both set");
+
+    write(PREF_BACKUP_PROVIDER, "").await;
+    assert!(
+        !backups_are_configured(&pool).await.unwrap(),
+        "an empty destination is no destination",
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 // --- .backupignore -------------------------------------------------------
 
 /// A plain directory-prefix pattern excludes that directory AND everything

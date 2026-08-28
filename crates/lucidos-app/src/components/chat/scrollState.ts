@@ -1,6 +1,9 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
 import { SCROLLABLE_SLACK_PX } from './threadWindow';
 import { prefersReducedMotion } from '../../utils/platform';
+// The LEAF breadcrumb module, not `utils/liveness`, which re-exports it behind
+// a `store` import this module deliberately avoids (see `parseNavigatedTurn`).
+import { postClientLog } from '../../utils/clientLog';
 import { USER_SCROLL_WINDOW_MS } from '../../utils/scrollActivity';
 import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
@@ -11,9 +14,9 @@ import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMa
  *  and readers before measuring one. A transcript laid out at 0x0 answers every
  *  geometric question wrongly (`isScrollable` false, so it clears `notAtTop`),
  *  and the app's own chrome routinely produces one. A COLLAPSED pane is the
- *  everyday case: the desktop split at ratio 0, or mobile's `.content-row`,
- *  which collapses to height 0 rather than `display: none` so its
- *  `position: fixed` children still render.
+ *  everyday case: the desktop split at ratio 0, or an ancestor clipped to
+ *  nothing rather than `display: none`, which leaves its `position: fixed`
+ *  children rendering.
  *
  *  The policy this module implements is ADR 0064, docs/adr/. The transcript's
  *  position belongs to the reader, and the follow toggle is the one standing
@@ -53,12 +56,26 @@ export function setActiveScrollElement(el: HTMLElement | null) {
 }
 
 /** True if the element is actually visible: not `display: none`, and not
- *  clipped by a zero-height `overflow: hidden` ancestor. Mobile's
- *  `.content-row` is the everyday second case, since it collapses to height 0
- *  so `position: fixed` children like ThreadDrawer still render. */
+ *  clipped by a zero-height `overflow: hidden` ancestor. That second case is
+ *  why the walk below exists, since such an ancestor keeps its
+ *  `position: fixed` children rendering and leaves the element measuring
+ *  full size. */
 export function isElementVisible(el: HTMLElement): boolean {
+  return unmeasurableBox(el) === null;
+}
+
+/** WHICH box makes `el` unmeasurable: `el` itself, or the nearest ancestor
+ *  clipping it to nothing. `null` when `el` is measurable, which is what
+ *  `isElementVisible` reports above.
+ *
+ *  Naming the box rather than answering yes or no is what lets a caller WAIT
+ *  for it. A box is the only thing a `ResizeObserver` can watch, and the two
+ *  answers point at DIFFERENT elements. A collapsed pane zeroes the target's
+ *  own rect. An ancestor clipped to nothing leaves the target measuring full
+ *  size while showing none of it. See `watchForABox` in the deep link. */
+function unmeasurableBox(el: HTMLElement): HTMLElement | null {
   const r = el.getBoundingClientRect();
-  if (r.width <= 0 || r.height <= 0) return false;
+  if (r.width <= 0 || r.height <= 0) return el;
   // An element inside a zero-height overflow:hidden container reports non-zero
   // dimensions from layout, so the clipping ancestor has to be found by walking.
   let ancestor = el.parentElement;
@@ -70,10 +87,10 @@ export function isElementVisible(el: HTMLElement): boolean {
       continue;
     }
     const ar = ancestor.getBoundingClientRect();
-    if (ar.height <= 0 || ar.width <= 0) return false;
+    if (ar.height <= 0 || ar.width <= 0) return ancestor;
     ancestor = ancestor.parentElement;
   }
-  return true;
+  return null;
 }
 
 /** Fallback for when `_activeScrollElement` has not been set yet. */
@@ -220,9 +237,9 @@ export function markNavigationScroll(el: HTMLElement, top: number) {
  *  request for older turns.
  *
  *  It is NOT a placement, and that half is the mobile bug it was added for. The
- *  correction can move the container hundreds of pixels while the reader's eye
- *  stays on one line. The hide-on-scroll header turned that delta into sliding
- *  chrome, so the reader's own line went behind a header and a thread title.
+ *  correction can move the container hundreds of pixels while the control the
+ *  reader pressed stays put. The hide-on-scroll header turned that delta into
+ *  sliding chrome, so what they pressed went behind a header and a title.
  *  See `isAnchorScroll`. */
 export function markAnchorScroll(el: HTMLElement, top: number): void {
   markNavigationScroll(el, top);
@@ -705,6 +722,14 @@ function liveEdgeTop(el: HTMLElement): number {
   return Math.max(0, el.scrollHeight - el.clientHeight);
 }
 
+/** Where `top` actually comes to rest in `el`: the browser clamps a `scrollTop`
+ *  write to `0 .. liveEdgeTop`, and a landing target routinely falls outside
+ *  that range at both ends. Read by the deep link's outcome breadcrumb, which
+ *  must report where the reader ended up rather than what was aimed at. */
+function clampToScrollRange(el: HTMLElement, top: number): number {
+  return Math.max(0, Math.min(top, liveEdgeTop(el)));
+}
+
 /** The ONE at-the-live-edge threshold, asked of an OFFSET. 2px of slack absorbs
  *  subpixel rounding (mobile zoom, device-pixel snapping) and the iOS overscroll
  *  bounce, without making the chevron look stuck.
@@ -1051,9 +1076,9 @@ export function honourAnchoredMutation(el: HTMLElement, onTheLiveEdge = false): 
  *
  *  It has to be asked BEFORE the mutation. Growth moves the edge while leaving
  *  `scrollTop` where it was, so afterwards nothing can tell the reader was
- *  resting on it. Holding their topmost line and holding the newest content
- *  agree everywhere but here: rows revealed between the two push the end of
- *  the thread off the bottom.
+ *  resting on it. Holding the control they pressed and holding the newest
+ *  content agree everywhere but here: rows revealed between the two push the
+ *  end of the thread off the bottom.
  *
  *  The BOX term stands in for the guard `keepTheLiveEdge` gets for free, which
  *  is a snapshot that starts false rather than measured. A boxless container
@@ -2066,6 +2091,15 @@ function syncAwayFromBottom() {
  *  rather than a second literal that drifts. `showEventWhereItLives` is that
  *  caller, resolving the anchor before it focuses. */
 export const EVENT_RESOLVE_DEADLINE_MS = 4000;
+/** The longest a deep link waits in total, however slow the thread is. The
+ *  deadline above re-arms while `stillArriving` reports more events coming.
+ *  This is what stops a stalled thread holding the link open for the life of
+ *  the page.
+ *
+ *  It sits past every budget on the load path, so only a thread that has
+ *  genuinely stalled reaches it. ThreadView's "Taking too long?" fuse is the
+ *  longest of those, at 8s. */
+export const EVENT_RESOLVE_MAX_WAIT_MS = 20000;
 /** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve. A
  *  fallback for browsers where `scrollend` is unsupported or unreliable, and
  *  released earlier if `scrollend` fires first. `smoothScrollToElement`'s tween
@@ -2239,22 +2273,43 @@ function pinHeaderForScroll(): void {
  *  plain descendant selector. A function picks the descendant PER MATCHED
  *  TARGET, which a change deep link needs: its body sits in `.response-panel` on
  *  a proposing turn and in `.initiator-panel` on a resolution card. When the
- *  chosen descendant is absent the pulse falls back to the whole target. */
+ *  chosen descendant is absent the pulse falls back to the whole target.
+ *
+ *  `addressedBy` is the attribute `selector` addresses the target by. The retry
+ *  watches it as well as the DOM tree, see the observer below. */
 function scrollToSelectorAndPulse(
   selector: string,
+  addressedBy: string,
   preferLast = false,
   pulseTarget?: string | ((target: HTMLElement) => HTMLElement | null),
-  onUnresolved?: () => void,
+  opts?: DeepLinkOptions,
 ): void {
   if (!selector || typeof document === 'undefined' || !document.querySelectorAll) return;
 
   let resolved = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let observer: MutationObserver | null = null;
+  /** Watches the BOXES that are keeping a match unmeasurable, so the link wakes
+   *  when one of them gets a size. See `watchForABox`. */
+  let boxObserver: ResizeObserver | null = null;
+  /** The boxes `boxObserver` already holds. `observe` on an element it is
+   *  already watching re-registers it, and each registration delivers an
+   *  initial observation, so an ungated re-watch calls `tryResolve` forever. */
+  const watchedBoxes = new Set<Element>();
   /** This call's claim identity. See `_pendingEventScrollClaim`: an object, so
    *  that re-opening the SAME notification within the resolve window is two
    *  distinguishable claims rather than one indistinguishable selector. */
   const claim = {};
+  /** When this link started waiting, so the deadline's re-arm below is bounded
+   *  however long the thread takes. */
+  const startedAt = nowMs();
+  /** Has this link said how it ended? A resolved link's deadline still fires,
+   *  doubling as the claim release, so the first word is the only one. */
+  let reported = false;
+  /** True once the synchronous first look has been taken, so a landing can say
+   *  whether it had to WAIT. That is the difference between an already-rendered
+   *  transcript and one the link had to watch for. */
+  let pastFirstLook = false;
 
   // Claim the deep-link scroll so a competing scroll defers (see
   // `_pendingEventScrollClaim`). Held until the deadline below, and NOT released
@@ -2289,14 +2344,90 @@ function scrollToSelectorAndPulse(
     }
   };
 
-  const stopWatching = () => {
+  /** Drop both watches: the tree and the boxes. Its own function because the
+   *  RESOLVE path wants exactly this and not the deadline, which has to keep
+   *  running to release the claim. */
+  const stopObserving = () => {
     if (observer) {
       observer.disconnect();
       observer = null;
     }
+    if (boxObserver) {
+      boxObserver.disconnect();
+      boxObserver = null;
+      watchedBoxes.clear();
+    }
+  };
+
+  const stopWatching = () => {
+    stopObserving();
     if (deadlineTimer !== null) {
       clearTimeout(deadlineTimer);
       deadlineTimer = null;
+    }
+  };
+
+  /** Say how this link ended, once, as a `[Client/deeplink] outcome` line in
+   *  engine.log. Four endings: it landed on the first look, it landed after
+   *  waiting, a newer tap took the claim, or it gave up.
+   *
+   *  A tap that appears to do nothing is otherwise unanswerable after the fact.
+   *  The dispatch breadcrumb records that a navigate was ROUTED and stops there.
+   *  So the three ways a landing can fail all read alike in the log. Four
+   *  readings separate them: the number of elements the selector matched, how
+   *  many had a box, whether a scroll container resolved, and where the
+   *  container was going to rest.
+   *
+   *  Best-effort telemetry (`.claude/rules/frontend.md`). It reports ON a
+   *  navigation rather than being part of one, and a dead link reaches the
+   *  reader through the caller's own toast. `postClientLog` is fire-and-forget
+   *  and never throws, so it can never stand between a resolve and its scroll. */
+  const reportOutcome = (
+    outcome: 'landed' | 'landed-after-wait' | 'superseded' | 'unresolved',
+    matches: ArrayLike<HTMLElement>,
+    landing?: { container: HTMLElement | null; fromTop: number; toTop: number },
+  ) => {
+    if (reported) return;
+    reported = true;
+    let visible = 0;
+    for (let i = 0; i < matches.length; i++) if (isElementVisible(matches[i])) visible++;
+    postClientLog('deeplink', 'outcome', {
+      outcome,
+      addressed_by: addressedBy,
+      waited_ms: Math.round(nowMs() - startedAt),
+      dom_matches: matches.length,
+      visible_matches: visible,
+      had_container: landing ? !!landing.container : !!resolveTarget(),
+      from_top: landing ? Math.round(landing.fromTop) : null,
+      to_top: landing ? Math.round(landing.toTop) : null,
+    });
+  };
+
+  /** Wait for a match that is in the DOM but has NO BOX to get one.
+   *
+   *  The tree watch below cannot answer this. Gaining a box is a layout change:
+   *  no node is added and no attribute changes, so `MutationObserver` never
+   *  fires and the one synchronous attempt is the only one the link gets.
+   *
+   *  Every reveal around a deep link is exactly that shape. `focusThread` calls
+   *  `revealThreadPane()` and this in the SAME task. A collapsed Conversation
+   *  pane has therefore not re-expanded yet, and a pane the reader is swiping
+   *  to has not arrived.
+   *
+   *  It watches the box `unmeasurableBox` names rather than the match. Those are
+   *  different elements in the two cases, and only one of them is about to
+   *  change size.
+   *
+   *  `blocked` cannot be null here, since this runs only when NO match passed
+   *  the visibility test. The check is the type narrowing. */
+  const watchForABox = (matches: ArrayLike<HTMLElement>) => {
+    if (typeof ResizeObserver !== 'function') return;
+    for (let i = 0; i < matches.length; i++) {
+      const blocked = unmeasurableBox(matches[i]);
+      if (!blocked || watchedBoxes.has(blocked)) continue;
+      boxObserver ??= new ResizeObserver(() => tryResolve());
+      watchedBoxes.add(blocked);
+      boxObserver.observe(blocked);
     }
   };
 
@@ -2337,14 +2468,17 @@ function scrollToSelectorAndPulse(
         if (!preferLast) break;
       }
     }
-    if (!target) return;
-    resolved = true;
-    // Stop watching the DOM, but keep the pending claim alive until the deadline
-    // so the post-resolve re-renders stay suppressed.
-    if (observer) {
-      observer.disconnect();
-      observer = null;
+    if (!target) {
+      // In the DOM but unmeasurable is a WAIT, not a miss: watch the box that
+      // is keeping it that way. No match at all leaves nothing to watch, and
+      // the tree observer below covers that case.
+      watchForABox(matches);
+      return;
     }
+    resolved = true;
+    // Stop watching the DOM and the boxes, but keep the pending claim alive
+    // until the deadline so the post-resolve re-renders stay suppressed.
+    stopObserving();
 
     // Mobile only: reveal the app header now and keep it pinned visible through
     // the smooth scroll below, so the event lands under the header + sticky
@@ -2358,8 +2492,21 @@ function scrollToSelectorAndPulse(
     // before anything moves. `landingTargetOf` is the number the scroll below
     // aims at, so the two cannot answer differently.
     const container = resolveTarget();
-    const landsOnTheEdge =
-      !!container && isLiveEdgeTop(container, landingTargetOf(target)(container));
+    const landingTop = container ? landingTargetOf(target)(container) : 0;
+    const landsOnTheEdge = !!container && isLiveEdgeTop(container, landingTop);
+    // Said BEFORE the scroll, so `from_top` is where the reader actually was
+    // rather than a frame of the tween. `to_top` is the number the scroll aims
+    // at, read off the same `landingTargetOf` the branch below uses.
+    reportOutcome(pastFirstLook ? 'landed-after-wait' : 'landed', matches, {
+      container,
+      fromTop: container ? container.scrollTop : 0,
+      // Clamped both ways, because the raw number is not a position the
+      // container can hold. A target near the top with a `scroll-margin-top`
+      // makes it negative, and one at the end overshoots the live edge. The
+      // browser clamps the write, so the log has to say where the reader
+      // actually ends up.
+      toTop: container ? clampToScrollRange(container, landingTop) : 0,
+    });
     if (container && landsOnTheEdge && _followingBottom.value) {
       // The link and the ride ask for the same place, so there is nothing to
       // retire. The reader tapped a notification pointing at the newest turn,
@@ -2431,6 +2578,7 @@ function scrollToSelectorAndPulse(
   };
 
   tryResolve();
+  pastFirstLook = true;
   if (resolved) {
     // Synchronous resolve: the thread's events were already in the DOM, so no
     // async load follows. Do NOT release the claim synchronously. The deep-link
@@ -2445,8 +2593,20 @@ function scrollToSelectorAndPulse(
   // so a scoped observer strands on a detached node. The hot-path filter
   // re-queries only when a mutation adds a node containing the target. Without
   // it, every streaming token triggers a document-wide scan.
+  //
+  // TWO ways a target becomes resolvable, and the tree is only the obvious one.
+  // `ChatExchange` STAMPS a turn with its change id when the aggregate
+  // `ChangeProposed` reaches it. That step renders nothing, so the id lands as
+  // an attribute on a row already on screen. A childList-only watch misses it,
+  // so the link died on a change the reader was looking at. `attributeFilter`
+  // keeps the second watch as cheap as the first: one attribute name, which
+  // only ever changes when a turn gains the id.
   observer = new MutationObserver((records) => {
     for (const record of records) {
+      if (record.type === 'attributes') {
+        tryResolve();
+        return;
+      }
       for (const node of record.addedNodes) {
         if (node.nodeType !== 1) continue;
         const el = node as Element;
@@ -2457,28 +2617,62 @@ function scrollToSelectorAndPulse(
       }
     }
   });
-  observer.observe(document.body, { childList: true, subtree: true });
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: [addressedBy],
+  });
   // Deadline. Two outcomes reach it, and only one is a failure.
   //
   //  - The target DID render and `tryResolve` landed on it. The timer then
   //    exists purely to release the claim.
-  //  - The target NEVER rendered: it is not in this thread, it renders nothing,
-  //    or the thread was still loading when the window closed. That is a dead
-  //    deep link, and the user is told through the caller's `onUnresolved`.
-  //    `scrollState` stays free of the `store` import, see `parseNavigatedTurn`.
+  //  - The target NEVER rendered: it is not in this thread, or it renders
+  //    nothing. That is a dead deep link, and the user is told through the
+  //    caller's `onUnresolved`. `scrollState` stays free of the `store` import,
+  //    see `parseNavigatedTurn`.
   //
   // It reports WITHOUT moving the transcript. The user asked to go to a place,
   // the place does not exist, and the bottom is not it.
   //
   // A deep link superseded mid-flight (`wasOurs` false) reports nothing. The
   // newer one owns the claim, the viewport and the outcome.
-  deadlineTimer = setTimeout(() => {
-    const wasOurs = _pendingEventScrollClaim === claim;
-    stopWatching();
-    releaseClaim();
-    if (resolved || !wasOurs) return;
-    onUnresolved?.();
-  }, EVENT_RESOLVE_DEADLINE_MS);
+  //
+  // A THIRD outcome used to reach the same report and is not a failure at all:
+  // the thread was still loading when the window closed. The report is a
+  // VERDICT, so `stillArriving` holds it while more events are on their way and
+  // the wait is under its cap. See that option, and `EVENT_RESOLVE_MAX_WAIT_MS`.
+  const armDeadline = () => {
+    deadlineTimer = setTimeout(() => {
+      const wasOurs = _pendingEventScrollClaim === claim;
+      const mayWait = nowMs() - startedAt < EVENT_RESOLVE_MAX_WAIT_MS;
+      if (!resolved && wasOurs && mayWait && opts?.stillArriving?.()) {
+        armDeadline();
+        return;
+      }
+      stopWatching();
+      releaseClaim();
+      if (resolved || !wasOurs) {
+        // A superseded link has never spoken, and its silence is the very thing
+        // that made a re-tapped notification unreadable in the log. A RESOLVED
+        // one said so at its landing, and is skipped by the `resolved` term
+        // rather than by `reported`. The query below is evaluated before the
+        // call, so leaning on that guard would sweep the whole transcript for a
+        // report every landed link discards.
+        if (!resolved) {
+          reportOutcome('superseded', document.querySelectorAll<HTMLElement>(selector));
+        }
+        return;
+      }
+      // The matches are re-read HERE rather than remembered, because what the
+      // DOM held when the link GAVE UP is the diagnostic. Zero says the event is
+      // not in this thread. One with no box says it is, and something is
+      // covering or collapsing it.
+      reportOutcome('unresolved', document.querySelectorAll<HTMLElement>(selector));
+      opts?.onUnresolved?.();
+    }, EVENT_RESOLVE_DEADLINE_MS);
+  };
+  armDeadline();
 }
 
 /** Shared options for the two deep-link entry points below. */
@@ -2491,6 +2685,21 @@ export interface DeepLinkOptions {
    *  The words are the WHOLE recovery: a dead link leaves the transcript exactly
    *  where it was. */
   onUnresolved?: () => void;
+  /** Are more of the target thread's events still on their way? The deadline
+   *  asks it, and a `true` holds the report rather than raising it.
+   *
+   *  The report above is a VERDICT, and a target's absence is only a verdict
+   *  once the transcript it should be in has finished arriving. Without this the
+   *  deadline was a stopwatch, and it ran shorter than the load path it was
+   *  racing: retries behind a 1s then 2s backoff, a watchdog restart at 2s, and
+   *  ThreadView's own "Taking too long?" fuse at 8s. A Changes row tapped into a
+   *  slow thread reported the change missing seconds before it painted.
+   *
+   *  The caller's, for the same reason `onUnresolved` is: the answer lives in
+   *  the store (`threadEventsStillArriving`), and this module stays free of that
+   *  import. Bounded by `EVENT_RESOLVE_MAX_WAIT_MS`, so a thread that never
+   *  finishes still gets an answer. */
+  stillArriving?: () => boolean;
 }
 
 /** Land on the element carrying `data-event-id`: a notification deep link
@@ -2515,12 +2724,13 @@ export function scrollToEventAndPulse(eventId: string, opts?: DeepLinkOptions): 
   if (!eventId) return;
   scrollToSelectorAndPulse(
     `[data-event-id="${CSS.escape(eventId)}"]`,
+    'data-event-id',
     false,
     (target) =>
       (target.matches?.('.chat-exchange')
         ? target.querySelector?.('.initiator-panel')
         : null) as HTMLElement | null,
-    opts?.onUnresolved,
+    opts,
   );
 }
 
@@ -2550,12 +2760,13 @@ export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions)
   if (!changeId) return;
   scrollToSelectorAndPulse(
     `[data-change-id="${CSS.escape(changeId)}"]`,
+    'data-change-id',
     true,
     (target) =>
       (target.querySelector?.(CHANGE_RESOLUTION_INITIATOR)
         ? target.querySelector?.('.initiator-panel')
         : target.querySelector?.('.response-panel')) as HTMLElement | null,
-    opts?.onUnresolved,
+    opts,
   );
 }
 

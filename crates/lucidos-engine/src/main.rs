@@ -121,22 +121,56 @@ async fn shutdown_signal(
     log!("[Shutdown] Shutdown complete.");
 }
 
-async fn read_vertex_region_pref(database_url: &str) -> Option<String> {
+/// Postgres `undefined_table`. This read runs before `LucidosEngine::new` has
+/// applied the migrations, so a brand-new workspace has no `preferences` table
+/// on its first boot.
+const PG_UNDEFINED_TABLE: &str = "42P01";
+
+/// The stored `vertex_region`, or `None` when no row holds one.
+///
+/// `Err` means the read could not run, which is NOT the same answer as `None`.
+/// A cold Postgres can time out the 5s acquire, and the caller then falls back
+/// to a region the user never chose. It says which happened rather than
+/// reporting the setting as absent.
+///
+/// A missing table is the one failure that IS `None`: no table means no stored
+/// setting, and warning about it would fire on every first boot.
+async fn read_vertex_region_pref(
+    database_url: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(5))
         .connect(database_url)
-        .await
-        .ok()?;
-    sqlx::query_scalar::<_, String>(
+        .await?;
+    let stored = sqlx::query_scalar::<_, String>(
         "SELECT value FROM preferences WHERE key = $1 AND device_id IS NULL",
     )
     .bind(lucidos_engine::core::PREF_VERTEX_REGION)
     .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten()
-    .filter(|s| !s.is_empty())
+    .await;
+    match stored {
+        Ok(value) => Ok(value.filter(|s| !s.is_empty())),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some(PG_UNDEFINED_TABLE) => {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The Vertex region to use when no stored setting supplies one, and the name
+/// of the input that supplied it.
+fn vertex_region_from_env_or_default() -> (String, &'static str) {
+    match std::env::var("VERTEX_REGION")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(region) => (region, "VERTEX_REGION"),
+        None => (
+            lucidos_engine::core::DEFAULT_VERTEX_REGION.to_string(),
+            "the default",
+        ),
+    }
 }
 
 fn get_gcloud_project() -> Option<String> {
@@ -417,7 +451,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // log, then hand the list on. The proxy routes re-read the same file per
     // request, so this call adds no authority, only timing. The announce
     // cannot happen yet: there is no EventBus until `LucidosEngine::new`.
-    let proxy_config_rejections = lucidos_engine::api::load_proxy_config(&workspace_path).rejected;
+    let proxy_load = lucidos_engine::api::load_proxy_config(&workspace_path);
+    // Trust on first sight, once per workspace: a handshake that worked before
+    // ADR 0144 keeps working, and every later start refuses a script nobody
+    // authored. `seed_if_absent` will not run twice.
+    let seeded_handshake_scripts = match lucidos_engine::core::handshake_approvals::seed_if_absent(
+        &workspace_path,
+        &proxy_load.handshake_script_paths(),
+    ) {
+        Ok(seeded) => seeded,
+        Err(e) => {
+            log!("[Startup] could not seed handshake approvals: {}", e);
+            Vec::new()
+        }
+    };
+    for path in &seeded_handshake_scripts {
+        log!(
+            "[Startup] approved the handshake script already in use: {}",
+            path
+        );
+    }
+    // Read before `rejected` is moved out below: only the map is kept, not the
+    // whole config.
+    let configured_credential_scopes = proxy_load.credential_scopes();
+    let proxy_config_rejections = proxy_load.rejected;
     for rejected in &proxy_config_rejections {
         log!(
             "[Startup] apis.json: refusing '{}': {}",
@@ -439,12 +496,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .or_else(get_gcloud_project)
         .unwrap_or_default();
 
-    let vertex_region_env =
-        std::env::var("VERTEX_REGION").unwrap_or_else(|_| "europe-west1".to_string());
-    let initial_region = read_vertex_region_pref(&database_url)
-        .await
-        .unwrap_or(vertex_region_env);
-    let vertex_region = lucidos_engine::llm::vertex::location_handle(initial_region);
+    // The log line below names which input won. Nothing else tells a user who
+    // set the region in Settings why requests still go somewhere else. An
+    // exported VERTEX_REGION only counts if this process inherited it.
+    let (initial_region, region_source) = match read_vertex_region_pref(&database_url).await {
+        Ok(Some(region)) => (region, "the vertex_region setting"),
+        Ok(None) => vertex_region_from_env_or_default(),
+        Err(e) => {
+            // Falls back exactly as an absent setting does, but says so. A
+            // silent fallback here reads as "you never set a region".
+            log!(
+                "[Startup] WARNING: could not read the vertex_region setting ({}), \
+                 falling back",
+                e
+            );
+            vertex_region_from_env_or_default()
+        }
+    };
+    let vertex_region = lucidos_engine::llm::vertex::location_handle(initial_region.clone());
 
     let model = std::env::var("LUCIDOS_MODEL")
         .unwrap_or_else(|_| lucidos_engine::core::DEFAULT_CHAT_MODEL.to_string());
@@ -469,7 +538,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if project_id.is_empty() {
             log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
         } else {
-            log!("[Startup] Vertex AI configured (project: {})", project_id);
+            log!(
+                "[Startup] Vertex AI configured (project: {}, region: {} from {})",
+                project_id,
+                initial_region,
+                region_source
+            );
         }
     }
 
@@ -614,6 +688,75 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     },
                 ),
                 "[Proxy] ProxyConfigRejected",
+            )
+            .await;
+    }
+
+    // A credential the proxy would now refuse for want of a scope gets the one
+    // its own entry uses, once, and says so (ADR 0144). Two entries disagreeing
+    // is not an answer, so those are left for the user to settle.
+    for (name, scopes) in configured_credential_scopes {
+        let mut usable = scopes.iter().filter(|u| !u.trim().is_empty());
+        let (Some(base_url), None) = (usable.next(), usable.next()) else {
+            continue;
+        };
+        match lucidos_engine::core::CredentialStore::infer_scope_if_empty(
+            engine.pool(),
+            &engine.event_bus,
+            &name,
+            base_url,
+        )
+        .await
+        {
+            Ok(true) => log!("[Startup] scoped credential '{}' to {}", name, base_url),
+            Ok(false) => {}
+            Err(e) => log!("[Startup] could not scope credential '{}': {}", name, e),
+        }
+    }
+
+    // Same two surfaces as the rejection announce above, and for the same
+    // reason: nothing is subscribed to SSE this early, so the notification is
+    // the half that reaches the user. Silent when nothing was seeded.
+    if !seeded_handshake_scripts.is_empty() {
+        for path in &seeded_handshake_scripts {
+            engine
+                .event_bus
+                .emit_or_log(
+                    lucidos_engine::engine::event_bus::BusEvent::System(
+                        lucidos_engine::engine::event_bus::SystemEvent::HandshakeScriptApproved {
+                            path: path.clone(),
+                            source:
+                                lucidos_engine::core::handshake_approvals::ApprovalSource::Seeded,
+                            actor: None,
+                        },
+                    ),
+                    "[Proxy] HandshakeScriptApproved",
+                )
+                .await;
+        }
+        engine
+            .event_bus
+            .emit_or_log(
+                lucidos_engine::engine::event_bus::BusEvent::System(
+                    lucidos_engine::engine::event_bus::SystemEvent::NotificationCreated {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title: "Approved your handshake scripts".to_string(),
+                        message: format!(
+                            "Lucidos now runs an auth handshake script only if it \
+                             recorded who wrote it. Lucidos approved the scripts \
+                             already in use as they stand:\n\n{}\n\nEdit one outside \
+                             Lucidos and it stops running until you approve it again.",
+                            seeded_handshake_scripts.join("\n")
+                        ),
+                        task_id: None,
+                        app_id: None,
+                        thread_id: None,
+                        event_id: None,
+                        tap: Default::default(),
+                        actor: None,
+                    },
+                ),
+                "[Proxy] handshake seed NotificationCreated",
             )
             .await;
     }

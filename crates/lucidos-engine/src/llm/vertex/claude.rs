@@ -79,11 +79,20 @@ impl VertexProvider {
                     continue;
                 }
 
-                return Err(crate::llm::with_retry_context(
-                    format!("Claude API error ({}): {}", status, error_body),
-                    attempt,
-                )
-                .into());
+                // A publisher-model 404 is the shape a fresh Vertex setup hits,
+                // and Google's own sentence names no fix. The helper supplies
+                // one. Every other failure keeps its own wording.
+                //
+                // `model` carries the `[1m]` suffix the URL drops, and naming
+                // it is deliberate: that is the value the user picks in
+                // Settings, so that is what they would change.
+                let message =
+                    super::explain_publisher_model_404(status.as_u16(), &error_body, model, &url)
+                        .unwrap_or_else(|| {
+                            format!("Claude API error ({}): {}", status, error_body)
+                        });
+
+                return Err(crate::llm::with_retry_context(message, attempt).into());
             }
 
             // Parse SSE stream — retry on overload errors

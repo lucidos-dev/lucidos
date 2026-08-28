@@ -18,6 +18,7 @@ pub mod push_test_log;
 #[cfg(test)]
 mod tasks;
 pub mod user_tasks;
+pub(crate) mod webhook_ingress;
 
 pub use notifications::{Notification, NotificationStore};
 pub use push::{PushSubscription, PushSubscriptionStore};
@@ -368,6 +369,23 @@ impl SchedulerManager {
         tokio::spawn(async move {
             run_plugin_marketplace_update_check(startup_engine, startup_pool).await;
         });
+
+        // Probe the public webhook path, so an ingress that stopped carrying
+        // deliveries is reported rather than silently dropping them.
+        let engine_ingress = self.engine.clone();
+        let pool_ingress = self.pool.clone();
+        let ingress_job = Job::new_async(WEBHOOK_INGRESS_CRON, move |_uuid, _lock| {
+            let engine = engine_ingress.clone();
+            let pool = pool_ingress.clone();
+            Box::pin(async move {
+                run_webhook_ingress_check(engine, pool).await;
+            })
+        })?;
+        self.scheduler.add(ingress_job).await?;
+        log!(
+            "[Scheduler] Registered system task: webhook_ingress_check ({})",
+            WEBHOOK_INGRESS_CRON
+        );
 
         Ok(())
     }
@@ -1247,6 +1265,7 @@ mod backup;
 use backup::run_scheduled_backup;
 pub(crate) use backup::{run_backup, BackupGuard};
 use plugin_updates::{run_plugin_marketplace_update_check, MARKETPLACE_UPDATE_CHECK_CRON};
+use webhook_ingress::{run_webhook_ingress_check, WEBHOOK_INGRESS_CRON};
 
 /// Drop webhook delivery claims nothing can still be waiting on.
 ///

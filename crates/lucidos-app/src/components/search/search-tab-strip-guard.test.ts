@@ -112,8 +112,8 @@ describe('the Search Everywhere tab strip pans on one axis only', () => {
  * the label, differing only in colour, so the only thing keeping a focused tab
  * distinguishable is which of the two `::after` rules the cascade lands on.
  * They carry EQUAL specificity, so that is decided by source order alone, and
- * getting it backwards breaks exactly ONE of the seven tabs: the focus line
- * still shows on the other six, so the bug hides behind them. The one it breaks
+ * getting it backwards breaks exactly ONE of the eight tabs: the focus line
+ * still shows on the other seven, so the bug hides behind them. The one it breaks
  * is the active tab, which already wears a line of its own and would simply
  * keep it, and which is also the tab a user Tabbing into the strip lands on
  * first. Nothing else in the gate reads a cascade, and no test renders this

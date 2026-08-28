@@ -1,5 +1,7 @@
 import { API } from '../../api/client';
 import type { Change } from '../../api/client';
+import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
+import { getEventStream, setEventStream } from './event-stream';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
@@ -78,9 +80,15 @@ const PROXY_CONFIG_REJECTED_TOAST_KEY = 'proxy-config-rejected';
  *  user-initiated and bound to no thread. */
 const NIL_THREAD_ID = '00000000-0000-0000-0000-000000000000';
 
-let eventSource: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
+
+/** Where the shell reaches the engine's event surface. The suffixes live in the
+ *  SDK beside the transports, so the shell and an app cannot name them
+ *  differently. */
+function hostTargets(): EventStreamTargets {
+  return eventStreamTargets(API);
+}
 
 function markEventStreamStatus(status: 'connecting' | 'connected' | 'disconnected'): void {
   if (typeof document === 'undefined') return;
@@ -244,88 +252,106 @@ function findMergeConflictEventId(threadId: string, changeId: string | undefined
   return found;
 }
 
+/** Route one frame's `data` payload into the store.
+ *
+ *  Exported for the transport-equivalence test. Both a direct frame and a
+ *  worker-relayed one land here, so asserting on this function proves the two
+ *  transports are indistinguishable to the shell. */
+export function handleHostFrame(data: string): void {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(data);
+  } catch (err) {
+    // Telemetry carve-out (.claude/rules/frontend.md): an unparseable SSE
+    // frame arrives without user intent and names no user-facing operation,
+    // so there is nothing honest to toast about. Self-recovery: the stream
+    // stays open and the next frame is handled normally. Any state the
+    // dropped frame carried is re-read by `resyncLoadedThreads` on the next
+    // reconnect or wake. Logged rather than swallowed, so a malformed
+    // envelope is diagnosable instead of looking like an event never sent.
+    console.warn('[SSE] dropping unparseable frame', err);
+    return;
+  }
+
+  // SSE envelope: SystemEvent uses { "type": "...", "data": {...} }, ThreadEvent uses { "type": "ThreadEvent", "data": {...} }
+  const type = parsed.type as string;
+  const payload = (parsed.data ?? {}) as Record<string, unknown>;
+
+  if (type === 'ThreadEvent') {
+    handleThreadEvent(payload);
+  } else {
+    handleGlobalEvent(type, payload);
+  }
+
+  // Entity sync: recents, nav stack, pinned apps, store refresh.
+  processSSEForReferences(type, payload);
+}
+
 export function connectThreadEvents(): void {
-  if (eventSource) return;
+  if (getEventStream()) return;
 
   const gen = ++sseGeneration;
-  const url = `${API}/events`;
   markEventStreamStatus('connecting');
-  const es = new EventSource(url);
-  eventSource = es;
 
-  es.onmessage = (msg) => {
-    // Stale handler — a newer connection replaced this one. The old
-    // EventSource was closed, but its queued message handler can still fire.
-    if (gen !== sseGeneration) return;
+  const handlers = {
+    onFrame: (data: string) => {
+      // Stale handler: a newer connection replaced this one. The old transport
+      // was closed, but its queued message handler can still fire.
+      if (gen !== sseGeneration) return;
+      handleHostFrame(data);
+    },
 
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(msg.data);
-    } catch (err) {
-      // Telemetry carve-out (.claude/rules/frontend.md): an unparseable SSE
-      // frame arrives without user intent and names no user-facing operation,
-      // so there is nothing honest to toast about. Self-recovery: the stream
-      // stays open and the next frame is handled normally. Any state the
-      // dropped frame carried is re-read by `resyncLoadedThreads` on the next
-      // reconnect or wake. Logged rather than swallowed, so a malformed
-      // envelope is diagnosable instead of looking like an event never sent.
-      console.warn('[SSE] dropping unparseable frame', err);
-      return;
-    }
+    onOpen: () => {
+      if (gen !== sseGeneration) return;
+      markEventStreamStatus('connected');
+      // Only resync after a reconnect. On the initial connect, useStartup.ts
+      // already loads thread state. Without the flag we'd double-fetch on every
+      // page load.
+      if (needsResyncOnOpen) {
+        needsResyncOnOpen = false;
+        // Terminal BackupCompleted and BackupFailed are ephemeral. Fired during
+        // the SSE gap, they leave the UI on "Backing up" forever. Clear the
+        // signal so the user can retry. An in-flight backup repopulates on the
+        // next BackupProgress event, and a duplicate POST returns 409.
+        backupProgress.value = null;
+        // `resyncLoadedThreads` coalesces and surfaces its own failures, so
+        // `void` here only acknowledges that the promise is not needed back.
+        void resyncLoadedThreads();
+      }
+    },
 
-    // SSE envelope: SystemEvent uses { "type": "...", "data": {...} }, ThreadEvent uses { "type": "ThreadEvent", "data": {...} }
-    const type = parsed.type as string;
-    const data = (parsed.data ?? {}) as Record<string, unknown>;
+    onError: () => {
+      // Stale handler: disconnectThreadEvents() already closed this transport
+      // and connectThreadEvents() created a replacement. Without this guard the
+      // old handler closes the NEW connection, via the module-scoped
+      // `eventStream`, costing a 3s SSE gap on every iOS Safari PWA resume.
+      if (gen !== sseGeneration) return;
 
-    if (type === 'ThreadEvent') {
-      handleThreadEvent(data);
-    } else {
-      handleGlobalEvent(type, data);
-    }
+      // Mark for resync. Events emitted during the gap never reach this tab, so
+      // the next successful connect must refetch persisted state.
+      needsResyncOnOpen = true;
+      markEventStreamStatus('disconnected');
 
-    // Entity sync: recents, nav stack, pinned apps, store refresh.
-    processSSEForReferences(type, data);
+      // A transport that retries for itself keeps its connection: the shared
+      // worker owns the one upstream, and dropping our port would take that
+      // stream down for every other document. Its next `open` lands here and
+      // runs the resync armed above.
+      if (getEventStream()?.ownsReconnect) return;
+
+      getEventStream()?.close();
+      setEventStream(null);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectThreadEvents();
+      }, 3000);
+    },
   };
 
-  es.onopen = () => {
-    if (gen !== sseGeneration) return;
-    markEventStreamStatus('connected');
-    // Only resync after a reconnect — on the initial connect, useStartup.ts
-    // already loads thread state. Without the flag we'd double-fetch on every
-    // page load.
-    if (needsResyncOnOpen) {
-      needsResyncOnOpen = false;
-      // Terminal BackupCompleted and BackupFailed are ephemeral. Fired during
-      // the SSE gap, they leave the UI on "Backing up" forever. Clear the
-      // signal so the user can retry. An in-flight backup repopulates on the
-      // next BackupProgress event, and a duplicate POST returns 409.
-      backupProgress.value = null;
-      // `resyncLoadedThreads` coalesces and surfaces its own failures, so
-      // `void` here only acknowledges that the promise is not needed back.
-      void resyncLoadedThreads();
-    }
-  };
-
-  es.onerror = () => {
-    // Stale handler: disconnectThreadEvents() already closed this EventSource
-    // and connectThreadEvents() created a replacement. Without this guard the
-    // old handler closes the NEW connection, via the module-scoped
-    // `eventSource`, costing a 3s SSE gap on every iOS Safari PWA resume.
-    if (gen !== sseGeneration) return;
-
-    // Mark for resync. Events emitted during the gap never reach this tab, so
-    // the next successful connect must refetch persisted state.
-    needsResyncOnOpen = true;
-    markEventStreamStatus('disconnected');
-
-    es.close();
-    eventSource = null;
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connectThreadEvents();
-    }, 3000);
-  };
+  // The shell answers a PresenceCheck, so it registers as a ponger. On a shared
+  // connection the worker ORs its ports' answers into the one pong the engine
+  // waits for.
+  setEventStream(openEventStream(hostTargets(), handlers, { pongs: true }));
 }
 
 /** Refetch thread metadata for every thread, and missed events for the focused
@@ -388,8 +414,8 @@ export function disconnectThreadEvents(): void {
   for (const timer of applySessionEndedTimers.values()) clearTimeout(timer);
   applySessionEndedTimers.clear();
   markEventStreamStatus('disconnected');
-  eventSource?.close();
-  eventSource = null;
+  getEventStream()?.close();
+  setEventStream(null);
 }
 
 /** Route an SSE ThreadEvent to the correct thread in threadMap.

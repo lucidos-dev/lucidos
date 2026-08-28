@@ -281,6 +281,77 @@ impl LucidosEngine {
         Ok(())
     }
 
+    /// Record a `data/scripts/` write as authored, so the handshake runner will
+    /// run it (ADR 0144). A no-op for every other path, and for every caller
+    /// that is not in process.
+    ///
+    /// It takes `authorship` rather than assuming it, so the whole decision is
+    /// here and a call site cannot forget its half. `data/scripts/` stays
+    /// writable over the API, and an app UI writing there looks exactly like
+    /// the Files panel, so an HTTP write must never record.
+    async fn record_script_authorship(
+        &self,
+        authorship: WriteAuthorship,
+        full_path: &std::path::Path,
+        bytes: &[u8],
+    ) {
+        let Some(rel) =
+            crate::core::handshake_approvals::workspace_relative(self.workspace_path(), full_path)
+        else {
+            return;
+        };
+        if !records_script_authorship(authorship, &rel) {
+            return;
+        }
+        match crate::core::handshake_approvals::record(self.workspace_path(), &rel, bytes) {
+            // Unchanged content re-recorded is not news, so it announces nothing.
+            Ok(false) => {}
+            Ok(true) => {
+                self.event_bus
+                    .emit_or_log(
+                        BusEvent::System(SystemEvent::HandshakeScriptApproved {
+                            path: rel,
+                            source: crate::core::handshake_approvals::ApprovalSource::Authored,
+                            actor: None,
+                        }),
+                        "[Files] HandshakeScriptApproved",
+                    )
+                    .await;
+            }
+            // The write landed and only the record failed. Failing the write
+            // now would be a lie, so the log is the signal here, and the
+            // runner's own refusal is what the user meets.
+            Err(e) => log!(
+                "[Files] Failed to record handshake approval for {}: {}",
+                rel,
+                e
+            ),
+        }
+    }
+
+    /// Drop a `data/scripts/` file's approval, so a later file at the same path
+    /// starts unapproved. A no-op for every other path.
+    async fn forget_script_authorship(&self, full_path: &std::path::Path) {
+        let Some(rel) =
+            crate::core::handshake_approvals::workspace_relative(self.workspace_path(), full_path)
+        else {
+            return;
+        };
+        // `delete_file` is a tool call, so the caller is in process by
+        // construction. Dropping an approval is safe from anywhere in any
+        // case: it can only stop a script running.
+        if !records_script_authorship(WriteAuthorship::InProcessTool, &rel) {
+            return;
+        }
+        if let Err(e) = crate::core::handshake_approvals::forget(self.workspace_path(), &rel) {
+            log!(
+                "[Files] Failed to drop handshake approval for {}: {}",
+                rel,
+                e
+            );
+        }
+    }
+
     /// Commit a file change via the appropriate manager: shared user dir, app, or workspace artifact.
     async fn commit_file_change(
         &self,
@@ -453,10 +524,39 @@ fn apply_text_edit(
     ))
 }
 
+/// Who asked for a write, for the one thing that turns on it: whether a
+/// `data/scripts/` file becomes runnable (ADR 0144).
+///
+/// It exists because [`edit_file_at_path`](LucidosEngine::edit_file_at_path)
+/// has two callers of very different standing. The `edit_file` tool runs in
+/// process for the Lucidos Agent. `POST /api/v1/data/edit` is an HTTP caller,
+/// and an app UI reaching it is indistinguishable from the Files panel. There
+/// is deliberately no `Default`: a new call site has to say which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteAuthorship {
+    /// An in-process tool. A `data/scripts/` write records as authored.
+    InProcessTool,
+    /// The HTTP data surface. Never records, whatever it writes.
+    ApiCaller,
+}
+
+/// Whether a write at `workspace_rel` may make a handshake script runnable.
+///
+/// Two conditions, and both are the decision rather than a detail. The caller
+/// has to be in process, because an HTTP one cannot be told apart from an app
+/// UI. And the file has to be under `data/scripts/`, the only tree the
+/// handshake runner reads.
+pub(crate) fn records_script_authorship(authorship: WriteAuthorship, workspace_rel: &str) -> bool {
+    authorship == WriteAuthorship::InProcessTool && workspace_rel.starts_with("data/scripts/")
+}
+
 /// Every input `edit_file_at_path` takes. A struct rather than nine positional
 /// arguments, so a call site reads as the tool call it mirrors.
 pub(crate) struct EditFileArgs<'a> {
     pub raw_path: &'a str,
+    /// Whether this edit may make a handshake script runnable. See
+    /// [`WriteAuthorship`].
+    pub authorship: WriteAuthorship,
     /// A registered repository's name or id. `raw_path` is relative to its root
     /// instead of to `data/`.
     pub repo: Option<&'a str>,
@@ -515,6 +615,7 @@ impl LucidosEngine {
     ) -> Result<FileEditResult, String> {
         let EditFileArgs {
             raw_path,
+            authorship,
             repo,
             json_path,
             new_value,
@@ -625,6 +726,14 @@ impl LucidosEngine {
                 .await
                 .map_err(|e| format!("Failed to emit event: {}", e))?;
         }
+
+        // Ahead of the emit below, which can fail on a transient pool timeout
+        // with the edit already committed. Recording after the `?` would leave
+        // an authored script unapproved, and the user meeting a refusal for a
+        // change they asked for. Same ordering, and same reason, as the
+        // profile-cache refresh above.
+        self.record_script_authorship(authorship, &full_path, new_content.as_bytes())
+            .await;
 
         self.emit_app_event_for_data_path(path, app_existed_before, false)
             .await
@@ -1101,6 +1210,15 @@ impl LucidosEngine {
                         .await?;
                 }
 
+                // Before the emit, which can fail with the write already
+                // committed. See the same ordering in `edit_file_at_path`.
+                self.record_script_authorship(
+                    WriteAuthorship::InProcessTool,
+                    &full_path,
+                    content.as_bytes(),
+                )
+                .await;
+
                 self.emit_app_event_for_data_path(path, app_existed_before, false)
                     .await?;
 
@@ -1117,6 +1235,8 @@ impl LucidosEngine {
                 match self
                     .edit_file_at_path(EditFileArgs {
                         raw_path,
+                        // The Lucidos Agent's own tool call, in process.
+                        authorship: WriteAuthorship::InProcessTool,
                         repo,
                         json_path: args.get("json_path").and_then(|v| v.as_str()),
                         new_value: args.get("new_value").cloned(),
@@ -1336,6 +1456,28 @@ impl LucidosEngine {
                         .await?;
                 }
 
+                // The bytes landed by copy rather than by a write, so read
+                // back what is actually there. Before the emit, which can fail
+                // with the copy already committed.
+                match std::fs::read(&dst_path) {
+                    Ok(bytes) => {
+                        self.record_script_authorship(
+                            WriteAuthorship::InProcessTool,
+                            &dst_path,
+                            &bytes,
+                        )
+                        .await
+                    }
+                    // The copy landed and only the read-back failed, so the
+                    // file stays unapproved. Fail-closed, and the runner's own
+                    // refusal names the fix.
+                    Err(e) => log!(
+                        "[Files] Could not read {} back to record it: {}",
+                        dst_path.display(),
+                        e
+                    ),
+                }
+
                 self.emit_app_event_for_data_path(&dst_data_path, app_existed_before, false)
                     .await?;
 
@@ -1414,6 +1556,9 @@ and emits the PluginUninstalled event so the registry stays in sync.",
 
                 self.emit_app_event_for_data_path(path, app_existed_before, true)
                     .await?;
+                // A later file at this path starts unapproved, rather than
+                // inheriting the deleted one's standing.
+                self.forget_script_authorship(&full_path).await;
 
                 let sha_short = &commit_sha[..commit_sha.floor_char_boundary(7)];
                 Ok(format!(

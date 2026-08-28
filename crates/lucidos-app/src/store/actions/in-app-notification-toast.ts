@@ -20,6 +20,7 @@ import {
   type DeepLinkTarget,
 } from './notification-deeplink';
 import { composeToastMessage } from '../../components/shared/toastMessage';
+import { currentNotificationToasts } from './preferences';
 import { dismissToast, showToast, toasts, focusedThreadId, threadMap, threadsLoaded } from '../store';
 import { isInViewport } from '../../utils/viewport';
 import { isPageActive } from '../../utils/pageActive';
@@ -116,6 +117,16 @@ export function showInAppNotificationToast({ title, body, target }: InAppNotific
     if (target.notification) markReadOptimistic(target.notification);
     return;
   }
+
+  // The user has turned in-app toasts off, so the notification waits on the
+  // bell badge and in the Notifications panel instead of interrupting. The gate
+  // sits HERE rather than in two other tempting places. Not in the engine: its
+  // push-suppressed decision is about presence, which this preference does not
+  // change, and moving it there would mean no toast AND a push. Not in
+  // `showToast`: an apply-change or error toast answers something the user just
+  // did, and this silences only the unsolicited kind. Below the Row 1 branch on
+  // purpose, so reading the source event still marks it read.
+  if (!currentNotificationToasts()) return;
 
   // Row 2 or 3: active page, on a different thread OR the same thread
   // scrolled away from the source event. Toast + badge (badge already

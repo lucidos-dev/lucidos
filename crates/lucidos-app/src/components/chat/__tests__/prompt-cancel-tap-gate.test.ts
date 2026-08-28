@@ -23,13 +23,21 @@ function findMorphButton(): string {
   return match[0];
 }
 
-/** The body of a `useTouchActivated` call, which is the ONE action both the
- *  touch path and the click path run. Gating it gates every activation. */
+/** The whole `useTouchActivated` call, which carries the ONE action both paths
+ *  run, plus the enable flag, the gate and the destructive flag.
+ *
+ *  Found by balancing parentheses rather than by a shape regex. A regex keyed
+ *  on the old one-line formatting matched nothing once the call was wrapped,
+ *  and an assertion over nothing passes. */
 function findActivationBody(name: string): string {
-  const re = new RegExp(`const ${name} = useTouchActivated\\([\\s\\S]*?\\n  \\}(?:,[^)]*)?\\);`);
-  const match = promptSource.match(re);
-  if (!match) throw new Error(`${name} not found in PromptInput.tsx`);
-  return match[0];
+  const start = promptSource.indexOf(`const ${name} = useTouchActivated(`);
+  if (start < 0) throw new Error(`${name} not found in PromptInput.tsx`);
+  let depth = 0;
+  for (let i = promptSource.indexOf('(', start); i < promptSource.length; i++) {
+    if (promptSource[i] === '(') depth++;
+    else if (promptSource[i] === ')' && --depth === 0) return promptSource.slice(start, i + 1);
+  }
+  throw new Error(`${name} call is unbalanced in PromptInput.tsx`);
 }
 
 describe('send-cancel-morph button has tap-gate scroll protection', () => {
@@ -56,20 +64,29 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
     expect(btn).toMatch(/onPointerCancel=\{[^}]*\.cancel\(\)/);
   });
 
-  it('hands the gate to the click path, which is the path it guards', () => {
+  it('hands the gate to every path that could fire from a scroll', () => {
     // The gate catches the click iOS fires after a touch that was starting a
-    // scroll. It used to wrap the shared action, where it also vetoed the touch
-    // path. That path is the only one on iOS with the keyboard up, so a veto
-    // there is a dead button. `touchActivated` asks the gate on `onClick` only.
-    expect(findMorphButton()).toMatch(/onClick=\{sendActivate\.onClick\}/);
-    expect(findActivationBody('sendActivate')).toMatch(/\}, morphMode === 'send', morphActivationGate\);$/);
+    // scroll. It used to wrap the shared action, where it also vetoed the
+    // constructive touch path. That path is the only one on iOS with the
+    // keyboard up, so a veto there is a dead button. So `touchActivated` asks
+    // the gate on `onClick`, and on `onTouchEnd` only for a destructive face.
+    expect(findMorphButton()).toMatch(/onClick=\{morphActivate\.onClick\}/);
+    expect(findActivationBody('morphActivate')).toMatch(/morphActivationGate/);
   });
 
   it('gives that gate a spend half, so a served press cannot rule on the next', () => {
     // The gate holds ONE press, and the touch path serves without asking. So
     // it spends the press instead. A stale one would rule on the next
     // activation that arrives with none of its own.
-    expect(promptSource).toMatch(/const morphActivationGate = \{ pass: morphTapPassed, spend: morphGate\.cancel \}/);
+    expect(promptSource).toMatch(/spend: morphGate\.spend,/);
+  });
+
+  it('never wires spend to cancel, which would fake an aborted gesture', () => {
+    // They were one method. `cancel` means the SYSTEM took the gesture, which
+    // `aborted` reports to the destructive touch path. A served press sharing
+    // it would stand the next Cancel down.
+    expect(promptSource).not.toMatch(/spend: morphGate\.cancel/);
+    expect(promptSource).toMatch(/aborted: morphGate\.wasAborted,/);
   });
 
   it('does not open a confirmation dialog before canceling', () => {
@@ -83,14 +100,19 @@ describe('send-cancel-morph button has tap-gate scroll protection', () => {
 // scroll-vs-tap gate. Without it the iOS scroll-tap turn-abort regression simply
 // moves to the relocated button.
 describe('answer control Cancel/Submit have tap-gate scroll protection', () => {
-  it('gates the lone Cancel onClick before aborting', () => {
-    expect(promptSource).toMatch(/if\s*\(!morphTapPassed\(\)\)\s*return;\s*cancelExchangeForTarget\(\)/);
+  it('routes the lone Cancel through a destructive activation, which is gated', () => {
+    // It used to guard its click inline. The shared path now carries the gate
+    // on both of its paths, because the button gained a touch path.
+    const body = findActivationBody('answerCancelActivate');
+    expect(body).toMatch(/cancelExchangeForTarget\(\)/);
+    expect(body).toMatch(/morphActivationGate/);
+    expect(body).toMatch(/true,\s*\)$/);
   });
 
   it('gates the lone Submit on its click path', () => {
     // Through `useTouchActivated`'s gate argument rather than inline, for the
     // reason the morph button's case above gives.
-    expect(findActivationBody('answerSubmitActivate')).toMatch(/\}, true, morphActivationGate\);$/);
+    expect(findActivationBody('answerSubmitActivate')).toMatch(/\}, true, morphActivationGate\)$/);
   });
 });
 
@@ -153,9 +175,11 @@ describe('post-submit cancel settle window is wired', () => {
 // WebKit dispatches the synthetic click. The click is dropped and the button
 // reads as dead. `touchActivated` runs the action inside the gesture instead.
 //
-// Constructive actions only, by decision. A dropped tap on Stop or Cancel is a
-// safe no-op the user repeats. Firing those a gesture earlier would work
-// against the gate and the settle window above.
+// It was constructive actions only, on the reading that a dropped tap on Cancel
+// is a safe no-op the user repeats. It is not: with the keyboard up there is no
+// click to repeat to, so the button is simply dead. A destructive face now
+// takes the touch path and RULES on the gate, which keeps the protection that
+// withholding it was buying.
 const splitButtonSource = readFileSync(resolve(here, '../../shared/SplitButton.tsx'), 'utf-8');
 const bannerSource = readFileSync(resolve(here, '../WaitingBanner.tsx'), 'utf-8');
 
@@ -164,12 +188,24 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(promptSource).toMatch(/import\s*\{[^}]*\buseTouchActivated\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/hooks\/useTouchActivated['"]/);
   });
 
-  it('gives the morph Send a touch path', () => {
-    expect(findMorphButton()).toMatch(/onTouchEnd=\{sendActivate\.onTouchEnd\}/);
+  it('gives the morph a touch path', () => {
+    expect(findMorphButton()).toMatch(/onTouchEnd=\{morphActivate\.onTouchEnd\}/);
   });
 
-  it('enables that touch path in Send mode only, never on Stop or Cancel', () => {
-    expect(findActivationBody('sendActivate')).toMatch(/\}, morphMode === 'send', morphActivationGate\);$/);
+  it('keeps that touch path live in Send AND Cancel mode', () => {
+    // Cancel had none, and iOS drops the click when the keyboard dismisses
+    // under the finger, so the button was dead whenever the keyboard was up.
+    // The probe logged it as `Cancel: dead` with the finger still and the node
+    // connected. See `docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`.
+    expect(findActivationBody('morphActivate'))
+      .toMatch(/morphMode === 'send' \|\| \(morphMode === 'cancel' && !cancelSettling\)/);
+  });
+
+  it('marks the morph destructive while it reads Cancel, never while it reads Send', () => {
+    // The flag is what makes the touch path RULE on the gate rather than spend
+    // it. On Send it must stay false: two shipped fixes asked the constructive
+    // path a question, and both were reported as a dead Send.
+    expect(findActivationBody('morphActivate')).toMatch(/morphMode === 'cancel',\s*\)$/);
   });
 
   it('gives the lone answer Submit a touch path', () => {
@@ -182,10 +218,18 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     // rest of the synthesized sequence, `click` included, so it removes the
     // fallback it was reaching for. It shipped once and the button went dead
     // wherever the user pressed, until they dismissed the keyboard.
-    for (const source of [promptSource, splitButtonSource]) {
+    for (const source of [promptSource, splitButtonSource, bannerSource]) {
       expect(source).not.toMatch(/onMouseDown=/);
       expect(source).not.toMatch(/\bholdFocusOnPress\b/);
     }
+  });
+
+  it('gives Diff a touch path, since it sits in the row and is not destructive', () => {
+    // Reported dead with the keyboard up, alongside the answer Submit and the
+    // lone Cancel. Diff opens a view and can be repeated, so none of the
+    // reasons the destructive faces decline the touch path apply to it.
+    expect(bannerSource).toMatch(/onTouchEnd=\{activate\.onTouchEnd\}/);
+    expect(bannerSource).toMatch(/import\s*\{[^}]*\buseTouchActivated\b[^}]*\}/);
   });
 
   it('opts the multi-select Submit in through the split button', () => {
@@ -193,15 +237,28 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     expect(splitButtonSource).toMatch(/!!props\.primaryTouchActivate && !props\.primaryDisabled/);
   });
 
-  it('leaves the destructive buttons on click alone', () => {
-    // Exactly two touch paths in the row: the morph in Send mode, and the lone
-    // answer Submit. A third means a destructive button took one.
-    expect((promptSource.match(/onTouchEnd=/g) ?? []).length).toBe(2);
+  it('enumerates every touch path in the row, and marks each destructive one', () => {
+    // The row's touch paths are enumerated, never counted to a bare total. A
+    // new one then has to be named here, and say whether it is destructive.
+    // Three live in PromptInput: the morph, the lone answer Submit and the
+    // lone answer Cancel. Diff is the fourth and lives in WaitingBanner.
+    expect((promptSource.match(/onTouchEnd=/g) ?? []).length).toBe(3);
+    expect((bannerSource.match(/onTouchEnd=/g) ?? []).length).toBe(1);
+    expect(findMorphButton()).toMatch(/onTouchEnd=\{morphActivate\.onTouchEnd\}/);
+    const loneCancel = promptSource.match(/answerMode === 'cancel' \?[\s\S]*?<\/button>/);
+    expect(loneCancel, 'the lone answer Cancel was not found').not.toBeNull();
+    expect(loneCancel![0]).toMatch(/onTouchEnd=\{answerCancelActivate\.onTouchEnd\}/);
+    // The two destructive ones pass the flag; the two constructive ones do not.
+    expect(findActivationBody('morphActivate')).toMatch(/morphMode === 'cancel',\s*\)$/);
+    expect(findActivationBody('answerCancelActivate')).toMatch(/true,\s*\)$/);
+    expect(findActivationBody('answerSubmitActivate')).not.toMatch(/destructive/);
+    expect(bannerSource).toMatch(/const activate = useTouchActivated\(\(\) => \{[\s\S]*?\n  \}\);/);
   });
 
   it('leaves the change-action banner Apply on click', () => {
-    // The split button is shared. Touch activation is opt-in precisely so the
-    // banner, which nobody reaches with a keyboard up, is unchanged.
+    // The split button is shared, and touch activation is opt-in. Apply leaves
+    // it off by choice, not by reach: it renders into this same row, but a
+    // press sliding off it would merge a branch.
     expect(bannerSource).not.toMatch(/primaryTouchActivate/);
   });
 
@@ -210,9 +267,14 @@ describe('the prompt row survives the iOS keyboard dropping a click', () => {
     // listens on `click`. So each action has to drop the keyboard itself.
     const submitFn = promptSource.match(/async function submit\(\)[\s\S]*?\n  \}/);
     const multiFn = promptSource.match(/async function submitMultiAnswer\(\)[\s\S]*?\n  \}/);
+    const diffFn = bannerSource.match(/function DiffButton\([\s\S]*?\n\}/);
     expect(submitFn, 'submit() not found').not.toBeNull();
     expect(multiFn, 'submitMultiAnswer() not found').not.toBeNull();
-    expect(submitFn![0]).toMatch(/if \(isMobile\(\)\) el\.blur\(\)/);
+    expect(diffFn, 'DiffButton not found').not.toBeNull();
+    expect(diffFn![0]).toMatch(/blurPromptInputIfFocused\(\)/);
+    // Optional on both, because a send no longer needs the textarea node. See
+    // `resolveComposerText`.
+    expect(submitFn![0]).toMatch(/if \(isMobile\(\)\) el\?\.blur\(\)/);
     expect(multiFn![0]).toMatch(/if \(isMobile\(\)\) el\?\.blur\(\)/);
   });
 

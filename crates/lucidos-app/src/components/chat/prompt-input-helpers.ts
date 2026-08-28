@@ -178,12 +178,75 @@ export function setCanceledWhileAwaiting(threadId: string, awaiting: boolean): v
   canceledWhileAwaitingByThread.value = next;
 }
 
+/** Is there anything to send? ONE reading, and both the Send face's lit-ness
+ *  and `submit()`'s dispatch take it.
+ *
+ *  Two readings is what a dead Send button looks like. The face was lit from
+ *  `text.length > 0` and the send refused on `text.trim()`. A draft of nothing
+ *  but spaces therefore drew an enabled button whose press returned in silence.
+ *  A FAILED image upload did the same from the other side: it counted as
+ *  content but not as in-flight, so nothing was sendable and the button said
+ *  otherwise.
+ *
+ *  The text arrives TRIMMED here, because that is what a send carries. An
+ *  upload arrives as a boolean rather than a count, because only one of the two
+ *  pending states is a reason to light Send: an `uploading` entry becomes a
+ *  send the moment its hash lands, and a `failed` one never will. */
 export function composeHasContent(
-  hasText: boolean,
+  text: string,
   attachedImagesCount: number,
-  pendingUploadsCount: number,
+  uploadInFlight: boolean,
 ): boolean {
-  return hasText || attachedImagesCount > 0 || pendingUploadsCount > 0;
+  return text.trim().length > 0 || attachedImagesCount > 0 || uploadInFlight;
+}
+
+/** What a submit sends, out of the two places the composer keeps its text.
+ *
+ *  **The draft decides.** The Send face is rendered from it, through
+ *  `composeHasContent` above, and `sendCompose` sends it. Gating on the textarea
+ *  instead lit the button from one value and refused it from another. The two
+ *  need only drift apart for the press to die in silence, which is what four
+ *  reports of a dead composer button look like. The plan behind this is
+ *  docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md.
+ *
+ *  The textarea is not ignored. Text the store lacks is sent, and handed back to
+ *  the store as well. So nothing typed is lost, and `sendCompose` cannot go on
+ *  to send an empty copy. `domText` is null when there is no textarea node,
+ *  which is an absent source rather than a disagreement.
+ *
+ *  Both are compared trimmed, matching what the submit paths already send, so
+ *  trailing whitespace never reads as a disagreement. */
+export interface ComposerText {
+  /** The trimmed text to send, and what the caller's own empty check reads. */
+  text: string;
+  /** The RAW textarea value to write into the store before dispatching, or null
+   *  when the store already holds the text. Raw, so the recovery alters nothing
+   *  the user typed. */
+  storeWrite: string | null;
+  /** The two sources held different text. The impossible state itself, so the
+   *  caller reports it. */
+  disagreed: boolean;
+}
+
+export function resolveComposerText(draftText: string, domText: string | null): ComposerText {
+  const draft = draftText.trim();
+  if (domText === null) return { text: draft, storeWrite: null, disagreed: false };
+  const dom = domText.trim();
+  if (draft === dom) return { text: draft, storeWrite: null, disagreed: false };
+  if (draft.length > 0) return { text: draft, storeWrite: null, disagreed: true };
+  return { text: dom, storeWrite: domText, disagreed: true };
+}
+
+/** What the user is told when the two disagreed, and null when they agreed. It
+ *  names which copy was sent, because the box may be showing the other one.
+ *
+ *  It takes the whole resolution rather than a side, so neither caller repeats
+ *  the reading of `storeWrite` that decides which copy that was. */
+export function composerTextDisagreementToast(resolved: ComposerText): string | null {
+  if (!resolved.disagreed) return null;
+  return resolved.storeWrite === null
+    ? 'The text on screen and the saved draft differed. Sent the saved draft.'
+    : 'The saved draft was empty. Sent the text on screen.';
 }
 
 /** Whether the optimistic `submittingThreadIds` flag should be released.

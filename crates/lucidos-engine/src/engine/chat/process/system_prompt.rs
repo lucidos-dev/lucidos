@@ -514,7 +514,7 @@ REFRESHING OPEN WINDOWS:
 FILE REFERENCES:
 - Always use the full path ("artifacts/notes.md", not "notes.md"): a full path becomes a clickable link, a bare filename does not.
 - ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered.
-- LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception.
+- LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception. A `#fragment` arrives as the app's `location.hash`, so name the ITEM when the app reads one: `[Some report](app:pr-understanding#pr-1645)`.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
 - Link a UI panel by its bare name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Apps and other plugins are downloaded from `[Plugins](app-store)`; call it the Plugins panel, never the retired "App Store" or "Store".
 
@@ -1078,7 +1078,21 @@ mod tests {
     /// The line itself is 285 chars, so the ratchet moved less than the line
     /// costs. The previous ceiling carried 68 chars of slack, and this
     /// absorbed it. Every row below is a measured total, never a rounded one.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_158;
+    ///
+    /// Raised by 140 to a measured 116,298 for the *app fragment* clause on
+    /// the app-link line. An app link named the app and nothing inside it. So
+    /// an agent publishing a per-item artifact into a shared app could only
+    /// link the app and hope. Knowhow cannot carry it, for the reason the
+    /// image line could not: writing the link is the moment the choice is
+    /// made, and nothing prompts a lookup first.
+    ///
+    /// Raised by 254 to a measured 116,552 for `fragment` on the two schemas
+    /// that build a navigation: `navigate_ui` and `send_notification`'s `tap`.
+    /// A notification tap could open an app and name no place inside it. So a
+    /// notification about one item landed on whatever the app shows by
+    /// default. Knowhow cannot carry it, for the reason the app-link clause
+    /// could not: the tap is written in the same breath as the notification.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_552;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1311,12 +1325,16 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_300,
+            2_436,
             "the two frozen enums the SDK is generated from (17 targets, 18 \
              settings views) are 758 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
-             glossed, because the value already says what the page is)",
+             glossed, because the value already says what the page is). Raised \
+             from 2,300 by `fragment`, the companion arg naming a place inside \
+             the app. It has to say where the value surfaces, the app's own \
+             `location.hash`, because no other surface the model reads says \
+             so, and the choice is made while writing the call",
         ),
         (
             "request_credential",
@@ -1906,6 +1924,39 @@ mod tests {
         assert!(
             section.contains("shows it to YOU"),
             "the section must say a read reaches the agent, not the user:\n{section}"
+        );
+    }
+
+    /// An app link named the app and nothing inside it. So an agent writing a
+    /// per-item artifact into a shared app could only link the app and hope.
+    /// The reader then landed on whatever item they saw last.
+    ///
+    /// Same shape as the image line above, and the same reason it lives here
+    /// rather than in knowhow: writing the link IS the moment the choice is
+    /// made, and nothing prompts a lookup first. The *app fragment* entry in
+    /// `docs/glossary.md` carries the mechanism.
+    #[test]
+    fn the_file_references_section_links_inside_an_app_not_only_at_it() {
+        let section = file_references_section();
+        let section = section.as_str();
+
+        // The form itself. Naming the capability without the `#` leaves the
+        // agent nothing to write.
+        assert!(
+            section.contains("(app:pr-understanding#pr-1645)"),
+            "the section must show the fragment form, not just name it:\n{section}"
+        );
+        // Where it arrives. Without this the agent cannot tell whether an app
+        // it wrote itself would even see the target.
+        assert!(
+            section.contains("location.hash"),
+            "the section must say how the fragment reaches the app:\n{section}"
+        );
+        // The caveat. An app that reads no hash ignores one, so a fragment is
+        // worth writing only where the app answers it.
+        assert!(
+            section.contains("when the app reads one"),
+            "the section must gate the fragment on the app reading it:\n{section}"
         );
     }
 

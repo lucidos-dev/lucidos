@@ -870,7 +870,7 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 /* Action buttons (copy) reveal on hover/focus on desktop, always visible on touch. */
 .thread-row-action {
     opacity: 0;
-    transition: opacity 0.12s ease-in-out;
+    transition: opacity calc(0.12s * var(--duration-scale)) ease-in-out;
 }
 
 @media (hover: hover) {

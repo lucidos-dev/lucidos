@@ -22,7 +22,9 @@
 /* The chip doubles as the Record button: click it to rebind the shortcut. */
 .shortcut-record-btn {
   cursor: pointer;
-  transition: border-color 0.12s ease, color 0.12s ease;
+  transition:
+    border-color calc(0.12s * var(--duration-scale)) ease,
+    color calc(0.12s * var(--duration-scale)) ease;
 }
 
 .shortcut-record-btn:hover {

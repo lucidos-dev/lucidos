@@ -141,6 +141,12 @@ Call **`get_backup_status`** (read-only, no arguments) to report:
 Use it to answer "when's my next/last backup?", "how big/long are my backups?",
 or to check before changing the schedule.
 
+The **workspace picker** states a short version of the same thing on every row:
+"Backed up 3h ago", or a warning when the last good backup is stale, has never
+happened, or backups were never set up. It is one line about one workspace, and
+it goes quiet for a workspace that is not running. So it answers "is my data
+safe?" at a glance and nothing more; `get_backup_status` is where the detail is.
+
 ## Encryption key
 
 Backups are encrypted with a per-workspace key. The first scheduled backup

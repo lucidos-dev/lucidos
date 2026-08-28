@@ -347,6 +347,7 @@ function CredentialFormInner({
   const isEmailPassword = selectedAuthType === 'email_password';
   const isPassword = selectedAuthType === 'password';
   const isOAuthClient = selectedAuthType === 'oauth_client';
+  const isSecret = selectedAuthType === 'secret';
   const isSingleValue = !isEmailPassword && !isPassword && !isOAuthClient;
   // Email server settings only make sense when editing an existing account;
   // the create/request flow just collects the password.
@@ -358,6 +359,7 @@ function CredentialFormInner({
       case 'bearer': return 'Bearer Token';
       case 'basic': return 'Username:Password';
       case 'email_password': return 'App Password';
+      case 'secret': return 'Secret';
       default: return 'Token';
     }
   }
@@ -368,6 +370,7 @@ function CredentialFormInner({
       case 'bearer': return 'Enter your bearer token';
       case 'basic': return 'Enter as username:password';
       case 'email_password': return 'Enter your app password';
+      case 'secret': return 'Paste the shared secret';
       default: return 'Enter your token or API key';
     }
   }
@@ -474,6 +477,10 @@ function CredentialFormInner({
                 required
               />
             </div>
+            {/* A `secret` is sent nowhere, so it has no base URL. Hiding the
+                field is what lets it stay `required` for every type that does
+                need one. */}
+            {!isSecret && (
             <div class="form-group">
               <label>Base URL</label>
               {/* Real state, not a bare `value=` with no handler. This input is
@@ -492,6 +499,7 @@ function CredentialFormInner({
                 required
               />
             </div>
+            )}
             <div class="form-group">
               <label>Auth Type</label>
               <Dropdown
@@ -501,6 +509,11 @@ function CredentialFormInner({
                   { value: 'basic', label: 'Basic Auth' },
                   { value: 'password', label: 'Password' },
                   { value: 'oauth_client', label: 'OAuth Client' },
+                  {
+                    value: 'secret',
+                    label: 'Secret',
+                    description: 'A shared secret, signed with rather than sent',
+                  },
                 ]}
                 value={selectedAuthType}
                 onChange={(v) => setSelectedAuthType(v as AuthType)}

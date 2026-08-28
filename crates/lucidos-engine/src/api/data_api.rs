@@ -575,6 +575,10 @@ pub(super) async fn edit_data(
             .engine
             .edit_file_at_path(crate::engine::tools::files::EditFileArgs {
                 raw_path: &body.path,
+                // An HTTP caller, so a `scripts/` edit here never makes the
+                // file runnable: an app UI reaching this route is
+                // indistinguishable from the Files panel (ADR 0144).
+                authorship: crate::engine::tools::files::WriteAuthorship::ApiCaller,
                 // The HTTP data surface is `data/`-only, so it never names a
                 // repo and always takes the committing default.
                 repo: None,

@@ -60,11 +60,14 @@ The engine runs the PresenceCheck protocol (§3) to find out. After Step A, it h
 | 2 | Active AND on source thread AND source event NOT in viewport | n/a¹ | yes | yes | no |
 | 3 | Active AND on Lucidos, NOT on source thread | n/a¹ | yes | yes | no |
 | 4 | Connected-but-hidden (SSE alive but `isPageActive()` false) | `push_allowed`² | no³ | yes | no |
+| 4b | Connected, visible, but an app is FULLSCREEN | `push_allowed`² | no⁴ | yes | no |
 | 5 | Offline (no SSE) | `push_allowed`² | — | re-syncs on next page load via `GET /api/v1/notifications?filter=unread` | no |
 
 ¹ Active devices never get an OS push by definition of Step A: at least one device (this one) is active, so `push_allowed = false` for everyone.
 ² Only sent when Step A returned `push_allowed = true`. Otherwise no push to this device either.
 ³ Page receives the `NotificationCreated` SSE message and increments the bell badge, but does NOT render a toast — the toast would auto-dismiss before the user returns to the tab, creating a "ghost toast" they'd miss. The bell badge is the durable, on-return signal.
+
+⁴ The page is visible, but the shell is not the surface in front of the user. It pongs `is_active: false`, so the notification takes the OS surface. See §4 for why. This makes a fullscreen app agree with a popped-out app window, which has always been Row 5. Rows 1 to 3 all require an ACTIVE shell, so a fullscreen app cannot match them.
 
 **OS-push transport — web push vs native desktop (Rows 4 & 5).** "OS push" in the matrix above is a *surface*, not a single transport. How it actually reaches a device depends on the client:
 - **Browser / PWA** → web push (APNs / FCM) to the device's stored `push_subscriptions` row, rendered by the service worker.
@@ -75,10 +78,12 @@ The engine runs the PresenceCheck protocol (§3) to find out. After Step A, it h
 
 **Row 1 requires a non-null `event_id`.** `notifications.event_id` is nullable; some notifications (scheduler errors, ad-hoc `send_notification` calls without an event ref, audit events) have no specific source event. When `event_id` is null, Row 1 cannot be evaluated and the device falls through to Row 2 (if thread matches) or Row 3.
 
-**Multi-tab / multi-window per device.** Two Lucidos tabs on the same browser share `device_id` (per-origin localStorage) and each maintain their own SSE connection. Both receive PresenceCheck pings and each POST their own pong. Reconciliation:
-- For Step A's `is_active`: logical-OR across pongs from the same device. If ANY tab on a device pongs as active, that device counts as active.
-- For Step B's auto-read (Row 1): if ANY tab pongs as "event in viewport on source thread", the auto-read endpoint is hit once. `POST /api/v1/notifications/:id/read` is idempotent — re-marking an already-read notification is a no-op.
-- Step B for the in-app surface is evaluated **per tab**, not per device. Each tab checks its own focused thread / viewport on SSE receipt; the device-wide pong reconciliation only matters for Step A.
+**Multi-tab / multi-window per device.** Two Lucidos tabs on the same browser share `device_id` (per-origin localStorage). Where the browser has `SharedWorker` they also share **one** SSE connection, held by the *shared SSE holder*. The holder ORs their answers into the single pong that connection owes. Where it does not, each tab holds its own connection and POSTs its own pong. Either way the reconciliation is the same:
+- For Step A's `is_active`: logical-OR across the device's answers. If ANY tab on a device is active, that device counts as active.
+- For Step B's auto-read (Row 1): if ANY tab reports "event in viewport on source thread", the auto-read endpoint is hit once. `POST /api/v1/notifications/:id/read` is idempotent, so re-marking an already-read notification is a no-op.
+- Step B for the in-app surface is evaluated **per tab**, not per device. Each tab checks its own focused thread / viewport on SSE receipt; the device-wide reconciliation only matters for Step A.
+
+**Where the OR happens is what keeps the count honest.** The engine waits for one pong per open SSE connection, so N documents behind one connection owe it one answer, not N. Aggregating in the holder makes that true by construction. Answering per document instead would let the engine decide on the first pong it saw. A background tab could then settle the push while a foreground one was still answering.
 
 **Worked example.** macOS Chrome with Lucidos in a background tab; iOS PWA with the screen off in your pocket.
 - Step A: Chrome's `device_presence` row was deleted when the tab went background (visibilitychange fired DeviceHidden), but its **EventSource stays open** while backgrounded, so it counts toward the live SSE-connection gate → the engine runs the PresenceCheck. Chrome pongs `is_active: false` (hidden — `hasFocus()` is false). iOS's PWA is suspended with its EventSource closed, so it never pongs. No `is_active` pong arrives within the deadline → `push_allowed = true`.
@@ -96,6 +101,11 @@ If you reported "Chrome bell only, no OS push" in this scenario, the bug is one 
 2. **`device_presence` candidates** — rows fresher than `PRESENCE_STALE_AFTER` (120s — `crates/lucidos-engine/src/core/device_presence.rs`), refreshed by a 30s heartbeat (`device-presence.ts:HEARTBEAT_INTERVAL_MS`) plus a forced refresh on `visibilitychange-while-visible`. A secondary signal that covers the inverse failure: a page that heartbeated within the last 120s but whose SSE connection just dropped (network blip).
 
 The engine runs the PresenceCheck when `max(sse_connections, candidate_count) > 0`, waiting for that many pongs (the deadline short-circuit fires once they all arrive). It skips the protocol and sets `push_allowed = true` directly **only when both are zero** — nobody is reachable (the "phone in your pocket" case).
+
+**A connection owes exactly one pong, and that is a client-side contract.** The count above is connections, not documents, so anything sharing a connection has to answer once for all of it. The *shared SSE holder* does that by ORing its documents' answers (§ Multi-tab above). Two consequences worth knowing when reading a trace:
+
+- An app iframe has **no presence voice**. It attaches to the holder and never answers, exactly as it never answered when it held its own connection. So a workspace with only apps open, and no shell anywhere, pongs nothing and takes the OS push.
+- A connection whose documents all decline to answer produces no pong at all. The engine then waits out `DEADLINE_MS` and pushes, which is the correct outcome: there was no shell to show a toast.
 
 **Why the SSE gate, not heartbeat freshness alone.** iOS suspends the 30s heartbeat timer while a PWA is foregrounded (and never fires `visibilitychange` because the page never went hidden), so a genuinely-active page's `device_presence` row ages past the 120s window even though its EventSource is open and it would pong `is_active`. Gating only on heartbeat freshness then skipped the PresenceCheck and fired an OS push on top of the active page ("push while the app was foreground for a while"). The live SSE-connection count doesn't depend on the heartbeat surviving, so the active page always gets a chance to pong and suppress the push.
 
@@ -170,6 +180,10 @@ Why `event_id` and not `thread_id`? An `event_id` is the producer naming a speci
 
 A `modal` row gets no chevron, since its body already opens the detail. Two shapes are load-bearing. `.notification-item` must stay a real `<button>`: the e2e helpers dispatch a synthetic `el.click()` on whatever matches, and that bubbles up rather than down. The chevron is therefore a SIBLING of it in a flex row, since a button cannot contain a button. The row's dim, unread tint and hover moved onto the `.notification-row` wrapper, so they span the chevron too.
 
+**A notification that reaches no thread offers Discuss, and the detail's action row is therefore never empty.** A row reaches a thread two ways: its own `thread_id` column, or a thread-targeted `navigate` tap, which the panel also labels "Open thread". Either way that thread IS the discussion, so Discuss stands down and the two never appear together.
+
+Everything else gets **Discuss**, which starts a Lucidos Agent thread with the notification quoted and SENDS it (`store/actions/notification-discuss.ts`, over `sendSeededPrompt`). The message is ordinary text on the ordinary send path, so what the agent reads is what the transcript shows. `ensureFocusedComposeThread` allocates the thread id client-side, so Discuss reveals the thread pane before the request goes out rather than after it. It leaves the notification detail open behind the conversation, so the reader keeps their place in the inbox. One tap is the whole gesture, with a single exception: a draft already in progress raises a confirm first, because a click must never blow away typed text.
+
 **Opening a notification never waits on the network for data the page already has.** Every open gesture (an inbox row tap, a toast `[Open]`, an OS push tap routed through `dispatchDeepLink`) resolves to one of two branches, and both are required to put something on screen on the tap itself rather than after a round-trip. The rule exists because the surfaces that break it are invisible in development: on an iOS PWA over Tailscale one round-trip is 400 to 800 ms steady state and 1100 to 1800 ms on the first packet after the phone radio resumes (§3), and a tap that changes nothing for that long reads as a dead tap.
 
 - **`tap.kind === 'modal'` (the notification detail).** `viewNotification` resolves the row from whichever loaded list holds it, the browse list `notifications` or the unread set `unreadNotifications`, and opens synchronously. This is sound because both lists carry WHOLE notifications: `NotificationStore::get_filtered` and `get_by_id` select an identical column list and serialize the same `Notification`, so a loaded row *is* what the single-row GET would return. Only a genuine miss fetches, which in practice means the cold push-tap deep link (a warm page has already loaded the unread set for its bell badge). That fetch reveals the pane immediately and renders `NotificationDetailInline`'s own skeleton, delay-gated past `SPINNER_DELAY_MS`. The `panelOverlay` is written only with a real notification in hand, so a failed fetch leaves no phantom entry in the panel nav stack; the pending id lives beside it in `notificationDetailPending`.
@@ -179,6 +193,8 @@ A `modal` row gets no chevron, since its body already opens the detail. Two shap
 
 - **Every deep-linkable event is addressable, whether or not it starts a turn.** An event that begins an exchange (`UserQuestionAsked`, `CodingAgentPermissionRequest`, `CredentialRequested`, `McpConsentRequested`, …) stamps the whole turn, and the pulse narrows to its `.initiator-panel`. An event that is folded into a turn as a STEP stamps the specific card that renders it instead, and the pulse stays on that card: today that is `ResponseFailed`, whose failure card is what the user is being sent to see. Landing on the whole turn for a failure buried in a long coding-agent run would not be an improvement, and before the card was addressable the link resolved to nothing at all and the tap did nothing. The same `[data-event-id]` lookup backs `event_in_viewport` below, so Row 1's auto-mark-read now works for those events too.
 - **An event that stamps nothing is reached through the turn that CONTAINS it.** The two stamps above are the whole set (`stampedEventIds` in `store/thread-events/exchange-render.ts` declares it, and a source-scan tripwire in `deep-link-anchor.test.ts` fails if `ChatExchange` grows a third without declaring it), so every other event, an ordinary tool call or a terminator like `CodingAgentIdled`, is addressable only via its turn. `deepLinkAnchorForEvent` does that re-targeting: the event itself when it stamps its own element, its exchange's starter otherwise. Notification deep-links do NOT use it, because a notification points at an event that is addressable by construction. The *event wait* step's **show it** does, because a wait can match ANY event type, and in practice matches a `CodingAgentIdled` in whichever thread it was watching. That step resolves the owning thread first (`GET /api/v1/events/:event_id/location`, which answers `thread_id: null` for a workspace domain event that belongs to no conversation, and 404 for an event id with no row), then re-targets and hands off to the same `focusThread(threadId, { targetEventId })` path a notification tap uses.
+- **A fullscreen app panel is the whole viewport, so a thread tap leaves it.** `handleNavigationRequest`'s `thread` branch calls `exitAppFullscreen()` before it focuses, exactly as `new-chat` does. Only fullscreen goes, and `panelOverlay` stays. The split gives the conversation its own pane, so closing the app would cost the reader what they were working in.
+- **A target with no BOX is waited for, and every link says how it ended.** A collapsed Conversation pane zeroes the target's own rect, and an ancestor clipped to nothing shows none of a target that still measures full size. `isElementVisible` rejects both, and gaining a box is a layout change no `MutationObserver` can see. So the link watches that box with a `ResizeObserver` too (`watchForABox`), inside its existing deadline. Whatever the ending, it writes one `[Client/deeplink] outcome` line to `engine.log`. That line names the ending, how many elements matched, how many had a box, and where the transcript was going to rest.
 - **A target that never renders is reported, not silently dropped.** The resolve waits out a deadline (4s) for a lazily-loading thread; when the event still isn't there (it isn't in this thread, or it renders nothing at all), a warning toast says the event is not shown in this thread. No pulse, since there is no element to mark, and **no scroll**: the transcript stays exactly where it was. The tap asked to go to a place, that place does not exist, and the bottom of the thread is not it (the *reading position* entry in `docs/glossary.md` has the wider rule). It used to land on the thread's most recent turn, with a `watchUserAction` guard so a reader who had scrolled away meanwhile was not yanked 4s later; both went when nothing else in the transcript scrolled on the app's own initiative either. The Changes-panel deep link (`data-change-id`) shares the same deadline and reports the same way.
 
 **The notification's `title` is the toast's HEADING — a producer must never restate it in the `body`.** The toast is a single string, so `showInAppNotificationToast` serializes the notification's separate `title` and `body` through `composeToastMessage` (`components/shared/toastMessage.ts`, the inverse of the `parseToastMessage` contract that reads line 1 as the heading and `"• "`-prefixed lines as bullets). A **plain single-line** body stays inline after the title (`"Permission needed: Edit /path"`); a **structured** body — more than one line, or a single `"• "` bullet — starts on line 2 so the title keeps the heading to itself. Producers therefore write the body as *content only*: bullets for a list, a bare sentence for a single item. Restating the title on the body's first line renders it twice (the toast heading, the detail pane's `<h2>`, and the OS push banner title all show the title in their own right) — the "1 change ready to apply: 1 change ready to apply" regression, whose producer had repeated the title to force the heading back when the toast fed the raw body straight to `parseToastMessage`.
@@ -192,14 +208,25 @@ Push (inactive devices) and toast (active devices) are therefore mutually exclus
 **On `PresenceCheck` received via SSE (and not dropped by the §3 freshness gate), the page only pongs:**
 
 ```ts
-postJson('/api/v1/presence-pong', {
-  notification_id, device_id,
-  is_active: isPageActive(),
+submitPong(notification_id, {
+  device_id,
+  is_active: shellIsActive(),
   focused_thread_id: focusedThreadId.value,
   event_in_viewport: payload.event_id ? isInViewport(payload.event_id) : false,
 });
 // No toast here — that's the engine's call, delivered via NotificationToastRequested.
+// submitPong goes through the TRANSPORT: direct connection POSTs at once, a
+// shared one hands the answer to the holder to OR with its peers.
 ```
+
+**`is_active` means the SHELL is what the user is looking at, not merely that the page is visible.** `shellIsActive()` (`store/actions/presence-pong.ts`) is `isPageActive()` AND no app fullscreen, covering both the native mode (`appFullscreenHost`) and the iOS CSS mode (`appPseudoFullscreen`).
+
+An app filling the screen therefore takes the **OS push**, not the toast. Two reasons:
+
+- **Only the shell can show a toast**, so presence answers "can we reach this person without pushing?". A reader deep in a fullscreen app is not reading the shell.
+- **It makes fullscreen agree with a popped-out app window.** The two are identical from where the user sits, and a popped-out one has always taken the push. They used to be opposite, which nobody had chosen.
+
+An app merely open in the content pane is unaffected: the shell is around it and renders the toast as before. The *device-presence heartbeat* is unaffected too, and deliberately so: it reports whether the page is visible, which under a fullscreen app it still is, and the engine reads it only to count expected pongs.
 
 **On `NotificationToastRequested` received via SSE (and fresh per `TOAST_REQUEST_STALE_AFTER_MS`), the page applies the §4 row matrix:**
 
@@ -211,10 +238,14 @@ const onSource = payload.event_id
 if (onSource) {
   markReadOptimistic(payload.notification_id);     // Row 1: looking at the source event.
   // no toast
-} else {
+} else if (currentNotificationToasts()) {
   showToast(payload);                              // Row 2 / 3: active, scrolled away or other thread.
 }
 ```
+
+**The Rows 2/3 toast is switchable: `notification_toasts`, a global preference, default `true`.** Set it to `false` and the toast never renders, the `+N more` overflow toast included. The notification still counts on the bell badge and waits in the Notifications panel, the deferred queue the switch sends it to. Unlike `push_notifications` this is workspace-wide, so one write covers every device. Settings → Appearance & Behavior → Notifications carries the row as **In-app toasts**.
+
+**No OS push arrives in its place.** The preference does not change presence, so the engine's `push_allowed` decision (§2, §3) is untouched, and a present device stays out of the fan-out. That is the point rather than a gap, because the user asked not to be interrupted, not to be interrupted differently. The gate sits in `showInAppNotificationToast` **below** the Row 1 branch, so reading the source event still auto-marks it read. It is deliberately not in `showToast`. That also serves toasts answering something the user just did, an apply-change result or an error, and those stay.
 
 **Independence within the matrix.** A notification can produce any combination of (push only / toast only / both / neither):
 - All devices hidden → push fans out to all subscriptions. No in-app toast anywhere.

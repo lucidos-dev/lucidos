@@ -21,6 +21,10 @@ pub enum AuthType {
     Password,
     OauthClient,
     EmailPassword,
+    /// A shared secret with no transport role. Every other variant says how a
+    /// value is SENT; this one is never sent. A webhook signing secret is the
+    /// first, and it is only ever fed to an HMAC.
+    Secret,
     Unknown,
 }
 
@@ -38,6 +42,7 @@ impl AuthType {
             "password" => Self::Password,
             "oauth_client" => Self::OauthClient,
             "email_password" => Self::EmailPassword,
+            "secret" => Self::Secret,
             _ => Self::Unknown,
         }
     }
@@ -52,6 +57,7 @@ impl fmt::Display for AuthType {
             Self::Password => "password",
             Self::OauthClient => "oauth_client",
             Self::EmailPassword => "email_password",
+            Self::Secret => "secret",
             Self::Unknown => "unknown",
         };
         f.write_str(s)
@@ -645,6 +651,47 @@ impl CredentialStore {
     /// prefix on a segment boundary. A raw string prefix check would inject a
     /// credential scoped to `https://api.example.com` into
     /// `https://api.example.com.evil.test/`.
+    /// Give a credential that carries no scope the one its `apis.json` entry
+    /// uses, and announce it. Returns whether the row changed.
+    ///
+    /// Once per credential, at startup, so the proxy's scope check has
+    /// something to enforce for a row that predates it (ADR 0144). The
+    /// `WHERE` clause is what makes it once: a row that already has a scope is
+    /// never rewritten, so this cannot walk a user's own correction back.
+    pub async fn infer_scope_if_empty(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        service_name: &str,
+        base_url: &str,
+    ) -> Result<bool, sqlx::Error> {
+        if base_url.trim().is_empty() {
+            return Ok(false);
+        }
+        let updated: Option<String> = sqlx::query_scalar(
+            "UPDATE credentials SET base_url = $1, updated_at = NOW() \
+             WHERE service_name = $2 AND btrim(COALESCE(base_url, '')) = '' \
+             RETURNING service_name",
+        )
+        .bind(base_url)
+        .bind(service_name)
+        .fetch_optional(pool)
+        .await?;
+        if updated.is_none() {
+            return Ok(false);
+        }
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::CredentialScopeInferred {
+                    service_name: service_name.to_string(),
+                    base_url: base_url.to_string(),
+                    actor: None,
+                }),
+                "[Credentials] CredentialScopeInferred",
+            )
+            .await;
+        Ok(true)
+    }
+
     pub async fn find_by_url(pool: &PgPool, url: &str) -> Result<Option<Credential>, sqlx::Error> {
         // Blind to `oauth_client`, for the same reason [`Self::get`] is, and on
         // its own merits besides: an OAuth client registration's `auth_value` is

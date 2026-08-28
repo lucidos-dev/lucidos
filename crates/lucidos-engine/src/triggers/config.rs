@@ -306,9 +306,30 @@ impl TriggerConfig {
         // Legacy `TriggerCreated` events lack `slug`; derive from name (with
         // UUID fallback) so existing workspaces keep resolving without a
         // backfill migration. New events from the API carry slug explicitly.
+        // The slug becomes a path segment under `data/triggers/`, so a stored
+        // `../../x` would write and delete outside the workspace data dir. The
+        // API rejects one, but any event row reaches here.
+        //
+        // Path safety only, NOT the canonical shape `apply_update` demands. A
+        // plugin trigger takes its slug from the installed directory segment,
+        // which carries no shape rule. Rejecting `daily_reflect` here would
+        // substitute a name-derived slug and break the three-way lockstep
+        // `resync_plugin_triggers` needs. The next plugin update would then read
+        // the trigger as undeclared and delete it.
         let slug = payload
             .get("slug")
             .and_then(|v| v.as_str())
+            .filter(|s| {
+                let ok = is_path_safe_trigger_slug(s);
+                if !ok {
+                    log!(
+                        "[Triggers] Ignored unsafe slug '{}' in TriggerCreated for {}",
+                        s,
+                        id
+                    );
+                }
+                ok
+            })
             .map(String::from)
             .unwrap_or_else(|| slugify_trigger_name_with_fallback(&name, &id));
         let side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
@@ -617,6 +638,21 @@ pub fn is_valid_trigger_slug(slug: &str) -> bool {
     bytes
         .iter()
         .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// True if `slug` is safe to use as one path segment under `data/triggers/`.
+///
+/// Weaker than [`is_valid_trigger_slug`] on purpose. It rejects only what can
+/// escape the directory or break a filesystem: empty, `.`, `..`, a separator, a
+/// NUL byte, or over 255 bytes. A plugin trigger's slug is its installed
+/// directory name, which carries no shape rule, so the create path can check
+/// safety but not shape.
+fn is_path_safe_trigger_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 255
+        && slug != "."
+        && slug != ".."
+        && !slug.contains(['/', '\\', '\0'])
 }
 
 /// Read the paused state from an event payload.

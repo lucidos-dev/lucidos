@@ -625,7 +625,7 @@ moment a run takes the machine-wide e2e lock it runs
 the answer to any watch this thread had for its release. That call is best
 effort and its refusal is discarded, since most runs never subscribed.
 
-### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
+### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>] [--fragment <FRAG>]`
 
 Send a push notification via the parent workspace. Persists to the inbox AND fans out as a web push to subscribed devices — identical to a `send_notification` LLM tool call, but callable directly from any subprocess (Python script, bash script, scheduled `script:`-typed trigger) without going through an LLM thread.
 
@@ -640,11 +640,12 @@ Both `--title` and `--message` are required and must be non-empty (the engine re
 
 #### Deep-linking back to the originating event
 
-For event-driven triggers ("coding agent is asking", "credential needed", …) the right behaviour is for the push tap to scroll straight to the specific event card the user needs to act on. Three flags wire this up:
+For event-driven triggers ("coding agent is asking", "credential needed", …) the push tap should land on the exact card the user must act on. Four flags wire this up:
 
 - **`--tap <modal|navigate>`** — which kind of tap. `modal` (default) opens the inbox detail; use it for purely informational pushes too ("Backup complete", "Sync finished") — every notification is openable, there is no passive kind. `navigate` deep-links to the target inferred from the other flags: `--thread-id` → navigate to that thread (scrolling and pulsing `--event-id` when set); `--app-id` → navigate to that app. When both `--thread-id` and `--app-id` are present, thread wins (the more common CTA shape — "answer this question"). (The passive `none` kind was retired — `docs/plans/2026-07-02-remove-notification-tap-none.md`.)
 - **`--thread-id <UUID>`** — the originating thread. With `--tap navigate`, the tap deep-links straight to this thread instead of the inbox modal. Even without `--tap`, this stamps the notification so the modal's "Open thread" button resolves.
 - **`--event-id <UUID>`** — a specific event id inside `--thread-id` to scroll to and briefly pulse when the tap lands. Ignored when `--thread-id` is absent.
+- **`--fragment <string>`**: the place INSIDE the app the tap lands on. It arrives as the app's `location.hash`, so an app that routes on the hash opens on that item. Only read on the `--app-id` branch, since a thread deep-link names no app. An app that ignores the hash still opens.
 
 ```bash
 # Deep-link the push to the exact UserQuestionAsked card on tap.
@@ -657,6 +658,18 @@ lucidos notify \
 ```
 
 The `TRIGGER_EVENT_THREAD_ID` and `TRIGGER_EVENT_ID` env vars in the snippet are set by the engine on every script trigger fired by a thread-scoped event (see `triggers.md` § "Script trigger env vars"). For schedule-fired triggers neither is set, so `--tap modal` (the default) is the only meaningful choice.
+
+An app deep-link takes `--fragment` the same way, so the tap lands on the item:
+
+```bash
+# Land on the habit the reminder is about, not on the board's default sort.
+lucidos notify \
+  --title "A streak is at risk" \
+  --message "Hydration has no entry for today." \
+  --tap navigate \
+  --app-id habit-tracker \
+  --fragment "habit-hydration"
+```
 
 The CLI rejects `--tap navigate` without `--thread-id` and `--app-id` (the navigate kind needs a destination) with a clear error before the HTTP round-trip — the server returns the same 400 if the CLI's check is bypassed. For panel-shaped targets (`changes`, `triggers`, `files`, …) the CLI doesn't currently expose a flag — use the `send_notification` LLM tool or POST directly to `/api/v1/notifications` with the full structured `tap` object.
 
@@ -1221,6 +1234,35 @@ Output is the response body on **stdout**. With `--include`, the status line and
 
 If you find a script doing `curl -H "Authorization: Bearer $CRED_..."` against an API the workspace already owns a credential for, that's drift — add an `apis.json` entry and switch the script to `lucidos proxy`.
 
+### `lucidos handshake list` / `lucidos handshake approve <path>`
+
+The engine runs a `script_handshake` script only when it recorded who wrote it
+(ADR 0144). `data/scripts/` is writable over the API, and an app UI reaches that
+API with the user's authority, so the file existing is not enough.
+
+Its own file tools record as they write, which covers the ordinary route: ask
+the Lucidos Agent to write or edit the script and nothing else is needed. This
+command is for a script that arrived another way, from the Files panel, an
+editor, or a plugin install.
+
+```bash
+lucidos handshake list
+# approved     data/scripts/auth/firebase.py
+# NOT APPROVED data/scripts/auth/comfort-cloud.py
+
+lucidos handshake approve scripts/auth/comfort-cloud.py
+# Approved data/scripts/auth/comfort-cloud.py
+```
+
+`approve` records the file as it stands now, so it has to run after the edit.
+Any spelling of the path works: the `apis.json` value, the workspace-relative
+form, or an absolute path inside the workspace.
+
+**There is no button for this, deliberately.** The route refuses a
+browser-shaped caller. An app UI shares the shell's origin, so a button would
+let it approve a script it wrote itself. Revoking is a line deleted from
+`<workspace>/.lucidos/approved-handshake-scripts`.
+
 ### `lucidos pair` (mint a code that lets a device in)
 
 Lucidos authenticates every caller that reaches it over the network. A device is
@@ -1328,6 +1370,59 @@ fields into one header, so it takes `"signature_key":"v1"` and
 A webhook needs at least one verifier and every one it has must pass. There is
 no LLM tool and no SDK namespace for any of this, deliberately: a webhook opens
 a publicly reachable door, so only you create one.
+
+#### Where the shared secret comes from
+
+Which side invents it depends on the sender, so `--signing-secret` saves the
+credential in the same call rather than making you save it first:
+
+```bash
+# GitHub lets you choose the secret. Lucidos mints it and prints it ONCE.
+lucidos webhooks create --name github --event-type PullRequestOpened \
+  --hmac '{"credential":"github-deploys",
+           "signature_header":"X-Hub-Signature-256",
+           "prefix":"sha256=","template":"{body}"}' \
+  --signing-secret '{"mode":"generate"}'
+```
+
+Paste the printed value into the Secret field on GitHub's own webhook form.
+
+**Slack and Stripe issue their own**, shown on the app's Basic Information page
+and on the endpoint's dashboard page. A secret you invent could never verify
+their deliveries, so those take `{"mode":"provided","value":"..."}`.
+
+A provided value is stored byte for byte. One that starts or ends with
+whitespace is refused by name, rather than trimmed: trimming can break a value
+that needs it, and keeping it breaks every delivery with nothing saying why.
+
+On `create` a name that already exists is refused, so nothing you saved earlier
+is overwritten by accident. On `update` it replaces the value, which is how you
+rotate.
+
+#### Changing what a hook verifies with
+
+`--hmac` on `update` takes the same object, and the hook keeps its delivery URL.
+That is the point: delete and recreate changes the URL, which breaks the sender.
+
+```bash
+# Fix a wrong signature header, or point at a different credential.
+lucidos webhooks update --id <uuid> \
+  --hmac '{"credential":"github-deploys",
+           "signature_header":"X-Hub-Signature-256",
+           "prefix":"sha256=","template":"{body}"}'
+
+# Rotate the secret and touch nothing else.
+lucidos webhooks update --id <uuid> --signing-secret '{"mode":"generate"}'
+
+# Stop signing. Prints a bearer token ONCE.
+lucidos webhooks update --id <uuid> --hmac null
+```
+
+**A hook carries exactly one verifier kind**, so each of those moves the other
+one too. Adding a signature drops any token, because a sender that signs
+attaches no bearer token and a hook holding both would refuse every delivery.
+Removing one mints a token, because a hook with no verifier at all cannot be
+stored.
 
 #### What a delivery becomes
 

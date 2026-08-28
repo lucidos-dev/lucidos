@@ -1,0 +1,57 @@
+/* Settings → Webhooks: the endpoints a third party posts to, and whether the
+   public path in front of them still answers. See
+   components/settings/WebhooksPage.tsx. */
+
+/* The standing ingress outage, on every enabled row. Colour alone carries it:
+   the row already has its fields, and a boxed callout per hook would repeat one
+   fact down the whole list. No left-accent stripe (.claude/rules/frontend-css.md). */
+.webhook-ingress-warning {
+    color: var(--accent-red);
+}
+
+/* A signed hook naming a credential the store no longer holds. Same treatment
+   as the outage above, and for the same reason: it is one line of fact on a row
+   that already has fields, not a panel. The hook refuses every delivery until
+   it is fixed, so it is red rather than muted. */
+.webhook-credential-missing {
+    color: var(--accent-red);
+}
+
+/* The signature editor, shared by the create form and by a row.
+   `.list-row-info` is a column, so each labelled control is its own line. */
+.webhook-signature-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    width: 100%;
+}
+
+/* Label above its control, not beside it: the pane is narrow on a phone, and a
+   two-column form there wraps into a ragged one. */
+.webhook-signature-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+/* A caption, matching `.form-group label`. NOT `.label`, which is the small
+   uppercase accent badge: as a flex item it stretches, so thirteen of them
+   stack into thirteen full-width coloured bars. */
+.webhook-signature-row > label {
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+}
+
+/* The hint under a scheme, and whatever the credential slot says instead of a
+   picker. Both sit inside a column that owns its own spacing. */
+.webhook-signature-fields .settings-section-desc {
+    margin: 0;
+}
+
+/* The two controls the digest takes, algorithm and encoding. They read as one
+   setting, so they sit side by side under the one label. */
+.webhook-signature-pair {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+}

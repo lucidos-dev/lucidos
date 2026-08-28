@@ -42,8 +42,19 @@ pub fn replay_trigger_events(events: Vec<TriggerEventRow>) -> HashMap<String, Tr
 
         match row.event_type.as_str() {
             "TriggerCreated" | "ScheduledTriggerCreated" => {
-                if let Ok(config) = TriggerConfig::from_created_payload(&row.payload) {
-                    triggers.insert(trigger_id, config);
+                match TriggerConfig::from_created_payload(&row.payload) {
+                    Ok(config) => {
+                        triggers.insert(trigger_id, config);
+                    }
+                    // Dropping it silently makes the trigger vanish from the
+                    // panel at boot with nothing anywhere to explain it. The
+                    // live applier logs the same failure.
+                    Err(e) => crate::log!(
+                        "[TriggerReplay] {} payload for {} did not parse: {}",
+                        row.event_type,
+                        trigger_id,
+                        e
+                    ),
                 }
             }
             "TriggerUpdated" | "ScheduledTriggerUpdated" => {

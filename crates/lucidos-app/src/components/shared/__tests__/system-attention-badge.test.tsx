@@ -131,7 +131,9 @@ describe('the menu hamburger', () => {
 
 describe('the rows that carry the mark inline', () => {
   it('puts it on the menu drawer\'s Settings row, as the union', () => {
-    const row = DRAWER.indexOf('\n          Settings\n');
+    // The row's text comes from `MENU_ITEM_LABELS`, the one map every surface
+    // naming a menu item reads, so that expression is the row's anchor here.
+    const row = DRAWER.indexOf('\n          {MENU_ITEM_LABELS.settings}\n');
     expect(row, 'the Settings row').toBeGreaterThan(-1);
     expect(DRAWER.slice(row, row + 160))
       .toContain('<SystemAttentionBadge placement="inline" label={systemAttentionBadge()} />');

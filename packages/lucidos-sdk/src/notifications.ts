@@ -21,6 +21,11 @@ export interface NavigateUi {
   target: NavigateTarget;
   settings_view?: SettingsViewTarget;
   app_id?: string;
+  /** The place INSIDE the app to open, delivered as the app iframe's
+   *  `location.hash`. Only used with `target: 'app'`. Lucidos never inspects
+   *  it, so only the app knows what its own targets are. An app that ignores
+   *  the hash still opens, at whatever it shows by default. */
+  fragment?: string;
   file_path?: string;
   /** Line to open the file at, 1-based. The preview scrolls it into view and
    *  highlights it, exactly as a click on that line number does. Only used with

@@ -48,18 +48,47 @@ pub(crate) fn deterministic_worktree_path(workspace_path: &Path, thread_id: uuid
     worktrees_dir(workspace_path).join(format!("thread-{}", short_thread_id(thread_id)))
 }
 
+/// Where a thread's last idle left its worktree HEAD, or why we cannot say.
+///
+/// `Absent` and `Unknown` are split because *branch adoption* reads them
+/// differently. A verified `Absent` lets the spawn boundary fall back to a
+/// weaker proof. Collapsing an unanswered query into it would let a dropped
+/// Postgres connection authorize retargeting a thread. That is
+/// `.claude/rules/rust.md`'s unanswered-probe rule, applied to the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdleAnchor {
+    /// An idle recorded this sha.
+    Found(String),
+    /// The query answered, and the thread has no idle carrying a sha.
+    Absent,
+    /// The query failed. Nothing is known about the anchor.
+    Unknown,
+}
+
+impl IdleAnchor {
+    /// The sha when there is one. `Absent` and `Unknown` collapse here, which
+    /// suits every caller that only skips work when no sha is available.
+    pub(crate) fn found(&self) -> Option<&str> {
+        match self {
+            Self::Found(sha) => Some(sha.as_str()),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+}
+
 /// Look up the most-recent `CodingAgentIdled` event for a thread and return
-/// its `worktree_head_sha` payload field. Returns `None` for legacy events
+/// its `worktree_head_sha` payload field. Answers `Absent` for legacy events
 /// that predate the field (Phase 8.1), for the truly-first turn of a thread,
 /// and for idles emitted without a worktree.
 ///
 /// Used by the spawn path to detect external user edits made between turns
-/// (see `external_edits::compute_external_edit_note`).
+/// (see `external_edits::compute_external_edit_note`) and to anchor
+/// `external_edits::try_adopt_renegade_branch`.
 pub(crate) async fn lookup_latest_worktree_head_sha(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
-) -> Option<String> {
-    sqlx::query_scalar::<_, Option<String>>(
+) -> IdleAnchor {
+    match sqlx::query_scalar::<_, Option<String>>(
         "SELECT payload->>'worktree_head_sha' FROM events \
          WHERE thread_id = $1 AND event_type = 'CodingAgentIdled' \
            AND payload->>'worktree_head_sha' IS NOT NULL \
@@ -69,18 +98,20 @@ pub(crate) async fn lookup_latest_worktree_head_sha(
     .bind(thread_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| {
-        log!(
-            "[AgentSession] Failed to look up latest worktree_head_sha for {}: {}",
-            thread_id,
-            e
-        );
-        e
-    })
-    .ok()
-    .flatten()
-    .flatten()
-    .filter(|s| !s.is_empty())
+    {
+        Ok(row) => match row.flatten().filter(|s| !s.is_empty()) {
+            Some(sha) => IdleAnchor::Found(sha),
+            None => IdleAnchor::Absent,
+        },
+        Err(e) => {
+            log!(
+                "[AgentSession] Failed to look up latest worktree_head_sha for {}: {}",
+                thread_id,
+                e
+            );
+            IdleAnchor::Unknown
+        }
+    }
 }
 
 /// Look up the most-recent `CodingAgentIdled` event for a thread and return

@@ -11,10 +11,27 @@ import { signal } from '@preact/signals';
  *  override of the same text still fires. */
 export const promptOverrideSyncSeq = signal(0);
 
+/** What the pending override did to the draft.
+ *
+ *  `replace` throws the old text away, so the caret offset indexes characters
+ *  that are gone. Restoring it drops the user mid-sentence in copy they did not
+ *  write. `append` leaves the prefix intact, so the offset still means what it
+ *  did and the caret stays where they left it. */
+export type PromptOverrideKind = 'replace' | 'append';
+
+/** Whether the pending override replaced the whole draft. Written just before
+ *  the counter and read beside it, so one render sees both. Only ever read on
+ *  the render a bump produces, which is why a stale value between bumps cannot
+ *  matter. */
+export const promptOverrideReplacesDraft = signal(false);
+
 /** Request a one-shot forced textarea sync — call AFTER writing the draft
  *  (`updateCompose`) so the effect observes both the new text and the bumped
- *  counter in one render. See {@link promptOverrideSyncSeq}. */
-export function requestPromptOverrideSync(): void {
+ *  counter in one render. See {@link promptOverrideSyncSeq}. `kind` is required
+ *  rather than defaulted: it decides where the caret lands, and a caller that
+ *  did not think about it is the bug this argument exists to prevent. */
+export function requestPromptOverrideSync(kind: PromptOverrideKind): void {
+  promptOverrideReplacesDraft.value = kind === 'replace';
   promptOverrideSyncSeq.value += 1;
 }
 
@@ -43,12 +60,13 @@ export function syncTextareaValue(
 }
 
 /** Skip the textarea sync only when THIS specific element is the active one
- *  and already holds locally-typed content. Element-identity (not "any
- *  prompt-input with this thread id is active") matters: SplitLayout and
- *  MobileSwipeContainer mount PromptInput twice with the same
- *  `data-thread-id`, and the unfocused copy must still re-sync after a
- *  Send on the focused copy. Empty `el.value` always re-syncs so the
- *  persisted draft reaches the textarea on initial autofocus. */
+ *  and already holds locally-typed content.
+ *
+ *  Element-identity matters, rather than "any prompt-input with this thread id
+ *  is active". Only the focused textarea can hold an in-flight keystroke, so a
+ *  copy that is not focused must still re-sync after a Send. Empty `el.value`
+ *  always re-syncs, so the persisted draft reaches the textarea on initial
+ *  autofocus. */
 export function shouldSkipSyncWhileEditing(
   el: HTMLTextAreaElement,
   sameThread: boolean,

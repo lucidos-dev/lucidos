@@ -41,6 +41,15 @@ pub struct Webhook {
     pub enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// When a delivery last verified and emitted.
+    pub last_accepted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a delivery last arrived and was turned away.
+    ///
+    /// This is the diagnostic half. Silence alone cannot tell a rotated secret
+    /// from a dead ingress, and a refusal can.
+    pub last_refused_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What [`DeliveryRefusal::reason`] said about that refusal.
+    pub last_refusal_reason: Option<String>,
 }
 
 /// Everything about a webhook except its identity: how it authenticates, and
@@ -62,16 +71,63 @@ pub struct WebhookConfig {
 /// A change to an existing webhook. Every field is optional, and `None` keeps
 /// the stored value.
 ///
-/// `dedupe` needs no "clear it" variant, so this stays free of the
+/// `dedupe` needs no "clear it" variant, so it stays free of the
 /// `Option<Option<_>>` an optional JSONB column otherwise wants: a config with
 /// `window_secs: 0` switches deduping off.
+///
+/// `hmac` has no such off value, so it takes a named three-state instead. The
+/// same reasoning, one step further: a shape nobody has to decode beats a
+/// nested option.
 #[derive(Debug, Clone, Default)]
 pub struct WebhookPatch {
     pub name: Option<String>,
     pub event_type: Option<String>,
     pub enabled: Option<bool>,
+    pub hmac: HmacChange,
     pub dedupe: Option<DedupeConfig>,
     pub headers: Option<Vec<String>>,
+}
+
+/// What an update does to a hook's signature config.
+///
+/// # A hook carries one verifier kind, so a change to either moves both
+///
+/// [`WebhookStore::create`] mints a token only for an unsigned hook, because
+/// [`verify`] requires every verifier a row carries and no signing sender
+/// attaches a bearer token. An update has to hold the same line from both
+/// sides, or it hands the user a hook that refuses everything:
+///
+/// - [`Self::Set`] drops the token. A hook that gained a signature and kept its
+///   token would refuse every delivery GitHub, Slack or Stripe can send.
+/// - [`Self::Clear`] mints one. The table's CHECK says a hook has at least one
+///   verifier, so unsigned with no token is a row that cannot exist. Refusing
+///   the transition was the alternative, and it sends the user back to delete
+///   and recreate, which changes the delivery URL and breaks the sender. That
+///   is the whole reason `hmac` became editable, so minting wins.
+///
+/// The minted token is returned once, on the contract `create` already has.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum HmacChange {
+    /// Keep the stored config, whatever it is.
+    #[default]
+    Keep,
+    /// Sign from now on, with this config.
+    Set(HmacConfig),
+    /// Stop signing, and go back to a bearer token.
+    Clear,
+}
+
+/// Absent keeps, an object sets, and `null` clears.
+///
+/// Hand-written so the request DTO needs no `Option<Option<_>>` either.
+/// `#[serde(default)]` answers the absent case, and this answers the other two.
+impl<'de> Deserialize<'de> for HmacChange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Option::<HmacConfig>::deserialize(deserializer)? {
+            Some(cfg) => Self::Set(cfg),
+            None => Self::Clear,
+        })
+    }
 }
 
 /// How a hook recognises a delivery it has already emitted.
@@ -400,7 +456,8 @@ pub fn verify(
 
 /// The columns every read selects, in the order [`row_to_webhook`] unpacks.
 const WEBHOOK_COLUMNS: &str = "id, name, event_type, token_hash, hmac, dedupe, headers, \
-                               enabled, created_at, updated_at";
+                               enabled, created_at, updated_at, last_accepted_at, \
+                               last_refused_at, last_refusal_reason";
 
 type WebhookRow = (
     Uuid,
@@ -413,11 +470,27 @@ type WebhookRow = (
     bool,
     chrono::DateTime<chrono::Utc>,
     chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
 );
 
 fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error + Send + Sync>> {
-    let (id, name, event_type, token_hash, hmac, dedupe, headers, enabled, created_at, updated_at) =
-        row;
+    let (
+        id,
+        name,
+        event_type,
+        token_hash,
+        hmac,
+        dedupe,
+        headers,
+        enabled,
+        created_at,
+        updated_at,
+        last_accepted_at,
+        last_refused_at,
+        last_refusal_reason,
+    ) = row;
     Ok(Webhook {
         id,
         name,
@@ -429,6 +502,9 @@ fn row_to_webhook(row: WebhookRow) -> Result<Webhook, Box<dyn std::error::Error 
         enabled,
         created_at,
         updated_at,
+        last_accepted_at,
+        last_refused_at,
+        last_refusal_reason,
     })
 }
 
@@ -520,25 +596,40 @@ impl WebhookStore {
     }
 
     /// Change a webhook. `Ok(None)` means no webhook has that id.
+    ///
+    /// The token comes back for the one update that mints one, which is the
+    /// clear described on [`HmacChange`]. Every other update returns `None`
+    /// beside the hook, since no token changed hands.
     pub async fn update(
         pool: &PgPool,
         bus: &EventBus,
         id: Uuid,
         patch: WebhookPatch,
         actor: Option<MessageOrigin>,
-    ) -> Result<Option<Webhook>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(Webhook, Option<String>)>, Box<dyn std::error::Error + Send + Sync>> {
         let WebhookPatch {
             name,
             event_type,
             enabled,
+            hmac,
             dedupe,
             headers,
         } = patch;
         let dedupe_json = dedupe.as_ref().map(serde_json::to_value).transpose()?;
+        // The verifier moves as one. A single flag writes `hmac` and
+        // `token_hash` together, so no combination of arguments can leave a row
+        // carrying both verifiers or neither.
+        let (verifier_moves, hmac_json, token) = match &hmac {
+            HmacChange::Keep => (false, None, None),
+            HmacChange::Set(cfg) => (true, Some(serde_json::to_value(cfg)?), None),
+            HmacChange::Clear => (true, None, Some(mint_token()?)),
+        };
         let row: Option<WebhookRow> = sqlx::query_as(&format!(
             "UPDATE webhooks SET name = COALESCE($2, name), \
              event_type = COALESCE($3, event_type), enabled = COALESCE($4, enabled), \
              dedupe = COALESCE($5, dedupe), headers = COALESCE($6, headers), \
+             hmac = CASE WHEN $7 THEN $8 ELSE hmac END, \
+             token_hash = CASE WHEN $7 THEN $9 ELSE token_hash END, \
              updated_at = NOW() WHERE id = $1 RETURNING {WEBHOOK_COLUMNS}"
         ))
         .bind(id)
@@ -547,6 +638,9 @@ impl WebhookStore {
         .bind(enabled)
         .bind(dedupe_json)
         .bind(&headers)
+        .bind(verifier_moves)
+        .bind(hmac_json)
+        .bind(token.as_deref().map(digest))
         .fetch_optional(pool)
         .await?;
         let Some(row) = row else {
@@ -558,10 +652,46 @@ impl WebhookStore {
             name: hook.name.clone(),
             event_type: hook.event_type.clone(),
             enabled: hook.enabled,
+            signed: hook.hmac.is_some(),
             actor,
         }))
         .await?;
-        Ok(Some(hook))
+        Ok(Some((hook, token)))
+    }
+
+    /// Stamp that a delivery verified and emitted.
+    ///
+    /// An observation, so it emits nothing. `updated_at` stays where it is:
+    /// nobody changed the hook, and moving it would make every delivery look
+    /// like an edit.
+    pub async fn record_accepted(
+        pool: &PgPool,
+        id: Uuid,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query("UPDATE webhooks SET last_accepted_at = NOW() WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Stamp that a delivery arrived and was turned away, and why.
+    ///
+    /// `reason` is a [`DeliveryRefusal::reason`] string. It reaches the
+    /// workspace owner's page and never the sender.
+    pub async fn record_refused(
+        pool: &PgPool,
+        id: Uuid,
+        reason: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        sqlx::query(
+            "UPDATE webhooks SET last_refused_at = NOW(), last_refusal_reason = $2 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete a webhook. `Ok(false)` means no webhook had that id.

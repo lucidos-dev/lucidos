@@ -1,6 +1,7 @@
 import {
   appsList,
   currentApp,
+  currentAppFragment,
   panelOverlay,
   closeInlineForm,
   pendingChatMessage,
@@ -29,7 +30,8 @@ import {
   postAppCapture,
   retryTransientRead,
 } from '../../api/client';
-import { pushNavState } from './navigation';
+import { pushNavState, replaceNavState } from './navigation';
+import { setAppFrameHash } from '../../components/apps/iframeNav';
 import { openPluginUninstallRequest } from './plugin-uninstall';
 import { isElementVisible } from '../../components/chat/scrollState';
 import { errorDetail } from '../../utils/errorDetail';
@@ -96,13 +98,32 @@ async function loadAppsInner(): Promise<void> {
   }
 }
 
-export function openApp(app: App): void {
-  panelOverlay.value = { type: 'app-ui', app };
+/** Open an app, optionally at an app fragment (docs/glossary.md): the place
+ *  inside it a link named, delivered to the iframe as `location.hash`.
+ *
+ *  When the app was ALREADY open, two things happen that a cold open does not
+ *  need. `replaceNavState` refreshes the kept entry, because `pushNavState`
+ *  dedupes on app id and moving inside an open panel is a mutation in place. A
+ *  reload then restores the newest target rather than the first one.
+ *
+ *  The hash also goes straight to the live frame, because the frame's own
+ *  effect fires on a CHANGED src. An app that moved itself with
+ *  `history.replaceState` leaves the src identical, so re-clicking the link the
+ *  reader arrived on would otherwise deliver nothing. `setAppFrameHash` is
+ *  idempotent, so the two writers cannot fight. */
+export function openApp(app: App, fragment?: string): void {
+  const wasOpen = currentApp.value?.id === app.id;
+  panelOverlay.value = { type: 'app-ui', app, fragment };
   cancelPendingRefresh();
   if (appRefreshKey.value) appRefreshKey.value = 0;
   localStorage.setItem('app-window-open', app.id);
   revealContentPane();
   pushNavState();
+  if (!wasOpen) return;
+  replaceNavState();
+  if (!fragment) return;
+  const frame = getVisibleAppFrame();
+  if (frame) setAppFrameHash(frame, fragment);
 }
 
 /** Open an app by ID — loads apps first if needed, then opens.
@@ -123,7 +144,11 @@ export function openApp(app: App): void {
  * on the second fetch would otherwise turn the user's loaded list into the
  * `failed` Loadable, deleting cached data for one bad click. Snapshot
  * pre-fetch and restore on transient failure. */
-export async function openAppById(appId: string, source?: string): Promise<void> {
+export async function openAppById(
+  appId: string,
+  source?: string,
+  fragment?: string,
+): Promise<void> {
   // `source` describes where a navigate originated (e.g. a thread label, or
   // "an app") so a miss toast says where it came from instead of swallowing it.
   const from = source ? ` (requested by ${source})` : '';
@@ -152,7 +177,7 @@ export async function openAppById(appId: string, source?: string): Promise<void>
     }
   }
   if (app) {
-    openApp(app);
+    openApp(app, fragment);
   } else {
     // Disk re-scanned and the app genuinely isn't there. Name the id + source
     // so the user knows what was missing and where the navigate came from.
@@ -333,7 +358,7 @@ export function getAppFrameSrc(): string | null {
   // WIP preview (an app coding-agent thread's worktree) vs. the live workspace
   // copy. When no preview thread is set, serve live.
   const tid = wipPreviewThreadId.value;
-  return appUrl(app.id, tid ?? undefined);
+  return appUrl(app.id, tid ?? undefined, currentAppFragment.value ?? undefined);
 }
 
 /** Open the app that's in the content pane as a top-level page of its own,

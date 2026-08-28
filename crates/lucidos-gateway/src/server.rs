@@ -763,8 +763,9 @@ impl GatewayState {
                     health: Health::Unhealthy,
                     autostart: ws.autostart,
                     last_error: Some("not started".to_string()),
-                    // No engine to poll, so no badge.
+                    // No engine to poll, so no badge and no backup line.
                     unread_count: None,
+                    last_successful_backup: None,
                 });
             }
         }
@@ -1092,6 +1093,7 @@ impl GatewayState {
             last_spawn: None,
             last_error: None,
             last_unread: None,
+            last_successful_backup: None,
         };
         self.set_route(&ws.id, ws.port);
         self.install_stack(&ws.id, stack).await;
@@ -1137,6 +1139,7 @@ impl GatewayState {
                 last_spawn: Some(Instant::now()),
                 last_error: None,
                 last_unread: None,
+                last_successful_backup: None,
             },
             Err(e) => {
                 crate::log!("[Gateway] workspace '{}' failed to start: {}", ws.id, e);
@@ -1165,6 +1168,7 @@ impl GatewayState {
                     last_spawn: Some(Instant::now()),
                     last_error: Some(e.message),
                     last_unread: None,
+                    last_successful_backup: None,
                 }
             }
         };
@@ -1341,6 +1345,7 @@ impl GatewayState {
                 autostart: ws.autostart,
                 last_error: Some("stack missing after create".to_string()),
                 unread_count: None,
+                last_successful_backup: None,
             },
         };
         Ok(status)
@@ -1725,6 +1730,7 @@ impl GatewayState {
                     last_spawn: Some(Instant::now()),
                     last_error: None,
                     last_unread: None,
+                    last_successful_backup: None,
                 };
                 self.set_route(&ws.id, ws.port);
                 self.install_stack(&ws.id, stack).await;
@@ -2136,24 +2142,29 @@ impl GatewayState {
         // stack lock held, so one slow engine never serializes the whole pass.
         let scheme = self.engine_scheme();
         let client = &self.inner.health_client;
-        // The unread count rides the same pass, and only for an engine that
-        // answers healthy. This is the sole unread-count path, because the
-        // gateway holds no DB handle (ADR 0014 §1). A stopped workspace
-        // therefore yields `None` and shows no badge.
-        let outcomes: Vec<(ProbeOutcome, Option<u64>)> =
+        // The unread count and the backup line ride the same pass, and only for
+        // an engine that answers healthy. These are the sole paths to either,
+        // because the gateway holds no DB handle (ADR 0014 §1). A stopped
+        // workspace therefore yields `None` for both, showing no badge and no
+        // backup note. The two reads run concurrently with each other, so the
+        // second costs the pass nothing.
+        let outcomes: Vec<EngineReadings> =
             futures::future::join_all(candidates.iter().map(|t| async move {
                 let outcome = stack::probe_health(client, scheme, t.port).await;
-                let unread = if outcome == ProbeOutcome::Healthy {
-                    stack::fetch_unread_count(client, scheme, t.port).await
-                } else {
-                    None
-                };
-                (outcome, unread)
+                if outcome != ProbeOutcome::Healthy {
+                    return (outcome, None, None);
+                }
+                let (unread, backup) = futures::future::join(
+                    stack::fetch_unread_count(client, scheme, t.port),
+                    stack::fetch_last_successful_backup(client, scheme, t.port),
+                )
+                .await;
+                (outcome, unread, backup)
             }))
             .await;
 
         // Apply phase: re-acquire each stack briefly to write the result back.
-        for (t, (outcome, unread)) in candidates.into_iter().zip(outcomes) {
+        for (t, (outcome, unread, backup)) in candidates.into_iter().zip(outcomes) {
             let mut s = t.stack.lock().await;
             // The lock was dropped across the probe, so the stack may have
             // changed under us (see `probe_result_is_stale`). `contains_key` is
@@ -2169,8 +2180,9 @@ impl GatewayState {
                 s.health_misses = 0;
                 s.last_error = None;
                 // `None` when the fetch failed even though health passed: show
-                // no badge rather than a stale one.
+                // no badge rather than a stale one. Same for the backup line.
                 s.last_unread = unread;
+                s.last_successful_backup = backup;
                 // Drop the boot phase so a later cold open starts clean, and
                 // the failure message with it: this boot demonstrably worked.
                 self.clear_boot_phase(&t.id);
@@ -2178,8 +2190,10 @@ impl GatewayState {
                 continue;
             }
 
-            // Not healthy, so no trustworthy count: clear the badge this tick.
+            // Not healthy, so nothing here is trustworthy: clear the badge and
+            // the backup line this tick.
             s.last_unread = None;
+            s.last_successful_backup = None;
 
             let since_spawn = s.last_spawn.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
             let alive = engine_process_alive(&mut s);
@@ -2287,6 +2301,16 @@ struct ProbeTarget {
     port: u16,
     last_spawn: Option<Instant>,
 }
+
+/// What one supervise probe learned about a stack: its health, and the two
+/// display facts the picker draws from a HEALTHY engine (the unread count and
+/// the backup line). Both are `None` for an engine that did not answer healthy,
+/// and `None` again when the engine answered health but not that read.
+type EngineReadings = (
+    ProbeOutcome,
+    Option<u64>,
+    Option<stack::LastSuccessfulBackup>,
+);
 
 /// Whether a health-probe result must be DISCARDED rather than applied to its
 /// stack. `supervise_once` releases the stack lock across the network probe, so
@@ -2917,9 +2941,7 @@ async fn serve(
     // serving workspaces, so refusing to start (or dying mid-flight) over a
     // webhook surface nobody may be using is the wrong trade. Its failures are
     // logged and it stops answering, while every workspace keeps serving.
-    if let Some(hook) =
-        hook_socket::hook_port(std::env::var("LUCIDOS_HOOK_PORT").ok().as_deref(), port)
-    {
+    if let Some(hook) = hook_socket::resolved_hook_port(port) {
         let addr = hook_socket::bind_addr(hook);
         match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
@@ -4083,6 +4105,7 @@ mod tests {
             last_spawn: None,
             last_error: None,
             last_unread: None,
+            last_successful_backup: None,
         }
     }
 

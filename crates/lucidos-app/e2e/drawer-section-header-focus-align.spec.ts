@@ -41,8 +41,20 @@ test.describe('Drawer section-header focus band alignment', () => {
         await page.waitForSelector('.thread-drawer-list .list-section-title');
 
         const edges = await page.evaluate(() => {
-            const header = document.querySelector('.thread-drawer-list .list-section-title');
-            const row = document.querySelector('.thread-drawer-list .thread-row-wrap .thread-row');
+            const list = document.querySelector('.thread-drawer-list');
+            if (!list) throw new Error('drawer list not found');
+            // Rows get a FLIP entrance animation (scale, translate); section
+            // headers only fade. A rect sampled mid-flight therefore compares an
+            // animated row box against a settled header box. Finish the finite
+            // animations and measure in the same task, so no frame can start a
+            // new one in between.
+            for (const anim of list.getAnimations({ subtree: true })) {
+                const timing = anim.effect?.getComputedTiming();
+                if (!timing || timing.iterations === Infinity || timing.duration === Infinity) continue;
+                anim.finish();
+            }
+            const header = list.querySelector('.list-section-title');
+            const row = list.querySelector('.thread-row-wrap .thread-row');
             if (!header || !row) throw new Error('drawer header or row not found');
             const h = header.getBoundingClientRect();
             const r = row.getBoundingClientRect();

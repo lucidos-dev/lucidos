@@ -13,14 +13,12 @@ import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
-import type { MenuItem } from '../../store/types';
+import { MENU_ITEM_LABELS, type MenuItem } from '../../store/types';
 
-const menuItems: Array<{ id: MenuItem; label: string }> = [
-  { id: 'files', label: 'Files' },
-  { id: 'apps', label: 'Apps' },
-  { id: 'plugins', label: 'Plugins' },
-  { id: 'triggers', label: 'Triggers' },
-];
+/** The rows this drawer lists in order. Not every menu item: Changes and
+ *  Settings are rendered below with a badge of their own, and Notifications is
+ *  reached from the bell rather than from here. */
+const menuItems: MenuItem[] = ['files', 'apps', 'plugins', 'triggers'];
 
 export const drawerOpen = signal(false);
 export const drawerClosing = signal(false);
@@ -171,14 +169,14 @@ export function Drawer() {
         {/* Menu items */}
         {menuItems.map((item) => (
           <div
-            key={item.id}
-            class={`drawer-item ${activeMenuItem.value === item.id ? 'active' : ''}`}
+            key={item}
+            class={`drawer-item ${activeMenuItem.value === item ? 'active' : ''}`}
             onClick={() => {
-              switchMenuItem(item.id);
+              switchMenuItem(item);
               closeDrawer();
             }}
           >
-            {item.label}
+            {MENU_ITEM_LABELS[item]}
           </div>
         ))}
 
@@ -214,7 +212,7 @@ export function Drawer() {
               closeDrawer();
             }}
           >
-            Changes
+            {MENU_ITEM_LABELS.changes}
             {changeCount !== null && changeCount > 0 && (
               <span class="drawer-badge">{changeCount > 99 ? '99+' : changeCount}</span>
             )}
@@ -232,7 +230,7 @@ export function Drawer() {
             closeDrawer();
           }}
         >
-          Settings
+          {MENU_ITEM_LABELS.settings}
           <SystemAttentionBadge placement="inline" label={systemAttentionBadge()} />
         </div>
       </Overlay>

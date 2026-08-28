@@ -46,6 +46,7 @@ paths:
   - "scripts/lib/preflight.sh"
   - "scripts/lib/sleep.sh"
   - "scripts/lib/host_load_guard*.sh"
+  - "scripts/lib/host_memory_guard*.sh"
   - "scripts/lib/webkit_reaper*.sh"
   - "scripts/lib/sigterm_contract_test.sh"
   - "scripts/lib/wait_for_engine_shutdown_test.sh"
@@ -264,6 +265,7 @@ brought clean in one mechanical sweep first (424 of 614 files at the time).
 
 - Dev engines bind loopback, exactly as packaged ones do. `start_gateway` sets no `LUCIDOS_GATEWAY_ENGINE_LOOPBACK`, so the gateway's loopback default applies, the engine's TLS cert is stripped, and the gateway proxies + health-probes over **http**. This is load-bearing rather than tidy. The gateway authenticates every network caller (ADR 0094), and a network-bound engine port walks straight past pairing. Another device reaches a workspace at `https://<host>:5251/<slug>/`.
 - **Set `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` only to reproduce the old topology.** It reopens that bypass, so it is not something to reach for casually.
+- **A directly-launched engine is not exempt** (legacy no-gateway, tauri-dev, e2e). `apply_dev_engine_bind` (`scripts/lib/workspace.sh`) no longer forces all-interfaces: it pins `LUCIDOS_BIND_ADDR=127.0.0.1` for e2e, and otherwise sets nothing so the engine's own resolver applies. That resolver takes an explicit `LUCIDOS_BIND_*`, then `network.toml`, then loopback. Nothing authenticates that port, so widening it is a deliberate act rather than a script default. `LUCIDOS_BIND_ADDR` rather than `LUCIDOS_BIND_LOOPBACK`, which also carries the `behind_gateway` meaning.
 - The gateway ITSELF binds all interfaces in dev via `LUCIDOS_GATEWAY_BIND_ALL=1` (set by `start_gateway`). It defaults to loopback-only, its packaged security posture, so dev must opt in explicitly. Otherwise a gateway rebuild+reload returns on `127.0.0.1` only, unreachable for the picker and `/<slug>/` routing from other devices (e.g. an iOS PWA over Tailscale).
 - Packaged (`desktop.rs::spawn_gateway`, `LUCIDOS_PACKAGED=1`) does NOT run `start_gateway`, so the gateway stays loopback-only there.
 - **The engine also refuses a cross-origin browser request** (`api::browser_origin`, layered over all of `/api/v1`). Loopback stops a remote caller, not a page on another origin driving that port out of the user's own browser. Non-browser callers send no fetch metadata and pass; app iframes are same-origin and pass. `LUCIDOS_PERMISSIVE_CORS` turns the layer off.

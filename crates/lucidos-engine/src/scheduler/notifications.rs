@@ -51,13 +51,18 @@ use crate::engine::thread_events::MessageOrigin;
 /// A force projection rebuild on a pre-migration workspace will fail loudly,
 /// at which point the workspace owner runs `migrate-tap-shape.md` and
 /// rebuilds.
+///
+/// `to` is boxed because `NavigateUi` is one field per navigate target and
+/// keeps growing, while `Modal` carries nothing. Unboxed, every `Tap` in the
+/// program paid the largest target's size, `Notification` and the
+/// `NotificationCreated` event included. The box is invisible on the wire.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Tap {
     #[default]
     Modal,
     Navigate {
-        to: NavigateUi,
+        to: Box<NavigateUi>,
     },
 }
 
@@ -84,7 +89,7 @@ impl<'de> Deserialize<'de> for Tap {
         enum TapWire {
             Modal,
             None,
-            Navigate { to: NavigateUi },
+            Navigate { to: Box<NavigateUi> },
         }
         Ok(match TapWire::deserialize(deserializer)? {
             TapWire::Modal | TapWire::None => Tap::Modal,
@@ -103,6 +108,13 @@ pub struct NavigateUi {
     pub settings_view: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<String>,
+    /// The place INSIDE the app to open, delivered as the app iframe's
+    /// `location.hash`. Only meaningful with `target: App`. The page-side
+    /// router hands it over and never inspects it, since only the app knows
+    /// what its own targets are. An app that ignores the hash still opens,
+    /// exactly as a file opens at the top when its cited line has gone stale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
     /// First line to select in the file preview, 1-based. Only meaningful with
@@ -174,12 +186,12 @@ pub enum NavigateTarget {
 pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
     match (link_thread, link_event) {
         (Some(thread), Some(event)) => Tap::Navigate {
-            to: NavigateUi {
+            to: Box::new(NavigateUi {
                 target: NavigateTarget::Thread,
                 id: Some(thread.to_string()),
                 event_id: Some(event.to_string()),
                 ..Default::default()
-            },
+            }),
         },
         _ => Tap::Modal,
     }
@@ -199,11 +211,11 @@ pub fn default_tap(link_thread: Option<Uuid>, link_event: Option<Uuid>) -> Tap {
 /// a System subpanel is "Settings → System → X", not "Settings → X".
 pub fn settings_tap(view: &str) -> Tap {
     Tap::Navigate {
-        to: NavigateUi {
+        to: Box::new(NavigateUi {
             target: NavigateTarget::Settings,
             settings_view: Some(view.to_string()),
             ..Default::default()
-        },
+        }),
     }
 }
 
@@ -579,12 +591,12 @@ mod tests {
     #[test]
     fn tap_navigate_thread_with_id_and_event_id() {
         let t = Tap::Navigate {
-            to: NavigateUi {
+            to: Box::new(NavigateUi {
                 target: NavigateTarget::Thread,
                 id: Some("11111111-2222-3333-4444-555555555555".into()),
                 event_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
                 ..Default::default()
-            },
+            }),
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["kind"], "navigate");
@@ -598,16 +610,49 @@ mod tests {
     #[test]
     fn tap_navigate_app_uses_app_id() {
         let t = Tap::Navigate {
-            to: NavigateUi {
+            to: Box::new(NavigateUi {
                 target: NavigateTarget::App,
                 app_id: Some("habit-tracker".into()),
                 ..Default::default()
-            },
+            }),
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["kind"], "navigate");
         assert_eq!(v["to"]["target"], "app");
         assert_eq!(v["to"]["app_id"], "habit-tracker");
+        // An app tap that names no place inside the app writes no key, so the
+        // shape stored before `fragment` existed is still the shape produced.
+        assert!(v["to"].get("fragment").is_none());
+    }
+
+    #[test]
+    fn tap_navigate_app_round_trips_a_fragment() {
+        let t = Tap::Navigate {
+            to: Box::new(NavigateUi {
+                target: NavigateTarget::App,
+                app_id: Some("habit-tracker".into()),
+                fragment: Some("day-2026-08-28".into()),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["to"]["fragment"], "day-2026-08-28");
+        assert_eq!(serde_json::from_value::<Tap>(v).unwrap(), t);
+    }
+
+    #[test]
+    fn tap_navigate_app_deserializes_without_a_fragment() {
+        // Every notification row written before the field existed. It must read
+        // back as `None` rather than failing the whole tap.
+        let t: Tap = serde_json::from_value(serde_json::json!({
+            "kind": "navigate",
+            "to": {"target": "app", "app_id": "habit-tracker"}
+        }))
+        .unwrap();
+        let Tap::Navigate { to } = t else {
+            panic!("expected a navigate tap");
+        };
+        assert_eq!(to.fragment, None);
     }
 
     #[test]

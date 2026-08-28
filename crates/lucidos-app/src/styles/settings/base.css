@@ -289,7 +289,7 @@
     cursor: pointer;
     /* `transition: all` also animates box-shadow, so the neon glow below fades
        in smoothly on hover/select instead of snapping on. */
-    transition: all 0.2s;
+    transition: all var(--duration-normal);
 }
 
 @media (hover: hover) {

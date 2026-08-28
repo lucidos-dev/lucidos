@@ -94,3 +94,32 @@ describe('app frame load cover', () => {
     expect(css).toMatch(/\.app-ui-cover\s*\{[^}]*position:\s*absolute/);
   });
 });
+
+describe('app frame fragment delivery', () => {
+  /** The frame's whole navigation effect, the same span the cover tests read. */
+  const effect = src.match(/const previous = splitFrameSrc[\s\S]*?\}, \[src\]\);/)?.[0] ?? '';
+
+  it('splits the src into document part and fragment before deciding', () => {
+    expect(effect, 'navigation effect not found in AppUiInline.tsx').not.toBe('');
+    expect(effect).toMatch(/splitFrameSrc\(lastSrcRef\.current\)/);
+    expect(effect).toMatch(/splitFrameSrc\(src\)/);
+  });
+
+  it('hands a fragment-only change to setAppFrameHash and raises NO cover', () => {
+    // The trap this pins: a hash-only `location.replace` fires no `load`, so
+    // covering here would leave the cover over a live app until its fuse.
+    const branch = effect.match(/if \(previous\.doc === next\.doc\) \{[\s\S]*?\n    \}/)?.[0] ?? '';
+    expect(branch, 'same-document branch not found').not.toBe('');
+    expect(branch).toContain('setAppFrameHash(iframe, next.fragment)');
+    expect(branch).not.toContain('navigateAppIframe');
+    expect(branch).not.toContain('setLoaded(false)');
+    // Guarded on a non-empty fragment: an emptied one is not a target, so it
+    // must move nobody and leave the reader where they were.
+    expect(branch).toMatch(/if \(next\.fragment\)/);
+  });
+
+  it('still navigates and re-covers when the document part changes', () => {
+    const after = effect.slice(effect.indexOf('navigateAppIframe'));
+    expect(after).toContain('setLoaded(false)');
+  });
+});

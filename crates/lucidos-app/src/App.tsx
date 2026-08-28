@@ -6,6 +6,7 @@ import { ContentPane } from './components/layout/ContentPane';
 import { AppHeader } from './components/layout/AppHeader';
 import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { ConnectionBanner } from './components/layout/ConnectionBanner';
+import { IngressBanner } from './components/layout/IngressBanner';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
@@ -110,10 +111,12 @@ export function App() {
         {/* Desktop's app-shell banners: flow siblings that push the panes down.
             The mobile copies are mounted inside the fixed header instead (see
             AppHeader), and each renders only under its own viewport.
-            The connection bar leads: it says the workspace is unreachable right
-            now, where the reminder below it is about a risk that will still be
-            there later. */}
+            Ordered by reach, widest first. The connection bar says this whole
+            workspace is unreachable; the ingress bar narrows that to the public
+            path a sender takes; the reminder below both is about a risk that
+            will still be there later. */}
         <ConnectionBanner layout="desktop" />
+        <IngressBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
         <Drawer />
         {mobile ? (

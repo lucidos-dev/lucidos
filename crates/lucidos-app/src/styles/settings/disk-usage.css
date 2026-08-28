@@ -65,7 +65,7 @@
 .disk-usage-segment {
     height: 100%;
     min-width: 0.125rem;
-    transition: filter 0.15s ease;
+    transition: filter var(--duration-fast) ease;
 }
 
 .disk-usage-segment:hover {

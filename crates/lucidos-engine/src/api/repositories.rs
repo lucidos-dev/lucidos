@@ -620,16 +620,35 @@ async fn resolve_recorded_branch(
     {
         return Ok(recorded);
     }
-    let head_sha =
-        crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(pool, thread_id)
-            .await
-            .ok_or((
+    // The 404 below states a fact about the user's data, so only an ANSWERED
+    // lookup may produce it. A dropped connection reporting "recorded no
+    // commit" would deny a thread that has commits, which is the same
+    // discipline as the `or_unknown(true)` above.
+    let head_sha = match crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
+        pool, thread_id,
+    )
+    .await
+    {
+        crate::engine::agent_session::resume::IdleAnchor::Found(sha) => sha,
+        crate::engine::agent_session::resume::IdleAnchor::Absent => {
+            return Err((
                 StatusCode::NOT_FOUND,
                 format!(
                     "Branch '{recorded}' no longer exists in this repository, and the thread \
                      recorded no commit to locate its work by."
                 ),
-            ))?;
+            ))
+        }
+        crate::engine::agent_session::resume::IdleAnchor::Unknown => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Branch '{recorded}' no longer exists in this repository, and the commit \
+                     that would locate its work could not be looked up. Try again."
+                ),
+            ))
+        }
+    };
     // Exclude the diff base AND the local default: `base_ref` is
     // `origin/<default>` whenever the local default has diverged, and
     // `for-each-ref refs/heads/` never lists a remote-tracking ref, so on its

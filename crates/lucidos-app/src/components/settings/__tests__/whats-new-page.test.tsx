@@ -10,9 +10,10 @@ import { describe, it, expect } from 'vitest';
 import {
   releaseRowIsOpen,
   releaseNotesBody,
+  leadAheadVersion,
   offeredRelease,
-  releaseRowAction,
   releaseRowMark,
+  releaseRowRoute,
   releaseRowStatus,
   stripReleaseHeading,
   defaultOpenRelease,
@@ -267,28 +268,82 @@ describe('releaseRowStatus', () => {
   });
 });
 
-describe('releaseRowAction', () => {
-  it('offers the install for the release actually on offer', () => {
-    expect(releaseRowAction('available', true)).toBe('install');
+describe('leadAheadVersion', () => {
+  // Newest first, as the endpoint serves it.
+  const LIST: ChangelogRelease[] = [
+    { version: '0.29.0', date: null, notes: '- c' },
+    { version: '0.28.0', date: null, notes: '- b' },
+    { version: '0.27.0', date: null, notes: '- a' },
+  ];
+
+  it('picks the newest release ahead of the running one', () => {
+    expect(leadAheadVersion(LIST, '0.27.0', null)).toBe('0.29.0');
   });
 
-  // A browser or PWA session and a headless install can both see the offer and
-  // neither can act on it. Their route is Settings, System.
-  it('offers no install where this session cannot install', () => {
-    expect(releaseRowAction('available', false)).toBeNull();
+  it('picks the offer when the updater has made one', () => {
+    expect(leadAheadVersion(LIST, '0.27.0', '0.29.0')).toBe('0.29.0');
   });
 
-  // A check is a global question, so per row it repeats itself down the list
-  // and answers nothing the Available row above has not. The one check is in
-  // Settings, System.
-  it('offers nothing on a published release the updater has not offered', () => {
-    expect(releaseRowAction('newer', true)).toBeNull();
-    expect(releaseRowAction('newer', false)).toBeNull();
+  // The mirror carries a release before the update-check origin announces it,
+  // and the origin can stage a rollout on purpose. A control on 0.29.0 would
+  // say "Update & Restart" and install 0.28.0 instead.
+  it('picks the offer even when the list reaches past it', () => {
+    expect(leadAheadVersion(LIST, '0.27.0', '0.28.0')).toBe('0.28.0');
   });
 
-  it('offers nothing on the running release or an older one', () => {
-    expect(releaseRowAction('running', true)).toBeNull();
-    expect(releaseRowAction('none', true)).toBeNull();
+  // The offer postdates the whole list, so it has a row of its own above it and
+  // the caller takes that as the lead.
+  it('falls back to the newest ahead row when the offer is not listed', () => {
+    expect(leadAheadVersion(LIST, '0.27.0', '9.9.9')).toBe('0.29.0');
+  });
+
+  it('picks nothing when the reader is on the newest release', () => {
+    expect(leadAheadVersion(LIST, '0.29.0', null)).toBeNull();
+  });
+
+  // /health can answer after the changelog does, and nothing is marked in that
+  // window. A lead there would put a control on a row wearing no chip.
+  it('picks nothing while the running release is unknown', () => {
+    expect(leadAheadVersion(LIST, null, null)).toBeNull();
+  });
+
+  it('picks nothing from an empty list', () => {
+    expect(leadAheadVersion([], '0.27.0', null)).toBeNull();
+  });
+});
+
+/**
+ * The rule the report asked for: a row the panel marks as ahead of you always
+ * has a route. It used to wear a `Newer` chip and offer nothing, so the update
+ * was on screen and unreachable.
+ */
+describe('releaseRowRoute', () => {
+  it('carries whatever route this session takes, on the lead row', () => {
+    expect(releaseRowRoute('available', true, 'install')).toBe('install');
+    expect(releaseRowRoute('newer', true, 'check')).toBe('check');
+    expect(releaseRowRoute('newer', true, 'guide')).toBe('guide');
+  });
+
+  // Never null for a marked lead row, whatever the session can do. This is the
+  // invariant, and the reason the route type has no "nothing" case.
+  it('always answers for a marked lead row', () => {
+    for (const status of ['available', 'newer'] as const) {
+      for (const route of ['install', 'check', 'guide'] as const) {
+        expect(releaseRowRoute(status, true, route), `${status}/${route}`).toBe(route);
+      }
+    }
+  });
+
+  // A route is a global answer, so a control per row would repeat itself down
+  // the list and say nothing new each time.
+  it('carries nothing on a row that is not the lead', () => {
+    expect(releaseRowRoute('newer', false, 'check')).toBeNull();
+    expect(releaseRowRoute('available', false, 'install')).toBeNull();
+  });
+
+  it('carries nothing on the running release or an older one', () => {
+    expect(releaseRowRoute('running', true, 'install')).toBeNull();
+    expect(releaseRowRoute('none', true, 'install')).toBeNull();
   });
 });
 
@@ -298,8 +353,14 @@ describe('releaseRowMark', () => {
     expect(releaseRowMark('available', 'install')).toBeNull();
   });
 
-  // A browser or PWA session has no button, so the chip is the only thing left
-  // saying the release is there.
+  // These say what to do next, which is not the same fact as "this release is
+  // published and you are not on it". Both belong on the row.
+  it('keeps the chip beside a check or a route to Settings', () => {
+    expect(releaseRowMark('newer', 'check')).toBe('newer');
+    expect(releaseRowMark('newer', 'guide')).toBe('newer');
+    expect(releaseRowMark('available', 'guide')).toBe('available');
+  });
+
   it('keeps the chip where the row has no control', () => {
     expect(releaseRowMark('available', null)).toBe('available');
     expect(releaseRowMark('newer', null)).toBe('newer');

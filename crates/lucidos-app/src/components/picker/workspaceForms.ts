@@ -17,6 +17,7 @@
 
 import { parseWorkspaceNameFromArchive, type WorkspaceStatus } from '../../api/client/control';
 import type { Loadable } from '../../store/types';
+import { formatTimeAgo } from '../../utils/formatTime';
 import { slugifyWorkspaceName, uniqueWorkspaceSlug } from '../../utils/slug';
 
 /** The first run: the list has loaded and there is no workspace yet. Two things
@@ -176,4 +177,39 @@ export function createNote(name: string, workspaces: readonly WorkspaceStatus[])
 export function showsAddress(ws: WorkspaceStatus, all: readonly WorkspaceStatus[]): boolean {
   if (slugifyWorkspaceName(ws.name) !== ws.id) return true;
   return all.some((other) => other.id !== ws.id && other.name === ws.name);
+}
+
+/** The row's backup line: what it says, and whether it is a warning.
+ *
+ *  `ok` is the reassuring case and the only quiet one. `warn` covers all three
+ *  ways a workspace is not protected: the last good backup is old, the schedule
+ *  has never produced one, and nobody set backups up here.
+ */
+export type BackupNote = { text: string; level: 'ok' | 'warn' } | null;
+
+/** What the row says about this workspace's backups, or null when it must say
+ *  nothing.
+ *
+ *  Null is reserved for genuine IGNORANCE: a stopped, unhealthy or unpolled
+ *  workspace, and an engine too old to answer. The gateway holds no database
+ *  handle, so it cannot know. A row guessing "never backed up" there would
+ *  report a nightly-backed-up workspace as unprotected.
+ *
+ *  Every other case speaks, including the unconfigured one. The line answers
+ *  "is this workspace's data safe?". Staying quiet about a workspace with no
+ *  backups at all is the one answer that misleads.
+ *
+ *  Staleness is the engine's verdict, not ours: the 24h threshold lives once, in
+ *  `core::backup::BACKUP_STALE_AFTER_SECONDS`. */
+export function backupNote(ws: WorkspaceStatus): BackupNote {
+  const backup = ws.last_successful_backup;
+  if (!backup) return null;
+  if (backup.at) {
+    const when = formatTimeAgo(new Date(backup.at));
+    return { text: `Backed up ${when}`, level: backup.stale ? 'warn' : 'ok' };
+  }
+  return {
+    text: backup.configured ? 'Never backed up' : 'Not backed up',
+    level: 'warn',
+  };
 }

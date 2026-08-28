@@ -90,6 +90,22 @@ half of a URL is never carved out.
 Rationale and the full invariant set:
 `docs/plans/2026-08-21-a-bare-data-path-in-prose-links-by-shape.md`.
 
+**Amended 2026-08-27: an app link may carry a fragment.** The inventory above
+lists the shapes that reached the guard, and an app entry point now has one more
+form: a trailing `#frag` naming a place inside the app it opens. It is the *app
+fragment* (`docs/glossary.md`), delivered to the iframe as `location.hash`.
+
+| App link shape | Example |
+|---|---|
+| `app:<id>` custom scheme | `[Habit Tracker](app:habit-tracker)` |
+| `apps/<id>[/index.html]` path | `[Habit Tracker](apps/habit-tracker/index.html)` |
+| either, with a fragment | `[Some report](app:pr-understanding#pr-1645)` |
+
+Nothing about the guard changes. The same extractor claims the same hrefs, and
+`app:` is still claimed before the terminal guard sees it. The bare-app-ref
+shapes carry no fragment, being model-tolerance measures.
+Rationale: `docs/plans/2026-08-27-app-links-carry-a-fragment.md`.
+
 ## Consequences
 
 - The next unrecognised href shape is a toast the user can read and report, not
@@ -97,9 +113,11 @@ Rationale and the full invariant set:
   than a bug fix.
 - **A dead link now says so.** Previously the workspace reloaded and the user
   was left guessing whether the link had "worked".
-- Hrefs that used to escape now resolve somewhere. `apps/<unknown-id>/index.html`
-  and `apps/<id>/styles.css` preview as files instead of navigating away; the
-  app gate stays strict, so only a KNOWN id ever opens an app.
+- Hrefs that used to escape now resolve somewhere. `apps/<id>/styles.css`
+  previews as a file. `apps/<unknown-id>/index.html` routes through the app
+  opener instead, which re-fetches the registry before reporting the app
+  gone. The app gate stays strict: only an id that genuinely exists opens
+  one.
 - The guard has to stay last. A new extractor added after it would be dead code
   and would read as covering a shape the guard already ate, so a source-scan
   test pins its position and its two exemptions.

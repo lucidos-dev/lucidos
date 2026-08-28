@@ -112,6 +112,29 @@ export function seedRenderCount(
   return countWithinBudget(costs, costs.length, budget, max);
 }
 
+/** How many trailing exchanges a window whose TOP EDGE sits at `floor` holds.
+ *  The inverse of `computeRenderFromIndex`, and the reason ThreadView stores the
+ *  edge rather than the count.
+ *
+ *  A count is a SIZE and the window's promise is about POSITION: no turn the
+ *  reader has already been shown may leave the DOM. Appending a turn grows
+ *  `total`, so a held count slides the window forward and evicts the oldest one
+ *  it was rendering. The fill below cannot grow the window back once the
+ *  transcript scrolls, which a narrow pane reaches in two turns. So the
+ *  transcript pins itself to the newest few, however many the reader adds. A
+ *  held EDGE keeps them all.
+ *
+ *  An edge PAST the end still renders one exchange, which is the floor
+ *  `countWithinBudget` keeps on the other side. A fold can return fewer
+ *  exchanges than the one that seeded the edge: an optimistic pending message
+ *  becomes part of the turn it opened. Clamping to `rows` alone would answer
+ *  zero there, and a transcript with content would draw nothing. */
+export function renderCountFromFloor(total: number, floor: number): number {
+  const rows = Math.max(0, total);
+  if (rows === 0) return 0;
+  return rows - Math.min(Math.max(0, floor), rows - 1);
+}
+
 /** The terms `canSeedRenderWindow` reads, named so the rule below can be read
  *  without ThreadView. */
 export interface RenderWindowSeedState {
@@ -146,6 +169,37 @@ export function computeRenderFromIndex(total: number, renderCount: number): numb
 /** Whether more (older) exchanges remain above the current window. */
 export function hasMoreAbove(total: number, renderCount: number): boolean {
   return computeRenderFromIndex(total, renderCount) > 0;
+}
+
+/** Is the exchange at `index` inside the window, i.e. rendered?
+ *
+ *  The stop condition for ThreadView's walk up to a saved *reading position*.
+ *  That position names a TURN (`hooks/useScrollMemory.ts`), and the restore
+ *  cannot place the reader until the turn is in the DOM.
+ *
+ *  The walk goes one budgeted round per commit rather than seeding straight to
+ *  `index`. A seed that jumped would render every turn in between in ONE pass,
+ *  which is the blocking render the window exists to prevent (ADR 0081).
+ *  Chunking is the answer that ADR names, beside windowing and moving work off
+ *  the main thread. */
+export function windowReachesIndex(total: number, renderCount: number, index: number): boolean {
+  return index >= computeRenderFromIndex(total, renderCount);
+}
+
+/** Does the window owe another round to reach `index`?
+ *
+ *  The whole of ThreadView's `reachAnchor` decision, so the walk's termination
+ *  is answerable without a component. Three ways it is already done, and each
+ *  ends the walk for good. A negative index is a saved position naming a turn
+ *  this thread has not got. The turn is rendered. Nothing is left above.
+ *
+ *  It shrinks monotonically under `expandRenderCount`, which always takes at
+ *  least one exchange while any remain. So a walk driven off this reaches false
+ *  in at most one round per remaining exchange. */
+export function windowMustReachIndex(total: number, renderCount: number, index: number): boolean {
+  if (index < 0) return false;
+  if (windowReachesIndex(total, renderCount, index)) return false;
+  return hasMoreAbove(total, renderCount);
 }
 
 /** Next `renderCount` after a scroll-up expansion: one more budget's worth of
