@@ -6,7 +6,7 @@ function cred(service_name: string, auth_type: AuthType, id: string): Credential
   return {
     id,
     service_name,
-    base_url: 'https://api.example.test',
+    base_urls: ['https://api.example.test'],
     auth_type,
     auth_header: 'Authorization',
     created_at: '2026-08-05T00:00:00Z',

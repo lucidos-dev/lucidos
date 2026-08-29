@@ -24,6 +24,7 @@ import {
   honourAnchoredMutation,
   isFollowScroll,
   isNavigationScroll,
+  markAnchorScroll,
   markNavigationScroll,
   markRevealScroll,
   makeScrollObservers,
@@ -1533,31 +1534,44 @@ describe('an IDLE thread keeps an armed reader who never left the edge', () => {
     expect(followingLiveEdge.value).toBe(true);
   });
 
-  it('lands them on the edge in one write when a reveal grows the thread', () => {
-    // A REVEAL grows every turn ABOVE the reader as well as below. It would
-    // leave a reader on the edge a screenful short of it. So they are put back
-    // in ONE held write, inside the frame that unfreezes the container.
+  it('leaves a TURN CONTROL where it was pressed, growth round included', () => {
+    // A reveal is the reader's own act, not the transcript's own rendering, so
+    // it carries nobody on a quiet thread. The correction holds the control,
+    // and this round must agree or the reader is hauled down anyway.
     //
-    // The caller hands down the reading it took BEFORE the mutation, because
-    // growth moves the edge while leaving `scrollTop` where it was. The anchor
-    // correction is skipped for the same reader, so this is the tap's one
-    // motion (`readerKeepsTheLiveEdge`).
-    //
-    // A reveal is growth too, so the branch below runs for one as well. It
-    // reads the same two terms, so it agrees rather than adding a motion.
-    const { el, onScroll, onResize } = armedAtTheEdgeOnAnIdleThread();
+    // The ANCHOR WRITE is what makes them agree. No scroll event runs here, on
+    // purpose: whether one lands before this round is a race, so the write
+    // itself has to be the signal.
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
 
-    el.scrollHeight = 5000;            // the steps unfold, above the reader and below
-    honourAnchoredMutation(el, true);  // and the reveal puts them on the new edge
+    el.scrollHeight = 5000;      // the steps unfold, above the control and below
+    markAnchorScroll(el, 3000);  // and the correction holds the control still
+    honourAnchoredMutation(el);
 
-    expect(el.writes).toBe(1);
-    expect(el.scrollTop).toBe(4500);
+    expect(el.scrollTop).toBe(3000);
 
-    onScroll();
+    onResize();                  // the reveal's own growth round
+
+    expect(el.scrollTop).toBe(3000);
+    expect(followingLiveEdge.value).toBe(true);
+  });
+
+  it('agrees even when the correction moved nobody', () => {
+    // THE REPORTED CASE. Unfolding one turn changes nothing ABOVE the control,
+    // so the correction's target is where the container already sits and no
+    // scroll event follows at all. Left on its old snapshot, this round wrote
+    // the new edge and the icon the reader pressed rose off the screen.
+    const { el, onResize } = armedAtTheEdgeOnAnIdleThread();
+
+    el.scrollHeight = 5000;
+    markAnchorScroll(el, el.scrollTop);
+    honourAnchoredMutation(el);
+    el.writes = 0;
+
     onResize();
 
-    expect(el.scrollTop).toBe(4500);
-    expect(followingLiveEdge.value).toBe(true);
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(2500);
   });
 
   it('moves an UNARMED reader on the edge zero pixels under the same growth', () => {

@@ -205,8 +205,8 @@ deleted triggers are honored from the first admission decision.
 
 ## The panel
 
-**Thread Queue** under **Settings → System** (a subpanel tab alongside Backup,
-Memory, Disk Usage, Environment Variables) shows the Running set (with the total
+**Thread Queue** under **Settings → System** (a row in that submenu, alongside
+Backup, Memory, Disk Usage, Environment Variables) shows the Running set (with the total
 cap — counting background **and** user-initiated work), the Queued backlog, and
 the capacity policy editor. Per **background** queued entry: **Run now** (force-admit,
 ignoring every cap) and **Drop** (discard without running). Running entries can't

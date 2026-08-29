@@ -62,6 +62,23 @@ fn walk_dir(
             return Ok(());
         }
         let path = entry.path();
+        // A symlink is skipped, never followed. Git checks links out verbatim,
+        // so `is_dir()` on a cloned `link -> /` walks the host filesystem into
+        // `data/artifacts/imported/`, and `loop -> .` recurses until the stack
+        // goes. Same guard, same reason, as `repo_files::repo_entries`.
+        //
+        // `entry.file_type()` rather than a `symlink_metadata` call: it reads
+        // the type the directory scan already returned, does not follow the
+        // link, and costs no extra syscall. An unreadable type is skipped
+        // rather than assumed non-symlink, so the guard fails closed.
+        let Ok(file_type) = entry.file_type() else {
+            *skipped_count += 1;
+            continue;
+        };
+        if file_type.is_symlink() {
+            *skipped_count += 1;
+            continue;
+        }
         let relative = path.strip_prefix(base).unwrap_or(&path);
         let relative_str = relative.to_string_lossy();
 

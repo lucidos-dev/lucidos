@@ -34,7 +34,9 @@ impl LucidosEngine {
                 let gdelt_url = format!(
                     "https://api.gdeltproject.org/api/v2/doc/doc?query={}&mode=artlist&maxrecords={}&format=json&sort=datedesc",
                     urlencoding::encode(topic),
-                    max_articles + 5 // Fetch a few extra in case of duplicates
+                    // Saturating: the arg carries no cap, and a plain `+ 5` on
+                    // a model-supplied `usize::MAX` wraps to 4 in release.
+                    max_articles.saturating_add(5) // A few extra, in case of duplicates
                 );
 
                 match client.get(&gdelt_url).send().await {
@@ -103,16 +105,15 @@ impl LucidosEngine {
                         topic
                     ))
                 } else {
-                    let result = all_articles
-                        .into_iter()
-                        .take(max_articles)
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
+                    let shown: Vec<String> = all_articles.into_iter().take(max_articles).collect();
+                    // Counted, not re-derived from the rendered text: a title
+                    // carrying the `**[` marker inflated the reported total.
+                    let count = shown.len();
                     Ok(format!(
                         "Found {} articles about '{}':\n\n{}",
-                        result.matches("**[").count(),
+                        count,
                         topic,
-                        result
+                        shown.join("\n\n")
                     ))
                 }
             }

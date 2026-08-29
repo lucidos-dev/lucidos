@@ -1,6 +1,9 @@
 # 0143: Webhook ingress is checked from outside the machine, per resolved address and per address family
 
-- **Status**: Accepted
+- **Status**: Accepted; the resolver fallback below is **revised by
+  [ADR 0158](0158-webhook-ingress-verdict-needs-a-measurement.md)**. The walk
+  now falls through an answer naming no record, and only a probe that was
+  actually sent can degrade a family. Everything else here still holds.
 - **Date**: 2026-08-27
 
 ## Context
@@ -94,6 +97,13 @@ So the lookup speaks DNS over HTTPS to `1.1.1.1`, and falls back to `8.8.8.8`.
 Both are IP literals, so there is no bootstrap lookup and no system resolver
 anywhere in the path. Any answer inside `100.64.0.0/10` is dropped before a
 request is built, and a test pins that property.
+
+**What "falls back" means is widened by
+[ADR 0158](0158-webhook-ingress-verdict-needs-a-measurement.md).** As first
+built, only a transport error reached the second endpoint, so a settled "no such
+record" from the first one ended the lookup. One resolver answers that way
+intermittently for a live funnel name, which reported a working ingress as
+dead.
 
 ### A family that fails is degraded, even when the other one is perfect
 

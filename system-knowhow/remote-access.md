@@ -905,6 +905,29 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
   to all interfaces.
 - A change takes effect only after a **restart**.
 
+### An engine that faces a network asks for a credential
+
+Widening the **gateway** bind changes nothing about how you reach Lucidos. The
+gateway has always authenticated every caller, on every bind, by pairing or by
+the machine-local token. Your phone pairs once and keeps working.
+
+Widening an **engine** bind is different, and only a directly-launched engine
+can be widened at all. Such an engine then requires a local credential on every
+path but `/api/v1/health` (ADR 0155). A browser cannot present one, so:
+
+- **Reach the workspace through the gateway**, at `https://<host>:<port>/<slug>/`.
+  That is the shipped route and it is unaffected.
+- **A bookmark pointing straight at an engine port stops working from another
+  device.** It still works on the machine itself only for processes that can
+  read `~/.lucidos/local-token`, such as the `lucidos` CLI.
+- Local callers need no setup. The CLI, the gateway's proxy hop and the webhook
+  hop all present their credential already.
+
+Two credentials exist, both minted by the gateway, both mode 0600:
+`~/.lucidos/local-token` reaches everything, and `~/.lucidos/webhook-token`
+reaches only webhook delivery. That is why a `tailscale funnel` pointed at the
+hook port cannot restart a workspace.
+
 Binding to the tailnet IP specifically (`100.x.y.z`) is the middle ground: the
 tailnet reaches it, the coffee-shop LAN does not.
 
@@ -966,3 +989,4 @@ not that an interface is missing).
 | No push notifications | Not a secure origin (check that first), or the OS-level permission was never granted. |
 | Apps load blank behind a reverse proxy | A path prefix was added. Serve Lucidos at the origin root, on its own port. |
 | `tailscale serve status` says "No serve config" but the URL works | Route C is in play. Not a problem. Probe the port. |
+| Anything needing a live socket fails, while pages load | A hop is dropping the WebSocket upgrade. Probe `/<slug>/api/v1/ws-echo`, which upgrades and echoes what you send it. A `101` means every hop carried it. |

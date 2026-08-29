@@ -257,11 +257,11 @@ describe('the repair path renders against the stored credential', () => {
     expect(source).toContain('open={!hasPrefilledEndpoints || repairNamedEndpoints}');
   });
 
-  it('does not write the base URL through a ref behind a controlled input', () => {
-    // The input is controlled, so a ref write is reverted by the next render
+  it('does not write the base URLs through a ref behind a controlled input', () => {
+    // The inputs are controlled, so a ref write is reverted by the next render
     // and the selected base provider's base_url never reaches the save.
     expect(source).not.toMatch(/baseUrlRef\.current\.value\s*=/);
-    expect(source).toContain('setBaseUrl(row.base_url)');
+    expect(source).toContain('setBaseUrls([row.base_url])');
   });
 });
 

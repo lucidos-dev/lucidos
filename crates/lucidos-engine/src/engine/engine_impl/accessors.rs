@@ -94,7 +94,13 @@ impl LucidosEngine {
 
     /// Set the self-reference after wrapping in Arc. Must be called once after Arc::new.
     pub fn set_self_arc(&self, arc: &Arc<LucidosEngine>) {
-        self.self_arc.set(Arc::downgrade(arc)).ok();
+        // A second call keeps the FIRST Arc while `attach_engine` below takes
+        // the second, so the queue and `clone_arc` would hand out different
+        // engines. Nothing here can recover from that, but it must not be
+        // silent.
+        if self.self_arc.set(Arc::downgrade(arc)).is_err() {
+            log!("[Engine] set_self_arc called twice: keeping the first Arc");
+        }
         // The Thread Queue executes admitted entries through the engine —
         // wire it the moment the Arc exists so no submission can race a
         // missing executor.
@@ -304,6 +310,7 @@ impl LucidosEngine {
     /// Record a Planned marker (the `implementation-plan` enforcement floor).
     /// Called by the `/api/v1/internal/mark-planned` endpoint that the
     /// `lucidos planned mark` CLI hits.
+    #[allow(clippy::too_many_arguments)] // one arg per planned_branches column
     pub(crate) async fn record_planned(
         &self,
         repo_root: &std::path::Path,
@@ -311,8 +318,9 @@ impl LucidosEngine {
         kind: crate::engine::git_ops::PlanMarkerKind,
         plan_path: Option<&str>,
         reason: Option<&str>,
+        files: &[String],
         head_sha: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::engine::git_ops::record_planned(
             &self.pool,
             repo_root,
@@ -320,6 +328,7 @@ impl LucidosEngine {
             kind,
             plan_path,
             reason,
+            files,
             head_sha,
         )
         .await
@@ -331,6 +340,18 @@ impl LucidosEngine {
         branch_name: &str,
     ) -> crate::engine::git_ops::PlanMarkerState {
         crate::engine::git_ops::plan_marker_state(&self.pool, repo_root, branch_name).await
+    }
+
+    /// The files a `BoundedSecurityFix` marker confines its branch to. `Ok` of
+    /// an empty list for every other state, and for a branch with no marker.
+    /// `Err` when the read failed, which the Apply floor reports as its own
+    /// fault rather than the branch's.
+    pub(crate) async fn plan_marker_files(
+        &self,
+        repo_root: &std::path::Path,
+        branch_name: &str,
+    ) -> Result<Vec<String>, String> {
+        crate::engine::git_ops::plan_marker_files(&self.pool, repo_root, branch_name).await
     }
 
     /// Approve a `Proposed` plan, flipping it to `Planned` so the gate passes.
@@ -414,20 +435,6 @@ impl LucidosEngine {
     }
 }
 
-/// Typed `data/` subdirectories the file tools write into. Anything else under
-/// the `data/` root (`.env`, `postgres/`, …) is gitignored config the tools must
-/// not touch — see [`normalize_data_path`].
-const KNOWN_DATA_PREFIXES: [&str; 8] = [
-    "artifacts/",
-    "apps/",
-    "knowhow/",
-    "triggers/",
-    "scripts/",
-    "config/",
-    "auth-modules/",
-    "system-knowhow/",
-];
-
 /// Normalize an LLM-supplied path to a workspace `data/`-relative path, or reject
 /// it. Pure string logic (no filesystem); callers join the result onto the
 /// workspace `data/` dir. Rules:
@@ -436,7 +443,7 @@ const KNOWN_DATA_PREFIXES: [&str; 8] = [
 /// - A leading `data/` is stripped — LLMs often pass the full workspace-relative path.
 /// - `.lucidos/…` is handled by [`normalize_lucidos_path`] BEFORE the untyped
 ///   default, because it names the ephemeral scratch tree outside `data/`.
-/// - A known typed prefix ([`KNOWN_DATA_PREFIXES`]) is kept as-is.
+/// - A known typed prefix ([`crate::core::KNOWN_DATA_PREFIXES`]) is kept as-is.
 /// - An *untyped* bare path (no `data/` prefix) defaults under `artifacts/`, the
 ///   catch-all content store — so `write_file('report.md')` lands sensibly at
 ///   `artifacts/report.md`.
@@ -468,7 +475,7 @@ fn normalize_data_path(relative_path: &str) -> Result<String, String> {
         return normalize_lucidos_path(had_data_prefix, stripped);
     }
 
-    if KNOWN_DATA_PREFIXES.iter().any(|p| stripped.starts_with(p)) {
+    if crate::core::is_known_data_prefix(stripped) {
         return Ok(stripped.to_string());
     }
     if had_data_prefix {

@@ -21,8 +21,11 @@ const TYPE_AAAA: u16 = 28;
 /// What the public resolvers said about a hostname.
 ///
 /// An empty answer and an unanswered question look identical as a bare list,
-/// and they are opposite readings. A host with no public record is unreachable
-/// from outside. A resolver we could not talk to says nothing at all.
+/// and they are opposite readings. One says the hostname carries no record. The
+/// other says a resolver we could not talk to told us nothing at all.
+///
+/// Neither is a verdict about the ingress. Only `Found` gives the probe an
+/// address to knock on, and only a knock decides whether a family is degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicAddresses {
     /// At least one address the outside world can reach.
@@ -38,10 +41,20 @@ pub enum PublicAddresses {
 /// This asks for both families. A client that gets one of each picks IPv6, and
 /// never notices a dead IPv4 relay.
 pub async fn public_addresses(client: &reqwest::Client, host: &str) -> PublicAddresses {
+    public_addresses_from(client, DOH_ENDPOINTS, host).await
+}
+
+/// The same lookup against a named endpoint list, so a test can serve the
+/// bodies itself. Production always passes [`DOH_ENDPOINTS`].
+async fn public_addresses_from(
+    client: &reqwest::Client,
+    endpoints: &[&str],
+    host: &str,
+) -> PublicAddresses {
     let mut found = Vec::new();
     let mut every_family_answered = true;
     for record_type in [TYPE_A, TYPE_AAAA] {
-        match resolve_one_type(client, host, record_type).await {
+        match resolve_one_type(client, endpoints, host, record_type).await {
             Some(addresses) => found.extend(addresses),
             None => every_family_answered = false,
         }
@@ -58,17 +71,29 @@ pub async fn public_addresses(client: &reqwest::Client, host: &str) -> PublicAdd
     }
 }
 
-/// Ask each endpoint in turn until one answers.
+/// Ask each endpoint in turn, and take the first one that names an address.
 ///
-/// `None` means no endpoint answered. An answer carrying no usable record is
-/// `Some` of an empty list, which is a fact about the hostname.
+/// A settled "no such record" does NOT stop the walk. Public resolvers disagree
+/// about funnel hostnames: measured over ten queries, Cloudflare intermittently
+/// answered NXDOMAIN for a name Google resolved every time. Stopping at the
+/// first refusal turned that flap into a phantom total outage.
+///
+/// So the walk ends on a non-empty list. An empty list needs UNANIMITY: every
+/// endpoint answered, and none named a record. Anything less is `None`, meaning
+/// nothing is known.
+///
+/// Unanimity is the same lesson stated once more. A lone "no such record" is
+/// the answer the measurement showed to be unreliable. It cannot carry the
+/// question on its own while its neighbour stays silent.
 async fn resolve_one_type(
     client: &reqwest::Client,
+    endpoints: &[&str],
     host: &str,
     record_type: u16,
 ) -> Option<Vec<IpAddr>> {
     let wanted = record_type.to_string();
-    for endpoint in DOH_ENDPOINTS {
+    let mut answered = 0usize;
+    for endpoint in endpoints {
         let response = client
             .get(*endpoint)
             .query(&[("name", host), ("type", wanted.as_str())])
@@ -91,13 +116,20 @@ async fn resolve_one_type(
         };
         match body {
             Ok(body) => match addresses_from_doh(&body, record_type) {
-                Some(addresses) => return Some(addresses),
+                Some(addresses) if !addresses.is_empty() => return Some(addresses),
+                // Settled, and naming nothing. Count the answer and ask the
+                // next endpoint anyway: one resolver refusing a name its
+                // neighbour resolves is the flap this walk exists to survive.
+                Some(_) => {
+                    answered += 1;
+                    log!("[WebhookIngress] {endpoint} named no public address for {host}");
+                }
                 None => log!("[WebhookIngress] {endpoint} did not answer for {host}"),
             },
             Err(e) => log!("[WebhookIngress] {endpoint} answer could not be read: {e}"),
         }
     }
-    None
+    (answered > 0 && answered == endpoints.len()).then(Vec::new)
 }
 
 /// The two response codes that settle a question. Anything else is a resolver
@@ -175,3 +207,9 @@ fn is_public_v6(ip: &Ipv6Addr) -> bool {
 #[cfg(test)]
 #[path = "dns_tests.rs"]
 mod tests;
+
+// Separate from the module above because these drive the endpoint walk against
+// a stub server, where those read one body with no network at all.
+#[cfg(test)]
+#[path = "dns_walk_tests.rs"]
+mod walk_tests;

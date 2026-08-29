@@ -21,7 +21,10 @@
 import type { WebhookIngressFamily, WebhookIngressOutage } from '../api/client';
 import { formatDurationPhrase } from './formatTime';
 
-const FAMILY_LABEL: Record<WebhookIngressFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
+/** How each family is spelled for a reader. Exported because the Discuss prompt
+ *  names them too, and two spellings of one family would describe one outage
+ *  two ways. */
+export const FAMILY_LABEL: Record<WebhookIngressFamily, string> = { ipv4: 'IPv4', ipv6: 'IPv6' };
 
 /** How often the engine looks again. Matches `WEBHOOK_INGRESS_CRON` in
  *  `scheduler/webhook_ingress/`, and a number that drifts from it promises a

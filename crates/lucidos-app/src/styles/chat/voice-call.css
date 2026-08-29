@@ -1,0 +1,87 @@
+/* The call strip: what a live call looks like, above the prompt row.
+ *
+ * A raised neutral surface rather than a bordered callout, and no left stripe
+ * (frontend-css.md bans it outright). The dot carries the state and the two
+ * lines carry the conversation.
+ *
+ * The toggle that starts and ends a call is NOT here. It lives with the prompt
+ * row's other toggle paints in input-messages.css, which is that row's one
+ * registry of on-state shapes. */
+
+.call-strip {
+    display: flex;
+    flex-direction: column;
+    gap: 0.125rem;
+    padding: 0.375rem 0.625rem;
+    margin-bottom: 0.375rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.5rem;
+    font-size: var(--font-size-sm);
+    max-width: 100%;
+}
+
+.call-strip-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+.call-strip-dot {
+    width: 0.4375rem;
+    height: 0.4375rem;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--text-muted);
+}
+
+/* Connecting is the only state the caller waits through, so it is the only one
+ * that moves. An indefinite animation carries a literal duration and no token
+ * (frontend-css.md): it is an activity indicator, not a transition. */
+.call-strip[data-phase="connecting"] .call-strip-dot {
+    background: var(--accent-notable);
+    animation: call-strip-pulse 1.2s ease-in-out infinite;
+}
+
+.call-strip[data-phase="listening"] .call-strip-dot {
+    background: var(--accent-green);
+}
+
+.call-strip[data-phase="speaking"] .call-strip-dot {
+    background: var(--accent);
+}
+
+@keyframes call-strip-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .call-strip[data-phase="connecting"] .call-strip-dot {
+        animation: none;
+    }
+}
+
+/* One line each, truncated. The strip sits above the composer and must not
+ * grow the prompt area as a reply streams in. */
+.call-strip-line {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+}
+
+.call-strip-said {
+    color: var(--text-primary);
+}
+
+.call-strip-who {
+    display: inline-block;
+    margin-right: 0.375rem;
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+}

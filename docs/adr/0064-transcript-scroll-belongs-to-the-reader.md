@@ -67,18 +67,27 @@ the edge out from under someone who never left it. A reader SCROLLED AWAY is
 carried only while the agent is live, because a quiet thread has nothing to be
 carried toward.
 
-> **A turn control's reveal is the app's own rendering too.** Showing the step
-> log grows every turn. The anchor correction holds the control the reader
-> pressed, which pushes the end of the thread off the bottom. The two readings
-> of "hold them still" disagree only here, and the reader on the edge asked for
-> the end.
-> So the reveal reads the same two terms the growth branch does, ARMED and ON
-> THE EDGE (`readerKeepsTheLiveEdge`).
+> **A turn control's reveal is the READER's own act, not the app's rendering.**
+> A press names one thing to change, so that thing is what must not move
+> (ADR 0147). The reveal therefore carries nobody on a quiet thread, and the
+> correction holds the control from every park, the live edge included. Only a
+> ride already CARRYING the reader outranks it. On a live thread the next
+> growth round would undo the hold, so the press would cost a second motion.
+> One predicate answers for both halves, `followIsCarrying`.
 
-> This replaces a carve-out that gave an armed reader on a QUIET thread the
-> anchor correction wherever they sat. It was reported as the transcript
-> scrolling up a few lines. A reader parked in history still gets the
-> correction, on a quiet thread and on a running one.
+> **This reverses an amendment, and the amendment's premise expired.** It
+> exempted an armed reader ON the edge, reading ARMED and ON THE EDGE before
+> the mutation. It was written when the anchor was a GUESS at the reader's
+> topmost line. Holding that guess pushed the end of the thread 974px below the
+> fold, reported as the transcript scrolling up a few lines. ADR 0147 then made
+> the anchor the element the reader clicked. The control is pinned to the pixel
+> now, so that drift cannot recur through it.
+
+> What the reversal owed was the growth branch. `keepTheLiveEdge` hauled the
+> same reader down on the reveal's own resize round, even where the correction
+> wrote nothing. It stands down for an ANCHOR WRITE now, the term its scroll
+> twin already had. Reported as expanding a folded turn from the bottom moving
+> the icon.
 
 **Four things retire a standing follow, and all four are the reader**: their own
 scroll gesture, a chevron or turn-nav press, opening another thread, and a

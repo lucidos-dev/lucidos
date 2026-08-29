@@ -1616,6 +1616,46 @@ fn ensure_workspace_gitignore_inserts_missing_trailing_newline() {
     assert!(content.contains(".lucidos/\ndata/postgres/\ndata/blobs/\n"));
 }
 
+/// The engine covers the launch that skips the gateway, so the helper has to
+/// create `.lucidos/` before it marks it. A workspace with no state dir would
+/// otherwise log an exclusion failure on every boot (ADR 0153).
+#[test]
+fn ensure_state_dir_excluded_creates_the_directory_it_marks() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!dir.path().join(".lucidos").exists());
+
+    ensure_state_dir_excluded_from_file_backup(dir.path()).expect("ensure ok");
+
+    assert!(dir.path().join(".lucidos").is_dir());
+}
+
+/// Every boot re-checks the exclusion, so only the first call may report a
+/// change. Otherwise the startup log carries the same line for ever.
+#[test]
+#[cfg(target_os = "macos")]
+fn ensure_state_dir_excluded_reports_the_change_once() {
+    let dir = tempfile::tempdir().unwrap();
+
+    assert!(
+        ensure_state_dir_excluded_from_file_backup(dir.path()).expect("first boot"),
+        "the first call sets the exclusion"
+    );
+    assert!(
+        !ensure_state_dir_excluded_from_file_backup(dir.path()).expect("second boot"),
+        "the re-check on the next boot must be silent"
+    );
+}
+
+/// Off macOS there is no exclusion to set. The call still succeeds and still
+/// creates the directory, so no caller needs a `cfg` around it.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn ensure_state_dir_excluded_is_a_quiet_no_op_off_macos() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!ensure_state_dir_excluded_from_file_backup(dir.path()).expect("ensure ok"));
+    assert!(dir.path().join(".lucidos").is_dir());
+}
+
 /// Brand-new workspace: helper writes `[ports]\nvite = N\n`, stages it,
 /// and commits via the engine's "Lucidos <lucidos@local>" identity. The
 /// return value is `true` so callers can log a one-liner about the pin.

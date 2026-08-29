@@ -55,7 +55,10 @@ use crate::engine::LucidosEngine;
 /// (`on`, conditions included), why (`reason`), and how long it has been and
 /// has left (`armed_at` / `expires_at`, plus the two ages spelled out because
 /// a timestamp is the thing a model is worst at subtracting).
-#[derive(Debug, Clone, serde::Serialize)]
+/// `Deserialize` as well as `Serialize`: this is the body of
+/// `GET /api/v1/threads/:id/event-waits`, and an API type carries both so a
+/// consumer can type the response instead of hand-walking the JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventWaitView {
     pub wait_id: Uuid,
     pub on: Vec<crate::core::event_subscription::EventSubscription>,

@@ -34,6 +34,7 @@ chrono-tz = "0.10"
 libc = "0.2"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "migrate"] }
 # pg-embed removed - using Docker PostgreSQL with pgvector
 # `vendored-openssl` statically links OpenSSL into the binary for the
@@ -43,7 +44,11 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chro
 # `openssl` dep below — together they vendor every OpenSSL path crate-wide.
 git2 = { version = "0.20", features = ["vendored-openssl"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
-axum = { version = "0.7", features = ["macros", "multipart"] }
+axum = { version = "0.7", features = ["macros", "multipart", "ws"] }
+# Outbound WebSocket client, for the voice talker. axum's `ws` feature serves a
+# socket; nothing here dialled one until voice needed to. Already in the tree
+# via chromiumoxide, but without TLS, and the talker is reached over `wss`.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "compression-gzip", "compression-br"] }
 fastembed = "4"

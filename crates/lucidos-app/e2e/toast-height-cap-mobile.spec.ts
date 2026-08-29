@@ -100,6 +100,10 @@ test.describe('toast height cap on mobile', () => {
         // rather than the body simply being short enough to fit.
         headingOverflows: heading.scrollHeight > heading.clientHeight + 1,
         headingScrolls: getComputedStyle(heading).overflowY === 'auto',
+        // The two the whole-line check needs. `line-height` resolves to a px
+        // length, so the ratio is the number of lines the box actually shows.
+        headingClientHeight: heading.clientHeight,
+        headingLineHeight: parseFloat(getComputedStyle(heading).lineHeight),
         openTop: openRect.top,
         openBottom: openRect.bottom,
         openHeight: openRect.height,
@@ -126,5 +130,16 @@ test.describe('toast height cap on mobile', () => {
     expect(geom.openHeight).toBeGreaterThan(0);
     expect(geom.openBottom).toBeLessThanOrEqual(geom.toastBottom + 1);
     expect(geom.openTop).toBeGreaterThanOrEqual(0);
+
+    // Whole lines. A heading ending mid-line shows the top halves of that
+    // line's glyphs. That is how the reported 503 card hid the error text under
+    // its own title. The source scan
+    // (`src/styles/__tests__/toast-height-cap.test.ts`) pins the two rules;
+    // only a browser resolves the ratio they are supposed to produce.
+    const lines = geom.headingClientHeight / geom.headingLineHeight;
+    expect(
+      Math.abs(lines - Math.round(lines)),
+      `the heading shows ${lines.toFixed(2)} lines, so the last one is sheared`,
+    ).toBeLessThan(0.05);
   });
 });

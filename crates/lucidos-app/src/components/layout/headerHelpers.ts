@@ -1,4 +1,4 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, settingsSubviewShortLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, settingsSubviewShortLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
 import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm, type SettingsNavKey } from '../../store/store';
 import { MENU_ITEM_LABELS } from '../../store/types';
 import type { NavEntry } from '../../store/actions/navigation';
@@ -59,12 +59,13 @@ function contentTitle(short: boolean): string {
   const settingsLabel: (key: SettingsNavKey) => string | undefined =
     short ? settingsSubviewShortLabel : settingsSubviewLabel;
   const overlay = panelOverlay.value;
-  const form = activeInlineForm.value;
   const url = panelUrl.value;
   const pageTitle = panelTitle.value;
   const active = activeMenuItem.value;
 
-  if (overlay?.type === 'form') return getFormTitle(form!);
+  // The overlay's own `form`, not the `activeInlineForm` alias computed off it.
+  // Narrowing gives it to us here, where the alias needed a `!` to say the same.
+  if (overlay?.type === 'form') return getFormTitle(overlay.form);
   if (overlay?.type === 'app-ui') {
     const wipTid = wipPreviewThreadId.value;
     if (wipTid) {

@@ -40,6 +40,7 @@ mod boot_phase;
 mod build_id;
 mod control;
 mod error;
+mod file_backup;
 mod hook_socket;
 mod net_config;
 mod next_boot;

@@ -498,7 +498,7 @@ pub(crate) fn assert_no_short_addresses(surface: &str) {
             hex.len(),
             32,
             "a shortened evt- address near: {}",
-            &after[..after.len().min(48)]
+            &after[..after.floor_char_boundary(48)]
         );
         rest = &after[hex.len()..];
     }

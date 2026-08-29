@@ -169,10 +169,10 @@ test.describe('A turn control holds itself still', () => {
       // This spec is about a reader who has PARKED somewhere and pressed a
       // control. The follow seed ships armed, so without this the thread opens
       // riding the live edge. `park()` writes `scrollTop` directly rather than
-      // as a gesture, and a direct write is not what disarms a ride.
-      // `withScrollAnchor` then skips the correction on purpose: a carried
-      // reader asked for the opposite of being held still. The press reads as a
-      // jump of hundreds of pixels, not the sub-pixel drift under test.
+      // as a gesture, and a direct write is not what disarms a ride. The
+      // transcript therefore hauls the reader back to the end before the press
+      // is made. What gets measured is that haul, hundreds of pixels of it,
+      // rather than the sub-pixel drift under test.
       await disarmFollowSeed(page);
       await navigateToApp(page);
       await openThreadDrawer(page);

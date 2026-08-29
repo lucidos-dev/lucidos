@@ -20,7 +20,8 @@
  * leftmost in that cluster (`TRAILING_LEFTMOST`) rather than naming one button.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, openThreadDrawer, ensureMobileView } from './helpers';
+import { createIframeAppFixture } from './db-helpers';
+import { assertHealthy, navigateToApp, openThreadDrawer, ensureMobileView, gotoWithRetry } from './helpers';
 
 /** The leftmost thing on the THREADS row's trailing side, whichever it
  *  currently is: what the centred title actually has to clear there. That is
@@ -97,6 +98,74 @@ async function measure(
   }, { headerSel, titleSel, leadingSel, trailingSel, text });
 }
 
+/** The nav cluster's geometry, resolved through a probe in the row rather than
+ *  recomputed from the token text.
+ *
+ *  `arm` is which half of the cluster's `max()` is in force. `reserve` is what
+ *  each end of the row keeps and `box` is one icon button, both in px at the
+ *  current root. Every ordinary width sits on the `reserve` arm. A row drops to
+ *  the `floor` only where two chevrons and both edge clusters stop fitting. */
+async function navGeometry(page: Page, headerSel: string): Promise<
+  { arm: 'floor' | 'reserve'; reserve: number; box: number } | null
+> {
+  return page.evaluate((sel) => {
+    const header = document.querySelector(sel) as HTMLElement | null;
+    const row = header?.querySelector('.mobile-header-row') as HTMLElement | null;
+    const cluster = header?.querySelector('.header-nav-cluster') as HTMLElement | null;
+    if (!row || !cluster || cluster.getBoundingClientRect().width === 0) return null;
+    const probe = document.createElement('div');
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    row.appendChild(probe);
+    const widthOf = (value: string): number => {
+      probe.style.width = value;
+      return probe.getBoundingClientRect().width;
+    };
+    const floor = widthOf('var(--header-nav-min-span)');
+    const reserve = widthOf('var(--header-nav-edge-reserve)');
+    const box = widthOf('var(--mobile-header-icon-box)');
+    probe.remove();
+    const afterReserve = row.getBoundingClientRect().width - 2 * reserve;
+    return { arm: afterReserve < floor ? 'floor' : 'reserve', reserve, box };
+  }, headerSel);
+}
+
+/** How far a row's two edge clusters sit from the nav cluster between them.
+ *
+ *  Measured against the nav cluster's own edges, which is what the reserve
+ *  places. On the thread and content rows those edges ARE the chevrons, since
+ *  `space-between` pins one to each. Do NOT ask this of the threads row: its
+ *  `.header-mark-end-cluster` holds a lone member at the trailing edge, so the
+ *  leading edge is empty box and `lead` would measure nothing. */
+async function edgeGaps(page: Page, headerSel: string, leadSel: string, trailSel: string): Promise<
+  { lead: number; trail: number } | null
+> {
+  return page.evaluate(({ headerSel, leadSel, trailSel }) => {
+    const header = document.querySelector(headerSel) as HTMLElement | null;
+    const cluster = header?.querySelector('.header-nav-cluster') as HTMLElement | null;
+    const lead = header?.querySelector(leadSel) as HTMLElement | null;
+    const trail = header?.querySelector(trailSel) as HTMLElement | null;
+    if (!cluster || !lead || !trail) return null;
+    const c = cluster.getBoundingClientRect();
+    const l = lead.getBoundingClientRect();
+    const t = trail.getBoundingClientRect();
+    if (c.width === 0 || l.width === 0 || t.width === 0) return null;
+    return { lead: c.left - l.right, trail: t.left - c.right };
+  }, { headerSel, leadSel, trailSel });
+}
+
+/** Put the root on a supported ui-scale and prove it stuck. The app writes
+ *  `--user-ui-scale` itself, so a preference load landing late takes the root
+ *  back and leaves the measurements guarding nothing. Module scope, because both
+ *  describe blocks below depend on a scale that actually took. */
+async function setScale(page: Page, scale: number, rootPx: number): Promise<void> {
+  await page.evaluate((s) => document.documentElement.style.setProperty('--user-ui-scale', `${s}%`), scale);
+  await expect
+    .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).fontSize),
+      { timeout: 5_000, message: `the root never settled at ui-scale ${scale}` })
+    .toBe(`${rootPx}px`);
+}
+
 test.describe('Mobile header titles are centered and clear of the leading icons', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
@@ -168,19 +237,19 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
 
     // The reserve itself survived into the computed style. It is a nested
     // `calc()` over two custom properties now (it clears the mark on the nav
-    // cluster's trailing edge, which is clamped, so it cannot be a rem
-    // constant), and both ways of getting it wrong are SILENT: a calc the
-    // parser rejects, and a `var()` naming a property nothing defines, each
+    // cluster's trailing edge, which is measured against the row, so it cannot
+    // be a rem constant), and both ways of getting it wrong are SILENT: a calc
+    // the parser rejects, and a `var()` naming a property nothing defines, each
     // leave `max-width: none`. That drops the only structural guarantee that a
     // title cannot cross the mark, while every assertion above still passes,
     // because this row's two titles ("Threads", "Filters") are short enough
     // never to reach it.
     //
     // `none` is the whole assertion, and the computed value must NOT be read as
-    // a px length: the expression carries a percentage (the cluster clamps
-    // against the row), a percentage in `max-width` survives into the computed
+    // a px length: the expression carries a percentage (the cluster is sized
+    // off the row), a percentage in `max-width` survives into the computed
     // value, so the browser hands back the unresolved
-    // `calc(… + clamp(…, 100% - …, …))` rather than a number.
+    // `calc(… + max(…, 100% - …))` rather than a number.
     expect(
       threads!.maxWidth,
       'the Threads title reserve was dropped, so nothing bounds the title',
@@ -220,51 +289,80 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     // The ask this pins: navigation must not move under the thumb when the user
     // swipes between panes. All three clusters are the same fixed-width centred
     // box, so the chevrons agree by construction; what could break it is a
-    // per-pane width, a shift, or a change to a pane's edge clusters that pushes
-    // the clamp off its preferred span on one row and not the other.
+    // per-pane width, a shift, or a change to a pane's edge clusters that moves
+    // the reserve on one row and not the other.
+    //
+    // Swept across both ARMS of the cluster's width. At 375px the arm is a pure
+    // function of the root. The edge reserve places the chevrons at 100% and at
+    // 137.5%. At 200% the row cannot hold the pair at all, so the min-span floor
+    // takes over and the ends do reach their edge controls.
     await navigateToApp(page);
 
     // Both thread chevrons carry the same class, so they are told apart by
     // their accessible names; the content pair has a class each.
-    await ensureMobileView(page, 'thread');
     const threadArgs = [
       '.mobile-thread-header', 'button[aria-label="Previous thread"]', 'button[aria-label="Next thread"]',
     ] as const;
-    await expect
-      .poll(() => chevrons(page, ...threadArgs), { timeout: 10_000, message: 'thread pane chevrons never laid out' })
-      .not.toBeNull();
-    const thread = (await chevrons(page, ...threadArgs))!;
-
-    await ensureMobileView(page, 'content');
     const contentArgs = ['.mobile-content-header', '.content-back-btn', '.content-forward-btn'] as const;
-    await expect
-      .poll(() => chevrons(page, ...contentArgs), { timeout: 10_000, message: 'content pane chevrons never laid out' })
-      .not.toBeNull();
-    const content = (await chevrons(page, ...contentArgs))!;
 
-    expect(
-      Math.abs(thread.backLeft - content.backLeft),
-      `back chevron: thread pane at ${thread.backLeft.toFixed(1)}, content pane at ${content.backLeft.toFixed(1)}`,
-    ).toBeLessThan(1);
-    expect(
-      Math.abs(thread.forwardRight - content.forwardRight),
-      `forward chevron: thread pane at ${thread.forwardRight.toFixed(1)}, content pane at ${content.forwardRight.toFixed(1)}`,
-    ).toBeLessThan(1);
+    for (const [scale, rootPx, expected] of [[100, 16, 'reserve'], [137.5, 22, 'reserve'], [200, 32, 'floor']] as const) {
+      await ensureMobileView(page, 'thread');
+      await setScale(page, scale, rootPx);
+      await expect
+        .poll(() => chevrons(page, ...threadArgs), { timeout: 10_000, message: `thread chevrons never laid out at ${scale}%` })
+        .not.toBeNull();
+      const thread = (await chevrons(page, ...threadArgs))!;
+      // Naming the arm per scale is what stops the sweep becoming three copies
+      // of one measurement. A token retune can move every scale onto one arm.
+      const geometry = (await navGeometry(page, '.mobile-thread-header'))!;
+      expect(geometry.arm, `ui-scale ${scale} was meant to sit on the ${expected} arm`).toBe(expected);
 
-    // The threads pane carries no chevrons, so its cluster holds one member,
-    // the Lucidos mark, at the same trailing edge. The mark is the only control
-    // on all three rows, and it was the one that moved as the user swiped: it
-    // rode the trailing icon run beside Search, roughly 45px right of this
-    // column at 375px.
-    await openThreadDrawer(page);
-    await expect
-      .poll(() => threadsMarkRight(page), { timeout: 10_000, message: 'the threads mark never laid out' })
-      .not.toBeNull();
-    const markRight = (await threadsMarkRight(page))!;
-    expect(
-      Math.abs(markRight - thread.forwardRight),
-      `threads mark at ${markRight.toFixed(1)}, forward chevron at ${thread.forwardRight.toFixed(1)}`,
-    ).toBeLessThan(1);
+      // The rule the reserve exists for, stated where it applies. This row
+      // carries one control at each end. Beside each stands the slot the
+      // reserve holds for a second one, so the room is never under a button.
+      if (geometry.arm === 'reserve') {
+        const gaps = (await edgeGaps(page, '.mobile-thread-header', '.thread-toggle', '.hamburger-panel'))!;
+        const slot = geometry.reserve - geometry.box;
+        for (const [side, gap] of [['leading', gaps.lead], ['trailing', gaps.trail]] as const) {
+          expect(gap, `ui-scale ${scale} ${side} gap ${gap.toFixed(1)} is not the held slot ${slot.toFixed(1)}`)
+            .toBeCloseTo(slot, 0);
+          expect(gap, `ui-scale ${scale} ${side} slot is under one ${geometry.box.toFixed(1)}px button`)
+            .toBeGreaterThanOrEqual(geometry.box);
+        }
+      }
+
+      await ensureMobileView(page, 'content');
+      await setScale(page, scale, rootPx);
+      await expect
+        .poll(() => chevrons(page, ...contentArgs), { timeout: 10_000, message: `content chevrons never laid out at ${scale}%` })
+        .not.toBeNull();
+      const content = (await chevrons(page, ...contentArgs))!;
+
+      expect(
+        Math.abs(thread.backLeft - content.backLeft),
+        `ui-scale ${scale} back chevron: thread ${thread.backLeft.toFixed(1)}, content ${content.backLeft.toFixed(1)}`,
+      ).toBeLessThan(1);
+      expect(
+        Math.abs(thread.forwardRight - content.forwardRight),
+        `ui-scale ${scale} forward chevron: thread ${thread.forwardRight.toFixed(1)}, content ${content.forwardRight.toFixed(1)}`,
+      ).toBeLessThan(1);
+
+      // The threads pane carries no chevrons, so its cluster holds one member,
+      // the Lucidos mark, at the same trailing edge. The mark is the only
+      // control on all three rows, and it was the one that moved as the user
+      // swiped: it rode the trailing icon run beside Search, roughly 45px right
+      // of this column at 375px.
+      await openThreadDrawer(page);
+      await setScale(page, scale, rootPx);
+      await expect
+        .poll(() => threadsMarkRight(page), { timeout: 10_000, message: `the threads mark never laid out at ${scale}%` })
+        .not.toBeNull();
+      const markRight = (await threadsMarkRight(page))!;
+      expect(
+        Math.abs(markRight - thread.forwardRight),
+        `ui-scale ${scale} mark at ${markRight.toFixed(1)}, forward chevron at ${thread.forwardRight.toFixed(1)}`,
+      ).toBeLessThan(1);
+    }
   });
 
   test('the chevrons sit on the same LINE on the thread and content panes', async ({ page }) => {
@@ -425,5 +523,95 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     expect(paint!.opacity, 'connected must not be dimmed').toBe('1');
     expect(paint!.animationName, 'connected must not animate').toBe('none');
     expect(paint!.ringContent, 'connected must carry no ring').toBe('none');
+  });
+});
+
+/**
+ * What the edge reserve buys, measured against the cluster it is sized for.
+ *
+ * The reserve is exactly the widest cluster either edge of either pane holds,
+ * and nothing beyond it. That cluster is the content row's overflow trigger
+ * plus the bell. So the forward chevron's home is the slot immediately inboard
+ * of that trigger: it clears the trigger, and it clears it by less than a
+ * button. On an edge carrying ONE control the same reserve reads as one empty
+ * icon slot, which is the look the placement was retuned for.
+ *
+ * Its own describe block because it needs an app in the content pane: the
+ * trigger only appears once a view carries two or more context actions
+ * (ContentHeaderActions), and a view with none shows the bell alone.
+ */
+test.describe('the reserve clears the widest trailing cluster by less than a button', () => {
+  test.use({ viewport: { width: 375, height: 812 } });
+
+  const APP_ID = 'e2e-nav-reserve-clearance';
+  let fixture: { cleanup: () => void };
+
+  test.beforeAll(() => {
+    fixture = createIframeAppFixture(APP_ID, {
+      manifest: { id: APP_ID, name: 'Half Marathon', description: 'e2e fixture' },
+      html: '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>x</title></head>'
+        + '<body><div id="ready">ready</div></body></html>',
+      js: '',
+    });
+  });
+
+  test.afterAll(() => fixture.cleanup());
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('the forward chevron clears the overflow trigger, and only just', async ({ page }) => {
+    // Restore-on-load opens the app in the content pane, the same hook
+    // mobile-content-title-overlap uses: three context actions fold whole, so
+    // the trailing cluster is the trigger plus the bell.
+    await page.addInitScript((id) => localStorage.setItem('app-window-open', id), APP_ID);
+    await gotoWithRetry(page, '/');
+    await expect(page.locator('iframe[data-role="app-ui-frame"]:visible')).toBeVisible({ timeout: 15_000 });
+    await ensureMobileView(page, 'content');
+    await expect(page.locator('.mobile-content-header .content-header-more')).toBeVisible({ timeout: 10_000 });
+
+    // A scaled root, so the measurement is not read at the one size a rem
+    // constant would happen to agree with. The arm is asserted because only the
+    // reserve arm places the chevrons: on the floor the row has run out of room
+    // and the ends reach their edge controls by design.
+    await setScale(page, 137.5, 22);
+    const geometry = (await navGeometry(page, '.mobile-content-header'))!;
+    expect(geometry.arm, 'the reserve is what places the chevrons here').toBe('reserve');
+
+    const gaps = (await edgeGaps(
+      page, '.mobile-content-header', '.hamburger-panel', '.content-header-actions',
+    ))!;
+    const trailingBoxes = await page.evaluate(() => document.querySelectorAll(
+      '.mobile-content-header .content-header-actions .icon-btn.header-icon',
+    ).length);
+
+    // The binding case: two boxes at the trailing edge. Anything wider than
+    // this and the reserve is undersized, whatever the gaps below read.
+    expect(trailingBoxes, 'the trailing cluster is meant to be the trigger plus the bell').toBe(2);
+
+    // The chevron is not painted under the trigger, and no whole empty slot is
+    // held back at the widest cluster.
+    const box = geometry.box;
+    expect(
+      gaps.trail,
+      `the trigger overlaps the forward chevron by ${(-gaps.trail).toFixed(1)}px`,
+    ).toBeGreaterThanOrEqual(-0.5);
+    expect(
+      gaps.trail,
+      `a whole button of clearance (${gaps.trail.toFixed(1)}px of a ${box.toFixed(1)}px box) is a slot too far in`,
+    ).toBeLessThan(box);
+
+    // The leading edge pays the same reserve and carries one control, so the
+    // room there is the empty slot the user asked for: a button and its gap,
+    // never two buttons.
+    expect(
+      gaps.lead,
+      `the leading gap ${gaps.lead.toFixed(1)}px is under one ${box.toFixed(1)}px box`,
+    ).toBeGreaterThanOrEqual(box);
+    expect(
+      gaps.lead,
+      `the leading gap ${gaps.lead.toFixed(1)}px is two boxes or more`,
+    ).toBeLessThan(2 * box);
   });
 });

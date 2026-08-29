@@ -136,7 +136,7 @@ fn switch_is_on(stored: Option<&str>) -> bool {
 /// Read the six switches, defaulting any unreadable one to on. A failed read is
 /// logged and treated as absent. Losing a provider over a transient query error
 /// is worse than honouring the veto one build late.
-async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
+pub(crate) async fn read_provider_switches(pool: &PgPool) -> ProviderSwitches {
     async fn one(pool: &PgPool, key: &str) -> bool {
         match PreferenceStore::get(pool, key).await {
             Ok(v) => switch_is_on(v.as_deref()),

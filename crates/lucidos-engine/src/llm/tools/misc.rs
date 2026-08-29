@@ -42,11 +42,13 @@ const NAVIGATE_TARGETS: &[&str] = &[
 /// Every value here must be a renderable subview in `SettingsView.renderSubview`,
 /// and a frontend Vitest cross-check pins that.
 ///
-/// This is now the COMPLETE set of top-level Settings categories plus the System
-/// subpanels. It used to omit four of them because they were platform-gated
-/// categories the LLM had no signal for; as of the 2026-08-05 restructure no
-/// category is platform-gated (only rows inside one are), so nothing has to be
-/// withheld. See `docs/plans/2026-08-05-settings-information-architecture.md`.
+/// Nearly every top-level Settings category and System sub-page. It used to omit
+/// four categories for being platform-gated, which the LLM had no signal for.
+/// None is gated now, only rows inside one, so nothing has to be withheld. See
+/// `docs/plans/2026-08-05-settings-information-architecture.md`.
+///
+/// Two are still absent, because every value costs the always-loaded budget and
+/// nothing has asked to link these: `webhooks` and `communication-surfaces`.
 pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "models",
     "permissions",
@@ -58,6 +60,10 @@ pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "access",
     "devices",
     "system",
+    // The Overview page: connection state, versions and maintenance. `system`
+    // above is the submenu listing the sub-pages. So that one answers "open
+    // System", and this one answers "what version is this".
+    "system-overview",
     "appearance",
     "keyboard-shortcuts",
     "release-notices",
@@ -86,7 +92,7 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                 "settings_view": {
                     "type": "string",
                     "enum": NAVIGABLE_SETTINGS_VIEWS,
-                    "description": "Only with target 'settings'; omitting it lands on the Settings home list. Non-obvious: 'models' also holds the current chat model, 'permissions' the command guard, 'coding-agents' binary paths and repositories, 'accounts' credentials and OAuth, 'access' remote reach, 'appearance' theme, font and scale."
+                    "description": "Only with target 'settings'; omitting it lands on the Settings home list. Non-obvious: 'models' also holds the current chat model, 'permissions' the command guard, 'coding-agents' binary paths and repositories, 'accounts' credentials and OAuth, 'access' remote reach, 'appearance' theme, font and scale, 'system-overview' versions and restart."
                 },
                 "app_id": {
                     "type": "string",

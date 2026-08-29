@@ -108,10 +108,32 @@ describe('settings search — System section', () => {
     expect(findSettingsEntry('disk-usage')?.path).toBe('Settings → System');
   });
 
-  it('resolves maintenance to the System subview', () => {
+  it('resolves maintenance to Overview, the page that renders it', () => {
+    // The three Overview rows moved with their page when `system` became the
+    // submenu. Landing them on the submenu would scroll to nothing.
     const entry = findSettingsEntry('system:maintenance');
-    expect(entry?.subview).toBe('system');
+    expect(entry?.subview).toBe('system-overview');
     expect(entry?.anchor).toBe('system:maintenance');
+  });
+
+  it('never puts the System submenu above the sub-page the user named', () => {
+    // The match is a plain substring over label plus keywords, every hit
+    // scores 1.0, and results come back in array order. The `system` entry
+    // sits above the sub-pages, so any word of theirs in its keywords wins
+    // their own query: Enter on the top hit opens a list of ten rows instead
+    // of the page. Naming the sub-pages there is what did it.
+    for (const [query, id] of [
+      ['backup', 'backup'],
+      ['memory', 'memory'],
+      ['disk usage', 'disk-usage'],
+      ['environment variables', 'environment-variables'],
+      ['debugging', 'debugging'],
+      ['release notices', 'release-notices'],
+      // Overview's own vocabulary leads with Overview, the page that holds it.
+      ['uptime', 'system-overview'],
+    ] as const) {
+      expect(getSettingsSearchResults(query, 5)[0]?.id, `"${query}" must lead with ${id}`).toBe(id);
+    }
   });
 });
 

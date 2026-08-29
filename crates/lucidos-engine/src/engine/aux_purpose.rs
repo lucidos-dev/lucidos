@@ -23,7 +23,7 @@ use sqlx::PgPool;
 
 use crate::core::{
     PreferenceStore, PREF_IMAGE_MODEL, PREF_MODEL_CONVERSATION_SUMMARY,
-    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
+    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER,
     PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
     PREF_REASONING_TITLE,
 };
@@ -101,6 +101,17 @@ pub(crate) fn model_prefs(purpose: ContextPurpose) -> Option<AuxModelPrefs> {
         },
         ContextPurpose::ImageGen => AuxModelPrefs {
             model_key: PREF_IMAGE_MODEL,
+            model_fallback_key: None,
+            reasoning: None,
+        },
+        // The rented talker (ADR 0149). No reasoning half: a speech-to-speech
+        // model offers no tiers, and a spoken reply cannot wait for one.
+        //
+        // It reads its model here and nothing else. Voice holds a socket rather
+        // than making an HTTP call, so `AuxCall` never sees it and the short
+        // budget `budget_for` hands it is unreachable.
+        ContextPurpose::Voice => AuxModelPrefs {
+            model_key: PREF_MODEL_VOICE_TALKER,
             model_fallback_key: None,
             reasoning: None,
         },
@@ -294,6 +305,7 @@ const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::Memory,
     ContextPurpose::ConversationSummary,
     ContextPurpose::ImageGen,
+    ContextPurpose::Voice,
 ];
 
 #[cfg(test)]
@@ -312,10 +324,11 @@ mod tests {
                 | ContextPurpose::ImageDescribe
                 | ContextPurpose::Memory
                 | ContextPurpose::ConversationSummary
-                | ContextPurpose::ImageGen => {}
+                | ContextPurpose::ImageGen
+                | ContextPurpose::Voice => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 6);
+        assert_eq!(ALL_PURPOSES.len(), 7);
     }
 
     /// The invariant this module exists for. Two purposes sharing one model

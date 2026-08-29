@@ -116,7 +116,7 @@ pub(super) fn mailbox_tools() -> Vec<ToolDefinition> {
                     "attachments": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Paths relative to data/ to attach; MIME type comes from the extension."
+                        "description": "Paths under a data/ subdir (artifacts/, knowhow/, ...); MIME type comes from the extension."
                     }
                 },
                 "required": ["to", "subject", "body"]

@@ -1431,7 +1431,7 @@ pub(crate) async fn emit_iteration_cap_response_generated(
                 model: effective_model,
                 reasoning_effort: effective_effort,
             },
-            meta: meta.clone(),
+            meta: meta.authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
         },
         "[AgenticLoop] ResponseGenerated (iteration cap)",
     )

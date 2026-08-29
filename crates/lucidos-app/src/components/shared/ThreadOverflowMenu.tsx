@@ -1,4 +1,4 @@
-import { OverflowMenu } from './OverflowMenu';
+import { OverflowMenu, type OverflowMenuOpener } from './OverflowMenu';
 import { CopyIcon, DownloadIcon, ArchiveIcon, PinIcon } from './icons';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
@@ -26,12 +26,15 @@ import { threadInfoRows } from '../drawer/threadRowInfo';
  *  Type / Exchanges / Started) — the same rows that used to ride the drawer
  *  row's hover tooltip, now reachable everywhere the ⋯ menu lives (drawer row +
  *  both thread-title headers). */
-export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClass, tabIndex }: {
+export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClass, tabIndex, openRef }: {
   threadId: string;
   title: string;
   stopPropagation?: boolean;
   extraClass?: string;
   tabIndex?: number;
+  /** Host-opened mode: no ⋯, the host's gesture opens the menu. The mobile
+   *  drawer row's long press is the only user. See <OverflowMenu>. */
+  openRef?: { current: OverflowMenuOpener | null };
 }) {
   return (
     <OverflowMenu
@@ -39,6 +42,7 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
       stopPropagation={stopPropagation}
       extraClass={extraClass}
       tabIndex={tabIndex}
+      openRef={openRef}
       // Read live thread meta only while a popover is open (OverflowMenu gates the
       // call). An unhydrated search hit has no live thread → null → no Info.
       infoRows={() => {

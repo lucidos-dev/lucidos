@@ -195,7 +195,7 @@ file). The class names are the contract:
 | `.accent-link` | An inline text link/button in the accent color |
 | `.label` | A small uppercase badge |
 | `.title` | A list/panel/modal title |
-| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group |
+| `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group: a few mutually exclusive options with one picked. Two or three segments is what it is for. Not page navigation, and not a long strip: the control has no room to say where a link goes, and past a handful of segments it wraps onto a second row and reads as options to weigh rather than places to go. Use a list of rows for that. It does wrap when the segments pass their container, so a squeezed strip keeps every label on one line. |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
 | `.list-row-add-card` (+ `.list-row-add-icon`, `.list-row-add-label`) | The "+ Add <thing>" row that closes a list. **Put it on a `<button type="button">`**, not a clickable `<div>`: the class carries the UA button reset and a `:focus-visible` ring, so on a button the card is in the tab order and answers Enter and Space, and on a div it is reachable by pointer only. Markup is `<button class="list-row-add-card"><span class="list-row-add-icon">+</span><span class="list-row-add-label">Add Thing</span></button>`. |
 | `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
@@ -935,12 +935,15 @@ type NavigateTarget =
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
-// Settings sub-section for `target: 'settings'`. Every top-level Settings
-// category plus the System subpanels: no category is platform-gated, so none
-// has to be withheld from a caller with no platform signal.
+// Settings sub-section for `target: 'settings'`. No category is platform-gated,
+// so none is withheld from a caller with no platform signal. `system` opens the
+// list of System pages; `system-overview` is the one holding versions. Two pages
+// are absent because nothing has asked to link them: `webhooks` and
+// `communication-surfaces`.
 type SettingsViewTarget =
-  | 'models' | 'permissions' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
+  | 'models' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
   | 'access' | 'devices' | 'system' | 'appearance' | 'keyboard-shortcuts'
+  | 'system-overview' | 'release-notices' | 'whats-new'
   | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
 interface NavigateUi {
@@ -1234,7 +1237,7 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
-| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System subpanel (`system`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging`). Omit `settings_view` for the Settings home list. |
+| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
@@ -1516,6 +1519,14 @@ interface ToastOptions {
 serializable subset is exposed — the host's toast action buttons take `onClick`
 callbacks, which can't cross the app-iframe boundary, so they aren't available
 from an app.
+
+**A toast is a summary, and the host bounds it.** A message longer than 2000
+characters is truncated with an ellipsis. An `'error'` toast is bounded harder:
+it is shown as ONE line, and truncated at 200 characters. So a newline in an
+error message is a space rather than a line break, and an error carries no
+bulleted list. Keep an error to a sentence, and put the detail somewhere the
+user can come back to. Every other type keeps the newline structure the host
+renders as a title over bullets.
 
 **Example:**
 

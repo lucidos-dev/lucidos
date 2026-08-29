@@ -535,9 +535,29 @@ impl LucidosEngine {
                     // where the row's recorded `merge_temp_branch` is stale
                     // and would ff the dead attempt's sha instead of the
                     // resolution the session just committed.
-                    match ff_merge_to_main(&repo_root, &wt_str, &branch_name, &change.branch_name)
-                        .await
-                    {
+                    // A bounded security fix must not widen here. THIS
+                    // session edited after the apply-time check, so its
+                    // `/harden` and test fixes are the one way an out-of-bound
+                    // file could still reach main. A refusal is terminal on
+                    // this path, in the `Err` arm below. That is why the check
+                    // is safe here and was not at the tier fast paths, where
+                    // an `Err` means "escalate" (ADR 0154).
+                    let bound_refusal = self
+                        .bounded_fix_refusal_for_resolution(
+                            &repo_root,
+                            Path::new(wt_str.as_ref()),
+                            &change.branch_name,
+                            &branch_name,
+                        )
+                        .await;
+                    let merge_result = match bound_refusal {
+                        Some(msg) => Err(msg.into()),
+                        None => {
+                            ff_merge_to_main(&repo_root, &wt_str, &branch_name, &change.branch_name)
+                                .await
+                        }
+                    };
+                    match merge_result {
                         Ok((pre_sha, post_sha)) => {
                             let commits = commits_in_range(&repo_root, &pre_sha, &post_sha).await;
                             // Mirror the kind-aware overrides apply_change

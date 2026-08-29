@@ -30,6 +30,7 @@ import { useFlipTransitions } from '../../hooks/useFlipAnimation';
 import { useDelayedFlag, useDelayedLoading, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { PANE_TRANSITION_MS } from '../layout/splitHelpers';
 import { useScrollMemory } from '../../hooks/useScrollMemory';
+import { useRowActionsGesture } from './useRowActionsGesture';
 import { getRemPx } from '../../utils/dom';
 import type { ThreadSearchResult } from '../../api/threads';
 import { PinIcon, InboxIcon, ArchiveIcon, DraftsIcon, AttentionIcon, RunningIcon } from '../shared/icons';
@@ -996,6 +997,27 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
         reposLoadable.status === 'loaded' ? reposLoadable.data : [],
     );
     const createdLabel = formatCreatedTimestamp(thread.meta.createdAt);
+    // Same deal as a started row: tap focuses the draft, and on mobile a hold
+    // opens its menu in place of the ⋯. No prefetch, a draft has no events.
+    const gesture = useRowActionsGesture({
+        enabled: true,
+        onTap: () => focusThread(thread.meta.id),
+    });
+    // Mouse-only (tabIndex=-1): the drawer is a single tab stop, and the
+    // keyboard reaches draft actions through the ⋯ menu shortcut.
+    const draftMenu = (
+        <DraftOverflowMenu
+            threadId={thread.meta.id}
+            mode={draftMode}
+            scope={draftScope}
+            contextName={contextName}
+            createdAt={thread.meta.createdAt}
+            stopPropagation
+            extraClass="thread-row-action"
+            tabIndex={-1}
+            openRef={gesture.openRef}
+        />
+    );
 
     return (
         <div data-flip-id={thread.meta.id} style={depthStyle(depth)} class={depth > 0 ? 'thread-row-wrap is-nested' : 'thread-row-wrap'}>
@@ -1009,9 +1031,11 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
                  data-thread-nav={thread.meta.id}
                  role="treeitem"
                  aria-selected={isHighlighted}
-                 // focusThread reveals the thread pane itself (revealThreadPane
-                 // handles the mobile swipe + desktop pane-group focus).
-                 onClick={() => focusThread(thread.meta.id)}>
+                 // The tap's focusThread reveals the thread pane itself
+                 // (revealThreadPane handles the mobile swipe + desktop
+                 // pane-group focus). It rides the gesture handlers so a mobile
+                 // hold opens the menu without also focusing the draft.
+                 {...gesture.handlers}>
                 <div class="thread-row-left">
                     <span class="thread-row-title-row">
                         <span class="thread-row-title">{threadDisplayTitle(thread)}</span>
@@ -1022,20 +1046,13 @@ export function ComposingThreadRow({ thread, depth = 0 }: { thread: ThreadState;
                 <div class="thread-row-right">
                     {modeLabel && <span class="label message-channel-tag">{modeLabel}</span>}
                     {contextName && <ContextChip name={contextName} />}
-                    <span class="thread-row-actions">
-                        {/* Mouse-only (tabIndex=-1): the drawer is a single tab stop;
-                            the keyboard reaches draft actions via the ⋯ menu shortcut. */}
-                        <DraftOverflowMenu
-                            threadId={thread.meta.id}
-                            mode={draftMode}
-                            scope={draftScope}
-                            contextName={contextName}
-                            createdAt={thread.meta.createdAt}
-                            stopPropagation
-                            extraClass="thread-row-action"
-                            tabIndex={-1}
-                        />
-                    </span>
+                    {/* The actions box exists to bottom-pin the ⋯, and a draft
+                        row has nothing else in it. On mobile there is no ⋯, and
+                        an empty box is still a flex item: it would open the
+                        column's 0.25rem gap under the chips. So the menu renders
+                        bare there, drawing nothing until the hold opens its
+                        portal. */}
+                    {gesture.openRef ? draftMenu : <span class="thread-row-actions">{draftMenu}</span>}
                 </div>
             </div>
         </div>
@@ -1149,6 +1166,14 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
     // an unknown channel, never paints an empty bordered chip.
     const channelLabel = props.channel ? formatThreadChannelLabel(props.channel, props.codingAgent) : null;
 
+    // Tap opens the thread. On mobile a hold opens the actions menu instead of
+    // the ⋯ trigger, which is then not rendered at all.
+    const gesture = useRowActionsGesture({
+        enabled: !sk && !!props.id,
+        onTap: props.onClick,
+        onPress: () => { if (props.id) void loadThreadEvents(props.id); },
+    });
+
     // The status dot is the wrapper's child, beside the row rather than inside
     // it. The wrapper carries the row's depth, so drawer.css can indent the dot
     // with the title from out here.
@@ -1174,8 +1199,12 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                  // ready by the time focusThread switches the view.
                  // `loadThreadEvents` is idempotent, so a canceled press just
                  // warms the cache and the tap never double-fetches.
-                 onPointerDown={sk ? undefined : () => { if (props.id) void loadThreadEvents(props.id); }}
-                 onClick={sk ? undefined : props.onClick}>
+                 //
+                 // Tap, prefetch and the mobile long press all come from
+                 // `useRowActionsGesture`, which owns the composition: the
+                 // gesture has to swallow its own paired click, so the row
+                 // cannot keep a separate `onClick`.
+                 {...gesture.handlers}>
                 {hasFamily && (
                     <button
                         type="button"
@@ -1237,7 +1266,7 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
                                 stop. The keyboard reaches every row action through
                                 the ⋯ menu via the "Open thread actions" shortcut. */}
                             <PinThreadButton threadId={props.id} saved={props.isSaved ?? false} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
-                            <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} />
+                            <ThreadOverflowMenu threadId={props.id} title={props.title ?? ''} stopPropagation extraClass="thread-row-action" tabIndex={-1} openRef={gesture.openRef} />
                         </span>
                     )}
                 </div>

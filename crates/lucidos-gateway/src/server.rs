@@ -131,14 +131,38 @@ pub struct GatewayState {
     inner: Arc<GatewayInner>,
 }
 
+/// What a pairing attempt produced, for the handler that answers it.
+///
+/// Three outcomes rather than an `Option`, because a throttled attempt and a
+/// wrong code deserve different statuses. Collapsing them would tell a person
+/// mid-pairing that their code was wrong, when the gateway simply declined to
+/// look at it.
+pub enum PairingOutcome {
+    /// Paired. Carries the credential the device now holds.
+    Paired(String),
+    /// The code was wrong or expired.
+    Rejected,
+    /// Too many wrong guesses lately (`auth::Redemption::Throttled`).
+    Throttled,
+}
+
 struct GatewayInner {
     /// Base dir for relative workspace dirs, `deleted/`, and `config/`.
     app_data: PathBuf,
     registry_path: PathBuf,
     gateway_port: u16,
     /// The machine-local token proving a caller is a process on this machine
-    /// (`crate::auth`). Minted at startup, never logged, never sent anywhere.
+    /// (`crate::auth`). Minted at startup, never logged.
+    ///
+    /// Sent on exactly one hop, the proxy's upstream request, so a wide-bound
+    /// engine can tell the gateway from the network. See [`crate::proxy`].
     local_token: String,
+    /// The webhook-delivery token, minted beside [`Self::local_token`].
+    ///
+    /// Presented by the hook socket on its engine hop and by nothing else. It
+    /// reaches one engine route, so a delivery from the open internet cannot
+    /// become a workspace restart (`lucidos_local_token::WEBHOOK_TOKEN_FILE`).
+    webhook_token: String,
     /// This gateway's own paired-device store, under its data dir. Never shared
     /// with another gateway on the machine (`auth::paired_devices_path`).
     paired_devices_path: PathBuf,
@@ -287,6 +311,7 @@ impl GatewayState {
                 registry_path: scratch.join("workspaces.json"),
                 gateway_port: 5251,
                 local_token: "test-local-token".to_string(),
+                webhook_token: "test-webhook-token".to_string(),
                 paired_devices_path: scratch.join("paired-devices.json"),
                 device_cookie_name: auth::device_cookie_name(&scratch),
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
@@ -352,6 +377,20 @@ impl GatewayState {
         &self.inner.device_cookie_name
     }
 
+    /// The full-authority credential, for the proxy's upstream hop only.
+    ///
+    /// Never sent to a client, and never forwarded from one: the proxy strips
+    /// the inbound header and re-injects this, exactly as it does for the
+    /// device id (ADR 0050's reasoning, applied to a secret).
+    pub fn local_token(&self) -> &str {
+        &self.inner.local_token
+    }
+
+    /// The webhook-delivery credential, for the hook socket's engine hop only.
+    pub fn webhook_token(&self) -> &str {
+        &self.inner.webhook_token
+    }
+
     /// Does this process terminate TLS on its own socket?
     ///
     /// Resolved once at boot through `net_config::serves_tls_from_env`, then
@@ -382,14 +421,15 @@ impl GatewayState {
 
     /// Redeem `code` and enrol a device called `label`.
     ///
-    /// `Ok(None)` means the code was wrong or expired, which is a caller error
-    /// rather than a failure. The code is consumed before the credential is
-    /// minted, so a failure to persist cannot leave a code redeemable twice.
+    /// A rejected or throttled attempt is a caller error rather than a failure.
+    /// The two are reported apart so the handler can answer 429 for the second.
+    /// The code is consumed before the credential is minted, so a failure to
+    /// persist cannot leave a code redeemable twice.
     pub fn redeem_pairing_code(
         &self,
         code: &str,
         requested_label: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PairingOutcome, String> {
         // The name the device typed wins when it gave one, because that person
         // is being more specific than whoever minted the code. Otherwise the
         // `lucidos pair --label` name applies, and only then the fallback.
@@ -400,8 +440,9 @@ impl GatewayState {
                 .lock()
                 .map_err(|_| "pairing state is unavailable".to_string())?;
             match pending.redeem(code) {
-                Some(label) => label,
-                None => return Ok(None),
+                auth::Redemption::Redeemed(label) => label,
+                auth::Redemption::Rejected => return Ok(PairingOutcome::Rejected),
+                auth::Redemption::Throttled => return Ok(PairingOutcome::Throttled),
             }
         };
         let label = requested_label
@@ -425,7 +466,7 @@ impl GatewayState {
             paired.devices.push(device.clone());
         })?;
         crate::log!("[Gateway] paired a new device: {}", device.label);
-        Ok(Some(credential))
+        Ok(PairingOutcome::Paired(credential))
     }
 
     /// Forget a paired device. `false` when no device had that id.
@@ -598,6 +639,13 @@ impl GatewayState {
         if let Ok(mut r) = self.inner.routes.write() {
             r.insert(id.to_string(), port);
         }
+    }
+
+    /// Point `id` at a port a test controls. That lets a hop run end to end
+    /// against a capturing upstream rather than a real engine.
+    #[cfg(test)]
+    pub(crate) fn set_route_for_test(&self, id: &str, port: u16) {
+        self.set_route(id, port);
     }
 
     fn clear_route(&self, id: &str) {
@@ -2743,10 +2791,14 @@ pub async fn run() -> Result<(), BoxError> {
         }
     }
     // Mint before serving, and treat a failure as fatal. A gateway with no
-    // local token can authenticate no local caller once enforcement lands. The
-    // CLI, the dev scripts and both e2e suites would then fail one request at a
-    // time. Failing here says why, once.
+    // local token can authenticate no local caller. The CLI, the dev scripts
+    // and both e2e suites would then fail one request at a time. Failing here
+    // says why, once.
     let local_token = auth::ensure_local_token()?;
+    // Its webhook-scoped sibling, on the same terms. The hook socket presents
+    // this on its engine hop, so a gateway without it could forward no delivery
+    // to an engine that requires a credential.
+    let webhook_token = auth::ensure_webhook_token()?;
     // Per gateway, under this process's own data dir, so the packaged app and a
     // dev checkout stop overwriting one machine-global file. The legacy path
     // seeds this store once, which is what keeps an already-paired device in.
@@ -2788,6 +2840,7 @@ pub async fn run() -> Result<(), BoxError> {
                 registry_path,
                 gateway_port,
                 local_token,
+                webhook_token,
                 paired_devices_path,
                 paired_devices: Mutex::new(paired_devices),
                 paired_devices_writing: Mutex::new(()),
@@ -2859,14 +2912,16 @@ pub async fn run() -> Result<(), BoxError> {
     serve(state, gateway_port, gateway_bind_choice).await
 }
 
-/// Build the gateway router and serve it, with TLS when certs are configured.
-/// `/~/api/v1/health` and `/~/api/v1/control/*` are the gateway's own, and
-/// every other path falls through to [`fallback`].
-async fn serve(
-    state: GatewayState,
-    port: u16,
-    bind_choice: net_config::BindChoice,
-) -> Result<(), BoxError> {
+/// The gateway's whole HTTP surface, assembled.
+///
+/// Split out of [`serve`] so a test drives the SAME router the process serves,
+/// rather than a restatement of the route table. A test that rebuilds the table
+/// proves only that its own copy agrees with itself. That is how `control.rs`
+/// kept a module note claiming the control plane rested on the loopback bind,
+/// years after [`crate::auth_api::enforce`] became its real door: the unit tests
+/// underneath exercised `control_request_allowed` alone, so nothing failed when
+/// the comment stopped being true.
+pub(crate) fn gateway_router(state: GatewayState) -> Router {
     let router = Router::new()
         .route("/~/api/v1/health", get(gateway_health))
         .nest("/~/api/v1/control", crate::control::router())
@@ -2885,13 +2940,24 @@ async fn serve(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        .with_state(state.clone());
-    let router = if permissive_cors_enabled() {
+        .with_state(state);
+    if permissive_cors_enabled() {
         crate::log!("[Gateway] permissive CORS enabled by LUCIDOS_PERMISSIVE_CORS");
         router.layer(CorsLayer::permissive())
     } else {
         router
-    };
+    }
+}
+
+/// Build the gateway router and serve it, with TLS when certs are configured.
+/// `/~/api/v1/health` and `/~/api/v1/control/*` are the gateway's own, and
+/// every other path falls through to [`fallback`].
+async fn serve(
+    state: GatewayState,
+    port: u16,
+    bind_choice: net_config::BindChoice,
+) -> Result<(), BoxError> {
+    let router = gateway_router(state.clone());
 
     // Every address to listen on, split by what a bind failure MEANS. A
     // specific `Address` ALSO binds loopback, so the dev launch scripts and
@@ -3218,7 +3284,15 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // the proxy's connect-failure splash can narrate what the engine
             // reported. A transient restart has no phase set.
             let boot_label = state.boot_splash_label(&slug);
-            proxy::proxy(&state.inner.proxy_client, &target, &slug, &boot_label, req).await
+            proxy::proxy(
+                &state.inner.proxy_client,
+                &target,
+                &slug,
+                &boot_label,
+                state.local_token(),
+                req,
+            )
+            .await
         }
         None => {
             // No live route. A registered-but-stopped workspace lazy-starts on
@@ -3874,6 +3948,17 @@ mod tests {
 
     // ── Two gateways on one machine keep their auth state apart ─────────────
 
+    /// The credential from a successful pairing, or a panic naming what came
+    /// back instead. A rejected and a throttled attempt read differently, so a
+    /// test must not collapse them into "not paired".
+    fn paired_credential(outcome: PairingOutcome) -> String {
+        match outcome {
+            PairingOutcome::Paired(credential) => credential,
+            PairingOutcome::Rejected => panic!("the code was refused"),
+            PairingOutcome::Throttled => panic!("the attempt was throttled"),
+        }
+    }
+
     /// Two states over two data dirs, the in-process model of the dev gateway
     /// and the packaged app running side by side.
     fn two_gateways() -> (
@@ -3912,7 +3997,7 @@ mod tests {
         let (_a_dir, _b_dir, a, b) = two_gateways();
 
         let code = a.mint_pairing_code(Some("My iPhone".into())).unwrap();
-        let credential = a.redeem_pairing_code(&code, None).unwrap().expect("paired");
+        let credential = paired_credential(a.redeem_pairing_code(&code, None).unwrap());
         assert_eq!(a.paired_devices().devices.len(), 1);
         assert!(b.paired_devices().devices.is_empty());
         assert!(!b.inner.paired_devices_path.exists());
@@ -3946,8 +4031,14 @@ mod tests {
         // pairs to a gateway, so `lucidos pair` refuses to guess which one.
         let (_a_dir, _b_dir, a, b) = two_gateways();
         let code = a.mint_pairing_code(None).unwrap();
-        assert!(b.redeem_pairing_code(&code, None).unwrap().is_none());
-        assert!(a.redeem_pairing_code(&code, None).unwrap().is_some());
+        assert!(matches!(
+            b.redeem_pairing_code(&code, None).unwrap(),
+            PairingOutcome::Rejected
+        ));
+        assert!(matches!(
+            a.redeem_pairing_code(&code, None).unwrap(),
+            PairingOutcome::Paired(_)
+        ));
     }
 
     #[test]
@@ -3956,10 +4047,7 @@ mod tests {
         let code_a = a.mint_pairing_code(None).unwrap();
         a.redeem_pairing_code(&code_a, Some("My iPhone")).unwrap();
         let code_b = b.mint_pairing_code(None).unwrap();
-        let cred_b = b
-            .redeem_pairing_code(&code_b, Some("My iPhone"))
-            .unwrap()
-            .expect("paired");
+        let cred_b = paired_credential(b.redeem_pairing_code(&code_b, Some("My iPhone")).unwrap());
 
         let id_a = a.paired_devices().devices[0].id.clone();
         assert!(a.revoke_device(&id_a).unwrap());

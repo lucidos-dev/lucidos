@@ -479,6 +479,17 @@ export function renderChannelSection(
         </div>
       );
     }
+    case 'webhook':
+      return (
+        <div class="route-row">
+          <strong>Webhook</strong>
+          <span>{origin.name}</span>
+        </div>
+      );
+    // No channel to name. The engine IS the channel, and an agent's identity
+    // is already the chip label above (ADR 0149: the user meets one entity,
+    // so a second agent's turn is not broken out here either).
+    case 'agent':
     case 'engine':
     case 'system':
       return null;
@@ -543,6 +554,8 @@ export function renderAuditSection(origin: MessageOrigin): preact.JSX.Element | 
       return <div class="muted mono">event: {origin.spawning_event_id}</div>;
     case 'device':
     case 'api':
+    case 'agent':
+    case 'webhook':
     case 'engine':
     case 'system':
       return null;

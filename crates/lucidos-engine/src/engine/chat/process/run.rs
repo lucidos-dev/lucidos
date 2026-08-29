@@ -395,16 +395,13 @@ impl LucidosEngine {
                         emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
                     }
                 }
-                return Ok(ProcessResult {
-                    response: String::new(),
-                    steps: vec![],
-                    images: vec![],
+                return Ok(terminal_result(
+                    String::new(),
+                    vec![],
                     request_id,
                     thread_id,
-                    proposed_change: false,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
+                    false,
+                ));
             }
         }
 
@@ -682,16 +679,13 @@ impl LucidosEngine {
 
                 if send_ok {
                     log!("[Chat] CC follow-up routed via msg_tx for thread {} (bypassed register_thread_queued)", thread_id);
-                    return Ok(ProcessResult {
-                        response: String::new(),
-                        steps: vec![],
-                        images: vec![],
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
                         request_id,
                         thread_id,
-                        proposed_change: false,
-                        auto_apply: false,
-                        orphaned_injections: vec![],
-                    });
+                        false,
+                    ));
                 }
 
                 // The live session went away or is terminating between the
@@ -854,16 +848,13 @@ impl LucidosEngine {
                             .await;
                         });
                     }
-                    return Ok(ProcessResult {
-                        response: String::new(),
-                        steps: vec![],
-                        images: vec![],
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
                         request_id,
                         thread_id,
-                        proposed_change: false,
-                        auto_apply: false,
-                        orphaned_injections: vec![],
-                    });
+                        false,
+                    ));
                 }
 
                 // Refused admission AND unable to inject: the live turn dropped
@@ -911,9 +902,6 @@ impl LucidosEngine {
             });
             done.drop_guard()
         });
-
-        // RequestId was used by the forwarder to route events — no longer needed
-        // since the bus emits directly with thread_id.
 
         // Persist + broadcast the exchange boundary event via EventBus.
         // When pre_emitted_origin is set, MessageReceived was already emitted by

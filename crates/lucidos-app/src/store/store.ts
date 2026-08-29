@@ -37,6 +37,7 @@ import type { AppUpdateRunning } from '../utils/tauri';
 import { cancelAppUpdate } from '../utils/tauri';
 import { documentTitle } from '../utils/windowTitle';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
+import { clampToastMessage } from '../components/shared/toastMessage';
 import type { EventSubscription, ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
@@ -202,7 +203,10 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
+// `system` is the System submenu, the list of the sub-pages below it. Overview
+// is one of those sub-pages and holds `system-overview`, so it is reached as a
+// row like every sibling.
+export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -234,10 +238,15 @@ export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
 export const settingsScrollTarget = signal<string | null>(null);
 
+/** The rows of the System submenu, in the order they are listed there. */
 export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
-  // The subpanels lead with the two a user ARRIVES at rather than goes looking
-  // for, and notices lead those: the badge and the notice modal both send the
-  // reader here, and a notice is the only thing in Settings that asks for work.
+  // Overview leads. It is where System used to open, and it answers the
+  // question most visits arrive with: is this thing connected, and what
+  // version is it running.
+  { key: 'system-overview', label: 'Overview' },
+  // Then the two a user ARRIVES at rather than goes looking for, and notices
+  // lead those: the badge and the notice modal both send the reader here, and a
+  // notice is the only thing in Settings that asks for work.
   { key: 'release-notices', label: 'Release Notices', short: 'Notices' },
   // Next, because the Lucidos menu's version row opens it and the update notice
   // links to it. It also sits closest to what Overview already says, which
@@ -473,7 +482,7 @@ export const latestTauriAppNotes = signal<string | null>(null);
  *  answer shared by every open window rather than a per-window poll. */
 export const releaseCheck = signal<ReleaseCheck | null>(null);
 /** Why the last packaged app-update check failed, or `null` when it succeeded
- *  or has not run. Rendered in Settings → System so a failing check is
+ *  or has not run. Rendered in System > Overview so a failing check is
  *  DIAGNOSABLE instead of silent. Swallowed, it makes a stranded install
  *  indistinguishable from an up-to-date one. */
 export const appUpdateCheckError = signal<string | null>(null);
@@ -489,7 +498,7 @@ export const appUpdateCheckInFlight = signal(false);
 /** Live phase of a packaged app-update run, or `null` when none is in flight.
  *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts).
  *  The engine has no part in it, so this stays null in a browser, PWA or dev
- *  client. Read by BOTH the progress dialog and Settings → System, so the two
+ *  client. Read by BOTH the progress dialog and System > Overview, so the two
  *  cannot disagree about what the update is doing.
  *
  *  Typed to the IN-FLIGHT frames only. `cancelled` and `failed` end a run, and
@@ -2053,8 +2062,14 @@ export function workspaceUnavailable(): boolean {
   return engineRestarting.value || appUpdateCommitted.value || !databaseReachable.value;
 }
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showWhileUnavailable?: boolean; noAutofocus?: boolean }) {
+export function showToast(rawMessage: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showWhileUnavailable?: boolean; noAutofocus?: boolean }) {
   const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showWhileUnavailable, noAutofocus } = opts ?? {};
+  // Bound the message HERE, so the store never holds a wall of text whatever
+  // raised it. Both branches below then store the clamped copy, the keyed
+  // in-place update included. Two callers carry no length of their own: an
+  // error built from a server's response body, and an app's `lucidos.ui.toast`
+  // arriving over the frame bridge.
+  const message = clampToastMessage(rawMessage, type);
   // While the workspace cannot serve requests, every in-flight request fails at
   // once (changes fetch, SSE, health poll, the ~20 startup loads) and they all
   // fail for the SAME reason. Suppress the resulting failure/info toasts,

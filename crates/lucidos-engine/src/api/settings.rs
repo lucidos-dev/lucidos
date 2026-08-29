@@ -176,6 +176,24 @@ pub(super) async fn create_credential(
             return ApiResult::err(rejection.message(name));
         }
     }
+    // Refused here rather than at the proxy gate, which is where an unparseable
+    // scope would otherwise surface: far from this form, as a 502 on a call the
+    // user thought they had configured.
+    //
+    // A body naming NEITHER scope field is refused too. An empty list is a real
+    // answer (a `secret` goes nowhere), so it has to be written down rather
+    // than arrived at by omission.
+    let Some(declared) = request.scope.declared() else {
+        return ApiResult::err(
+            "base_urls is required. Pass the API's base URL, or [] for a \
+             credential that is signed with rather than sent"
+                .to_string(),
+        );
+    };
+    let base_urls = match crate::core::normalized_base_urls(declared) {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
+    };
     // `upsert` emits `Credential{Created,Updated}` itself, so this handler
     // resolves the device actor up front instead of going through
     // `emit_user_system`. The emit is not the caller's to make (see
@@ -185,7 +203,7 @@ pub(super) async fn create_credential(
         &state.pool,
         &state.engine.event_bus,
         &service_name,
-        &request.base_url,
+        &base_urls,
         auth_type,
         &request.auth_value,
         request.auth_header.as_deref(),
@@ -237,12 +255,19 @@ pub(super) async fn update_credential(
     // frontend relies on when the user edits only non-secret fields.
     let new_secret = request.auth_value.as_deref().filter(|s| !s.is_empty());
 
-    // For email credentials the canonical base_url mirrors the SMTP host
+    // For email credentials the canonical scope mirrors the SMTP host
     // (matches `configure_email`'s `smtp://<host>`), derived from the edited
     // server settings when present.
-    let base_url = match (auth_type, &request.email) {
-        (AuthType::EmailPassword, Some(email)) => format!("smtp://{}", email.smtp_host),
-        _ => request.base_url.clone(),
+    //
+    // `None` means the body named no scope, and the store then keeps the stored
+    // one. An edit of the auth header alone must not empty the set.
+    let declared = match (auth_type, &request.email) {
+        (AuthType::EmailPassword, Some(email)) => Some(vec![format!("smtp://{}", email.smtp_host)]),
+        _ => request.scope.declared(),
+    };
+    let base_urls = match declared.map(crate::core::normalized_base_urls).transpose() {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
     };
 
     // Optional custom env var name — validated; empty/whitespace clears it back
@@ -265,7 +290,7 @@ pub(super) async fn update_credential(
         &state.pool,
         &state.engine.event_bus,
         id,
-        &base_url,
+        base_urls.as_deref(),
         auth_type,
         request.auth_header.as_deref(),
         new_secret,
@@ -311,6 +336,43 @@ pub(super) async fn update_credential(
         }
         Ok(None) => ApiResult::err("Credential not found".to_string()),
         Err(e) => ApiResult::err(format!("Failed to update credential: {}", e)),
+    }
+}
+
+/// Replace one credential's *credential scope*, the set of base URLs it may be
+/// presented to.
+///
+/// The verb behind `lucidos credentials set-base-urls`. It sits apart from the
+/// whole-row edit for one reason: that body names the auth type and defaults
+/// the auth header. A script widening a scope through it clobbers fields it
+/// never meant to touch.
+///
+/// It replaces rather than appends. The command therefore states the whole
+/// resulting set, and a reader of the shell history sees what it now covers.
+pub(super) async fn set_credential_base_urls(
+    State(state): State<AppState>,
+    Query(query): Query<CredentialIdQuery>,
+    headers: HeaderMap,
+    Json(request): Json<SetCredentialBaseUrlsRequest>,
+) -> Json<ApiResult> {
+    let base_urls = match crate::core::normalized_base_urls(request.base_urls) {
+        Ok(urls) => urls,
+        Err(reason) => return ApiResult::err(reason),
+    };
+    // The store owns the `CredentialUpdated` emit, so resolve the actor here.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match CredentialStore::set_base_urls(
+        &state.pool,
+        &state.engine.event_bus,
+        query.id,
+        &base_urls,
+        actor,
+    )
+    .await
+    {
+        Ok(Some(_)) => ApiResult::ok(),
+        Ok(None) => ApiResult::err("Credential not found".to_string()),
+        Err(e) => ApiResult::err(format!("Failed to set credential base URLs: {}", e)),
     }
 }
 
@@ -1686,6 +1748,7 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_credential)
                 .delete(delete_credential),
         )
+        .route("/credential-base-urls", put(set_credential_base_urls))
         .route("/email-account", get(get_email_account))
         // User-managed non-secret environment variables
         // (Settings → System → Environment variables).

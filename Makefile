@@ -1,4 +1,4 @@
-.PHONY: build check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix test test-eval test-full clean run start stop restart status logs
+.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-full clean clean-all run run-local start stop restart status logs fresh
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -200,6 +200,7 @@ run-local:
 
 # Build and run fresh
 fresh: build
-	./scripts/stop.sh -w $(WORKSPACE) || true
-	rm -rf $(WORKSPACE)/data $(WORKSPACE)/.lucidos
-	LUCIDOS_WORKSPACE=$(WORKSPACE) ./scripts/start.sh
+	@test -n "$(WORKSPACE)" || { echo "ERROR: WORKSPACE is empty; refusing to rm -rf /data"; exit 1; }
+	./scripts/stop.sh -w "$(WORKSPACE)" || true
+	rm -rf "$(WORKSPACE)/data" "$(WORKSPACE)/.lucidos"
+	LUCIDOS_WORKSPACE="$(WORKSPACE)" ./scripts/start.sh

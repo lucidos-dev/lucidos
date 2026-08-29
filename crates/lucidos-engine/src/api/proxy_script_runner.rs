@@ -119,14 +119,35 @@ impl std::fmt::Display for RunError {
 /// Strict on purpose. This is a filesystem path, so any `..` substring is out.
 /// `proxy::request_path_has_traversal` guards an upstream URL path and is
 /// deliberately looser; it is not a substitute here.
+///
+/// **It must also name `scripts/`, and a traversal check alone did not.** The
+/// value joins onto `data/`, which holds the gitignored config beside the typed
+/// subdirectories, so `"script": ".env"` needed no `..` to name the workspace
+/// secrets. The approve route in `api/handshake_scripts.rs` has always required
+/// `data/scripts/`, so the two guards disagreed about what a handshake script
+/// even is. The bytes gate stopped an ordinary workspace executing one, but a
+/// workspace with no approvals file seeds and approves exactly what
+/// `apis.json` names (`core/handshake_approvals.rs`).
+///
+/// **`scripts/` is judged after the redundant `data/` prefix comes off**, via
+/// `config_path_under_data`, so both spellings of one file pass. The traversal
+/// check still runs on the raw value, before anything is stripped.
 pub fn script_path_rejection(script: &str) -> Option<String> {
-    crate::api::is_path_traversal(script).then(|| {
-        format!(
+    if crate::api::is_path_traversal(script) {
+        return Some(format!(
             "script path '{}' must be relative under the workspace \
              (no '..', no leading '/' or '\\')",
             script
-        )
-    })
+        ));
+    }
+    if !crate::core::handshake_approvals::config_path_under_data(script).starts_with("scripts/") {
+        return Some(format!(
+            "script path '{}' must live under data/scripts/, the only place a \
+             handshake script runs from",
+            script
+        ));
+    }
+    None
 }
 
 /// The trampoline `python3 -c` runs, with the approved source on stdin and the
@@ -192,7 +213,14 @@ pub async fn run_handshake_script(
     // runner will not run a file anywhere else in the tree, however it got
     // there. The traversal guard above already ran on the raw relative value,
     // so the join stays inside `data/`.
-    let script_abs = workspace_path.join("data").join(script_rel_path);
+    //
+    // Joining the record key, rather than re-deriving the path here, is what
+    // keeps the file this opens and the line the approval reads in step. The
+    // two spellings drifted apart once, and the seed then blessed a path the
+    // runner never looked up.
+    let script_abs = workspace_path.join(crate::core::handshake_approvals::config_path_key(
+        script_rel_path,
+    ));
     if !script_abs.exists() {
         // A clean error before we pay to spawn python3 only to have it print a
         // confusing "can't open file". It names the `data/`-relative path, so
@@ -372,6 +400,38 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
         assert!(
             names.contains(&"x-where"),
             "data/-relative script should run"
+        );
+    }
+
+    /// The regression a packaged 0.32.0 install hit. A config written before
+    /// resolution moved under `data/` spells the value `data/scripts/auth/x.py`.
+    /// Removing the workspace-root fallback made that join `data/data/...`, and
+    /// every such workspace lost its handshake proxies.
+    #[tokio::test]
+    async fn the_data_prefixed_spelling_runs_the_same_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = write_script(
+            tmp.path(),
+            "both-spellings.py",
+            r#"import json; print(json.dumps({"headers": {"X-Where": "data"}, "expires_in": 60}))"#,
+        );
+        let prefixed = format!("data/{rel}");
+        let out = run_handshake_script(tmp.path(), &prefixed, vec![])
+            .await
+            .unwrap_or_else(|e| panic!("'{prefixed}' must resolve to the same file: {e}"));
+        let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x-where"));
+    }
+
+    /// One strip, never a loop. Doubling the prefix by hand must not launder a
+    /// value into one that runs, and the refusal has to name `data/scripts/`.
+    #[test]
+    fn a_doubled_data_prefix_is_still_refused() {
+        let reason = script_path_rejection("data/data/scripts/auth/x.py")
+            .expect("a doubled prefix must be refused");
+        assert!(
+            reason.contains("data/scripts/"),
+            "refused for the wrong reason: {reason}"
         );
     }
 

@@ -116,10 +116,20 @@ fn both_families_are_always_reported() {
 }
 
 #[test]
-fn nothing_probed_at_all_declares_nothing() {
+fn no_verdict_is_pronounced_over_zero_measurements() {
+    // A health check must not call a path unreachable when it never reached for
+    // it. The engine once judged a hostname with no resolvable record degraded
+    // over both families, and reported a live funnel as dead.
+    //
+    // `judge` is the only producer of a family verdict, so this one test covers
+    // every path into the payload.
     let families = judge(&[]);
-    assert!(families.iter().all(|f| f.verdict == Verdict::NotProbed));
     assert!(degraded_families(&families).is_empty());
+    for family in families {
+        assert_eq!(family.verdict, Verdict::NotProbed);
+        assert_eq!(family.total, 0);
+        assert_eq!(family.healthy, 0);
+    }
 }
 
 #[test]
@@ -183,18 +193,6 @@ fn a_null_status_and_detail_stay_in_the_payload() {
     .unwrap();
     assert!(json.get("status").is_some_and(serde_json::Value::is_null));
     assert!(json.get("detail").is_some_and(serde_json::Value::is_null));
-}
-
-#[test]
-fn a_hostname_with_no_public_record_is_degraded_over_both_families() {
-    // The resolvers answered and named nothing, so no delivery can address this
-    // host at all. There is no address left to probe and prove it.
-    let families = judge_no_public_record();
-    assert_eq!(
-        degraded_families(&families),
-        vec![Family::Ipv4, Family::Ipv6]
-    );
-    assert!(families.iter().all(|f| f.total == 0));
 }
 
 #[test]

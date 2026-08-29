@@ -719,6 +719,35 @@ if has "$out" "NOT deleting the data"; then pass "said so, and how to finish the
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 echo ""
+echo "test: --purge is REFUSED when the launchd DOMAIN cannot be read"
+# The unknown-is-not-a-no half. A shell with no console session cannot see
+# gui/<uid>, and `launchctl print` exits non-zero for that exactly as it does
+# for "not loaded". Reading the second made --purge delete the cluster of a
+# live KeepAlive gateway. The plist is still removed, so it cannot resurrect.
+FB="$(make_fakebin "" 1)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/test" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.test.plist"; printf 'x\n' > "$PLIST"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_LAUNCHD_TIMEOUT=1 \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name test --purge 2>&1)"
+if [ -d "$PREFIX/test" ]; then pass "kept the data when the domain could not be read"; else fail "purged on an unreadable domain: $out"; fi
+if has "$out" "unreachable"; then pass "named the unreachable domain"; else fail "refusal did not say why: $out"; fi
+if [ ! -f "$PLIST" ]; then pass "still removed the plist, so it cannot resurrect"; else fail "left the plist behind: $out"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: --list reports an unreadable launchd domain as unknown, never as stopped"
+# --list is what a user reads before deciding to --purge, so it must not
+# contradict remove_instance for the same instance in the same shell.
+FB="$(make_fakebin "" 1)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+# No plist: `instance_status` never reads one. Discovery is the port marker, and
+# the label it probes is derived from the slug.
+mkdir -p "$PREFIX/test" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' bash "$UNINSTALL" --prefix "$PREFIX" --list 2>&1)"
+if has "$out" "unknown"; then pass "--list says unknown"; else fail "--list did not report unknown: $out"; fi
+if has "$out" "(stopped)"; then fail "--list called an unreadable domain stopped: $out"; else pass "--list does not claim stopped"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
 echo "test: --all --purge keeps the SHARED runtime and drops the purged banner when a gateway is live"
 # The runtime holds the binaries the live gateway is executing, and launchd would
 # try to respawn it from a path we just deleted. And a banner reading

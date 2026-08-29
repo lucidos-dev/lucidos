@@ -18,9 +18,11 @@ import type { WebhookIngressOutage } from '../api/client';
 
 function outage(over: Partial<WebhookIngressOutage> = {}): WebhookIngressOutage {
   return {
+    webhook_name: 'github-ci',
     host: 'node.tailnet.ts.net',
     port: 8443,
     families: ['ipv4'],
+    addresses: [],
     down_since: '2026-08-26T22:10:00Z',
     down_secs: 28_800,
     ...over,

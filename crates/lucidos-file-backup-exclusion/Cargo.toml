@@ -1,0 +1,25 @@
+[package]
+name = "lucidos-file-backup-exclusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Opting a directory out of file-level backup, in one place. See ADR 0153.
+#
+# A file-level backup is one the operating system or a third-party product
+# takes by copying files off the machine. Time Machine is the shape that
+# prompted this. It is NOT a Lucidos backup, which is the workspace's own
+# encrypted archive, and the two must not be confused.
+#
+# Both the gateway and the engine create state directories holding a secret, so
+# both need this. ADR 0014 §1 forbids `lucidos-gateway` from depending on
+# `lucidos-engine`, and offers "extracted to a tiny shared util or duplicated"
+# for what they share. This crate is the first option, in the
+# `lucidos-tailscale` shape: `libc` is the only dependency and it must stay
+# that way.
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

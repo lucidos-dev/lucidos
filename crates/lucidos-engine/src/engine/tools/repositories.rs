@@ -126,9 +126,13 @@ async fn add_repository(
     )
     .await
     {
+        // `~/…`, for the same reason `list_repositories` abbreviates. The raw
+        // path can carry a home dir named `<username>@<employer-domain>`, and
+        // this result reaches the model provider and the persisted event.
         Ok(repo) => Ok(format!(
             "Repository '{}' registered at `{}`",
-            repo.name, repo.path
+            repo.name,
+            crate::core::home_path::abbreviate_str(&repo.path)
         )),
         Err(e) => Err(format!("Error: failed to add repository: {}", e)),
     }

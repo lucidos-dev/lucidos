@@ -23,36 +23,57 @@
        size inside the run's box), and both used to spell the number out. */
     --header-mark-art-scale: 0.74;
 
-    /* Where the nav chevrons sit. The cluster is a fixed-width centred box and
-       the chevrons are pinned to its outer edges, so these three values ARE the
-       chevron positions, and they are the same on the thread pane and the
-       content pane by construction: one span, one formula, whatever each row
-       happens to put between them.
-       - span: how far apart to hold them when the row can afford it.
-       - edge reserve: room kept at each end for the widest edge cluster on
-         EITHER pane plus a row gap's clearance, which is the content pane's
-         overflow-menu-plus-bell (2 x 1.75rem + 0.25rem). The thread pane's own
-         trailing side is a lone hamburger and could spare more, but spending it
-         there is exactly what would break the placements matching.
+    /* Where the nav chevrons sit. The cluster is a centred box and the chevrons
+       are pinned to its outer edges, so these two values ARE the chevron
+       positions, and they are the same on the thread pane and the content pane
+       by construction: one formula, whatever each row happens to put between
+       them.
+       - edge reserve: exactly the widest edge cluster either pane can hold,
+         with no clearance on top of it. That cluster is the content row's
+         overflow trigger plus the bell: two icon boxes and the one gap between
+         them. It is a slot HELD, not room spent. On a row whose edge carries
+         one control the outer box is the bell (or the hamburger) and the inner
+         one stands empty, so the chevron reads one icon slot in from it. Open a
+         view that has context actions and the overflow trigger fills that empty
+         slot, and the chevron does not move. The thread pane's edges are
+         narrower and could spare more, but spending it there is what would
+         break the two panes' placements matching.
        - min span: the floor, the cluster's natural width, so the chevrons never
-         squeeze themselves. It only engages past ~150% ui-scale, where the row
-         can no longer fit two chevrons and both edge clusters at all. */
-    --header-nav-span: 11rem;
-    --header-nav-edge-reserve: 4rem;
+         squeeze themselves. It engages past ~160% ui-scale on a phone, where
+         the row cannot fit two chevrons and both edge clusters at all. */
+    /* Arithmetic on the button box, never a rem constant, so retuning the
+       button moves the chevrons with it. That is also why
+       --mobile-header-icon-box is declared for every width (styles/mobile.css)
+       rather than inside the mobile breakpoint. The gap term stays a literal:
+       --pane-header-gap is declared on .pane-header, and a custom property is
+       substituted on the element that declares it, so :root cannot read it.
+       styles/__tests__/header-mark-geometry.test.ts holds it to the trailing
+       cluster's own gap. */
+    --header-nav-edge-reserve: calc(2 * var(--mobile-header-icon-box) + 0.25rem);
     --header-nav-min-span: 6.3rem;
-    /* The three above, resolved into the one width every cluster takes. Named
-       because the span is no longer only the cluster's own business: the
-       threads row's title is bounded by where that row's mark lands, and the
-       mark lands on the cluster's trailing edge (see .header-mark-end-cluster
-       and .mobile-header-title). A second copy of this clamp is exactly how the
-       title and the mark would drift apart at some ui-scale and nowhere else.
-       The `100%` inside is substituted, not resolved here: it means "the
-       containing block", and every element reading this property lives in the
-       same one, `.mobile-header-row`. */
-    --header-nav-cluster-width: clamp(
+    /* The two above, resolved into the one width every cluster takes. Named
+       because the width is not only the cluster's own business: the threads
+       row's title is bounded by where that row's mark lands, and the mark lands
+       on the cluster's trailing edge (see .header-mark-end-cluster and
+       .mobile-header-title). A second copy of this expression is exactly how
+       the title and the mark would drift apart at some ui-scale and nowhere
+       else.
+
+       There is deliberately NO preferred span here, and its absence is the
+       whole rule: the cluster takes everything the row has left once each end
+       keeps its reserve. A third `clamp()` arm holding the chevrons a fixed
+       11rem apart used to win on any phone below ~124% ui-scale, which parked
+       them well inside the slot the reserve had already held for them and left
+       nearly two empty icon boxes against the bell. Then the reserve governed
+       above that scale and the span below it, so the placement answered to a
+       different rule depending on the user's setting.
+
+       The `100%` is substituted, not resolved here: it means "the containing
+       block", and every element reading this property lives in the same one,
+       `.mobile-header-row`. */
+    --header-nav-cluster-width: max(
         var(--header-nav-min-span),
-        calc(100% - 2 * var(--header-nav-edge-reserve)),
-        var(--header-nav-span)
+        calc(100% - 2 * var(--header-nav-edge-reserve))
     );
 
     /* The badge riding the mark's corner (see .brand-mark-slot below).

@@ -142,7 +142,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-28. Anything not
+The currently-accepted categories, counted as of 2026-08-29. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 79 sites across 49 files,
@@ -177,8 +177,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 500 sites across 175 files, every one of them
-  test-only code: 167 `*.test.ts`, seven `*.test.tsx`
+  `@types/node` in project**, 514 sites across 180 files, every one of them
+  test-only code: 172 `*.test.ts`, seven `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -248,7 +248,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   phase above invokes it.** Recorded 2026-08-04. The npm workspace has two
   JS members (`crates/lucidos-app` and `packages/lucidos-sdk`), but only
   the app is gated by phases 3 and 4. Running the SDK's script directly
-  fails with 13 `TS2307: Cannot find module 'vitest'` errors, one per
+  fails with 16 `TS2307: Cannot find module 'vitest'` errors, one per
   `packages/lucidos-sdk/src/**/*.test.ts`. It was eight when this was first
   recorded, and the count grows with the SDK's test suite.
 
@@ -267,16 +267,24 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   dependency + lockfile change (ADR 0020) and belongs in its own commit,
   not inside a clean-build run.
 
-  Coverage today, so the gap is not overstated: the SDK's **non-test**
-  sources are type checked transitively by phase 3, because
+  Coverage today, so the gap is neither overstated nor understated: the SDK's
+  **non-test** sources are type checked transitively by phase 3, because
   `crates/lucidos-app/node_modules/@lucidos/sdk` symlinks to the package
   and its `types` field points at `src/index.ts`. The SDK's **test** files
   are type checked by nothing, though they do execute: the app's
   `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
   the vitest include list, so `/run-tests` runs them.
 
-- **Phase 4's entry chunk is 685.81 kB against its 600 kB ceiling, and the
-  2026-08-28 run left it there.** `vite build` exits 0 and prints no code
+  **`src/worker/` is the hole in that transitive coverage**, found on the
+  2026-08-29 run. `src/index.ts` never imports it, so phase 3 never reaches
+  it. `sseWorker.build.mjs` bundles it with esbuild into
+  `src/generated/sse-worker.js`, which the engine `include_str!`s and serves,
+  and esbuild type checks nothing. So it is shipping code that no gate reads.
+  It had one real error, `SharedWorkerGlobalScope` undeclared, which that run
+  fixed by adding `WebWorker` to the SDK's `lib`.
+
+- **Phase 4's entry chunk is 692.35 kB against its 600 kB ceiling, and the
+  2026-08-29 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -296,40 +304,51 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.10 kB, against an 85.81 kB gap:
+  attribution now puts the whole list at 38.18 kB, against a 92.35 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.51 |
+  | `CodingAgentControlMenu` | 8.59 |
   | `ThreadFilterPanel` | 5.91 |
   | `WorkspaceSwitcher` | 4.36 |
   | `QuestionCard` | 3.98 |
   | `TodoListPanel` | 2.96 |
-  | `OverflowMenu` | 2.38 |
+  | `OverflowMenu` | 2.37 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave nearly 48 kB of it. The next
+  leave the advisory firing, and would now leave 54 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
-  Growth is diffuse rather than one mistake. The 2026-08-28 run added 8.83 kB
+  Growth is diffuse rather than one mistake. The 2026-08-29 run added 6.50 kB
   and re-ran the check for the usual culprit, a component gone from lazy to
-  eager. There was none, for the third run running.
+  eager. There was none, for the fourth run running.
 
   **That check is two questions, not one.** Does any module sit in both the
   entry chunk and a separately emitted chunk? And does any target of a
   `lazy(() => import(...))` sit in the entry chunk at all? The second catches
   a lazy view that a static import has quietly pulled forward. That shape
-  leaves no duplicate, so the first question misses it. All 34 view targets
-  were absent.
+  leaves no duplicate, so the first question misses it.
 
-  The top is unchanged: `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.82
+  The 2026-08-29 run widened the second question to every relative `import()`
+  in the app source and the SDK, all 114 of them. Scan the whole file list, not
+  a `src/**/*.ts` pathspec: git's default globbing lets `*` cross a slash, so
+  `**/` costs you the top-level files, and `main.tsx` holds the lazy views. The
+  one entry-chunk hit was `_fetch.ts`, which its own test imports dynamically
+  and the SDK barrel needs statically anyway.
+
+  The top is unchanged: `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.83
   and `store.ts` at 17.18. The three thread-event exchange modules add
-  42.81 kB between them. A first paint reaches all of them. The 8.83 kB came
-  from ordinary fixes to first-paint chat code (`scrollState.ts`,
-  `threadWindow.ts`, `PromptInput.tsx`, `deadPressProbe.ts`,
-  `thread-loading.ts`).
+  42.92 kB between them. A first paint reaches all of them. Two new
+  first-paint modules carried the 6.50 kB: `chat/scrollAnchor.ts` at 1.06 kB
+  and the SDK's `eventStream.ts` at 1.32 kB. The rest is growth in
+  `useScrollMemory.ts`, `scrollState.ts`, `deadPressProbe.ts` and
+  `ThreadView.tsx`, against a 2.29 kB saving in `CreateThreadView.tsx`.
+
+  **The entry chunk carries no `node_modules` code at all**, measured on the
+  2026-08-29 run by grouping the sourcemap's sources. Every byte of it is code
+  we wrote, so no vendor-chunking idea can buy anything here.
 
   **The SDK's `tooltip.ts` is 6.22 kB of the entry chunk and is NOT a cut**,
   measured on the 2026-08-28 run. It looks like one. `ui.ts` pulls the whole
@@ -337,6 +356,10 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   `api/client/settings.ts` imports at first paint. But the host shell installs
   tooltips itself, through `hooks/useTooltip.ts`. So the bytes are used rather
   than dragged, and moving the opt-out to its own module would free none.
+
+  The whole SDK is 14.44 kB of the entry chunk across 15 modules, measured on
+  the 2026-08-29 run. That bounds the barrel: dropping every SDK byte still
+  leaves the advisory firing.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
   the lever.** A barrel is the one shape that splits with no loading flash.
@@ -350,9 +373,10 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   free money.
 
   **`api/client.ts` is a second barrel, and the 2026-08-27 run measured it. It
-  is not a lever either.** 24.15 kB of `api/*` lands in the entry chunk across 16
-  modules, and tree-shaking already works: `mcp.ts`, `webhooks.ts` and
-  `data.ts` never reach it. The biggest resident is `settings.ts` at 5.32 kB,
+  is not a lever either.** 24.77 kB of `api/*` lands in the entry chunk across 17
+  modules, and tree-shaking still works, though it now keeps less out: only
+  `mcp.ts` and `data.ts`. `webhooks.ts` joined the entry chunk by the
+  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.34 kB,
   which first paint genuinely needs. It exports `getPreferences`,
   `setPreference` and the notification calls beside the backup, memory and
   OAuth ones. Splitting it is an API-client refactor rather than a clean cut.

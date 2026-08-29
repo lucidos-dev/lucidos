@@ -12,7 +12,7 @@
 //! and assert on the response + the events the EventBus writes. Real CC sub-
 //! thread spawn would force an LLM round-trip we don't need to exercise.
 
-use crate::support::{base_url, db_url, http_client};
+use crate::support::{base_url, count_events_of_type, db_url, http_client};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -76,23 +76,7 @@ async fn cleanup_threads(pool: &sqlx::PgPool, ids: &[Uuid]) {
 }
 
 async fn count_thread_archived_events(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events \
-         WHERE thread_id = $1 AND event_type = 'ThreadArchived'",
-    )
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0)
-}
-
-async fn count_events_of_type(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2")
-        .bind(thread_id)
-        .bind(event_type)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0)
+    count_events_of_type(pool, thread_id, "ThreadArchived").await
 }
 
 /// Seed a `SessionStarted` event row directly (bypassing EventBus — these

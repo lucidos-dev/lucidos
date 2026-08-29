@@ -26,7 +26,7 @@
 //! `/publishers/<publisher>/models/<model>:<method>` suffix; the access token is
 //! minted/refreshed server-side per request via the shared token cache.
 
-use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint};
+use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_static_layers::StaticHeaderLayer;
 use crate::core::{
     AuthType, CredentialStore, PreferenceStore, DEFAULT_LOCAL_BASE_URL, PREF_LOCAL_BASE_URL,
@@ -41,7 +41,8 @@ use axum::http::{HeaderName, StatusCode};
 use std::sync::{Arc, LazyLock};
 
 /// A resolved builtin target: the upstream base URL + the pre-built auth
-/// pipeline. Fed straight into [`crate::api::proxy::dispatch_with_layers`].
+/// pipeline. Bound through [`crate::api::proxy::ScopedPipeline`] before it can
+/// be dispatched, exactly as an `apis.json` pipeline is.
 type BuiltinTarget = (String, Vec<Arc<dyn AuthLayer>>);
 
 /// Resolve a builtin model-provider proxy target for `name`.
@@ -78,6 +79,16 @@ fn unconfigured_msg(name: &str, missing: &str, how: &str) -> (StatusCode, String
     )
 }
 
+/// The binding for a builtin key whose upstream the engine chose, not a
+/// caller. Every provider here but `local` pairs its key with a base URL from
+/// this binary or from the engine's boot config.
+fn pinned(what: &str, base_url: &str) -> ScopeBinding {
+    ScopeBinding::Pinned {
+        what: what.to_string(),
+        base_url: base_url.to_string(),
+    }
+}
+
 /// Fetch a stored credential as `(auth_type, auth_value)`. Missing → `None`; a
 /// DB read error is a 500 (not a silent skip).
 async fn credential_pair(
@@ -110,7 +121,11 @@ async fn resolve_openai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCod
             "add an 'openai' credential in Settings → Models → Providers, set OPENAI_API_KEY",
         ));
     };
-    let layer = StaticHeaderLayer::bearer("openai".to_string(), key);
+    let layer = StaticHeaderLayer::bearer(
+        "openai".to_string(),
+        key,
+        pinned("openai", OPENAI_DEFAULT_BASE_URL),
+    );
     Ok((OPENAI_DEFAULT_BASE_URL.to_string(), vec![Arc::new(layer)]))
 }
 
@@ -124,7 +139,11 @@ async fn resolve_openrouter(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Statu
             "add an 'openrouter' credential in Settings → Models → Providers, set LUCIDOS_OPENROUTER_API_KEY",
         ));
     };
-    let layer = StaticHeaderLayer::bearer("openrouter".to_string(), key);
+    let layer = StaticHeaderLayer::bearer(
+        "openrouter".to_string(),
+        key,
+        pinned("openrouter", OPENROUTER_BASE_URL),
+    );
     Ok((OPENROUTER_BASE_URL.to_string(), vec![Arc::new(layer)]))
 }
 
@@ -138,7 +157,7 @@ async fn resolve_xai(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, 
             "add an 'xai' credential in Settings → Models → Providers, set LUCIDOS_XAI_API_KEY",
         ));
     };
-    let layer = StaticHeaderLayer::bearer("xai".to_string(), key);
+    let layer = StaticHeaderLayer::bearer("xai".to_string(), key, pinned("xai", XAI_BASE_URL));
     Ok((XAI_BASE_URL.to_string(), vec![Arc::new(layer)]))
 }
 
@@ -167,7 +186,13 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
     // `Authorization: Bearer`. Mirrors `anthropic::chat::auth_header`.
     let layers: Vec<Arc<dyn AuthLayer>> = match auth {
         AnthropicAuth::ApiKey(key) => vec![Arc::new(
-            StaticHeaderLayer::api_key("anthropic".to_string(), "x-api-key", key).map_err(|e| {
+            StaticHeaderLayer::api_key(
+                "anthropic".to_string(),
+                "x-api-key",
+                key,
+                pinned("anthropic", ANTHROPIC_API_BASE_URL),
+            )
+            .map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("failed to build anthropic auth header: {e}"),
@@ -183,12 +208,16 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
             Arc::new(StaticHeaderLayer::bearer(
                 "anthropic-auth".to_string(),
                 token,
+                pinned("anthropic", ANTHROPIC_API_BASE_URL),
             )),
             Arc::new(
                 StaticHeaderLayer::api_key(
                     "anthropic-oauth-beta".to_string(),
                     "anthropic-beta",
                     crate::llm::anthropic::ANTHROPIC_OAUTH_BETA.to_string(),
+                    // A protocol constant, not a secret. Pinned all the same,
+                    // so no layer is exempt from declaring where it may go.
+                    pinned("anthropic", ANTHROPIC_API_BASE_URL),
                 )
                 .map_err(|e| {
                     (
@@ -202,7 +231,48 @@ fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (Statu
     Ok((ANTHROPIC_API_BASE_URL.to_string(), layers))
 }
 
+/// Where the `local` key came from, and therefore what binds it.
+///
+/// `local` is the one builtin whose upstream a caller can rewrite:
+/// `local_base_url` is an ordinary settable preference. So the key's own source
+/// has to name the host, never the preference (ADR 0144 decision 4).
+enum LocalKeySource {
+    /// A stored `local` credential. Its `base_url` is the scope, and Settings
+    /// can correct it.
+    Credential,
+    /// `LUCIDOS_LOCAL_API_KEY`. Nothing in the database scopes it, so process
+    /// env has to name the host too.
+    Environment(String),
+}
+
+/// The upstream the builtin `local` provider resolves to: the preference,
+/// then `LUCIDOS_LOCAL_BASE_URL`, then the built-in default.
+///
+/// `None` when the preference read failed, so a caller cannot mistake a broken
+/// database for a configured host. The boot pass reads this to give an unscoped
+/// `local` credential the scope it needs (ADR 0144).
+pub async fn local_upstream_base_url(pool: &sqlx::PgPool) -> Option<String> {
+    let base_pref = PreferenceStore::get(pool, PREF_LOCAL_BASE_URL)
+        .await
+        .ok()?
+        .filter(|s| !s.trim().is_empty());
+    Some(
+        base_pref
+            .or_else(|| {
+                std::env::var("LUCIDOS_LOCAL_BASE_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string()),
+    )
+}
+
 async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
+    // Reads the preference and the env var itself rather than calling
+    // `local_upstream_base_url`: the two halves are needed apart, for the
+    // unconfigured check below and for the env key's own pairing. Keep the
+    // pref-then-env-then-default order in step with that function.
+    //
     // Opt-in, mirroring `build_local_provider`: only resolve when a base URL
     // (pref or env) or key is configured — otherwise a default localhost
     // backend isn't conjured for a workspace that never asked for one.
@@ -218,15 +288,24 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
     let base_env = std::env::var("LUCIDOS_LOCAL_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let key = credential_pair(pool, "local")
+    let key = match credential_pair(pool, "local")
         .await?
         .map(|(_, v)| v)
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("LUCIDOS_LOCAL_API_KEY")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        });
+    {
+        Some(v) => Some((v, LocalKeySource::Credential)),
+        None => std::env::var("LUCIDOS_LOCAL_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|v| {
+                // The env pairing, decided here rather than at the base URL
+                // below: an env key follows the env base URL, or the default.
+                let host = base_env
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
+                (v, LocalKeySource::Environment(host))
+            }),
+    };
 
     if base_pref.is_none() && base_env.is_none() && key.is_none() {
         return Err(unconfigured_msg(
@@ -241,7 +320,17 @@ async fn resolve_local(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode
         .unwrap_or_else(|| DEFAULT_LOCAL_BASE_URL.to_string());
     // A keyless local server (Ollama / llama.cpp) gets no auth layer.
     let layers: Vec<Arc<dyn AuthLayer>> = match key {
-        Some(k) => vec![Arc::new(StaticHeaderLayer::bearer("local".to_string(), k))],
+        Some((k, source)) => {
+            let binding = match source {
+                LocalKeySource::Credential => ScopeBinding::StoredCredential("local".to_string()),
+                LocalKeySource::Environment(host) => pinned("LUCIDOS_LOCAL_API_KEY", &host),
+            };
+            vec![Arc::new(StaticHeaderLayer::bearer(
+                "local".to_string(),
+                k,
+                binding,
+            ))]
+        }
         None => Vec::new(),
     };
     Ok((base, layers))
@@ -266,7 +355,10 @@ async fn resolve_vertex(
     let cache = engine
         .vertex_token_cache()
         .unwrap_or_else(|| PROXY_VERTEX_TOKEN_CACHE.clone());
-    Ok((base_url, vec![Arc::new(VertexAdcLayer::new(cache))]))
+    Ok((
+        base_url.clone(),
+        vec![Arc::new(VertexAdcLayer::new(cache, base_url))],
+    ))
 }
 
 /// Engine-owned Vertex AI URL prefix. The app supplies only the
@@ -290,11 +382,18 @@ static PROXY_VERTEX_TOKEN_CACHE: LazyLock<TokenCache> =
 /// once — mirroring `VertexProvider`'s own 401 handling.
 struct VertexAdcLayer {
     token_cache: TokenCache,
+    /// The Vertex URL prefix this token was minted for. `vertex_base_url`
+    /// derives it from the engine's project and region, and `vertex_host`
+    /// refuses a region that could name another host.
+    base_url: String,
 }
 
 impl VertexAdcLayer {
-    fn new(token_cache: TokenCache) -> Self {
-        Self { token_cache }
+    fn new(token_cache: TokenCache, base_url: String) -> Self {
+        Self {
+            token_cache,
+            base_url,
+        }
     }
 }
 
@@ -302,6 +401,10 @@ impl VertexAdcLayer {
 impl AuthLayer for VertexAdcLayer {
     fn output_namespace(&self) -> &str {
         "vertex"
+    }
+
+    fn scope_bindings(&self) -> Vec<ScopeBinding> {
+        vec![pinned("the Vertex access token", &self.base_url)]
     }
 
     fn retry_on_401(&self) -> RetryHint {
@@ -406,7 +509,7 @@ mod tests {
             "tok-123".to_string(),
             Instant::now(),
         ))));
-        let layer = VertexAdcLayer::new(cache.clone());
+        let layer = VertexAdcLayer::new(cache.clone(), "https://x.googleapis.com".to_string());
         let body = Bytes::new();
         let prior = HashMap::new();
         let m = layer.apply(&dummy_input(&body, &prior)).await.unwrap();
@@ -657,6 +760,73 @@ mod tests {
             vec![("authorization".to_string(), "Bearer local-key".to_string())]
         );
         teardown_test_db(&db).await;
+    }
+
+    /// FINDING 2, at the source. A stored `local` credential is bound by its
+    /// own `base_url`, so Settings can correct it and a rewritten preference
+    /// cannot speak for it. Every other builtin pins to a base URL no API
+    /// caller can write.
+    #[tokio::test]
+    async fn every_builtin_layer_declares_what_binds_it() {
+        let (pool, db) = setup_test_db().await;
+        crate::test_support::seed_preference(
+            &pool,
+            PREF_LOCAL_BASE_URL,
+            "http://localhost:1234/v1",
+        )
+        .await
+        .expect("seed local_base_url pref");
+        seed_credential(
+            &pool,
+            "local",
+            "http://localhost:1234/v1",
+            AuthType::Bearer,
+            "local-key",
+        )
+        .await;
+        let target = resolve_local(&pool).await.expect("local resolves");
+        assert_eq!(
+            target.1[0].scope_bindings(),
+            vec![ScopeBinding::StoredCredential("local".to_string())],
+            "a stored local key follows the credential's own scope"
+        );
+
+        seed_credential(
+            &pool,
+            "openai",
+            OPENAI_DEFAULT_BASE_URL,
+            AuthType::ApiKey,
+            "sk-test-openai",
+        )
+        .await;
+        let target = resolve_openai(&pool).await.expect("openai resolves");
+        assert_eq!(
+            target.1[0].scope_bindings(),
+            vec![pinned("openai", OPENAI_DEFAULT_BASE_URL)],
+            "a constant upstream is pinned to that constant"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    /// An env-supplied key has no row to scope it, so the env base URL binds
+    /// it. Driven through the layer shaping, because mutating process env would
+    /// race every other test in the binary.
+    #[tokio::test]
+    async fn an_env_local_key_is_pinned_to_the_env_base_url() {
+        let layer = StaticHeaderLayer::bearer(
+            "local".to_string(),
+            "env-key".to_string(),
+            pinned("LUCIDOS_LOCAL_API_KEY", DEFAULT_LOCAL_BASE_URL),
+        );
+        assert_eq!(
+            layer.scope_bindings(),
+            vec![ScopeBinding::Pinned {
+                what: "LUCIDOS_LOCAL_API_KEY".to_string(),
+                base_url: DEFAULT_LOCAL_BASE_URL.to_string(),
+            }]
+        );
     }
 
     /// Precedence: an `apis.json` entry with the same name as a builtin wins —

@@ -1,15 +1,7 @@
 import type { Notification } from '../types';
 import { sendSeededPrompt } from './compose';
 import { formatNotificationDate } from '../../utils/formatTime';
-
-/** Prefix every line with a markdown blockquote marker. A blank line takes a
- *  bare `>` so the quote stays one block instead of splitting in two. */
-function quote(text: string): string {
-  return text
-    .split('\n')
-    .map((line) => (line.trim() ? `> ${line}` : '>'))
-    .join('\n');
-}
+import { quoteBlock } from '../../utils/markdownQuote';
 
 /** The message the Discuss button sends: a lead-in and the notification quoted.
  *
@@ -23,7 +15,7 @@ export function notificationDiscussPrompt(n: Notification): string {
   const title = n.title.trim() || 'Notification';
   const body = n.message.trim();
   const block = body ? `**${title}**\n\n${body}` : `**${title}**`;
-  return `Let's discuss this notification (${when}):\n\n${quote(block)}`;
+  return `Let's discuss this notification (${when}):\n\n${quoteBlock(block)}`;
 }
 
 /** Start a conversation about a notification that has no thread of its own.

@@ -83,12 +83,23 @@ impl LucidosEngine {
                             match event_store.thread_has_title(&tid_str).await {
                                 Ok(true) => {}
                                 Ok(false) => {
-                                    let image_desc = event_store
+                                    // Logged, like the sibling arm below. The
+                                    // title still generates, just without the
+                                    // image description.
+                                    let image_desc = match event_store
                                         .get_thread_first_message(&tid_str)
                                         .await
-                                        .ok()
-                                        .flatten()
-                                        .and_then(|(_, desc, _)| desc);
+                                    {
+                                        Ok(found) => found.and_then(|(_, desc, _)| desc),
+                                        Err(e) => {
+                                            log!(
+                                                "[Thread] First-message read failed for the title of {}: {}",
+                                                tid_str,
+                                                e
+                                            );
+                                            None
+                                        }
+                                    };
                                     emit_generated_title(
                                         &bus,
                                         &call,

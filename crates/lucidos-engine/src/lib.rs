@@ -81,8 +81,13 @@ pub mod scheduler;
 #[cfg(test)]
 mod test_support;
 pub mod triggers;
+pub mod voice;
 
 pub use engine::LucidosEngine;
+
+/// The `--wasm-selftest` entry point, reachable from the `lucidos-engine`
+/// binary. Re-exported as an item because its module is `pub(crate)`.
+pub use api::proxy_wasm_signer::jit_selftest;
 
 /// Hidden re-exports of crate-internal items exercised by the wasmtime
 /// integration tests in `tests/proxy_wasm_engine.rs`.

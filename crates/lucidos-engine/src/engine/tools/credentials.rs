@@ -256,17 +256,29 @@ impl LucidosEngine {
                 // Google API key as "already configured" when the agent is
                 // asking for the Google app registration, and never open the
                 // modal.
-                let existing = CredentialStore::get_typed(
+                // A lookup that FAILED is not "no credential is stored". Read as
+                // one, a DB blip re-opens the modal for a credential the user
+                // already entered, and they type it in again.
+                match CredentialStore::get_typed(
                     &self.pool,
                     service_name,
                     crate::core::AuthType::parse(auth_type),
                 )
-                .await;
-                if let Ok(Some(_)) = existing {
-                    return Ok(format!(
-                        "Credentials for '{}' are already configured. You can proceed with API requests.",
-                        service_name
-                    ));
+                .await
+                {
+                    Ok(Some(_)) => {
+                        return Ok(format!(
+                            "Credentials for '{}' are already configured. You can proceed with API requests.",
+                            service_name
+                        ))
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Ok(format!(
+                            "Error: could not check whether '{}' is already configured: {}. Not asking the user for it again until this read works.",
+                            service_name, e
+                        ))
+                    }
                 }
 
                 // For oauth_client, the agent may pass endpoint URLs (looked up in

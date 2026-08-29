@@ -17,7 +17,7 @@ if (typeof (globalThis as any).cancelAnimationFrame === 'undefined') {
 
 import { mockContainer, mockDynamicAnchor, useMockMO } from './scroll-test-helpers';
 import { withScrollAnchor } from '../CreateThreadView';
-import { setActiveScrollElement, stopFollowingBottom } from '../scrollState';
+import { resumeFollowingBottom, setActiveScrollElement, setThreadLive, stopFollowingBottom } from '../scrollState';
 
 /**
  * **The anchor is the element the reader clicked.**
@@ -117,5 +117,58 @@ describe('a turn control holds the element the reader clicked', () => {
 
     expect(container.scrollTop).toBe(900);
     restoreMO();
+  });
+
+  /** **A reader parked on the end of a quiet thread.**
+   *
+   *  The one park that used to be exempt. An armed reader on the live edge was
+   *  carried to the new edge rather than held, which moved the icon they had
+   *  just pressed. Nothing is arriving on a quiet thread, so the ride has
+   *  nothing to carry them toward and the press wins.
+   *
+   *  Armed through `resumeFollowingBottom` rather than the toggle: it arms and
+   *  writes the edge with no tween, and this file runs `requestAnimationFrame`
+   *  synchronously. */
+  describe('with the reader on the end of a quiet thread', () => {
+    function armedAtTheEnd(container: ReturnType<typeof mockContainer>) {
+      setActiveScrollElement(container as any);
+      setThreadLive(false);
+      resumeFollowingBottom(container as any);
+    }
+
+    it('holds the control the reader pressed', () => {
+      const restoreMO = useMockMO();
+      const container = mockContainer({ scrollTop: 3500, scrollHeight: 4000 });
+      armedAtTheEnd(container);
+      // The last turn is short, so its header IS on screen at the bottom. That
+      // is the only way a finger reaches a control from here.
+      const control = mockDynamicAnchor(container, 3600);
+      const before = viewportTop(control);
+
+      withScrollAnchor(control as any, () => {
+        control._setOffset(4100);
+        container.scrollHeight = 9000;
+      });
+
+      expect(viewportTop(control)).toBe(before);
+      expect(container.scrollTop).toBe(4000);
+      restoreMO();
+    });
+
+    it('moves nobody when the `⋯` stub unfolds under them', () => {
+      const restoreMO = useMockMO();
+      const container = mockContainer({ scrollTop: 3500, scrollHeight: 4000 });
+      armedAtTheEnd(container);
+      const stub = mockDynamicAnchor(container, 3600);
+
+      withScrollAnchor(stub as any, () => {
+        (stub as any).isConnected = false;
+        (stub as any).getBoundingClientRect = () => ({ top: 0, bottom: 0, height: 0, left: 0, right: 0, width: 0 });
+        container.scrollHeight = 9000;
+      });
+
+      expect(container.scrollTop).toBe(3500);
+      restoreMO();
+    });
   });
 });

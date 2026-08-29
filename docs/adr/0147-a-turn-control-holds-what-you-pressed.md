@@ -82,11 +82,17 @@ it.
 - The `⋯` stub cannot collect a clamp debt the header control earned, because
   the two are different elements. Keying the debt on the turn would buy that
   round trip and sell a credit shared by two unrelated controls.
-- Folding the LAST turn from a control at the foot of the pane misses by 70px on
-  WebKit. The correction reads the offset on the frame the mutation commits, and
-  WebKit has not settled there. The sweep skips that one park and says so.
-- ADR 0064 is unchanged. An armed reader measured on the live edge is still
-  carried there rather than held on their control.
+- Folding the LAST turn from a control at the foot of the pane missed by 70px on
+  WebKit, and the sweep skipped that one park. Diagnosed a day later as a CLAMP
+  rather than an unsettled read: the fold takes its rows out before the stub
+  goes in, so the offset is clamped against a container that is briefly tiny.
+  The correction re-asserts until the height stops moving now, and the sweep
+  covers the park.
+- ADR 0064 was left unchanged here, and reversed a day later. Its amendment
+  exempted an armed reader measured on the live edge, on the strength of a
+  ranking this decision had just deleted. Holding the pressed control cannot
+  produce the drift that amendment answered. So the press wins from every park
+  now, and only a ride already carrying the reader outranks it.
 - A press that collapses the transcript by an order of magnitude reveals the
   mobile header. `useHideOnScroll` re-takes its baseline one frame after the
   anchor write, and a shrink that large settles later. The reader lands near the

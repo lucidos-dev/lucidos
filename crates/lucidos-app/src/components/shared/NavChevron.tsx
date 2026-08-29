@@ -41,7 +41,7 @@ interface NavChevronProps {
  *  (touch or mouse hold) or right-click opens a list of the destinations that
  *  chevron walks toward, so the user can jump several steps at once. A plain
  *  click still does the single-step navigation. Used by both the thread-pane
- *  chevrons (`ThreadNav`) and the content-pane chevrons (`PanelNav`). */
+ *  chevrons (`ThreadNav`) and the content-pane chevrons (`ContentNav`). */
 export function NavChevron({
   direction, disabled, onStep, getItems, ariaLabel, tooltip, buttonClass, history = true,
 }: NavChevronProps) {

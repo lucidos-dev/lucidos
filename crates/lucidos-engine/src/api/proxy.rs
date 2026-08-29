@@ -45,6 +45,15 @@ pub struct ProxyConfig {
     /// `proxy_migration::migrate_apis_json_if_needed`.
     #[serde(default)]
     pub auth: Option<PipelineConfig>,
+    /// Accept an unauthenticated transport to this provider. Off by default.
+    ///
+    /// One flag, one meaning: the engine will not ask this upstream to prove
+    /// who it is. It accepts an invalid or self-signed certificate, and it lets
+    /// an auth layer travel over plain `http://` to a host that is not
+    /// loopback. Both are what a local device or a self-signed dev backend
+    /// needs, and both hand an on-path attacker the credential.
+    #[serde(default)]
+    pub insecure_transport: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,8 +74,21 @@ pub type ProxyConfigMap = HashMap<String, ProxyConfig>;
 
 const PROXY_CONFIG_REL_PATH: &str = "data/config/apis.json";
 
-/// Shared client — pooled, no proxy, accepts self-signed certs (for local
-/// HTTP backends).
+/// Whether the upstream has to prove who it is.
+///
+/// The engine used to accept any certificate from every provider, which handed
+/// an on-path attacker the API key for an ordinary public API. Validation is
+/// now the default, and the exception is per provider and explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Certificates are validated. Every provider, unless it opted out.
+    Verified,
+    /// Certificates are accepted unchecked. Reachable only through
+    /// `insecure_transport` on an `apis.json` entry.
+    Unverified,
+}
+
+/// Options both proxy clients share. Pooled, no proxy, bounded timeouts.
 ///
 /// `redirect(Policy::none())`: signed proxy requests must NOT auto-follow
 /// redirects. reqwest would replay the original Authorization header /
@@ -75,18 +97,39 @@ const PROXY_CONFIG_REL_PATH: &str = "data/config/apis.json";
 /// for the redirect URL. Engine-side handling lives in
 /// `forward_with_redirects`: same-host hops re-run the pipeline against
 /// the new path/query; cross-host hops return 502.
-static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+fn proxy_client_options() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
-        .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
+}
+
+/// The default client. Validates certificates, so a credential only ever
+/// reaches a host that proved its name.
+static VERIFIED_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    proxy_client_options()
         .build()
         .expect("failed to build proxy reqwest client")
 });
+
+/// The opted-in client, for a local device or a self-signed dev backend. Never
+/// reached without `insecure_transport` on the provider's `apis.json` entry.
+static UNVERIFIED_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    proxy_client_options()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("failed to build insecure proxy reqwest client")
+});
+
+fn client_for(transport: Transport) -> &'static reqwest::Client {
+    match transport {
+        Transport::Verified => &VERIFIED_CLIENT,
+        Transport::Unverified => &UNVERIFIED_CLIENT,
+    }
+}
 
 /// One `apis.json` entry the engine refuses to serve, and why.
 ///
@@ -109,16 +152,39 @@ impl RejectedProvider {
     }
 }
 
-/// What `apis.json` yielded: the providers the engine will serve, and the
-/// entries it refuses.
+/// One entry whose transport the engine will not vouch for, and why.
 ///
-/// Both halves matter, and neither is an error. A refused entry is a
-/// configuration mistake the user can fix, reported by name, while every
-/// other entry keeps working.
+/// Either it opted out of certificate validation, or it would put a credential
+/// on plain `http://` to a host that is not loopback. Both are worth saying out
+/// loud at boot, where a user can still see the whole list.
+#[derive(Debug, Clone)]
+pub struct InsecureTransport {
+    pub provider: String,
+    pub reason: String,
+}
+
+/// What `apis.json` yielded: the providers the engine will serve, the entries
+/// it refuses, and the ones whose transport it will not vouch for.
+///
+/// None of the three is an error. A refused entry is a configuration mistake
+/// the user can fix, reported by name, while every other entry keeps working.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfigLoad {
     pub providers: ProxyConfigMap,
     pub rejected: Vec<RejectedProvider>,
+    pub insecure: Vec<InsecureTransport>,
+}
+
+/// The only value in `values`, or `None` when there are none or more than one.
+///
+/// One entry naming a script is an answer for the seed. Two entries disagreeing
+/// is not, so those bind on first use instead of taking whichever came first.
+fn only<T>(values: impl IntoIterator<Item = T>) -> Option<T> {
+    let mut it = values.into_iter();
+    match (it.next(), it.next()) {
+        (Some(single), None) => Some(single),
+        _ => None,
+    }
 }
 
 impl ProxyConfigLoad {
@@ -128,21 +194,50 @@ impl ProxyConfigLoad {
     /// The runner keys approvals that way, and the startup seed needs the same
     /// spelling. A rejected entry contributes nothing: it will never run.
     pub fn handshake_script_paths(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .providers
-            .values()
-            .filter_map(|cfg| cfg.auth.as_ref())
-            .flat_map(|pipeline| pipeline.pipeline.iter())
-            .filter_map(|layer| match layer {
-                crate::api::proxy_pipeline_config::LayerConfig::ScriptHandshake {
-                    script, ..
-                } => Some(format!("data/{}", script.trim_start_matches('/'))),
-                _ => None,
+        self.handshake_seed_entries()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect()
+    }
+
+    /// The same scripts, each with the upstream its token may be sent to and
+    /// the secrets its entries inject.
+    ///
+    /// The startup seed writes both into the approvals record. A rewritten
+    /// `apis.json` then cannot redirect a minted token, nor swap the secret a
+    /// script receives (ADR 0144). One entry naming a script is an answer. Two
+    /// entries disagreeing is not, and those bind on first use instead.
+    pub fn handshake_seed_entries(&self) -> Vec<crate::core::handshake_approvals::SeedEntry> {
+        use crate::api::proxy_pipeline_config::LayerConfig;
+        use crate::core::handshake_approvals::{config_path_key, injected_secrets, SeedEntry};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        type Seen = (BTreeSet<String>, BTreeSet<BTreeSet<String>>);
+        let mut seen: BTreeMap<String, Seen> = BTreeMap::new();
+        for cfg in self.providers.values() {
+            for layer in cfg.auth.iter().flat_map(|p| &p.pipeline) {
+                if let LayerConfig::ScriptHandshake {
+                    script,
+                    credential,
+                    oauth_providers,
+                } = layer
+                {
+                    let entry = seen.entry(config_path_key(script)).or_default();
+                    entry.0.insert(cfg.base_url.clone());
+                    entry.1.insert(injected_secrets(
+                        credential.as_deref(),
+                        oauth_providers.iter().map(String::as_str),
+                    ));
+                }
+            }
+        }
+        seen.into_iter()
+            .map(|(path, (urls, injected))| SeedEntry {
+                path,
+                base_url: only(urls.into_iter().filter(|u| !u.trim().is_empty())),
+                injects: only(injected.into_iter().filter(|set| !set.is_empty())),
             })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+            .collect()
     }
 
     /// Which `base_url` each named credential is used against, across every
@@ -210,11 +305,11 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
         return ProxyConfigLoad::default();
     }
     let file_level = |reason: String| ProxyConfigLoad {
-        providers: ProxyConfigMap::new(),
         rejected: vec![RejectedProvider {
             provider: None,
             reason,
         }],
+        ..Default::default()
     };
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -232,6 +327,12 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
     for (name, entry) in raw {
         match parse_provider(&name, &entry) {
             Ok(cfg) => {
+                if let Some(reason) = insecure_transport_reason(&cfg) {
+                    load.insecure.push(InsecureTransport {
+                        provider: name.clone(),
+                        reason,
+                    });
+                }
                 load.providers.insert(name, cfg);
             }
             Err(reason) => load.rejected.push(RejectedProvider {
@@ -243,7 +344,65 @@ pub fn load_proxy_config(workspace_path: &FsPath) -> ProxyConfigLoad {
     // Stable order so a log line, an event payload and a test all read the
     // same way regardless of the hash map's iteration order.
     load.rejected.sort_by(|a, b| a.provider.cmp(&b.provider));
+    load.insecure.sort_by(|a, b| a.provider.cmp(&b.provider));
     load
+}
+
+/// Why this entry's transport is worth saying out loud at boot, if it is.
+///
+/// The refusal itself happens per request in [`ScopedPipeline::bind`], which is
+/// the only place that knows the resolved base URL and the built layers. This
+/// is the same judgment, read off the file so a user hears it once.
+fn insecure_transport_reason(cfg: &ProxyConfig) -> Option<String> {
+    if cfg.insecure_transport {
+        return Some(format!(
+            "insecure_transport is on, so the engine will not check {}'s certificate \
+             and will send credentials over plain http",
+            cfg.base_url
+        ));
+    }
+    let carries_auth = cfg.auth.as_ref().is_some_and(|p| !p.pipeline.is_empty());
+    if carries_auth && plaintext_to_a_public_host(&cfg.base_url) {
+        return Some(format!(
+            "it attaches credentials over plain http to {}, which is not loopback. \
+             Every call answers 502 until the base_url uses https, or the entry \
+             sets \"insecure_transport\": true",
+            cfg.base_url,
+        ));
+    }
+    None
+}
+
+/// True when `base_url` is plain `http://` to a host that is not loopback.
+///
+/// Loopback is exempt on purpose. No attacker sits on the path to `localhost`,
+/// and the documented local-device workflow lives there: an `apis.json` entry
+/// for a device on this machine, and the builtin `local` model provider. A LAN
+/// or tailnet address is NOT loopback and needs the opt-in, which is the line
+/// that keeps the rule simple to explain.
+fn plaintext_to_a_public_host(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        // Unparseable, so nothing here can vouch for it. The request path
+        // refuses it outright, and calling it insecure as well would be noise.
+        return false;
+    };
+    url.scheme() == "http" && !host_is_loopback(url.host_str().unwrap_or_default())
+}
+
+/// True when `host` names this machine over the loopback interface.
+///
+/// `host_str` brackets an IPv6 literal, so those come off before parsing.
+/// `is_loopback` then covers all of `127.0.0.0/8` and `::1`, not just the two
+/// spellings people write.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// One provider's entry, or the reason the engine will not serve it.
@@ -620,14 +779,18 @@ pub(crate) async fn lookup_credential_value(
         .map(|c| c.auth_value)
 }
 
-/// Refuse to present `name` to a provider whose `base_url` its scope does not
-/// cover (ADR 0144).
+/// Refuse to present `name` to a provider no member of its scope covers
+/// (ADR 0144).
 ///
 /// `data/config/apis.json` is writable over the API, so `base_url` is caller
 /// data. Without this, an entry naming `github` and pointing at an attacker
 /// host makes the engine attach that credential and forward it. The rule is
 /// already applied to git: `core::git_auth` re-checks the same predicate on
 /// every credential callback, so a redirect cannot carry a secret off.
+///
+/// A credential's scope is a SET, because one key often covers several
+/// hostnames of one provider. Each member is judged exactly as a lone scope
+/// was, so declaring a second host widens the credential by that host alone.
 ///
 /// A credential with no scope is refused rather than presented anywhere. The
 /// startup pass infers a scope for one that predates this rule, so what reaches
@@ -638,26 +801,323 @@ pub(crate) async fn check_credential_scope(
     base_url: &str,
 ) -> Result<(), (StatusCode, String)> {
     let credential = fetch_required_credential(pool, name).await?;
-    if credential.base_url.trim().is_empty() {
+    if credential.base_urls.is_empty() {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!(
-                "credential '{}' has no base_url, so it will not be sent anywhere. \
-                 Set its base_url in Settings to the API it belongs to",
+                "credential '{}' has no base URL, so it will not be sent anywhere. \
+                 Set its base URL in Settings to the API it belongs to",
                 name
             ),
         ));
     }
-    if !crate::core::credentials::credential_base_url_matches(&credential.base_url, base_url) {
+    if !crate::core::credential_scope_covers(&credential.base_urls, base_url) {
+        // Names the DECLARED set and where to change it, never a command with
+        // the requested host filled in. That host is `apis.json` data, which an
+        // app UI can write. A copy-pasteable grant for it would turn this
+        // refusal into the last step of the theft it exists to stop.
         return Err((
             StatusCode::BAD_GATEWAY,
             format!(
-                "credential '{}' is scoped to {} and will not be sent to {}",
-                name, credential.base_url, base_url
+                "credential '{}' is scoped to {} and will not be sent to {}. \
+                 If that host really belongs to this credential, add it under \
+                 Settings, Credentials, or with `lucidos credentials set-base-urls`",
+                name,
+                credential.base_urls.join(", "),
+                base_url,
             ),
         ));
     }
     Ok(())
+}
+
+/// An auth pipeline that has been checked against the URL it will be sent to.
+///
+/// **This is the chokepoint.** [`dispatch_scoped`] takes one of these and
+/// nothing else, and [`ScopedPipeline::bind`] is the only way to make one. So
+/// every arm that reaches the network passed the gate, including any arm added
+/// later: the `apis.json` pipeline, the builtin model providers, and whatever
+/// comes next. Three separate per-arm checks is what let two of them drift
+/// (ADR 0144 decision 4).
+pub(crate) struct ScopedPipeline {
+    base_url: String,
+    layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
+    transport: Transport,
+}
+
+/// Counts the layers rather than showing them. Every layer holds a live
+/// credential, so a derived `Debug` would print secrets into a test failure or
+/// a log line.
+impl std::fmt::Debug for ScopedPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedPipeline")
+            .field("base_url", &self.base_url)
+            .field("layers", &self.layers.len())
+            .field("transport", &self.transport)
+            .finish()
+    }
+}
+
+/// What the gate needs to judge a pipeline.
+///
+/// Named separately from the engine so a test can drive the gate with a temp
+/// workspace and an offline bus. It also makes the gate state what it needs.
+pub(crate) struct ScopeContext<'a> {
+    pub pool: &'a sqlx::PgPool,
+    pub workspace_path: &'a FsPath,
+    pub event_bus: &'a crate::engine::event_bus::EventBus,
+}
+
+impl<'a> ScopeContext<'a> {
+    pub(crate) fn from_engine(engine: &'a Arc<crate::engine::LucidosEngine>) -> Self {
+        Self {
+            pool: engine.pool(),
+            workspace_path: engine.workspace_path(),
+            event_bus: &engine.event_bus,
+        }
+    }
+}
+
+impl ScopedPipeline {
+    /// Check every layer's bindings against `base_url`, and settle the
+    /// transport. Refuses rather than forwarding whenever either says no.
+    pub(crate) async fn bind(
+        ctx: &ScopeContext<'_>,
+        name: &str,
+        base_url: String,
+        layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
+        insecure_transport: bool,
+    ) -> Result<Self, (StatusCode, String)> {
+        // Nothing downstream can judge a URL it cannot parse, and a binding
+        // that compares against one silently matches nothing. Refuse here,
+        // through the same predicate a stored scope member has to pass.
+        if !crate::core::credentials::url_names_a_host(&base_url) {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("proxy '{name}' base_url is not a URL with a host: {base_url}"),
+            ));
+        }
+        // Every layer here exists to attach auth, so a non-empty pipeline is
+        // exactly "this request carries a credential".
+        if !layers.is_empty() && !insecure_transport && plaintext_to_a_public_host(&base_url) {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "proxy '{name}' would send credentials over plain http to {base_url}, \
+                     where anyone on the path reads them. Use https, or accept it by \
+                     setting \"insecure_transport\": true on a '{name}' entry in \
+                     {PROXY_CONFIG_REL_PATH}"
+                ),
+            ));
+        }
+        for layer in &layers {
+            for binding in layer.scope_bindings() {
+                enforce_binding(ctx, name, &binding, &base_url).await?;
+            }
+        }
+        Ok(Self {
+            base_url,
+            layers,
+            transport: match insecure_transport {
+                true => Transport::Unverified,
+                false => Transport::Verified,
+            },
+        })
+    }
+}
+
+/// Refuse one layer's secret unless its own scope covers `base_url`.
+async fn enforce_binding(
+    ctx: &ScopeContext<'_>,
+    name: &str,
+    binding: &crate::api::proxy_auth_layer::ScopeBinding,
+    base_url: &str,
+) -> Result<(), (StatusCode, String)> {
+    use crate::api::proxy_auth_layer::ScopeBinding;
+    match binding {
+        ScopeBinding::StoredCredential(credential) => {
+            check_credential_scope(ctx.pool, credential, base_url).await
+        }
+        ScopeBinding::Pinned {
+            what,
+            base_url: scope,
+        } => {
+            if crate::core::credentials::credential_base_url_matches(scope, base_url) {
+                return Ok(());
+            }
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "proxy '{name}': {what} belongs to {scope} and will not be sent to {base_url}"
+                ),
+            ))
+        }
+        ScopeBinding::HandshakeScript(script) => {
+            check_handshake_scope(ctx, name, script, base_url).await
+        }
+        ScopeBinding::HandshakeInjects { script, injects } => {
+            check_handshake_injects(ctx, name, script, injects).await
+        }
+    }
+}
+
+/// Refuse to hand a handshake script a secret it was not approved with.
+///
+/// A `script_handshake` entry names a stored credential and a list of OAuth
+/// providers, and both land in the script's environment. Neither is sent to the
+/// entry's `base_url`, so [`check_credential_scope`] has nothing true to say
+/// here: it refuses every ordinary OAuth handshake, whose credential is scoped
+/// to the provider's token endpoint by design.
+///
+/// The real exposure is an `apis.json` rewrite naming a different secret on an
+/// already-approved script. The record answers that, on the same terms as the
+/// scope beside it (ADR 0144).
+async fn check_handshake_injects(
+    ctx: &ScopeContext<'_>,
+    name: &str,
+    script: &str,
+    injects: &std::collections::BTreeSet<String>,
+) -> Result<(), (StatusCode, String)> {
+    use crate::core::handshake_approvals::{self, BindOutcome};
+    let workspace = ctx.workspace_path;
+    // A name carrying a comma or whitespace cannot be written to the record
+    // without re-cutting the line, so it is refused before anything is written.
+    if !handshake_approvals::injects_are_recordable(injects) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "proxy '{name}': a credential or OAuth provider named with a comma or a \
+                 space cannot be recorded against the handshake script '{script}'. \
+                 Rename it in Settings, and name the new one in {PROXY_CONFIG_REL_PATH}"
+            ),
+        ));
+    }
+    let refuse = |recorded: &std::collections::BTreeSet<String>| {
+        let list = |set: &std::collections::BTreeSet<String>| {
+            set.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "proxy '{name}': the handshake script '{script}' is approved to receive {}, \
+                 so it will not receive {}. Put the entry back, or edit the injects column \
+                 in .lucidos/approved-handshake-scripts",
+                list(recorded),
+                list(injects)
+            ),
+        )
+    };
+    if let Some(recorded) = handshake_approvals::injects_for(workspace, script) {
+        return match recorded == *injects {
+            true => Ok(()),
+            false => Err(refuse(&recorded)),
+        };
+    }
+    // Trust on first sight, as the scope does. Two concurrent first requests
+    // race here, so the outcome carries whichever set won and this one is
+    // checked against it.
+    match handshake_approvals::bind_injects_if_absent(workspace, script, injects) {
+        Ok(BindOutcome::Bound) => {
+            log!(
+                "[Proxy] bound handshake script {} to inject {:?} (ADR 0144)",
+                script,
+                injects
+            );
+            ctx.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::HandshakeScriptInjectsBound {
+                            path: script.to_string(),
+                            injects: injects.iter().cloned().collect(),
+                            actor: None,
+                        },
+                    ),
+                    "[Proxy] HandshakeScriptInjectsBound",
+                )
+                .await;
+            Ok(())
+        }
+        Ok(BindOutcome::AlreadyBound(recorded)) => match recorded == *injects {
+            true => Ok(()),
+            false => Err(refuse(&recorded)),
+        },
+        // Nothing to bind: unrecorded, or its bytes are not the approved ones.
+        // The runner refuses it by hash, and that message is the useful one.
+        Ok(BindOutcome::NotBindable) => Ok(()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not bind what handshake script '{script}' may receive: {e}"),
+        )),
+    }
+}
+
+/// Refuse a minted handshake token for a host the script is not bound to.
+///
+/// A script mints its own token, so no stored credential speaks for it. Its
+/// scope lives beside its hash in `.lucidos/approved-handshake-scripts`, which
+/// no API caller can write. An unbound script binds here, once, and is checked
+/// from then on (ADR 0144).
+async fn check_handshake_scope(
+    ctx: &ScopeContext<'_>,
+    name: &str,
+    script: &str,
+    base_url: &str,
+) -> Result<(), (StatusCode, String)> {
+    use crate::core::handshake_approvals::{self, BindOutcome};
+    let workspace = ctx.workspace_path;
+    let refuse = |scope: &str| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "proxy '{name}': the handshake script '{script}' mints a token for {scope}, \
+                 so it will not mint one for {base_url}. Point the entry back at {scope}, \
+                 or edit the base_url column in .lucidos/approved-handshake-scripts"
+            ),
+        )
+    };
+    if let Some(scope) = handshake_approvals::scope_for(workspace, script) {
+        return match crate::core::credentials::credential_base_url_matches(&scope, base_url) {
+            true => Ok(()),
+            false => Err(refuse(&scope)),
+        };
+    }
+    // Trust on first sight. Two concurrent first requests race here, so the
+    // outcome carries whichever scope won and this one is checked against it.
+    match handshake_approvals::bind_scope_if_absent(workspace, script, base_url) {
+        Ok(BindOutcome::Bound) => {
+            log!(
+                "[Proxy] bound handshake script {} to {} (ADR 0144)",
+                script,
+                base_url
+            );
+            ctx.event_bus
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::HandshakeScriptScopeBound {
+                            path: script.to_string(),
+                            base_url: base_url.to_string(),
+                            actor: None,
+                        },
+                    ),
+                    "[Proxy] HandshakeScriptScopeBound",
+                )
+                .await;
+            Ok(())
+        }
+        Ok(BindOutcome::AlreadyBound(scope)) => {
+            match crate::core::credentials::credential_base_url_matches(&scope, base_url) {
+                true => Ok(()),
+                false => Err(refuse(&scope)),
+            }
+        }
+        // Nothing to scope: unrecorded, or its bytes are not the approved ones.
+        // The runner refuses it by hash, and that message is the useful one.
+        Ok(BindOutcome::NotBindable) => Ok(()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not bind handshake script '{script}' to {base_url}: {e}"),
+        )),
+    }
 }
 
 /// Forward a request to the configured upstream and return the upstream
@@ -669,6 +1129,7 @@ pub(crate) async fn check_credential_scope(
 /// for `query_param` auth this MUST be a redacted form of `target_url`
 /// (otherwise the credential leaks through the logs and the upstream-error
 /// response body). For everything else, callers pass `target_url` for both.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_request(
     method: Method,
     target_url: &str,
@@ -676,6 +1137,7 @@ pub async fn forward_request(
     request_headers: HeaderMap,
     auth_headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
+    transport: Transport,
 ) -> Response {
     let req_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
         Ok(m) => m,
@@ -687,7 +1149,7 @@ pub async fn forward_request(
                 .into_response();
         }
     };
-    let mut builder = CLIENT.request(req_method, target_url);
+    let mut builder = client_for(transport).request(req_method, target_url);
 
     let filtered = filter_request_headers(&request_headers);
     for (name, value) in &filtered {
@@ -961,8 +1423,16 @@ async fn proxy_handle_inner(
             )
             .await
         }
+        // The builtin arm builds its own layers, so it binds its own pipeline.
+        // Same gate, same type, no second way to reach the network.
         ResolvedProxy::Builtin { base_url, layers } => {
-            dispatch_with_layers(&name, &base_url, layers, method, path, query, headers, body).await
+            let ctx = ScopeContext::from_engine(&state.engine);
+            match ScopedPipeline::bind(&ctx, &name, base_url, layers, false).await {
+                Ok(scoped) => {
+                    dispatch_scoped(&name, &scoped, method, path, query, headers, body).await
+                }
+                Err(e) => Err(e),
+            }
         }
     };
     match result {
@@ -992,31 +1462,30 @@ pub async fn dispatch_proxy_request(
     // every credential and re-instantiating WASM signers would be wasted
     // work.
     let layers = build_pipeline_layers(engine, name, config).await?;
-    dispatch_with_layers(
+    let scoped = ScopedPipeline::bind(
+        &ScopeContext::from_engine(engine),
         name,
-        &config.base_url,
+        config.base_url.clone(),
         layers,
-        method,
-        path,
-        query,
-        headers,
-        body,
+        config.insecure_transport,
     )
-    .await
+    .await?;
+    dispatch_scoped(name, &scoped, method, path, query, headers, body).await
 }
 
-/// Forward through a pre-built layer pipeline (with same-host redirect
-/// re-signing) and drive the one-shot 401 invalidate-and-retry. Shared by the
-/// `apis.json` path ([`dispatch_proxy_request`], which builds `layers` from a
-/// `ProxyConfig`) and the builtin-provider path
-/// ([`crate::api::proxy_builtin::resolve_builtin_provider`], which builds
-/// `layers` from the engine's own model-provider credentials) so the forward +
-/// redirect + retry semantics stay identical for both.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn dispatch_with_layers(
+/// Forward through a scoped pipeline (with same-host redirect re-signing) and
+/// drive the one-shot 401 invalidate-and-retry.
+///
+/// Shared by two callers, so their forward, redirect and retry semantics stay
+/// identical. [`dispatch_proxy_request`] builds layers from a `ProxyConfig`,
+/// and [`crate::api::proxy_builtin::resolve_builtin_provider`] builds them from
+/// the engine's own model-provider credentials.
+///
+/// Takes a [`ScopedPipeline`] rather than loose layers, which is what makes the
+/// scope gate impossible to skip.
+pub(crate) async fn dispatch_scoped(
     name: &str,
-    base_url: &str,
-    layers: Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>>,
+    scoped: &ScopedPipeline,
     method: Method,
     path: String,
     query: Option<String>,
@@ -1025,8 +1494,7 @@ pub(crate) async fn dispatch_with_layers(
 ) -> Result<Response, (StatusCode, String)> {
     let (response, outcome) = forward_with_redirects(
         name,
-        base_url,
-        &layers,
+        scoped,
         &method,
         &path,
         query.as_deref(),
@@ -1035,14 +1503,17 @@ pub(crate) async fn dispatch_with_layers(
     )
     .await?;
 
-    if !crate::api::proxy_pipeline::pipeline_should_retry(&layers, &outcome, response.status()) {
+    if !crate::api::proxy_pipeline::pipeline_should_retry(
+        &scoped.layers,
+        &outcome,
+        response.status(),
+    ) {
         return Ok(response);
     }
-    crate::api::proxy_pipeline::pipeline_invalidate_for_retry(&layers, &outcome).await;
+    crate::api::proxy_pipeline::pipeline_invalidate_for_retry(&scoped.layers, &outcome).await;
     let (response, _) = forward_with_redirects(
         name,
-        base_url,
-        &layers,
+        scoped,
         &method,
         &path,
         query.as_deref(),
@@ -1075,7 +1546,6 @@ async fn build_pipeline_layers(
         workspace_path: Arc::new(engine.workspace_path().to_path_buf()),
         token_cache: engine.proxy_token_cache_arc(),
         proxy_name: name,
-        base_url: &config.base_url,
         proxy_modules: &modules_snapshot,
         wasm_engine: engine.wasm_engine().clone(),
     };
@@ -1091,17 +1561,17 @@ async fn build_pipeline_layers(
 ///
 /// Returns the final response and the `PipelineOutcome` from the first
 /// hop (which is what the 401-retry decision inspects).
-#[allow(clippy::too_many_arguments)]
 async fn forward_with_redirects(
     name: &str,
-    base_url: &str,
-    layers: &[Arc<dyn crate::api::proxy_auth_layer::AuthLayer>],
+    scoped: &ScopedPipeline,
     method: &Method,
     initial_path: &str,
     initial_query: Option<&str>,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<(Response, crate::api::proxy_pipeline::PipelineOutcome), (StatusCode, String)> {
+    let base_url = scoped.base_url.as_str();
+    let layers = scoped.layers.as_slice();
     // Auth is bound to the initial origin (scheme + host + port) — a
     // redirect that crosses ANY of those later is refused with 502.
     // Host-only binding would re-sign + re-send the credential after a
@@ -1163,6 +1633,7 @@ async fn forward_with_redirects(
             headers.clone(),
             auth_headers,
             body_for_send,
+            scoped.transport,
         )
         .await;
 

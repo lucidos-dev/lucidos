@@ -79,42 +79,62 @@ pub struct StoredGitCredential {
     pub secret: String,
 }
 
+/// The username and secret a git remote could be offered, or `None` when this
+/// credential's type carries nothing presentable.
+///
+/// Says nothing about the credential's scope: an unscoped one still holds a
+/// usable secret, and the caller reports the two causes apart.
+fn presentable_pair(credential: &Credential) -> Option<(Option<String>, String)> {
+    let (username, secret) = match credential.auth_type {
+        AuthType::Bearer | AuthType::ApiKey => (None, credential.auth_value.clone()),
+        AuthType::Basic => match credential.auth_value.split_once(':') {
+            Some((user, password)) => (Some(user.to_string()), password.to_string()),
+            None => (None, credential.auth_value.clone()),
+        },
+        AuthType::Password => {
+            let parsed: serde_json::Value = serde_json::from_str(&credential.auth_value).ok()?;
+            let username = parsed["username"].as_str()?.to_string();
+            let password = parsed["password"].as_str()?.to_string();
+            (Some(username), password)
+        }
+        AuthType::OauthClient | AuthType::EmailPassword | AuthType::Secret | AuthType::Unknown => {
+            return None
+        }
+    };
+    (!secret.trim().is_empty()).then_some((username, secret))
+}
+
 impl StoredGitCredential {
-    /// Reduce a stored credential, or `None` if its type cannot clone.
+    /// Reduce a stored credential to one entry per base URL it declares, or an
+    /// empty vector if its type cannot clone.
     ///
     /// `bearer` and `api_key` hold a bare token. `basic` holds the
     /// `username:password` pair its own form asks for. `password` holds that
     /// pair as JSON. The rest carry no secret a git remote could use, `secret`
     /// included: it is signed with rather than sent.
     ///
+    /// One entry per member, because a scope is a set and each member is an
+    /// independent host this credential may be offered at. The caller matches
+    /// per entry, so nothing here widens what a member covers.
+    ///
     /// The stored value is presented byte for byte, because a password may
     /// legitimately start or end with a space. Trimming decides emptiness and
     /// nothing else, matching the credential form and the env-var injection.
-    pub fn from_credential(credential: Credential) -> Option<Self> {
-        let (username, secret) = match credential.auth_type {
-            AuthType::Bearer | AuthType::ApiKey => (None, credential.auth_value),
-            AuthType::Basic => match credential.auth_value.split_once(':') {
-                Some((user, password)) => (Some(user.to_string()), password.to_string()),
-                None => (None, credential.auth_value.clone()),
-            },
-            AuthType::Password => {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&credential.auth_value).ok()?;
-                let username = parsed["username"].as_str()?.to_string();
-                let password = parsed["password"].as_str()?.to_string();
-                (Some(username), password)
-            }
-            AuthType::OauthClient
-            | AuthType::EmailPassword
-            | AuthType::Secret
-            | AuthType::Unknown => return None,
+    pub fn entries_from_credential(credential: Credential) -> Vec<Self> {
+        let Some((username, secret)) = presentable_pair(&credential) else {
+            return Vec::new();
         };
-        (!secret.trim().is_empty()).then(|| Self {
-            service_name: credential.service_name,
-            base_url: credential.base_url,
-            username: username.filter(|u| !u.is_empty()),
-            secret,
-        })
+        let username = username.filter(|u| !u.is_empty());
+        credential
+            .base_urls
+            .iter()
+            .map(|base_url| Self {
+                service_name: credential.service_name.clone(),
+                base_url: base_url.clone(),
+                username: username.clone(),
+                secret: secret.clone(),
+            })
+            .collect()
     }
 
     /// Which HTTPS forms this credential is worth offering in.
@@ -168,16 +188,28 @@ impl GitCredentials {
             };
             let Some(credential) = found else { continue };
             let service_name = credential.service_name.clone();
-            match StoredGitCredential::from_credential(credential) {
-                Some(entry) => {
-                    if !entries.iter().any(|e| e.base_url == entry.base_url) {
-                        entries.push(entry);
-                    }
-                }
-                None => log!(
+            // Two causes, two messages. A bearer token with no declared host
+            // holds a perfectly good secret. Saying it holds none sends the
+            // user to re-enter a key that was never the problem.
+            if credential.base_urls.is_empty() {
+                log!(
+                    "[GitAuth] credential {} declares no base URL, so it is offered nowhere",
+                    service_name
+                );
+                continue;
+            }
+            let found_entries = StoredGitCredential::entries_from_credential(credential);
+            if found_entries.is_empty() {
+                log!(
                     "[GitAuth] credential {} holds nothing a git clone can present",
                     service_name
-                ),
+                );
+                continue;
+            }
+            for entry in found_entries {
+                if !entries.iter().any(|e| e.base_url == entry.base_url) {
+                    entries.push(entry);
+                }
             }
         }
         entries.sort_by_key(|e| std::cmp::Reverse(e.base_url.len()));

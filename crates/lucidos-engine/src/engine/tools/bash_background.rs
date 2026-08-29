@@ -2153,10 +2153,20 @@ mod tests {
         // re-polled hundreds of times (172 calls in one release thread,
         // 51 of them 2 s apart). The wait must now hold its full budget
         // and hand back everything that accumulated in one go.
+        // The child emits every ~20 ms, not every ~100 ms. That is what makes
+        // this test answer about the CODE and not about the host. The
+        // line-count assertion below counts what the child produced inside a
+        // fixed 700 ms window. At a 100 ms cadence a loaded machine delivered
+        // two lines and failed a wait that had behaved perfectly.
+        //
+        // The faster cadence strengthens the primary assertion too: the first
+        // chunk lands sooner, so a wait that woke on it cuts short more
+        // visibly. 100 lines at 20 ms is 2 s of work against a 700 ms wait, so
+        // the task is still running when the wait returns.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
             .spawn(
-                "for i in $(seq 1 100); do echo line$i; sleep 0.1; done",
+                "for i in $(seq 1 100); do echo line$i; sleep 0.02; done",
                 30,
                 std::path::Path::new("/tmp"),
                 &[],

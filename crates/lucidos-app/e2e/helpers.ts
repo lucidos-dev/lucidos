@@ -875,11 +875,7 @@ export async function openFilesPanel(page: Page): Promise<void> {
   if (isMobileViewport(page)) {
     // On mobile, the drawer is only accessible from the content pane (via hamburger).
     // Navigate to content pane first, open the drawer, then click 'Files'.
-    await page.evaluate(() => {
-      const dot = document.querySelector('button.mobile-dot[aria-label="content view"]');
-      if (dot) (dot as HTMLElement).click();
-    });
-    await page.waitForTimeout(300);
+    await ensureMobileView(page, 'content');
     await clickVisibleElement(page, '.hamburger-panel');
     // Wait for the drawer to open and items to be visible
     await page.waitForFunction(() => {
@@ -911,13 +907,7 @@ export function addTriggerCard(page: Page): Locator {
  *  lives on the content pane, so swipe there first. Finally waits for the
  *  panel's "Add Trigger" card so callers never click a still-loading list. */
 export async function openTriggersPanel(page: Page): Promise<void> {
-  if (isMobileViewport(page)) {
-    await page.evaluate(() => {
-      const dot = document.querySelector('button.mobile-dot[aria-label="content view"]');
-      if (dot) (dot as HTMLElement).click();
-    });
-    await page.waitForTimeout(300);
-  }
+  await ensureMobileView(page, 'content');
   await clickVisibleElement(page, '.hamburger-panel');
   await page.waitForFunction(() => {
     const items = document.querySelectorAll('.drawer-item');

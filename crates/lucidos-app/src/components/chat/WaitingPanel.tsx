@@ -131,7 +131,9 @@ export function WaitingIndicator() {
           unaffected (see <Overlay>). */}
       <Overlay
         open={isOpen}
-        onClose={() => (open.value = false)}
+        onClose={() => {
+          open.value = false;
+        }}
         anchor={anchorEl}
         backdrop={false}
         portal
@@ -157,7 +159,9 @@ export function WaitingIndicator() {
               threadId: id ?? '',
               waits,
               subThreads,
-              onClose: () => (open.value = false),
+              onClose: () => {
+                open.value = false;
+              },
             })
           : null}
       </Overlay>

@@ -2,7 +2,9 @@ import type { Ref, VNode } from 'preact';
 import { useRef } from 'preact/hooks';
 import type { WebhookIngressOutage } from '../../api/client';
 import { currentIngressOutage } from '../../store/actions/webhookIngress';
+import { discussWebhookIngress } from '../../store/actions/webhook-ingress-discuss';
 import { openWebhookSettings } from '../../store/actions/menu';
+import { composeHandlers } from '../chat/promptFocus';
 import { useCoarseClock } from '../../hooks/useCoarseClock';
 import { webhookIngressNotice } from '../../utils/webhookIngressNotice';
 import { viewportIsMobile } from '../../utils/viewport';
@@ -35,10 +37,12 @@ export function shouldRenderIngressBanner(opts: {
  *  No dot. The `.status-dot` scale names THIS client's connection, and borrowing
  *  a word from it here would say the app is offline while it is online.
  *
- *  One button, and it only navigates. The engine reports an ingress outage and
- *  never repairs one, so a button promising a fix would promise what nothing
- *  behind it does. Not dismissable either: the bar retracts itself on the next
- *  good probe, so a dismiss would only hide a live fault.
+ *  Neither button repairs anything. The engine reports an ingress outage and
+ *  never fixes one, so a button promising a fix would promise what nothing
+ *  behind it does. One navigates to the page. The other hands the whole
+ *  declaration to the agent, which is where a repair can be worked out. Not
+ *  dismissable either: the bar retracts itself on the next good probe, so a
+ *  dismiss would only hide a live fault.
  *
  *  `role="status"` rather than `alert`: this is news about a condition that has
  *  already held for two probe cycles, not an interruption. */
@@ -46,15 +50,26 @@ export function ingressBannerBody(props: {
   layout: BannerLayout;
   outage: WebhookIngressOutage | null;
   onOpenWebhooks: () => void;
+  onDiscuss: () => void;
   elRef?: Ref<HTMLDivElement>;
 }): VNode | null {
   if (!props.outage) return null;
   const notice = webhookIngressNotice(props.outage);
+  // `composeHandlers` with NO focus nudge, the shape the notification detail's
+  // Discuss uses. The wrapper is here for its touch and click dedup. A tap with
+  // the iOS keyboard up can blur the field and shift the viewport, which moves
+  // the button out from under the finger. WebKit then drops the synthetic
+  // click. The focus half is dropped because Discuss sends, so a raised
+  // keyboard would only cover the reply.
+  const discussHandlers = composeHandlers(props.onDiscuss, () => {});
   return (
     <div ref={props.elRef} class="ingress-banner" data-layout={props.layout} role="status">
       <span class="ingress-banner-text">
         <b>{notice.title}</b>{' '}{notice.detail}
       </span>
+      <button class="action-btn" {...discussHandlers}>
+        Discuss
+      </button>
       <button class="action-btn" onClick={props.onOpenWebhooks}>
         Open Webhooks
       </button>
@@ -101,5 +116,8 @@ export function IngressBanner({ layout }: { layout: BannerLayout }) {
     outage,
     elRef: ref,
     onOpenWebhooks: openWebhookSettings,
+    // Non-null inside `show`, and read here so the message quotes the outage
+    // exactly as it is drawn, age included.
+    onDiscuss: () => { void discussWebhookIngress(outage!); },
   });
 }

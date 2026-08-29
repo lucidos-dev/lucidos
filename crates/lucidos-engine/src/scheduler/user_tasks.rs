@@ -163,6 +163,27 @@ pub fn is_self_deleting_trigger(trigger_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Longest `result_summary` a completed run records, in CHARACTERS. The value
+/// lands in a `TriggerExecuted` payload and on the trigger row, so it is a
+/// one-glance summary rather than the run's transcript.
+const RESULT_SUMMARY_MAX_CHARS: usize = 500;
+
+/// Cap a run's `result_summary` at [`RESULT_SUMMARY_MAX_CHARS`], appending an
+/// ellipsis when it had to cut. Counted in characters, so multi-byte output is
+/// never split mid-codepoint.
+///
+/// Shared by the script and the intent path. Both spelled the same rule with
+/// the same two magic numbers. A change to one would have left the other
+/// reporting a different length for the same kind of run.
+fn clamp_result_summary(summary: &str) -> String {
+    if summary.chars().count() > RESULT_SUMMARY_MAX_CHARS {
+        let kept: String = summary.chars().take(RESULT_SUMMARY_MAX_CHARS - 3).collect();
+        format!("{}...", kept)
+    } else {
+        summary.to_string()
+    }
+}
+
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
 /// Failure notifications never deep-link to the trigger's owning app — see the
 /// "Deep-link discipline" guidance in `system-knowhow/triggers.md`.
@@ -293,10 +314,8 @@ async fn execute_script_task(
             // non-zero exit). See `crate::triggers::summary`.
             let summary = if output.trim().is_empty() {
                 crate::triggers::script_fallback_summary(&output, &config.name, 0)
-            } else if output.chars().count() > 500 {
-                format!("{}...", output.chars().take(497).collect::<String>())
             } else {
-                output
+                clamp_result_summary(&output)
             };
             engine
                 .record_trigger_completed(&config.id, &config.name, &summary, None)
@@ -417,14 +436,7 @@ async fn execute_llm_task(
         }
     };
 
-    let event_summary = if result.response.chars().count() > 500 {
-        format!(
-            "{}...",
-            result.response.chars().take(497).collect::<String>()
-        )
-    } else {
-        result.response.clone()
-    };
+    let event_summary = clamp_result_summary(&result.response);
     engine
         .record_trigger_completed(
             &config.id,

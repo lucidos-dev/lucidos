@@ -565,3 +565,106 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
 // list. Replace-whole-list semantics: each emission carries the full new
 // state, so the projection / frontend just takes the latest.
 // ──────────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────────
+// Voice session: the pair that IS the session record. Voice is a mode of a
+// thread (ADR 0148), so neither half moves status or section, and neither
+// carries a byte of audio.
+// ──────────────────────────────────────────────────────────────────────────
+
+fn voice_started(session_id: uuid::Uuid) -> ThreadEvent {
+    ThreadEvent::VoiceSessionStarted { session_id }
+}
+
+fn voice_ended(session_id: uuid::Uuid, reason: VoiceSessionEndReason) -> ThreadEvent {
+    ThreadEvent::VoiceSessionEnded {
+        session_id,
+        reason,
+        duration_secs: 42,
+    }
+}
+
+#[test]
+fn voice_session_events_report_their_pascal_case_names() {
+    let id = uuid::Uuid::new_v4();
+    assert_eq!(voice_started(id).event_type(), "VoiceSessionStarted");
+    assert_eq!(
+        voice_ended(id, VoiceSessionEndReason::Hangup).event_type(),
+        "VoiceSessionEnded"
+    );
+}
+
+#[test]
+fn voice_session_events_are_persisted_and_triggerable() {
+    let id = uuid::Uuid::new_v4();
+    for event in [
+        voice_started(id),
+        voice_ended(id, VoiceSessionEndReason::Hangup),
+    ] {
+        assert!(event.is_persisted(), "{} must persist", event.event_type());
+        assert!(
+            !event.is_per_token_streaming(),
+            "{} must stay triggerable",
+            event.event_type()
+        );
+    }
+}
+
+/// No audio at rest (the plan's decision 12). The payload is the whole record,
+/// so the assertion is over its complete key set rather than over a guessed
+/// field name: a future audio field would have to appear here first.
+#[test]
+fn a_voice_session_payload_carries_no_audio() {
+    let id = uuid::Uuid::new_v4();
+    let started = serde_json::to_value(voice_started(id)).unwrap();
+    let mut started_keys: Vec<_> = started.as_object().unwrap().keys().cloned().collect();
+    started_keys.sort();
+    assert_eq!(started_keys, vec!["session_id", "type"]);
+
+    let ended =
+        serde_json::to_value(voice_ended(id, VoiceSessionEndReason::ProviderFailed)).unwrap();
+    let mut ended_keys: Vec<_> = ended.as_object().unwrap().keys().cloned().collect();
+    ended_keys.sort();
+    assert_eq!(
+        ended_keys,
+        vec!["duration_secs", "reason", "session_id", "type"]
+    );
+    assert_eq!(ended["reason"], "provider_failed");
+}
+
+/// The pair is what makes a session countable, so both halves must carry the
+/// same id through a serialize / deserialize round trip.
+#[test]
+fn a_voice_session_pairs_by_id_across_the_wire() {
+    let id = uuid::Uuid::new_v4();
+    let json =
+        serde_json::to_value(voice_ended(id, VoiceSessionEndReason::EngineShutdown)).unwrap();
+    let back: ThreadEvent = serde_json::from_value(json).unwrap();
+    match back {
+        ThreadEvent::VoiceSessionEnded {
+            session_id,
+            reason,
+            duration_secs,
+        } => {
+            assert_eq!(session_id, id);
+            assert_eq!(reason, VoiceSessionEndReason::EngineShutdown);
+            assert_eq!(duration_secs, 42);
+        }
+        other => panic!("expected VoiceSessionEnded, got {}", other.event_type()),
+    }
+}
+
+/// A live microphone is not a turn. Both halves classify as Metadata, which is
+/// the asymmetry against the coding-agent pair, where the end is Terminal.
+#[test]
+fn a_voice_session_moves_neither_status_nor_section() {
+    use crate::engine::thread_lifecycle::{classify_event, EventClass};
+    assert_eq!(
+        classify_event("VoiceSessionStarted"),
+        Some(EventClass::Metadata)
+    );
+    assert_eq!(
+        classify_event("VoiceSessionEnded"),
+        Some(EventClass::Metadata)
+    );
+}

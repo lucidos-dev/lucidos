@@ -236,6 +236,24 @@
     margin-bottom: 0.5rem;
 }
 
+/* The credential-scope editor stacks `.removable-input-row`s (skills.css), the
+   same field-plus-Remove shape the trigger form uses. Only the vertical rhythm
+   and the input's slack are local. */
+.credential-scope-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.credential-scope-rows input {
+    flex: 1;
+    min-width: 0;
+}
+
+.credential-scope-add {
+    margin-top: 0.5rem;
+}
+
 /* Why the form reopened on a repair: which required fields the saved OAuth
    Client was missing. Warning-toned because the registration is broken until
    it is filled in, but not an error: the fix is right here. */

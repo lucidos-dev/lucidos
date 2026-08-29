@@ -397,7 +397,7 @@ export async function getServedBuildId(): Promise<string | null> {
 /** Ask the active service worker for its stamped BUILD_ID (vite.config.ts
  *  `lucidos-sw-stamp`). The reply arrives as a `lucidos:build-id` message,
  *  handled in useStartup.ts where it lands in the `serviceWorkerBuildId` signal.
- *  Its one reader is the Settings → System page's "Service worker" row.
+ *  Its one reader is the System > Overview page's "Service worker" row.
  *
  *  We query the SW rather than baking the id into the app bundle so the reported
  *  value is the build that's ACTUALLY controlling the page — the same value

@@ -672,6 +672,30 @@ Resumability stopped a slow verdict costing a *rebuild*; it did not stop it bloc
 
 **Local builds get the same treatment one rung down.** With no `APPLE_SIGNING_IDENTITY`, `build-dmg.sh` signs the bundle with the stable dev identity from `scripts/lib/codesign.sh` when `lucidos_signing_identity_ready`, so a local `.app` rebuild stops discarding the developer's TCC grants. Strictly a fallback: an explicit identity wins, `--release*` still hard-requires Developer ID, the staging gate rejects a self-signed payload (no Team Identifier), and no notarization is attempted. It uses **neither** `--options runtime` nor `--timestamp`, deliberately: both exist for notarization, library validation under the hardened runtime matches by Team Identifier (which a self-signed cert lacks, risking the bundled Postgres dylibs failing to load), a secure timestamp would mean ~200 network round trips, and the certificate-anchored requirement depends on neither.
 
+### A bundled helper process carries its own entitlements (ADR 0160)
+
+`sign_app_bundle` signs every loose Mach-O with `--options runtime`. Entitlements
+are per binary, so the outer `.app` signature governs the app process **and
+nothing else**. The engine and the gateway are separate processes: a capability
+either of them needs goes in its own plist, applied to that binary by name.
+
+Two files today. `crates/lucidos-app/Entitlements.plist` is the outer `.app`
+(the camera). `crates/lucidos-app/EngineEntitlements.plist` is
+`Contents/Resources/lucidos-engine`, which embeds wasmtime and compiles a signer
+module, so it claims `com.apple.security.cs.allow-unsigned-executable-memory`.
+Release 0.32.0 shipped without it and macOS SIGKILLed the engine on every turn
+that reached a Wasm-signed proxy.
+
+**The gate is running the signed bytes, not reading them back.** `sign_app_bundle`
+runs `lucidos-engine --wasm-selftest` as its LAST step, after the outer `.app`
+codesign. So it exercises the bytes the function hands back, never an
+intermediate artifact. A readback says what the plist asked for;
+only this says what macOS allowed, and the difference is not hypothetical:
+`allow-jit` reads fine and still crashes, because wasmtime never asks for a
+`MAP_JIT` mapping. **Measure with a real Developer ID identity**, never `-s -`:
+an ad-hoc signature does not honour these keys the same way, and believing it is
+how the wrong key got picked first. Static halves are in `build_dmg_test.sh`.
+
 ### The submitted set is paired, and the manifest is published last (F3, F4, F5, F8, F10)
 
 Five findings from `docs/audits/2026-08-02-macos-update-path-audit.md`, all in `build-dmg.sh` and its libs.

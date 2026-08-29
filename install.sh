@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.32.0"
+LUCIDOS_DEFAULT_VERSION="0.33.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -272,7 +272,9 @@ verify_checksum_against_sidecar() {
 # unless LUCIDOS_FORCE is set. Prints the runtime dir on stdout.
 extract_tarball() {
     local tarball="$1" stem="$2"
-    local runtime_parent="$LUCIDOS_PREFIX/runtime"
+    # `:?` because --prefix accepts an empty argument, and every rm -rf
+    # below is derived from this path.
+    local runtime_parent="${LUCIDOS_PREFIX:?}/runtime"
     local runtime_dir="$runtime_parent/$stem"
 
     if [ -x "$runtime_dir/lucidos-gateway" ] && [ -z "$LUCIDOS_FORCE" ]; then
@@ -283,10 +285,42 @@ extract_tarball() {
 
     step "Extracting runtime → $runtime_dir" >&2
     mkdir -p "$runtime_parent" || die "Could not create $runtime_parent"
-    rm -rf "$runtime_dir"
-    tar -xzf "$tarball" -C "$runtime_parent" || die "Failed to extract $tarball into $runtime_parent"
-    [ -x "$runtime_dir/lucidos-gateway" ] \
-        || die "Extracted runtime is missing the gateway binary at $runtime_dir/lucidos-gateway — the tarball is not a valid Lucidos runtime."
+
+    # Extract beside the live tree and swap, never delete then extract. This
+    # runtime is SHARED: every registered instance's service runs
+    # `<prefix>/runtime/current/<binary>` and `current` points here, so a
+    # `--force` re-install used to remove those binaries for the whole duration
+    # of the untar. A KeepAlive respawn inside that window fails on a missing
+    # file, and every other instance loses its on-disk image.
+    # Both names carry this shell's pid, so they are unique to this run and need
+    # no pre-clean. Do NOT add a `.staging-$stem.*` sweep here to reclaim a
+    # killed run's leftovers: that glob is scoped to the stem, not the pid, so a
+    # second concurrent install deletes THIS run's `.previous-` rollback copy.
+    # The restore below is then skipped, and the shared runtime is left missing,
+    # which is the outcome this whole staging dance exists to prevent.
+    local staging="$runtime_parent/.staging-$stem.$$"
+    local previous="$runtime_parent/.previous-$stem.$$"
+    mkdir -p "$staging" || die "Could not create $staging"
+    tar -xzf "$tarball" -C "$staging" || {
+        rm -rf "$staging"
+        die "Failed to extract $tarball into $staging"
+    }
+    [ -x "$staging/$stem/lucidos-gateway" ] || {
+        rm -rf "$staging"
+        die "Extracted runtime is missing the gateway binary at $stem/lucidos-gateway. The tarball is not a valid Lucidos runtime."
+    }
+    if [ -e "$runtime_dir" ] && ! mv "$runtime_dir" "$previous"; then
+        rm -rf "$staging"
+        die "Could not move the existing runtime aside at $runtime_dir"
+    fi
+    if ! mv "$staging/$stem" "$runtime_dir"; then
+        # Put the old runtime back: a failed re-install must not leave the
+        # shared path missing for the instances still pointing at it.
+        [ -e "$previous" ] && mv "$previous" "$runtime_dir"
+        rm -rf "$staging"
+        die "Could not activate the extracted runtime at $runtime_dir"
+    fi
+    rm -rf "$staging" "$previous"
     ok "Extracted $stem" >&2
     printf '%s\n' "$runtime_dir"
 }

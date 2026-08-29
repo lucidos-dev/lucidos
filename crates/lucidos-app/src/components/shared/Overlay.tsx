@@ -47,8 +47,14 @@ export interface OverlayProps {
   open: boolean;
   /** Close the overlay — flip the signal that renders it. Called on
    *  outside-click, on Escape (via the central overlay stack), or by the
-   *  caller's own toggle handler. */
-  onClose: () => void;
+   *  caller's own toggle handler.
+   *
+   *  Return `false` to declare the call a NO-OP. That leaves the paired-click
+   *  suppressor disarmed, so the user's tap still reaches the button under it.
+   *  `closeDrawer` returns it during its slide-out, and so do `ProgressDialog`
+   *  and a zoomed `ImagePopup`. The TYPE has to say so. A `() => void` reads as
+   *  "the return is ignored", so a wrapper callback would drop it in silence. */
+  onClose: () => void | boolean;
   /** The toggle element that opened this overlay. Exempt from the
    *  outside-pointerdown dismiss so re-activating it closes via its OWN handler
    *  rather than being raced by the dismiss (on touch the dismiss-then-reopen

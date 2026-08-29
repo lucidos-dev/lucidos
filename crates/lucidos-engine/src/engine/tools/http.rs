@@ -132,15 +132,26 @@ impl LucidosEngine {
                         }
                     }
 
-                    headers.insert(
-                        reqwest::header::AUTHORIZATION,
-                        reqwest::header::HeaderValue::from_str(&format!(
-                            "Bearer {}",
-                            account.access_token
-                        ))
-                        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("")),
-                    );
-                    log!("[OAuth] Injected {} token for {}", oauth_provider, url);
+                    // Same shape as the 401-retry arm below. An unrenderable
+                    // token used to fall back to an EMPTY `Authorization`.
+                    // That also overwrote the stored credential injected
+                    // above, so the request went out unauthenticated and the
+                    // agent read the 401 as a bad key.
+                    match reqwest::header::HeaderValue::from_str(&format!(
+                        "Bearer {}",
+                        account.access_token
+                    )) {
+                        Ok(val) => {
+                            headers.insert(reqwest::header::AUTHORIZATION, val);
+                            log!("[OAuth] Injected {} token for {}", oauth_provider, url);
+                        }
+                        Err(e) => log!(
+                            "[OAuth] {} token is not a valid header value ({}); leaving the request's existing auth in place for {}",
+                            oauth_provider,
+                            e,
+                            url
+                        ),
+                    }
                 }
                 Ok(None) => log!(
                     "[OAuth] No {} account found, skipping token injection for {}",

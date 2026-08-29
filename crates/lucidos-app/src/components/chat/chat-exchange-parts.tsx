@@ -207,26 +207,12 @@ export function EventDeliveryBody({
   eventId?: string;
   payloadJson?: string;
 }) {
-  // Resolving the matched event's thread is a round-trip except for a match in
-  // this same thread. So the chip dims and goes inert while the jump is in
-  // flight, rather than accepting a second tap. See `showEventWhereItLives`.
-  const opening = useSignal(false);
-  const linkable = useEventTarget(eventId);
+  const jump = useEventJump(eventId);
   return eventDeliveryBody({
     eventType,
     payloadJson,
-    opening: opening.value,
-    onOpenMatched: linkable && eventId
-      ? async () => {
-          if (opening.value) return;
-          opening.value = true;
-          try {
-            await showEventWhereItLives(eventId);
-          } finally {
-            opening.value = false;
-          }
-        }
-      : undefined,
+    opening: jump.opening,
+    onOpenMatched: jump.onOpen,
   });
 }
 
@@ -236,12 +222,39 @@ export function EventDeliveryBody({
  *  The other direction, a link that appears and then disappears, reads as a bug
  *  and can be tapped in the window before it goes.
  *
- *  Shared by the two rows that offer a jump. Resolution happens in the effect
- *  rather than the render body precisely so the row subscribes to the one small
- *  verdict signal and not to `threadMap`. */
+ *  Resolution happens in the effect rather than the render body precisely so the
+ *  row subscribes to the one small verdict signal and not to `threadMap`. */
 function useEventTarget(eventId: string | undefined): boolean {
   useEffect(() => { ensureEventTargetResolved(eventId); }, [eventId]);
   return eventHasTarget(eventId);
+}
+
+/** The jump to a matched event, as the two things a chip needs: whether it is in
+ *  flight, and the handler when there is somewhere to go.
+ *
+ *  Resolving the matched event's thread is a round-trip except for a match in
+ *  this same thread. So the chip dims and goes inert while the jump runs, rather
+ *  than accepting a second tap. See `showEventWhereItLives`.
+ *
+ *  `onOpen` is absent when the event has nowhere to open, which is what keeps a
+ *  dead tap unreachable rather than merely unlikely. Both rows that offer a jump
+ *  take it from here, so neither can grow a different in-flight rule. */
+function useEventJump(eventId: string | undefined): { opening: boolean; onOpen?: () => void } {
+  const opening = useSignal(false);
+  const linkable = useEventTarget(eventId);
+  if (!linkable || !eventId) return { opening: opening.value };
+  return {
+    opening: opening.value,
+    onOpen: async () => {
+      if (opening.value) return;
+      opening.value = true;
+      try {
+        await showEventWhereItLives(eventId);
+      } finally {
+        opening.value = false;
+      }
+    },
+  };
 }
 
 /** The row's markup, hookless for the same reason `eventWaitRowBody` is. There
@@ -316,22 +329,11 @@ type TriggerStartedEvent = Extract<Exchange['userEvent'], { type: 'TriggerStarte
  *  The thin hook-holding wrapper; the markup is `triggerFiredBody`. */
 export function TriggerFiredBody({ event }: { event: TriggerStartedEvent }) {
   const matched = event.invocation?.kind === 'Event' ? event.invocation.event_id : undefined;
-  const opening = useSignal(false);
-  const linkable = useEventTarget(matched);
+  const jump = useEventJump(matched);
   return triggerFiredBody({
     event,
-    opening: opening.value,
-    onOpenMatched: linkable && matched
-      ? async () => {
-          if (opening.value) return;
-          opening.value = true;
-          try {
-            await showEventWhereItLives(matched);
-          } finally {
-            opening.value = false;
-          }
-        }
-      : undefined,
+    opening: jump.opening,
+    onOpenMatched: jump.onOpen,
   });
 }
 

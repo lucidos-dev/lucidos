@@ -111,8 +111,15 @@ fn self_workspace_name() -> Option<String> {
 /// Accepts the engine's self-signed cert because the target is `localhost`.
 /// Auto-forwards the thread-bound origin token when the matching env var
 /// is present (i.e., we're inside a Lucidos-spawned subprocess).
+///
+/// `no_proxy()` + `danger_accept_invalid_certs(true)` is the loopback pair
+/// `.claude/rules/rust.md` prescribes, and the one `pair.rs` and every engine
+/// and gateway client already use. Without it an `HTTPS_PROXY` in the
+/// environment, which a corporate machine exports globally, routes every
+/// subcommand's call to its own engine through that proxy.
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
     reqwest::blocking::Client::builder()
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .default_headers(default_headers_from_env())
         .build()
@@ -132,6 +139,7 @@ pub(crate) fn client_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<reqwest::blocking::Client, BoxError> {
     reqwest::blocking::Client::builder()
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .default_headers(default_headers_from_env())
         .timeout(timeout)
@@ -148,6 +156,7 @@ pub(crate) fn client_with_timeout(
 /// honest attribution.
 pub(crate) fn permission_prompt_client() -> Result<reqwest::blocking::Client, BoxError> {
     reqwest::blocking::Client::builder()
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .default_headers(default_headers_from_env())
         .timeout(None)
@@ -227,6 +236,21 @@ pub(crate) fn send_expect_success(
         return Err(format!("{} {} returned {}: {}", method, url, status, text).into());
     }
     Ok(text)
+}
+
+/// [`send_expect_success`], then parse the body as JSON.
+///
+/// The engine answers every `/api/v1` route with JSON, so a body that will not
+/// parse means something else replied. One message for that, rather than a copy
+/// per subcommand.
+pub(crate) fn send_expect_json(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<serde_json::Value, BoxError> {
+    let body = send_expect_success(method, url, req)?;
+    serde_json::from_str(&body)
+        .map_err(|e| format!("Unexpected response from {}: {}", url, e).into())
 }
 
 /// Send `req`, fail on non-2xx, and write the response body to stdout.

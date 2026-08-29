@@ -11,6 +11,9 @@ mod support;
 #[path = "api_support/health_test.rs"]
 mod health_test;
 
+#[path = "api_support/ws_echo_test.rs"]
+mod ws_echo_test;
+
 #[path = "api_support/changelog_test.rs"]
 mod changelog_test;
 

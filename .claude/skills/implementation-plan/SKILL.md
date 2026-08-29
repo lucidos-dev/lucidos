@@ -13,6 +13,61 @@ The output is **always a checked-in plan file** at `docs/plans/YYYY-MM-DD-<slug>
 
 **Enforcement (the Planned marker) + human approval.** Lucidos requires a gate-satisfying *Planned marker* on the branch before any source edit and before Apply. Running this skill records a **proposed** marker for you (after committing the plan file, run `lucidos planned mark --plan docs/plans/YYYY-MM-DD-<slug>.md`). A proposed plan does **not** unblock editing: it awaits the human's approval. **Present the plan, then ask for approval with the `AskUserQuestion` tool** (see "Asking for approval" below). Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying; only then are source edits and Apply unblocked. If the user requests changes, revise the plan file, re-commit, and ask again the same way (the marker stays proposed until approved). For genuinely local fixes that don't warrant a plan, the agent acknowledges instead with `lucidos planned mark --simple "<one-line reason>"` (no approval needed); that path does not use this skill.
 
+## When nobody can be asked: the unattended run
+
+This rule and the nightly orchestrator's own rule used to deadlock, and the
+deadlock cost real security fixes. The nightly's cross-cutting rule is that a
+sub-session never pauses for input and decides on its own. This gate wants a
+human decision before a security change is edited. A security scan is
+cross-layer by definition, so it tripped the gate every night. The child
+correctly refused both available bypasses: `lucidos planned approve` records an
+approval nobody gave, and `--simple` calls a cross-module credential fix local.
+So it wrote a plan and stopped.
+
+Two lanes resolve it. Both are for an **unattended** run only. If you can ask
+the user, ask: everything above still applies to you unchanged.
+
+**The bounded lane, for a fix that fits.** Take it for a security fix confined
+to a small, named set of files, shipping a regression test that fails without
+it. Such a fix may be committed with no prior plan decision:
+
+```bash
+lucidos planned mark --security-fix "<the finding, and the test that proves the fix>" \
+  --files crates/lucidos-engine/src/api/proxy.rs,crates/lucidos-engine/src/api/proxy_tests.rs
+```
+
+That records `bounded_security_fix`, which satisfies the gate at once. It is a
+distinct marker state on purpose. It claims neither that the work is local nor
+that a human approved. It claims only that an unattended run bounded itself, and
+asks the human to decide at review.
+
+**Apply refuses the branch if it touched anything outside that list**, so the
+bound is a check rather than a promise. If the fix has to grow, re-run the
+command with the full list. The engine caps the list; a list that long is not a
+bounded fix.
+
+The lane is for **security work only**. It is not a general way past the gate,
+and using it for anything else is the failure the whole rule exists to prevent.
+
+**The blocked lane, for anything wider.** Do not stop silently and do not file
+the finding as unfixable. Write the plan, commit it, record it with
+`lucidos planned mark --plan <path>`, leave the marker `proposed`, and end your
+final reply with this literal line:
+
+```text
+BLOCKED ON PLAN DECISION: <plan path> | <one line naming the decision the human owes>
+```
+
+That line is a *step outcome*, not a failure. The orchestrator reads it and
+reports the run as blocked on a decision rather than as a failed scan. It then
+carries on with the rest of the pipeline. Ending with a plan and that line is a
+**complete** unattended run.
+
+The orchestrator's half of this lives in the workspace knowhow
+`lucidos-ops/nightly-pipeline`, § "Two cross-cutting rules every step carries"
+and § "Step 3 detail". The reasoning and the rejected alternatives are in
+[ADR 0154](../../../docs/adr/0154-unattended-security-fixes-get-a-bounded-lane.md).
+
 ## Workflow
 
 1. **Check whether decisions are settled.**

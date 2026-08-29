@@ -107,9 +107,20 @@ export function sampleToastBurst(): void {
  *  of literal props. This one is a record, so it lives here with the rest of the
  *  content. */
 export const SAMPLE_INGRESS_OUTAGE: WebhookIngressOutage = {
+  webhook_name: 'github-ci',
   host: 'node.tailnet.ts.net',
   port: 8443,
   families: ['ipv4'],
+  addresses: [
+    {
+      address: '203.0.113.7',
+      family: 'ipv4',
+      stage: 'ingress-unreachable',
+      status: null,
+      detail: 'could not connect: tls handshake eof',
+    },
+    { address: '2001:db8::1', family: 'ipv6', stage: 'healthy', status: 401, detail: null },
+  ],
   down_since: '2026-08-26T22:10:00Z',
   down_secs: 28_800,
 };

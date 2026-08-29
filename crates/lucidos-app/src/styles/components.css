@@ -559,6 +559,11 @@
     /* The category icon's box. It is out of flow, so .toast-body pays for it as
        left padding rather than as a flex sibling. */
     --toast-icon-size: 1.125rem;
+    /* The message's line height, named because .toast-heading's cap is a whole
+       multiple of it. A literal restated there is a value that silently stops
+       dividing the day this is retuned, and the whole point of that cap is
+       that it divides. */
+    --toast-line-height: 1.4;
     /* Elevated surface: in DARK mode the fill sits one step above the app
        background (--bg-tertiary, not the near-canvas --bg-secondary) and rides
        the deeper --shadow-md, so the toast clearly floats above the chrome
@@ -683,9 +688,28 @@
    It is a scroll box itself for the one case with nothing under it: a message
    with no sections is all heading, and a long one has to scroll rather than be
    clipped at the cap. A one-line heading is already at its floor, so it cannot
-   shrink and never shows a bar. */
+   shrink and never shows a bar.
+
+   WHOLE LINES ONLY, which is the third job and the reason for the two rules
+   below. Flex has no reason to stop shrinking on a line boundary, so a heading
+   squeezed to make room for .toast-sections was sheared through the middle of
+   its last line: the reported 503 card showed the top halves of the glyphs that
+   carried the actual error. `flex-shrink: 0` hands the squeeze to the sections
+   box, which is what `flex: 1 1 auto; min-height: 0` there is for, and the cap
+   is a whole multiple of the line height so the box always ends on a boundary.
+
+   Six lines, and the number matters in one direction only: it must leave room
+   under .toast's 14rem cap for the actions row and the close X, which are the
+   heading's siblings rather than its content.
+
+   `em`, not the `rem` the rest of the app sizes in, and this one is not a slip.
+   A line here is the HEADING's own font-size times the ratio, so only an
+   em-relative cap tracks it. A rem value is a fixed length that stops dividing
+   the moment the message font moves. */
 .toast-heading {
-    flex: 0 1 auto;
+    flex: 0 0 auto;
+    line-height: var(--toast-line-height);
+    max-height: calc(6em * var(--toast-line-height));
     min-height: var(--toast-close-size);
     margin-right: var(--toast-close-size);
     overflow-y: auto;
@@ -750,7 +774,7 @@
 .toast-bullets {
     margin: 0.25rem 0 0;
     font-size: var(--font-size-sm);
-    line-height: 1.4;
+    line-height: var(--toast-line-height);
 }
 
 .toast-section {
@@ -1339,7 +1363,6 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     align-items: center;
     justify-content: center;
     z-index: 1;
-    transition: background var(--duration-fast);
 }
 
 .image-popup-nav-prev {
@@ -1432,15 +1455,31 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
     }
 }
 
+/* The chrome fades on its way in and on its way out, and each direction takes
+   the curve that suits it. A rule governs the change TOWARD its own state, so
+   this one is the arrival and the .chrome-hidden one below is the departure.
+   An ease-out departure is down to a tenth of its opacity inside 70ms, which
+   reads as a snap rather than a fade.
+
+   Opacity alone, with no drift toward the screen edge. Every control here is a
+   bordered circle or pill whose ring needs whole-pixel edges (see the note over
+   .image-popup-close), and a transform holds them on fractions for the length
+   of the animation.
+
+   `background` rides along because this shorthand replaces whatever the
+   individual rules set. The close button and the nav chevrons darken on hover,
+   and without it here they snap. */
 .image-popup-close,
 .floating-mobile-close,
 .image-popup-nav,
 .image-popup-counter,
 .image-popup-zoom {
-    transition: opacity var(--duration-fast) ease-out;
+    transition: opacity var(--duration-slow) ease-out, background var(--duration-fast);
 }
 
-/* pointer-events:none keeps the invisible buttons from eating the next tap. */
+/* pointer-events:none keeps the invisible buttons from eating the next tap. It
+   lands at once rather than with the fade, so a control on its way out is dead
+   from the first frame. */
 .image-popup-content.chrome-hidden .image-popup-close,
 .image-popup-content.chrome-hidden .floating-mobile-close,
 .image-popup-content.chrome-hidden .image-popup-nav,
@@ -1448,6 +1487,7 @@ html[data-theme="light"] .toast { background: var(--bg-primary); }
 .image-popup-content.chrome-hidden .image-popup-zoom {
     opacity: 0;
     pointer-events: none;
+    transition: opacity var(--duration-slow) ease-in;
 }
 
 @media (max-width: 600px) {

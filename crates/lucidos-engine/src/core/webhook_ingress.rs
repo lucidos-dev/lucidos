@@ -100,6 +100,10 @@ pub fn classify_status(status: u16) -> Stage {
 /// A family with no probed address is `not-probed`, never degraded. That covers
 /// a host with no IPv6 egress, which would otherwise report a permanent outage
 /// of an ingress that is fine.
+///
+/// This is the ONLY producer of a family verdict, deliberately. Every verdict
+/// therefore rests on at least one attempted request, so `degraded` can never
+/// be pronounced over zero measurements.
 pub fn judge(addresses: &[AddressProbe]) -> Vec<FamilyVerdict> {
     Family::BOTH
         .iter()
@@ -122,23 +126,6 @@ pub fn judge(addresses: &[AddressProbe]) -> Vec<FamilyVerdict> {
                 healthy,
                 total: probed.len(),
             }
-        })
-        .collect()
-}
-
-/// Judge a hostname that carries no public record at all.
-///
-/// The resolvers answered and named nothing, so no delivery can address this
-/// host from outside. That is a total outage, and there is no address to probe
-/// to prove it.
-pub fn judge_no_public_record() -> Vec<FamilyVerdict> {
-    Family::BOTH
-        .iter()
-        .map(|family| FamilyVerdict {
-            family: *family,
-            verdict: Verdict::Degraded,
-            healthy: 0,
-            total: 0,
         })
         .collect()
 }

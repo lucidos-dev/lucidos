@@ -155,11 +155,22 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
   });
 
   // Two scales, because the default root has room to spare at this width and
-  // proves nothing on its own. Measured at 112.5% on this fixture: the row
-  // asked for 337px of a 317.5px content box before the fix and asks for 296px
-  // after it. That scale is the one pinning the arithmetic.
-  for (const scale of [100, 112.5]) {
-    test(`Diff sits beside Apply at ui-scale ${scale}, and typing moves no icon`, async ({ page }) => {
+  // proves nothing on its own. 112.5% is the one pinning the arithmetic.
+  //
+  // `liftsDiff` is measured, not chosen. The *call toggle* gave the leading
+  // cluster a fourth box. At 112.5% the row's six items now ask for 327.9px of
+  // a 317.1px content box. That IS a genuine overflow, so lifting is the row
+  // keeping its promise rather than breaking it. Promise 1 is unchanged: Diff
+  // shares the row while the row can hold it.
+  //
+  // A control added or removed here moves that number. Re-measure and re-set
+  // the flag. Do not relax the assertion to accept either answer, which is
+  // what would stop this spec noticing the next control.
+  for (const { scale, liftsDiff } of [
+    { scale: 100, liftsDiff: false },
+    { scale: 112.5, liftsDiff: true },
+  ]) {
+    test(`Diff keeps the seat the row can afford at ui-scale ${scale}, and typing moves no icon`, async ({ page }) => {
       const suffix = uniqueMessage('rowfit').replace(/[^a-z0-9-]/g, '');
       const { threadId, changeId, branch, file } = createCCThreadWithChange(
         'E2E Row Fit', suffix, { requiresRestart: true },
@@ -175,26 +186,38 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
 
         const empty = await setScaleAndSettle(page, scale);
 
-        // Promise 1: one row. Both controls sit on the same vertical middle,
-        // and the lifted layout is not engaged at all.
+        // Promise 1: the row lifts Diff exactly when it cannot hold it, and
+        // never with room to spare.
         // A stacked row still ends flush with the content edge, so the width
         // it ASKS for is the honest number to report here.
         const asked = empty.items.reduce((sum, i) => sum + (i.right - i.left), 0);
+        const arithmetic = `Its ${empty.items.length} items ask for ${asked.toFixed(1)}px `
+          + `plus one gap, against `
+          + `${(empty.contentRight - empty.contentLeft).toFixed(1)}px of content box`;
         expect(
           empty.stacked,
-          `ui-scale ${scale}: the row lifted Diff. Its ${empty.items.length} items ask for `
-          + `${asked.toFixed(1)}px plus one gap, against `
-          + `${(empty.contentRight - empty.contentLeft).toFixed(1)}px of content box`,
-        ).toBe(false);
-        expect(
-          Math.abs(empty.diffMiddle! - empty.applyMiddle!),
-          `ui-scale ${scale}: Diff and Apply are on different rows`,
-        ).toBeLessThan(2);
+          liftsDiff
+            ? `ui-scale ${scale}: the row kept Diff on one row. ${arithmetic}`
+            : `ui-scale ${scale}: the row lifted Diff. ${arithmetic}`,
+        ).toBe(liftsDiff);
+        // Same vertical middle means one row. On the scale that overflows, the
+        // lift is the point, so they must NOT share one.
+        const middles = Math.abs(empty.diffMiddle! - empty.applyMiddle!);
+        if (liftsDiff) {
+          expect(middles, `ui-scale ${scale}: Diff did not leave Apply's row`)
+            .toBeGreaterThan(2);
+        } else {
+          expect(middles, `ui-scale ${scale}: Diff and Apply are on different rows`)
+            .toBeLessThan(2);
+        }
+        // The half that holds at BOTH scales, and the one that matters most:
+        // lifted or not, nothing may cross the row's content edge.
         expectNoOverflow(empty, `ui-scale ${scale}, empty draft`);
 
         // The empty row carries no clear-draft box: the agent menu, the follow
-        // toggle and the attach button. That 2.25rem fourth box is what used to
-        // push Diff off the row.
+        // toggle, the call toggle and the attach button. A clear button would
+        // be a FIFTH 2.25rem box. Reserving one with nothing to clear is what
+        // used to push Diff off the row at both scales.
         expect(
           empty.leadingDesc,
           `ui-scale ${scale}: an empty draft still reserves a clear button`,
@@ -202,7 +225,7 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
         expect(
           empty.leadingDesc.length,
           `ui-scale ${scale}: leading cluster is [${empty.leadingDesc.join(' | ')}]`,
-        ).toBe(3);
+        ).toBe(4);
         expect(empty.sendCount, `ui-scale ${scale}: the banner owns the send slot`).toBe(0);
 
         // Promise 2: the first character mounts the clear button and the send
@@ -212,10 +235,10 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
 
         expect(typed.leadingDesc, `ui-scale ${scale}: the clear button never arrived`)
           .toContain('Clear draft');
-        expect(typed.leadingDesc.slice(0, 3), `ui-scale ${scale}: the cluster reordered`)
+        expect(typed.leadingDesc.slice(0, 4), `ui-scale ${scale}: the cluster reordered`)
           .toEqual(empty.leadingDesc);
         expect(
-          typed.iconLefts.slice(0, 3),
+          typed.iconLefts.slice(0, 4),
           `ui-scale ${scale}: the leading icons moved when the draft opened`,
         ).toEqual(empty.iconLefts.map(x => expect.closeTo(x, 1)));
         expect(typed.sendCount, `ui-scale ${scale}: the send morph replaces the banner`).toBe(1);

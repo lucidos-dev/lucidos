@@ -1,11 +1,16 @@
 /* Settings → System */
 
-.system-subpanel-switcher {
-    margin-bottom: 1.25rem;
-}
+/* A sub-page reads down one column, capped and centred exactly as the
+   transcript and the composer are (`.thread-content > *`,
+   chat/input-messages.css). Same token, so the two cannot drift apart. Below
+   the cap this is a no-op and the panel's own --space-lg gutter is the whole
+   inset.
 
-.system-subpanel-options {
-    justify-content: flex-start;
+   The System submenu that reaches these pages is deliberately NOT capped: it
+   is a Settings nav list, so it takes the width the Settings home list takes. */
+.system-page {
+    max-width: var(--content-max-width);
+    margin-inline: auto;
 }
 
 /* The state's two quantities, named because the note under the row derives its
@@ -61,32 +66,60 @@
     color: var(--text-secondary);
 }
 
+/* A block of facts, as a two-column definition list. No surface, and no rule
+   per row: the LABEL COLUMN is the whole structure.
+
+   Don't put either back. A rule only earns its place when the label and the
+   value sit at opposite ends of the pane, which is a thousand pixels at a wide
+   pane and a high UI scale. The label track closes that gap instead, and a
+   surface drawn around a gap already closed is decoration.
+
+   The padding is deliberate with nothing painted behind it. It is the block's
+   own breathing room, holding the first row off its eyebrow and indenting the
+   run under it. */
 .system-info-list {
-    display: flex;
-    flex-direction: column;
-}
-
-.system-info-row {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: 9rem minmax(0, 1fr);
+    /* A label and a value at different steps sit on one line, not on one box
+       top. The flex row this replaced said `align-items: baseline` for the same
+       reason, and grid drops to `stretch` if nobody says otherwise. */
     align-items: baseline;
-    gap: 1rem;
-    padding: 0.375rem 0;
-    border-top: 1px solid var(--border-color);
+    row-gap: var(--space-xs);
+    column-gap: var(--space-lg);
+    padding: var(--space-sm) var(--space-md);
 }
 
+/* On a phone the fixed column is half the row, and it spends that width on
+   trailing space no label uses: the value is what gets squeezed, and a version
+   or a path is what wraps for it. So the label track sizes to the longest label
+   instead. Values still share one edge WITHIN a block, which is what the reader
+   scans; only the alignment BETWEEN two stacked blocks is given up, and that
+   one is invisible on a screen you scroll a block at a time. */
+@media (max-width: 768px) {
+    .system-info-list {
+        grid-template-columns: max-content minmax(0, 1fr);
+    }
+}
+
+/* The row groups its two cells in the markup and contributes no box of its own,
+   so both land directly in the grid above and every value starts on one column.
+   Safe here because a row is two plain spans carrying no role: nothing depends
+   on the wrapper being rendered. */
+.system-info-row {
+    display: contents;
+}
+
+/* Quiet label, loud value. The value is what the reader came for, and it used
+   to be the dimmest text in its own row. */
 .system-info-label {
-    flex: 0 0 auto;
     font-size: var(--font-size-md);
-    color: var(--text-primary);
+    color: var(--text-secondary);
 }
 
 .system-info-value {
-    flex: 1 1 auto;
     min-width: 0;
-    color: var(--text-secondary);
+    color: var(--text-primary);
     font-size: var(--font-size-md);
-    text-align: right;
     overflow-wrap: anywhere;
 }
 
@@ -99,18 +132,29 @@
 .system-info-long {
     font-family: var(--font-mono, monospace);
     font-size: var(--font-size-xs);
+    /* One step back down from the value colour. A path or a build id is a value
+       you copy rather than one you read, so it stays quiet while the version
+       numbers beside it carry the block. */
+    color: var(--text-secondary);
 }
 
+/* The copy button hugs its own URL. As a grid item it would otherwise stretch
+   across the whole value column, so a click on the blank surface to the right
+   of the address would silently copy it. */
 .system-api-url {
     background: none;
     border: none;
     padding: 0;
+    justify-self: start;
+    text-align: left;
 }
 
-/* Update markers ("*", "(latest: …)", "(update available)") stand out from the
-   muted --text-secondary value text by weight + contrast, not by an amber hue. */
+/* Update markers ("*", "(latest: …)", "(update available)"), on the accent
+   rather than an amber hue. Weight and contrast used to carry them, against a
+   value text that was muted; the value rests at --text-primary now, so there is
+   no contrast left above it and the marker needs a colour of its own. */
 .system-update {
-    color: var(--text-primary);
+    color: var(--accent);
     font-weight: 600;
 }
 
@@ -135,6 +179,19 @@
     line-height: 1.4;
 }
 
+/* What to DO about the state, under the notice stating it. A second card at the
+   notice's own weight reads as a second alarm, which is what the source-checkout
+   guidance under a restart notice looked like. No surface and no bold, so the
+   pair reads as one thing said twice over: the state, then the answer. Padded to
+   the notice's text inset above it, so the two share a left column. */
+.system-guidance {
+    background: none;
+    font-weight: 400;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    padding: 0 0.625rem;
+}
+
 /* Determinate progress under a .system-notice narrating a live packaged update.
    The notice is a card, so this is internal component spacing, not a structural
    gutter. */
@@ -142,14 +199,34 @@
     margin-top: 0.5rem;
 }
 
+/* Buttons size to their own labels. Give the row a flex basis instead and it
+   splits the pane between them, which hands a routine Refresh Client the same
+   weight as a rebuild.
+
+   Network Access wears this class too, so the base rule stays neutral and the
+   System page states its own alignment below. */
 .system-actions {
     display: flex;
     gap: 0.5rem;
     flex-wrap: wrap;
 }
 
-.system-actions .action-btn {
-    flex: 1 1 10rem;
+/* On System the row CLOSES its section, so it sits at the far edge with a step
+   of its own above it. What precedes it there is a stack of notices, and an
+   action flush under the last of them reads as part of that message. Rightmost
+   is the weightiest action, which is already the DOM order (Rebuild & Restart
+   is last), so reordering the buttons also reorders their weight.
+
+   `padding`, not `margin`: the notice above carries a bottom margin, adjacent
+   siblings collapse to the larger of the two, and a step that only wins by the
+   difference is no step.
+
+   Scoped to `.system-page` because Network Access has no such column. Its lone
+   Save would fly to the far side of an uncapped pane, a screen away from the
+   field it saves. */
+.system-page .system-actions {
+    justify-content: flex-end;
+    padding-top: var(--space-sm);
 }
 
 /* Settings → Coding Agents: the per-agent binary-path override row.

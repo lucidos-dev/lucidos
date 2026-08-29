@@ -584,6 +584,12 @@ pub async fn resolve_attend_mode(
                     _ => AttendMode::Unattended { grant: Vec::new() },
                 };
             }
+            // An agent authored it, so nobody is attending. Not expected as an
+            // ORIGINATING origin: the variant is stamped on what an agent
+            // wrote, and a thread starts from what a caller sent. Classified
+            // anyway rather than left unclassifiable, because "an LLM decided"
+            // is the unattended case exactly, and it lends no grant.
+            MessageOrigin::Agent { .. } => return AttendMode::Unattended { grant: Vec::new() },
             // A webhook is an external caller, so it lends no grant at all. A
             // trigger that fires on the event it emitted carries its OWN grant,
             // and arrives here as `Engine { Scheduler }` rather than this.

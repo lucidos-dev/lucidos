@@ -61,7 +61,17 @@ pub fn read_location(handle: &LocationHandle) -> String {
 ///   regional host — hitting those 404s with a Google robot HTML page.
 /// - Any specific region (e.g. `europe-west1`) →
 ///   `{location}-aiplatform.googleapis.com`.
+///
+/// A location the caller made up falls back to `global`, loudly. `vertex_region`
+/// is an ordinary settable preference, so this string is caller data, and it is
+/// interpolated straight into a host. Left alone, `evil.test#` builds
+/// `https://evil.test#-aiplatform.googleapis.com`, whose host is `evil.test`,
+/// and a live ADC access token follows it there.
 pub fn vertex_host(location: &str) -> String {
+    // DNS is case-insensitive and every real region is lowercase, so folding
+    // case first keeps `EUROPE-WEST1` working instead of discarding it.
+    let lowered = location.to_ascii_lowercase();
+    let location = well_formed_location(&lowered);
     if location == "global" {
         "aiplatform.googleapis.com".to_string()
     } else if is_multi_region(location) {
@@ -69,6 +79,27 @@ pub fn vertex_host(location: &str) -> String {
     } else {
         format!("{}-aiplatform.googleapis.com", location)
     }
+}
+
+/// `location` if it can only ever be a label inside a Google host, else
+/// `global`.
+///
+/// Every real Vertex location is lowercase letters, digits and dashes: `global`,
+/// `eu`, `europe-west1`. Anything else cannot reach a valid endpoint anyway, so
+/// refusing it costs nothing and closes the host-injection above.
+fn well_formed_location(location: &str) -> &str {
+    let ok = !location.is_empty()
+        && location
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        return location;
+    }
+    crate::log!(
+        "[Vertex] refusing malformed region {:?}; using global instead",
+        location
+    );
+    "global"
 }
 
 /// Is `location` one of Vertex's two multi-regions?
@@ -827,6 +858,37 @@ mod tests {
             vertex_host("europe-west1"),
             "europe-west1-aiplatform.googleapis.com"
         );
+    }
+
+    /// `vertex_region` is a settable preference, and it lands inside a host
+    /// name. A caller who can write it must not be able to choose the host: the
+    /// builtin `vertex` proxy mints a live ADC access token and sends it there.
+    #[test]
+    fn a_malformed_region_cannot_choose_the_host() {
+        // Case folds rather than being discarded: DNS does not care, and a
+        // user who typed it that way still reaches their own region.
+        assert_eq!(
+            vertex_host("EUROPE-WEST1"),
+            "europe-west1-aiplatform.googleapis.com"
+        );
+        for region in [
+            "evil.test#",
+            "evil.test/",
+            "evil.test?",
+            "user@evil.test",
+            "evil.test:443",
+            "eu rope",
+            "",
+        ] {
+            let url = format!("https://{}/v1/projects/p", vertex_host(region));
+            let parsed = reqwest::Url::parse(&url)
+                .unwrap_or_else(|e| panic!("region {region:?} built an unparseable URL: {e}"));
+            let host = parsed.host_str().unwrap_or_default();
+            assert!(
+                host.ends_with("googleapis.com"),
+                "region {region:?} chose host {host}"
+            );
+        }
     }
 
     /// Grounded web search must ALWAYS hit `locations/global`, whatever region

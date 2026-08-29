@@ -7,7 +7,7 @@
 //! Credential values are read at pipeline-build time so rotations are
 //! picked up on the next request without engine state.
 
-use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput};
+use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, ScopeBinding};
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
 
@@ -15,19 +15,25 @@ use axum::http::{HeaderName, StatusCode};
 /// auth all reduce to "compute the header value once at construction,
 /// emit it on every apply" — see the `bearer`, `api_key`, `basic`
 /// constructors.
+///
+/// Every constructor takes the [`ScopeBinding`] for the value it carries. The
+/// caller has to say where the secret came from, because that is the only
+/// thing the gate can check it against.
 pub struct StaticHeaderLayer {
     namespace: String,
     header_name: HeaderName,
     value: String,
+    binding: ScopeBinding,
 }
 
 impl StaticHeaderLayer {
     /// `Authorization: Bearer <token>`.
-    pub fn bearer(namespace: String, token: String) -> Self {
+    pub fn bearer(namespace: String, token: String, binding: ScopeBinding) -> Self {
         Self {
             namespace,
             header_name: HeaderName::from_static("authorization"),
             value: format!("Bearer {token}"),
+            binding,
         }
     }
 
@@ -37,6 +43,7 @@ impl StaticHeaderLayer {
         namespace: String,
         header_name_str: &str,
         value: String,
+        binding: ScopeBinding,
     ) -> Result<Self, String> {
         let header_name = HeaderName::try_from(header_name_str)
             .map_err(|e| format!("invalid header name '{header_name_str}': {e}"))?;
@@ -44,11 +51,12 @@ impl StaticHeaderLayer {
             namespace,
             header_name,
             value,
+            binding,
         })
     }
 
     /// `Authorization: Basic base64(user:password)`.
-    pub fn basic(namespace: String, username: &str, password: &str) -> Self {
+    pub fn basic(namespace: String, username: &str, password: &str, binding: ScopeBinding) -> Self {
         use base64::Engine;
         let encoded =
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
@@ -56,6 +64,7 @@ impl StaticHeaderLayer {
             namespace,
             header_name: HeaderName::from_static("authorization"),
             value: format!("Basic {encoded}"),
+            binding,
         }
     }
 }
@@ -64,6 +73,9 @@ impl StaticHeaderLayer {
 impl AuthLayer for StaticHeaderLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
+    }
+    fn scope_bindings(&self) -> Vec<ScopeBinding> {
+        vec![self.binding.clone()]
     }
     async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         Ok(AuthMutation {
@@ -78,14 +90,16 @@ pub struct QueryParamLayer {
     namespace: String,
     param: String,
     value: String,
+    binding: ScopeBinding,
 }
 
 impl QueryParamLayer {
-    pub fn new(namespace: String, param: String, value: String) -> Self {
+    pub fn new(namespace: String, param: String, value: String, binding: ScopeBinding) -> Self {
         Self {
             namespace,
             param,
             value,
+            binding,
         }
     }
 }
@@ -94,6 +108,9 @@ impl QueryParamLayer {
 impl AuthLayer for QueryParamLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
+    }
+    fn scope_bindings(&self) -> Vec<ScopeBinding> {
+        vec![self.binding.clone()]
     }
     async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         // Credentials in query strings must be redacted before logs/error
@@ -132,7 +149,11 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_emits_authorization_header() {
-        let layer = StaticHeaderLayer::bearer("test-cred".into(), "secret123".into());
+        let layer = StaticHeaderLayer::bearer(
+            "test-cred".into(),
+            "secret123".into(),
+            ScopeBinding::StoredCredential("test-cred".into()),
+        );
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://example.com/x", &prior);
@@ -144,8 +165,13 @@ mod tests {
 
     #[tokio::test]
     async fn api_key_emits_named_header() {
-        let layer =
-            StaticHeaderLayer::api_key("svc".into(), "x-api-key", "abc-def".into()).unwrap();
+        let layer = StaticHeaderLayer::api_key(
+            "svc".into(),
+            "x-api-key",
+            "abc-def".into(),
+            ScopeBinding::StoredCredential("svc".into()),
+        )
+        .unwrap();
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://example.com/x", &prior);
@@ -157,7 +183,12 @@ mod tests {
 
     #[test]
     fn api_key_rejects_invalid_header_name() {
-        match StaticHeaderLayer::api_key("svc".into(), "bad header", "v".into()) {
+        match StaticHeaderLayer::api_key(
+            "svc".into(),
+            "bad header",
+            "v".into(),
+            ScopeBinding::StoredCredential("svc".into()),
+        ) {
             Err(err) => assert!(err.contains("invalid header name"), "msg was: {err}"),
             Ok(_) => panic!("expected api_key constructor to reject 'bad header'"),
         }
@@ -165,7 +196,12 @@ mod tests {
 
     #[tokio::test]
     async fn basic_emits_base64_basic_authorization() {
-        let layer = StaticHeaderLayer::basic("svc".into(), "user", "pass");
+        let layer = StaticHeaderLayer::basic(
+            "svc".into(),
+            "user",
+            "pass",
+            ScopeBinding::StoredCredential("svc".into()),
+        );
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://example.com/x", &prior);
@@ -177,7 +213,12 @@ mod tests {
 
     #[tokio::test]
     async fn query_param_layer_publishes_redacted_log_url() {
-        let layer = QueryParamLayer::new("svc".into(), "api-key".into(), "actual-secret".into());
+        let layer = QueryParamLayer::new(
+            "svc".into(),
+            "api-key".into(),
+            "actual-secret".into(),
+            ScopeBinding::StoredCredential("svc".into()),
+        );
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://example.com/data", &prior);

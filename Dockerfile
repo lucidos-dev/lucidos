@@ -8,7 +8,10 @@ COPY . .
 # lucidos-cli is built alongside the engine so the `lucidos` binary lands in
 # /usr/bin (next to lucidos-engine), matching what `lucidos_cli_dir()` expects
 # at runtime when prepending to spawned CC sessions' PATH.
-RUN cargo build -p lucidos-engine -p lucidos-cli --release
+# `--locked` per ADR 0020: the image must fail on Cargo.toml/Cargo.lock drift
+# rather than resolve fresh dependencies and ship a binary the lockfile never
+# described.
+RUN cargo build --locked -p lucidos-engine -p lucidos-cli --release
 
 # Runtime stage - single container with PostgreSQL + pgvector + Lucidos
 FROM debian:bookworm-slim

@@ -77,16 +77,13 @@ impl LucidosEngine {
                         "[Chat] CC follow-up for thread {} queued behind active spawn leader",
                         thread_id
                     );
-                    return Ok(ProcessResult {
-                        response: String::new(),
-                        steps: vec![],
-                        images: vec![],
+                    return Ok(crate::engine::agentic_loop::terminal_result(
+                        String::new(),
+                        vec![],
                         request_id,
                         thread_id,
-                        proposed_change: false,
-                        auto_apply: false,
-                        orphaned_injections: vec![],
-                    });
+                        false,
+                    ));
                 }
                 LeaderElection::Leader => {
                     // Fall through to spawn CC. Drain happens just before
@@ -136,7 +133,7 @@ impl LucidosEngine {
             crate::engine::agent_session::lookup_latest_cc_session_id(&self.pool, thread_id).await;
         // Direct run_direct_agent here is NOT a parallel path:
         // `run_cc_chat_branch` IS the CC slow path of
-        // `process_message_with_steps_internal` (chat/process.rs's
+        // `process_message_with_steps_internal` (chat/process/run.rs's
         // `use_coding_agent == Some(true)` branch routes here). The
         // unified router funnels every chat-driven and agent-driven CC
         // turn through this call; it's the bottom of the funnel.
@@ -212,8 +209,17 @@ impl LucidosEngine {
             let residual = self.cc_spawn_coalesce.clear(thread_id);
             if !residual.is_empty() {
                 let mut orphans = crate::engine::agent_session::queued_to_orphans(residual);
-                if let Ok(ref mut pr) = result {
-                    pr.orphaned_injections.append(&mut orphans);
+                match result {
+                    Ok(ref mut pr) => pr.orphaned_injections.append(&mut orphans),
+                    // A failed turn carries no result to hang them on, so they
+                    // do go. Said out loud rather than silently, which is what
+                    // this block exists to prevent.
+                    Err(ref e) => log!(
+                        "[Chat] Dropped {} coalesced follow-up(s) on thread {}: the CC turn failed ({})",
+                        orphans.len(),
+                        thread_id,
+                        e
+                    ),
                 }
             }
         }

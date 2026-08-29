@@ -18,7 +18,7 @@ use super::error::ApiError;
 use super::*;
 use crate::core::credentials::{AuthType, Credential};
 use crate::core::webhook_deliveries::{Claim, DeliveryLedger, MAX_WINDOW_SECS};
-use crate::core::webhook_ingress::Family;
+use crate::core::webhook_ingress::{AddressProbe, Family};
 use crate::core::webhooks::{
     self, DedupeConfig, HmacChange, HmacConfig, PresentedDelivery, Webhook, WebhookConfig,
     WebhookPatch, WebhookStore,
@@ -319,7 +319,7 @@ impl PendingSecret {
             &state.pool,
             &state.engine.event_bus,
             credential,
-            existing.map_or("", |c| c.base_url.as_str()),
+            existing.map_or(&[][..], |c| c.base_urls.as_slice()),
             // A signing secret is sent nowhere, so it has no transport shape.
             // An existing row keeps whatever the user chose for it.
             existing.map_or(AuthType::Secret, |c| c.auth_type),
@@ -965,10 +965,17 @@ struct IngressStatus {
 /// enabled hook rather than the probed one.
 #[derive(Serialize)]
 struct IngressOutage {
+    /// The hook the probe used, not the owner of the outage. Named so a reader
+    /// can say which delivery path this is, and so the Discuss button can quote
+    /// it. The page still marks every enabled hook.
+    webhook_name: String,
     host: String,
     port: u16,
     /// The families that could not be reached: `ipv4`, `ipv6`, or both.
     families: Vec<Family>,
+    /// What each probed address answered. The verdict says a family is down,
+    /// and this says how each of its addresses failed.
+    addresses: Vec<AddressProbe>,
     down_since: String,
     down_secs: i64,
 }
@@ -995,9 +1002,11 @@ async fn ingress_status(State(state): State<AppState>) -> Result<Json<IngressSta
 
     Ok(Json(IngressStatus {
         degraded: Some(IngressOutage {
+            webhook_name: outage.webhook_name,
             host: outage.host,
             port: outage.port,
             families: outage.families,
+            addresses: outage.addresses,
             down_since: outage.down_since.to_rfc3339(),
             down_secs: outage.down_secs,
         }),
@@ -1224,7 +1233,7 @@ mod tests {
         Credential {
             id: Uuid::new_v4(),
             service_name: name.into(),
-            base_url: "https://api.example.com".into(),
+            base_urls: vec!["https://api.example.com".into()],
             auth_type,
             auth_value: "the-users-live-api-key".into(),
             auth_header: "Authorization".into(),

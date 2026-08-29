@@ -3498,7 +3498,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Connect to PostgreSQL (use DATABASE_URL env var)
     let database_url = lucidos_engine::core::database_url();
-    log!("[Populate] Connecting to PostgreSQL at {}", database_url);
+    log!(
+        "[Populate] Connecting to PostgreSQL at {}",
+        lucidos_engine::core::redact_postgres_secrets(&database_url)
+    );
 
     // Create shared connection pool
     let pool = sqlx::postgres::PgPoolOptions::new()

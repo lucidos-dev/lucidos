@@ -1,198 +1,86 @@
 # Voice control for Lucidos
 
-**Date:** 2026-06-01
-**Status:** Note. An architecture discussion written down, not a plan. Nothing is
-scheduled, nothing is implemented, and no decision has been made. If this is ever
-built it needs an ADR for the decisions and a real plan under `docs/plans/`.
-**Topic:** Hands-free voice control of Lucidos using OpenAI's GPT-Realtime-2 speech-to-speech model.
+**Status:** Superseded. This note was an architecture discussion, written before
+any decision was made. The decisions were made later, in a design thread, and
+most of what this note proposed lost.
 
----
+**Read instead:**
 
-## The question
+- `docs/plans/2026-08-28-voice-joins-a-thread-as-a-participant.md`, the plan.
+- ADR 0148, voice is a mode of a thread.
+- ADR 0149, the rented tool-less talker beside the agent we own.
+- ADR 0150, an agent-authored event names its author.
+- ADR 0151, the gateway carries a WebSocket upgrade.
 
-Can Lucidos add voice control built on OpenAI's GPT-Realtime-2 (the May 2026
-speech-to-speech model)? What does "voice control" mean, what does it cost, and
-how does it fit Lucidos's event-sourced, engine-owns-logic architecture?
+Two sections of this note survive, and they are kept below because nothing else
+records them. Everything not in those two sections is superseded.
 
-## Verdict
+## What this note got wrong
 
-Feasible and well-aligned. De-risked by **Clicky / HeyClicky** (Farza Majeed):
-the viral build uses GPT-Realtime, proving an S2S "instant assistant" works as a
-consumer product. The design below keeps the engine clean and rides Lucidos's
-existing primitives (threads, sub-threads, EventBus, MCP, integrations, apps,
-coding agents).
+Listed so nobody resurrects it from here. Each row's reasoning is in the ADR.
 
-## Grounding facts (verified May to Jun 2026)
+| This note proposed | We decided | Where |
+|---|---|---|
+| A new thread `source = 'voice'` | Voice is a mode of a *chat thread* | ADR 0148 |
+| A slim voice agent with a curated toolset | The talker holds no tools at all | ADR 0149 |
+| A `dispatch` tool spawning sub-threads | Both models sit on one thread | plan, non-goals |
+| The voice model narrating async progress | One voice, first person, one entity | ADR 0149 |
+| Rejecting WebRTC on latency grounds | Rejected on credential grounds | ADR 0151 |
 
-- **GPT-Realtime-2** (released 2026-05-07): flagship speech-to-speech, GPT-5-class
-  reasoning, 128K context, adjustable reasoning effort (default `low`), parallel
-  tool calls, interruption recovery, preamble phrases ("let me check…"). Realtime
-  API is now GA. Siblings: **GPT-Realtime-Whisper** (streaming STT, $0.017/min)
-  and **GPT-Realtime-Translate**.
-- **Pricing:** GPT-Realtime-2 audio is token-billed at **$32 / 1M audio-in,
-  $64 / 1M audio-out**, cached-in **$0.40 / 1M** (98.75% discount). Audio
-  tokenizes at 1 token / 100 ms (user) and 1 token / 50 ms (assistant) → 600
-  tokens/min in, 1,200 tokens/min out.
-- **Cost trajectory (the important part):** S2S re-sends the whole context every
-  turn, so cumulative session cost grows ~O(N²) without mitigation. For Lucidos
-  the large system prompt + tool schemas dominate. Real-world voice agents land
-  **$0.18 to $0.46/min uncached, $0.05 to $0.10/min with caching**. The two levers that
-  bend the curve: **prompt caching** (stable prefix → $0.40/1M) and
-  **context truncation** (cap history window). Prices trend down ~quarterly, but
-  caching + truncation (engineering available today) beat waiting for price cuts.
-- **Cost is explicitly not a design constraint here.** Building for capability /
-  the frontier, single-user, not for cheap models.
+The note also proposed a *voice session* glossary entry. It is wrong on both
+`source` and dispatch, so the plan writes a fresh one in the phase that builds a
+session.
 
-## Locked decisions
+## What still holds: the cost shape
 
-1. **Conversational layer = GPT-Realtime-2 speech-to-speech.** Not an STT/TTS
-   bolt-on (Clicky V1's open-source stack: AssemblyAI + Claude + ElevenLabs),
-   not the heavy default agent loop. The bolt-on is a proven waypoint; S2S is the
-   destination.
-2. **A lighter orchestrator on top, never the heavy loop.** "Instant" comes from
-   a fast, slim conversational layer + streaming + immediate acknowledgment, not
-   from running the full agentic loop per spoken turn (that's the dead-air
-   failure mode).
-3. **LLM-judged dispatch → sub-threads for heavy work.** The voice session is
-   itself a thread; quick turns are answered locally, and when a turn needs real
-   work the model's `dispatch` tool spawns a **sub-thread running the full Lucidos
-   Agent**. The model speaks a preamble immediately and **narrates async** as the
-   sub-thread's EventBus events arrive. (Realtime-2's interruption recovery +
-   parallel tools make "keep talking while it works" natural.)
-4. **Engine-relayed WebSocket transport.** Browser ↔ engine over a new axum
-   WebSocket (`/api/v1/voice`); the engine holds the single GPT-Realtime-2
-   connection and mediates everything (function calls, sub-thread spawns,
-   injecting results, event-sourcing turns). Because the engine runs **locally**,
-   the relay hop is loopback (~0 added latency), so we get full server control +
-   statelessness nearly for free. The only unavoidable network hop is
-   engine to OpenAI, paid either way. (Rejected: direct WebRTC, because it puts
-   session state in the browser and complicates dispatch + event-sourcing. Its
-   latency edge
-   only matters against a *remote* server, which ours isn't.)
-5. **Event model + statelessness.** The voice session is a **thread**. Each
-   spoken turn persists as a **transcript**: user turn → `MessageReceived`
-   (transcript + `voice` origin marker), model reply → `ResponseGenerated`. New
-   thread **`source = 'voice'`** alongside `'chat'`/`'trigger'`. Dispatch reuses
-   the existing spawn path (the sub-thread is a normal, already-event-sourced
-   Lucidos Agent thread). **Ephemeral (allowed):** raw PCM frames, the OpenAI
-   Realtime WebSocket, the browser WebSocket, VAD state. **Restart = dropped
-   call, intact conversation:** transcript survives; in-flight dispatched
-   sub-threads keep running and auto-resume; on reconnect the voice session
-   re-establishes the Realtime connection seeded with the prior transcript and
-   re-subscribes to any still-running sub-thread to narrate its now-ready result.
-6. **Lean-by-default base (preferred foundation).** Make the agent's default
-   context small and fetch more on demand: defer tool schemas (the
-   ToolSearch-style pattern this very CC harness uses), lazy-load taxonomy /
-   intent registry; `load_knowhow` is already lazy. This is a product-wide
-   latency + cost win (chat, triggers, voice) and the multimodal-ready end-state.
-   On a lean base the orchestrator's "slim prompt" dissolves into the base; the
-   dispatch/async seam stays. Caveat: "fetch when needed" can add a mid-turn
-   stall (masked by the preamble/narration habit), and a smaller prompt can
-   cache *worse* (smaller stable prefix). Blast radius is large (core prompt/tool
-   assembly), so it's its own workstream.
-7. **Action scope = operate Lucidos's world (API-level).** Voice acts through
-   Lucidos's existing action surface: **email** (`email_accounts`,
-   `/api/v1/email/send`), **MCP servers** (`mcp_servers`), **integrations**
-   (OAuth, Notion/Gmail/Calendar-style), **apps** (`create_app`, run/build), and
-   **coding/research sub-threads**. This is most of Clicky's actual value
-   (Clicky's own YC blurb is integration + codegen). NOT pixel-level puppeting of
-   arbitrary on-screen apps from the engine.
+A speech-to-speech model re-sends its whole context every turn. So a session's
+cumulative cost grows superlinearly with its length, and the system prompt plus
+tool schemas dominate. Two levers bend that curve, and both are engineering
+available today rather than a price cut to wait for:
 
-## Computer use, as knowhow rather than engine core
+- **Prompt caching**, which needs a stable prefix. A cached prefix is roughly
+  two orders of magnitude cheaper than fresh input.
+- **Context truncation**, which caps the history window.
 
-Pixel-level computer use (driving external apps, flying the cursor) is **out of
-the engine core.** Lucidos is web/PWA + Tauri and has no native automation
-layer, and baking one in is effectively a different product (a general
-computer-use agent) with a major security model.
+The plan's append-only invariant comes straight from this. Deleting one history
+item mid-session was measured to triple full-price input for that turn, because
+it invalidates the cached prefix behind it. So the rule is to append, and to
+trim rarely in large steps.
 
-But it doesn't have to be blocked. Framed as **knowhow**, it rides Lucidos's
-existing extensibility model:
+Cost is not a design constraint for Lucidos here. This is a single-user system
+built for capability. The shape matters anyway, because a session that gets
+slower and dearer the longer you talk is a product problem, not a bill.
 
-- **Execution** lives in a pluggable **MCP server** outside the engine:
-  browser automation (Playwright-style), desktop automation, or an OpenAI
-  computer-use sandbox. This is the API-level handle on computer use.
-- A **knowhow** file documents *when and how* to use that MCP tool.
-- An optional **script** wraps any repeatable procedure.
-- The voice agent **dispatches** to a sub-thread that loads the knowhow and
-  drives the MCP tool.
+Live per-token prices belong on the provider's pricing page, not in this file.
 
-Net: the engine stays clean and web-first; computer use is a capability the user
-can plug in (MCP integration + knowhow + script), reached through the same
-dispatch path as any other heavy work. No special engine feature required.
+## What still holds: computer use as knowhow
 
-## Defaults on minor opens (revisit at build time)
+Pixel-level computer use stays out of the engine core. Lucidos is a web and PWA
+client plus a Tauri shell, with no native automation layer. Building one is a
+different product with a much larger security model.
 
-- **Context source:** **workspace-only** (threads / events / apps / integrations).
-  Screen-awareness was only needed for the pixel-level path, which is out.
-- **Activation:** **push-to-talk** (hotkey/button), not wake-word. Simpler, no
-  always-listening privacy surface. Surfaces: desktop / Tauri first; PWA where
-  mic permissions allow.
-- **Audio storage:** **transcript-only**; raw audio discarded after playback
-  (cheapest, statelessness-clean, no audio-privacy surface). Persisting audio as
-  content-addressed blobs is a possible later add for replay.
+It is not blocked, though. Framed as *knowhow* it rides the existing
+extensibility model:
 
-## Suggested build order
+- Execution lives in a pluggable **MCP server** outside the engine: browser
+  automation, desktop automation, or a hosted computer-use sandbox.
+- A **knowhow** file records when and how to use that tool.
+- A **script** wraps any repeatable procedure.
+- A sub-thread loads the knowhow and drives the tool.
 
-- **Phase 0, lean base.** Defer tool schemas, lazy taxonomy/intent (knowhow
-  already lazy). Product-wide latency/cost win; voice quality depends on it.
-- **Phase 1, voice transport.** New axum WebSocket `/api/v1/voice`; browser mic
-  capture (reuse the existing `AudioContext` unlock shim) + audio playback;
-  engine ↔ GPT-Realtime-2 relay; push-to-talk. Voice session = thread;
-  transcripts event-sourced.
-- **Phase 2, orchestrator + instant actions.** Slim voice prompt (or just the
-  lean base); curated instant-action toolset (open app, navigate, query/emit
-  events, send email, apply a named pending change, hit MCP tools/integrations).
-- **Phase 3, dispatch + async narration.** `dispatch` tool → spawn sub-thread
-  (full Lucidos Agent); subscribe to its EventBus; inject voice-friendly
-  summaries; narrate async; restart resilience (re-dial + re-subscribe).
-- **Later / optional.** Computer-use knowhow + MCP server; persisted audio blobs;
-  GPT-Realtime-Translate for live translation; wake-word activation.
+The engine stays web-first, and computer use becomes a capability the user plugs
+in. No engine feature is required.
 
-## Surfaces touched (docs must land with code)
-
-Per `.claude/rules/system-knowhow.md`, building this touches documented surfaces
-that must be updated in the same change:
-
-- `system-knowhow/thread-events.md`: new thread `source = 'voice'` + the
-  `MessageReceived`/`ResponseGenerated` voice origin marker; any new variant gets
-  a row + the streaming-blocklist flag.
-- `system-knowhow/glossary.md`: a **voice session** entry (proposed below).
-- `system-knowhow/js-sdk.md`: if a `lucidos.voice.*` SDK surface is added.
-- `.claude/rules/db.md`: if any new `SystemEvent` variant is introduced.
-- New credentials: OpenAI Realtime API key (the engine already has a
-  credentials/proxy pipeline to reuse). GPT-Realtime-2 emits voice natively, so
-  no separate TTS provider is required.
-
-## Proposed glossary entry (add to `system-knowhow/glossary.md` when built)
-
-> **voice session**: a *thread* whose conversational turns are driven by a
-> realtime speech-to-speech model (GPT-Realtime-2) over an engine-relayed
-> WebSocket, rather than by typed messages through the agentic loop. It answers
-> quick turns itself with a slim toolset and **dispatches** heavy work to
-> sub-threads running the full Lucidos Agent, narrating their progress as
-> EventBus events arrive. Turns persist as transcripts (`source = 'voice'`); the
-> audio stream and the live connection are ephemeral.
-
-## Open questions for build time
-
-- Exact slim toolset for instant actions, and the dispatch decision boundary.
-- How sub-thread results are summarized into voice-friendly narration (and by
-  whom: the sub-thread, a summarizer, or the voice model reading a trimmed
-  EventBus feed).
-- Caching strategy for the stable prefix + context-truncation window.
-- Mobile/PWA mic + WebSocket viability vs. desktop/Tauri-first.
+This is independent of voice and outlived the note that proposed it.
 
 ## Sources
 
+The original note's grounding links, kept for provenance:
+
 - OpenAI: [Introducing gpt-realtime](https://openai.com/index/introducing-gpt-realtime/),
-  [Advancing voice intelligence](https://openai.com/index/advancing-voice-intelligence-with-new-models-in-the-api/),
   [API pricing](https://openai.com/api/pricing/),
-  [Realtime cost guide](https://developers.openai.com/api/docs/guides/realtime-costs),
-  [gpt-realtime-2 model](https://developers.openai.com/api/docs/models/gpt-realtime-2)
-- [GPT-Realtime-2 release (MarkTechPost)](https://www.marktechpost.com/2026/05/08/openai-releases-three-realtime-audio-models-gpt-realtime-2-gpt-realtime-translate-and-gpt-realtime-whisper-in-the-realtime-api/),
-  [DataCamp deep-dive](https://www.datacamp.com/blog/gpt-realtime-2),
-  [CallSphere cost math](https://callsphere.ai/blog/vw2c-openai-realtime-cost-per-minute-math-2026)
-- Clicky / HeyClicky: [clicky.so](https://clicky.so/),
-  [GitHub (open-source V1)](https://github.com/farzaa/clicky),
-  [how Clicky works (Isaac Flath)](https://isaacflath.com/writing/how-clicky-works),
-  [YC profile](https://www.ycombinator.com/companies/heyclicky)
+  [Realtime cost guide](https://developers.openai.com/api/docs/guides/realtime-costs)
+- [Introducing GPT-Live](https://openai.com/index/introducing-gpt-live/),
+  [how the realtime system was built](https://openai.com/index/continuous-voice-interaction-with-gpt-live/)
+- Clicky: [clicky.so](https://clicky.so/),
+  [how Clicky works](https://isaacflath.com/writing/how-clicky-works)

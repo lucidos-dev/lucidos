@@ -605,7 +605,10 @@ export interface CredentialInfo {
    *  registration may share a name with an API key for the same provider. */
   id: string;
   service_name: string;
-  base_url: string;
+  /** Every base URL this credential may be presented to, its *credential
+   *  scope*. A set rather than one value, because one key often covers several
+   *  hostnames of one provider. Empty means it goes nowhere. */
+  base_urls: string[];
   auth_type: AuthType;
   auth_header: string;
   created_at: string;

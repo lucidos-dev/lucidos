@@ -91,6 +91,9 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   EventWaitDelivered: 'activity',
   EventWaitExpired: 'activity',
   EventWaitCanceled: 'activity',
+  VoiceSessionStarted: 'metadata',
+  VoiceSessionEnded: 'metadata',
+  SpokenReplyGenerated: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

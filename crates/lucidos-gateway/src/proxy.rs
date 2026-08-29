@@ -37,6 +37,69 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP.iter().any(|h| n.eq_ignore_ascii_case(h))
 }
 
+/// Does the gateway own this request header, rather than forwarding it?
+///
+/// The trust boundary, and one definition for both paths. Five names are the
+/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, `x-lucidos-device-id`
+/// and the two engine credentials. A client-supplied one must never reach the
+/// engine. The caller re-injects the prefix, the device id and the local token
+/// with the gateway's own values. `HOST` and `CONTENT_LENGTH` are re-framed by
+/// whoever sends the upstream request.
+///
+/// The two credentials are here for the reason the device id is, one step
+/// sharper. A wide-bound engine reads them as authorization
+/// (`lucidos_engine::api::local_auth`), so a value a client chose would BE the
+/// authorization.
+///
+/// The webhook one is owned but never re-injected on this path. Only the hook
+/// socket presents it. Injecting it here would hand every proxied request a
+/// second and narrower credential to be confused by.
+///
+/// `keep_handover` is the only difference between the two paths. The HTTP path
+/// drops every hop-by-hop header. The upgrade path keeps `connection` and
+/// `upgrade`, which ARE the handshake it forwards rather than framing to
+/// discard (ADR 0151).
+fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
+    let n = name.as_str();
+    if name == header::HOST
+        || name == header::CONTENT_LENGTH
+        || n.eq_ignore_ascii_case("x-forwarded-prefix")
+        || n.eq_ignore_ascii_case("x-forwarded-host")
+        || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
+        || n.eq_ignore_ascii_case(crate::auth::HEADER_LOCAL_TOKEN)
+        || n.eq_ignore_ascii_case(crate::auth::HEADER_WEBHOOK_TOKEN)
+    {
+        return true;
+    }
+    if keep_handover && (n.eq_ignore_ascii_case("connection") || n.eq_ignore_ascii_case("upgrade"))
+    {
+        return false;
+    }
+    is_hop_by_hop(name)
+}
+
+/// Is this a WebSocket upgrade request?
+///
+/// Both halves are required. `Connection` is a comma-separated LIST and a
+/// browser sends `keep-alive, Upgrade`, so a whole-value compare misses it.
+/// `Upgrade` names the protocol, and only websocket takes the splice path.
+fn is_websocket_upgrade(req: &axum::extract::Request) -> bool {
+    let hands_over = req
+        .headers()
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    let websocket = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    hands_over && websocket
+}
+
 /// Strip a leading `/<slug>` from a path-and-query, returning the remainder
 /// (always starting with `/`). Returns `None` when the path is exactly
 /// `/<slug>` with no trailing slash — the caller redirects that to `/<slug>/`
@@ -64,6 +127,7 @@ pub async fn proxy(
     target_base: &str,
     slug: &str,
     boot_label: &str,
+    local_token: &str,
     req: axum::extract::Request,
 ) -> Response {
     let path_and_query = req
@@ -82,6 +146,10 @@ pub async fn proxy(
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     };
+
+    if is_websocket_upgrade(&req) {
+        return proxy_upgrade(target_base, rest, slug, local_token, req).await;
+    }
 
     let method = req.method().clone();
     let url = format!("{target_base}{rest}");
@@ -109,15 +177,7 @@ pub async fn proxy(
         .cloned();
     let mut builder = client.request(method.clone(), &url);
     for (name, value) in req.headers() {
-        if name == header::HOST
-            || name == header::CONTENT_LENGTH
-            || name.as_str().eq_ignore_ascii_case("x-forwarded-prefix")
-            || name.as_str().eq_ignore_ascii_case("x-forwarded-host")
-            || name
-                .as_str()
-                .eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
-            || is_hop_by_hop(name)
-        {
+        if gateway_owns_header(name, false) {
             continue;
         }
         builder = builder.header(name.as_str(), value);
@@ -126,6 +186,17 @@ pub async fn proxy(
     builder = builder.header("x-forwarded-prefix", &forwarded_prefix);
     if let Some(crate::auth::AuthenticatedDevice(id)) = authenticated_device {
         builder = builder.header(crate::stack::HEADER_DEVICE_ID, id);
+    }
+    // Prove to the engine that this hop is the gateway. An engine on a wide
+    // bind requires it; a loopback one ignores it. Sent unconditionally so the
+    // two topologies take one code path, and safe to send either way: the
+    // engine is a co-located process that could read the same file.
+    //
+    // This is the gateway vouching for a hop it has ALREADY authorized, not the
+    // caller's own credential. `enforce` ran as a router layer, so an unpaired
+    // request never reaches here (ADR 0094).
+    if let Some(value) = crate::auth::sensitive_credential(local_token) {
+        builder = builder.header(crate::auth::HEADER_LOCAL_TOKEN, value);
     }
 
     // Stream the request body straight through — never buffer it (a 100 MB
@@ -172,6 +243,175 @@ pub async fn proxy(
     // Stream the response body — critical for SSE (`/api/v1/events`) and free
     // for everything else.
     resp.body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// How long the upgrade hop waits to reach the engine. Matches the HTTP path's
+/// `connect_timeout`, so a down engine fails the same way on both.
+const UPGRADE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Proxy a WebSocket upgrade to the engine, then splice the two byte streams.
+///
+/// Transparent by construction (ADR 0151): the gateway never parses a frame, so
+/// subprotocols, extensions, ping, pong and close all pass through with no code
+/// here to get them wrong. It carries the SAME rules as the HTTP path, because
+/// both read the trust boundary out of [`gateway_owns_header`].
+///
+/// `enforce` has already run as a router layer, so an unpaired caller never
+/// reaches this. That is the auth boundary, and it is inherited rather than
+/// re-implemented.
+async fn proxy_upgrade(
+    target_base: &str,
+    rest: &str,
+    slug: &str,
+    local_token: &str,
+    mut req: axum::extract::Request,
+) -> Response {
+    // Plain http only. `engine_tls` is false in both shipped topologies, and
+    // only the retired pre-0096 one turns it on. A TLS leg here would be code
+    // nothing reaches, so refuse loudly instead of failing obscurely.
+    let Some(authority) = target_base.strip_prefix("http://") else {
+        crate::log!(
+            "[Gateway] websocket upgrade to {} refused: the upgrade hop carries plain http only",
+            target_base
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            "websocket upgrade needs a plain-http engine hop",
+        )
+            .into_response();
+    };
+
+    // Taken before the request is consumed. Absent when hyper saw no
+    // upgradeable connection, which means HTTP/2 or a client that cannot hand
+    // over. Nothing to splice either way.
+    let Some(client_upgrade) = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return (StatusCode::BAD_REQUEST, "not an upgradeable connection").into_response();
+    };
+
+    let mut upstream = hyper::Request::builder()
+        .method(req.method().clone())
+        .uri(rest)
+        .header(header::HOST, authority);
+    for (name, value) in req.headers() {
+        if !gateway_owns_header(name, true) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    upstream = upstream.header("x-forwarded-prefix", format!("/{slug}/"));
+    if let Some(crate::auth::AuthenticatedDevice(id)) =
+        req.extensions().get::<crate::auth::AuthenticatedDevice>()
+    {
+        upstream = upstream.header(crate::stack::HEADER_DEVICE_ID, id);
+    }
+    // The upgrade is a second way in, so it meets the same door (ADR 0151).
+    // Omitting it here would let a wide-bound engine refuse the socket while
+    // serving every HTTP request beside it.
+    if let Some(value) = crate::auth::sensitive_credential(local_token) {
+        upstream = upstream.header(crate::auth::HEADER_LOCAL_TOKEN, value);
+    }
+    let Ok(upstream) = upstream.body(axum::body::Body::empty()) else {
+        return (StatusCode::BAD_REQUEST, "malformed upgrade request").into_response();
+    };
+
+    let connect = tokio::time::timeout(
+        UPGRADE_CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(authority),
+    );
+    let stream = match connect.await {
+        Ok(Ok(s)) => s,
+        // A cold-booting engine looks exactly like this, so 503 rather than
+        // 502: the condition clears by itself and a client may retry.
+        //
+        // The two failures are logged apart because they mean different
+        // things. Refused is nobody listening yet; timed out is a host too
+        // busy to accept. Collapsing them loses the refusal's reason, which is
+        // the common one.
+        Ok(Err(e)) => {
+            crate::log!(
+                "[Gateway] websocket upgrade to {}{} could not connect: {}",
+                target_base,
+                rest,
+                e
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "engine unreachable").into_response();
+        }
+        Err(_) => {
+            crate::log!(
+                "[Gateway] websocket upgrade to {}{} timed out after {:?}",
+                target_base,
+                rest,
+                UPGRADE_CONNECT_TIMEOUT
+            );
+            return (StatusCode::SERVICE_UNAVAILABLE, "engine unreachable").into_response();
+        }
+    };
+
+    let (mut sender, conn) =
+        match hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::log!("[Gateway] websocket upgrade handshake failed: {}", e);
+                return (StatusCode::BAD_GATEWAY, "upgrade handshake failed").into_response();
+            }
+        };
+    // `with_upgrades` is what lets the connection hand its socket over rather
+    // than closing it after the 101.
+    tokio::spawn(conn.with_upgrades());
+
+    let engine_response = match sender.send_request(upstream).await {
+        Ok(r) => r,
+        Err(e) => {
+            crate::log!("[Gateway] websocket upgrade request failed: {}", e);
+            return (StatusCode::BAD_GATEWAY, "upgrade request failed").into_response();
+        }
+    };
+
+    // The engine declined the upgrade (404, 401, anything). Forward its answer
+    // verbatim, so the client sees the engine's reason and not ours.
+    if engine_response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let (parts, body) = engine_response.into_parts();
+        let mut out = Response::builder().status(parts.status);
+        for (name, value) in parts.headers.iter() {
+            if !is_hop_by_hop(name) {
+                out = out.header(name, value);
+            }
+        }
+        return out
+            .body(Body::new(body))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    }
+
+    // Rebuild the 101 verbatim, framing headers included. On this path they are
+    // the handover the client's own hyper needs to see.
+    let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (name, value) in engine_response.headers().iter() {
+        out = out.header(name, value);
+    }
+    let upstream_upgrade = hyper::upgrade::on(engine_response);
+
+    tokio::spawn(async move {
+        let (client_io, engine_io) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::log!("[Gateway] websocket upgrade never completed: {}", e);
+                return;
+            }
+        };
+        let mut client_io = hyper_util::rt::TokioIo::new(client_io);
+        let mut engine_io = hyper_util::rt::TokioIo::new(engine_io);
+        // Either side closing ends the splice, which is the ordinary way a
+        // call ends. Only the rest is worth a line.
+        if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut engine_io).await {
+            if e.kind() != std::io::ErrorKind::ConnectionReset
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                crate::log!("[Gateway] websocket relay ended: {}", e);
+            }
+        }
+    });
+
+    out.body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -454,6 +694,13 @@ pub fn build_client() -> Client {
         .build()
         .expect("failed to build gateway proxy reqwest client")
 }
+
+/// The gateway's own credential, as the test modules below spell it.
+///
+/// Deliberately not a value any test client sends, so "the gateway's own
+/// reached the upstream" and "the client's did not" stay separate assertions.
+#[cfg(test)]
+const TEST_LOCAL_TOKEN: &str = "gateway-own-token";
 
 #[cfg(test)]
 mod tests {
@@ -823,7 +1070,15 @@ mod proxy_tests {
             .header("accept-language", "en-US")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -853,7 +1108,15 @@ mod proxy_tests {
             .header("x-forwarded-prefix", "/evil/")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -882,7 +1145,15 @@ mod proxy_tests {
             .header("x-forwarded-host", "evil.example")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -896,6 +1167,93 @@ mod proxy_tests {
     }
 
     #[tokio::test]
+    async fn the_gateway_vouches_for_its_own_hop() {
+        // A wide-bound engine requires this, and a loopback one ignores it. It
+        // is sent either way so the two topologies take one code path.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let req = request("GET", "/dev/api/v1/threads/list", Body::empty());
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            got.contains(&format!(
+                "{}: {TEST_LOCAL_TOKEN}",
+                crate::auth::HEADER_LOCAL_TOKEN
+            )),
+            "the gateway's own credential must reach the engine; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_cannot_supply_either_engine_credential() {
+        // The escalation this closes. A wide-bound engine reads both headers as
+        // authorization, so a value the caller chose would BE the
+        // authorization. The gateway owns both names and re-injects only its
+        // own local token.
+        for spoofed in [
+            crate::auth::HEADER_LOCAL_TOKEN,
+            crate::auth::HEADER_WEBHOOK_TOKEN,
+        ] {
+            let (port, captured) = capturing_upstream().await;
+            let target = format!("http://127.0.0.1:{port}");
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/dev/api/v1/data/config/apis.json")
+                .header(spoofed, "client-forged-secret")
+                .body(Body::empty())
+                .unwrap();
+            let resp = proxy(
+                &build_client(),
+                &target,
+                "dev",
+                DEFAULT_LABEL,
+                TEST_LOCAL_TOKEN,
+                req,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = captured.lock().await.to_lowercase();
+            assert!(
+                !got.contains("client-forged-secret"),
+                "a client-supplied {spoofed} must be stripped; upstream saw:\n{got}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_webhook_credential_is_never_injected_on_the_proxy_path() {
+        // Only the hook socket presents it. Injecting it here would hand every
+        // proxied request a second credential, and widen what a proxy bug leaks.
+        let (port, captured) = capturing_upstream().await;
+        let target = format!("http://127.0.0.1:{port}");
+        let req = request("GET", "/dev/", Body::empty());
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            !got.contains(crate::auth::HEADER_WEBHOOK_TOKEN),
+            "the webhook scope has no business on this path; upstream saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
     async fn forwards_the_authenticated_device_id() {
         // The engine keys push, per-device preferences and actor attribution on
         // this header, so it must carry the device the gateway authenticated.
@@ -904,7 +1262,15 @@ mod proxy_tests {
         let mut req = request("GET", "/dev/", Body::empty());
         req.extensions_mut()
             .insert(crate::auth::AuthenticatedDevice("device-1".into()));
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -927,7 +1293,15 @@ mod proxy_tests {
             .unwrap();
         req.extensions_mut()
             .insert(crate::auth::AuthenticatedDevice("device-1".into()));
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -952,7 +1326,15 @@ mod proxy_tests {
             .header("x-lucidos-device-id", "unproven-device")
             .body(Body::empty())
             .unwrap();
-        let resp = proxy(&build_client(), &target, "dev", DEFAULT_LABEL, req).await;
+        let resp = proxy(
+            &build_client(),
+            &target,
+            "dev",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            req,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = captured.lock().await.to_lowercase();
         assert!(
@@ -968,6 +1350,7 @@ mod proxy_tests {
             "http://127.0.0.1:1",
             "dev",
             DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
             request("GET", "/dev", Body::empty()),
         )
         .await;
@@ -994,6 +1377,7 @@ mod proxy_tests {
             &target,
             "dev",
             "Running migrations…",
+            TEST_LOCAL_TOKEN,
             request("GET", "/dev/", Body::empty()),
         )
         .await;
@@ -1010,5 +1394,317 @@ mod proxy_tests {
             html.contains("Running migrations…"),
             "the connect-failure splash must render the passed boot phase label"
         );
+    }
+}
+
+/// The WebSocket upgrade hop (ADR 0151). Two things must hold and neither is
+/// visible from the HTTP tests above: the handshake survives the proxy, and the
+/// trust boundary is the same one.
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use crate::boot_phase::DEFAULT_LABEL;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A client's upgrade request, as a browser sends it.
+    ///
+    /// `Connection` carries a LIST, which is what browsers do and what a
+    /// whole-value compare would miss.
+    fn upgrade_request_bytes(path: &str, extra: &str) -> String {
+        format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: gateway.example\r\n\
+             Connection: keep-alive, Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             {extra}\r\n"
+        )
+    }
+
+    /// Read a request or response head, stopping at the blank line.
+    async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while sock.read_exact(&mut byte).await.is_ok() {
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&head).into_owned()
+    }
+
+    /// A stand-in engine: completes the handshake, then echoes every byte.
+    ///
+    /// Raw TCP rather than a WebSocket library, deliberately. What these tests
+    /// must prove is that BYTES cross intact, because the gateway never parses
+    /// a frame.
+    async fn upgrading_upstream() -> (u16, Arc<tokio::sync::Mutex<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let c = captured.clone();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            *c.lock().await = read_head(&mut sock).await.to_lowercase();
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\n\
+                      Connection: Upgrade\r\n\
+                      Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                )
+                .await;
+            let mut buf = vec![0u8; 1024];
+            while let Ok(n) = sock.read(&mut buf).await {
+                if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (port, captured)
+    }
+
+    /// A gateway serving one route through the real [`proxy`], with an
+    /// optionally-authenticated device. `axum::serve` drives connections with
+    /// upgrades, which is what puts `OnUpgrade` in the request extensions.
+    async fn gateway_serving(target: String, device: Option<&'static str>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().fallback(move |mut req: axum::extract::Request| {
+            let target = target.clone();
+            async move {
+                if let Some(id) = device {
+                    req.extensions_mut()
+                        .insert(crate::auth::AuthenticatedDevice(id.into()));
+                }
+                proxy(
+                    &build_client(),
+                    &target,
+                    "dev",
+                    DEFAULT_LABEL,
+                    TEST_LOCAL_TOKEN,
+                    req,
+                )
+                .await
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        port
+    }
+
+    /// Open an upgrade through a gateway and return its response head plus the
+    /// live socket.
+    async fn upgrade_through(port: u16, extra: &str) -> (String, tokio::net::TcpStream) {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(upgrade_request_bytes("/dev/api/v1/ws-echo", extra).as_bytes())
+            .await
+            .unwrap();
+        let head = read_head(&mut client).await;
+        (head, client)
+    }
+
+    /// The whole point: an upgrade crosses the gateway and bytes flow both
+    /// ways afterwards. A relay that re-framed messages could pass the
+    /// handshake half of this and still corrupt the payload.
+    #[tokio::test]
+    async fn an_upgrade_crosses_the_gateway_and_bytes_flow_both_ways() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        let (head, mut client) = upgrade_through(gw, "").await;
+
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(
+            head.to_lowercase().contains("sec-websocket-accept:"),
+            "the engine's handshake answer must reach the client: {head}"
+        );
+
+        // Bytes, not frames. The gateway is transparent, so whatever is
+        // written arrives unchanged.
+        client.write_all(b"\x82\x03abc").await.unwrap();
+        let mut back = [0u8; 5];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"\x82\x03abc");
+
+        // The engine saw a real handshake, with the prefix stripped.
+        let got = captured.lock().await.clone();
+        assert!(got.contains("get /api/v1/ws-echo http/1.1"), "{got}");
+        assert!(got.contains("upgrade: websocket"), "{got}");
+        assert!(got.contains("sec-websocket-key:"), "{got}");
+        assert!(got.contains("x-forwarded-prefix: /dev/"), "{got}");
+    }
+
+    /// The framing headers are the one thing the upgrade path must NOT strip.
+    /// The HTTP path drops both as hop-by-hop, and an engine that never sees
+    /// them refuses the handshake.
+    #[tokio::test]
+    async fn the_handover_headers_survive_the_upgrade_path() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        let (head, _client) = upgrade_through(gw, "").await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let got = captured.lock().await.clone();
+        assert!(got.contains("connection:"), "{got}");
+        assert!(got.contains("upgrade: websocket"), "{got}");
+    }
+
+    /// Same trust boundary as the HTTP path: the authenticated device reaches
+    /// the engine, which keys push, preferences and attribution on it.
+    #[tokio::test]
+    async fn the_upgrade_path_forwards_the_authenticated_device() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(
+            format!("http://127.0.0.1:{upstream_port}"),
+            Some("device-1"),
+        )
+        .await;
+        let (head, _client) = upgrade_through(gw, "").await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let got = captured.lock().await.clone();
+        assert!(got.contains("x-lucidos-device-id: device-1"), "{got}");
+    }
+
+    /// A second path through the gateway is a second place to forget the trust
+    /// boundary. A forged device id would let a paired caller act as any other
+    /// device. It must die here exactly as it does on the HTTP path.
+    #[tokio::test]
+    async fn the_upgrade_path_strips_a_spoofed_device_id_and_prefix() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(
+            format!("http://127.0.0.1:{upstream_port}"),
+            Some("device-1"),
+        )
+        .await;
+        let (head, _client) = upgrade_through(
+            gw,
+            "x-lucidos-device-id: someone-elses-device\r\n\
+             x-forwarded-prefix: /evil/\r\n\
+             x-forwarded-host: evil.example\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let got = captured.lock().await.clone();
+        assert!(got.contains("x-lucidos-device-id: device-1"), "{got}");
+        assert!(!got.contains("someone-elses-device"), "{got}");
+        assert!(got.contains("x-forwarded-prefix: /dev/"), "{got}");
+        assert!(!got.contains("/evil/"), "{got}");
+        assert!(!got.contains("evil.example"), "{got}");
+    }
+
+    /// A local process holds no device row, so nothing is handed to it. The
+    /// stripped forgery is not replaced by anything.
+    #[tokio::test]
+    async fn an_upgrade_with_no_authenticated_device_forwards_none() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        let (head, _client) = upgrade_through(gw, "x-lucidos-device-id: unproven-device\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let got = captured.lock().await.clone();
+        assert!(!got.contains("x-lucidos-device-id"), "{got}");
+    }
+
+    /// An engine that declines answers for itself. The gateway must not turn a
+    /// 404 into its own error, or the client cannot tell a missing route from
+    /// a broken proxy.
+    #[tokio::test]
+    async fn a_declined_upgrade_forwards_the_engines_own_answer() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                read_head(&mut sock).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nno socket")
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        let (head, _client) = upgrade_through(gw, "").await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
+    }
+
+    /// A cold-booting engine looks like a refused connection. 503 says the
+    /// condition clears by itself, where 502 would read as a dead end.
+    #[tokio::test]
+    async fn an_unreachable_engine_answers_503_rather_than_a_boot_splash() {
+        let dead = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let gw = gateway_serving(format!("http://127.0.0.1:{dead}"), None).await;
+        let (head, _client) = upgrade_through(gw, "").await;
+        assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+        // An HTML boot splash is meaningless to a socket, so it is not served.
+        assert!(!head.to_lowercase().contains("text/html"), "{head}");
+    }
+
+    /// `Connection` is a comma-separated list, and a browser sends
+    /// `keep-alive, Upgrade`. A whole-value compare would send every browser
+    /// upgrade down the HTTP path, where `reqwest` silently drops it.
+    #[test]
+    fn a_connection_list_still_names_the_upgrade() {
+        let req = |conn: &str, upgrade: &str| {
+            axum::http::Request::builder()
+                .uri("/dev/api/v1/ws-echo")
+                .header(header::CONNECTION, conn)
+                .header(header::UPGRADE, upgrade)
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert!(is_websocket_upgrade(&req(
+            "keep-alive, Upgrade",
+            "websocket"
+        )));
+        assert!(is_websocket_upgrade(&req("Upgrade", "WebSocket")));
+        assert!(!is_websocket_upgrade(&req("keep-alive", "websocket")));
+        // Some other protocol is not ours to splice.
+        assert!(!is_websocket_upgrade(&req("Upgrade", "h2c")));
+        // A plain request never takes the path.
+        let plain = axum::http::Request::builder()
+            .uri("/dev/")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_websocket_upgrade(&plain));
+    }
+
+    /// The trust boundary is one predicate for both paths, and the handover is
+    /// the only thing that differs. Pinned here so a future edit cannot widen
+    /// the upgrade path's exception past those two headers.
+    #[test]
+    fn only_the_handover_headers_differ_between_the_two_paths() {
+        for owned in [
+            header::HOST.as_str(),
+            header::CONTENT_LENGTH.as_str(),
+            "x-forwarded-prefix",
+            "x-forwarded-host",
+            crate::stack::HEADER_DEVICE_ID,
+            "transfer-encoding",
+            "te",
+        ] {
+            let name = HeaderName::from_static(owned);
+            assert!(gateway_owns_header(&name, false), "{owned}");
+            assert!(gateway_owns_header(&name, true), "{owned}");
+        }
+        for handover in ["connection", "upgrade"] {
+            let name = HeaderName::from_static(handover);
+            assert!(gateway_owns_header(&name, false), "{handover}");
+            assert!(!gateway_owns_header(&name, true), "{handover}");
+        }
+        for forwarded in ["accept-encoding", "sec-websocket-key", "cookie"] {
+            let name = HeaderName::from_static(forwarded);
+            assert!(!gateway_owns_header(&name, false), "{forwarded}");
+            assert!(!gateway_owns_header(&name, true), "{forwarded}");
+        }
     }
 }

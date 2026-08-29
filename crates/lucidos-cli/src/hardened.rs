@@ -99,10 +99,13 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
             .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
+    // `floor_char_boundary` rather than a byte index: `head_sha` is whatever
+    // `git rev-parse` printed, and slicing subprocess output by byte panics on
+    // anything multi-byte.
     println!(
         "Hardening recorded: {} {}",
         branch,
-        &head_sha[..head_sha.len().min(12)]
+        &head_sha[..head_sha.floor_char_boundary(12)]
     );
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::agent_session::CodingAgentKind;
 use super::event_bus::SystemEvent;
 use super::git_ops::{
-    any_iframe_bundled_file_changed, git_cmd, harden_marker_state, HardenMarkerState,
+    any_iframe_bundled_file_changed, git_cmd, git_ran_ok, harden_marker_state, HardenMarkerState,
 };
 use super::thread_events::MessageOrigin;
 use super::LucidosEngine;
@@ -603,11 +603,14 @@ pub(crate) async fn revert_with_shas(
         .await
         {
             Ok(o) if o.status.success() => {
+                // The reverted content is staged at this point, so a failed
+                // commit leaves the repo root holding it. The user acts on
+                // this message, so it carries git's own reason rather than a
+                // bare "failed".
                 let msg = format!("Revert changes from {}", branch_name);
-                match git_cmd(&["commit", "-m", &msg], repo_root).await {
-                    Ok(o) if o.status.success() => Ok(()),
-                    _ => Err("Failed to commit revert".into()),
-                }
+                git_ran_ok(&["commit", "-m", &msg], repo_root)
+                    .await
+                    .map_err(|e| format!("Failed to commit revert: {}", e).into())
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();

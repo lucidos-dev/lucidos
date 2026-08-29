@@ -53,6 +53,19 @@ const NO_UI_STATE: Record<string, string> = {
     'the audit record of what an update did to local edits. It always rides '
     + 'with `PluginInstalled`, which is what refreshes the lists',
   CredentialRevealed: 'an audit record of a read. Nothing changed',
+  BackupKeyRevealed:
+    'an audit record of a read. The Backup page already holds what it was '
+    + 'handed, and `key/exists` is what labels its button',
+  HandshakeScriptScopeBound:
+    'a one-time record that a script\'s minted token got a scope. Its sibling '
+    + '`CredentialScopeInferred` takes an arm because the credentials list '
+    + 'shows `base_url`; no surface shows this one. The Files panel\'s '
+    + 'handshake banner reads `{path, exists, approved}` and moves on '
+    + '`HandshakeScriptApproved`',
+  HandshakeScriptInjectsBound:
+    'the same one-time record for the secrets going INTO a script. No surface '
+    + 'shows the injects column either, and the Files panel banner moves on '
+    + '`HandshakeScriptApproved`',
   EmailSent: 'an audit record of a send. No surface lists sent mail',
   EngineSupervisorRespawned:
     'emitted at boot, for the timeline. Every client reconnecting after that '

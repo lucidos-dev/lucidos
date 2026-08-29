@@ -232,7 +232,9 @@ export function TodoListIndicator() {
           contract lives in <Overlay>. */}
       <Overlay
         open={isOpen}
-        onClose={() => (open.value = false)}
+        onClose={() => {
+          open.value = false;
+        }}
         anchor={anchorEl}
         backdrop={false}
         portal
@@ -253,7 +255,13 @@ export function TodoListIndicator() {
       >
         {items &&
           (items.length > 0 || notes) &&
-          todoListPanelBody({ items, notes, onClose: () => (open.value = false) })}
+          todoListPanelBody({
+            items,
+            notes,
+            onClose: () => {
+              open.value = false;
+            },
+          })}
       </Overlay>
     </>
   );

@@ -74,22 +74,38 @@ pub fn router() -> Router<GatewayState> {
         .layer(middleware::from_fn(control_authz))
 }
 
-// ── Control-plane request authorization ────────────────────────────────────
+// ── Control-plane CSRF defense ─────────────────────────────────────────────
 //
-// The control plane (workspace create/restart/stop/delete-to-trash/restore,
-// gateway reload) lives at `/~/api/v1/control/*` on the GATEWAY origin. App UIs
-// are served same-origin at `/<slug>/app/<id>/` with `allow-same-origin`, so
-// without a gate an app's JS could `fetch('/~/api/v1/control/workspaces/<slug>/
-// stop', {method:'POST'})` and stop/delete the workspace it runs in.
+// This is a CSRF gate, NOT an authenticator. Browser metadata is a CSRF signal,
+// and the absence of it proves nothing about a caller: any curl can omit every
+// header. Read this module as answering one question only: *which document sent
+// this request*.
 //
-// This is an EXPLICIT, documented gate (see ADR 0014). What it closes and the
-// one residual it cannot (same-origin app iframes share the gateway origin, so
-// no header is a perfect discriminator):
+// WHO the caller is was already decided, upstream, by
+// [`crate::auth_api::enforce`] (ADR 0094). It wraps the entire gateway router,
+// so a control request arrives here only after it presented the machine-local
+// token or a paired device's credential. `auth_api::is_public_path` is the whole
+// exemption list, and no control route is on it. That is why the header-less
+// arm below allows: not because such a caller is trusted, but because it has
+// already proved a credential.
+//
+// The bind is not what protects this plane, and never should be read as doing
+// so. The default IS loopback, but `~/.lucidos/network.toml` and
+// `LUCIDOS_GATEWAY_BIND_ALL` both open it, and remote access is a shipped
+// feature. A gateway on a tailnet address refuses an uncredentialed control
+// request exactly as a loopback one does, which
+// `an_uncredentialed_control_request_is_refused` pins against the real router.
+//
+// What this gate adds on top. App UIs are served same-origin at
+// `/<slug>/app/<id>/` with `allow-same-origin`, so an app's JS runs with
+// whatever credential the browser holds. Without this, that JS could
+// `fetch('/~/api/v1/control/workspaces/<slug>/stop', {method:'POST'})` and stop
+// the workspace it runs in, carrying the user's own cookie. Three arms:
 //
 //   * Non-browser clients (the dev launcher / `stop.sh` curl, the engine→gateway
-//     boot-phase report, the packaged smoke test) send NO fetch metadata — they
-//     are allowed, protected instead by the gateway's loopback bind (default;
-//     opened only by explicit `LUCIDOS_GATEWAY_BIND_ALL`).
+//     boot-phase report, the packaged smoke test) send NO fetch metadata. They
+//     are not driving a document, so there is no CSRF to defend against, and
+//     `enforce` has already authenticated them.
 //   * Cross-site / cross-origin browser requests are rejected via the
 //     forge-proof `Sec-Fetch-Site` + `Origin`/`Host` checks (a page cannot set
 //     these via `fetch()`). This fully closes the classic CSRF vector.
@@ -142,7 +158,8 @@ fn control_request_allowed(headers: &HeaderMap, host: Option<&str>) -> bool {
     let referer = header_str(headers, "referer");
 
     // Non-browser client (CLI launcher, engine→gateway report, curl): no fetch
-    // metadata at all → allow. Protected by the loopback bind topology.
+    // metadata at all → allow. It is driving no document, so there is no CSRF
+    // here to defend against, and `auth_api::enforce` already authenticated it.
     if sec_fetch_site.is_none() && origin.is_none() && referer.is_none() {
         return true;
     }
@@ -727,8 +744,10 @@ mod authz_tests {
     #[test]
     fn no_fetch_metadata_is_allowed() {
         // The dev launcher / stop.sh curl, the engine→gateway boot-phase report,
-        // the packaged smoke test: no Origin/Sec-Fetch/Referer → allowed
-        // (protected by the loopback bind, not this gate).
+        // the packaged smoke test: no Origin/Sec-Fetch/Referer → allowed. This
+        // function is the CSRF half only. Such a caller reached it because
+        // `auth_api::enforce` authenticated it, which
+        // `an_uncredentialed_control_request_is_refused` pins.
         assert!(control_request_allowed(&headers(&[]), Some(HOST)));
         assert!(control_request_allowed(
             &headers(&[("user-agent", "curl/8.0")]),
@@ -849,5 +868,143 @@ mod authz_tests {
         // The dev launcher, `stop.sh` and the packaged smoke test all land here.
         // Their teardowns stay unattributed rather than borrowing a name.
         assert_eq!(requesting_device(None), None);
+    }
+
+    // ── The plane behind the real router ────────────────────────────────────
+    //
+    // Everything above tests the CSRF half in isolation, which is what let a
+    // false claim about the loopback bind survive three security reviews. These
+    // drive `server::gateway_router`, so they answer the question a reviewer
+    // actually asks: can a caller with no credential reach this plane?
+
+    /// Every destructive route the plane exposes, as (method, path).
+    ///
+    /// Listed rather than derived, so adding a route to `router()` without
+    /// adding it here is the only way to miss one. The refusal happens before
+    /// routing, so a path that no longer exists still asserts the same 401.
+    const DESTRUCTIVE_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/~/api/v1/control/workspaces"),
+        ("POST", "/~/api/v1/control/workspaces"),
+        ("POST", "/~/api/v1/control/workspaces/adopt"),
+        ("POST", "/~/api/v1/control/workspaces/restore"),
+        ("POST", "/~/api/v1/control/workspaces/dev/stop"),
+        ("POST", "/~/api/v1/control/workspaces/dev/restart"),
+        ("POST", "/~/api/v1/control/workspaces/dev/rename"),
+        ("DELETE", "/~/api/v1/control/workspaces/dev"),
+        ("POST", "/~/api/v1/control/gateway/reload"),
+        ("GET", "/~/api/v1/control/network-config"),
+        ("PUT", "/~/api/v1/control/network-config"),
+    ];
+
+    async fn control_call(
+        state: &crate::server::GatewayState,
+        method: &str,
+        path: &str,
+        hdrs: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt as _;
+        let mut builder = axum::extract::Request::builder().method(method).uri(path);
+        for (k, v) in hdrs {
+            builder = builder.header(*k, *v);
+        }
+        crate::server::gateway_router(state.clone())
+            .oneshot(builder.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn an_uncredentialed_control_request_is_refused() {
+        // The reported attack: no Origin, no Referer, no Sec-Fetch-Site, which
+        // `control_request_allowed` reads as a trusted non-browser client. It
+        // never gets that far, because `auth_api::enforce` wraps the router.
+        let state = crate::server::GatewayState::for_tests();
+        for (method, path) in DESTRUCTIVE_ROUTES {
+            assert_eq!(
+                control_call(&state, method, path, &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} must refuse a caller that proved nothing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bind_is_not_what_protects_the_control_plane() {
+        // A gateway on a tailnet address answers exactly as a loopback one
+        // does. Auth here is bind-independent on purpose (ADR 0094): a
+        // `tailscale serve` hop arrives with a loopback peer address, so
+        // trusting the bind would trust the whole tailnet.
+        let state = crate::server::GatewayState::for_tests();
+        for host in ["127.0.0.1:5251", "100.64.0.1:5251", "[::1]:5251"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "POST",
+                    "/~/api/v1/control/workspaces/dev/stop",
+                    &[("host", host)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+                "a caller reaching us on {host} must still prove a credential"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_machine_local_token_reaches_the_control_plane() {
+        // The other half of the contract. `stop.sh`, the dev launcher, the
+        // engine's boot report and `lucidos` all authenticate this way. A gate
+        // that refused them would break every local caller.
+        //
+        // A read, deliberately: an authenticated POST here would create or stop
+        // something for real.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "GET",
+            "/~/api/v1/control/workspaces",
+            &[(auth::HEADER_LOCAL_TOKEN, "test-local-token")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_local_token_is_refused() {
+        let state = crate::server::GatewayState::for_tests();
+        for token in ["", "   ", "not-the-token"] {
+            assert_eq!(
+                control_call(
+                    &state,
+                    "GET",
+                    "/~/api/v1/control/workspaces",
+                    &[(auth::HEADER_LOCAL_TOKEN, token)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED,
+                "token {token:?} must not authenticate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_iframe_holding_a_real_credential_is_still_refused() {
+        // Both halves at once, which is the case neither half covers alone. The
+        // caller authenticates, so `enforce` passes it, and `control_authz`
+        // then refuses it for the document it came from.
+        let state = crate::server::GatewayState::for_tests();
+        let status = control_call(
+            &state,
+            "POST",
+            "/~/api/v1/control/workspaces/dev/stop",
+            &[
+                (auth::HEADER_LOCAL_TOKEN, "test-local-token"),
+                ("sec-fetch-site", "same-origin"),
+                ("referer", "https://localhost:5251/dev/app/habit-tracker/"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }

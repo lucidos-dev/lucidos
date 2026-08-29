@@ -81,7 +81,7 @@ impl AppManager {
             let mut index = repo.index()?;
             super::reset_index_to_head(&repo, &mut index)?;
             let repo_path = format!("data/apps/{}", app_path);
-            index.add_path(Path::new(&repo_path))?;
+            super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
             index.write()?;
             super::commit_index(&repo, message)
         })
@@ -95,7 +95,7 @@ impl AppManager {
             super::reset_index_to_head(&repo, &mut index)?;
             for p in app_paths {
                 let repo_path = format!("data/apps/{}", p);
-                index.add_path(Path::new(&repo_path))?;
+                super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
             }
             index.write()?;
             super::commit_index(&repo, message)

@@ -174,6 +174,9 @@ impl ThreadEvent {
             Self::EventWaitDelivered { .. } => "EventWaitDelivered",
             Self::EventWaitExpired { .. } => "EventWaitExpired",
             Self::EventWaitCanceled { .. } => "EventWaitCanceled",
+            Self::VoiceSessionStarted { .. } => "VoiceSessionStarted",
+            Self::VoiceSessionEnded { .. } => "VoiceSessionEnded",
+            Self::SpokenReplyGenerated { .. } => "SpokenReplyGenerated",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -292,6 +295,9 @@ impl ThreadEvent {
         "CodingAgentThreadSpawned",
         "CodingAgentDiffChanged",
         "ChildrenCountChanged",
+        "VoiceSessionStarted",
+        "VoiceSessionEnded",
+        "SpokenReplyGenerated",
     ];
 
     /// The `#[serde(alias = ...)]` spellings, kept for rows written before a

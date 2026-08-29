@@ -93,15 +93,43 @@ export interface WebhookWithToken extends Webhook {
 /** Which address family an ingress probe could not reach. */
 export type WebhookIngressFamily = 'ipv4' | 'ipv6';
 
+/** How far one probe request got. The stage IS the diagnosis.
+ *
+ *  Mirrors the engine's `Stage`, pinned by
+ *  `docs/adr/0143-webhook-ingress-probed-per-address-family.md`. */
+export type WebhookIngressStage =
+  | 'healthy'
+  | 'ingress-unreachable'
+  | 'backend-unreachable'
+  | 'route-missing'
+  | 'unexpected-responder'
+  | 'local-stack-unavailable';
+
+/** What one address answered when the outage was declared. */
+export interface WebhookIngressAddress {
+  address: string;
+  family: WebhookIngressFamily;
+  stage: WebhookIngressStage;
+  /** The HTTP status when one arrived, and `null` when none did. */
+  status: number | null;
+  /** A short human line, present only on a failure. */
+  detail: string | null;
+}
+
 /** One standing outage of the public path every webhook shares.
  *
- *  It names no webhook. The probe picks one hook as its target, and what failed
- *  is the ingress in front of all of them. */
+ *  `webhook_name` is the hook the probe knocked on, NOT the owner of the
+ *  outage. What failed is the ingress in front of every hook, so the page marks
+ *  them all. The name is here so a reader can say which path this is. */
 export interface WebhookIngressOutage {
+  webhook_name: string;
   host: string;
   port: number;
   /** The families that could not be reached: `ipv4`, `ipv6`, or both. */
   families: WebhookIngressFamily[];
+  /** What each probed address answered. Empty when the declaration predates
+   *  the engine carrying this field. */
+  addresses: WebhookIngressAddress[];
   /** RFC 3339, from the engine's own declaration of the outage. */
   down_since: string;
   /** How long it has been down, measured by the database. */

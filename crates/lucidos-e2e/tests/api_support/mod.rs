@@ -446,6 +446,27 @@ pub async fn register_repo(client: &reqwest::Client, path: &Path, label: &str) -
     repo["id"].as_str().unwrap().to_string()
 }
 
+/// Count events of one type on a thread.
+///
+/// Most callers assert this is ZERO, so a query error must never come back as a
+/// count. Swallowing one into `0` turns a "nothing was emitted" assertion into a
+/// pass the moment the DB hiccups. Here rather than in either test file, so the
+/// two cannot grow different failure behaviour for the same question.
+pub async fn count_events_of_type(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    event_type: &str,
+) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2",
+    )
+    .bind(thread_id)
+    .bind(event_type)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("counting {event_type} on thread {thread_id} failed: {e}"))
+}
+
 /// Subset of `thread_summaries` columns the API tests poll for.
 pub struct ThreadSummaryRow {
     pub thread_id: uuid::Uuid,

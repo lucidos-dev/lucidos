@@ -573,6 +573,8 @@ fn the_config_load_and_the_spawn_guard_refuse_the_same_script_paths() {
         "scripts/auth/a..b.py",
         "../../../etc/passwd",
         "/etc/passwd",
+        ".env",
+        "config/apis.json",
     ] {
         let refused_at_spawn =
             crate::api::proxy_script_runner::script_path_rejection(script).is_some();
@@ -582,6 +584,45 @@ fn the_config_load_and_the_spawn_guard_refuse_the_same_script_paths() {
             "'{script}' must get the same verdict from both guards"
         );
     }
+}
+
+/// The `data/` root holds gitignored config beside the typed subdirectories, so
+/// a path naming it needs no `..` to reach the workspace secrets. The approve
+/// route has always required `data/scripts/`; the runner's guard did not, and a
+/// first-run workspace auto-approves whatever `apis.json` names.
+#[test]
+fn a_handshake_script_cannot_name_the_gitignored_data_root() {
+    // Both spellings of every one of them. The runner strips a redundant
+    // `data/` so an older config resolves, and that must widen nothing: the
+    // prefixed form has to be refused for the same reason as the bare one.
+    for script in [
+        ".env",
+        "postgres/pg_hba.conf",
+        "config/apis.json",
+        "secrets",
+        "data/.env",
+        "data/postgres/pg_hba.conf",
+        "data/config/apis.json",
+        "data/data/scripts/auth/ok.py",
+    ] {
+        let reason = crate::api::proxy_script_runner::script_path_rejection(script)
+            .unwrap_or_else(|| panic!("'{script}' must be refused"));
+        assert!(
+            reason.contains("data/scripts/"),
+            "'{script}' refused for the wrong reason: {reason}"
+        );
+    }
+    for script in ["scripts/auth/ok.py", "data/scripts/auth/ok.py"] {
+        assert!(
+            crate::api::proxy_script_runner::script_path_rejection(script).is_none(),
+            "'{script}' is a real handshake script and must still be allowed"
+        );
+    }
+    // Stripping happens after the traversal check, never before it.
+    assert!(
+        crate::api::proxy_script_runner::script_path_rejection("data/../.env").is_some(),
+        "a '..' value must not be normalized into an accepted path"
+    );
 }
 
 /// A refused config has to say which provider and which value. The operator
@@ -699,6 +740,7 @@ async fn run_method_test(method: Method, body: &str) {
         HeaderMap::new(),
         Vec::new(),
         Bytes::copy_from_slice(body.as_bytes()),
+        Transport::Verified,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -743,7 +785,16 @@ async fn upstream_does_not_see_stripped_headers() {
         ("Referer", "https://engine.local/"),
         ("X-Keep-Me", "yes"),
     ]);
-    let _ = forward_request(Method::GET, &url, &url, headers, Vec::new(), Bytes::new()).await;
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        headers,
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+    )
+    .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     let observed: Vec<&str> = recorded.headers.iter().map(|(n, _)| n.as_str()).collect();
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("cookie")));
@@ -760,7 +811,16 @@ async fn upstream_does_not_see_host_header_from_engine() {
     let (base, slot) = spawn_recording_upstream(200, "ok").await;
     let url = format!("{}/x", base);
     let headers = hm(&[("Host", "engine.example.com")]);
-    let _ = forward_request(Method::GET, &url, &url, headers, Vec::new(), Bytes::new()).await;
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        headers,
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+    )
+    .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     let host = recorded
         .headers
@@ -798,6 +858,7 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
         HeaderMap::new(),
         auth_vec,
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -826,6 +887,7 @@ async fn forwards_query_param_auth_to_upstream() {
         HeaderMap::new(),
         Vec::new(),
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -848,6 +910,7 @@ async fn forwards_query_param_auth_preserves_existing_query() {
         HeaderMap::new(),
         Vec::new(),
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
@@ -865,6 +928,7 @@ async fn upstream_5xx_passes_through() {
         HeaderMap::new(),
         Vec::new(),
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -925,6 +989,7 @@ async fn forward_request_does_not_auto_follow_30x() {
         HeaderMap::new(),
         Vec::new(),
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
@@ -948,6 +1013,7 @@ async fn upstream_unreachable_returns_502() {
         HeaderMap::new(),
         Vec::new(),
         Bytes::new(),
+        Transport::Verified,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -1041,7 +1107,7 @@ fn an_explicitly_named_oauth_client_still_injects_its_env_vars() {
     let cred = Credential {
         id: uuid::Uuid::new_v4(),
         service_name: "acme".to_string(),
-        base_url: "https://api.acme.test".to_string(),
+        base_urls: vec!["https://api.acme.test".to_string()],
         auth_type: AuthType::OauthClient,
         auth_value: "{\"client_id\":\"cid\"}".to_string(),
         auth_header: "Authorization".to_string(),
@@ -1333,6 +1399,86 @@ fn handshake_script_paths_are_workspace_relative_and_deduped() {
     );
 }
 
+/// The shape a packaged 0.32.0 install carried, reconstructed. Its config
+/// spelled every script `data/scripts/auth/*.py`, from before resolution moved
+/// under `data/`. Prefixing `data/` again keyed the seed at `data/data/...`, so
+/// the boot pass approved nothing and wrote the once-only marker anyway.
+#[test]
+fn the_data_prefixed_spelling_seeds_the_same_scripts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join("data/config")).unwrap();
+    std::fs::write(
+        ws.join("data/config/apis.json"),
+        r#"{
+          "storage": {"base_url": "https://storage.test", "auth": {"pipeline": [
+            {"type": "script_handshake",
+             "script": "data/scripts/auth/exchange.py",
+             "credential": "web-api-key",
+             "oauth_providers": ["google"]}
+          ]}},
+          "calendar": {"base_url": "https://calendar.test", "auth": {"pipeline": [
+            {"type": "script_handshake", "script": "scripts/auth/exchange.py"}
+          ]}}
+        }"#,
+    )
+    .unwrap();
+
+    let seeds = load_proxy_config(ws).handshake_seed_entries();
+    assert_eq!(
+        seeds.len(),
+        1,
+        "both spellings name one script, so they seed one line: {seeds:?}"
+    );
+    assert_eq!(seeds[0].path, "data/scripts/auth/exchange.py");
+    // Two hosts disagree, so neither is an answer and the first call binds.
+    assert_eq!(seeds[0].base_url, None);
+    // The injected set does NOT disagree. No secret moves through an entry
+    // that injects nothing, so it holds no opinion, and the one entry that
+    // does inject decides.
+    assert_eq!(
+        seeds[0].injects,
+        Some(
+            ["c:web-api-key", "o:google"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        )
+    );
+}
+
+/// One entry naming a script IS an answer, for both columns at once.
+#[test]
+fn a_single_entry_seeds_its_scope_and_its_injected_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    std::fs::create_dir_all(ws.join("data/config")).unwrap();
+    std::fs::write(
+        ws.join("data/config/apis.json"),
+        r#"{
+          "storage": {"base_url": "https://storage.test", "auth": {"pipeline": [
+            {"type": "script_handshake",
+             "script": "data/scripts/auth/exchange.py",
+             "credential": "web-api-key",
+             "oauth_providers": ["google"]}
+          ]}}
+        }"#,
+    )
+    .unwrap();
+
+    let seeds = load_proxy_config(ws).handshake_seed_entries();
+    assert_eq!(seeds[0].base_url.as_deref(), Some("https://storage.test"));
+    assert_eq!(
+        seeds[0].injects,
+        Some(
+            ["c:web-api-key", "o:google"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        )
+    );
+}
+
 /// The credential-theft half of ADR 0144. `apis.json` is writable over the
 /// API, so `base_url` is caller data: an entry naming a real credential and
 /// pointing somewhere else must not get that credential attached.
@@ -1375,6 +1521,101 @@ async fn a_credential_is_refused_for_a_provider_outside_its_scope() {
     teardown_test_db(&db).await;
 }
 
+/// The defect a set of base URLs exists for. Binance signs spot calls at
+/// `api.binance.com` and futures calls at `fapi.binance.com` with ONE HMAC
+/// pair, and Helius has the same shape. A single scope could not say so, so the
+/// second entry answered 502 on every call.
+#[tokio::test]
+async fn one_credential_reaches_every_host_of_the_provider_it_declares() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    CredentialStore::upsert(
+        &pool,
+        &bus,
+        "binance",
+        &[
+            "https://api.binance.com".to_string(),
+            "https://fapi.binance.com".to_string(),
+        ],
+        crate::core::AuthType::ApiKey,
+        "the-hmac-key",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for host in ["https://api.binance.com", "https://fapi.binance.com"] {
+        check_credential_scope(&pool, "binance", host)
+            .await
+            .unwrap_or_else(|e| panic!("{host} is declared, so it is in scope: {}", e.1));
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// And the other half: declaring a second host widens the credential by that
+/// host and by nothing else. A sibling of a declared host is not declared.
+#[tokio::test]
+async fn a_multi_scope_credential_is_still_refused_outside_its_set() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    CredentialStore::upsert(
+        &pool,
+        &bus,
+        "binance",
+        &[
+            "https://api.binance.com".to_string(),
+            "https://fapi.binance.com".to_string(),
+        ],
+        crate::core::AuthType::ApiKey,
+        "the-hmac-key",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    for elsewhere in [
+        "https://evil.test",
+        // Undeclared sibling hosts of a declared one. Nothing is inferred from
+        // how a host is spelled, so neither is in scope.
+        "https://dapi.binance.com",
+        "https://binance.com",
+        // The near-miss a raw string prefix would wave through.
+        "https://api.binance.com.evil.test",
+        "http://api.binance.com",
+    ] {
+        let err = check_credential_scope(&pool, "binance", elsewhere)
+            .await
+            .expect_err("a host outside the declared set must be refused");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("will not be sent"), "{}", err.1);
+        // The refusal names the whole DECLARED set, so the user can see what
+        // it does cover, and points at the two surfaces that change it.
+        assert!(err.1.contains("https://api.binance.com"), "{}", err.1);
+        assert!(err.1.contains("https://fapi.binance.com"), "{}", err.1);
+        assert!(err.1.contains("Settings"), "{}", err.1);
+        assert!(err.1.contains("set-base-urls"), "{}", err.1);
+        // But it never hands back a command with the REQUESTED host filled in.
+        // That host is `apis.json` data an app UI can write, so a ready-made
+        // grant for it would finish the theft the gate exists to refuse.
+        assert!(
+            !err.1.contains(&format!("--url {elsewhere}")),
+            "the refusal must not pre-fill a grant for the rejected host: {}",
+            err.1
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 /// An unscoped credential goes nowhere, and the refusal says how to fix it.
 /// The startup pass gives a scope to any row `apis.json` explains, so one that
 /// still has none is a row nothing accounts for.
@@ -1394,7 +1635,7 @@ async fn an_unscoped_credential_is_not_sent_anywhere() {
     let err = check_credential_scope(&pool, "unscoped-key", "https://api.example.test")
         .await
         .expect_err("an unscoped credential must be refused");
-    assert!(err.1.contains("no base_url"), "{}", err.1);
+    assert!(err.1.contains("no base URL"), "{}", err.1);
     assert!(err.1.contains("Settings"), "{}", err.1);
 
     pool.close().await;
@@ -1477,8 +1718,772 @@ async fn inferring_a_scope_leaves_an_existing_one_alone() {
         "a scoped credential is never re-scoped"
     );
     let stored = CredentialStore::get(&pool, "legacy-key").await.unwrap();
-    assert_eq!(stored.unwrap().base_url, "https://api.first.test");
+    assert_eq!(
+        stored.unwrap().base_urls,
+        vec!["https://api.first.test".to_string()],
+        "the inference fills the set once, and never appends to it"
+    );
 
     pool.close().await;
     teardown_test_db(&db).await;
+}
+
+// ---- The scope gate (ADR 0144 decision 4) ------------------------------
+
+/// A gate context over a temp workspace, an offline bus, and a pool that is
+/// never reached. Enough for every binding but `StoredCredential`.
+fn offline_scope_ctx<'a>(
+    workspace: &'a std::path::Path,
+    pool: &'a sqlx::PgPool,
+    bus: &'a crate::engine::event_bus::EventBus,
+) -> ScopeContext<'a> {
+    ScopeContext {
+        pool,
+        workspace_path: workspace,
+        event_bus: bus,
+    }
+}
+
+fn unreachable_pool() -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+        .expect("connect_lazy never errors on parse-only failure")
+}
+
+/// A credential-less `script_handshake` layer, the arm that used to skip the
+/// check entirely.
+fn handshake_layer(script: &str) -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+    handshake_layer_injecting(script, None, &[])
+}
+
+/// The same layer, with the secrets an `apis.json` entry asks us to inject.
+fn handshake_layer_injecting(
+    script: &str,
+    credential: Option<&str>,
+    oauth_providers: &[&str],
+) -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+    vec![Arc::new(
+        crate::api::proxy_script_layer::ScriptHandshakeLayer::new(
+            "script_handshake".into(),
+            "comfort".into(),
+            credential.map(str::to_string),
+            script.into(),
+            oauth_providers.iter().map(|p| p.to_string()).collect(),
+            unreachable_pool(),
+            Arc::new(std::path::PathBuf::from("/ws")),
+            Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
+            Arc::new(crate::api::proxy_script_layer::DbOAuthLookup::new(
+                unreachable_pool(),
+            )),
+        ),
+    )]
+}
+
+/// Write `script` and record it as approved, which is what an in-process file
+/// tool does. The bytes never run here, but they have to be on disk: binding a
+/// scope verifies that the file is still the approved one.
+fn approve(workspace: &std::path::Path, script: &str) {
+    const BODY: &[u8] = b"print(1)";
+    let rel = crate::core::handshake_approvals::config_path_key(script);
+    let abs = workspace.join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, BODY).unwrap();
+    crate::core::handshake_approvals::record(workspace, &rel, BODY).unwrap();
+}
+
+/// FINDING 1. A handshake script mints a live token, and `apis.json` is
+/// writable over the API. Rewriting `base_url` used to deliver that token to
+/// the attacker's host, because the base-URL check ran only when the layer
+/// named a credential.
+#[tokio::test]
+async fn a_credential_less_handshake_is_refused_off_its_bound_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/comfort.py");
+
+    // First use binds the script to the host its entry then named.
+    ScopedPipeline::bind(
+        &ctx,
+        "comfort",
+        "https://accsmart.panasonic.test".to_string(),
+        handshake_layer("scripts/auth/comfort.py"),
+        false,
+    )
+    .await
+    .expect("the first call binds the script to its own upstream");
+    assert_eq!(
+        crate::core::handshake_approvals::scope_for(ws, "data/scripts/auth/comfort.py").as_deref(),
+        Some("https://accsmart.panasonic.test")
+    );
+
+    // Now the attacker rewrites base_url and keeps the script.
+    let err = ScopedPipeline::bind(
+        &ctx,
+        "comfort",
+        "https://evil.test".to_string(),
+        handshake_layer("scripts/auth/comfort.py"),
+        false,
+    )
+    .await
+    .expect_err("a rewritten base_url must not receive the minted token");
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("data/scripts/auth/comfort.py"), "{}", err.1);
+    assert!(
+        err.1.contains("https://accsmart.panasonic.test"),
+        "{}",
+        err.1
+    );
+}
+
+/// The regression a packaged 0.32.0 install hit, at the gate that caused it.
+///
+/// A handshake credential is presented by the SCRIPT, to the provider's own
+/// token endpoint, and never to the entry's `base_url`. Checking it against
+/// `base_url` refused every ordinary OAuth handshake: a `google` OAuth client
+/// is scoped to `oauth2.googleapis.com` and the calendar API lives on
+/// `www.googleapis.com`.
+///
+/// The pool here is unreachable on purpose. Passing proves the gate no longer
+/// asks the credential store a question it cannot answer.
+#[tokio::test]
+async fn a_handshake_credential_scoped_to_its_token_endpoint_still_works() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/google-oauth-bearer.py");
+
+    ScopedPipeline::bind(
+        &ctx,
+        "google-calendar",
+        "https://www.googleapis.test".to_string(),
+        handshake_layer_injecting(
+            "scripts/auth/google-oauth-bearer.py",
+            Some("oauth:google"),
+            &["google"],
+        ),
+        false,
+    )
+    .await
+    .expect("a handshake credential does not travel to the entry's base_url");
+
+    assert_eq!(
+        crate::core::handshake_approvals::injects_for(
+            ws,
+            "data/scripts/auth/google-oauth-bearer.py"
+        ),
+        Some(
+            ["c:oauth:google", "o:google"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        ),
+        "the first call records what the script may be handed"
+    );
+}
+
+/// What replaces the credential-scope check on this arm.
+///
+/// `apis.json` is writable over the API. An entry naming an approved script can
+/// be rewritten to ask for a secret the user never meant it to see. The record
+/// decides, not the entry.
+#[tokio::test]
+async fn a_handshake_script_is_refused_a_secret_it_was_not_approved_with() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/exchange.py");
+
+    let bind = |layers| {
+        ScopedPipeline::bind(
+            &ctx,
+            "storage",
+            "https://storage.test".to_string(),
+            layers,
+            false,
+        )
+    };
+    bind(handshake_layer_injecting(
+        "scripts/auth/exchange.py",
+        Some("firebase-web-api-key"),
+        &["google"],
+    ))
+    .await
+    .expect("the first call binds what the entry then asked for");
+
+    // Swapping the credential, and adding a provider, are the same attack.
+    for (credential, providers) in [
+        (Some("openrouter"), &["google"][..]),
+        (Some("firebase-web-api-key"), &["google", "microsoft"][..]),
+        (None, &["google"][..]),
+    ] {
+        let err = bind(handshake_layer_injecting(
+            "scripts/auth/exchange.py",
+            credential,
+            providers,
+        ))
+        .await
+        .expect_err("a rewritten entry must not change what the script receives");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("c:firebase-web-api-key"), "{}", err.1);
+        assert!(err.1.contains("approved to receive"), "{}", err.1);
+    }
+}
+
+/// The record is one line per script, comma joined inside a whitespace split.
+/// A credential named with either character would re-cut that line, so the call
+/// is refused before anything is written rather than after.
+#[tokio::test]
+async fn a_credential_name_that_would_corrupt_the_record_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/x.py");
+
+    for bad in ["my key", "a,b"] {
+        let err = ScopedPipeline::bind(
+            &ctx,
+            "p",
+            "https://api.test".to_string(),
+            handshake_layer_injecting("scripts/auth/x.py", Some(bad), &[]),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert!(err.1.contains("Rename it in Settings"), "{}", err.1);
+    }
+    assert!(
+        crate::core::handshake_approvals::injects_for(ws, "data/scripts/auth/x.py").is_none(),
+        "a refused set must not reach the record"
+    );
+}
+
+/// The bind is once, and a concurrent first request is checked against
+/// whichever host won rather than waved through.
+#[tokio::test]
+async fn a_second_first_call_is_checked_against_the_scope_that_won() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/x.py");
+    crate::core::handshake_approvals::bind_scope_if_absent(
+        ws,
+        "data/scripts/auth/x.py",
+        "https://first.test",
+    )
+    .unwrap();
+
+    ScopedPipeline::bind(
+        &ctx,
+        "p",
+        "https://second.test".to_string(),
+        handshake_layer("scripts/auth/x.py"),
+        false,
+    )
+    .await
+    .expect_err("the losing racer must be refused, not passed");
+}
+
+/// A path under the bound host is the same API, so a deeper base_url is fine.
+#[tokio::test]
+async fn a_deeper_path_on_the_bound_host_still_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+    approve(ws, "scripts/auth/x.py");
+    crate::core::handshake_approvals::bind_scope_if_absent(
+        ws,
+        "data/scripts/auth/x.py",
+        "https://api.test",
+    )
+    .unwrap();
+
+    ScopedPipeline::bind(
+        &ctx,
+        "p",
+        "https://api.test/v2".to_string(),
+        handshake_layer("scripts/auth/x.py"),
+        false,
+    )
+    .await
+    .expect("a deeper path on the bound host is the same API");
+}
+
+/// An unapproved script gets no scope invented for it. The runner refuses it
+/// by hash, and that message is the one worth showing.
+#[tokio::test]
+async fn an_unapproved_script_is_left_to_the_runner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(ws, &pool, &bus);
+
+    ScopedPipeline::bind(
+        &ctx,
+        "p",
+        "https://anywhere.test".to_string(),
+        handshake_layer("scripts/auth/never-approved.py"),
+        false,
+    )
+    .await
+    .expect("the gate has no approval to scope, so it says nothing");
+    assert!(
+        crate::core::handshake_approvals::entries(ws).is_empty(),
+        "binding must never invent an approval"
+    );
+}
+
+/// FINDING 2. `local_base_url` is an ordinary settable preference, so the
+/// builtin `local` provider's upstream is caller data. Its key follows the
+/// credential's own scope, and the gate is what refuses the rewrite. The
+/// binding `resolve_local` hands over is pinned in `proxy_builtin`'s own tests.
+#[tokio::test]
+async fn the_builtin_local_key_is_refused_outside_its_credential_scope() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    seed_credential(
+        &pool,
+        "local",
+        "http://localhost:1234/v1",
+        crate::core::AuthType::Bearer,
+        "local-key",
+    )
+    .await;
+
+    let local_bearer = || -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+        vec![Arc::new(
+            crate::api::proxy_static_layers::StaticHeaderLayer::bearer(
+                "local".into(),
+                "local-key".into(),
+                crate::api::proxy_auth_layer::ScopeBinding::StoredCredential("local".into()),
+            ),
+        )]
+    };
+
+    let err = ScopedPipeline::bind(
+        &ctx,
+        "local",
+        "https://evil.test".to_string(),
+        local_bearer(),
+        false,
+    )
+    .await
+    .expect_err("the local key must not follow a rewritten preference");
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("local"), "{}", err.1);
+    assert!(err.1.contains("will not be sent"), "{}", err.1);
+
+    // The backend it was actually scoped to still works, key and all.
+    ScopedPipeline::bind(
+        &ctx,
+        "local",
+        "http://localhost:1234/v1".to_string(),
+        local_bearer(),
+        false,
+    )
+    .await
+    .expect("the scoped local backend keeps working");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The reported defect, at the chokepoint rather than at the predicate. Two
+/// `apis.json` entries name one credential, and the pipeline binds for both.
+#[tokio::test]
+async fn the_gate_binds_one_credential_for_two_declared_hosts() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    CredentialStore::upsert(
+        &pool,
+        &bus,
+        "binance",
+        &[
+            "https://api.binance.com".to_string(),
+            "https://fapi.binance.com".to_string(),
+        ],
+        crate::core::AuthType::ApiKey,
+        "the-hmac-key",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let signed = || -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+        vec![Arc::new(
+            crate::api::proxy_static_layers::StaticHeaderLayer::bearer(
+                "binance".into(),
+                "the-hmac-key".into(),
+                crate::api::proxy_auth_layer::ScopeBinding::StoredCredential("binance".into()),
+            ),
+        )]
+    };
+
+    for (entry, host) in [
+        ("binance", "https://api.binance.com"),
+        ("binance-futures", "https://fapi.binance.com"),
+    ] {
+        ScopedPipeline::bind(&ctx, entry, host.to_string(), signed(), false)
+            .await
+            .unwrap_or_else(|e| panic!("{entry} must reach {host}: {}", e.1));
+    }
+
+    let err = ScopedPipeline::bind(
+        &ctx,
+        "binance-elsewhere",
+        "https://evil.test".to_string(),
+        signed(),
+        false,
+    )
+    .await
+    .expect_err("a third host was never declared");
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A key the environment supplied has no row to scope it, so process env has
+/// to name the host as well. A rewritten preference cannot speak for it.
+#[tokio::test]
+async fn an_env_supplied_local_key_follows_the_env_base_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    let env_keyed = || -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+        vec![Arc::new(
+            crate::api::proxy_static_layers::StaticHeaderLayer::bearer(
+                "local".into(),
+                "env-key".into(),
+                crate::api::proxy_auth_layer::ScopeBinding::Pinned {
+                    what: "LUCIDOS_LOCAL_API_KEY".into(),
+                    base_url: "http://localhost:11434/v1".into(),
+                },
+            ),
+        )]
+    };
+
+    ScopedPipeline::bind(
+        &ctx,
+        "local",
+        "http://localhost:11434/v1".to_string(),
+        env_keyed(),
+        false,
+    )
+    .await
+    .expect("the env base URL is where an env key belongs");
+
+    let err = ScopedPipeline::bind(
+        &ctx,
+        "local",
+        "https://evil.test".to_string(),
+        env_keyed(),
+        false,
+    )
+    .await
+    .expect_err("a preference cannot redirect an env-supplied key");
+    assert!(err.1.contains("LUCIDOS_LOCAL_API_KEY"), "{}", err.1);
+}
+
+// ---- Transport policy --------------------------------------------------
+
+/// A layer whose pin covers whatever it is asked about, so these cases test the
+/// transport rule and nothing else.
+fn layers_pinned_to(base_url: &str) -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+    vec![Arc::new(
+        crate::api::proxy_static_layers::StaticHeaderLayer::bearer(
+            "k".into(),
+            "sk-live".into(),
+            crate::api::proxy_auth_layer::ScopeBinding::Pinned {
+                what: "the test key".into(),
+                base_url: base_url.to_string(),
+            },
+        ),
+    )]
+}
+
+/// FINDING 3, plaintext half. Anyone on the path reads a credential sent over
+/// plain http to a public host. So it needs the same explicit opt-in an invalid
+/// certificate does.
+#[tokio::test]
+async fn a_credential_over_plaintext_needs_the_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    let public = "http://api.example.test";
+    let err = ScopedPipeline::bind(
+        &ctx,
+        "p",
+        public.to_string(),
+        layers_pinned_to(public),
+        false,
+    )
+    .await
+    .expect_err("a credential over plaintext must be refused by default");
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+    assert!(err.1.contains("insecure_transport"), "{}", err.1);
+
+    // Opted in, the operator has said they accept it.
+    ScopedPipeline::bind(
+        &ctx,
+        "p",
+        public.to_string(),
+        layers_pinned_to(public),
+        true,
+    )
+    .await
+    .expect("the opt-in is what makes it allowed");
+
+    // Loopback is exempt: no attacker sits on the path to this machine. This is
+    // the documented local-device workflow and the builtin `local` provider.
+    for loopback in [
+        "http://localhost:5005",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:8080",
+    ] {
+        ScopedPipeline::bind(
+            &ctx,
+            "p",
+            loopback.to_string(),
+            layers_pinned_to(loopback),
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("loopback must keep working: {loopback} gave {}", e.1));
+    }
+
+    // A keyless entry has nothing to leak, so plain http stays fine.
+    ScopedPipeline::bind(&ctx, "p", public.to_string(), Vec::new(), false)
+        .await
+        .expect("an uncredentialed plaintext entry is unchanged");
+}
+
+/// Nothing downstream can judge a base URL with no host. The gate refuses it
+/// rather than comparing scopes against a string that parses to nothing.
+#[tokio::test]
+async fn a_base_url_with_no_host_is_refused_at_the_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    for bad in ["", "not a url", "file:///etc/passwd"] {
+        let err = ScopedPipeline::bind(&ctx, "p", bad.to_string(), Vec::new(), false)
+            .await
+            .expect_err("a base_url with no host must be refused");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY, "{bad}");
+    }
+}
+
+/// The boot read names both shapes so a user hears about them once, in one
+/// place, rather than on the first 502.
+#[test]
+fn the_load_names_every_entry_it_will_not_vouch_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspace_with_apis_json(
+        &tmp,
+        r#"{
+          "opted-in":  {"base_url": "https://self-signed.test", "insecure_transport": true},
+          "plaintext": {"base_url": "http://api.public.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "k"}
+          ]}},
+          "loopback":  {"base_url": "http://localhost:5005", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "k"}
+          ]}},
+          "fine":      {"base_url": "https://api.good.test", "auth": {"pipeline": [
+            {"type": "static_credential", "kind": "bearer", "credential": "k"}
+          ]}}
+        }"#,
+    );
+
+    let load = load_proxy_config(&ws);
+    let named: Vec<&str> = load.insecure.iter().map(|i| i.provider.as_str()).collect();
+    assert_eq!(named, vec!["opted-in", "plaintext"]);
+    assert!(load.insecure[0].reason.contains("insecure_transport is on"));
+    assert!(load.insecure[1].reason.contains("not loopback"));
+}
+
+/// A self-signed certificate and the private key for it, as PEM.
+///
+/// Built with the `openssl` crate rather than a new dev-dependency. The SAN is
+/// what makes the opted-in half meaningful. rustls refuses a certificate with
+/// no SAN before it weighs the signature, so without one both clients fail and
+/// the test proves nothing.
+fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use openssl::x509::{X509NameBuilder, X509};
+
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut subject = X509NameBuilder::new().unwrap();
+    subject.append_entry_by_text("CN", "localhost").unwrap();
+    let subject = subject.build();
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&subject).unwrap();
+    builder.set_issuer_name(&subject).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    let san = SubjectAlternativeName::new()
+        .ip("127.0.0.1")
+        .dns("localhost")
+        .build(&builder.x509v3_context(None, None))
+        .unwrap();
+    builder.append_extension(san).unwrap();
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+    (
+        builder.build().to_pem().unwrap(),
+        key.private_key_to_pem_pkcs8().unwrap(),
+    )
+}
+
+/// Serve one HTTPS request from a self-signed certificate, then stop. Returns
+/// the base URL. Deliberately hand-rolled: the assertion is about the TLS
+/// handshake, so the HTTP half only has to be enough for a 200.
+async fn spawn_self_signed_upstream() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (cert_pem, key_pem) = self_signed_pem();
+    let cert = openssl::x509::X509::from_pem(&cert_pem).unwrap();
+    let key = openssl::pkey::PKey::private_key_from_pem(&key_pem).unwrap();
+    // A non-empty passphrase: macOS Security.framework refuses an empty one
+    // with -25293, and the bundle never leaves this process.
+    const BUNDLE_PASS: &str = "handshake-test";
+    let pkcs12 = openssl::pkcs12::Pkcs12::builder()
+        .name("test")
+        .pkey(&key)
+        .cert(&cert)
+        .build2(BUNDLE_PASS)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    let identity = native_tls::Identity::from_pkcs12(&pkcs12, BUNDLE_PASS).unwrap();
+    let acceptor: tokio_native_tls::TlsAcceptor =
+        native_tls::TlsAcceptor::new(identity).unwrap().into();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Two accepts: the refused client also opens a connection, and which
+        // test runs first is not ours to decide.
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = tls.read(&mut buf).await;
+                let _ = tls
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                    .await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    format!("https://127.0.0.1:{}", addr.port())
+}
+
+/// FINDING 3, certificate half. The shared client accepted any certificate for
+/// every provider, so an on-path attacker read the API key for an ordinary
+/// public API. Validation is the default now, and the exception is per
+/// provider.
+#[tokio::test]
+async fn a_provider_without_the_opt_in_refuses_an_invalid_certificate() {
+    let base = spawn_self_signed_upstream().await;
+    let url = format!("{base}/v1/items");
+
+    let refused = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+    )
+    .await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_GATEWAY,
+        "a self-signed certificate must not be accepted by default"
+    );
+
+    let accepted = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+        Transport::Unverified,
+    )
+    .await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::OK,
+        "the self-signed dev workflow keeps working behind the opt-in"
+    );
+    assert_eq!(body_text(accepted).await, "ok");
+}
+
+/// The opt-in is the only route to the unverified client, so the flag on the
+/// entry is what decides which one a request uses.
+#[tokio::test]
+async fn the_transport_follows_the_entry_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = unreachable_pool();
+    let bus = crate::test_support::offline_event_bus();
+    let ctx = offline_scope_ctx(tmp.path(), &pool, &bus);
+
+    let verified = ScopedPipeline::bind(&ctx, "p", "https://a.test".into(), Vec::new(), false)
+        .await
+        .unwrap();
+    let unverified = ScopedPipeline::bind(&ctx, "p", "https://a.test".into(), Vec::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(verified.transport, Transport::Verified);
+    assert_eq!(unverified.transport, Transport::Unverified);
 }

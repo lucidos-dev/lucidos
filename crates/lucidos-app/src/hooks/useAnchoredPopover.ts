@@ -510,10 +510,16 @@ export function useDismissOnOutside(
   isTop?: () => boolean,
 ): void {
   // Stash onDismiss in a ref so an inline arrow callback at the call site
-  // doesn't churn the effect deps below. Callers should be free to write
-  // `() => (open.value = false)` without ceremony; the listeners install
-  // once per (isOpen, anchor) transition, not on every render. The ref is
-  // updated every render so the latest callback always wins on fire.
+  // doesn't churn the effect deps below: the listeners install once per
+  // (isOpen, anchor) transition, not on every render. The ref is updated every
+  // render so the latest callback always wins on fire.
+  //
+  // Give that callback a BRACED body, `() => { open.value = false; }`. This
+  // comment used to recommend the expression form, and that was a bug it
+  // spread to four live overlays. An arrow with an expression body returns the
+  // assignment's value, so `() => (open.value = false)` returns `false`, which
+  // is the no-op signal below: the overlay closed and the paired click was
+  // never swallowed, so the control underneath it fired on the dismissing tap.
   const dismissRef = useRef(onDismiss);
   dismissRef.current = onDismiss;
   // Same ref treatment, and for a second reason: the predicate reads the

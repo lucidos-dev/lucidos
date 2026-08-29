@@ -5,8 +5,9 @@
 //!
 //! # This is not an authorizer
 //!
-//! Nothing here decides *who* is calling. The gateway owns that (ADR 0094).
-//! Every engine binds loopback by default, so its callers are processes on this
+//! Nothing here decides *who* is calling. On a loopback bind the gateway owns
+//! that (ADR 0094), and on a wide one [`crate::api::local_auth`] does. Every
+//! engine binds loopback by default, so its callers are processes on this
 //! machine. The one caller it cannot otherwise tell apart is a page on another
 //! origin, driving that loopback port out of the user's own browser. CORS does
 //! not stop such a request. It only stops the page reading the reply.
@@ -18,25 +19,32 @@
 
 //! # What a wide bind costs
 //!
-//! "Left to the bind topology" holds only while the bind IS loopback. Three
+//! "Left to the bind topology" holds only while the bind IS loopback. Four
 //! settings widen it: `LUCIDOS_BIND_ALL` and `LUCIDOS_BIND_ADDR` on the engine,
-//! and `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` on the gateway that spawns it.
-//! ADR 0096 made loopback the default for dev and packaged alike, and nothing
-//! in the repo sets any of the three.
+//! `LUCIDOS_GATEWAY_ENGINE_LOOPBACK=0` on the gateway that spawns it, and
+//! `~/.lucidos/network.toml` for an engine launched directly. ADR 0096 made
+//! loopback the default for dev and packaged alike, and nothing in the repo
+//! sets any of the first three.
 //!
-//! Widen it and this gate defends nothing extra. A network client sends no
-//! fetch metadata, so it reads exactly like the CLI and passes. Nor is there a
-//! second lock behind this one. The API is unauthenticated by design, on the
-//! premise that reaching it proves you are local. A wide bind retires that
-//! premise, so it opens the whole API to that network.
+//! Widen it and THIS gate defends nothing extra. A network client sends no
+//! fetch metadata, so it reads exactly like the CLI and passes here.
+//!
+//! What stops it is the second lock, `local_auth`. It engages on exactly those
+//! binds and asks for a credential no remote caller can read. A wide bind
+//! therefore costs a browser its direct route to this port, which is the ADR
+//! 0096 posture. It no longer costs the API its privacy.
 
 //! # An app iframe passes, deliberately
 //!
 //! Apps are served from the engine's own origin, so an SDK call from inside one
 //! reads as `same-origin`. That is the shipped contract: apps keep the user's
-//! authority, and the ADR 0014 residual stays open. The gateway's control plane
-//! also refuses an app-iframe `Referer`, and copying that here would break
-//! every app.
+//! authority, and ADR 0144 records why. The gateway's control plane refuses an
+//! app-iframe `Referer`, and copying that here would break every app.
+//!
+//! A handful of routes refuse one anyway, per route rather than per surface.
+//! They are the ones that hand back a stored secret, and they live behind
+//! [`super::secret_reveal`]. Adding a route that returns a secret or a key
+//! means putting it there, not widening this gate.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -176,7 +184,8 @@ mod tests {
     #[test]
     fn an_app_iframe_passes() {
         // Apps are same-origin with the engine and call the API through the
-        // SDK. Refusing them here would break every app.
+        // SDK. Refusing them here would break every app. The routes that hand
+        // back a secret refuse one on their own, in `api::secret_reveal`.
         let h = hm(&[
             ("host", "localhost:5173"),
             ("origin", "https://localhost:5173"),

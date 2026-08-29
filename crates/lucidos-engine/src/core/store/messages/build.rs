@@ -1,7 +1,20 @@
 use super::super::types::*;
 use super::collect_dismissed_event_ids;
 use crate::core::EventRow;
+use crate::engine::thread_events::{AgentParticipant, MessageOrigin};
 use chrono::{DateTime, Utc};
+
+/// Which agent authored this event, when its actor names one (ADR 0150).
+///
+/// Read from the persisted actor rather than inferred from position, because
+/// two agents can interleave on one thread. A row from before the actor
+/// existed, or one whose actor names a human, yields `None`.
+fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
+    serde_json::from_value::<MessageOrigin>(event.payload.get("actor")?.clone())
+        .ok()?
+        .agent()
+        .cloned()
+}
 
 /// Format a persisted `ChildThreadCompleted` event row as the `[CHILD THREAD
 /// COMPLETED]` user-channel block the parent LLM sees in its conversation
@@ -178,6 +191,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         request_event_id: current_request_event_id.clone(),
                         event_id: None,
                         thread_id: current_thread_id.clone(),
+                        agent: None,
                     });
                     last_cc_chunk_len = 0;
                     last_cc_event_len = 0;
@@ -212,6 +226,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                         request_event_id: current_request_event_id.clone(),
                         event_id: None,
                         thread_id: current_thread_id.clone(),
+                        agent: None,
                     });
                     last_text_chunk_len = 0;
                     last_text_event_len = 0;
@@ -287,6 +302,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     request_event_id: None,
                     event_id: Some(event.id.to_string()),
                     thread_id: current_thread_id.clone(),
+                    agent: None,
                 });
             }
             // "Thinking" is the legacy DB string; T7 renamed the variant to
@@ -653,6 +669,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     request_event_id: user_eid,
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: authoring_agent(event),
                 });
                 last_cc_event_len = 0;
                 last_text_event_len = 0;
@@ -700,6 +717,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     request_event_id: user_eid,
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
                 });
             }
             "TriggerStarted" => {
@@ -741,6 +759,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     request_event_id: None,
                     event_id: Some(event.id.to_string()),
                     thread_id: current_thread_id.clone(),
+                    agent: None,
                 });
             }
             "TriggerCompleted" => {
@@ -783,7 +802,43 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     request_event_id: None,
                     event_id: Some(event.id.to_string()),
                     thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                    agent: None,
                 });
+            }
+            "SpokenReplyGenerated" => {
+                // What the talker said out loud. It reaches the reasoner under
+                // the talker's own speaker label. So the reasoner reads what
+                // was already said in its name, never as its own turn.
+                //
+                // It consumes NOTHING pending. A spoken reply lands mid-call,
+                // often while the reasoner's turn is still running, and those
+                // steps and text belong to that turn.
+                let text = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: text.to_string(),
+                        created_at: event.created,
+                        channel: None,
+                        steps: vec![],
+                        images: vec![],
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: Some(true),
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: vec![],
+                        events: vec![],
+                        request_event_id: None,
+                        event_id: Some(event.id.to_string()),
+                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                        agent: authoring_agent(event),
+                    });
+                }
             }
             _ => {}
         }
@@ -859,6 +914,7 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
             request_event_id: current_request_event_id.clone(),
             event_id: None,
             thread_id: current_thread_id.clone(),
+            agent: None,
         });
     }
 

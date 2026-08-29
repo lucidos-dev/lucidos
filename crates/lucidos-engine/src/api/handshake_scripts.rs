@@ -42,6 +42,10 @@ pub(super) struct HandshakeScriptState {
 /// Three spellings reach here and all mean one file: the `apis.json` value
 /// (`scripts/auth/x.py`), the workspace-relative one (`data/scripts/auth/x.py`),
 /// and an absolute path inside this workspace.
+///
+/// The first two are settled by `config_path_key`, which is the one decider for
+/// a config value. This route once carried its own copy of that rule, and the
+/// copy was the half that got the two spellings right.
 fn approval_key(workspace_path: &std::path::Path, raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -52,8 +56,7 @@ fn approval_key(workspace_path: &std::path::Path, raw: &str) -> Result<String, S
             handshake_approvals::workspace_relative(workspace_path, std::path::Path::new(trimmed))
                 .ok_or_else(|| format!("'{}' is outside this workspace", trimmed))?
         }
-        false if trimmed.starts_with("data/") => trimmed.to_string(),
-        false => format!("data/{}", trimmed),
+        false => handshake_approvals::config_path_key(trimmed),
     };
     if crate::api::is_path_traversal(rel.strip_prefix("data/").unwrap_or(&rel)) {
         return Err(format!("'{}' must be a relative path with no '..'", raw));
@@ -80,7 +83,9 @@ pub(super) async fn list_handshake_scripts(State(state): State<AppState>) -> Res
             let bytes = std::fs::read(&abs).ok();
             HandshakeScriptState {
                 approved: bytes.as_ref().is_some_and(|b| {
-                    recorded.get(&path) == Some(&handshake_approvals::content_hash(b))
+                    recorded
+                        .get(&path)
+                        .is_some_and(|a| a.hash == handshake_approvals::content_hash(b))
                 }),
                 exists: bytes.is_some(),
                 path,
@@ -216,6 +221,22 @@ mod tests {
             assert_eq!(
                 approval_key(ws, spelling).unwrap(),
                 "data/scripts/auth/x.py",
+                "{spelling}"
+            );
+        }
+    }
+
+    /// This route and the runner have to key one config value the same line.
+    /// They drifted once: this side accepted both spellings and the runner's
+    /// side doubled the prefix, so `lucidos handshake approve` recorded a path
+    /// no proxy call ever looked up.
+    #[test]
+    fn approving_keys_a_config_value_the_way_the_runner_does() {
+        let ws = std::path::Path::new("/ws");
+        for spelling in ["scripts/auth/x.py", "data/scripts/auth/x.py"] {
+            assert_eq!(
+                approval_key(ws, spelling).unwrap(),
+                handshake_approvals::config_path_key(spelling),
                 "{spelling}"
             );
         }

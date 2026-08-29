@@ -67,7 +67,7 @@ export function LocalProviderSettings() {
     try {
       const ok = await submitNewCredential(
         LOCAL_SERVICE,
-        url.trim() || DEFAULT_LOCAL_BASE_URL,
+        [url.trim() || DEFAULT_LOCAL_BASE_URL],
         'api_key',
         secret.trim()
       );

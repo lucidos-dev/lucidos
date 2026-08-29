@@ -1,7 +1,7 @@
 /**
  * The words for the connection state: what the mark's accessible name says, what
  * the desktop tooltip says, what the Lucidos menu's notice leads with, what the
- * header's connection bar states, and what Settings > System spells under its
+ * header's connection bar states, and what System > Overview spells under its
  * status row.
  *
  * A leaf module because the number of surfaces outgrew the one that used to own

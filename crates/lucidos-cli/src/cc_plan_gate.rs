@@ -59,6 +59,12 @@ pub(crate) fn is_plan_artifact(file_path: &str) -> bool {
 }
 
 /// Deny reason for a `Missing` marker — no plan recorded yet.
+///
+/// The third option, the bounded security-fix lane, is named here and nowhere
+/// else a session reads by default. This text is the only one guaranteed to
+/// arrive when an unattended run needs it, and an unattended run is the one
+/// that cannot ask. Its precondition leads the sentence so an attended session
+/// cannot skim past it: a session with a user to ask must ask.
 pub(crate) fn build_deny_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: this branch has no implementation-plan marker yet. Before editing source, \
@@ -66,8 +72,14 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
          security / migration / process change, ADR- or design-backed, or anything beyond a local \
          bug fix), run the `implementation-plan` skill first — it writes docs/plans/<date>-<slug>.md \
          and records a `proposed` marker for the user to approve. If this is a genuinely local fix, \
-         acknowledge it with `lucidos planned mark --simple \"<one-line reason>\"`. Then retry your \
-         edit to `{path}`.",
+         acknowledge it with `lucidos planned mark --simple \"<one-line reason>\"`. ONLY IF NOBODY \
+         CAN BE ASKED (an unattended run, such as the nightly security pass) and this is a security \
+         fix confined to a few named files with a regression test, take the bounded lane instead: \
+         `lucidos planned mark --security-fix \"<finding + the test that proves the fix>\" --files \
+         <comma-separated repo-relative paths>`. Apply then refuses the branch if it touches \
+         anything outside that list, so anything wider stays gated: write the plan, leave the \
+         marker `proposed`, and report that you are blocked on a decision. Then retry your edit to \
+         `{path}`.",
         path = file_path,
     );
     deny_envelope(&reason)
@@ -236,6 +248,22 @@ mod tests {
             reason.contains("lucidos planned mark --simple"),
             "reason must offer the local-fix escape: {reason}"
         );
+        // The bounded security-fix lane is named nowhere else a session reads
+        // by default, and an unattended run is the one that cannot ask. Its
+        // precondition must lead, or an attended session reads it as a general
+        // way past the gate.
+        for needle in [
+            "ONLY IF NOBODY CAN BE ASKED",
+            "lucidos planned mark --security-fix",
+            "--files",
+            "blocked on a decision",
+        ] {
+            assert!(
+                reason.contains(needle),
+                "reason must name the bounded security-fix lane and its bound \
+                 (missing {needle:?}): {reason}"
+            );
+        }
     }
 
     #[test]

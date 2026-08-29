@@ -40,6 +40,17 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// 429, for the pairing route when wrong guesses have used up their budget.
+    ///
+    /// Distinct from a 400 so a person mid-pairing is not sent hunting a typo
+    /// that is not there (`auth::Redemption::Throttled`).
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

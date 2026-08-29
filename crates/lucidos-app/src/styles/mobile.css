@@ -1,3 +1,14 @@
+/* The button around each mobile header glyph. It is declared for every width,
+   unlike the mobile tokens below it, because styles/header-mark.css derives
+   --header-nav-edge-reserve from it and declares that at an unscoped :root. A
+   var() with nothing behind it makes the cluster clamp invalid, which drops the
+   nav cluster's width in silence.
+   Three rules have to agree on this box: the buttons themselves, the centred
+   title's reserve, and the nav cluster's edge reserve. */
+:root {
+    --mobile-header-icon-box: 1.75rem;
+}
+
 /* Prevent iOS Safari from scrolling the document when the keyboard opens.
    overflow:hidden on html reduces (but doesn't fully prevent) the
    window.scrollY drift that pushes the prompt below the viewport.
@@ -29,10 +40,9 @@
            larger still AND tunable, so neither is what the bar's breathing room
            below the row can be measured from. See .mobile-dot-indicator. */
         --mobile-header-glyph-box: var(--icon-size-lg);
-        /* The button around each of those glyphs. Named because two rules need
-           to agree on it: the buttons themselves, and the centred title's
-           reserve, which has to clear whichever button is nearest it. */
-        --mobile-header-icon-box: 1.75rem;
+        /* The button around each of those glyphs is --mobile-header-icon-box,
+           declared at the top of this file rather than here. Its note there
+           says why it cannot be breakpoint-scoped. */
         /* The pane dots, and the equal breathing room kept above and below
            them. */
         --mobile-dot-size: 0.3125rem;
@@ -520,14 +530,14 @@
        derived from that cluster rather than from a constant rem, and it is one
        subtraction of it: the title may span the cluster less a mark's button
        and its clearance at each end. A rem constant would only agree with the
-       mark at one ui-scale, since the cluster's own width is clamped against
+       mark at one ui-scale, since the cluster's own width is measured against
        the row (at 150% the pair used to kiss). Clearing the mark clears the
-       row's own edges with it, on the clamp's middle arm for free: there the
-       cluster keeps --header-nav-edge-reserve (4rem) at each end, wider than
-       the Filter button leading it and the Search button trailing it. On the
-       min-span arm the ends keep only (row - 6.3rem)/2, which is the same
-       regime where the other two rows' chevrons reach their own edge controls,
-       and it is what --header-nav-min-span's note is about.
+       row's own edges with it, on the reserve arm for free: there the cluster
+       keeps --header-nav-edge-reserve (two icon boxes and a gap) at each end,
+       wider than the Filter and Search buttons flanking it. On the floor arm
+       the ends keep only (row - 6.3rem)/2, which is the same regime where the
+       other two rows' chevrons reach their own edge controls, and it is what
+       --header-nav-min-span's note is about.
 
        The title pays for the mark being further in: past ~137.5% ui-scale on a
        375px phone the reserve is narrower than the word, so "Threads" starts

@@ -323,6 +323,109 @@ async fn plan_marker_proposed_then_approved_round_trip() {
     pool.close().await;
 }
 
+/// The bounded security-fix lane over the internal HTTP surface. It satisfies
+/// the gate with no approval step, which is the whole point, and the engine
+/// refuses a mark whose bound could not be enforced.
+///
+/// The refusal must be a 400 carrying the reason. The caller is an unattended
+/// agent that can correct the call, and a 500 reads as an engine fault it would
+/// retry unchanged.
+#[tokio::test]
+async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bound() {
+    let client = http_client();
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/bounded-security-{}", suffix);
+    let mark_url = format!("{}/api/v1/internal/mark-planned", base_url());
+    let state_url = format!("{}/api/v1/internal/planned-state", base_url());
+
+    let read_state = |branch: String| {
+        let client = client.clone();
+        let state_url = state_url.clone();
+        let repo_root = repo_root.to_string();
+        async move {
+            let resp = client
+                .get(&state_url)
+                .query(&[
+                    ("repo_root", repo_root.as_str()),
+                    ("branch_name", branch.as_str()),
+                ])
+                .send()
+                .await
+                .expect("planned-state GET failed");
+            let body: serde_json::Value = resp.json().await.expect("planned-state non-JSON");
+            (
+                body["state"].as_str().unwrap_or_default().to_string(),
+                body["kind"].as_str().unwrap_or_default().to_string(),
+            )
+        }
+    };
+
+    // A bounded fix with no bound is refused, and leaves no marker behind.
+    let no_bound = client
+        .post(&mark_url)
+        .json(&json!({
+            "repo_root": repo_root,
+            "branch_name": branch,
+            "head_sha": "deadbeef",
+            "state": "bounded_security_fix",
+            "reason": "no files named",
+        }))
+        .send()
+        .await
+        .expect("mark-planned POST failed");
+    assert_eq!(
+        no_bound.status(),
+        400,
+        "an unenforceable bound is the caller's mistake, not an engine fault",
+    );
+    let body = no_bound.text().await.unwrap_or_default();
+    assert!(
+        body.contains("--files"),
+        "the 400 body must tell the agent how to fix the call: {body}",
+    );
+    assert_eq!(read_state(branch.clone()).await.0, "MISSING");
+
+    // With a bound it satisfies the gate immediately: no approval step, which
+    // is the deadlock this lane exists to break.
+    let marked = client
+        .post(&mark_url)
+        .json(&json!({
+            "repo_root": repo_root,
+            "branch_name": branch,
+            "head_sha": "deadbeef",
+            "state": "bounded_security_fix",
+            "reason": "unscoped proxy key; covered by proxy_tests::refuses_foreign_host",
+            "files": ["crates/lucidos-engine/src/api/proxy.rs"],
+        }))
+        .send()
+        .await
+        .expect("mark-planned POST failed");
+    assert_eq!(marked.status(), 204, "mark-planned must return 204");
+    assert_eq!(
+        read_state(branch.clone()).await,
+        ("SATISFIED".to_string(), "bounded_security_fix".to_string()),
+        "the lane satisfies the gate, and reports its own kind so a reviewer \
+         can tell it from an approved plan",
+    );
+
+    // Cleanup the marker row (keyed on canonical repo_root).
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let canonical = std::fs::canonicalize(repo_root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| repo_root.to_string());
+    let _ = sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2")
+        .bind(&canonical)
+        .bind(&branch)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
 /// Sequential apply of two changes must both succeed.
 /// Regression test: after applying the first change, the working tree was left
 /// dirty (detached HEAD caused `reset --hard HEAD` to target the wrong commit),

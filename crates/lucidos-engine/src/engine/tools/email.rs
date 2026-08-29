@@ -110,8 +110,29 @@ impl LucidosEngine {
                     );
                 }
 
-                // If use_oauth is set, find the matching OAuth account and link it
+                // If use_oauth is set, find the matching OAuth account and link it.
                 if let Some(oauth_provider) = use_oauth {
+                    // Resolved BEFORE the upsert. The other way round, an
+                    // unconnected provider still rewrote the account's address,
+                    // hosts and ports, then reported the error.
+                    let oauth_account = match OAuthStore::get_by_provider(
+                        &self.pool,
+                        oauth_provider,
+                    )
+                    .await
+                    {
+                        Ok(Some(account)) => account,
+                        Ok(None) => {
+                            return Ok(format!(
+                                "Error: No OAuth account connected for provider '{}'. Use connect_oauth_account first.",
+                                oauth_provider
+                            ));
+                        }
+                        Err(e) => {
+                            return Ok(format!("Error: Failed to look up OAuth account: {}", e))
+                        }
+                    };
+
                     EmailStore::upsert(
                         &self.pool,
                         name,
@@ -127,30 +148,28 @@ impl LucidosEngine {
                     .await
                     .map_err(|e| format!("Error: {}", e))?;
 
-                    match OAuthStore::get_by_provider(&self.pool, oauth_provider).await {
-                        Ok(Some(oauth_account)) => {
-                            EmailStore::link_oauth(&self.pool, name, Some(oauth_account.id))
-                                .await
-                                .map_err(|e| format!("Error: {}", e))?;
-                            return Ok(format!(
-                                "Email account '{}' configured with OAuth ({}) for SMTP authentication. No app password needed. Ready to send/receive.",
-                                name, oauth_provider
-                            ));
-                        }
-                        Ok(None) => {
-                            return Ok(format!(
-                                "Error: No OAuth account connected for provider '{}'. Use connect_oauth_account first.",
-                                oauth_provider
-                            ));
-                        }
-                        Err(e) => {
-                            return Ok(format!("Error: Failed to look up OAuth account: {}", e))
-                        }
-                    }
+                    EmailStore::link_oauth(&self.pool, name, Some(oauth_account.id))
+                        .await
+                        .map_err(|e| format!("Error: {}", e))?;
+                    return Ok(format!(
+                        "Email account '{}' configured with OAuth ({}) for SMTP authentication. No app password needed. Ready to send/receive.",
+                        name, oauth_provider
+                    ));
                 }
 
-                // Check if account already exists with a password or OAuth link
-                if let Ok(Some(existing)) = EmailStore::get(&self.pool, name).await {
+                // Check if account already exists with a password or OAuth link.
+                // A lookup that FAILED is not "no such account": read as one, a
+                // DB blip re-prompts the user for a password already on file.
+                let existing = match EmailStore::get(&self.pool, name).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        return Ok(format!(
+                            "Error: could not read the '{}' email account: {}. Not asking for its password again until this read works.",
+                            name, e
+                        ))
+                    }
+                };
+                if let Some(existing) = existing {
                     if !existing.password.is_empty() || existing.oauth_account_id.is_some() {
                         EmailStore::upsert(
                             &self.pool,

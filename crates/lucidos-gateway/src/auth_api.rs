@@ -319,16 +319,34 @@ struct PairRequest {
 /// Redeem a pairing code and become a paired device.
 ///
 /// Public by necessity: the caller has no credential yet, which is the point.
-/// The code is the only thing standing here, so it is single use and expires.
+/// The code is the only thing standing here, so it is single use, it expires,
+/// and wrong guesses are rate limited. On a wide bind this route is reachable
+/// from the LAN. Unthrottled, it would be eight digits against a caller that
+/// guesses as fast as the socket accepts.
 async fn pair(
     State(state): State<GatewayState>,
     headers: HeaderMap,
     Json(body): Json<PairRequest>,
 ) -> Result<Response, ApiError> {
-    let credential = state
-        .redeem_pairing_code(&body.code, body.label.as_deref())
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::bad_request("that pairing code is not valid or has expired"))?;
+    let credential =
+        match state
+            .redeem_pairing_code(&body.code, body.label.as_deref())
+            .map_err(ApiError::internal)?
+        {
+            crate::server::PairingOutcome::Paired(credential) => credential,
+            crate::server::PairingOutcome::Rejected => {
+                return Err(ApiError::bad_request(
+                    "that pairing code is not valid or has expired",
+                ))
+            }
+            // Said plainly, because the person on the other end may be the user
+            // watching a real code go unanswered. A 400 here would send them
+            // hunting a typo that is not there.
+            crate::server::PairingOutcome::Throttled => return Err(ApiError::too_many_requests(
+                "too many pairing attempts just now, so this one was not checked. Wait a minute \
+                 and try again.",
+            )),
+        };
     let secure = auth::request_is_secure(&headers, state.serves_tls());
     Ok((
         StatusCode::OK,
@@ -788,6 +806,35 @@ mod tests {
         let state = GatewayState::for_tests();
         let response = get(&state, "/dev/", &[("sec-fetch-mode", "navigate")]).await;
         assert!(!response.status().is_success());
+        assert!(response
+            .headers()
+            .get(crate::server::PAIRING_SHELL_HEADER)
+            .is_none());
+    }
+
+    /// The upgrade path is a SECOND way into a workspace, so it has to meet the
+    /// same door (ADR 0151). `enforce` is a router layer and covers the
+    /// fallback, so an unpaired upgrade is refused before the proxy considers
+    /// it. Pinned here because a 401 on a handshake is the whole defence: a
+    /// client that gets one never reaches the engine's socket.
+    #[tokio::test]
+    async fn an_unpaired_websocket_upgrade_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_frontend(dir.path());
+        let response = get(
+            &state,
+            "/dev/api/v1/ws-echo",
+            &[
+                ("connection", "keep-alive, Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // Never a pairing screen: a socket cannot render one, and a 101 here
+        // would hand an unpaired caller the workspace.
         assert!(response
             .headers()
             .get(crate::server::PAIRING_SHELL_HEADER)

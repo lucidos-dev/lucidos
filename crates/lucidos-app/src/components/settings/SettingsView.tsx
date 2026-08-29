@@ -31,6 +31,7 @@ import {
 import { lucidosTiers, type ModelChoice } from '../../store/modelSelection';
 import { ModelSelectionRow } from './ModelSelectionRow';
 import { ModelsManager } from './ModelsManager';
+import { VoiceSection } from './VoiceSection';
 import { AnthropicProviderSettings } from './AnthropicProviderSettings';
 import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
@@ -55,9 +56,10 @@ import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
 import { SystemPage } from './SystemPage';
+import { SystemSubmenu } from './SystemSubmenu';
+import { SettingsNavRow } from './SettingsNavRow';
 import { isTauri, describeDeviceUserAgent } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
-import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
 import { openAddCredential, loadCredentials } from '../../store/actions/credentials';
 import { loadRepositories } from '../../store/actions/chat';
@@ -66,7 +68,6 @@ import { DirectoryPicker } from './DirectoryPicker';
 import { LoadableError } from '../shared/LoadableError';
 import { LoadableToggle } from '../shared/LoadableToggle';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
-import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
 import { systemAttentionBadge } from '../../store/systemAttentionBadge';
 import { LoadingFade } from '../shared/LoadingFade';
 import { openSettingsSubview } from '../../store/actions/menu';
@@ -1244,6 +1245,7 @@ export function SettingsView() {
             )}
           />
         </div>
+        <VoiceSection />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="models:providers">Providers</div>
           <VertexProviderSettings />
@@ -1540,7 +1542,8 @@ export function SettingsView() {
 
   function renderSubview() {
     switch (settingsSubview.value) {
-      case 'system': return <SystemPage />;
+      case 'system': return <SystemSubmenu />;
+      case 'system-overview': return <SystemPage panel="overview" />;
       case 'release-notices': return <SystemPage panel="release-notices" />;
       case 'whats-new': return <SystemPage panel="whats-new" />;
       case 'thread-queue': return <SystemPage panel="thread-queue" />;
@@ -1593,29 +1596,18 @@ export function SettingsView() {
   return (
     <div class="content-view active settings-panel">
       {SETTINGS_NAV_ITEMS.map(({ key, label, group }, i) => (
-        <div class="settings-section settings-nav-item" key={key}>
+        // The third step of the path into System, and still the UNION: this row
+        // leads to both causes, and the submenu below it is where they split.
+        <SettingsNavRow
+          key={key}
+          label={label}
+          badge={key === 'system' ? news : null}
+          onClick={() => openSettingsSubview(key)}
+        >
           {group !== SETTINGS_NAV_ITEMS[i - 1]?.group && (
             <div class="settings-nav-group-title">{group}</div>
           )}
-          {/* A real <button>, not a clickable div: these rows are the only way
-              into a settings category, so a div here puts every category out of
-              keyboard reach (and with it every control inside one). */}
-          <button
-            type="button"
-            class="settings-section-title settings-nav-row"
-            onClick={() => openSettingsSubview(key)}
-            // The mark is decorative, so the row says the words. Only the
-            // badged row carries a label at all: everywhere else the visible
-            // text already names the row, and repeating it would be noise.
-            aria-label={key === 'system' && news ? `${label} · ${news}` : undefined}
-          >
-            {/* The third step of the path into System. Inside the label span, so
-                the mark hugs the word and the chevron keeps the row's trailing
-                edge. Still the union: this row leads to both tabs. */}
-            <span>{label}{key === 'system' && <SystemAttentionBadge placement="inline" label={news} />}</span>
-            <ChevronRightIcon />
-          </button>
-        </div>
+        </SettingsNavRow>
       ))}
     </div>
   );

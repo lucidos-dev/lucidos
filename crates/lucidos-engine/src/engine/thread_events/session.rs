@@ -52,6 +52,29 @@ impl SessionEndReason {
     }
 }
 
+/// Why a voice session ended.
+///
+/// A cause rather than a free string, so a reader can branch on it and a
+/// trigger can filter on it. Distinct from [`SessionEndReason`], which is the
+/// coding-agent session: the two share a word and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionEndReason {
+    /// The caller hung up. The ordinary ending.
+    Hangup,
+    /// The socket died without a goodbye: the network dropped, or the page
+    /// closed. Indistinguishable from a hangup to the user, and worth telling
+    /// apart in the log.
+    Disconnected,
+    /// The talker failed and the call could not go on. Carries no message here:
+    /// the engine logs the detail, and a reason a trigger can match on is worth
+    /// more than prose nobody reads.
+    ProviderFailed,
+    /// The engine went away under the call. Emitted by the shutdown path, or by
+    /// the boot sweep for a start whose process never got that far.
+    EngineShutdown,
+}
+
 /// Outcome of a child thread that just completed, surfaced to the parent via
 /// `ThreadEvent::ChildThreadCompleted`. Replaces the prose discriminator
 /// strings (`"completed with proposed changes"`, `"completed (no changes)"`,

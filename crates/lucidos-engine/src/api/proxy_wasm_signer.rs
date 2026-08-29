@@ -263,6 +263,80 @@ pub fn build_wasmtime_engine() -> Result<Engine, String> {
     Ok(engine)
 }
 
+/// The value [`SELFTEST_MODULE`] returns, and the only value
+/// [`jit_selftest`] accepts.
+const SELFTEST_ANSWER: i32 = 42;
+
+/// A Wasm module exporting `selftest() -> i32`, which returns
+/// [`SELFTEST_ANSWER`].
+///
+/// Hand-assembled rather than written as `.wat`, because parsing text needs
+/// wasmtime's `wat` feature and this crate builds without it. Sections in
+/// order: magic and version, one `() -> i32` type, one function of that type,
+/// the export, then a body of `i32.const 42` and `end`.
+const SELFTEST_MODULE: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version 1
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f, // type: () -> i32
+    0x03, 0x02, 0x01, 0x00, // one function, of type 0
+    0x07, 0x0c, 0x01, 0x08, 0x73, 0x65, 0x6c, 0x66, 0x74, 0x65, 0x73, 0x74, 0x00,
+    0x00, // export "selftest"
+    0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b, // code: i32.const 42, end
+];
+
+/// Budget for the self-test call. Generous: it exists to stop a wedge, not to
+/// measure anything.
+const SELFTEST_BUDGET: Duration = Duration::from_secs(30);
+
+/// Compile and run [`SELFTEST_MODULE`], proving this binary may execute code it
+/// compiled at runtime.
+///
+/// **This is a packaging gate, not a health check.** On macOS the hardened
+/// runtime kills a process that executes a page no signature covers, and
+/// wasmtime does exactly that. So a signed engine missing
+/// `com.apple.security.cs.allow-unsigned-executable-memory` dies with SIGKILL on
+/// its first proxy signer call, and it dies the same way on every retry. That
+/// shipped in 2026.08.28.0.
+///
+/// The build runs this against the SIGNED binary, which is the whole point: an
+/// entitlement readback proves what the plist asked for, and this proves the
+/// kernel agreed. Reuses [`build_wasmtime_engine`] so the config it clears is
+/// the config the signer uses, never a simpler one that could pass alone.
+///
+/// Needs no database, no workspace and no network, so it can run inside a
+/// signing step. See
+/// `docs/plans/2026-08-29-the-packaged-engine-is-allowed-to-jit.md`.
+pub async fn jit_selftest() -> Result<(), String> {
+    let engine = build_wasmtime_engine()?;
+    let module =
+        Module::new(&engine, SELFTEST_MODULE).map_err(|e| format!("compile selftest: {e}"))?;
+    let mut store: Store<()> = Store::new(&engine, ());
+    // Same shape as `WasmSignerLayer::apply`: epoch interruption is on for the
+    // whole engine, so a store that never sets a deadline is a wedge waiting to
+    // happen.
+    store.set_epoch_deadline(epoch_deadline_ticks(SELFTEST_BUDGET));
+    store.epoch_deadline_trap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let instance = linker
+        .instantiate_async(&mut store, &module)
+        .await
+        .map_err(|e| format!("instantiate selftest: {e}"))?;
+    let func = instance
+        .get_typed_func::<(), i32>(&mut store, "selftest")
+        .map_err(|e| format!("selftest export missing: {e}"))?;
+    // The call is what the hardened runtime kills. Nothing before it touches a
+    // page the kernel objects to, so a binary that reaches here still fails.
+    let got = func
+        .call_async(&mut store, ())
+        .await
+        .map_err(|e| format!("call selftest: {e}"))?;
+    if got != SELFTEST_ANSWER {
+        return Err(format!(
+            "selftest returned {got}, expected {SELFTEST_ANSWER}"
+        ));
+    }
+    Ok(())
+}
+
 /// Number of epoch ticks that make up `budget` (at least 1, so even a
 /// sub-tick budget still traps at the next increment).
 fn epoch_deadline_ticks(budget: Duration) -> u64 {
@@ -574,6 +648,17 @@ enum BodyViewOwned {
 impl AuthLayer for WasmSignerLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// The module never sees the bytes, but the signature it produces travels
+    /// to the upstream, so the same scope decides.
+    fn scope_bindings(&self) -> Vec<crate::api::proxy_auth_layer::ScopeBinding> {
+        self.credential_handles
+            .iter()
+            .map(|h| {
+                crate::api::proxy_auth_layer::ScopeBinding::StoredCredential(h.credential.clone())
+            })
+            .collect()
     }
 
     async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {

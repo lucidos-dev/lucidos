@@ -324,7 +324,7 @@ impl ArtifactManager {
 
                 for artifact_path in &paths {
                     let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
-                    index.add_path(Path::new(&repo_path))?;
+                    super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
                 }
                 index.write()?;
 
@@ -368,7 +368,7 @@ impl ArtifactManager {
 
                 for data_path in &paths {
                     let repo_path = format!("data/{}", data_path);
-                    index.add_path(Path::new(&repo_path))?;
+                    super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
                 }
                 index.write()?;
 
@@ -445,7 +445,7 @@ impl ArtifactManager {
                 let mut index = repo.index()?;
                 super::reset_index_to_head(&repo, &mut index)?;
 
-                index.add_path(Path::new(&repo_path))?;
+                super::add_path_unless_ignored(&repo, &mut index, &repo_path)?;
                 index.write()?;
 
                 super::commit_index(&repo, &message)
@@ -1030,5 +1030,45 @@ mod tests {
             .await
             .unwrap();
         assert!(!sha.is_empty());
+    }
+
+    /// `index.add_path` stages whatever it is handed, ignore rules included.
+    /// So a `run_python` script writing `data/.env`, the documented route for
+    /// a loose data-root file, put the workspace secrets into the tracked
+    /// repo. The real output beside it must still commit.
+    #[tokio::test]
+    async fn committing_a_gitignored_data_path_stages_nothing() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let am = ArtifactManager::new(ws.to_path_buf()).unwrap();
+
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/.env"), "OPENAI_API_KEY=sk-secret").unwrap();
+        std::fs::write(ws.join("data/artifacts/report.csv"), "col1\n1").unwrap();
+
+        am.commit_data_paths(
+            &[".env".to_string(), "artifacts/report.csv".to_string()],
+            "test: a script's output beside a secret",
+        )
+        .await
+        .unwrap();
+
+        let repo = Repository::open(ws).unwrap();
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        assert!(
+            tree.get_path(Path::new("data/.env")).is_err(),
+            "data/.env is gitignored and must never be committed"
+        );
+        assert!(
+            tree.get_path(Path::new("data/artifacts/report.csv"))
+                .is_ok(),
+            "the script's real output must still commit"
+        );
     }
 }

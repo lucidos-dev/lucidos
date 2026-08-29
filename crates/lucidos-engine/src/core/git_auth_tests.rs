@@ -14,7 +14,7 @@ fn credential(auth_type: AuthType, auth_value: &str) -> Credential {
     Credential {
         id: uuid::Uuid::new_v4(),
         service_name: "example-git".to_string(),
-        base_url: "https://github.com".to_string(),
+        base_urls: vec!["https://github.com".to_string()],
         auth_type,
         auth_value: auth_value.to_string(),
         auth_header: "Authorization".to_string(),
@@ -22,6 +22,14 @@ fn credential(auth_type: AuthType, auth_value: &str) -> Credential {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// The one entry a single-scope fixture reduces to, or `None` when its type
+/// carries nothing a clone can present.
+fn only_entry(credential: Credential) -> Option<StoredGitCredential> {
+    let mut entries = StoredGitCredential::entries_from_credential(credential);
+    assert!(entries.len() <= 1, "the fixture declares one base URL");
+    entries.pop()
 }
 
 fn stored(base_url: &str, username: Option<&str>, secret: &str) -> StoredGitCredential {
@@ -183,8 +191,7 @@ fn an_empty_plan_is_spent_immediately() {
 #[test]
 fn a_bearer_or_api_key_credential_is_a_bare_token() {
     for auth_type in [AuthType::Bearer, AuthType::ApiKey] {
-        let entry = StoredGitCredential::from_credential(credential(auth_type, "ghp-secret"))
-            .expect("a usable credential");
+        let entry = only_entry(credential(auth_type, "ghp-secret")).expect("a usable credential");
         assert_eq!(entry.username, None, "{auth_type}");
         assert_eq!(entry.secret, "ghp-secret");
         assert_eq!(entry.kind(), StoredKind::Token);
@@ -196,21 +203,19 @@ fn a_bearer_or_api_key_credential_is_a_bare_token() {
 #[test]
 fn a_stored_secret_keeps_the_whitespace_the_user_stored() {
     let entry =
-        StoredGitCredential::from_credential(credential(AuthType::Bearer, " pw with ends "))
-            .expect("a usable credential");
+        only_entry(credential(AuthType::Bearer, " pw with ends ")).expect("a usable credential");
     assert_eq!(entry.secret, " pw with ends ");
 
-    let entry =
-        StoredGitCredential::from_credential(credential(AuthType::Basic, "alice: pw with ends "))
-            .expect("a usable credential");
+    let entry = only_entry(credential(AuthType::Basic, "alice: pw with ends "))
+        .expect("a usable credential");
     assert_eq!(entry.username.as_deref(), Some("alice"));
     assert_eq!(entry.secret, " pw with ends ");
 }
 
 #[test]
 fn a_basic_credential_splits_on_the_first_colon() {
-    let entry = StoredGitCredential::from_credential(credential(AuthType::Basic, "alice:pw:with"))
-        .expect("a usable credential");
+    let entry =
+        only_entry(credential(AuthType::Basic, "alice:pw:with")).expect("a usable credential");
     assert_eq!(entry.username.as_deref(), Some("alice"));
     assert_eq!(entry.secret, "pw:with", "a colon in the password survives");
     assert_eq!(entry.kind(), StoredKind::UserPass);
@@ -220,15 +225,14 @@ fn a_basic_credential_splits_on_the_first_colon() {
 /// for. Reading it as a token still clones, where refusing it would not.
 #[test]
 fn a_basic_credential_without_a_colon_reads_as_a_token() {
-    let entry = StoredGitCredential::from_credential(credential(AuthType::Basic, "ghp-secret"))
-        .expect("a usable credential");
+    let entry = only_entry(credential(AuthType::Basic, "ghp-secret")).expect("a usable credential");
     assert_eq!(entry.username, None);
     assert_eq!(entry.kind(), StoredKind::Token);
 }
 
 #[test]
 fn a_password_credential_reads_its_json_pair() {
-    let entry = StoredGitCredential::from_credential(credential(
+    let entry = only_entry(credential(
         AuthType::Password,
         r#"{"username":"alice","password":"pw"}"#,
     ))
@@ -251,11 +255,36 @@ fn a_credential_carrying_nothing_a_clone_can_present_is_skipped() {
         (AuthType::Password, r#"{"username":"alice"}"#),
     ] {
         assert_eq!(
-            StoredGitCredential::from_credential(credential(auth_type, auth_value)),
+            only_entry(credential(auth_type, auth_value)),
             None,
             "{auth_type} / {auth_value}"
         );
     }
+}
+
+/// A scope is a set, so one credential is offered at every host it names and
+/// nowhere else. The set widens by named hosts, never by a shape.
+#[test]
+fn a_credential_declaring_two_hosts_is_offered_at_both_and_no_third() {
+    let mut row = credential(AuthType::Bearer, "ghp-secret");
+    row.base_urls = vec![
+        "https://github.com".to_string(),
+        "https://git.example.com".to_string(),
+    ];
+    let credentials = resolved(StoredGitCredential::entries_from_credential(row));
+
+    for host in ["https://github.com", "https://git.example.com"] {
+        assert_eq!(
+            credentials
+                .for_url(&format!("{host}/example-org/example-repo.git"))
+                .map(|c| c.secret.as_str()),
+            Some("ghp-secret"),
+            "{host}"
+        );
+    }
+    assert!(credentials
+        .for_url("https://git.evil.test/example-org/example-repo.git")
+        .is_none());
 }
 
 #[test]

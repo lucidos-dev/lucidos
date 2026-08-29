@@ -108,9 +108,13 @@ export function CredentialItem({ credential }: Props) {
       <div class="list-row-info">
         <div class="title list-row-name">{title}</div>
         <div class="list-row-details">
-          {/* Gated: a `secret` has no base URL, and `.list-row-details` is a
-              flex row whose gap would render the empty span as a hole. */}
-          {credential.base_url && <span class="list-row-url">{credential.base_url}</span>}
+          {/* One field per base URL the credential covers, since a *credential
+              scope* is a set. `.list-row-details` is a flex row of fields, so
+              its own gap separates them. A `secret` declares none and renders
+              nothing, rather than an empty span the gap would show as a hole. */}
+          {credential.base_urls.map((url) => (
+            <span class="list-row-url" key={url}>{url}</span>
+          ))}
           <span class="list-row-type">{formatAuthType(credential.auth_type)}</span>
         </div>
         {/* A sentence, so `.list-row-details-prose` (the bare class is a flex

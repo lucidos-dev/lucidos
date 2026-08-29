@@ -1092,7 +1092,22 @@ mod tests {
     /// notification about one item landed on whatever the app shows by
     /// default. Knowhow cannot carry it, for the reason the app-link clause
     /// could not: the tap is written in the same breath as the notification.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_552;
+    ///
+    /// Raised by 21 to a measured 116,573 for `send_email`'s attachment
+    /// wording. Attachments used to be validated for traversal only, so a path
+    /// naming the `data/` root mailed the workspace `.env` to any address the
+    /// model chose. The validator now takes a typed subdirectory, and a schema
+    /// still saying "relative to data/" would send the model at a path that is
+    /// refused. Knowhow cannot carry it: the schema is what the model reads
+    /// when it writes the argument.
+    ///
+    /// Raised by 58 to a measured 116,631 for `navigate_ui`'s
+    /// `system-overview`. Settings > System became a submenu, so `system` now
+    /// opens a list of rows. The versions, the update control and the restart
+    /// moved to a page of their own. Without a value naming that page, the
+    /// model cannot ask for them at all. Knowhow cannot carry it: the enum is
+    /// what the model picks from when it writes the argument.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_631;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1325,16 +1340,19 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_436,
-            "the two frozen enums the SDK is generated from (17 targets, 18 \
-             settings views) are 758 chars before a word of prose; the settings \
+            2_494,
+            "the two frozen enums the SDK is generated from (17 targets, 21 \
+             settings views) are 447 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
              glossed, because the value already says what the page is). Raised \
              from 2,300 by `fragment`, the companion arg naming a place inside \
              the app. It has to say where the value surfaces, the app's own \
              `location.hash`, because no other surface the model reads says \
-             so, and the choice is made while writing the call",
+             so, and the choice is made while writing the call. Raised from \
+             2,436 by `system-overview`: Settings > System became a submenu, \
+             so `system` opens a list of rows and the versions and restart \
+             the model used to reach there now need their own value",
         ),
         (
             "request_credential",

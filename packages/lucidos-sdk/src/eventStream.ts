@@ -15,15 +15,6 @@
  * `document`.
  */
 
-/** The payload the engine sends with a `PresenceCheck`. Structural, so the
- *  worker can route one without depending on the host's own copy of the type. */
-export interface PresenceCheckLike {
-  notification_id: string;
-  event_id: string | null;
-  deadline_ms: number;
-  sent_at_ms: number;
-}
-
 /** One document's answer to a `PresenceCheck`, before aggregation. */
 export interface PongAnswer {
   device_id: string;

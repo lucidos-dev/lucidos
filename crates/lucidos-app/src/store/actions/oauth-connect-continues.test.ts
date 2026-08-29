@@ -70,7 +70,7 @@ describe('a saved registration continues the connection it was blocking', () => 
     await submitRequestedCredential(
       { service: 'dropbox' },
       'dropbox',
-      'https://api.dropboxapi.test',
+      ['https://api.dropboxapi.test'],
       'oauth_client',
       '{"client_id":"abc"}',
     );
@@ -90,7 +90,7 @@ describe('a saved registration continues the connection it was blocking', () => 
       submitRequestedCredential(
         { service: 'dropbox' },
         'dropbox',
-        'https://api.dropboxapi.test',
+        ['https://api.dropboxapi.test'],
         'oauth_client',
         '{"client_id":"abc"}',
       );
@@ -111,7 +111,7 @@ describe('a saved registration continues the connection it was blocking', () => 
     await submitRequestedCredential(
       { service: 'dropbox' },
       'dropbox',
-      'https://api.dropboxapi.test',
+      ['https://api.dropboxapi.test'],
       'oauth_client',
       '{"client_id":"abc"}',
     );
@@ -130,7 +130,7 @@ describe('a saved registration continues the connection it was blocking', () => 
     await submitRequestedCredential(
       { service: 'jira' },
       'jira',
-      'https://jira.test',
+      ['https://jira.test'],
       'api_key',
       'secret',
     );
@@ -147,7 +147,7 @@ describe('a saved registration continues the connection it was blocking', () => 
     await submitRequestedCredential(
       { service: 'dropbox' },
       'dropbox',
-      'https://api.dropboxapi.test',
+      ['https://api.dropboxapi.test'],
       'oauth_client',
       '{"client_id":"abc"}',
     );
@@ -162,7 +162,7 @@ describe('a repair updates the existing registration', () => {
     await submitRequestedCredential(
       { service: 'dropbox', existing_credential_id: 'cred-1', missing: ['auth_url'] },
       'dropbox',
-      'https://api.dropboxapi.test',
+      ['https://api.dropboxapi.test'],
       'oauth_client',
       '{"client_id":"abc","auth_url":"https://dropbox.test/authorize"}',
     );
@@ -170,7 +170,7 @@ describe('a repair updates the existing registration', () => {
     expect(createCredential).not.toHaveBeenCalled();
     expect(updateCredential).toHaveBeenCalledWith('cred-1', expect.objectContaining({
       auth_type: 'oauth_client',
-      base_url: 'https://api.dropboxapi.test',
+      base_urls: ['https://api.dropboxapi.test'],
     }));
   });
 
@@ -179,7 +179,7 @@ describe('a repair updates the existing registration', () => {
     await submitRequestedCredential(
       { service: 'dropbox' },
       'dropbox',
-      'https://api.dropboxapi.test',
+      ['https://api.dropboxapi.test'],
       'oauth_client',
       '{"client_id":"abc"}',
     );

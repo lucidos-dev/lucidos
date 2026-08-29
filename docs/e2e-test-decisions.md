@@ -46,7 +46,9 @@ This tests the important thing (data persistence) without depending on the auto-
 Lucidos uses HTTPS even in dev (Vite TLS). Both Playwright (`ignoreHTTPSErrors: true`) and Rust tests (`danger_accept_invalid_certs`) accept self-signed certificates.
 
 ### Port discovery
-Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
+Both test layers read the workspace ports from `<workspace>/.lucidos/ports`. The workspace path is configurable via the `E2E_WORKSPACE` environment variable, defaulting to `~/workspaces/e2e-test`.
+
+**The name is gated.** `scripts/lib/e2e.sh` asserts at source time that the basename starts with `e2e-`, and aborts otherwise. The suite drops that workspace's database and force-removes its worktrees and `lucidos-*` branches. Nothing else checked what the variable pointed at, so `E2E_WORKSPACE=$HOME/workspaces/dev` was a working way to destroy a live workspace. It is asserted at source time rather than inside the destructive functions because `setup_e2e_session` installs its teardown trap first: a refusal raised later aborts under `set -e` and the trap then runs against the workspace just refused. A new sandbox in a lib test must be named to match.
 
 ### Unknown API routes return SPA fallback
 The engine proxies unknown `/api/v1/*` routes to Vite, which returns the SPA HTML fallback with status 200. The Rust error test verifies the response is not valid JSON (i.e., it's HTML) rather than asserting a specific HTTP status code.

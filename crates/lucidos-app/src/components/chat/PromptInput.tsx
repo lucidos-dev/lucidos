@@ -20,6 +20,7 @@ import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
+import { CallStrip } from './CallStrip';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
@@ -1155,6 +1156,10 @@ export function PromptInput() {
           <span class="url-context-label">{panelTitle.value || 'Page content'}</span>
         </div>
       )}
+      {/* A live call, above the composer and never in place of it. The composer
+          stays usable throughout, so speech and typing interleave in one
+          transcript (the parent plan's decision 2). */}
+      <CallStrip />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea

@@ -59,11 +59,27 @@ export type MessageOrigin =
       mode?: ActorMode;
       direction?: ThreadDirection;
     }
+  /** An agent in this thread authored the event, and `agent` names which one
+   *  (ADR 0150). The outbound case: every other variant names a way IN.
+   *  `agent` is absent on a payload written without it, and means the
+   *  workspace's own Lucidos Agent. */
+  | { kind: 'agent'; agent?: AgentParticipant }
+  /** An inbound webhook fired. `name` is what the user called it, so the
+   *  timeline can say which hook rather than "API caller". */
+  | { kind: 'webhook'; webhook_id: string; name: string }
   | { kind: 'engine'; reason: EngineReason }
   /** The host system killed the underlying process (engine shutdown, OS signal,
    *  crash, safety-net catch). Distinct from `engine` which represents
    *  engine-deliberate actions (hardening retrigger, scheduler, merge conflict). */
   | { kind: 'system' };
+
+/** Mirrors the Rust `AgentParticipant` enum (serde tag = "kind", snake_case).
+ *  Which agent authored a thread event, once a thread can carry more than one
+ *  (ADR 0150). `lucidos_agent` is the default and what a payload naming no
+ *  participant decodes to. */
+export type AgentParticipant =
+  | { kind: 'lucidos_agent' }
+  | { kind: 'guest'; label: string };
 
 /** The five actor labels below are the WHOLE of what this module says about the
  *  actor chip. Every chip's glyph is a component and every one of them resolves
@@ -107,6 +123,12 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
     case 'api':         return origin.mode ?? 'human';
     case 'workspace':   return origin.mode ?? 'human';
     case 'thread_link': return origin.mode ?? 'agent';
+    // A guest collapses to plain agent mode on purpose, so `actorInitiator`
+    // draws one Lucidos chip whoever wrote the turn. The user meets one
+    // entity (ADR 0149); the split is for `history.rs`, whose reader must
+    // NOT (ADR 0150).
+    case 'agent':       return 'agent';
+    case 'webhook':     return 'engine';
     case 'engine':      return 'engine';
     case 'system':      return 'engine';
   }
@@ -385,6 +407,21 @@ export type EventWaitCancelCause =
   | 'thread_canceled'
   | 'unknown';
 
+/** Why a voice session ended.
+ *
+ *  `hangup` is the caller ringing off, and the ordinary one. `disconnected` is
+ *  the socket dying with no goodbye, which the user cannot tell apart from a
+ *  hangup and the log can.
+ *
+ *  `provider_failed` and `engine_shutdown` are the two the user did not choose.
+ *  A shutdown row is also what the boot sweep writes for a session whose engine
+ *  never got to emit its own end. */
+export type VoiceSessionEndReason =
+  | 'hangup'
+  | 'disconnected'
+  | 'provider_failed'
+  | 'engine_shutdown';
+
 export type ThreadEvent =
   | { type: 'MessageReceived'; text: string; channel?: EventChannel; user_image_hashes?: string[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
   | { type: 'QueuedMessageRemoved'; removed_message_id: string; actor?: MessageOrigin; channel?: EventChannel }
@@ -627,7 +664,25 @@ export type ThreadEvent =
   // `actor` rides `EventMeta` like every other stamped event. A `user_stop`
   // opens a turn of its own (see `isUserStoppedWait`), and this is what puts
   // the device that pressed the button in that turn's origin popover.
-  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; on?: EventSubscription[]; reason?: string; was_attached?: boolean; actor?: MessageOrigin };
+  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; on?: EventSubscription[]; reason?: string; was_attached?: boolean; actor?: MessageOrigin }
+  // ── Voice-session lifecycle ───────────────────────────────────────────
+  // Voice is a mode of a thread, never a kind of one (ADR 0148). So neither of
+  // these moves the thread's status or its section.
+  //
+  // They pair by `session_id`, and the pair is the only record a session
+  // leaves. The audio is never persisted, and a spoken turn is its own event.
+  //
+  // `actor` rides `EventMeta`. The start carries the device that opened the
+  // socket; the end carries whoever or whatever closed it.
+  | { type: 'VoiceSessionStarted'; session_id: string; actor?: MessageOrigin }
+  | { type: 'VoiceSessionEnded'; session_id: string; reason: VoiceSessionEndReason; duration_secs: number; actor?: MessageOrigin }
+  // What the talker said out loud, one per talker turn. It carries text and
+  // never audio, so this is the only record of a spoken turn.
+  //
+  // `actor` is the talker itself: `MessageOrigin.Agent` naming a guest (ADR
+  // 0150). That is what tells a spoken turn apart from the reasoner's written
+  // one, which the caller never heard.
+  | { type: 'SpokenReplyGenerated'; session_id: string; text: string; interrupted: boolean; actor?: MessageOrigin };
 
 /** Every `ThreadEvent['type']` discriminant, as a compile-time-checked object.
  *  The `satisfies Record<ThreadEvent['type'], true>` annotation forces this map
@@ -713,6 +768,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   BackgroundBashCompleted: true,
   ImageDescribed: true,
   ConversationSummarized: true,
+  VoiceSessionStarted: true,
+  VoiceSessionEnded: true,
+  SpokenReplyGenerated: true,
 } satisfies Record<ThreadEvent['type'], true>;
 
 /** Runtime-enumerable set of every `ThreadEvent['type']` discriminant. Derived

@@ -306,6 +306,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // Packaging gate, run by the DMG build against the just-signed binary. It
+    // compiles a tiny Wasm module and calls it. That call is what the macOS
+    // hardened runtime kills when the engine may not execute code it compiled
+    // itself. Exits before any engine construction, so it needs no database, no
+    // workspace and no network.
+    if std::env::args().skip(1).any(|a| a == "--wasm-selftest") {
+        return match build_runtime()?.block_on(lucidos_engine::jit_selftest()) {
+            Ok(()) => {
+                log!("[Selftest] wasm JIT selftest passed");
+                Ok(())
+            }
+            Err(e) => Err(format!("wasm JIT selftest failed: {e}").into()),
+        };
+    }
+
     // The workspace gateway is the standalone `lucidos-gateway` binary (ADR
     // 0014 §1). A stray `--gateway` flag is a misconfiguration: fail loudly,
     // rather than silently booting one engine on the gateway's port.
@@ -378,12 +393,54 @@ async fn run_restore_archive() -> Result<(), Box<dyn std::error::Error + Send + 
     Ok(())
 }
 
+/// What this engine will bind, resolved from env, `network.toml` and the
+/// per-workspace preference.
+///
+/// SECURITY: the bind resolves loopback-first, and `net_config` owns the whole
+/// precedence order. With nothing set the default is loopback-only. A malformed
+/// value fails safe to loopback, never to all-interfaces.
+///
+/// The all-interfaces case binds `[::]`, and macOS defaults IPV6_V6ONLY=0 so
+/// that serves IPv4 too. A packaged gateway engine sets
+/// `LUCIDOS_BIND_LOOPBACK=1`, pinning it to loopback behind the proxy.
+///
+/// Called before the router is built, because the answer decides whether that
+/// router requires a credential (`api::local_auth`). A wide bind no longer
+/// means an unauthenticated API. It does mean a browser must come through the
+/// gateway rather than straight to this port.
+async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
+    let loopback_signal = std::env::var("LUCIDOS_BIND_LOOPBACK")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let bind_addr_env = std::env::var("LUCIDOS_BIND_ADDR").ok();
+    let bind_all_env = std::env::var("LUCIDOS_BIND_ALL").ok();
+    let net = net_config::read_network_toml();
+    // The per-workspace bind only matters when engines do NOT inherit the
+    // gateway bind; read it from this workspace's DB then.
+    let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
+        lucidos_engine::core::preferences::PreferenceStore::get(
+            engine.pool(),
+            net_config::NETWORK_BIND_PREF_KEY,
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    net_config::resolve_engine_bind(
+        loopback_signal,
+        bind_addr_env.as_deref(),
+        bind_all_env.as_deref(),
+        net.engine_inherit,
+        net.gateway_bind.as_deref(),
+        per_workspace_bind.as_deref(),
+    )
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Multiple crates enable both the aws-lc-rs and ring features on rustls, so
-    // auto-detection fails. Install one explicitly before any TLS use.
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls CryptoProvider");
+    // Before any TLS use, and before anything that might reach the network.
+    lucidos_engine::net_config::install_crypto_provider();
 
     let _ = dotenvy::dotenv();
 
@@ -457,7 +514,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // authored. `seed_if_absent` will not run twice.
     let seeded_handshake_scripts = match lucidos_engine::core::handshake_approvals::seed_if_absent(
         &workspace_path,
-        &proxy_load.handshake_script_paths(),
+        &proxy_load.handshake_seed_entries(),
     ) {
         Ok(seeded) => seeded,
         Err(e) => {
@@ -480,6 +537,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "[Startup] apis.json: refusing '{}': {}",
             rejected.label(),
             rejected.reason
+        );
+    }
+    let proxy_insecure_transports = proxy_load.insecure;
+    for insecure in &proxy_insecure_transports {
+        log!(
+            "[Startup] apis.json: '{}' has an unauthenticated transport: {}",
+            insecure.provider,
+            insecure.reason
         );
     }
 
@@ -692,6 +757,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .await;
     }
 
+    // Say once, loudly, which providers the engine will not vouch for. Same two
+    // surfaces and same reasoning as the rejection announce above: nothing is
+    // subscribed to SSE this early, so the notification is the half that lands.
+    if !proxy_insecure_transports.is_empty() {
+        let summary = proxy_insecure_transports
+            .iter()
+            .map(|i| format!("{}: {}", i.provider, i.reason))
+            .collect::<Vec<_>>()
+            .join("\n");
+        engine
+            .event_bus
+            .emit_or_log(
+                lucidos_engine::engine::event_bus::BusEvent::System(
+                    lucidos_engine::engine::event_bus::SystemEvent::NotificationCreated {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        title: "Proxy transport is not authenticated".to_string(),
+                        message: format!(
+                            "Anyone on the network path to these providers can read \
+                             the credentials Lucidos sends them.\n\n{summary}"
+                        ),
+                        task_id: None,
+                        app_id: None,
+                        thread_id: None,
+                        event_id: None,
+                        tap: Default::default(),
+                        actor: None,
+                    },
+                ),
+                "[Proxy] insecure transport NotificationCreated",
+            )
+            .await;
+    }
+
     // A credential the proxy would now refuse for want of a scope gets the one
     // its own entry uses, once, and says so (ADR 0144). Two entries disagreeing
     // is not an answer, so those are left for the user to settle.
@@ -711,6 +809,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(true) => log!("[Startup] scoped credential '{}' to {}", name, base_url),
             Ok(false) => {}
             Err(e) => log!("[Startup] could not scope credential '{}': {}", name, e),
+        }
+    }
+
+    // The builtin `local` provider has no `apis.json` entry to read a scope
+    // from, so its credential gets the base URL the provider itself resolves.
+    // Same once-only inference, and it keeps a workspace that already stores a
+    // `local` key working after the proxy started checking scopes.
+    if let Some(local_base) = lucidos_engine::api::local_upstream_base_url(engine.pool()).await {
+        match lucidos_engine::core::CredentialStore::infer_scope_if_empty(
+            engine.pool(),
+            &engine.event_bus,
+            "local",
+            &local_base,
+        )
+        .await
+        {
+            Ok(true) => log!("[Startup] scoped credential 'local' to {}", local_base),
+            Ok(false) => {}
+            Err(e) => log!("[Startup] could not scope credential 'local': {}", e),
         }
     }
 
@@ -821,6 +938,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Same for the chat MCP permission lane: a chat turn parked on an
     // McpPermissionRequested is dead after restart, so clear the card.
     lucidos_engine::engine::mcp_permission::recover_orphan_mcp_permission_requests(
+        shared_engine.pool(),
+        &shared_engine.event_bus,
+    )
+    .await;
+    // A voice session died with the process holding its socket, so every
+    // unpaired start belongs to a call that is already over.
+    lucidos_engine::voice::recovery::settle_orphan_voice_sessions(
         shared_engine.pool(),
         &shared_engine.event_bus,
     )
@@ -1136,6 +1260,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // scheduler's event replay just loaded.
     shared_engine.thread_queue.start_draining();
 
+    // Resolved BEFORE the router is built, because it decides whether the
+    // router carries a door (`api::local_auth`). The port it will be paired
+    // with is read further down, where the listener is set up.
+    let bind_choice = resolve_bind_choice(&shared_engine).await;
+
     let started_at = chrono::Utc::now();
     let app = create_router(
         shared_engine.clone(),
@@ -1146,6 +1275,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         workspace_path,
         scheduler.clone(),
         started_at,
+        &bind_choice,
     );
     // Dev-only: advance this engine's served-frontend snapshot to the
     // checkout-shared `dist/` when that is safe. A PEER workspace then picks up
@@ -1201,41 +1331,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }),
         None => 3000,
     };
-    // SECURITY: the bind resolves loopback-first, and `net_config` owns the
-    // whole precedence order. With nothing set the default is loopback-only,
-    // because a directly-launched engine has no request-level API auth. A
-    // malformed value fails safe to loopback, never to all-interfaces.
-    //
-    // The all-interfaces case binds `[::]`, and macOS defaults IPV6_V6ONLY=0 so
-    // that serves IPv4 too. A packaged gateway engine sets
-    // `LUCIDOS_BIND_LOOPBACK=1`, pinning it to loopback behind the proxy.
-    let loopback_signal = std::env::var("LUCIDOS_BIND_LOOPBACK")
-        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    let bind_addr_env = std::env::var("LUCIDOS_BIND_ADDR").ok();
-    let bind_all_env = std::env::var("LUCIDOS_BIND_ALL").ok();
-    let net = net_config::read_network_toml();
-    // The per-workspace bind only matters when engines do NOT inherit the
-    // gateway bind; read it from this workspace's DB then.
-    let per_workspace_bind = if !loopback_signal && !net.engine_inherit {
-        lucidos_engine::core::preferences::PreferenceStore::get(
-            shared_engine.pool(),
-            net_config::NETWORK_BIND_PREF_KEY,
-        )
-        .await
-        .ok()
-        .flatten()
-    } else {
-        None
-    };
-    let bind_choice = net_config::resolve_engine_bind(
-        loopback_signal,
-        bind_addr_env.as_deref(),
-        bind_all_env.as_deref(),
-        net.engine_inherit,
-        net.gateway_bind.as_deref(),
-        per_workspace_bind.as_deref(),
-    );
     // Every address to listen on. A specific `Address` ALSO binds loopback, so
     // the gateway probe, the dev scripts and the engine's own restart callback
     // keep working over `127.0.0.1`. `addr` is the primary, used only for the

@@ -529,11 +529,21 @@ impl LucidosEngine {
             // session's worktree is checked out on it); mirror
             // `apply_now_success`: emit `ChangeApplied`, reset the worktree to
             // main, keep the session alive.
+            // A read that failed is not "no pending change". It falls through
+            // to the branch below, which resets the worktree. So the reason has
+            // to reach the log rather than vanish into an empty list.
             let pending_change = self
                 .changes()
                 .pending_for_thread(thread_id)
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|e| {
+                    log!(
+                        "[ApplyNow] pending_for_thread({}): {}. Treating the branch as having nothing to apply",
+                        thread_id,
+                        e
+                    );
+                    Vec::new()
+                })
                 .into_iter()
                 .next();
             if let Some(change) = pending_change {
@@ -636,6 +646,42 @@ impl LucidosEngine {
                 .await;
             // CC stays alive for retry
             return Ok(());
+        }
+
+        // Step 5b: the bounded-security-fix bound, checked on THIS path too.
+        //
+        // `apply_now` is a second route to main: with a live session it merges
+        // below rather than through `change_ops::apply_change`, so the bound
+        // enforced there would never run. The lane skips the human plan
+        // decision in exchange for this check, and `apply_now_success` consumes
+        // the marker afterwards, so nothing later can catch a breach.
+        //
+        // Here rather than at the merge, for the same reason as in
+        // `apply_change_inner`: this returns a clean refusal, while an `Err`
+        // out of the merge helpers reads as "main diverged" and escalates.
+        //
+        // Only the bounded lane is gated. Whether this path should carry the
+        // whole plan floor is a separate question, and widening it would start
+        // refusing applies that work today.
+        if let crate::engine::git_ops::PlanMarkerState::Present(kind) =
+            self.plan_marker_state(repo_root, branch_name).await
+        {
+            if kind.is_file_bounded() {
+                let dirty = crate::engine::git_ops::worktree_dirty_files(worktree_path).await;
+                if let Some(msg) = self
+                    .bounded_fix_refusal(repo_root, dirty, branch_name)
+                    .await
+                {
+                    log!(
+                        "[ApplyNow] Apply blocked: bounded security fix left its bound on branch {}",
+                        branch_name
+                    );
+                    self.emit_apply_failed(thread_id, change_id, &msg, actor.clone())
+                        .await;
+                    // CC stays alive so the session can widen the bound or plan.
+                    return Ok(());
+                }
+            }
         }
 
         // Step 6: Merge main into CC worktree and ff main to the branch

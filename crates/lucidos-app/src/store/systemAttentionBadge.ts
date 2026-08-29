@@ -2,7 +2,7 @@
  * The *System attention badge*: the mark on the whole path into Settings >
  * System, while something there is waiting to be acted on.
  *
- * Two things raise it, on two different tabs. An update to install is What's
+ * Two things raise it, on two different pages. An update to install is What's
  * New. A notice owed an answer is Release Notices. Both are work.
  *
  * Unread release NOTES deliberately do not. That state is true after every
@@ -19,6 +19,7 @@
  */
 import { packagedUpdateVersion } from './packagedUpdate';
 import { owedReleaseNoticeCount } from './releaseNotices';
+import type { SettingsNavKey } from './store';
 
 /**
  * What the badge says, or `null` when there is nothing to say.
@@ -57,11 +58,11 @@ export function systemAttentionBadge(): string | null {
 }
 
 /**
- * The two halves, for the two TABS the causes now live on.
+ * The two halves, for the two PAGES the causes now live on.
  *
- * A badge on a tab promises work on THAT tab, so each reads only its own
- * source. The union above is for everything upstream of the split, where one
- * mark stands for both destinations.
+ * A badge on a page's own row promises work on THAT page, so each reads only
+ * its own source. The union above is for everything upstream of the split,
+ * where one mark stands for both destinations.
  *
  * Built from the same {@link systemAttentionBadgeLabel}, so the surfaces cannot
  * end up with four spellings of one sentence.
@@ -76,14 +77,18 @@ export function releaseNoticeBadge(): string | null {
 }
 
 /**
- * What a System TAB wears, by its subview key, or `null` for a tab that can
- * owe nothing.
+ * What a System sub-page owes, by its subview key, or `null` for a page that
+ * can owe nothing.
  *
  * The routing rule in one place, rather than a pair of `key ===` tests in the
- * switcher. Every other tab answers null, so a new subpanel is unmarked until
+ * submenu. Every other page answers null, so a new sub-page is unmarked until
  * somebody names a source for it here.
+ *
+ * A `SettingsNavKey`, never a bare string. `SystemPage` spells this same page
+ * `overview` in its own `SystemPanel` type, and that spelling passed here would
+ * compile and silently answer null for good.
  */
-export function systemTabBadge(key: string): string | null {
+export function systemPageBadge(key: SettingsNavKey): string | null {
   if (key === 'whats-new') return updateBadge();
   if (key === 'release-notices') return releaseNoticeBadge();
   return null;

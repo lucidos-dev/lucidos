@@ -15,6 +15,12 @@ use std::str::FromStr;
 const TRIGGER_SURFACE: crate::core::event_subscription::SubscriptionSurface =
     crate::core::event_subscription::SubscriptionSurface::Trigger;
 
+/// The two accepted shapes of a trigger's `run` field, for a parse failure to
+/// quote back. One const, because the two copies drifted: update's named the
+/// retired `text` alias where create's named `intent`.
+const RUN_FIELD_SHAPES: &str =
+    "Expected { type: 'intent', intent: '...' } or { type: 'script', path: '...' }";
+
 /// Hard guard: scheduling tools (`create_trigger`, `update_trigger`,
 /// `delete_trigger`, `pause_trigger`, `resume_trigger`) called from inside a
 /// scheduled trigger's LLM execution are usually a bug — the LLM mistook the
@@ -160,17 +166,20 @@ impl LucidosEngine {
 
                 // Parse run field: { type: "intent", intent: "..." } or { type: "script", path: "..." }
                 let run: TriggerRun = match args.get("run") {
-                    Some(run_val) if !run_val.is_null() => {
-                        serde_json::from_value(run_val.clone())
-                            .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', intent: '...' }} or {{ type: 'script', path: '...' }}", e))?
-                    }
+                    Some(run_val) if !run_val.is_null() => serde_json::from_value(run_val.clone())
+                        .map_err(|e| format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES))?,
                     _ => {
                         // Backward compat: accept prompt_text as a shorthand
-                        let prompt_text = args.get("prompt_text").and_then(|v| v.as_str()).unwrap_or("");
+                        let prompt_text = args
+                            .get("prompt_text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if prompt_text.is_empty() {
                             return Ok("Error: 'run' is required. Use { type: 'intent', intent: '...' } or { type: 'script', path: '...' }".to_string());
                         }
-                        TriggerRun::Intent { intent: prompt_text.to_string() }
+                        TriggerRun::Intent {
+                            intent: prompt_text.to_string(),
+                        }
                     }
                 };
 
@@ -340,8 +349,9 @@ impl LucidosEngine {
 
                 let new_name = args.get("name").and_then(|v| v.as_str());
                 let new_run: Option<TriggerRun> = match args.get("run").filter(|v| !v.is_null()) {
-                    Some(v) => Some(serde_json::from_value(v.clone())
-                        .map_err(|e| format!("Invalid 'run' field: {}. Expected {{ type: 'intent', text: '...' }} or {{ type: 'script', path: '...' }}", e))?),
+                    Some(v) => Some(serde_json::from_value(v.clone()).map_err(|e| {
+                        format!("Invalid 'run' field: {}. {}", e, RUN_FIELD_SHAPES)
+                    })?),
                     None => None,
                 };
                 // Subscriptions are sent as a full replacement: None = absent

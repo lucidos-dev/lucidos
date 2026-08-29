@@ -37,6 +37,7 @@ export const SETTINGS_VIEW_TARGETS = [
   'access',
   'devices',
   'system',
+  'system-overview',
   'appearance',
   'keyboard-shortcuts',
   'release-notices',

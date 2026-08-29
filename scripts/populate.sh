@@ -53,8 +53,10 @@ fi
 # Clean if requested
 if [ -n "$CLEAN" ]; then
     echo "Cleaning workspace data..."
-    rm -rf "$WORKSPACE/data"
-    rm -rf "$WORKSPACE/.lucidos"
+    # `${WORKSPACE:?}`, the same guard ports_test.sh and build-dmg.sh use: an
+    # empty WORKSPACE would make these `rm -rf /data` and `rm -rf /.lucidos`.
+    rm -rf "${WORKSPACE:?}/data"
+    rm -rf "${WORKSPACE:?}/.lucidos"
 fi
 
 # Build if requested

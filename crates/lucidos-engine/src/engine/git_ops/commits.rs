@@ -616,6 +616,53 @@ pub(crate) async fn commit_worktree_or_err(
     Ok(true)
 }
 
+/// Repo-relative paths that are dirty in `worktree_path`, from
+/// `git status --porcelain`. Empty means a clean tree.
+///
+/// The apply paths `git add -A` before merging, so a dirty file is a file that
+/// WILL land on main. A caller asking "what does this branch put on main?"
+/// therefore needs this alongside the committed diff, and
+/// `branch_changed_files_checked` alone under-reports it.
+///
+/// `Err` when git cannot answer, never an empty list. The one caller is the
+/// bounded security-fix bound, which must fail closed.
+///
+/// `-z` because it emits raw bytes: no `core.quotePath` escaping and no quoting
+/// of a path with a space. Its record shape needs care, though. An ordinary
+/// record is `XY <path>`, but a rename or copy emits its ORIGIN as a SECOND
+/// record carrying NO status prefix. Stripping three bytes off that one would
+/// mangle the path, and could panic on a multi-byte boundary.
+pub(crate) async fn worktree_dirty_files(worktree_path: &Path) -> Result<Vec<String>, String> {
+    let out = git_cmd(&["status", "--porcelain", "-z"], worktree_path).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "git status --porcelain failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let mut records = raw.split('\0');
+    let mut files = Vec::new();
+    while let Some(record) = records.next() {
+        // `get`, not `[3..]`: a non-UTF-8 filename lossily converts to U+FFFD,
+        // so byte 3 need not be a char boundary and slicing would panic.
+        // `.claude/rules/rust.md` bans the index form outright.
+        let Some(path) = record.get(3..).filter(|p| !p.is_empty()) else {
+            continue; // the empty trailing record, or a truncated one
+        };
+        let carries_origin = record.starts_with('R') || record.starts_with('C');
+        files.push(path.to_string());
+        if carries_origin {
+            // Take the origin whole. Both halves of a rename land on main, so
+            // both belong in the answer.
+            if let Some(origin) = records.next().filter(|o| !o.is_empty()) {
+                files.push(origin.to_string());
+            }
+        }
+    }
+    Ok(files)
+}
+
 /// Run `git commit --no-edit` in `worktree_path`, returning `Err` on failure.
 ///
 /// Used by the conflict-resolution merge path, which has an in-progress merge

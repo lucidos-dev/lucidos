@@ -26,6 +26,13 @@ import { SecretInput } from '../shared/SecretInput';
 import { isMobile } from '../../utils/viewport';
 import { pickCredentialAutofocus } from './credentialAutofocus';
 import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
+import {
+  addScopeRow,
+  removeScopeRow,
+  seedScopeRows,
+  setScopeRow,
+  submittedScopes,
+} from './credentialScopes';
 import { LoadableError } from '../shared/LoadableError';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
@@ -211,7 +218,15 @@ function CredentialFormInner({
 }: CredentialFormInnerProps) {
   // `editing` is an id, so the name shown comes off the resolved row.
   const initialService = existingCred?.service_name || request?.service || '';
-  const initialBaseUrl = existingCred?.base_url || request?.base_url || '';
+  // The stored set wins. A request proposes ONE base URL, because the agent is
+  // asking for one API; the user adds the provider's other hosts here.
+  const initialBaseUrls = seedScopeRows(
+    existingCred?.base_urls?.length
+      ? existingCred.base_urls
+      : request?.base_url
+        ? [request.base_url]
+        : [],
+  );
   const initialAuthType = existingCred?.auth_type || request?.auth_type || 'api_key';
   const initialAuthHeader = existingCred?.auth_header || 'Authorization';
   const initialEnvVarName = existingCred?.env_var_name || request?.env_var_name || '';
@@ -235,9 +250,10 @@ function CredentialFormInner({
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
-  /** The Base URL field. State rather than a ref write, because the input is
-   *  controlled and every re-render would otherwise restore `initialBaseUrl`. */
-  const [baseUrl, setBaseUrl] = useState(initialBaseUrl);
+  /** The Base URLs field, one row per host. State rather than ref writes,
+   *  because the inputs are controlled and every re-render would otherwise
+   *  restore `initialBaseUrls`. */
+  const [baseUrls, setBaseUrls] = useState<string[]>(initialBaseUrls);
 
   // The *OAuth provider registry*, for the console help and the derived-provider
   // picker. Absent or failed degrades to no help and no picker, which is the
@@ -297,7 +313,7 @@ function CredentialFormInner({
     setBasedOn(id);
     const row = knownProviders.find((p) => p.id === id);
     if (!row) return;
-    setBaseUrl(row.base_url);
+    setBaseUrls([row.base_url]);
     if (authUrlRef.current) authUrlRef.current.value = row.auth_url;
     if (tokenUrlRef.current) tokenUrlRef.current.value = row.token_url;
     if (userinfoUrlRef.current) userinfoUrlRef.current.value = row.userinfo_url ?? '';
@@ -311,7 +327,6 @@ function CredentialFormInner({
   }
 
   const serviceRef = useRef<HTMLInputElement>(null);
-  const baseUrlRef = useRef<HTMLInputElement>(null);
   const authHeaderRef = useRef<HTMLInputElement>(null);
   const envVarNameRef = useRef<HTMLInputElement>(null);
   const valueRef = useRef<HTMLInputElement>(null);
@@ -396,7 +411,14 @@ function CredentialFormInner({
   async function handleSubmit(e: Event) {
     e.preventDefault();
     const service = serviceRef.current?.value.trim() || '';
-    const baseUrl = baseUrlRef.current?.value.trim() || '';
+    // A `secret` renders no scope field at all, and is sent nowhere.
+    const scopes = selectedAuthType === 'secret' ? [] : submittedScopes(baseUrls);
+    // Checked on the SET, not per input. `required` on the first row instead
+    // blocks a form whose first host was cleared and whose second was filled.
+    if (selectedAuthType !== 'secret' && scopes.length === 0) {
+      showToast('Add at least one base URL, or pick the Secret auth type.', 'error');
+      return;
+    }
     const authType = selectedAuthType;
     const fields = collectFields();
     // Custom env var name is offered for every type except email_password.
@@ -439,7 +461,10 @@ function CredentialFormInner({
       }
 
       const body: UpdateCredentialBody = {
-        base_url: existingCred?.base_url || baseUrl,
+        // The form is authoritative, with no fallback to the stored set. A
+        // fallback makes the empty scope unsaveable, so removing every host
+        // silently restored the ones the user just deleted.
+        base_urls: scopes,
         auth_type: authType,
         auth_header: authHeaderRef.current?.value.trim() || initialAuthHeader,
         auth_value: authValue,
@@ -452,9 +477,9 @@ function CredentialFormInner({
       // two reasons: a repair carries the id of the row it must update (creating
       // would make a second OAuth Client for one provider), and a save here has
       // an authorization waiting behind it that must now continue.
-      await submitRequestedCredential(request, service, baseUrl, authType, authValue, envVarName);
+      await submitRequestedCredential(request, service, scopes, authType, authValue, envVarName);
     } else {
-      await submitNewCredential(service, baseUrl, authType, authValue, envVarName);
+      await submitNewCredential(service, scopes, authType, authValue, envVarName);
     }
   }
 
@@ -482,22 +507,56 @@ function CredentialFormInner({
                 need one. */}
             {!isSecret && (
             <div class="form-group">
-              <label>Base URL</label>
-              {/* Real state, not a bare `value=` with no handler. This input is
-                  CONTROLLED, so every re-render rewrites it from its prop: it
-                  only appeared to accept typing because nothing re-rendered.
-                  Anything that does (picking an Auth Type, picking the base
-                  provider a derived name runs on) silently reverted it, which
-                  is how a derived connection kept the guessed
-                  `https://<name>.com` instead of the registry row's base URL. */}
-              <input
-                ref={baseUrlRef}
-                type="url"
-                value={baseUrl}
-                onInput={(e) => setBaseUrl((e.target as HTMLInputElement).value)}
-                placeholder="e.g. https://api.github.com"
-                required
-              />
+              <FieldLabel
+                title="Base URLs"
+                label={<>Base URLs {baseUrls.length > 1 && <span class="form-hint">({baseUrls.length})</span>}</>}
+              >
+                  <p>
+                    The credential is sent to these and nowhere else. A request
+                    to any other host is refused.
+                  </p>
+                  <p>
+                    Add one per hostname the provider uses. Binance signs spot
+                    calls at <code>https://api.binance.com</code> and futures
+                    calls at <code>https://fapi.binance.com</code> with the same
+                    key.
+                  </p>
+              </FieldLabel>
+              {/* These inputs are CONTROLLED, so write every edit through
+                  state. A bare `value=` with no handler is reverted by the next
+                  re-render, and picking an Auth Type or a base provider is one. */}
+              <div class="credential-scope-rows">
+              {baseUrls.map((value, index) => (
+                <div class="removable-input-row" key={index}>
+                  <input
+                    type="url"
+                    value={value}
+                    onInput={(e) =>
+                      setBaseUrls((rows) =>
+                        setScopeRow(rows, index, (e.target as HTMLInputElement).value),
+                      )
+                    }
+                    placeholder="e.g. https://api.github.com"
+                  />
+                  {/* Hidden on the sole row, where it can only clear the field
+                      rather than remove it. `handleSubmit` owns the "at least
+                      one host" rule. */}
+                  {baseUrls.length > 1 && (
+                    <button
+                      type="button"
+                      class="action-btn action-btn-danger"
+                      aria-label={`Remove base URL ${index + 1}`}
+                      onClick={() => setBaseUrls((rows) => removeScopeRow(rows, index))}
+                    >Remove</button>
+                  )}
+                </div>
+              ))}
+              </div>
+              <button
+                type="button"
+                class="action-btn credential-scope-add"
+                onClick={() => setBaseUrls(addScopeRow)}
+              >Add another host</button>
             </div>
             )}
             <div class="form-group">
@@ -541,7 +600,6 @@ function CredentialFormInner({
         {isEmailPassword && (
           <>
             <input ref={serviceRef} type="hidden" value={initialService} />
-            <input ref={baseUrlRef} type="hidden" value={initialBaseUrl} />
           </>
         )}
         {showEmailSettings && (

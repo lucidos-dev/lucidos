@@ -254,6 +254,17 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "SessionStarted" | "ContinuationStarted" | "CodingAgentSettingsChanged" => {
             EventClass::Metadata
         }
+        // Voice-session lifecycle. Metadata on BOTH halves, which is the
+        // asymmetry against the coding-agent pair above, where the end is
+        // Terminal. A live microphone is not a turn: the thread's status
+        // belongs to the agent's turn, and voice is a mode of the thread
+        // (ADR 0148). An end that settled status would terminate a turn the
+        // reasoner is still running.
+        "VoiceSessionStarted" | "VoiceSessionEnded" => EventClass::Metadata,
+        // A spoken reply, for the same reason. The talker authors it mid-call,
+        // often while the reasoner's own turn is still running. Classifying it
+        // as a response would settle a turn it has no part in.
+        "SpokenReplyGenerated" => EventClass::Metadata,
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "ThoughtStreamed" | "MemoryRecalled" => EventClass::Activity,
@@ -442,6 +453,14 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "EventWaitDelivered",
         "EventWaitExpired",
         "EventWaitCanceled",
+        // Voice-session lifecycle. Persisted because the pair IS the record:
+        // there is no session table, and the boot sweep finds an unpaired
+        // start by reading these back.
+        "VoiceSessionStarted",
+        "VoiceSessionEnded",
+        // What the caller actually heard. Persisted because the audio is not,
+        // so this text is the only record of a spoken turn.
+        "SpokenReplyGenerated",
     ]
 }
 
@@ -717,7 +736,21 @@ pub fn resolve_transition(
         | "EventWaitStarted"
         | "EventWaitDelivered"
         | "EventWaitExpired"
-        | "EventWaitCanceled" => no_change,
+        | "EventWaitCanceled"
+        // Voice-session lifecycle. Voice is a MODE of a thread (ADR 0148), so
+        // neither half moves it: the section and the status belong to the
+        // agent's turn, and a live microphone is not a turn. An end that
+        // settled the thread would terminate work the agent is still doing.
+        //
+        // Legal on both thread types, matching the event-wait pair above.
+        // Nothing offers voice on a coding-agent thread today, and the rule
+        // that decides is what a session touches rather than who opened it.
+        | "VoiceSessionStarted"
+        | "VoiceSessionEnded"
+        // A spoken reply moves nothing either. The caller is on the call, so
+        // surfacing the thread to the Inbox would ask for attention they are
+        // already giving.
+        | "SpokenReplyGenerated" => no_change,
         _ => violation("Unknown event type"),
     }?;
 

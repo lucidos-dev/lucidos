@@ -260,6 +260,13 @@ pub enum ContextPurpose {
     /// jobs, which still share `model_memory`.
     ConversationSummary,
     ImageGen,
+    /// One reply from a voice session's rented *talker* (ADR 0149).
+    ///
+    /// It owns `model_voice_talker`, per the standing invariant above. Unlike
+    /// every sibling here it is not one HTTP call: the talker speaks over a
+    /// live socket, so a row is written per reply and the purpose's
+    /// `AuxBudget` is never asked for.
+    Voice,
 }
 
 impl ContextPurpose {
@@ -279,6 +286,7 @@ impl ContextPurpose {
             Self::Memory => "Memory Request",
             Self::ConversationSummary => "Conversation Summary Request",
             Self::ImageGen => "Image Generation Request",
+            Self::Voice => "Voice Reply",
         }
     }
 }
@@ -302,7 +310,7 @@ impl ContextPurpose {
 /// a cache write and reports no count for one. `cache_read_tokens` is set by
 /// both. `output_tokens` may be zero on a snapshot emitted mid-stream, before
 /// the final delta.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,

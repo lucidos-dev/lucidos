@@ -380,10 +380,14 @@ pub fn grep_entries(
             }
         }
 
-        if let Ok(meta) = std::fs::metadata(&abs) {
-            if meta.len() > GREP_MAX_FILE_BYTES {
-                continue;
-            }
+        // An unstattable file is skipped, not read. Under `if let Ok` an
+        // unknown size was the one case with no cap, so the read below pulled
+        // the whole file into memory.
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            continue;
+        };
+        if meta.len() > GREP_MAX_FILE_BYTES {
+            continue;
         }
         let bytes = match std::fs::read(&abs) {
             Ok(b) => b,

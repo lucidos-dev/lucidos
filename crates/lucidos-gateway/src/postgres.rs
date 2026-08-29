@@ -689,6 +689,12 @@ async fn ensure_embedded_cluster(
         initdb_cluster(bin, lib, data)?;
     }
 
+    // The `credentials` table sits in here in plaintext (ADR 0153). A
+    // file-level copy of a live cluster is a torn read anyway, and the copy
+    // that restores is the workspace's own `pg_dump`-backed backup. This runs
+    // on every start, so a cluster older than the ADR converges on its next.
+    crate::file_backup::exclude(data, "Postgres data dir");
+
     // Adopt an already-running cluster ONLY if it is reachable AND version-matched.
     if pg_ctl_status(bin, lib, data) {
         match read_postmaster_port(data) {
@@ -807,6 +813,13 @@ fn parse_pg_major(s: &str) -> Option<u16> {
 
 /// Move a foreign-version data dir aside (rename, never delete) so a fresh
 /// cluster can `initdb` in its place while the old data stays recoverable.
+///
+/// The copy keeps every credential the old cluster held, so the mover marks it
+/// rather than the caller (ADR 0153). No future caller can preserve a data dir
+/// and forget. A rename carries the exclusion with the inode, so there is work
+/// to do here only for a cluster older than the ADR. That is also the one
+/// upgrade that would otherwise strand a plaintext credential store in a
+/// file-level backup for ever.
 fn move_data_dir_aside(data: &Path, data_major: u16) -> Result<PathBuf, BoxError> {
     let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let base = data
@@ -815,6 +828,7 @@ fn move_data_dir_aside(data: &Path, data_major: u16) -> Result<PathBuf, BoxError
         .unwrap_or("pgdata");
     let aside = data.with_file_name(foreign_aside_dir_name(base, data_major, &ts));
     std::fs::rename(data, &aside)?;
+    crate::file_backup::exclude(&aside, "preserved Postgres data dir");
     Ok(aside)
 }
 
@@ -1124,13 +1138,34 @@ struct PgUrlParts {
     database: String,
 }
 
+/// `url` with any `user:password@` userinfo replaced by `***@`.
+///
+/// A message from here reaches the boot splash and the picker's health-dot
+/// tooltip, not only the gateway log. The legacy migration source is a URL the
+/// user configured, so the shape stays readable and the credential never leaves
+/// the process. Applied to whatever precedes the LAST `@` in the authority,
+/// matching how [`PgUrlParts::parse`] splits it.
+fn redact_pg_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), url),
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    match rest[..authority_end].rsplit_once('@') {
+        Some((_, host_port)) => format!("{scheme}***@{host_port}{}", &rest[authority_end..]),
+        None => format!("{scheme}{rest}"),
+    }
+}
+
 impl PgUrlParts {
     fn parse(url: &str) -> Result<Self, BoxError> {
+        // Every refusal below quotes the URL, so redact once up front.
+        let safe = redact_pg_url(url);
         let rest = url.split("://").nth(1).unwrap_or(url);
         let without_query = rest.split('?').next().unwrap_or(rest);
         let (authority, path) = without_query
             .split_once('/')
-            .ok_or_else(|| format!("postgres URL has no database path: '{url}'"))?;
+            .ok_or_else(|| format!("postgres URL has no database path: '{safe}'"))?;
         let (user, password, host_port) = match authority.rsplit_once('@') {
             Some((auth, host_port)) => {
                 let (user, password) = match auth.split_once(':') {
@@ -1146,7 +1181,7 @@ impl PgUrlParts {
             None => (host_port.to_string(), 5432),
         };
         if host.is_empty() || path.is_empty() {
-            return Err(format!("invalid postgres URL: '{url}'").into());
+            return Err(format!("invalid postgres URL: '{safe}'").into());
         }
         Ok(Self {
             user,
@@ -1184,8 +1219,9 @@ fn sql_string_literal(value: &str) -> String {
 /// deadline passes. A TCP connect proves the postmaster is listening; the engine
 /// then runs its own pooled connect + migrations (which retry/fail loudly).
 async fn wait_for_pg(url: &str, timeout: Duration) -> Result<(), BoxError> {
+    let safe = redact_pg_url(url);
     let (host, port) = parse_host_port(url)
-        .ok_or_else(|| format!("could not parse host:port from database_url '{url}'"))?;
+        .ok_or_else(|| format!("could not parse host:port from database_url '{safe}'"))?;
     let deadline = Instant::now() + timeout;
     loop {
         match tcp_connect(&host, port).await {
@@ -1448,6 +1484,27 @@ mod tests {
         );
     }
 
+    /// Every message built from a database URL goes through the redactor, and
+    /// those messages reach the boot splash and the picker's tooltip.
+    #[test]
+    fn a_redacted_url_keeps_its_shape_and_drops_its_password() {
+        let redacted = redact_pg_url("postgres://lucidos:secret@127.0.0.1:5544/lucidos_dev");
+        assert_eq!(redacted, "postgres://***@127.0.0.1:5544/lucidos_dev");
+        assert!(!redacted.contains("secret"));
+        // A password containing an `@` is removed whole. The split is on the
+        // LAST one in the authority, as the parser's own split is.
+        assert_eq!(
+            redact_pg_url("postgres://u:p@ss@db.example:5432/x?sslmode=require"),
+            "postgres://***@db.example:5432/x?sslmode=require"
+        );
+        // Nothing to hide, and a malformed value, both pass through readable.
+        assert_eq!(
+            redact_pg_url("postgres://127.0.0.1:5432/lucidos"),
+            "postgres://127.0.0.1:5432/lucidos"
+        );
+        assert_eq!(redact_pg_url("not-a-url"), "not-a-url");
+    }
+
     #[test]
     fn parse_pg_major_handles_every_shape_we_read() {
         // `postgres --version` output.
@@ -1489,6 +1546,29 @@ mod tests {
         assert_eq!(
             foreign_aside_dir_name("pgdata", 17, "20260622-120000"),
             "pgdata.foreign-17-20260622-120000"
+        );
+    }
+
+    /// A foreign-major upgrade keeps the old cluster for ever, and that copy
+    /// holds the credential store in plaintext. Excluding only the fresh
+    /// `pgdata` would strand it in the user's backup, so the mover marks what
+    /// it preserves (ADR 0153). Re-running the idempotent ensure is how the
+    /// test reads the state back: `AlreadySet` means the mark is there.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn moving_a_foreign_data_dir_aside_excludes_the_copy_it_keeps() {
+        let parent = tempfile::tempdir().unwrap();
+        let data = parent.path().join("pgdata");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("PG_VERSION"), "17\n").unwrap();
+
+        let moved = move_data_dir_aside(&data, 17).expect("move aside");
+
+        assert!(moved.join("PG_VERSION").exists(), "the old data is kept");
+        assert_eq!(
+            lucidos_file_backup_exclusion::ensure_excluded(&moved).unwrap(),
+            lucidos_file_backup_exclusion::Exclusion::AlreadySet,
+            "the preserved copy must already carry the exclusion"
         );
     }
 

@@ -397,6 +397,7 @@ fn make_user_msg(content: &str, hashes: Vec<String>) -> SessionMessage {
         request_event_id: None,
         event_id: None,
         thread_id: None,
+        agent: None,
     }
 }
 
@@ -418,6 +419,7 @@ fn make_assistant_msg(content: &str) -> SessionMessage {
         request_event_id: None,
         event_id: None,
         thread_id: None,
+        agent: None,
     }
 }
 

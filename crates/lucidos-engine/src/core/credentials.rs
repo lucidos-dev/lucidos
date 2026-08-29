@@ -69,7 +69,10 @@ impl fmt::Display for AuthType {
 pub struct CredentialInfo {
     pub id: Uuid,
     pub service_name: String,
-    pub base_url: String,
+    /// Every base URL this credential may be presented to, its *credential
+    /// scope*. A set rather than one value, because one key often covers
+    /// several hostnames of one provider. Empty means it goes nowhere.
+    pub base_urls: Vec<String>,
     pub auth_type: AuthType,
     pub auth_header: String,
     /// Optional custom env var name for the injected secret (e.g. `GITHUB_TOKEN`
@@ -84,7 +87,9 @@ pub struct CredentialInfo {
 pub struct Credential {
     pub id: Uuid,
     pub service_name: String,
-    pub base_url: String,
+    /// See [`CredentialInfo::base_urls`]. Matched by
+    /// [`credential_scope_covers`], which asks whether ANY member covers a URL.
+    pub base_urls: Vec<String>,
     pub auth_type: AuthType,
     pub auth_value: String,
     pub auth_header: String,
@@ -103,7 +108,7 @@ impl fmt::Debug for Credential {
         f.debug_struct("Credential")
             .field("id", &self.id)
             .field("service_name", &self.service_name)
-            .field("base_url", &self.base_url)
+            .field("base_urls", &self.base_urls)
             .field("auth_type", &self.auth_type)
             .field("auth_value", &"<redacted>")
             .field("auth_header", &self.auth_header)
@@ -119,7 +124,7 @@ impl fmt::Debug for Credential {
 type CredentialRow = (
     Uuid,
     String,
-    String,
+    Vec<String>,
     String,
     String,
     String,
@@ -130,14 +135,14 @@ type CredentialRow = (
 
 /// Columns selected for a full credential (with secret), in `CredentialRow` order.
 const CREDENTIAL_COLUMNS: &str =
-    "id, service_name, base_url, auth_type, auth_value, auth_header, created_at, updated_at, env_var_name";
+    "id, service_name, base_urls, auth_type, auth_value, auth_header, created_at, updated_at, env_var_name";
 
 /// Parse a credential row tuple from the database (with secret).
 fn parse_credential(row: CredentialRow) -> Credential {
     let (
         id,
         service_name,
-        base_url,
+        base_urls,
         auth_type,
         auth_value,
         auth_header,
@@ -148,7 +153,7 @@ fn parse_credential(row: CredentialRow) -> Credential {
     Credential {
         id,
         service_name,
-        base_url,
+        base_urls,
         auth_type: AuthType::parse(&auth_type),
         auth_value,
         auth_header,
@@ -162,7 +167,7 @@ fn parse_credential(row: CredentialRow) -> Credential {
 type CredentialInfoRow = (
     Uuid,
     String,
-    String,
+    Vec<String>,
     String,
     String,
     DateTime<Utc>,
@@ -172,12 +177,12 @@ type CredentialInfoRow = (
 
 /// Parse a credential info row tuple from the database (without secret).
 fn parse_credential_info(row: CredentialInfoRow) -> CredentialInfo {
-    let (id, service_name, base_url, auth_type, auth_header, created_at, updated_at, env_var_name) =
+    let (id, service_name, base_urls, auth_type, auth_header, created_at, updated_at, env_var_name) =
         row;
     CredentialInfo {
         id,
         service_name,
-        base_url,
+        base_urls,
         auth_type: AuthType::parse(&auth_type),
         auth_header,
         env_var_name,
@@ -219,7 +224,7 @@ impl CredentialStore {
             CREATE TABLE IF NOT EXISTS credentials (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 service_name TEXT NOT NULL,
-                base_url TEXT NOT NULL,
+                base_urls TEXT[] NOT NULL DEFAULT '{}',
                 auth_type TEXT NOT NULL,
                 auth_value TEXT NOT NULL,
                 auth_header TEXT DEFAULT 'Authorization',
@@ -273,13 +278,15 @@ impl CredentialStore {
     async fn upsert_row(
         pool: &PgPool,
         service_name: &str,
-        base_url: &str,
+        base_urls: &[String],
         auth_type: AuthType,
         auth_value: &str,
         auth_header: Option<&str>,
         env_var_name: Option<&str>,
     ) -> Result<(Uuid, bool), sqlx::Error> {
         let auth_header = auth_header.unwrap_or("Authorization");
+        // The floor: no caller can store a blank member. See `scope_members`.
+        let base_urls = scope_members(base_urls);
 
         // Postgres infers a partial unique index from a matching index
         // predicate, so the non-oauth arm names the predicate verbatim.
@@ -291,10 +298,10 @@ impl CredentialStore {
 
         let result = sqlx::query_as::<_, (Uuid, bool)>(&format!(
             r#"
-            INSERT INTO credentials (service_name, base_url, auth_type, auth_value, auth_header, env_var_name)
+            INSERT INTO credentials (service_name, base_urls, auth_type, auth_value, auth_header, env_var_name)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT {conflict_target} DO UPDATE SET
-                base_url = EXCLUDED.base_url,
+                base_urls = EXCLUDED.base_urls,
                 auth_type = EXCLUDED.auth_type,
                 auth_value = EXCLUDED.auth_value,
                 auth_header = EXCLUDED.auth_header,
@@ -304,7 +311,7 @@ impl CredentialStore {
             "#
         ))
         .bind(service_name)
-        .bind(base_url)
+        .bind(&base_urls)
         .bind(auth_type.to_string())
         .bind(auth_value)
         .bind(auth_header)
@@ -326,7 +333,7 @@ impl CredentialStore {
         pool: &PgPool,
         event_bus: &EventBus,
         service_name: &str,
-        base_url: &str,
+        base_urls: &[String],
         auth_type: AuthType,
         auth_value: &str,
         auth_header: Option<&str>,
@@ -336,7 +343,7 @@ impl CredentialStore {
         let (id, created) = Self::upsert_row(
             pool,
             service_name,
-            base_url,
+            base_urls,
             auth_type,
             auth_value,
             auth_header,
@@ -438,8 +445,9 @@ impl CredentialStore {
     /// Get the mailbox password for an email account. Replaces resolving the
     /// string `email:<account>`.
     ///
-    /// **Temporary measure (`credential-email-prefix-fallback` in
-    /// `docs/temporary-measures.md`):** also matches a still-prefixed
+    /// **Temporary measure**, registered in `docs/temporary-measures.md` under
+    /// "`email:`-prefixed credential fallback in `get_email_password`": this also
+    /// matches a still-prefixed
     /// `email:<account>` row. The prefix-stripping migration skips any row whose
     /// unprefixed name is already taken by another non-oauth credential, so a
     /// workspace with both an `email:work` mailbox password and a separate
@@ -469,7 +477,7 @@ impl CredentialStore {
     pub async fn list(pool: &PgPool) -> Result<Vec<CredentialInfo>, sqlx::Error> {
         let results = sqlx::query_as::<_, CredentialInfoRow>(
             r#"
-            SELECT id, service_name, base_url, auth_type, auth_header, created_at, updated_at, env_var_name
+            SELECT id, service_name, base_urls, auth_type, auth_header, created_at, updated_at, env_var_name
             FROM credentials
             ORDER BY service_name ASC
             "#,
@@ -541,6 +549,10 @@ impl CredentialStore {
     /// re-entering the secret. Returns the row's `service_name` when one
     /// existed, for the announcement.
     ///
+    /// `base_urls: None` keeps the stored scope, on the same terms. An EMPTY
+    /// slice is a different answer and clears it, which is what a `secret`
+    /// carries. So a caller that never mentioned the scope cannot empty it.
+    ///
     /// Keyed on `id`, for a sharper reason than [`Self::delete_row`]'s: the edit
     /// form can CHANGE `auth_type`, so `(service_name, auth_type)` cannot name
     /// the row being edited when the type is the field being edited.
@@ -550,29 +562,32 @@ impl CredentialStore {
     async fn update_row(
         pool: &PgPool,
         id: Uuid,
-        base_url: &str,
+        base_urls: Option<&[String]>,
         auth_type: AuthType,
         auth_header: Option<&str>,
         auth_value: Option<&str>,
         env_var_name: Option<&str>,
     ) -> Result<Option<String>, sqlx::Error> {
         let auth_header = auth_header.unwrap_or("Authorization");
+        let base_urls = base_urls.map(scope_members);
 
-        // Two static queries instead of a dynamic one: the only difference is
-        // whether `auth_value` is touched, and sqlx wants compile-time SQL.
-        // `env_var_name` is always set (NULL clears it back to the `CRED_` default).
+        // `COALESCE($2::text[], base_urls)` is what makes `None` mean "keep":
+        // a NULL bind leaves the column as it stands. `auth_value` gets two
+        // static queries instead, because a NULL there is the value the user
+        // just typed. `env_var_name` is always set (NULL clears it back to the
+        // `CRED_` default).
         match auth_value {
             Some(value) => {
                 sqlx::query_scalar::<_, String>(
                     r#"
                     UPDATE credentials
-                    SET base_url = $2, auth_type = $3, auth_header = $4, auth_value = $5, env_var_name = $6, updated_at = NOW()
+                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, auth_value = $5, env_var_name = $6, updated_at = NOW()
                     WHERE id = $1
                     RETURNING service_name
                     "#,
                 )
                 .bind(id)
-                .bind(base_url)
+                .bind(&base_urls)
                 .bind(auth_type.to_string())
                 .bind(auth_header)
                 .bind(value)
@@ -584,13 +599,13 @@ impl CredentialStore {
                 sqlx::query_scalar::<_, String>(
                     r#"
                     UPDATE credentials
-                    SET base_url = $2, auth_type = $3, auth_header = $4, env_var_name = $5, updated_at = NOW()
+                    SET base_urls = COALESCE($2::text[], base_urls), auth_type = $3, auth_header = $4, env_var_name = $5, updated_at = NOW()
                     WHERE id = $1
                     RETURNING service_name
                     "#,
                 )
                 .bind(id)
-                .bind(base_url)
+                .bind(&base_urls)
                 .bind(auth_type.to_string())
                 .bind(auth_header)
                 .bind(env_var_name)
@@ -614,7 +629,7 @@ impl CredentialStore {
         pool: &PgPool,
         event_bus: &EventBus,
         id: Uuid,
-        base_url: &str,
+        base_urls: Option<&[String]>,
         auth_type: AuthType,
         auth_header: Option<&str>,
         auth_value: Option<&str>,
@@ -624,7 +639,7 @@ impl CredentialStore {
         let updated = Self::update_row(
             pool,
             id,
-            base_url,
+            base_urls,
             auth_type,
             auth_header,
             auth_value,
@@ -645,31 +660,78 @@ impl CredentialStore {
         Ok(updated)
     }
 
-    /// Find a credential whose base_url scopes the given URL.
+    /// Replace one credential's scope set, and announce it. Returns the row's
+    /// `service_name` when one was touched.
     ///
-    /// Matching is URL-aware: same scheme, host, effective port, and a path
-    /// prefix on a segment boundary. A raw string prefix check would inject a
-    /// credential scoped to `https://api.example.com` into
-    /// `https://api.example.com.evil.test/`.
+    /// The narrow verb behind `PUT /api/v1/credential-base-urls`, so a caller
+    /// widening a scope cannot also rewrite the secret, the auth type or the
+    /// auth header. [`Self::update`] is the whole-row edit the Settings form
+    /// makes; this is the one field a script or the CLI has business changing.
+    ///
+    /// Takes an already-normalized set: [`normalized_base_urls`] is the one
+    /// speller, and the API boundary runs it so the refusal reaches the user.
+    pub async fn set_base_urls(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: Uuid,
+        base_urls: &[String],
+        actor: Option<MessageOrigin>,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let base_urls = scope_members(base_urls);
+        let updated = sqlx::query_scalar::<_, String>(
+            "UPDATE credentials SET base_urls = $2, updated_at = NOW() \
+             WHERE id = $1 RETURNING service_name",
+        )
+        .bind(id)
+        .bind(&base_urls)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(service_name) = &updated {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::CredentialUpdated {
+                        service_name: service_name.clone(),
+                        actor,
+                    }),
+                    "[Credentials] CredentialUpdated",
+                )
+                .await;
+        }
+        Ok(updated)
+    }
+
     /// Give a credential that carries no scope the one its `apis.json` entry
     /// uses, and announce it. Returns whether the row changed.
     ///
     /// Once per credential, at startup, so the proxy's scope check has
     /// something to enforce for a row that predates it (ADR 0144). The
     /// `WHERE` clause is what makes it once: a row that already has a scope is
-    /// never rewritten, so this cannot walk a user's own correction back.
+    /// never rewritten, so this cannot walk a user's own correction back. It
+    /// also never APPENDS to a scope set: an entry naming an already-scoped
+    /// credential says nothing about whether the user wants both hosts, and
+    /// `apis.json` is writable over the API.
     pub async fn infer_scope_if_empty(
         pool: &PgPool,
         event_bus: &EventBus,
         service_name: &str,
         base_url: &str,
     ) -> Result<bool, sqlx::Error> {
-        if base_url.trim().is_empty() {
+        // Through the same speller as every other write, so the documented
+        // "one speller" holds. A malformed `apis.json` value is declined here
+        // rather than stored as a scope the gate can only ever refuse.
+        let inferred = match normalized_base_urls(vec![base_url.to_string()]) {
+            Ok(urls) => urls,
+            Err(reason) => {
+                log!("[Credentials] not scoping '{service_name}': {reason}");
+                return Ok(false);
+            }
+        };
+        let [base_url] = inferred.as_slice() else {
             return Ok(false);
-        }
+        };
         let updated: Option<String> = sqlx::query_scalar(
-            "UPDATE credentials SET base_url = $1, updated_at = NOW() \
-             WHERE service_name = $2 AND btrim(COALESCE(base_url, '')) = '' \
+            "UPDATE credentials SET base_urls = ARRAY[$1], updated_at = NOW() \
+             WHERE service_name = $2 AND cardinality(base_urls) = 0 \
              RETURNING service_name",
         )
         .bind(base_url)
@@ -692,6 +754,17 @@ impl CredentialStore {
         Ok(true)
     }
 
+    /// Find a credential whose scope covers the given URL.
+    ///
+    /// Matching is URL-aware: same scheme, host, effective port, and a path
+    /// prefix on a segment boundary. A raw string prefix check would inject a
+    /// credential scoped to `https://api.example.com` into
+    /// `https://api.example.com.evil.test/`.
+    ///
+    /// The narrowest scope wins, measured on the MEMBER that matched rather
+    /// than on the row. Two credentials can both cover a URL, and the one
+    /// naming a longer path is the more specific answer whatever else its set
+    /// holds. Ties keep the first row in name order, so the answer is stable.
     pub async fn find_by_url(pool: &PgPool, url: &str) -> Result<Option<Credential>, sqlx::Error> {
         // Blind to `oauth_client`, for the same reason [`Self::get`] is, and on
         // its own merits besides: an OAuth client registration's `auth_value` is
@@ -701,30 +774,108 @@ impl CredentialStore {
         // (`https://www.googleapis.com`), which is exactly what a request to
         // that provider matches, and now that an API key may share the row's
         // name the two are far likelier to sit side by side. The tie-break here
-        // is longest-`base_url`-first, so which one won was arbitrary.
+        // is longest-matching-scope-first, so which one won was arbitrary.
         let results = sqlx::query_as::<_, CredentialRow>(&format!(
             "SELECT {CREDENTIAL_COLUMNS} FROM credentials \
              WHERE auth_type <> 'oauth_client' \
-             ORDER BY length(base_url) DESC"
+             ORDER BY service_name ASC"
         ))
         .fetch_all(pool)
         .await?;
 
+        let mut best: Option<(usize, CredentialRow)> = None;
         for row in results {
-            if credential_base_url_matches(&row.2, url) {
-                return Ok(Some(parse_credential(row)));
+            let Some(len) = longest_matching_scope(&row.2, url) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(seen, _)| len > *seen) {
+                best = Some((len, row));
             }
         }
 
-        Ok(None)
+        Ok(best.map(|(_, row)| parse_credential(row)))
     }
 }
 
-/// Whether a credential scoped to `base_url` may be presented to `request_url`.
+/// The length of the longest member of `base_urls` covering `request_url`, or
+/// `None` when no member does.
 ///
-/// [`CredentialStore::find_by_url`] selects with this. `core::git_auth` also
-/// re-checks it on every git credential callback, so a redirect cannot carry a
-/// secret to a host the user never scoped it to.
+/// A matching member's PATH length, the only thing that can differ.
+///
+/// Scheme, host and port were all equal already, or the member did not match.
+/// So ranking the whole string lets an explicit `:443` or a trailing slash
+/// out-rank a member that really is narrower.
+fn longest_matching_scope(base_urls: &[String], request_url: &str) -> Option<usize> {
+    base_urls
+        .iter()
+        .filter(|base| credential_base_url_matches(base, request_url))
+        .filter_map(|base| reqwest::Url::parse(base.trim()).ok())
+        .map(|base| base.path().trim_end_matches('/').len())
+        .max()
+}
+
+/// Whether a credential whose scope is `base_urls` may be presented to
+/// `request_url`. True when ANY member covers it.
+///
+/// This is the whole of multi-scope matching. Each member is judged by
+/// [`credential_base_url_matches`], exactly as a lone scope always was. So a
+/// second member widens the credential by one named host and by nothing else.
+pub fn credential_scope_covers(base_urls: &[String], request_url: &str) -> bool {
+    longest_matching_scope(base_urls, request_url).is_some()
+}
+
+/// Whether `value` parses as a URL that names a host.
+///
+/// The one definition of what a scope member and a proxy upstream must look
+/// like. `api::proxy::ScopedPipeline::bind` asks it of the outbound URL, and
+/// [`normalized_base_urls`] asks it of every member. So the two cannot drift
+/// apart on what the gate accepts.
+pub(crate) fn url_names_a_host(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|u| u.host_str().is_some())
+}
+
+/// Trim, drop blanks and collapse duplicates, keeping order. Infallible.
+///
+/// The floor under every write, applied by the store itself, so a scope set can
+/// never hold a blank member. A blank one is a SECOND spelling of "no scope":
+/// `cardinality(base_urls) = 0` is what the startup pass and the gate's "no
+/// base URL" arm both ask, and `{""}` answers no to both while covering
+/// nothing.
+fn scope_members(base_urls: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(base_urls.len());
+    for raw in base_urls {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !out.iter().any(|kept| kept == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+/// [`scope_members`], plus a refusal for anything that is not a URL with a host.
+///
+/// The API boundary's speller. An unparseable member could only ever be refused
+/// at the gate, silently and far from the form it was typed into. Refusing it at
+/// the write puts the message where the user can act on it.
+///
+/// An empty result is legal and means the credential goes nowhere. A `secret`
+/// carries that, and so does a row awaiting the startup scope pass.
+pub fn normalized_base_urls(base_urls: Vec<String>) -> Result<Vec<String>, String> {
+    let members = scope_members(&base_urls);
+    if let Some(bad) = members.iter().find(|m| !url_names_a_host(m)) {
+        return Err(format!(
+            "'{bad}' is not a URL with a host. Write the scheme too, \
+             for example https://api.example.com"
+        ));
+    }
+    Ok(members)
+}
+
+/// Whether one scope member, `base_url`, covers `request_url`.
+///
+/// [`credential_scope_covers`] is what a caller asks. `core::git_auth` re-checks
+/// the same predicate on every credential callback. A redirect therefore cannot
+/// carry a secret to a host the user never scoped it to.
 pub(crate) fn credential_base_url_matches(base_url: &str, request_url: &str) -> bool {
     let Ok(base) = reqwest::Url::parse(base_url.trim()) else {
         return false;
@@ -866,7 +1017,7 @@ mod tests {
             &pool,
             &bus,
             "openai",
-            "https://api.openai.com",
+            &["https://api.openai.com".to_string()],
             AuthType::ApiKey,
             "sk-one",
             None,
@@ -882,7 +1033,7 @@ mod tests {
             &pool,
             &bus,
             "openai",
-            "https://api.openai.com",
+            &["https://api.openai.com".to_string()],
             AuthType::ApiKey,
             "sk-two",
             None,
@@ -912,7 +1063,7 @@ mod tests {
             &pool,
             &bus,
             Uuid::new_v4(),
-            "https://example.test",
+            Some(&["https://example.test".to_string()][..]),
             AuthType::ApiKey,
             None,
             None,
@@ -928,7 +1079,7 @@ mod tests {
             &pool,
             &bus,
             "svc",
-            "https://example.test",
+            &["https://example.test".to_string()],
             AuthType::ApiKey,
             "secret",
             None,
@@ -942,7 +1093,7 @@ mod tests {
                 &pool,
                 &bus,
                 id,
-                "https://example.test/v2",
+                Some(&["https://example.test/v2".to_string()][..]),
                 AuthType::ApiKey,
                 None,
                 None,
@@ -960,6 +1111,120 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    /// A blank member is not a second spelling of "no scope". The store drops
+    /// it, so `cardinality(base_urls) = 0` stays the one question the gate and
+    /// the startup pass both ask.
+    #[tokio::test]
+    async fn a_blank_member_is_never_stored() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        let id = CredentialStore::upsert(
+            &pool,
+            &bus,
+            "svc",
+            &[String::new(), "  ".to_string()],
+            AuthType::Secret,
+            "shared-secret",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(CredentialStore::get(&pool, "svc")
+            .await
+            .unwrap()
+            .expect("the row exists")
+            .base_urls
+            .is_empty());
+
+        CredentialStore::update(
+            &pool,
+            &bus,
+            id,
+            Some(&["   ".to_string()]),
+            AuthType::Secret,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(CredentialStore::get(&pool, "svc")
+            .await
+            .unwrap()
+            .expect("the row exists")
+            .base_urls
+            .is_empty());
+
+        teardown_test_db(&db).await;
+    }
+
+    /// `None` keeps the stored scope, on the same terms `auth_value: None`
+    /// keeps the secret. An edit of the auth header alone must not empty a set,
+    /// which would refuse the credential everywhere with nothing to undo it.
+    #[tokio::test]
+    async fn updating_without_a_scope_keeps_the_stored_one() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        let id = CredentialStore::upsert(
+            &pool,
+            &bus,
+            "svc",
+            &["https://api.example.test".to_string()],
+            AuthType::ApiKey,
+            "k",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        CredentialStore::update(
+            &pool,
+            &bus,
+            id,
+            None,
+            AuthType::ApiKey,
+            Some("X-Api-Key"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let kept = CredentialStore::get(&pool, "svc").await.unwrap().unwrap();
+        assert_eq!(kept.base_urls, vec!["https://api.example.test".to_string()]);
+        assert_eq!(kept.auth_header, "X-Api-Key", "the edit still landed");
+
+        // An EMPTY slice is a different answer, and it does clear the set.
+        CredentialStore::update(
+            &pool,
+            &bus,
+            id,
+            Some(&[]),
+            AuthType::Secret,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(CredentialStore::get(&pool, "svc")
+            .await
+            .unwrap()
+            .unwrap()
+            .base_urls
+            .is_empty());
+
+        teardown_test_db(&db).await;
+    }
+
     /// Removal announces exactly once: a repeated delete finds no row and stays
     /// silent, so a racing double-remove cannot emit twice.
     #[tokio::test]
@@ -971,7 +1236,7 @@ mod tests {
             &pool,
             &bus,
             "svc",
-            "https://example.test",
+            &["https://example.test".to_string()],
             AuthType::ApiKey,
             "secret",
             None,
@@ -1005,7 +1270,7 @@ mod tests {
         Credential {
             id: Uuid::nil(),
             service_name: service_name.to_string(),
-            base_url: String::new(),
+            base_urls: Vec::new(),
             auth_type,
             auth_value: auth_value.to_string(),
             auth_header: "Authorization".to_string(),
@@ -1254,6 +1519,136 @@ mod tests {
             "not a url"
         ));
     }
+
+    /// The defect this column exists for. One HMAC pair serves Binance's spot
+    /// and futures hosts, and one scope could not say so.
+    #[test]
+    fn a_scope_set_covers_every_host_it_names_and_no_other() {
+        let scope = vec![
+            "https://api.binance.com".to_string(),
+            "https://fapi.binance.com".to_string(),
+        ];
+        assert!(credential_scope_covers(
+            &scope,
+            "https://api.binance.com/api/v3/account"
+        ));
+        assert!(credential_scope_covers(
+            &scope,
+            "https://fapi.binance.com/fapi/v2/balance"
+        ));
+        assert!(!credential_scope_covers(
+            &scope,
+            "https://evil.test/fapi/v2/balance"
+        ));
+        // A second member widens by one named host, never by a shape. The
+        // sibling-host trick the single-scope check already refused stays
+        // refused.
+        assert!(!credential_scope_covers(
+            &scope,
+            "https://dapi.binance.com/x"
+        ));
+        assert!(!credential_scope_covers(
+            &scope,
+            "https://api.binance.com.evil.test/x"
+        ));
+    }
+
+    /// An empty set is the fail-closed state, and it is reachable: a `secret`
+    /// carries it, and so does a row the startup pass has not scoped.
+    #[test]
+    fn an_empty_scope_set_covers_nothing() {
+        assert!(!credential_scope_covers(&[], "https://api.example.com"));
+    }
+
+    /// Ranking on the whole string let a longer SPELLING of the same scope beat
+    /// a member that really is narrower. `https://api.example.com:443` is 4
+    /// characters longer than `https://api.example.com/v1` is short, so the
+    /// broad row won a request both cover. Only the path can differ once a
+    /// member matches, so only the path is ranked.
+    #[test]
+    fn specificity_ranks_the_path_and_not_the_spelling() {
+        let broad = vec!["https://api.example.com:443".to_string()];
+        let narrow = vec!["https://api.example.com/v1".to_string()];
+        let url = "https://api.example.com/v1/things";
+
+        let broad_rank = longest_matching_scope(&broad, url).expect("the broad scope covers it");
+        let narrow_rank = longest_matching_scope(&narrow, url).expect("the narrow scope covers it");
+        assert!(
+            narrow_rank > broad_rank,
+            "the member carrying a path is the more specific answer: \
+             narrow={narrow_rank} broad={broad_rank}"
+        );
+
+        // A trailing slash is the same scope written twice, so it ranks equal.
+        let slashed = vec!["https://api.example.com/v1/".to_string()];
+        assert_eq!(longest_matching_scope(&slashed, url), Some(narrow_rank));
+    }
+
+    /// A blank member is a second spelling of "no scope": it covers nothing,
+    /// but `cardinality(base_urls) = 0` answers no, so the startup pass would
+    /// skip the row and the gate's "no base URL" arm would not fire. The store
+    /// drops it before it can be written.
+    #[test]
+    fn a_blank_member_never_becomes_a_scope() {
+        assert!(scope_members(&[String::new(), "   ".to_string()]).is_empty());
+        assert_eq!(
+            scope_members(&[
+                " https://api.example.com ".to_string(),
+                String::new(),
+                "https://api.example.com".to_string(),
+            ]),
+            vec!["https://api.example.com".to_string()],
+            "trims, drops the blank, and collapses the duplicate"
+        );
+    }
+
+    /// Specificity is PATH depth. Scheme, host and port were equal already, or
+    /// the member did not match, so a longer string can be the wider scope.
+    #[test]
+    fn a_longer_string_does_not_out_rank_a_narrower_path() {
+        let whole_host = vec!["https://api.example.com:443".to_string()];
+        let one_path = vec!["https://api.example.com/v1".to_string()];
+        let url = "https://api.example.com/v1/orders";
+        assert!(credential_scope_covers(&whole_host, url));
+        assert!(credential_scope_covers(&one_path, url));
+        assert!(
+            longest_matching_scope(&one_path, url) > longest_matching_scope(&whole_host, url),
+            "the path-narrowed member is the more specific answer, though its \
+             string is shorter"
+        );
+    }
+
+    #[test]
+    fn normalizing_trims_drops_blanks_and_collapses_duplicates() {
+        let out = normalized_base_urls(vec![
+            "  https://api.binance.com ".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "https://api.binance.com".to_string(),
+            "https://fapi.binance.com".to_string(),
+        ])
+        .expect("every member is a URL with a host");
+        assert_eq!(
+            out,
+            vec![
+                "https://api.binance.com".to_string(),
+                "https://fapi.binance.com".to_string()
+            ],
+            "order is kept and the duplicate collapses"
+        );
+    }
+
+    /// Refused at the write, where the user can act on it. Stored, it could
+    /// only ever be refused at the gate, far from the form it was typed into.
+    #[test]
+    fn normalizing_refuses_a_value_that_is_not_a_url_with_a_host() {
+        for bad in ["api.example.com", "not a url", "https://"] {
+            let err = normalized_base_urls(vec![bad.to_string()])
+                .expect_err("a scope with no host is refused");
+            assert!(err.contains("host"), "unhelpful message: {err}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 20260805134838_drop_credential_name_prefixes_use_auth_type.sql
     // -----------------------------------------------------------------------
@@ -1290,8 +1685,8 @@ mod tests {
 
     async fn insert_raw(pool: &PgPool, service_name: &str, auth_type: &str) {
         sqlx::query(
-            "INSERT INTO credentials (service_name, base_url, auth_type, auth_value) \
-             VALUES ($1, 'https://api.example.com', $2, '{}')",
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
+             VALUES ($1, ARRAY['https://api.example.com'], $2, '{}')",
         )
         .bind(service_name)
         .bind(auth_type)
@@ -1410,7 +1805,7 @@ mod tests {
                 &pool,
                 &bus,
                 name,
-                "https://api.acme.test",
+                &["https://api.acme.test".to_string()],
                 auth_type,
                 value,
                 None,
@@ -1440,7 +1835,7 @@ mod tests {
             &pool,
             &bus,
             "acme",
-            "https://api.acme.test",
+            &["https://api.acme.test".to_string()],
             AuthType::OauthClient,
             "{\"client_id\":\"cid\"}",
             None,
@@ -1456,6 +1851,59 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        teardown_test_db(&db).await;
+    }
+
+    /// The narrowest scope wins, measured on the member that matched. A wide
+    /// credential carrying many hosts must not out-rank a narrow one just for
+    /// holding a longer set.
+    #[tokio::test]
+    async fn find_by_url_ranks_on_the_matching_scope_not_the_widest_row() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        for (name, scopes, value) in [
+            (
+                "wide",
+                vec![
+                    "https://api.acme.test".to_string(),
+                    "https://other.acme.test/a/very/long/path".to_string(),
+                ],
+                "wide-key",
+            ),
+            (
+                "narrow",
+                vec!["https://api.acme.test/v1".to_string()],
+                "narrow-key",
+            ),
+        ] {
+            CredentialStore::upsert(
+                &pool,
+                &bus,
+                name,
+                &scopes,
+                AuthType::ApiKey,
+                value,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let found = CredentialStore::find_by_url(&pool, "https://api.acme.test/v1/things")
+            .await
+            .unwrap()
+            .expect("both scope it, so one must answer");
+        assert_eq!(found.auth_value, "narrow-key");
+
+        let outside = CredentialStore::find_by_url(&pool, "https://api.acme.test/v2/things")
+            .await
+            .unwrap()
+            .expect("only the wide credential reaches here");
+        assert_eq!(outside.auth_value, "wide-key");
 
         teardown_test_db(&db).await;
     }
@@ -1641,8 +2089,8 @@ mod tests {
         insert_raw(&pool, "shared", "api_key").await;
 
         let err = sqlx::query(
-            "INSERT INTO credentials (service_name, base_url, auth_type, auth_value) \
-             VALUES ('shared', 'https://api.example.com', 'bearer', '{}')",
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
+             VALUES ('shared', ARRAY['https://api.example.com'], 'bearer', '{}')",
         )
         .execute(&pool)
         .await
@@ -1667,8 +2115,8 @@ mod tests {
 
     async fn insert_client(pool: &PgPool, service_name: &str, auth_value: &str) {
         sqlx::query(
-            "INSERT INTO credentials (service_name, base_url, auth_type, auth_value) \
-             VALUES ($1, 'https://api.example.com', 'oauth_client', $2)",
+            "INSERT INTO credentials (service_name, base_urls, auth_type, auth_value) \
+             VALUES ($1, ARRAY['https://api.example.com'], 'oauth_client', $2)",
         )
         .bind(service_name)
         .bind(auth_value)
@@ -1820,6 +2268,75 @@ mod tests {
         assert_eq!(
             authorize_params(&pool, "oauth:dropbox").await.as_deref(),
             Some("token_access_type=offline")
+        );
+
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 20260829132711_credential_scope_is_a_set.sql
+    // -----------------------------------------------------------------------
+
+    /// The shipped file, so there is no second copy that can drift.
+    const SCOPE_IS_A_SET: &str =
+        include_str!("../../migrations/20260829132711_credential_scope_is_a_set.sql");
+
+    /// Put the column back the way it looked before: one `base_url TEXT`.
+    async fn restore_single_scope_column(pool: &PgPool) {
+        for stmt in [
+            "ALTER TABLE credentials DROP COLUMN base_urls",
+            "ALTER TABLE credentials ADD COLUMN base_url TEXT NOT NULL DEFAULT ''",
+        ] {
+            sqlx::query(stmt).execute(pool).await.expect(stmt);
+        }
+    }
+
+    async fn insert_with_single_scope(pool: &PgPool, service_name: &str, base_url: &str) {
+        sqlx::query(
+            "INSERT INTO credentials (service_name, base_url, auth_type, auth_value) \
+             VALUES ($1, $2, 'api_key', 'k')",
+        )
+        .bind(service_name)
+        .bind(base_url)
+        .execute(pool)
+        .await
+        .expect("insert credential");
+    }
+
+    async fn scopes_of(pool: &PgPool, service_name: &str) -> Vec<String> {
+        sqlx::query_scalar("SELECT base_urls FROM credentials WHERE service_name = $1")
+            .bind(service_name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The load-bearing property: the upgrade is lossless and widens nothing.
+    /// A scoped row keeps exactly its own host, and a blank one stays refused
+    /// everywhere rather than becoming a credential that goes anywhere.
+    #[tokio::test]
+    async fn migration_carries_one_scope_across_and_invents_none() {
+        let (pool, db) = setup_test_db().await;
+        restore_single_scope_column(&pool).await;
+        insert_with_single_scope(&pool, "binance", "https://api.binance.com").await;
+        insert_with_single_scope(&pool, "webhook-secret", "").await;
+        insert_with_single_scope(&pool, "padded", "  https://api.example.com  ").await;
+
+        sqlx::raw_sql(SCOPE_IS_A_SET).execute(&pool).await.unwrap();
+
+        assert_eq!(
+            scopes_of(&pool, "binance").await,
+            vec!["https://api.binance.com".to_string()]
+        );
+        assert!(
+            scopes_of(&pool, "webhook-secret").await.is_empty(),
+            "a blank scope must not become a scope that covers something"
+        );
+        assert_eq!(
+            scopes_of(&pool, "padded").await,
+            vec!["https://api.example.com".to_string()],
+            "the carried value is trimmed, matching what the write path stores"
         );
 
         pool.close().await;

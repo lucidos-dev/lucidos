@@ -1293,6 +1293,62 @@ describe('undelivered compose drafts are parked and re-sent', () => {
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
   });
 
+  /** The gateway's 503 holding page, as `proxy.rs::starting_page` sends it.
+   *  Served for EVERY proxied request whose upstream connect fails, this PUT
+   *  included, so a mid-session restart answers a compose write with a whole
+   *  HTML document. Truncated: the real page inlines the splash stylesheet. */
+  function bootSplash(): Response {
+    const html = [
+      '<!doctype html><html><head>',
+      '<meta http-equiv="refresh" content="2">',
+      '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">',
+      '<meta name="theme-color" content="#0a4ea8">',
+      '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,...">',
+      '</head><body><div class="boot-splash">Starting engine</div></body></html>',
+    ].join('\n');
+    return new Response(html, {
+      status: 503,
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': '2',
+        'x-lucidos-boot-splash': '1',
+      },
+    });
+  }
+
+  // The reported card, end to end: a real `fetch` answer through the real
+  // `throwIfNotOk`, the real failure handler, and the real `showToast`.
+  it('treats the gateway boot splash as no answer, so the draft is owed a re-send', async () => {
+    mockFetch.mockResolvedValue(bootSplash());
+
+    updateCompose('t-1', { text: 'typed while the engine was restarting' });
+    await vi.runAllTimersAsync();
+
+    // The engine never saw the write, so this is not a verdict and the user is
+    // owed nothing but the re-send. Before the fix it toasted the HTML page AND
+    // dropped the thread from the queue, which lost the write silently.
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+  });
+
+  it('never puts an HTML body into the card, however the page arrived', async () => {
+    // A 502 from something in front of the gateway IS a verdict, so it toasts.
+    // What it must not do is toast the page. The reported card ran the body
+    // through the section parser: a bold line, then one bullet per `<meta>`.
+    mockFetch.mockResolvedValue(new Response(
+      '<!doctype html>\n<html><head>\n<meta http-equiv="refresh" content="2">\n</head></html>',
+      { status: 502, statusText: 'Bad Gateway', headers: { 'Content-Type': 'text/html' } },
+    ));
+
+    updateCompose('t-1', { text: 'against a broken proxy' });
+    await vi.runAllTimersAsync();
+
+    const [card] = toasts.value.filter((t) => t.type === 'error');
+    expect(card.message).toBe('Compose sync failed: 502 Bad Gateway');
+    expect(card.message).not.toMatch(/[<>]/);
+    expect(card.message).not.toContain('\n');
+  });
+
   it('re-sends the CURRENT draft on flush, then drains and retracts the card', async () => {
     mockFetch.mockRejectedValue(noAnswer());
     for (const text of ['a', 'ab', 'abc']) {

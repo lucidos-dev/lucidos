@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::{EventChannel, MessageOrigin};
+use super::{AgentParticipant, EventChannel, MessageOrigin};
 
 /// Cross-cutting metadata merged into the event payload during persistence.
 /// Not part of the ThreadEvent type itself — these are routing/grouping fields
@@ -32,6 +32,21 @@ impl EventMeta {
         EventMeta {
             actor,
             ..EventMeta::NONE
+        }
+    }
+
+    /// This request's meta, plus the agent that authored the event (ADR 0150).
+    ///
+    /// Keeps `request_event_id` and `channel`, because an authored event
+    /// belongs to the same cycle as the request that prompted it.
+    ///
+    /// Stamp only what the agent WROTE, never the turn's request meta itself.
+    /// `meta_with_cancel_actor` fills its slot only when it is empty, so a
+    /// pre-filled one would attribute the user's Stop click to the agent.
+    pub fn authored_by(&self, agent: AgentParticipant) -> Self {
+        EventMeta {
+            actor: Some(MessageOrigin::Agent { agent }),
+            ..self.clone()
         }
     }
 

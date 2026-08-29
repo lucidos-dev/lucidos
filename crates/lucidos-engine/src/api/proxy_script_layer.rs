@@ -4,7 +4,7 @@
 //! requests for the same proxy from all spawning the script.
 
 use crate::api::proxy::fetch_required_credential;
-use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint};
+use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, RetryHint, ScopeBinding};
 use crate::api::proxy_token_cache::ProxyTokenCache;
 use crate::core::oauth;
 use async_trait::async_trait;
@@ -196,6 +196,27 @@ impl ScriptHandshakeLayer {
 impl AuthLayer for ScriptHandshakeLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// The script mints a token, and the token travels. So the script's own
+    /// recorded scope binds this layer whether or not a credential is named.
+    ///
+    /// The secrets the entry asks us to inject bind separately. They do not
+    /// travel to `base_url`, so a credential's own scope cannot judge them; the
+    /// record says which ones this script may be handed. An entry injecting
+    /// nothing declares nothing, because no secret moves.
+    fn scope_bindings(&self) -> Vec<ScopeBinding> {
+        use crate::core::handshake_approvals::{config_path_key, injected_secrets};
+        let script = config_path_key(&self.script_rel_path);
+        let injects = injected_secrets(
+            self.credential.as_deref(),
+            self.oauth_providers.iter().map(String::as_str),
+        );
+        let mut out = vec![ScopeBinding::HandshakeScript(script.clone())];
+        if !injects.is_empty() {
+            out.push(ScopeBinding::HandshakeInjects { script, injects });
+        }
+        out
     }
 
     fn retry_on_401(&self) -> RetryHint {

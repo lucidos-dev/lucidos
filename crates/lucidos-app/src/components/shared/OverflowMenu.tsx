@@ -29,12 +29,23 @@ export interface OverflowMenuContext {
   run: (fn: () => void) => (e: MouseEvent) => void;
 }
 
+/** How a host opens a menu that renders no ⋯ trigger. The element passed is what
+ *  the popovers position against. */
+export type OverflowMenuOpener = (anchor: HTMLElement) => void;
+
 /** Generic ⋯ overflow menu: a trigger button, an anchored menu popover, and an
  *  optional secondary Info popover — the whole dismiss/Escape/inert contract via
  *  the central <Overlay>, `portal`ed + `position: fixed` so it escapes the
  *  drawer's scroll/overflow clipping and any transformed header ancestor. The
  *  shared shell behind ThreadOverflowMenu (started threads) and DraftOverflowMenu
  *  (compose drafts); each supplies its own `items` and `infoRows`.
+ *
+ *  **`openRef` hands opening to the host, and the mobile drawer row is why.**
+ *  There the ⋯ is not drawn and a long press on the row opens the menu instead:
+ *  a 31x27px trigger against the pane's right edge is the hardest place on a
+ *  phone to hit. One prop rather than a hide-the-trigger flag beside it. A menu
+ *  with neither a trigger nor a host opener would be unopenable, and that state
+ *  is now unrepresentable.
  *
  *  **Open mode (keyboard vs pointer) shapes the menu.** A real pointer click
  *  reports `e.detail >= 1`; a keyboard activation (Enter/Space) and a synthetic
@@ -53,15 +64,19 @@ export interface OverflowMenuContext {
  *  (the drawer row's focus-thread `onClick`) — toggling the menu or running an
  *  item must not also fire it.
  */
-export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex, items, infoRows }: {
+export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex, openRef, items, infoRows }: {
   ariaLabel: string;
   stopPropagation?: boolean;
   extraClass?: string;
   /** `-1` removes the ⋯ trigger from the Tab order (the drawer row's mouse-only
    *  use — the drawer is a single tab stop, and the menu is opened via the
    *  "Open thread actions" shortcut). Default undefined → natively tabbable
-   *  (the thread-title headers). */
+   *  (the thread-title headers). Ignored in host-opened mode: there is no
+   *  trigger to order. */
   tabIndex?: number;
+  /** Set it and the host owns opening: no ⋯ is rendered, and this menu writes
+   *  its opener here for the host's gesture to call. See the class comment. */
+  openRef?: { current: OverflowMenuOpener | null };
   /** Custom items, rendered above the auto-appended Info row. Invoked only while
    *  the menu is open. */
   items: (ctx: OverflowMenuContext) => ComponentChildren;
@@ -73,6 +88,9 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const infoRef = useRef<HTMLDivElement>(null);
+  // The element the host last opened against, so the Info popover lands on the
+  // same one the menu did. Null whenever a ⋯ trigger is doing the opening.
+  const hostAnchorRef = useRef<HTMLElement | null>(null);
   // Anchor element when open, null when closed — `useAnchoredPosition` reacts to
   // anchor changes via its effect deps, so no separate `open` flag is needed.
   // The menu and the Info popover each carry their own anchor; they're mutually
@@ -92,8 +110,14 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
   // of a drawer row / thread-title header, so left-start placement would push the
   // wide panel off-screen and the viewport clamp would strand it near the left
   // edge (the "all the way to the left" report on narrow mobile viewports).
-  const pos = useAnchoredPosition(anchor, menuRef, undefined, 'end');
-  const infoPos = useAnchoredPosition(infoAnchor, infoRef, undefined, 'end');
+  //
+  // Host-opened mode inverts that, because the anchor does too: a whole drawer
+  // row, not a button at its end. Right-aligning to it puts the panel back in
+  // the corner the long press exists to leave. So it aligns to the row's
+  // leading edge instead.
+  const align = openRef ? 'start' : 'end';
+  const pos = useAnchoredPosition(anchor, menuRef, undefined, align);
+  const infoPos = useAnchoredPosition(infoAnchor, infoRef, undefined, align);
 
   const close = () => {
     setAnchor(null);
@@ -122,6 +146,25 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
     close();
     fn();
   };
+
+  // Host-opened mode's entry point, published for the host's own gesture. It
+  // only ever OPENS: the host cannot call it while the menu is up, because an
+  // open overlay makes the shell behind it inert and the gesture never starts.
+  // Always a pointer-open, since a gesture is what invokes it.
+  //
+  // Assigned during render rather than in an effect, so it is live from the
+  // first frame. Cleared on unmount, so a row scrolled out of the list cannot
+  // be opened through a stale handle.
+  if (openRef) {
+    openRef.current = (el: HTMLElement) => {
+      closeInfo();
+      hostAnchorRef.current = el;
+      setOpenedViaKeyboard(false);
+      lastFocusedRef.current = null;
+      setAnchor(el);
+    };
+  }
+  useEffect(() => () => { if (openRef) openRef.current = null; }, [openRef]);
 
   // ↑/↓/Home/End rove focus across the menu items (the Overlay owns Escape;
   // Enter/Space activate the focused <button> natively → its onClick).
@@ -152,25 +195,35 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
   // Read ONLY while a popover is open so a closed menu subscribes to no signals.
   const rows = (open || infoOpen) && infoRows ? infoRows() : null;
 
+  // The Overlay's anchor is the element that re-activates the overlay through
+  // its OWN handler, exempt from the outside-pointerdown dismiss. That is the ⋯
+  // trigger, and host-opened mode has none. The row is not a toggle: its click
+  // focuses the thread, so exempting it would let one tap both dismiss the menu
+  // and navigate. The re-open race the exemption normally guards cannot happen
+  // here, because a short tap never opens this menu.
+  const overlayAnchor = openRef ? null : triggerRef.current;
+
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        tabIndex={tabIndex}
-        class={`icon-btn header-icon${extraClass ? ` ${extraClass}` : ''}`}
-        onClick={toggle}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-label={ariaLabel}
-        data-tooltip="More actions"
-      >
-        <MoreIcon />
-      </button>
+      {!openRef && (
+        <button
+          ref={triggerRef}
+          type="button"
+          tabIndex={tabIndex}
+          class={`icon-btn header-icon${extraClass ? ` ${extraClass}` : ''}`}
+          onClick={toggle}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-label={ariaLabel}
+          data-tooltip="More actions"
+        >
+          <MoreIcon />
+        </button>
+      )}
       <Overlay
         open={open}
         onClose={close}
-        anchor={triggerRef.current}
+        anchor={overlayAnchor}
         backdrop={false}
         portal
         panelClass="thread-overflow-menu"
@@ -185,7 +238,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
         {rows && (
           <>
             <div class="thread-overflow-divider" role="separator" />
-            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => setInfoAnchor(triggerRef.current))}>
+            <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => setInfoAnchor(triggerRef.current ?? hostAnchorRef.current))}>
               <InfoIcon />
               Info
             </button>
@@ -195,7 +248,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
       <Overlay
         open={infoOpen}
         onClose={closeInfo}
-        anchor={triggerRef.current}
+        anchor={overlayAnchor}
         backdrop={false}
         portal
         panelClass="thread-info-popover"

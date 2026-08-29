@@ -25,6 +25,7 @@ mod history;
 mod images;
 pub(crate) mod internal;
 mod knowhow;
+pub(crate) mod local_auth;
 mod mcp;
 mod mcp_permission;
 mod memory;
@@ -52,6 +53,7 @@ mod sdk;
 mod sdk_fonts;
 mod sdk_prefs;
 mod search;
+pub(crate) mod secret_reveal;
 mod settings;
 pub mod sse_connections;
 pub(crate) mod target_workspace;
@@ -61,13 +63,16 @@ mod threads;
 mod threads_compose;
 mod trigger_groups;
 mod triggers;
+mod voice;
 mod webhooks;
 mod workspace_label;
+mod ws_echo;
 
 /// The `apis.json` read, re-exported because the engine binary reads it at
 /// startup and `SystemEvent::ProxyConfigRejected` carries the refusals. The
 /// rest of `proxy` stays crate-internal.
-pub use proxy::{load_proxy_config, ProxyConfigLoad, RejectedProvider};
+pub use proxy::{load_proxy_config, InsecureTransport, ProxyConfigLoad, RejectedProvider};
+pub use proxy_builtin::local_upstream_base_url;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -210,9 +215,9 @@ pub struct AppState {
     /// Pending OAuth flows keyed by provider — the receiver resolves when the
     /// background listener receives the callback and completes token exchange.
     pub pending_oauth_flows: PendingOAuthFlows,
-    /// Live one-shot credential-reveal tokens. Ephemeral by design; see
-    /// `api::credential_reveal`.
-    pub reveal_tokens: credential_reveal::RevealTokens,
+    /// Live one-shot secret-reveal tokens, shared by the credential reveal and
+    /// the backup key. Ephemeral by design; see `api::secret_reveal`.
+    pub reveal_tokens: secret_reveal::RevealTokens,
 }
 
 /// App context sent when an app UI is open — tells the LLM which app is active.
@@ -532,10 +537,44 @@ pub struct CredentialsListResponse {
     pub credentials: Vec<CredentialInfo>,
 }
 
+/// The *credential scope* a create or update body declares.
+///
+/// `base_urls` is the field. `base_url` is permanent back-compat for a caller
+/// written before the scope became a set, and [`RequestedScope::declared`]
+/// folds it into the list. Both present is not an error: the singular joins the
+/// set, which is what adding a host to an old body means.
+#[derive(Deserialize, Default)]
+pub struct RequestedScope {
+    #[serde(default)]
+    pub base_urls: Option<Vec<String>>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+impl RequestedScope {
+    /// Every base URL the body asked for, or `None` when it named NEITHER
+    /// field.
+    ///
+    /// The distinction is load-bearing on the update verb, where absence has to
+    /// mean "leave the scope alone". Both fields are optional, so the two
+    /// spellings can coexist. An absent scope therefore deserializes as an
+    /// empty one, and an empty one CLEARS the credential. A `PUT` that only
+    /// meant to change the auth header would silently have emptied the set.
+    pub fn declared(&self) -> Option<Vec<String>> {
+        if self.base_urls.is_none() && self.base_url.is_none() {
+            return None;
+        }
+        let mut out = self.base_urls.clone().unwrap_or_default();
+        out.extend(self.base_url.clone());
+        Some(out)
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CreateCredentialRequest {
     pub service_name: String,
-    pub base_url: String,
+    #[serde(flatten)]
+    pub scope: RequestedScope,
     pub auth_type: String,
     pub auth_value: String,
     #[serde(default)]
@@ -546,9 +585,21 @@ pub struct CreateCredentialRequest {
     pub env_var_name: Option<String>,
 }
 
+/// Body of `PUT /api/v1/credential-base-urls?id=<uuid>`, which replaces one
+/// credential's scope and nothing else.
+///
+/// Narrow on purpose. The whole-row edit needs the auth type, and it defaults
+/// the auth header. So a script widening a scope through it can clobber fields
+/// it never meant to name.
+#[derive(Deserialize)]
+pub struct SetCredentialBaseUrlsRequest {
+    pub base_urls: Vec<String>,
+}
+
 #[derive(Deserialize)]
 pub struct UpdateCredentialRequest {
-    pub base_url: String,
+    #[serde(flatten)]
+    pub scope: RequestedScope,
     pub auth_type: String,
     #[serde(default)]
     pub auth_header: Option<String>,
@@ -1084,6 +1135,10 @@ pub fn create_router(
     workspace_path: PathBuf,
     scheduler: Arc<tokio::sync::Mutex<SchedulerManager>>,
     started_at: chrono::DateTime<chrono::Utc>,
+    // What this engine is about to bind. It decides whether callers must
+    // present a credential, so it is resolved before the router is built rather
+    // than at listen time. See `api::local_auth`.
+    bind_choice: &crate::net_config::BindChoice,
 ) -> Router {
     // Initialize AppManager
     let app_manager =
@@ -1121,7 +1176,7 @@ pub fn create_router(
         scheduler,
         started_at,
         pending_oauth_flows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        reveal_tokens: credential_reveal::RevealTokens::new(),
+        reveal_tokens: secret_reveal::RevealTokens::new(),
     };
 
     // Serve static files from the data/ tree. One mount covers every
@@ -1172,6 +1227,8 @@ pub fn create_router(
         .merge(internal::router())
         .merge(backup::router())
         .merge(disk_usage::router())
+        .merge(voice::router())
+        .merge(ws_echo::router())
         .merge(frontend_preview::router())
         .merge(search::router())
         .merge(release_notices::router())
@@ -1271,6 +1328,24 @@ pub fn create_router(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
+        // Who is calling, on an engine that faces a network. Layered out here
+        // rather than inside the `/api/v1` nest. `/app`, `/data` and the
+        // frontend fallback are siblings of that nest, so a gate inside it
+        // would miss all three. `/data` serves the workspace's files straight
+        // off disk, which would be the whole leak.
+        //
+        // Inert on a loopback bind, which is every shipped topology: the layer
+        // returns immediately and nothing about today's behaviour changes.
+        //
+        // Deliberately NOT skipped for `LUCIDOS_PERMISSIVE_CORS`, unlike the
+        // origin gate below. That variable says this deployment wants
+        // cross-origin browser access. It does not say it wants no
+        // authentication, and reading it that way would make an escape hatch
+        // for one concern silently open another.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(local_auth::EngineAuth::resolve(bind_choice)),
+            local_auth::enforce,
+        ))
         .layer(axum::middleware::from_fn(request_logger));
 
     if permissive_cors_enabled() {
@@ -1331,6 +1406,62 @@ mod tests {
             base64: base64_data,
             mime_type: "image/png".to_string(),
         }
+    }
+
+    /// Absence and emptiness are different answers, and the update verb acts on
+    /// the difference. A body that names no scope leaves the stored one alone;
+    /// one that names `[]` clears it. Without the distinction, a `PUT` changing
+    /// only the auth header emptied the set and every call through the
+    /// credential started failing.
+    #[test]
+    fn a_body_naming_no_scope_is_told_apart_from_one_naming_an_empty_scope() {
+        let parse = |body: &str| {
+            serde_json::from_str::<RequestedScope>(body)
+                .expect("the body parses")
+                .declared()
+        };
+
+        assert_eq!(
+            parse("{}"),
+            None,
+            "neither field named: keep what is stored"
+        );
+        assert_eq!(
+            parse(r#"{"base_urls":[]}"#),
+            Some(vec![]),
+            "an empty list is a real answer and clears the scope"
+        );
+        assert_eq!(
+            parse(r#"{"base_urls":["https://api.binance.com"]}"#),
+            Some(vec!["https://api.binance.com".to_string()])
+        );
+    }
+
+    /// The singular field is permanent back-compat, and it JOINS the set rather
+    /// than replacing it. A caller written before the scope became a set adds a
+    /// host by sending both.
+    #[test]
+    fn the_old_singular_field_joins_the_set() {
+        let both: RequestedScope = serde_json::from_str(
+            r#"{"base_urls":["https://api.binance.com"],"base_url":"https://fapi.binance.com"}"#,
+        )
+        .expect("the body parses");
+        assert_eq!(
+            both.declared(),
+            Some(vec![
+                "https://api.binance.com".to_string(),
+                "https://fapi.binance.com".to_string(),
+            ])
+        );
+
+        let singular: RequestedScope =
+            serde_json::from_str(r#"{"base_url":"https://api.binance.com"}"#)
+                .expect("the body parses");
+        assert_eq!(
+            singular.declared(),
+            Some(vec!["https://api.binance.com".to_string()]),
+            "the singular alone still names a scope"
+        );
     }
 
     /// Compressing a media response would strip `Accept-Ranges`, so the

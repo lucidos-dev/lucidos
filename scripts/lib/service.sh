@@ -504,6 +504,20 @@ service_launchd_is_loaded() {
     launchctl print "$(service_launchd_target "$1" "$2")" >/dev/null 2>&1
 }
 
+# service_launchd_domain_reachable <uid>: true if this shell can inspect the
+# per-user launchd domain at all.
+#
+# `service_launchd_is_loaded` cannot tell "the job is not bootstrapped" from
+# "this shell cannot see the domain": both make `launchctl print` exit non-zero.
+# A shell with no console session (headless, logged out, admin over ssh) gets
+# the second. Reading that as "nothing is loaded" made uninstall.sh report a
+# live KeepAlive gateway as stopped, then purge the instance data dir underneath
+# it. Ask about the DOMAIN to tell the two apart. The systemd half already draws
+# this distinction, with its `show-environment` bus probe.
+service_launchd_domain_reachable() {
+    launchctl print "$(service_launchd_domain "$1")" >/dev/null 2>&1
+}
+
 # ── the async-bootout rule, which the two wrappers below both depend on ──────
 #
 # `launchctl bootout` IS ASYNCHRONOUS, AND ITS EXIT CODE IS NOT AN ANSWER. It

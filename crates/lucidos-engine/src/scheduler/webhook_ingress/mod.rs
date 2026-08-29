@@ -30,8 +30,7 @@ use sqlx::PgPool;
 
 use crate::api::SharedEngine;
 use crate::core::webhook_ingress::{
-    decide, degraded_families, judge, judge_no_public_record, AddressProbe, Decision, Family,
-    FamilyVerdict,
+    decide, degraded_families, judge, AddressProbe, Decision, Family, FamilyVerdict,
 };
 use crate::core::webhook_probe_token;
 use crate::core::WebhookStore;
@@ -139,20 +138,14 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
     };
 
     let path = format!("/{slug}/{}", hook.id);
-    let (addresses, families) = match dns::public_addresses(&resolver, &ingress.host).await {
-        dns::PublicAddresses::Unknown => {
-            return undetermined("the funnel hostname could not be resolved");
-        }
-        // Answered, and named nothing. No delivery can address this host.
-        dns::PublicAddresses::NoRecord => (Vec::new(), judge_no_public_record()),
-        dns::PublicAddresses::Found(found) => match probe_each(&ingress, &path, &found).await {
-            Some(probed) => {
-                let families = judge(&probed);
-                (probed, families)
-            }
-            None => return undetermined("no probe token could be minted"),
-        },
+    let found = match addresses_to_probe(dns::public_addresses(&resolver, &ingress.host).await) {
+        Ok(found) => found,
+        Err(reason) => return undetermined(reason),
     };
+    let Some(addresses) = probe_each(&ingress, &path, &found).await else {
+        return undetermined("no probe token could be minted");
+    };
+    let families = judge(&addresses);
     let observed = degraded_families(&families);
 
     match record_cycle(&families, declared.as_ref()) {
@@ -212,6 +205,23 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
     None
 }
 
+/// The addresses this cycle can knock on, or the reason it can judge nothing.
+///
+/// Only `Found` yields a verdict. A hostname every resolver answered with no
+/// record, and a lookup nobody answered, are different facts, and neither one
+/// is a measurement of the ingress. So both stop the cycle.
+///
+/// They keep separate reasons, because a log has to name which one happened.
+fn addresses_to_probe(answer: dns::PublicAddresses) -> Result<Vec<std::net::IpAddr>, &'static str> {
+    match answer {
+        dns::PublicAddresses::Found(found) => Ok(found),
+        dns::PublicAddresses::NoRecord => {
+            Err("the resolvers named no public address for the funnel host")
+        }
+        dns::PublicAddresses::Unknown => Err("the funnel hostname could not be resolved"),
+    }
+}
+
 /// Probe every address, under a bearer minted for this cycle alone.
 ///
 /// The token is minted here rather than at the top of the cycle, so it is live
@@ -237,7 +247,11 @@ async fn probe_each(
     Some(probe::probe_all(&target, addresses, probe::LocalRoutes::detect()).await)
 }
 
-/// This cycle could not tell healthy from degraded, so nothing is emitted.
+/// This cycle measured nothing, so it pronounces nothing.
+///
+/// A health check must not call a path unreachable when it never reached for
+/// it. Every reason that lands here left the probe with no address to knock on.
+/// The ingress therefore went untested, and a standing outage stays as it is.
 ///
 /// The debounce memory is cleared, because two failures separated by a cycle
 /// nobody could read are not consecutive.
@@ -334,6 +348,9 @@ pub(crate) struct DeclaredOutage {
     pub host: String,
     pub port: u16,
     pub families: Vec<Family>,
+    /// What each address answered when the outage was declared. This is the
+    /// diagnosis, so the page can hand a reader more than "it is down".
+    pub addresses: Vec<AddressProbe>,
     pub down_since: chrono::DateTime<chrono::Utc>,
     pub down_secs: i64,
 }
@@ -346,6 +363,14 @@ struct DegradedPayload {
     host: String,
     port: u16,
     degraded_families: Vec<Family>,
+    /// Filled by `parse_declaration`, never by this derive.
+    ///
+    /// It is the only descriptive field here, and the rest decide whether an
+    /// outage stands. A payload this engine cannot fully read must therefore
+    /// cost the diagnosis alone. Losing the whole declaration would strand a
+    /// live outage that nothing else can retract.
+    #[serde(skip)]
+    addresses: Vec<AddressProbe>,
 }
 
 /// Read the newest ingress declaration, whichever webhook it named.
@@ -383,6 +408,7 @@ pub(crate) async fn declared_outage(pool: &PgPool) -> Result<Option<DeclaredOuta
             host: payload.host,
             port: payload.port,
             families: payload.degraded_families,
+            addresses: payload.addresses,
             down_since: created,
             down_secs: age_secs,
         }),
@@ -405,6 +431,12 @@ fn parse_declaration(event_type: &str, data: &serde_json::Value) -> Option<Degra
     if payload.degraded_families.is_empty() {
         return None;
     }
+    // All or nothing, on purpose. A half-read list would name two of three
+    // addresses under a heading promising every one of them.
+    payload.addresses = data
+        .get("addresses")
+        .and_then(|addresses| serde_json::from_value(addresses.clone()).ok())
+        .unwrap_or_default();
     Some(payload)
 }
 
@@ -487,8 +519,32 @@ mod tests {
         let degraded = stored(serde_json::json!(["ipv4"]));
         let parsed = parse_declaration("WebhookIngressDegraded", &degraded).expect("an outage");
         assert_eq!(parsed.degraded_families, vec![Family::Ipv4]);
+        // `stored` carries no `addresses` key, which is what a declaration made
+        // before this engine read that field looks like. It must still parse: a
+        // whole-payload failure would strand a live outage nothing can retract.
+        assert!(parsed.addresses.is_empty());
         // A recovery retracts, so it declares nothing.
         assert!(parse_declaration("WebhookIngressRecovered", &degraded).is_none());
+    }
+
+    #[test]
+    fn an_unreadable_address_costs_the_diagnosis_and_not_the_outage() {
+        // A stage a later engine added, read back after a downgrade. The events
+        // table is append-only, so that row outlives the version that wrote it.
+        // Dropping the declaration over it would clear the bar on a path that
+        // is still down, and no later cycle would ever retract it.
+        let mut data = stored(serde_json::json!(["ipv4"]));
+        data["addresses"] = serde_json::json!([
+            { "address": "203.0.113.7", "family": "ipv4", "stage": "from-the-future",
+              "status": null, "detail": null }
+        ]);
+
+        let parsed = parse_declaration("WebhookIngressDegraded", &data).expect("still an outage");
+        assert_eq!(parsed.degraded_families, vec![Family::Ipv4]);
+        assert!(
+            parsed.addresses.is_empty(),
+            "a list that cannot be read whole is dropped whole, never half"
+        );
     }
 
     #[test]
@@ -508,14 +564,21 @@ mod tests {
     fn a_declaration_reads_back_off_its_own_wire_shape() {
         // The debounce compares the two family sets for equality, so a payload
         // that did not round trip would re-declare the same outage every cycle.
+        let probed = AddressProbe {
+            address: "203.0.113.7".into(),
+            family: Family::Ipv4,
+            stage: crate::core::webhook_ingress::Stage::IngressUnreachable,
+            status: None,
+            detail: Some("could not connect: connection refused".into()),
+        };
         let event = SystemEvent::WebhookIngressDegraded {
             webhook_id: "6f1c0f3e-0000-4000-8000-000000000001".into(),
             webhook_name: "github-ci".into(),
             host: "node.tailnet.ts.net".into(),
             port: 8443,
             degraded_families: vec![Family::Ipv4, Family::Ipv6],
-            families: judge(&[]),
-            addresses: Vec::new(),
+            families: judge(std::slice::from_ref(&probed)),
+            addresses: vec![probed.clone()],
         };
         let wire = serde_json::to_value(&event).expect("the event serializes");
         let data = wire.get("data").expect("a tagged payload carries data");
@@ -528,6 +591,10 @@ mod tests {
         );
         assert_eq!(parsed.host, "node.tailnet.ts.net");
         assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.webhook_name, "github-ci");
+        // The diagnosis survives the round trip, so the page and the Discuss
+        // prompt can state what each address answered.
+        assert_eq!(parsed.addresses, vec![probed]);
     }
 
     /// What one cycle read, in the order every payload lists the families.
@@ -544,6 +611,26 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_resolution_that_measured_nothing_judges_nothing() {
+        // The false alarm this replaced: an empty address list became a verdict
+        // of degraded over both families, for a funnel that was answering.
+        // Nothing was sent, so there is nothing to pronounce on.
+        assert!(addresses_to_probe(dns::PublicAddresses::NoRecord).is_err());
+        assert!(addresses_to_probe(dns::PublicAddresses::Unknown).is_err());
+        // The two stay apart, so a log says which of them happened.
+        assert_ne!(
+            addresses_to_probe(dns::PublicAddresses::NoRecord).unwrap_err(),
+            addresses_to_probe(dns::PublicAddresses::Unknown).unwrap_err()
+        );
+
+        let found = vec!["203.0.113.7".parse().expect("test address parses")];
+        assert_eq!(
+            addresses_to_probe(dns::PublicAddresses::Found(found.clone())),
+            Ok(found)
+        );
+    }
+
     /// A standing declaration over the given families.
     fn standing(families: Vec<Family>) -> DeclaredOutage {
         DeclaredOutage {
@@ -552,6 +639,7 @@ mod tests {
             host: "node.tailnet.ts.net".into(),
             port: 8443,
             families,
+            addresses: Vec::new(),
             down_since: chrono::Utc::now(),
             down_secs: 900,
         }
@@ -583,6 +671,15 @@ mod tests {
         assert_eq!(record_cycle(&down, None), Decision::Nothing);
         forget_last_cycle();
         assert_eq!(record_cycle(&down, None), Decision::Nothing);
+
+        // The same cycle while an outage stands. `run_cycle` returns before
+        // `record_cycle` is reached, so the declaration is neither repeated nor
+        // retracted, and the cycle after it re-declares nothing.
+        reset_memory();
+        assert_eq!(record_cycle(&down, None), Decision::Nothing);
+        assert_eq!(record_cycle(&down, None), Decision::Declare);
+        forget_last_cycle();
+        assert_eq!(record_cycle(&down, Some(&ipv4_down)), Decision::Nothing);
 
         reset_memory();
     }

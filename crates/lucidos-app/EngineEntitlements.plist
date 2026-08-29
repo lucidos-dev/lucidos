@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for Contents/Resources/lucidos-engine ONLY.
+
+  NO DOUBLE HYPHEN ANYWHERE IN THIS COMMENT, for the reason
+  Entitlements.plist gives beside it: codesign hands the file to
+  AMFIUnserializeXML, whose parser rejects a "- -" pair inside a comment.
+
+  The engine is a SEPARATE PROCESS, spawned by the gateway. Entitlements
+  are per binary, so the outer .app signature never reaches it. It needs
+  its own file, and this is it.
+
+  Why a key at all. The engine embeds wasmtime and compiles a signer
+  module to native code on the proxy auth path (api/proxy_wasm_signer.rs).
+  The release path signs with the hardened runtime, which forbids
+  executing a page no signature covers, so the kernel killed the process
+  the instant it called compiled code: SIGKILL, CODESIGNING, Invalid Page.
+
+  Why THIS key and not allow-jit. allow-jit covers MAP_JIT mappings.
+  wasmtime never asks for one: it maps anonymous memory and mprotects it
+  to read plus execute, which is what this key covers. Measured on a probe
+  of that exact allocation, signed with a Developer ID certificate and the
+  hardened runtime: no entitlement dies, allow-jit dies, this key runs.
+  So allow-jit would be dead weight, and is deliberately absent.
+
+  Measurements and the reasoning:
+  docs/plans/2026-08-29-the-packaged-engine-is-allowed-to-jit.md
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>

@@ -92,12 +92,57 @@ source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 source "$_E2E_LIB_DIR/host_memory_guard.sh"
 
+# ── assert_e2e_workspace_is_disposable ──────────────────────────────────
+# Refuse to proceed unless $E2E_WORKSPACE names a disposable e2e workspace.
+#
+# This suite DROPS the workspace's database and force-removes its worktrees and
+# `lucidos-*` branches. `E2E_WORKSPACE` is deliberately env-overridable (the
+# comment at the top of this file says why), and nothing checked what it
+# pointed at. So `E2E_WORKSPACE=$HOME/workspaces/dev ./scripts/e2e.sh` dropped
+# `lucidos_dev` and deleted that workspace's coding-agent worktrees.
+#
+# The name is the gate, matching the eval harness, which refuses a path whose
+# name lacks its own prefix. Every sanctioned shape starts `e2e-`: the default
+# `e2e-test`, and the sandboxes the lib tests pin before sourcing us
+# (`$SANDBOX/e2e-test`, `$TMPROOT/e2e-ws`). A new sandbox must be named to match.
+#
+# Trailing slashes come off first. `${var##*/}` answers an empty string for a
+# path written `.../e2e-test/`, which would refuse the default workspace.
+assert_e2e_workspace_is_disposable() {
+    local path="$E2E_WORKSPACE"
+    while [ "${path%/}" != "$path" ]; do path="${path%/}"; done
+    case "${path##*/}" in
+        e2e-*) return 0 ;;
+    esac
+    echo "ERROR: E2E_WORKSPACE points at '$E2E_WORKSPACE'." >&2
+    echo "       This suite drops that workspace's database and force-removes" >&2
+    echo "       its worktrees, so it only runs against a disposable workspace" >&2
+    echo "       whose directory name starts with 'e2e-'." >&2
+    return 1
+}
+
+# Assert at SOURCE TIME, which is the only place that is actually safe.
+#
+# The two destructive functions call it too, but a refusal raised down there is
+# too late: `setup_e2e_session` installs `trap teardown_e2e EXIT` BEFORE it
+# calls them, and that teardown runs `stop_e2e_workspace` and
+# `sweep_e2e_orphans`. Under the entry scripts' `set -e` the refusal aborts, the
+# trap then fires against the workspace just refused, and the sweep SIGUSR1s its
+# engine and kills every process under its worktrees. The guard would have
+# triggered the destruction it exists to prevent.
+#
+# Here there is no trap, no lock and no consumer yet, and every later reader of
+# `$E2E_WORKSPACE` in this library and in `e2e_lock.sh` is covered by
+# construction rather than by remembering to add another call.
+assert_e2e_workspace_is_disposable || exit 1
+
 # ── e2e_workspace_env ───────────────────────────────────────────────────
 # Resolve this workspace's globals (pidfiles, log path, PG_NAME), its ports and
 # TLS. Idempotent and cheap. Both ensure_workspace_running and
 # reset_e2e_database need it — the reset runs BEFORE the engine's first boot, so
 # it can't rely on ensure_workspace_running having gone first.
 e2e_workspace_env() {
+    assert_e2e_workspace_is_disposable || return 1
     export WORKSPACE="$E2E_WORKSPACE"
     resolve_workspace
     allocate_ports "$WORKSPACE"
@@ -336,6 +381,7 @@ prune_orphan_worktree_dirs() {
 }
 
 cleanup_e2e_worktrees() {
+    assert_e2e_workspace_is_disposable || return 1
     echo "Cleaning up e2e worktrees..."
     local original_dir="$PWD"
     cd "$E2E_WORKSPACE" || return
@@ -640,17 +686,34 @@ report_playwright_totals() {
 }
 
 # ── kill_orphan_simulator ────────────────────────────────────────────
-# The Simulator's Virtualization VM survives `simctl shutdown` (XPC service
-# persists for fast reboot) and holds multiple GB resident — pkill it too.
-# Gate on CoreSimulatorService being alive so we don't clobber other
-# Virtualization.framework consumers (Docker Desktop, etc.).
+# The Simulator's Virtualization VM survives `simctl shutdown` (the XPC service
+# persists for fast reboot) and holds multiple GB resident, so reclaim it.
+#
+# CRITICAL: prove the VM is the Simulator's before signalling it. Docker
+# Desktop drives the same framework, and its helper is the identical Apple
+# binary with an EMPTY argv, reparented to launchd. Neither a name match nor a
+# ppid check can tell the two apart, so `pkill -f` on that binary killed
+# Docker's VM, taking `lucidos-pg-shared` and every workspace's database with
+# it. Gating on CoreSimulatorService did not help: it proves a Simulator is
+# alive, never whose VM this is. The open files are the honest discriminator.
+# A VM we cannot place is LEFT ALONE, because leaked RAM is recoverable and a
+# dropped database cluster is not.
 kill_orphan_simulator() {
     pgrep -x Simulator >/dev/null 2>&1 || pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1 || return 0
     xcrun simctl shutdown all >/dev/null 2>&1 || true
     killall Simulator 2>/dev/null || true
-    if pgrep -f "com.apple.CoreSimulator.CoreSimulatorService" >/dev/null 2>&1; then
-        pkill -f "com.apple.Virtualization.VirtualMachine" 2>/dev/null || true
-    fi
+    command -v lsof >/dev/null 2>&1 || return 0
+    local vm_pid vm_comm
+    ps -Aww -o pid=,comm= 2>/dev/null | while read -r vm_pid vm_comm; do
+        case "$vm_pid" in ''|*[!0-9]*) continue ;; esac
+        [ "$vm_pid" -le 1 ] && continue
+        [ "${vm_comm##*/}" = "com.apple.Virtualization.VirtualMachine" ] || continue
+        # -n -P: no reverse DNS and no port-name lookup. This runs inside the
+        # e2e lock window, and a bare lsof on a multi-GB VM resolves every
+        # INET fd it holds.
+        lsof -n -P -p "$vm_pid" 2>/dev/null | grep -q CoreSimulator || continue
+        kill "$vm_pid" 2>/dev/null || true
+    done
 }
 
 # ── setup_e2e_session ────────────────────────────────────────────────

@@ -13,5 +13,12 @@
 	     Entitlements.plist. -->
 	<key>NSCameraUsageDescription</key>
 	<string>Lucidos uses the camera when you take a photo to attach to a message.</string>
+	<!-- The composer's call toggle opens the microphone for as long as the call
+	     lasts. Same two halves as the camera above: this string is the consent
+	     prompt's copy, and com.apple.security.device.audio-input in
+	     Entitlements.plist is what the hardened runtime reads. With no string
+	     there is no prompt, and getUserMedia never settles. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lucidos uses the microphone while you are on a call, so you can talk to it out loud.</string>
 </dict>
 </plist>

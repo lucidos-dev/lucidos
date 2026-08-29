@@ -25,6 +25,7 @@ mod cc_read_coerce;
 mod cc_stop_reminder;
 mod changes;
 mod coding_agent_diff_hook;
+mod credentials;
 mod data;
 mod data_store;
 mod event_waits;
@@ -260,6 +261,14 @@ enum Command {
     /// wrote it (ADR 0144). Its own file tools record as they write, so this is
     /// for a script edited outside Lucidos.
     Handshake(HandshakeCliArgs),
+    /// Read and set the base URLs a stored credential covers, its *credential
+    /// scope*.
+    ///
+    /// The proxy presents a credential only to a base URL it declares. A
+    /// provider often needs several: one Binance key pair signs both
+    /// `api.binance.com` and `fapi.binance.com`. Adding or removing a secret is
+    /// Settings, not this.
+    Credentials(CredentialsCliArgs),
     /// Send a push notification via the parent workspace. Persists to the
     /// inbox AND pushes to subscribed devices, identical to the
     /// `send_notification` LLM tool. Use from scripts that need to nudge the
@@ -665,6 +674,44 @@ pub(crate) struct NotifyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct CredentialsCliArgs {
+    #[command(subcommand)]
+    pub(crate) action: CredentialsAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CredentialsAction {
+    /// Every stored credential, its auth type, and the base URLs it covers.
+    List {
+        /// Only the credential with this service name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print the engine's own JSON array instead of one line per row.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace the whole set of base URLs one credential covers.
+    ///
+    /// Replaces rather than appends, so pass every host the credential should
+    /// reach. Passing none leaves it sent nowhere, which is what an unscoped
+    /// credential already is.
+    #[command(name = "set-base-urls")]
+    SetBaseUrls {
+        /// The credential's service name, as Settings shows it.
+        #[arg(long)]
+        name: String,
+        /// Which row, when an OAuth client registration shares the name with an
+        /// API key. Omit unless the CLI asks for it.
+        #[arg(long = "auth-type")]
+        auth_type: Option<String>,
+        /// One base URL, repeated per host. Each needs its scheme, e.g.
+        /// `--url https://api.binance.com --url https://fapi.binance.com`.
+        #[arg(long = "url")]
+        urls: Vec<String>,
+    },
+}
+
+#[derive(Args)]
 pub(crate) struct HandshakeCliArgs {
     #[command(subcommand)]
     pub(crate) action: HandshakeAction,
@@ -866,10 +913,18 @@ enum FrontendPreviewCmd {
 #[derive(Subcommand)]
 enum PlannedCmd {
     /// Record a Planned marker for the current branch (in $PWD). Pass exactly
-    /// one of `--plan <docs/plans/file>` (a real implementation plan was
-    /// written — the `implementation-plan` skill calls this; records the
-    /// awaiting-approval `proposed` state) or `--simple "<reason>"` (this
-    /// change is a local fix needing no plan; records `acknowledged_simple`).
+    /// one of:
+    ///
+    /// `--plan <docs/plans/file>`, a real implementation plan the
+    /// `implementation-plan` skill wrote. Records the awaiting-approval
+    /// `proposed` state.
+    ///
+    /// `--simple "<reason>"`, a local fix needing no plan. Records
+    /// `acknowledged_simple`.
+    ///
+    /// `--security-fix "<reason>" --files <csv>`, an UNATTENDED run's security
+    /// fix confined to those files. Records `bounded_security_fix`.
+    ///
     /// POSTs to the parent engine's `/api/v1/internal/mark-planned`.
     Mark(PlannedMarkArgs),
     /// Approve the proposed plan on the current branch (in $PWD), flipping the
@@ -889,12 +944,24 @@ pub(crate) struct PlannedMarkArgs {
     /// Relative path of the implementation plan that was written
     /// (e.g. `docs/plans/2026-06-18-my-change.md`). Records state `proposed`
     /// (awaiting the user's approval).
-    #[arg(long, conflicts_with = "simple")]
+    #[arg(long, conflicts_with_all = ["simple", "security_fix"])]
     pub(crate) plan: Option<String>,
     /// One-line reason this change is a local fix needing no plan. Records
     /// state `acknowledged_simple`.
-    #[arg(long, conflicts_with = "plan")]
+    #[arg(long, conflicts_with_all = ["plan", "security_fix"])]
     pub(crate) simple: Option<String>,
+    /// One-line reason an UNATTENDED run is committing this security fix with
+    /// no prior plan decision. Name the finding and the regression test that
+    /// proves the fix. Records state `bounded_security_fix` and requires
+    /// `--files`. Never use it in a session that can ask the user, and never
+    /// for non-security work.
+    #[arg(long, requires = "files", conflicts_with_all = ["plan", "simple"])]
+    pub(crate) security_fix: Option<String>,
+    /// Repo-relative paths the bounded security fix is confined to, comma
+    /// separated. Apply refuses the branch if it touched anything else, so
+    /// name every file including the test. The engine caps the list.
+    #[arg(long, value_delimiter = ',', requires = "security_fix")]
+    pub(crate) files: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -1088,14 +1155,19 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             let ws = resolve_from_env()?;
             match action {
                 PlannedCmd::Mark(args) => {
-                    let kind = match (args.plan.as_deref(), args.simple.as_deref()) {
-                        (Some(p), None) => planned::MarkKind::Plan(p),
-                        (None, Some(r)) => planned::MarkKind::Simple(r),
-                        (None, None) => {
-                            return Err("`lucidos planned mark` requires either --plan <path> or --simple \"<reason>\"".into());
+                    // clap's `conflicts_with` makes the three mutually
+                    // exclusive, so at most one arm can match.
+                    let kind = if let Some(p) = args.plan.as_deref() {
+                        planned::MarkKind::Plan(p)
+                    } else if let Some(r) = args.simple.as_deref() {
+                        planned::MarkKind::Simple(r)
+                    } else if let Some(r) = args.security_fix.as_deref() {
+                        planned::MarkKind::SecurityFix {
+                            reason: r,
+                            files: args.files.clone(),
                         }
-                        // clap's conflicts_with prevents both being set.
-                        (Some(_), Some(_)) => unreachable!("clap conflicts_with(plan, simple)"),
+                    } else {
+                        return Err("`lucidos planned mark` requires one of --plan <path>, --simple \"<reason>\", or --security-fix \"<reason>\" --files <csv>".into());
                     };
                     planned::cmd_mark(&ws, kind)?;
                 }
@@ -1175,6 +1247,20 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match args.action {
                 HandshakeAction::List => handshake::cmd_list(&ws)?,
                 HandshakeAction::Approve { path } => handshake::cmd_approve(&ws, &path)?,
+            }
+            Ok(0)
+        }
+        Command::Credentials(args) => {
+            let ws = resolve_from_env()?;
+            match args.action {
+                CredentialsAction::List { name, json } => {
+                    credentials::cmd_list(&ws, name.as_deref(), json)?
+                }
+                CredentialsAction::SetBaseUrls {
+                    name,
+                    auth_type,
+                    urls,
+                } => credentials::cmd_set_base_urls(&ws, &name, auth_type.as_deref(), &urls)?,
             }
             Ok(0)
         }

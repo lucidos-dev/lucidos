@@ -1,7 +1,20 @@
 use super::*;
 use std::sync::LazyLock;
 
-/// Mutable workspace-data prefixes — user-owned trees the API may write/delete.
+/// Mutable workspace-data prefixes: user-owned trees the API may write and
+/// delete.
+///
+/// The write side cannot tell an app from the shell. So each of these is
+/// guarded at the point of USE instead (ADR 0156 decision 2). A new prefix
+/// states its answer in this table, and the test below fails if it does not.
+///
+/// | Prefix | Guard at use |
+/// |---|---|
+/// | `artifacts/`, `apps/`, `knowhow/`, `triggers/` | none: content the user owns |
+/// | `config/` | credential scope, so `apis.json` cannot send a secret off-scope |
+/// | `auth-modules/` | the wasmtime sandbox, plus credential scope per handle |
+/// | `scripts/` | the handshake approval record: path plus content hash |
+///
 /// `config/` and `auth-modules/` are coupled: `config/apis.json` references
 /// signers by name from `auth-modules/`, so deleting one without the other
 /// leaves a dangling reference.
@@ -827,6 +840,47 @@ mod tests {
 
         let result = list_data_inner(data, None);
         assert_eq!(result, vec!["artifacts/x.md"]);
+    }
+
+    /// Every mutable prefix names what stops it at the point of use.
+    ///
+    /// No header tells an app from the shell (ADR 0156 decision 1). So a
+    /// prefix is safe because of what refuses it downstream, never because of
+    /// who wrote it. `scripts/` and `config/` sat here for a long time with
+    /// that answer written down nowhere, and a write-then-execute chain grew
+    /// in the gap. Adding a prefix now costs one table row.
+    #[test]
+    fn every_mutable_prefix_states_what_guards_it_at_use() {
+        // The doc block immediately above the const, read out of this file's
+        // own source. A table in a comment nothing checks is a table that goes
+        // stale the first time someone is in a hurry.
+        let source = include_str!("data_api.rs");
+        let (before, _) = source
+            .split_once("const MUTABLE_PREFIXES")
+            .expect("the const this test is about");
+        let doc: String = before
+            .lines()
+            .rev()
+            .take_while(|l| l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            doc.contains("Guard at use"),
+            "the doc block above MUTABLE_PREFIXES must carry the guard table"
+        );
+        for prefix in MUTABLE_PREFIXES {
+            assert!(
+                doc.contains(&format!("`{prefix}`")),
+                "{prefix} is writable over the API and the table does not say \
+                 what refuses it at the point of use"
+            );
+        }
+        // The check can say no. Without this, a long table would pass the
+        // loop above whatever it actually listed.
+        assert!(
+            !doc.contains("`postgres/`"),
+            "a prefix absent from the table must not read as present"
+        );
     }
 
     #[test]

@@ -10,25 +10,50 @@ import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealt
  *
  *  The drawer row's overflow (⋯) menu is the overlay under test. It used to be
  *  the thread filter, until the filter became a panel INSIDE the thread drawer
- *  pane (`ThreadFilterPanel`) and stopped being an overlay at all. */
+ *  pane (`ThreadFilterPanel`) and stopped being an overlay at all.
+ *
+ *  Only the DISMISS has to be synthetic, so opening follows whatever the layout
+ *  offers. The mobile row draws no ⋯ (`useRowActionsGesture`), and a long press
+ *  opens the same menu there. Its host-opened mode passes the Overlay no
+ *  anchor, so the mobile arm also covers the branch where nothing is exempt
+ *  from the dismiss. */
 test.describe('Overlay dismiss and swallow (synthetic clicks)', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
   const openRowMenu = async (page: import('@playwright/test').Page) => {
-    const opened = await page.evaluate(() => {
-      const buttons = document.querySelectorAll('button[aria-label="More thread actions"]');
-      for (const btn of buttons) {
-        const rect = btn.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) {
-          (btn as HTMLElement).click();
-          return true;
-        }
-      }
-      return false;
+    const opened = await page.evaluate(async () => {
+      const visible = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      // Scoped to the drawer. On mobile every pane is mounted at once, and the
+      // off-screen ones are translated aside rather than hidden. So a bare
+      // document query answers with the conversation pane's own ⋯, and opens a
+      // menu nobody can see.
+      const trigger = [...document.querySelectorAll('.thread-drawer button[aria-label="More thread actions"]')].find(visible);
+      if (trigger) { (trigger as HTMLElement).click(); return 'trigger'; }
+
+      // No ⋯ means the mobile row, where a hold is the way in. Held past
+      // useLongPress's 450ms threshold, with the pointer still.
+      const row = [...document.querySelectorAll('.thread-drawer .thread-row')].find(visible);
+      if (!row) return 'none';
+      const box = row.getBoundingClientRect();
+      const at = (type: string) => row.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        button: 0,
+        isPrimary: true,
+        clientX: box.left + box.width / 2,
+        clientY: box.top + box.height / 2,
+      }));
+      at('pointerdown');
+      await new Promise(resolve => setTimeout(resolve, 600));
+      at('pointerup');
+      return 'hold';
     });
-    expect(opened, 'a drawer row overflow button was visible').toBe(true);
+    expect(opened, 'no drawer row to open a menu from').not.toBe('none');
     await expect(page.locator('.thread-overflow-menu')).toHaveCount(1);
   };
 
@@ -97,7 +122,9 @@ test.describe('Overlay dismiss and swallow (synthetic clicks)', () => {
     // Click the row's Pin button behind the open menu. Per the dismiss-and-swallow
     // contract this must dismiss the menu and NOT pin the thread.
     const clicked = await page.evaluate(() => {
-      const buttons = document.querySelectorAll('button[aria-label="Pin thread"]');
+      // Drawer-scoped for the same reason the trigger lookup above is: the
+      // conversation pane carries its own pin, off-screen but laid out.
+      const buttons = document.querySelectorAll('.thread-drawer button[aria-label="Pin thread"]');
       for (const btn of buttons) {
         const rect = btn.getBoundingClientRect();
         if (rect.width > 0 && rect.height > 0) {

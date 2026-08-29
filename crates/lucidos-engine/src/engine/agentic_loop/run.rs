@@ -1407,7 +1407,9 @@ impl LucidosEngine {
                                         model: effective_model.clone(),
                                         reasoning_effort: effective_effort.clone(),
                                     },
-                                meta: meta.clone(),
+                                meta: meta.authored_by(
+                                    crate::engine::thread_events::AgentParticipant::LucidosAgent,
+                                ),
                             },
                             "[AgenticLoop] ResponseGenerated",
                         )
@@ -1500,7 +1502,9 @@ impl LucidosEngine {
                                         model: effective_model.clone(),
                                         reasoning_effort: effective_effort.clone(),
                                     },
-                                meta: meta.clone(),
+                                meta: meta.authored_by(
+                                    crate::engine::thread_events::AgentParticipant::LucidosAgent,
+                                ),
                             },
                             "[AgenticLoop] ResponseGenerated (empty completion)",
                         )
@@ -1623,7 +1627,7 @@ impl LucidosEngine {
                                     event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
                                         text: msg.to_string(), images: images.clone(), model: effective_model.clone(), reasoning_effort: effective_effort.clone(),
                                     },
-                                    meta: meta.clone(),
+                                    meta: meta.authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
                                 },
                                 "[AgenticLoop] ResponseGenerated (force-break)",
                             ).await;
@@ -1678,7 +1682,7 @@ impl LucidosEngine {
                                             model: effective_model.clone(),
                                             reasoning_effort: effective_effort.clone(),
                                         },
-                                    meta: meta.clone(),
+                                    meta: meta.authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
                                 },
                                 "[AgenticLoop] ResponseGenerated (read_file force-break)",
                             )
@@ -1742,7 +1746,7 @@ impl LucidosEngine {
                                             model: effective_model.clone(),
                                             reasoning_effort: effective_effort.clone(),
                                         },
-                                    meta: meta.clone(),
+                                    meta: meta.authored_by(crate::engine::thread_events::AgentParticipant::LucidosAgent),
                                 },
                                 "[AgenticLoop] ResponseGenerated (generic force-break)",
                             )
@@ -2152,12 +2156,10 @@ impl LucidosEngine {
 
                 // Track screenshots for HTML embedding
                 if tool_call.name == tn::BROWSER_SCREENSHOT && !is_error {
-                    // Extract path from "Screenshot saved to artifacts/{path} ({} bytes)"
-                    if let Some(start) = result.find("artifacts/") {
-                        if let Some(end) = result[start..].find(" (") {
-                            let path = &result[start + 10..start + end]; // skip "artifacts/"
-                            images.push(path.to_string());
-                        }
+                    if let Some(path) =
+                        crate::engine::tools::browser::screenshot_artifact_path(&result)
+                    {
+                        images.push(path.to_string());
                     }
                 }
 

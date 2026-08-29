@@ -3,6 +3,11 @@
 - **Status**: Accepted
 - **Date**: 2026-08-26
 
+Amended by
+[ADR 0159](0159-update-check-disclosure-sits-behind-the-explainer.md) on one
+point: the Settings row now says what is sent behind its explainer, not at rest
+on the page.
+
 ## Context
 
 ADR 0108 put the update check in the gateway and gave it three gates. The

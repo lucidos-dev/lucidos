@@ -73,11 +73,16 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Devices page rather than under Access. Still gateway-gated: with none, no
   // row carries a Revoke button and the word would land on nothing.
   { id: 'devices:paired', label: 'Paired devices', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:list', keywords: 'paired pairing device revoke unpair sign out cut off network access', gatewayOnly: true },
-  { id: 'system', label: 'System', subview: 'system', path: 'Settings', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
+  // No keywords, deliberately. The match is a plain substring over label plus
+  // keywords, every hit scores the same, and results come back in array order.
+  // So naming this row's own sub-pages here would put "System" above every one
+  // of them: typing "backup" would offer the submenu first and Backup second.
+  { id: 'system', label: 'System', subview: 'system', path: 'Settings' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
   { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // System subpanels
+  { id: 'system-overview', label: 'Overview', subview: 'system-overview', path: 'Settings → System', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
   { id: 'release-notices', label: 'Release Notices', subview: 'release-notices', path: 'Settings → System', anchor: 'release-notices:list', keywords: 'release notice notices after upgrade to do action needed workspace audit drift got it answered' },
   { id: 'whats-new', label: "What's New", subview: 'whats-new', path: 'Settings → System', keywords: 'changelog release notes version history whats new updates changes released' },
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
@@ -92,10 +97,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
   { id: 'debugging:restart-engine', label: 'Restart engine', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:restart-engine', keywords: 'restart engine service launchd relaunch reboot recovery unresponsive stuck', packagedOnly: true },
 
-  // System overview
-  { id: 'system:connection', label: 'Connection', subview: 'system', path: 'Settings → System', anchor: 'system:connection', keywords: 'status workspace path api url' },
-  { id: 'system:versions', label: 'Versions', subview: 'system', path: 'Settings → System', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
-  { id: 'system:maintenance', label: 'Maintenance', subview: 'system', path: 'Settings → System', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
+  // System → Overview rows
+  { id: 'system:connection', label: 'Connection', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:connection', keywords: 'status workspace path api url' },
+  { id: 'system:versions', label: 'Versions', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
+  { id: 'system:maintenance', label: 'Maintenance', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
 
   // Locale subview
   { id: 'locale:language', label: 'Language', subview: 'locale', path: 'Settings → Locale', anchor: 'locale:language', keywords: 'language locale respond reply' },

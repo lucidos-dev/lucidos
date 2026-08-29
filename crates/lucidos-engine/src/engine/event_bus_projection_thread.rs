@@ -1499,7 +1499,17 @@ impl EventBus {
             // the reverted-state render and broadcast over SSE, but it doesn't
             // resurface the thread. Both are pure card/audit projection.
             | ThreadEvent::CommandCheckpointed { .. }
-            | ThreadEvent::CommandCheckpointReverted { .. } => Vec::new(),
+            | ThreadEvent::CommandCheckpointReverted { .. }
+            // Voice-session lifecycle. Voice is a mode of the thread (ADR
+            // 0148), so a session touches no summary column: not `source`,
+            // not status, not activity. Persisted so a session is countable
+            // and a trigger can subscribe.
+            | ThreadEvent::VoiceSessionStarted { .. }
+            | ThreadEvent::VoiceSessionEnded { .. }
+            // A spoken reply touches no column either. The reasoner's turn
+            // owns the thread's status, and the talker is its peer on the
+            // thread rather than the author of that turn.
+            | ThreadEvent::SpokenReplyGenerated { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.

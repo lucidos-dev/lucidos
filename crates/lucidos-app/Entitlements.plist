@@ -11,24 +11,37 @@
   file entirely.
 
   The release path signs with the hardened runtime, because notarization
-  requires it and the hardened runtime denies camera access to a binary that
-  does not claim it, whatever Info.plist says. So the composer's Camera item
-  needs BOTH halves: NSCameraUsageDescription for the consent prompt's copy
-  (Info.plist) and this entitlement for the runtime.
+  requires it and the hardened runtime denies a capture device to a binary that
+  does not claim it, whatever Info.plist says. So each item needs BOTH halves:
+  a usage string for the consent prompt's copy (Info.plist) and the matching
+  entitlement here for the runtime.
+
+  Two capture devices, one item each. The composer's Camera item takes a photo,
+  paired with NSCameraUsageDescription. Its call toggle opens the microphone
+  for the length of a call, paired with NSMicrophoneUsageDescription.
 
   Deliberately minimal. Lucidos is not sandboxed, so nothing here is a
   container permission; each key is a hardened-runtime capability we actually
-  exercise. getUserMedia is video-only, so there is no audio-input key: add one
-  only in the change that starts capturing audio.
+  exercise. A key with no capture site behind it widens what the app may do for
+  no reason, so add one only in the change that starts using it.
 
-  It is applied to the outer .app and to nothing else. sign_app_bundle also
-  signs ~200 loose Mach-O files (the relocatable Postgres tree, the engine, the
-  gateway, the CLI), none of which capture anything, and the bundle carries no
-  nested bundles or XPC services for deep signing to propagate to.
+  THIS file is applied to the outer .app and to nothing else, and the bundle
+  carries no nested bundles or XPC services for deep signing to propagate it to.
+  sign_app_bundle also signs ~200 loose Mach-O files (the relocatable Postgres
+  tree, the engine, the gateway, the CLI). None of them capture anything, so
+  none of them claim a capture device.
+
+  One of them does claim something else. The engine is a separate process, so
+  this signature never governs it, and it carries its own
+  EngineEntitlements.plist for the wasmtime code it compiles at run time. A
+  bundled executable that needs a hardened-runtime capability gets its own file
+  rather than a key here. See ADR 0160.
 -->
 <plist version="1.0">
 <dict>
 	<key>com.apple.security.device.camera</key>
+	<true/>
+	<key>com.apple.security.device.audio-input</key>
 	<true/>
 </dict>
 </plist>

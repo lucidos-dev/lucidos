@@ -713,6 +713,11 @@ pub struct LucidosEngine {
     /// the 30s timer while the PWA is foregrounded). See
     /// `system-knowhow/notifications.md` §3. Transient — reset on restart.
     pub sse_connections: crate::api::sse_connections::SseConnectionCounter,
+    /// Which threads have a live *voice session*. One per thread, so a second
+    /// upgrade is refused and every start stays paired with one end. Transient:
+    /// a call cannot outlive the process holding its socket, and the boot sweep
+    /// settles what a dead one left behind.
+    pub voice_sessions: crate::voice::registry::LiveVoiceSessions,
     /// CC commands cache keyed by repo root — each repo has different tools.
     /// Populated from CC Init events, persisted to `.lucidos/cc-commands.json`.
     pub(crate) cc_commands_cache: tokio::sync::RwLock<HashMap<String, CcCommandsInfo>>,

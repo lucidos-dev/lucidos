@@ -13,7 +13,8 @@
 //! the resume path (no fresh CC spawn) and just emits `UserQuestionAnswered`.
 
 use crate::support::{
-    base_url, db_url, seed_cc_thread_summary, seed_chat_thread_summary, user_client,
+    base_url, count_events_of_type, db_url, seed_cc_thread_summary, seed_chat_thread_summary,
+    user_client,
 };
 use uuid::Uuid;
 
@@ -90,7 +91,7 @@ async fn count_answered(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str)
     .bind(tool_use_id)
     .fetch_one(pool)
     .await
-    .unwrap_or(0)
+    .expect("counting UserQuestionAnswered failed")
 }
 
 /// Count CodingAgentPromptSent events for a thread. After answering a
@@ -100,14 +101,17 @@ async fn count_answered(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str)
 /// marker — no CC turn follows, the QuestionCard's own ✓ Cancel state
 /// already conveys the outcome (see `emit_resume_marker_for_cc_answer`).
 async fn count_resume_marker(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM events \
-         WHERE thread_id = $1 AND event_type = 'CodingAgentPromptSent'",
-    )
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0)
+    count_events_of_type(pool, thread_id, "CodingAgentPromptSent").await
+}
+
+/// Count EVERY event on a thread. Same reason as `count_events_of_type` for
+/// panicking rather than reading a query error as a count.
+async fn count_all_events(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("counting events on thread {thread_id} failed: {e}"))
 }
 
 #[tokio::test]
@@ -229,13 +233,7 @@ async fn answer_question_chat_channel_skips_cc_resume_marker() {
         "chat-channel answer must NOT emit CodingAgentPromptSent — the chat tool is in-process and returns the answer directly as a tool_result"
     );
 
-    let continue_signals: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ContinuationRequested'",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(0);
+    let continue_signals = count_events_of_type(&pool, thread_id, "ContinuationRequested").await;
     assert_eq!(
         continue_signals, 0,
         "chat-channel answer must NOT emit ContinuationRequested — chat has no subprocess to respawn"
@@ -294,13 +292,7 @@ async fn archive_with_pending_question_emits_canceled_answer() {
         "answer kind must be Canceled"
     );
 
-    let archived: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'ThreadArchived'",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(0);
+    let archived = count_events_of_type(&pool, thread_id, "ThreadArchived").await;
     assert_eq!(archived, 1, "ThreadArchived must still be emitted");
 }
 
@@ -430,13 +422,7 @@ async fn chat_freeform_followup_on_chat_thread_routes_to_pending_question() {
     // the answer, not a new exchange. (insert_chat_user_question_asked only
     // inserts UserQuestionAsked; any MessageReceived rows are noise from the
     // routing failing and falling through to the normal chat path.)
-    let mr_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = 'MessageReceived'",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or(0);
+    let mr_count = count_events_of_type(&pool, thread_id, "MessageReceived").await;
     assert_eq!(
         mr_count, 0,
         "free-text routing must NOT emit a fresh MessageReceived — it must be absorbed as the answer"
@@ -533,11 +519,7 @@ async fn cancel_chat_idle_thread_reports_not_canceled() {
     // Idle chat thread, no pending question, no live session.
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
 
-    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
+    let before = count_all_events(&pool, thread_id).await;
 
     let resp = client
         .post(format!(
@@ -556,11 +538,7 @@ async fn cancel_chat_idle_thread_reports_not_canceled() {
     );
 
     // No junk terminal event fabricated on an already-idle thread.
-    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
-        .bind(thread_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
+    let after = count_all_events(&pool, thread_id).await;
     assert_eq!(
         after, before,
         "a no-op cancel must not emit any event on an idle thread"

@@ -15,8 +15,6 @@ import {
   restartRequired,
   serviceWorkerBuildId,
   showToast,
-  SETTINGS_SYSTEM_SUBPANEL_ITEMS,
-  type SettingsNavKey,
   updateAvailable,
   visibleWorkspaceName,
   workspacePath,
@@ -35,7 +33,7 @@ import { packagedUpdateVersion } from '../../store/packagedUpdate';
 import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
-import { openSettingsSubview, openWhatsNew } from '../../store/actions/menu';
+import { openWhatsNew } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
 import { formatBuildId } from '../../utils/buildId';
 import { clientVersionLabel } from '../../utils/clientVersion';
@@ -52,8 +50,6 @@ import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
 import { ReleaseNoticesPage } from './ReleaseNoticesPage';
-import { SystemAttentionBadge } from '../shared/SystemAttentionBadge';
-import { systemTabBadge } from '../../store/systemAttentionBadge';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -63,49 +59,11 @@ function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
 }
 
+/** Which sub-page this renders. `SystemSubmenu` is the list that reaches them,
+ *  and `SettingsView.renderSubview` maps each subview key onto one of these. */
 export type SystemPanel = 'overview' | 'release-notices' | 'whats-new' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging' | 'communication-surfaces';
 
-const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
-  { key: 'overview', label: 'Overview', subview: 'system' },
-  ...SETTINGS_SYSTEM_SUBPANEL_ITEMS.map(item => ({
-    key: item.key as Exclude<SystemPanel, 'overview'>,
-    label: item.label,
-    subview: item.key,
-  })),
-];
-
-function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
-  return (
-    <div class="settings-section system-subpanel-switcher">
-      <div class="settings-row-options system-subpanel-options">
-        {SYSTEM_PANELS.map(item => {
-          // BY SOURCE, never the union: this is the last step of the path, so a
-          // mark here promises work on the tab it sits on. An update dotting
-          // Release Notices would send the reader to a page with nothing on it.
-          const badge = systemTabBadge(item.key);
-          return (
-            <button
-              key={item.key}
-              class={`settings-option${activePanel === item.key ? ' active' : ''}`}
-              aria-current={activePanel === item.key ? 'page' : undefined}
-              // The mark is decorative, so the tab says the words. Only a badged
-              // tab carries a label, for the reason the Settings nav row gives.
-              aria-label={badge ? `${item.label} · ${badge}` : undefined}
-              onClick={() => openSettingsSubview(item.subview)}
-            >
-              {item.label}
-              {/* This switcher renders above Overview too, so the mark is on
-                  screen the moment System opens. */}
-              <SystemAttentionBadge placement="inline" label={badge} />
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
+export function SystemPage({ panel }: { panel: SystemPanel }) {
   const status = connectionStatus.value;
   const name = visibleWorkspaceName.value;
   // Non-null for exactly the states that are not `connected`, which is what the
@@ -392,13 +350,13 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
               (ADR 0142), so it owes an answer to every install shape that
               arrives. The rule is `updateGuidance`, which is pure. */}
           {guidance === 'source-checkout' && (
-            <div class="system-notice">
+            <div class="system-notice system-guidance">
               This engine runs from a source checkout, so no update is
               downloaded. Pull the release, then Rebuild &amp; Restart.
             </div>
           )}
           {guidance === 'install-in-the-app' && (
-            <div class="system-notice">
+            <div class="system-notice system-guidance">
               An update installs from the Lucidos app on the machine that runs
               this workspace, never from a browser session.
             </div>
@@ -441,62 +399,58 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             )}
           </div>
           {/* The machine's release check, beside the thing it governs rather
-              than buried. The product says what this sends nowhere else, so the
-              note states it in the open (ADR 0139). It is worded for both
-              switch positions, since a row that describes an hourly request
-              while the switch is off is the one thing it must not do. Rendered
-              only where the check can run, so a dev gateway shows no knob for a
+              than buried. What it sends belongs behind the explainer, never at
+              rest on the page (ADR 0159, amending ADR 0139); `PRIVACY.md` is
+              the full notice. The copy reads correctly in both switch
+              positions, since prose describing an hourly request while the
+              switch is off is the one thing it must not do. Rendered only
+              where the check can run, so a dev gateway shows no knob for a
               poll it will never make. */}
           {check?.supported && (
-            <>
-              <div class="settings-row" data-search-anchor="system:update-check">
-                <span class="settings-row-label">
-                  Check for updates automatically
-                  <Explainer title="Check for updates automatically">
-                    <p>
-                      One request per machine, from the gateway, however many windows
-                      you have open. A gateway started from a source checkout never
-                      asks at all.
-                    </p>
-                    <p>
-                      Nothing else is sent, nothing identifies you, and nothing
-                      installs itself. Taking an update is always your click.
-                    </p>
-                    <p>
-                      Turn it off and Lucidos stops asking on its own. You can still
-                      check by hand with the button above.
-                    </p>
-                  </Explainer>
-                </span>
-                <label class="toggle-switch">
-                  <input
-                    type="checkbox"
-                    checked={check.enabled}
-                    onChange={(e) => {
-                      const on = (e.currentTarget as HTMLInputElement).checked;
-                      void setReleaseCheckEnabled(on);
-                    }}
-                  />
-                  <span class="toggle-slider" />
-                </label>
-              </div>
-              <div class="settings-row-note">
-                While this is on, Lucidos asks <code>lucidos.dev</code> once an hour
-                whether a newer version is published. The request carries your
-                platform, your architecture and the version you run, plus the IP
-                address any web request carries.
-              </div>
-            </>
+            <div class="settings-row" data-search-anchor="system:update-check">
+              <span class="settings-row-label">
+                Check for updates automatically
+                <Explainer title="Check for updates automatically">
+                  <p>
+                    While this is on, Lucidos asks <code>lucidos.dev</code> once an
+                    hour whether a newer version is published. It is a regular web
+                    request, and it says which platform, architecture and version
+                    you run.
+                  </p>
+                  <p>
+                    One request per machine, from the gateway, however many windows
+                    you have open. A gateway started from a source checkout never
+                    asks at all.
+                  </p>
+                  <p>
+                    Nothing else is sent, nothing identifies you, and nothing
+                    installs itself. Taking an update is always your click.
+                  </p>
+                  <p>
+                    Turn it off and Lucidos stops asking on its own. You can still
+                    check by hand with the button above.
+                  </p>
+                </Explainer>
+              </span>
+              <label class="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={check.enabled}
+                  onChange={(e) => {
+                    const on = (e.currentTarget as HTMLInputElement).checked;
+                    void setReleaseCheckEnabled(on);
+                  }}
+                />
+                <span class="toggle-slider" />
+              </label>
+            </div>
           )}
         </div>
       </>
     );
   }
 
-  return (
-    <>
-      <SystemPanelSwitcher activePanel={panel} />
-      {renderPanel()}
-    </>
-  );
+  // The wrapper is what caps every sub-page at the column width, so it stays
+  // even though the switcher it used to carry is gone.
+  return <div class="system-page">{renderPanel()}</div>;
 }

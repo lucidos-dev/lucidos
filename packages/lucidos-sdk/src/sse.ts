@@ -39,10 +39,10 @@ function dispatch(eventType: string, data: unknown, raw: SseEvent) {
 
 /** Route one frame's `data` payload to its listeners.
  *
- *  Exported for the transport-equivalence test: a direct frame and a relayed
- *  frame both land here, so asserting on this function is what proves the two
- *  transports are indistinguishable. */
-export function handleFrame(data: string): void {
+ *  The one place both transports converge: a direct frame and a relayed frame
+ *  land here identically, which is what makes them indistinguishable to a
+ *  listener. `eventStream.test.ts` pins the relay half of that. */
+function handleFrame(data: string): void {
   try {
     const parsed = JSON.parse(data) as SseEvent;
     const outerType = parsed?.type;

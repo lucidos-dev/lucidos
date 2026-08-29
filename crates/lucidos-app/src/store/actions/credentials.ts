@@ -73,14 +73,14 @@ export function closeCredentialForm(): void {
 export async function submitRequestedCredential(
   request: CredentialRequest,
   service: string,
-  baseUrl: string,
+  baseUrls: string[],
   authType: AuthType,
   authValue: string,
   envVarName?: string,
 ): Promise<boolean> {
   const saved = request.existing_credential_id
     ? await submitCredentialEdit(request.existing_credential_id, {
-        base_url: baseUrl,
+        base_urls: baseUrls,
         auth_type: authType,
         // An `oauth_client` is not sent through the proxy auth pipeline, so it
         // has no meaningful auth header. The field is required by the update
@@ -89,7 +89,7 @@ export async function submitRequestedCredential(
         auth_value: authValue,
         env_var_name: envVarName,
       })
-    : await submitNewCredential(service, baseUrl, authType, authValue, envVarName);
+    : await submitNewCredential(service, baseUrls, authType, authValue, envVarName);
   if (!saved) return false;
   await resumeOAuthConnectAfterCredentialSaved(service);
   return true;
@@ -121,13 +121,20 @@ async function runCredentialSave(
 /** Create a brand-new credential (also used by the engine credential-request flow). */
 export async function submitNewCredential(
   service: string,
-  baseUrl: string,
+  baseUrls: string[],
   authType: AuthType,
   authValue: string,
   envVarName?: string
 ): Promise<boolean> {
-  if (!service || !baseUrl) {
-    showToast('Service name and base URL are required', 'error');
+  if (!service) {
+    showToast('Service name is required', 'error');
+    return false;
+  }
+  // A `secret` is signed with rather than sent, so it declares no base URL and
+  // an empty scope is its correct state. Requiring one here made the type
+  // unsaveable from the credential form.
+  if (authType !== 'secret' && baseUrls.length === 0) {
+    showToast('Base URL is required', 'error');
     return false;
   }
   if (!authValue) {
@@ -138,7 +145,7 @@ export async function submitNewCredential(
     () =>
       createCredential({
         service_name: service,
-        base_url: baseUrl,
+        base_urls: baseUrls,
         auth_type: authType,
         auth_value: authValue,
         env_var_name: envVarName?.trim() || undefined,

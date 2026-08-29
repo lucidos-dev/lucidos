@@ -1,3 +1,6 @@
+import { clampText } from '../../utils/clampText';
+import type { ToastType } from '../../store/types';
+
 /** A parsed restart-required (or similar) toast message:
  *  the first line is the heading, blank lines start a new section, and lines
  *  prefixed with "• " are bullets within their section. */
@@ -7,6 +10,31 @@ export interface ParsedToastMessage {
 }
 
 const BULLET_PREFIX = '• ';
+
+/** Longest ERROR message, in characters. An error is one sentence, and the
+ *  longest the engine writes is around 180. A 390pt phone shows about 150 in
+ *  the heading's six-line box, so a message at this budget is one short scroll
+ *  rather than a page. No count can promise "always fits": the same string
+ *  wraps to more lines on a 320pt screen than on a 430pt one. */
+const ERROR_MAX_CHARS = 200;
+
+/** Longest message of any other kind. A status or notification toast may
+ *  legitimately carry a titled list, such as the engine build's commit groups.
+ *  So this is a backstop against a pathological payload, not a style rule. An
+ *  app reaching `showToast` through the toast bridge is bounded here too. */
+const TOAST_MAX_CHARS = 2000;
+
+/** What `showToast` stores, rather than what the caller passed.
+ *
+ *  An ERROR is flattened to one line as well as clamped. `parseToastMessage`
+ *  below reads structure out of newlines, so a body carrying them renders as a
+ *  bold title over a bulleted list. Right for a build's commit groups, wrong
+ *  for a failure. It is how an HTML holding page once rendered as a list of its
+ *  own `<meta>` tags. */
+export function clampToastMessage(message: string, type: ToastType): string {
+  if (type !== 'error') return clampText(message, TOAST_MAX_CHARS);
+  return clampText(message.replace(/\s+/g, ' ').trim(), ERROR_MAX_CHARS);
+}
 
 /** Serialize a notification's separate `title` and `body` into the single
  *  message string `parseToastMessage` reads back — the inverse of the parse

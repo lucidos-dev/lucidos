@@ -642,6 +642,19 @@ impl LucidosEngine {
             );
         }
 
+        // `.lucidos/` holds `backup.key`, so it must not reach a Time Machine
+        // snapshot beside the credential database (ADR 0153). Runs on every
+        // boot, which is what converges a workspace created before the ADR.
+        // Silent once correct, and never fatal.
+        match crate::core::ensure_state_dir_excluded_from_file_backup(&workspace_path) {
+            Ok(true) => log!("[Startup] Excluded .lucidos/ from file-level backup"),
+            Ok(false) => {}
+            Err(e) => log!(
+                "[Startup] Failed to exclude .lucidos/ from file-level backup: {}",
+                e
+            ),
+        }
+
         // First-ever boot: pin the allocated vite port to `lucidos.toml` and
         // commit it. That keeps the workspace out of an untracked-and-dirty
         // state, and survives later `~/.lucidos/port-registry` drift.
@@ -982,8 +995,8 @@ impl LucidosEngine {
             // One-time, marker-guarded: re-point coding-agent threads orphaned by
             // the old random-UUID registry onto the default repo's deterministic
             // id (every lucidos/legacy thread targets the Lucidos source by
-            // definition). Must run AFTER ensure_exists above so the live row
-            // already carries the new id.
+            // definition). Must run AFTER `RepositoryStore::register` above so
+            // the live row already carries the new id.
             let default_repo_det_id = crate::core::repositories::deterministic_id(
                 default_repo_root_commit.as_deref(),
                 &repo_root.to_string_lossy(),
@@ -1283,7 +1296,7 @@ impl LucidosEngine {
                         Err(e) => {
                             // A bad .wasm shouldn't take the engine down — log
                             // loud, start with an empty map. Operators fix it
-                            // and POST /proxy-modules/reload (Phase 9).
+                            // and POST /api/v1/proxy-modules/reload (Phase 9).
                             log!(
                                 "[Startup] WASM auth module load failed at {}: {} \
                                  (proceeding with no signer modules)",
@@ -1310,6 +1323,7 @@ impl LucidosEngine {
             },
             presence_tracker: crate::api::presence_pong::PresenceTracker::new(),
             sse_connections: crate::api::sse_connections::SseConnectionCounter::new(),
+            voice_sessions: crate::voice::registry::LiveVoiceSessions::new(),
             pool,
             proxy_token_cache: Arc::new(crate::api::proxy_token_cache::ProxyTokenCache::new()),
             wasm_engine,

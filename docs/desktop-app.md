@@ -649,7 +649,7 @@ silent `await` reads as a frozen app, which is exactly how it behaved while the
 plugin's progress callbacks were discarded. Every step now emits an
 `app-update-progress` Tauri event carrying an `AppUpdatePhase` frame, and the page
 turns it into a live toast (message + spinner + a determinate `.progress-bar`) and
-mirrors it in **Settings → System**, which shares one derivation
+mirrors it in **Settings → System → Overview**, which shares one derivation
 (`appUpdateNarration`) so the two surfaces cannot disagree:
 
 | Phase | Shown as | Cancellable |

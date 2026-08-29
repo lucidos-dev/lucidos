@@ -46,9 +46,20 @@ start_engine
 start_vite
 show_banner "tauri"
 
-# Kill old Tauri process before launching a new one
+# Kill old Tauri process before launching a new one.
+#
+# `pgrep -f` proposes candidates; the EXECUTABLE decides. A coding agent
+# carries the engine's thread history inside a roughly 22 KB
+# `--append-system-prompt` argument, so a thread quoting this phrase matches
+# the pattern and used to be killed by it. Same class as ADR 0025, and as
+# `select_cargo_lock_holders` in scripts/lib/workspace.sh.
 while IFS= read -r tauri_pid; do
     [ -z "$tauri_pid" ] && continue
+    tauri_comm="$(ps -p "$tauri_pid" -o comm= 2>/dev/null || true)"
+    [ "${tauri_comm##*/}" = "cargo" ] || continue
+    if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$tauri_pid"; then
+        continue
+    fi
     echo "Killing old Tauri process (PID $tauri_pid)..."
     kill "$tauri_pid" 2>/dev/null || true
 done < <(pgrep -f "cargo tauri dev" 2>/dev/null || true)

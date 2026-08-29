@@ -19,10 +19,13 @@ describe('settings navigation', () => {
     expect(keys).not.toContain('whats-new');
     expect(keys).not.toContain('release-notices');
     expect(keys).not.toContain('communication-surfaces');
-    // The two a user ARRIVES at lead, notices first. The badge and the notice
-    // modal both send the reader to Release Notices, and the Lucidos menu's
-    // version row opens What's New. Both sit closest to Overview's subject.
-    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['release-notices', 'whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
+    // Overview leads: it is the page System used to open on, and it answers the
+    // question most visits come with. Then the two a user ARRIVES at, notices
+    // first. The badge and the notice modal both send the reader to Release
+    // Notices, and the Lucidos menu's version row opens What's New. Both sit
+    // closest to Overview's subject.
+    expect(SETTINGS_SYSTEM_SUBPANEL_ITEMS.map((item) => item.key)).toEqual(['system-overview', 'release-notices', 'whats-new', 'thread-queue', 'backup', 'memory', 'disk-usage', 'environment-variables', 'debugging', 'communication-surfaces']);
+    expect(settingsSubviewLabel('system-overview')).toBe('Overview');
     expect(settingsSubviewLabel('release-notices')).toBe('Release Notices');
     expect(settingsSubviewShortLabel('release-notices')).toBe('Notices');
     expect(settingsSubviewLabel('whats-new')).toBe("What's New");

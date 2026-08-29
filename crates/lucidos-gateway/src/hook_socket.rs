@@ -172,6 +172,16 @@ async fn deliver(
         }
         request = request.header(name.as_str(), value);
     }
+    // The scope, added by us and never forwarded. `forwarded_to_engine` drops
+    // every inbound `x-lucidos-*`, so a public sender cannot supply this or
+    // upgrade itself to the full-authority token beside it.
+    //
+    // It reaches exactly the delivery route on an engine that requires a
+    // credential (`lucidos_engine::api::local_auth`). That is what stops a
+    // funnel-exposed hook from becoming a workspace restart.
+    if let Some(value) = crate::auth::sensitive_credential(state.webhook_token()) {
+        request = request.header(crate::auth::HEADER_WEBHOOK_TOKEN, value);
+    }
 
     match request.body(body).send().await {
         Ok(upstream) => {
@@ -391,6 +401,7 @@ mod tests {
         // listener it is written by whoever posted the delivery.
         for name in [
             "x-lucidos-local-token",
+            "x-lucidos-webhook-token",
             "x-lucidos-agent-origin-token",
             "x-lucidos-device-id",
             "x-lucidos-target-workspace",
@@ -399,6 +410,84 @@ mod tests {
         ] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
+        // The two engine credentials by their real names, so a rename cannot
+        // quietly take either off the list above.
+        for name in [
+            crate::auth::HEADER_LOCAL_TOKEN,
+            crate::auth::HEADER_WEBHOOK_TOKEN,
+        ] {
+            assert!(!forwarded_to_engine(name), "{name} must be dropped");
+        }
+    }
+
+    /// An upstream that records the raw bytes of the request it is handed.
+    async fn capturing_engine() -> (u16, std::sync::Arc<tokio::sync::Mutex<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let sink = captured.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *sink.lock().await = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        (port, captured)
+    }
+
+    #[tokio::test]
+    async fn a_delivery_carries_the_webhook_scope_and_nothing_wider() {
+        // The scope in one test. The hop presents the narrow credential, and a
+        // sender that tried to send the wide one gets it dropped.
+        let state = crate::server::GatewayState::for_tests();
+        let (port, captured) = capturing_engine().await;
+        state.set_route_for_test("dev", port);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dev/abc")
+                    .header("x-hub-signature-256", "sha256=deadbeef")
+                    .header(crate::auth::HEADER_LOCAL_TOKEN, "sender-forged-full-token")
+                    .body(Body::from("{\"hello\":\"world\"}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            got.contains(&format!(
+                "{}: test-webhook-token",
+                crate::auth::HEADER_WEBHOOK_TOKEN
+            )),
+            "the delivery must present the webhook scope; engine saw:\n{got}"
+        );
+        assert!(
+            !got.contains("sender-forged-full-token"),
+            "a sender must not hand the engine full authority; engine saw:\n{got}"
+        );
+        // The signed material still arrives, which is what ADR 0097 protects.
+        assert!(
+            got.contains("x-hub-signature-256: sha256=deadbeef"),
+            "a signature header must survive the hop; engine saw:\n{got}"
+        );
+        assert!(
+            got.contains("{\"hello\":\"world\"}"),
+            "the body must reach the engine byte for byte; engine saw:\n{got}"
+        );
     }
 
     #[test]

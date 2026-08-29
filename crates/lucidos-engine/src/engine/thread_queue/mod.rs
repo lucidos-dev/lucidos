@@ -863,12 +863,24 @@ impl ThreadQueue {
                     i += 1;
                     continue;
                 }
-                let config = self
-                    .trigger_configs
-                    .read()
-                    .ok()
-                    .and_then(|c| c.get(tid).map(|c| c.paused));
-                match config {
+                // A registry we could not READ is unknown, never "the trigger
+                // is gone": that arm drops the fire. `.ok()` collapsed the two,
+                // so one poisoning panic discarded every queued fire in the
+                // workspace on the next drain.
+                let paused = match self.trigger_configs.read() {
+                    Ok(configs) => configs.get(tid).map(|c| c.paused),
+                    Err(e) => {
+                        log!(
+                            "[ThreadQueue] Trigger registry unreadable ({}); leaving {}'s queued fires in place",
+                            e,
+                            tid
+                        );
+                        skipped.insert(tid.clone());
+                        i += 1;
+                        continue;
+                    }
+                };
+                match paused {
                     None => {
                         // Trigger no longer exists — its queued fires are
                         // undeliverable.

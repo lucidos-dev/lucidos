@@ -1296,3 +1296,61 @@ export function currentCommandGuardJudge(): boolean {
 export function setCommandGuardJudge(enabled: boolean): Promise<void> {
   return savePreference('command_guard_judge', enabled ? 'true' : 'false');
 }
+
+// --- Voice ---
+
+/**
+ * Whether this workspace has voice turned on at all.
+ *
+ * Off unless somebody opted in, matching the engine's `voice_enabled` default.
+ * An unloaded preference set therefore reads OFF, which is the right way round:
+ * the call control appears once we know it should, never in the gap before the
+ * answer arrives.
+ */
+export function voiceEnabled(): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return preferences.value.data['voice_enabled'] === 'true';
+}
+
+export function setVoiceEnabled(enabled: boolean): Promise<void> {
+  return savePreference('voice_enabled', enabled ? 'true' : 'false');
+}
+
+/** The speech-to-speech model a *voice session* speaks through. Mirrors the
+ *  backend `model_voice_talker` default in `core/preference_catalog.rs`.
+ *  Deliberately NOT a chat-model registry row, so it is a typed id rather than
+ *  a pick from `backgroundModelChoices()`: a realtime model cannot serve an
+ *  ordinary turn and never appears in that registry. */
+export const DEFAULT_VOICE_TALKER_MODEL = 'gpt-realtime';
+
+/**
+ * What is STORED, which is empty until somebody sets it.
+ *
+ * Deliberately not resolved against the default. The field renders this. A
+ * resolved value would fill an unset field with the default. A clear would
+ * then read as an edit and save an empty string on every blur. Empty is what
+ * the placeholder is for, and the engine falls back on its own.
+ */
+export function storedVoiceTalkerModel(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['model_voice_talker'] ?? '';
+}
+
+export function setVoiceTalkerModel(model: string): Promise<void> {
+  return savePreference('model_voice_talker', model.trim());
+}
+
+/** What a call loads before it starts, as comma-separated section ids. The
+ *  talker can look nothing up mid-call, so this block is the whole of what it
+ *  answers from. Mirrors the backend `voice_resident_sections` default. */
+export const DEFAULT_VOICE_RESIDENT_SECTIONS = 'who-and-where,this-thread,workspace-shape';
+
+/** What is stored, empty until set. Raw for the same reason as the model. */
+export function storedVoiceResidentSections(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['voice_resident_sections'] ?? '';
+}
+
+export function setVoiceResidentSections(sections: string): Promise<void> {
+  return savePreference('voice_resident_sections', sections.trim());
+}

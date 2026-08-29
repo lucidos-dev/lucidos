@@ -1,5 +1,4 @@
 import { test, expect } from './fixtures';
-import { execSync } from 'child_process';
 import {
   navigateToApp, sendMessage, sendFollowUp, uniqueMessage,
   assertHealthy, pickComposeDestination, newThread,
@@ -9,18 +8,22 @@ import {
 import { clearAllThreads } from './db-helpers';
 
 /**
- * Reproduces the "stuck request after CC process exit" bug:
+ * Guards the follow-up path a "stuck request after CC process exit" report
+ * came from: a follow-up must produce a real response with a status label,
+ * never be silently dropped.
  *
- * 1. Start CC session → wait for idle (Done)
- * 2. Kill the CC child process (simulates natural process exit after timeout)
- * 3. Send follow-up message
- * 4. Verify the follow-up gets an actual response (not silently dropped)
+ * The originating bug is that `spawn_or_resume` resumed with a stale session
+ * id, whose CC binary emits Init plus an empty Result and exits. The engine
+ * read that empty Result as a valid response.
  *
- * Bug: when the CC process dies while idle and the user sends a follow-up,
- * spawn_or_resume resumes with the stale session ID. The CC binary starts,
- * emits Init + empty Result, then exits immediately. The engine treats the
- * empty Result as a valid (empty) response — the user's message is silently
- * dropped with no status label or error.
+ * **These tests do NOT kill the CC subprocess.** They used to try, through a
+ * `pgrep -f 'claude…' | xargs kill` whose pattern never matched, so the step
+ * was inert. That shape must not come back. It matches every concurrent
+ * workspace's agent on this host, so it would destroy other people's sessions
+ * the day someone fixed the pattern. A real reproduction has to kill the
+ * engine's own child pid. Until then these cover the live in-memory routing
+ * path, and the codeword test below adds the content assertion the non-empty
+ * one cannot give.
  */
 test.describe('CC resume after process exit', () => {
   test.beforeEach(async ({ page }) => {
@@ -28,7 +31,7 @@ test.describe('CC resume after process exit', () => {
     await assertHealthy(page);
   });
 
-  test('follow-up after CC process dies produces a non-empty response', async ({ page }) => {
+  test('a follow-up on an idle CC thread produces a non-empty response', async ({ page }) => {
     await navigateToApp(page);
     await newThread(page);
     await pickComposeDestination(page);
@@ -42,28 +45,15 @@ test.describe('CC resume after process exit', () => {
     const firstResponseCount = await countVisibleResponses(page);
     expect(firstResponseCount).toBeGreaterThanOrEqual(1);
 
-    // Step 2: Find and kill the CC child process for this thread.
-    // The thread ID is in the URL or we can find it via DB.
-    // Kill all idle claude processes — in e2e there should only be ours.
-    try {
-      // Kill claude processes that are children of the engine (not the engine itself).
-      // The CC binary runs as a child process; killing it simulates natural timeout exit.
-      execSync(
-        `pgrep -f 'claude.*--resume\\|claude.*mcp' | xargs kill 2>/dev/null || true`,
-        { encoding: 'utf-8', timeout: 5_000 },
-      );
-    } catch {
-      // Process may already be gone — that's fine
-    }
-
-    // Give the engine a moment to notice the process exit
+    // Let the idle session settle before the follow-up, so the send lands on a
+    // settled thread rather than one still writing its Done state.
     await page.waitForTimeout(2_000);
 
-    // Step 3: Send follow-up — this should trigger a fresh CC session, not a stale resume
+    // Step 2: Send the follow-up
     const msg2 = uniqueMessage('cc-resume-exit-2');
     await sendFollowUp(page, `Say exactly: "second ${msg2}" and nothing else. Do not create any files.`);
 
-    // Step 4: Verify the follow-up is processed
+    // Step 3: Verify the follow-up is processed
     // The exchange should show "Requesting..." then "Working on it..." status labels
     // (Bug: no status label was shown — request was silently dropped)
     await waitForCCToStart(page, 120_000);
@@ -107,13 +97,6 @@ test.describe('CC resume after process exit', () => {
    * (the fix in 76529c04). Either path must preserve the codeword. The
    * unit test in resume.rs already exercises the resolver mechanics; this
    * test guards the user-visible promise that conversation context survives.
-   *
-   * Note: the existing "follow-up after CC process dies" test above tries
-   * to kill claude processes, but its `pgrep -f 'claude.*--resume\\|claude.*mcp'`
-   * pattern is broken (BRE `\\|` does not alternate in macOS pgrep's ERE),
-   * so the kill is effectively a no-op. Both tests therefore exercise the
-   * in-memory routing path; this one adds the content assertion the
-   * non-empty test cannot give.
    */
   test('revival preserves conversation content (codeword round-trip)', async ({ page }) => {
     await navigateToApp(page);
@@ -161,15 +144,8 @@ test.describe('CC resume after process exit', () => {
     await sendMessage(page, `Say exactly: "first ${msg1}" and nothing else. Do not create any files.`);
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    // Kill CC process to simulate natural exit
-    try {
-      execSync(
-        `pgrep -f 'claude.*--resume\\|claude.*mcp' | xargs kill 2>/dev/null || true`,
-        { encoding: 'utf-8', timeout: 5_000 },
-      );
-    } catch {
-      // Process may already be gone
-    }
+    // Let the idle session settle before the follow-up, so the send lands on a
+    // settled thread rather than one still writing its Done state.
     await page.waitForTimeout(2_000);
 
     // Send follow-up and immediately check for status label

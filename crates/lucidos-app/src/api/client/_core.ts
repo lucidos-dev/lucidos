@@ -5,6 +5,7 @@ import { BASE_PATH } from '../../utils/basePath';
 // client needs the same header and must not pull in the store to get it, so the
 // one copy lives in utils/.
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
+import { clampText } from '../../utils/clampText';
 
 // Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
 // under `/<slug>/`, so every API URL must carry that prefix. `BASE_PATH` is
@@ -23,8 +24,15 @@ export class ApiError extends Error {
     /** Parsed JSON body when the engine returned one. Lets callers format
      *  domain-specific error toasts from structured fields (e.g. the archive
      *  endpoint's `{reason, blocking: [...]}` 409 body) instead of falling
-     *  back to the raw `httpCode + reason` string. */
+     *  back to the raw `httpCode + reason` string.
+     *
+     *  A non-JSON body is NOT kept here. There is nothing to read fields off,
+     *  and holding the raw text is how it reached a toast (`errorReason`). */
     public readonly body?: unknown,
+    /** The workspace GATEWAY answered for an engine it could not reach, rather
+     *  than the engine answering for itself. Not a verdict about the request,
+     *  so `isTransientFetchError` folds it in with the aborts. */
+    public readonly bootSplash: boolean = false,
   ) {
     super(`${httpCode} ${reason}`);
     this.name = 'ApiError';
@@ -90,14 +98,18 @@ export function isTransportError(err: unknown): boolean {
  *  - `TimeoutError` — our own client-side deadline fired (a read issued while
  *    the engine is still booting is the common one).
  *  - a transport `TypeError` — stale connection (see `isTransportError`).
+ *  - the gateway's boot splash: it answered for an engine it could not reach,
+ *    so the request never got to the thing that decides.
  *
- *  A `4xx`/`5xx` (`ApiError`), a parse error, or any other `TypeError` is a real
- *  verdict and must surface.
+ *  Every OTHER `ApiError` is a real verdict and must surface, a 503 the ENGINE
+ *  itself sent included: "the embedding model is still loading" is an answer the
+ *  user is owed. So is a parse error, and so is any other `TypeError`.
  *
  *  Deliberately WIDER than `isAbortError` (`utils/errorDetail`): the background
  *  paths use that narrower predicate to suppress a cancel while still escalating
  *  a timeout. Here every non-verdict rejection is worth one more attempt. */
 export function isTransientFetchError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.bootSplash;
   if (err instanceof DOMException) {
     return err.name === 'AbortError' || err.name === 'TimeoutError';
   }
@@ -136,24 +148,83 @@ export async function mutatingFetchIdempotent(url: string, init?: RequestInit): 
   }
 }
 
-/** Throw `ApiError` with the most specific reason available: the body's
- *  `{error}` field when the body is JSON, the raw text when the body is
- *  non-JSON (so proxy 502 HTML and plain-text panics surface their content),
- *  else `res.statusText`. */
+/** Longest reason taken from a PLAIN-TEXT error body. A sentence, not a
+ *  document: the engine's plain-text handlers write one, and a panic writes one
+ *  followed by a backtrace this must not follow. */
+const MAX_TEXT_REASON_CHARS = 200;
+
+/** What a 503 with nothing to say of its own means to the user. Mid-session is
+ *  the only moment a loaded app's fetch reaches the gateway's holding page, and
+ *  mid-session the engine was up and went away. */
+const RESTARTING_REASON = 'Lucidos is restarting';
+
+/** Is this body markup rather than a message? A holding page from the gateway,
+ *  from a reverse proxy, or from a captive portal all arrive this way. */
+function looksLikeMarkup(res: Response, text: string): boolean {
+  if (/html|xml/i.test(res.headers.get('content-type') ?? '')) return true;
+  return text.trimStart().startsWith('<');
+}
+
+/** The workspace gateway answered for an engine it could not reach.
+ *
+ *  `proxy_request` serves its boot splash for EVERY proxied request whose
+ *  upstream connect fails, an `/api/v1` mutation included, and marks it with
+ *  `x-lucidos-boot-splash` (`crates/lucidos-gateway/src/proxy.rs`). Anything
+ *  else in the path can serve its own unmarked HTML holding page, so an HTML
+ *  503 counts as well. */
+function isBootSplashResponse(res: Response, text: string): boolean {
+  if (res.headers.get('x-lucidos-boot-splash') === '1') return true;
+  return res.status === 503 && looksLikeMarkup(res, text);
+}
+
+/** A short human phrase for a response whose body said nothing usable.
+ *
+ *  Never `res.statusText` alone: it is `""` over HTTP/2, which leaves a toast
+ *  reading "Compose sync failed: 503" and nothing else. */
+function statusPhrase(res: Response): string {
+  if (res.status === 503) return RESTARTING_REASON;
+  return res.statusText || `HTTP ${res.status}`;
+}
+
+/** The most specific reason a failed response offers, normalized so nothing a
+ *  server sent can paint the screen. `json` is the parsed body, or `undefined`
+ *  when the body did not parse.
+ *
+ *  JSON keeps its `{error}` / `{reason}` field as written: the engine wrote that
+ *  for the user. Markup is discarded outright, the gateway's boot splash having
+ *  once rendered as a toast listing its own `<meta>` tags. Plain text keeps its
+ *  FIRST LINE only, whitespace-collapsed and clamped. It stays a sentence, and
+ *  can never grow the bullets `parseToastMessage` reads out of newlines. */
+function errorReason(res: Response, text: string, json: unknown): string {
+  const obj = json as Record<string, unknown> | null | undefined;
+  if (typeof obj?.error === 'string' && obj.error) return obj.error;
+  if (typeof obj?.reason === 'string' && obj.reason) return obj.reason;
+  if (json === undefined && text && !looksLikeMarkup(res, text)) {
+    const firstLine = text.split('\n', 1)[0].replace(/\s+/g, ' ').trim();
+    if (firstLine) return clampText(firstLine, MAX_TEXT_REASON_CHARS);
+  }
+  return statusPhrase(res);
+}
+
+/** Throw `ApiError` with the most specific reason the response offers, and
+ *  never the raw body. See `errorReason` for what each body shape yields. */
 export async function throwIfNotOk(res: Response): Promise<void> {
   if (res.ok) return;
   const text = await res.text().catch(() => '');
-  let reason = res.statusText;
-  let body: unknown;
+  // `undefined` means "did not parse", which a JSON body can never be: `null`
+  // parses to `null`. That is what tells `errorReason` the text is unstructured.
+  let json: unknown;
   if (text) {
     try {
-      body = JSON.parse(text);
-      const obj = body as Record<string, unknown> | null;
-      if (typeof obj?.error === 'string') reason = obj.error;
-      else if (typeof obj?.reason === 'string') reason = obj.reason;
-    } catch { reason = text; }
+      json = JSON.parse(text);
+    } catch { /* not JSON, and the text is never surfaced */ }
   }
-  throw new ApiError(res.status, reason, body);
+  throw new ApiError(
+    res.status,
+    errorReason(res, text, json),
+    json,
+    isBootSplashResponse(res, text),
+  );
 }
 
 /** AbortSignal.timeout fires with a TimeoutError DOMException, so errorDetail
@@ -200,7 +271,23 @@ async function fetchWithDefaults(url: string, init: RequestInit | undefined, tim
 export async function json<T>(url: string, init?: RequestInit, timeoutMs = 10000): Promise<T> {
   const res = await fetchWithDefaults(url, init, timeoutMs);
   await throwIfNotOk(res);
-  return res.json();
+  try {
+    return await res.json() as T;
+  } catch (err) {
+    // A PARSE failure only. Reading the body can also fail for reasons that say
+    // nothing about its content. The deadline stays armed while the stream
+    // runs, so a slow body past it rejects with `AbortError`. A connection
+    // dropped mid-body rejects with a transport `TypeError`. Both are transient
+    // and their callers park or retry, so re-stamping either would turn a radio
+    // handoff into a verdict.
+    if (!(err instanceof SyntaxError)) throw err;
+    // The other half of `throwIfNotOk`'s rule, for a body that answered OK and
+    // then turned out not to be JSON: a captive portal or a tunnel interstitial
+    // sends its login page with a 200. V8 quotes the payload's first characters
+    // into the `SyntaxError` it throws, so the raw `<!doctype html` lands in
+    // whatever renders the rejection. Say what happened instead.
+    throw new SyntaxError('The server sent a reply Lucidos could not read');
+  }
 }
 
 /** Like `json<T>` but for endpoints that return plain text (file contents,

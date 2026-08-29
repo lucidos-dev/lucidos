@@ -40,6 +40,7 @@ layer.
 {
   "<provider-name>": {
     "base_url": "https://api.example.com",
+    "insecure_transport": false,   // optional, default false (see below)
     "auth": {
       "pipeline": [
         // one or more layer entries, in execution order
@@ -49,6 +50,30 @@ layer.
   }
 }
 ```
+
+### `insecure_transport`: off by default, and say why you turned it on
+
+The engine validates the upstream's certificate, for every provider. It also
+refuses to put a credential on plain `http://` when the host is not loopback,
+because anyone on the path reads it.
+
+`"insecure_transport": true` on an entry turns both off, for that one provider.
+One flag, one meaning: you accept that this upstream never proves who it is.
+Reach for it in exactly two cases.
+
+- **A self-signed dev backend.** An `https://` URL whose certificate nothing
+  signed.
+- **A device on your LAN or tailnet with a key**, reachable only over plain
+  `http://`.
+
+Two things do NOT need it. A **loopback** address is exempt, so
+`{"sonos": {"base_url": "http://localhost:5005"}}` and a keyed local model
+server both keep working untouched. An **uncredentialed** plain-`http://` entry
+has no secret to leak, so it is fine as it stands.
+
+Without the flag, an affected call answers 502 naming what to change. With it,
+the engine logs the provider at startup and posts one notification listing every
+entry it will not vouch for.
 
 Layer shapes (all live in `proxy_pipeline_config::LayerConfig`):
 
@@ -121,7 +146,8 @@ For login dances. The engine caches the script's output until `expires_in` elaps
 
 ### Script contract
 
-- **Where the file lives.** `script` is resolved relative to `data/`, and nowhere else: the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. A script placed anywhere else in the workspace tree does not run, and the call answers 500 naming the `data/` path it looked for. Keep handshake scripts under `data/`, where they are git-tracked.
+- **Where the file lives.** `script` is resolved under `data/scripts/`, and nowhere else: the file at `data/scripts/auth/foo.py` is referenced as `"script": "scripts/auth/foo.py"`. A path outside `scripts/` is refused when `apis.json` loads, naming the provider and the value, so the config never reaches a request. That guard matches the approve route, which has always required `data/scripts/`. Without it, `"script": ".env"` needed no `..` to name the gitignored config beside the typed subdirectories.
+- **Two spellings, one file.** `"scripts/auth/foo.py"` is the form to write. A config from before resolution moved under `data/` says `"data/scripts/auth/foo.py"`, and that still resolves: the redundant `data/` comes off once. It comes off once and no more, so `"data/data/scripts/x.py"` is refused rather than laundered, and `"data/.env"` reduces to `".env"` and is refused with it.
 - **A script runs only if Lucidos recorded who wrote it.** `data/scripts/` is
   writable over the API, and an app UI reaches that API with your authority. So
   the engine will not run a handshake script just because the file is there
@@ -139,6 +165,30 @@ For login dances. The engine caches the script's output until `expires_in` elaps
 
   Editing the file changes its hash, so approval is per content, not per path.
   Overwriting an approved script does not inherit its standing.
+- **A script's token goes to one host, and `apis.json` cannot move it.** The
+  script mints a live token, so no stored credential's scope covers it. The
+  record therefore carries a `base_url` column beside the hash, and the token
+  goes nowhere else (ADR 0144 decision 4). It is filled the first time a proxy
+  call would use the script, from whatever `base_url` the entry then names, and
+  enforced from then on.
+
+  Point the entry somewhere else afterwards and the call answers 502 naming
+  both hosts. That is the whole point: `data/config/apis.json` is writable over
+  the API, and without the column a rewritten `base_url` delivered the minted
+  token to whoever wrote it. To move a script on purpose, or to let a second
+  provider share one, edit the column in
+  `<workspace>/.lucidos/approved-handshake-scripts`.
+- **A script is handed one set of secrets, and `apis.json` cannot swap it.**
+  `credential` and `oauth_providers` both name something the engine puts in the
+  script's environment. Neither is sent to the entry's `base_url`, so the
+  credential's own scope has nothing true to say about them: an OAuth client is
+  scoped to its provider's token endpoint, which is where the SCRIPT presents
+  it, not where the proxy goes.
+
+  The record carries an `injects` column instead, beside the `base_url` one and
+  filled the same way. It lists `c:<credential>` and `o:<provider>` members.
+  Change either field afterwards and the call answers 502, naming what the
+  script is approved to receive. To change it on purpose, edit that column.
 - **The path must be relative, with no `..` anywhere in it.** Not just no `..` segment: any `..` substring is refused, because this is a filesystem path. A rejected value takes out that one entry, naming the provider and the value, and a call to it answers 502. See "A bad entry is rejected, never fatal" above.
 - **`credential` is optional.** When the layer config sets `credential`, that credential is injected as env vars (shape below) before the script runs. When it's omitted, no `CRED_*` env var is injected from this layer — the script must source its secret by other means (read a rotating token from the OS keychain, do an OAuth-only exchange, etc.). The env-var table below applies only when a credential is configured.
 - Reads the named credential from env vars. The shape depends on the credential's type — same convention `run_python` / `run_bash` already inject for their subprocesses, so a script you wrote for one works for the other:
@@ -552,9 +602,22 @@ After every forwarded request, the pipeline asks each layer "did your `apply` co
   save works and the script stops running, because nothing recorded the new
   content. Ask the agent to make the edit, or approve it afterwards.
 - **A credential pointed at the wrong provider.** A credential is only sent to
-  the API its own `base_url` covers, so an entry whose `base_url` sits elsewhere
-  answers 502 naming both. Fix the credential's `base_url` in Settings, or the
-  entry's.
+  a base URL it declares, so an entry pointing elsewhere answers 502 naming the
+  whole declared set. Fix the credential's base URLs in Settings, or the entry's
+  `base_url`.
+- **One key serving two hostnames of one provider.** Binance signs spot calls at
+  `api.binance.com` and futures calls at `fapi.binance.com` with the same HMAC
+  pair, so the credential must declare BOTH. It is a set, and every member is
+  exact: there is no wildcard and nothing is inferred from a host's spelling.
+  Add the second host in Settings, or run:
+
+  ```bash
+  lucidos credentials set-base-urls --name binance-key \
+    --url https://api.binance.com --url https://fapi.binance.com
+  ```
+
+  `set-base-urls` REPLACES the set, so pass every host. `lucidos credentials
+  list` prints what each credential covers today.
 - **Logging credentials inside a script_handshake.** Stderr is captured by the engine and surfaced. Don't `print(username)` or write secrets to a file.
 - **WASM module too big or too slow.** wasmtime instantiates per request. Keep the heap small (the binance-hmac signer uses 256KB) and avoid pulling heavy crates — `no_std` + `panic = "abort"` keeps it tight.
 - **Cryptic `incompatible import type` from wasmtime when the imports look right.** Almost always means the running engine binary pre-dates the host import you're calling — the source repo has the new function but the installed engine was built before the commit that added it (verify with `strings <engine-binary> | grep <import-name>`). Two fixes: rebuild + restart the engine, OR drop the host import and inline a pure-Rust replacement in the signer (see § Prefer pure-Rust crypto/encoding). The second is the more durable fix — the signer no longer depends on the engine's host-import revision.

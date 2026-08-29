@@ -133,7 +133,7 @@ async fn permission_prompt_resolves_when_consent_posted() {
     .bind(thread_id)
     .fetch_one(&pool)
     .await
-    .unwrap_or(0);
+    .expect("counting CodingAgentPermissionResolved failed");
     assert_eq!(
         resolved_count, 1,
         "exactly one CodingAgentPermissionResolved with allowed=true must be persisted"
@@ -201,7 +201,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
     .bind(thread_id)
     .fetch_one(&pool)
     .await
-    .unwrap_or(0);
+    .expect("counting CodingAgentPermissionRequest failed");
     assert_eq!(
         request_count, 1,
         "concurrent identical permission requests must produce exactly ONE request event \
@@ -231,7 +231,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
     .bind(thread_id)
     .fetch_one(&pool)
     .await
-    .unwrap_or(0);
+    .expect("counting CodingAgentPermissionResolved failed");
     assert_eq!(
         resolved_count, 1,
         "exactly one CodingAgentPermissionResolved must be persisted, not one per duplicate"

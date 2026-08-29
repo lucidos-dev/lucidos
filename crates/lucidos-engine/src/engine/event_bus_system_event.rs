@@ -122,6 +122,24 @@ pub enum SystemEvent {
         /// When it failed (RFC 3339).
         finished_at: chrono::DateTime<chrono::Utc>,
     },
+    /// The workspace backup key was handed to a caller. PERSISTED.
+    ///
+    /// The key decrypts every archive this workspace ever uploaded, so a read
+    /// of it is a bigger fact than a credential reveal. Same secrecy contract
+    /// as `CredentialRevealed`: the row records the act and the actor, never
+    /// the key.
+    ///
+    /// The origin check in front of it is defense in depth, not a boundary
+    /// (ADR 0117, ADR 0144). So a reveal that should not have happened still
+    /// leaves a row somebody can find.
+    BackupKeyRevealed {
+        /// True when this call created the key, which is the moment prior
+        /// backups would have been orphaned had one existed. A plain reveal of
+        /// an existing key is `false`.
+        minted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// The engine booted with entries in `data/config/apis.json` it refuses
     /// to serve. PERSISTED, and emitted only when something is refused.
     ///
@@ -1102,6 +1120,32 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A `script_handshake` script that carried no scope was bound to one, so
+    /// the token it mints can only be sent there (ADR 0144). No stored
+    /// credential speaks for a minted token, and the record lives outside
+    /// `data/`. Once per script, on the first request that would use it.
+    HandshakeScriptScopeBound {
+        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
+        path: String,
+        /// The one upstream this script's token may now be sent to.
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A `script_handshake` script that carried no injected-secret set was
+    /// bound to one, so `apis.json` can no longer swap what it receives
+    /// (ADR 0144). The sibling of `HandshakeScriptScopeBound`, for the secrets
+    /// going IN rather than the token coming out. Once per script, on the first
+    /// request that would inject one.
+    HandshakeScriptInjectsBound {
+        /// Workspace-relative path, e.g. `data/scripts/auth/comfort-cloud.py`.
+        path: String,
+        /// What this script may now be handed, sorted. `c:<credential>` for a
+        /// stored credential, `o:<provider>` for a connected OAuth account.
+        injects: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A credential that carried no `base_url` was bound to one, so the proxy's
     /// scope check has something to enforce (ADR 0144). The scope comes from
     /// the `apis.json` entry naming it. Once per credential, at startup.
@@ -1290,6 +1334,8 @@ impl SystemEvent {
         "EmailSent",
         "ProxyModulesReloaded",
         "HandshakeScriptApproved",
+        "HandshakeScriptScopeBound",
+        "HandshakeScriptInjectsBound",
         "CredentialScopeInferred",
         "ThreadQueued",
         "ThreadQueueAdmitted",
@@ -1298,6 +1344,7 @@ impl SystemEvent {
         "CapacityPolicyChanged",
         "BackupCompleted",
         "BackupFailed",
+        "BackupKeyRevealed",
         "ProxyConfigRejected",
     ];
 
@@ -1335,6 +1382,7 @@ impl SystemEvent {
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
             Self::BackupFailed { .. } => "BackupFailed",
+            Self::BackupKeyRevealed { .. } => "BackupKeyRevealed",
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
@@ -1421,6 +1469,8 @@ impl SystemEvent {
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
             Self::HandshakeScriptApproved { .. } => "HandshakeScriptApproved",
+            Self::HandshakeScriptScopeBound { .. } => "HandshakeScriptScopeBound",
+            Self::HandshakeScriptInjectsBound { .. } => "HandshakeScriptInjectsBound",
             Self::CredentialScopeInferred { .. } => "CredentialScopeInferred",
             Self::ThreadQueued { .. } => "ThreadQueued",
             Self::ThreadQueueAdmitted { .. } => "ThreadQueueAdmitted",
@@ -1465,6 +1515,7 @@ impl SystemEvent {
         "BackupProgress",
         "BackupCompleted",
         "BackupFailed",
+        "BackupKeyRevealed",
         "ProxyConfigRejected",
         "RecoveryProgress",
         "Toast",
@@ -1551,6 +1602,8 @@ impl SystemEvent {
         "EmailSent",
         "ProxyModulesReloaded",
         "HandshakeScriptApproved",
+        "HandshakeScriptScopeBound",
+        "HandshakeScriptInjectsBound",
         "CredentialScopeInferred",
         "ThreadQueued",
         "ThreadQueueAdmitted",
@@ -1583,6 +1636,7 @@ impl SystemEvent {
             | Self::BackupProgress { .. }
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }
+            | Self::BackupKeyRevealed { .. }
             | Self::ProxyConfigRejected { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
@@ -1667,7 +1721,9 @@ impl SystemEvent {
             | Self::EngineBuildStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
-            Self::HandshakeScriptApproved { .. } => "handshake_script",
+            Self::HandshakeScriptApproved { .. }
+            | Self::HandshakeScriptScopeBound { .. }
+            | Self::HandshakeScriptInjectsBound { .. } => "handshake_script",
             Self::ThreadQueued { .. }
             | Self::ThreadQueueAdmitted { .. }
             | Self::ThreadQueueDropped { .. }
@@ -1773,7 +1829,9 @@ impl SystemEvent {
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
             | Self::DataFileEdited { path, .. }
-            | Self::HandshakeScriptApproved { path, .. } => path.clone(),
+            | Self::HandshakeScriptApproved { path, .. }
+            | Self::HandshakeScriptScopeBound { path, .. }
+            | Self::HandshakeScriptInjectsBound { path, .. } => path.clone(),
             Self::ApplyAllBatchStarted { batch_id, .. }
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),

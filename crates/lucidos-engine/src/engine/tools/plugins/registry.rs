@@ -337,6 +337,15 @@ async fn snapshot_installed(
         .collect())
 }
 
+/// The one "no such installed plugin" line, for every surface that resolves a
+/// plugin reference. Four copies of it drifted apart otherwise.
+pub(crate) fn not_installed_error(query: &str) -> String {
+    format!(
+        "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
+        query
+    )
+}
+
 /// Resolve a free-form plugin reference (id, manifest name, or app folder
 /// installed by the plugin) to the canonical plugin id stored in the
 /// `PluginInstalled` event. Case-insensitive, dash/underscore/whitespace-
@@ -368,10 +377,7 @@ pub(crate) async fn resolve_plugin_query(
         .map_err(|e| format!("Error: list installed plugins: {}", e))?;
     let needle = normalize_plugin_query(query);
     if needle.is_empty() {
-        return Err(format!(
-            "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
-            query
-        ));
+        return Err(not_installed_error(query));
     }
 
     let matches: Vec<&InstalledIndex> = installed
@@ -380,10 +386,7 @@ pub(crate) async fn resolve_plugin_query(
         .collect();
 
     match matches.as_slice() {
-        [] => Err(format!(
-            "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
-            query
-        )),
+        [] => Err(not_installed_error(query)),
         [single] => Ok(single.plugin_id.clone()),
         many => {
             let mut listing = many

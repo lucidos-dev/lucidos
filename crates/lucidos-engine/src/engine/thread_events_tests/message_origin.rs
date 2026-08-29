@@ -245,3 +245,85 @@ fn message_origin_mode_reads_field_for_workspace_and_thread_link() {
     assert_eq!(ws.mode(), ActorMode::Agent);
     assert_eq!(tl.mode(), ActorMode::Engine);
 }
+
+/// The wire shape the frontend union mirrors (ADR 0150). A guest carries its
+/// speaker label, because that is the only thing distinguishing two agents on
+/// one thread.
+#[test]
+fn message_origin_agent_serializes_with_its_participant() {
+    let ours = MessageOrigin::Agent {
+        agent: AgentParticipant::LucidosAgent,
+    };
+    assert_eq!(
+        serde_json::to_value(&ours).unwrap(),
+        serde_json::json!({"kind": "agent", "agent": {"kind": "lucidos_agent"}})
+    );
+    let guest = MessageOrigin::Agent {
+        agent: AgentParticipant::Guest {
+            label: "Voice".into(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&guest).unwrap(),
+        serde_json::json!({"kind": "agent", "agent": {"kind": "guest", "label": "Voice"}})
+    );
+}
+
+/// A payload naming the origin without naming a participant reads as the
+/// Lucidos Agent, which is what a single-agent thread's events were.
+#[test]
+fn message_origin_agent_defaults_its_participant_to_the_lucidos_agent() {
+    let decoded: MessageOrigin = serde_json::from_str(r#"{"kind":"agent"}"#).unwrap();
+    assert_eq!(
+        decoded,
+        MessageOrigin::Agent {
+            agent: AgentParticipant::LucidosAgent
+        }
+    );
+    assert_eq!(AgentParticipant::default(), AgentParticipant::LucidosAgent);
+}
+
+/// An agent origin means an LLM decided, so its mode is intrinsic. Nothing
+/// carries a mode field that could disagree.
+#[test]
+fn message_origin_agent_mode_is_agent() {
+    let origin = MessageOrigin::Agent {
+        agent: AgentParticipant::Guest {
+            label: "Voice".into(),
+        },
+    };
+    assert_eq!(origin.mode(), ActorMode::Agent);
+}
+
+/// `agent()` answers "which agent wrote this", and answers `None` for every
+/// origin that names a way in rather than an author.
+#[test]
+fn only_an_agent_origin_names_an_authoring_agent() {
+    let authored = MessageOrigin::Agent {
+        agent: AgentParticipant::LucidosAgent,
+    };
+    assert_eq!(authored.agent(), Some(&AgentParticipant::LucidosAgent));
+    assert_eq!(MessageOrigin::System.agent(), None);
+    assert_eq!(
+        MessageOrigin::Device {
+            device_id: "dev-1".into(),
+            label: "My MacBook".into(),
+        }
+        .agent(),
+        None
+    );
+}
+
+/// Our own agent keeps `Assistant`, the word every existing transcript uses.
+/// A guest speaks under its own name, which is the whole point of the variant.
+#[test]
+fn a_guest_speaks_under_its_own_name_and_our_agent_stays_assistant() {
+    assert_eq!(AgentParticipant::LucidosAgent.speaker_label(), "Assistant");
+    assert_eq!(
+        AgentParticipant::Guest {
+            label: "Voice".into()
+        }
+        .speaker_label(),
+        "Voice"
+    );
+}

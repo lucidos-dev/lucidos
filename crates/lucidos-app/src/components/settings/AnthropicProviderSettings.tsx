@@ -38,7 +38,7 @@ export function AnthropicProviderSettings() {
     try {
       const ok = await submitNewCredential(
         ANTHROPIC_SERVICE,
-        ANTHROPIC_BASE_URL,
+        [ANTHROPIC_BASE_URL],
         authKind as AuthType,
         secret.trim()
       );

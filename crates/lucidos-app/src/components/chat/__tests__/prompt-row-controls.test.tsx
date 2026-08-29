@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 import { Fragment } from 'preact';
 import type { ComponentChildren, VNode } from 'preact';
 import { FollowLiveEdgeIcon } from '../../shared/icons';
+import { CallToggle } from '../CallToggle';
 import { CodingAgentControlMenu } from '../CodingAgentControlMenu';
 import { WaitingIndicator } from '../WaitingPanel';
 import { LucidosControlMenu } from '../LucidosControlMenu';
@@ -84,20 +85,21 @@ describe('PromptRowControls', () => {
    *  positionally, so the order is part of the contract, not an accident of
    *  how the JSX reads.
    *
-   *  The first two slots are FIXED and the rest float behind them: the control
-   *  menu anchors the row, and the follow toggle is second on every thread
-   *  because it is the only control here that renders in every state. Behind
-   *  the indicators it was third on a Lucidos Agent thread, second on a
+   *  The first three slots are FIXED and the rest float behind them: the
+   *  control menu anchors the row, the follow toggle is second and the call
+   *  toggle third. Each renders in every state. Behind the indicators the
+   *  follow toggle was third on a Lucidos Agent thread, second on a
    *  coding-agent one, and fourth with a subscription armed, so the button
-   *  moved under the thumb depending on what the thread was doing. The toggle
-   *  shows up here as its ICON, the one function component inside the
-   *  `<button>` this walk can see. */
-  it('pins the menu and the follow toggle, and floats the indicators behind them', () => {
+   *  moved under the thumb depending on what the thread was doing. The follow
+   *  toggle shows up here as its ICON, the one function component inside the
+   *  `<button>` this walk can see. The call toggle is its own component, so it
+   *  shows up under its own name. */
+  it('pins the menu and the two toggles, and floats the indicators behind them', () => {
     expect(cluster(null)).toEqual([
-      LucidosControlMenu, FollowLiveEdgeIcon, TodoListIndicator, WaitingIndicator,
+      LucidosControlMenu, FollowLiveEdgeIcon, CallToggle, TodoListIndicator, WaitingIndicator,
     ]);
     expect(cluster('claude-code')).toEqual([
-      CodingAgentControlMenu, FollowLiveEdgeIcon, WaitingIndicator,
+      CodingAgentControlMenu, FollowLiveEdgeIcon, CallToggle, WaitingIndicator,
     ]);
   });
 });

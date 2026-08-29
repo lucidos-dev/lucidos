@@ -15,7 +15,7 @@ import type { ProgressDialogState } from './types';
  *  sentence, the determinate fraction (or `null` when there is no honest one),
  *  and whether the run can still be abandoned.
  *
- *  The SINGLE derivation behind both the dialog and Settings → System. The two
+ *  The SINGLE derivation behind both the dialog and System > Overview. The two
  *  must never disagree about what the update is doing. Terminal frames
  *  (`cancelled` / `failed`) are deliberately absent: they end the run rather
  *  than describe it, so their callers close the dialog instead of updating it. */

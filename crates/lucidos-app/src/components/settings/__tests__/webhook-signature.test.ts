@@ -31,7 +31,7 @@ function credential(over: Partial<CredentialInfo>): CredentialInfo {
   return {
     id: 'id-1',
     service_name: 'deploys-github',
-    base_url: '',
+    base_urls: [],
     auth_type: 'secret',
     auth_header: 'Authorization',
     created_at: '2026-08-01T00:00:00Z',

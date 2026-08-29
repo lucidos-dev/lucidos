@@ -2,12 +2,42 @@
 //! invoked by the lucidos-cli ask-user-question-hook subcommand from inside
 //! CC subprocesses. Drives the endpoint with HTTP only — no real CC needed.
 
-use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary};
+use crate::support::{base_url, count_events_of_type, db_url, http_client, seed_cc_thread_summary};
 use serde_json::json;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+/// Poll until the hook endpoint has persisted `UserQuestionAsked` for
+/// `tool_use_id`.
+///
+/// Every answering task below waits on this first: answering before the emit
+/// lands makes the handler's pending-question lookup 409. A query error
+/// panics rather than reading as "not yet", which would surface as the
+/// deadline panic and name the wrong cause.
+async fn wait_for_question_asked(pool: &PgPool, thread_id: Uuid, tool_use_id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
+             AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
+        )
+        .bind(thread_id)
+        .bind(tool_use_id)
+        .fetch_one(pool)
+        .await
+        .expect("polling for UserQuestionAsked failed");
+        if exists {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "UserQuestionAsked never persisted by the hook endpoint"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
 
 #[tokio::test]
 async fn long_poll_returns_answer_when_user_responds() {
@@ -32,25 +62,7 @@ async fn long_poll_returns_answer_when_user_responds() {
     let q0_id_bg = q0_id.clone();
     let pool_bg = pool.clone();
     let answerer = tokio::spawn(async move {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
-                 AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
-            )
-            .bind(thread_id)
-            .bind(&q0_id_bg)
-            .fetch_one(&pool_bg)
-            .await
-            .unwrap_or(false);
-            if exists {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("UserQuestionAsked never persisted by the hook endpoint");
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
         let resp = client_bg
             .post(format!(
                 "{}/api/v1/threads/{}/answer-question",
@@ -142,25 +154,7 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
     let q0_id_bg = q0_id.clone();
     let pool_bg = pool.clone();
     let resolver = tokio::spawn(async move {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
-                 AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
-            )
-            .bind(thread_id)
-            .bind(&q0_id_bg)
-            .fetch_one(&pool_bg)
-            .await
-            .unwrap_or(false);
-            if exists {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("UserQuestionAsked never persisted by the hook endpoint");
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
         let resp = client_bg
             .post(format!(
                 "{}/api/v1/threads/{}/answer-question",
@@ -244,14 +238,7 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
 
     // A supersede leaves the next turn to the follow-up that caused it.
     for event_type in ["CodingAgentPromptSent", "ContinuationRequested"] {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE thread_id = $1 AND event_type = $2",
-        )
-        .bind(thread_id)
-        .bind(event_type)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(0);
+        let count = count_events_of_type(&pool, thread_id, event_type).await;
         assert_eq!(
             count, 0,
             "{event_type} must not fire for an answer-less resolution: no turn follows it"
@@ -335,7 +322,7 @@ async fn answer_question_refuses_a_client_supplied_superseded() {
     .bind(thread_id)
     .fetch_one(&pool)
     .await
-    .unwrap_or(0);
+    .expect("counting UserQuestionAnswered failed");
     assert_eq!(
         answered, 0,
         "a refused answer must leave the question pending and answerable"
@@ -367,25 +354,7 @@ async fn multi_select_question_returns_joined_answer() {
     let q0_id_bg = q0_id.clone();
     let pool_bg = pool.clone();
     let answerer = tokio::spawn(async move {
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE thread_id = $1 \
-                 AND event_type = 'UserQuestionAsked' AND payload->>'tool_use_id' = $2)",
-            )
-            .bind(thread_id)
-            .bind(&q0_id_bg)
-            .fetch_one(&pool_bg)
-            .await
-            .unwrap_or(false);
-            if exists {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("UserQuestionAsked never persisted by the hook endpoint");
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_question_asked(&pool_bg, thread_id, &q0_id_bg).await;
         let resp = client_bg
             .post(format!(
                 "{}/api/v1/threads/{}/answer-question",

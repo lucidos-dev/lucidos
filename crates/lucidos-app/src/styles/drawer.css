@@ -421,13 +421,16 @@
      * hypothetical wrapper-less row on the un-indented column. */
     --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth-offset, 0px));
     padding-left: var(--thread-row-pad-left);
+    /* Where the row's content column ends. A var because the bottom-edge
+     * divider `::after` has to stop at the same x, and the mobile block below
+     * moves it: two hand-synced copies drifted the moment one of them did. */
+    --thread-row-pad-right: 0.5rem;
     /* Right padding gives the action icons breathing room inside the row. */
-    padding-right: 0.5rem;
-    /* No right inset: the focused / hover / highlighted background runs full
+    padding-right: var(--thread-row-pad-right);
+    /* No right MARGIN: the focused / hover / highlighted background runs full
      * width to the drawer's right edge (or up to the scrollbar when the list
      * overflows), so the selection reads flush with no `--bg-primary` gap strip.
-     * The bottom-edge divider `::after` keeps its own `right: 0.5rem` content
-     * inset. No left margin either: nested sub-thread selections reach the left
+     * No left margin either: nested sub-thread selections reach the left
      * edge. */
     -webkit-touch-callout: none;
     -webkit-user-select: none;
@@ -456,9 +459,9 @@
  * below it. Drawn as a bottom-anchored `::after` (rather than `border-bottom`)
  * so both ends inset toward the row's text column: `left` is the row's
  * `padding-left` (`--thread-row-pad-left`) less a small 0.25rem nudge, so the
- * line starts just left of the thread-name text, and `right: 0.5rem` matches
- * `padding-right` so it stops at the row's content column — neither end runs
- * flush to the drawer edge.
+ * line starts just left of the thread-name text, and `right` reads the row's
+ * own `--thread-row-pad-right` so it stops at the content column. Neither end
+ * runs flush to the drawer edge.
  * `--border-color` matches every other divider in the app. Scoped to
  * `.thread-drawer .thread-row` so it covers both wrapped rows (list / drafts)
  * AND the bare `SearchResultRow`. Each row's line tracks its own indented text
@@ -468,7 +471,7 @@
     content: '';
     position: absolute;
     left: calc(var(--thread-row-pad-left) - 0.25rem);
-    right: 0.5rem;
+    right: var(--thread-row-pad-right);
     bottom: 0;
     border-bottom: 1px solid var(--border-color);
     pointer-events: none;
@@ -984,6 +987,16 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     .thread-row-actions .icon-btn.header-icon {
         width: 1.75rem;
         height: 1.5rem;
+    }
+
+    /* The pin is the row's ONLY control here: the ⋯ is gone and a long press on
+     * the row opens its menu instead (useRowActionsGesture). Letting the pin
+     * slide into the vacated slot would leave that one control in the corner
+     * this change exists to leave, so the whole right column moves in to the
+     * shared --space-lg gutter. The chips above it travel with it, keeping one
+     * right edge, and the bottom divider tracks the same var. */
+    .thread-row {
+        --thread-row-pad-right: var(--space-lg);
     }
 
     /* Bigger sub-thread disclosure on touch — both the ▴ chevron (expanded) and

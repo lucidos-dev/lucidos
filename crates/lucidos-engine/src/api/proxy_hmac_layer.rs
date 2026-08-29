@@ -4,7 +4,7 @@
 //! emits one header (key) plus two query params (timestamp + signature).
 
 use crate::api::proxy::{compute_hmac_hex, lookup_credential_value, HmacAlgorithm};
-use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput};
+use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, LayerInput, ScopeBinding};
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
 use sqlx::PgPool;
@@ -67,6 +67,15 @@ impl HmacSignedLayer {
 impl AuthLayer for HmacSignedLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Both credentials travel: the key as a header, the secret as the
+    /// signature it produces. So both are checked against the outbound URL.
+    fn scope_bindings(&self) -> Vec<ScopeBinding> {
+        vec![
+            ScopeBinding::StoredCredential(self.key_credential.clone()),
+            ScopeBinding::StoredCredential(self.secret_credential.clone()),
+        ]
     }
 
     async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {

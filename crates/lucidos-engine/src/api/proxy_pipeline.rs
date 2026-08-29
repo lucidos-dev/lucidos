@@ -174,6 +174,10 @@ mod tests {
         fn output_namespace(&self) -> &str {
             self.name
         }
+        fn scope_bindings(&self) -> Vec<ScopeBinding> {
+            // A test layer carries no real secret, so nothing binds it.
+            Vec::new()
+        }
         async fn apply(
             &self,
             _input: &LayerInput<'_>,
@@ -224,6 +228,9 @@ mod tests {
             fn output_namespace(&self) -> &str {
                 "fail"
             }
+            fn scope_bindings(&self) -> Vec<ScopeBinding> {
+                Vec::new()
+            }
             async fn apply(
                 &self,
                 _input: &LayerInput<'_>,
@@ -261,6 +268,10 @@ mod tests {
     impl AuthLayer for ConfigurableRetryLayer {
         fn output_namespace(&self) -> &str {
             self.name
+        }
+        fn scope_bindings(&self) -> Vec<ScopeBinding> {
+            // A test layer carries no real secret, so nothing binds it.
+            Vec::new()
         }
         fn retry_on_401(&self) -> RetryHint {
             self.retry_hint
@@ -422,6 +433,10 @@ mod tests {
         fn output_namespace(&self) -> &str {
             "capture"
         }
+        fn scope_bindings(&self) -> Vec<ScopeBinding> {
+            // A test layer carries no real secret, so nothing binds it.
+            Vec::new()
+        }
         async fn apply(
             &self,
             input: &LayerInput<'_>,
@@ -486,6 +501,9 @@ mod tests {
         impl AuthLayer for RedactingLayer {
             fn output_namespace(&self) -> &str {
                 "redact"
+            }
+            fn scope_bindings(&self) -> Vec<ScopeBinding> {
+                Vec::new()
             }
             async fn apply(
                 &self,

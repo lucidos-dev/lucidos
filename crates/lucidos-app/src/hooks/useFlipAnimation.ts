@@ -68,8 +68,8 @@ export function useFlipTransitions(
     // ── Build affected siblings: any existing item that isn't moved/new ──
     // When sections appear/disappear, index-range heuristics miss items outside
     // the source-dest range (e.g. a section header below the moved thread).
-    // Instead, mark ALL surviving items as potential siblings — the pixel-delta
-    // check later (line ~177) skips items that didn't actually move.
+    // Instead, mark ALL surviving items as potential siblings: the `noMovement`
+    // pixel-delta check below skips items that didn't actually move.
     const affectedSiblings = new Set<string>();
     const hasChanges = transitioned.size > 0 || newItems.size > 0;
     if (hasChanges && prevOrder.current.length > 0) {

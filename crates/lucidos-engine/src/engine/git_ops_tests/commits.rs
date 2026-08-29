@@ -209,3 +209,84 @@ async fn sole_branch_containing_ignores_the_local_default_too() {
         "merged and deleted work must not resolve to the default branch"
     );
 }
+
+/// The dirty list is what the bounded security-fix bound is checked against,
+/// alongside the committed diff, because every apply path `git add -A`s the
+/// worktree before merging.
+#[tokio::test]
+async fn worktree_dirty_files_reports_every_shape_that_would_be_committed() {
+    let (_tmp, repo) = make_test_repo().await;
+    assert!(
+        worktree_dirty_files(&repo)
+            .await
+            .expect("clean tree answers")
+            .is_empty(),
+        "a clean tree has nothing that would land",
+    );
+
+    // Untracked, modified and staged all get swept up by `git add -A`, so all
+    // three have to show. A quoted path proves the -z parse needs no unquoting.
+    tokio::fs::write(repo.join("untracked.rs"), "u")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("with space.rs"), "s")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("init.txt"), "changed")
+        .await
+        .unwrap();
+    tokio::fs::write(repo.join("staged.rs"), "st")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "staged.rs"], &repo).await;
+
+    let mut dirty = worktree_dirty_files(&repo).await.expect("dirty tree");
+    dirty.sort();
+    assert_eq!(
+        dirty,
+        vec![
+            "init.txt".to_string(),
+            "staged.rs".to_string(),
+            "untracked.rs".to_string(),
+            "with space.rs".to_string(),
+        ],
+    );
+}
+
+/// A rename emits its ORIGIN as a second `-z` record carrying NO status
+/// prefix. Stripping three bytes off that record mangles the path, and on a
+/// multi-byte boundary it panics.
+///
+/// Both halves land on main, so both belong in the answer. Getting the origin
+/// wrong is not a cosmetic slip: an unattended bounded fix would be refused
+/// against a path that does not exist, with nobody there to re-mark it.
+#[tokio::test]
+async fn worktree_dirty_files_reads_a_rename_origin_whole() {
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::create_dir_all(repo.join("src")).await.unwrap();
+    tokio::fs::write(repo.join("src/alpha.rs"), "a")
+        .await
+        .unwrap();
+    // A leading multi-byte char, so a three-byte strip would land mid-char.
+    tokio::fs::write(repo.join("ünïcödé.rs"), "u")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "-A"], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add the files to rename"], &repo).await;
+
+    let _ = git_cmd(&["mv", "src/alpha.rs", "src/beta.rs"], &repo).await;
+    let _ = git_cmd(&["mv", "ünïcödé.rs", "renamed.rs"], &repo).await;
+
+    let mut dirty = worktree_dirty_files(&repo).await.expect("rename listed");
+    dirty.sort();
+    assert_eq!(
+        dirty,
+        vec![
+            "renamed.rs".to_string(),
+            "src/alpha.rs".to_string(),
+            "src/beta.rs".to_string(),
+            "ünïcödé.rs".to_string(),
+        ],
+        "both halves of each rename, with the origin path intact",
+    );
+}

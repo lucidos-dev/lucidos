@@ -104,6 +104,15 @@ const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete an
 /// PreToolUse hook, so for Codex this rule plus the Apply floor are the whole
 /// enforcement. Keep in sync with the `implementation-plan` skill and
 /// `lucidos planned`.
+///
+/// The bounded security-fix carve-out is deliberately NOT stated here. It cost
+/// ~500 bytes on every request of every Lucidos-source session, for a lane only
+/// an unattended security run takes. This prompt is ceiling-gated by
+/// `every_prompt_flavor_stays_under_its_size_ceiling`, which is what said so. It lives where it is
+/// free: the `cc-plan-gate` deny message, which arrives exactly when an edit is
+/// blocked, the skill's own section, and the nightly's spawn intent. A session
+/// that never learns the lane exists writes a plan and reports blocked, which
+/// is the safe outcome, not a failure.
 const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST code edit, decide \
     whether this is complex work — ADR- or design-thread-backed, cross-layer, any routing / \
     topology / storage / security / migration / process change, or anything beyond a local bug \
@@ -125,7 +134,8 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     marker stays proposed until approved). If this is genuinely a local fix, acknowledge that \
     instead with \
     `lucidos planned mark --simple \"<one-line reason>\"` (no \
-    approval needed). A gate-satisfying marker MUST exist before the change can be applied: Claude \
+    approval needed). A gate-satisfying marker MUST \
+    exist before the change can be applied: Claude \
     Code blocks your first source edit until one is set and approved, and Apply refuses a \
     marker-less or unapproved change. Writing the plan file itself under `docs/plans/` is never \
     blocked. Keep the plan's load-bearing invariants in view while you edit; do not defer their \

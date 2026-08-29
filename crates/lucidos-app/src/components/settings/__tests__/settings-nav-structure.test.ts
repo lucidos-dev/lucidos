@@ -37,6 +37,8 @@ import { findSettingsEntry, settingsSearchEntryIds } from '../../search/searchIn
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SETTINGS_VIEW = readFileSync(resolve(here, '..', 'SettingsView.tsx'), 'utf8');
+const SYSTEM_SUBMENU = readFileSync(resolve(here, '..', 'SystemSubmenu.tsx'), 'utf8');
+const NAV_ROW = readFileSync(resolve(here, '..', 'SettingsNavRow.tsx'), 'utf8');
 const COMPONENTS_DIR = resolve(here, '..', '..');
 
 /** Strip comments so the prose explaining a call can never stand in for it. */
@@ -88,6 +90,22 @@ function renderedAnchors(): Set<string> {
   return anchors;
 }
 
+/** No `key` comparison stands between a list's `.map(` and the row it renders.
+ *
+ *  That is where a platform gate would go, and a gated row hides a whole page
+ *  from the device that needs it. A decoration the row hangs off its own label
+ *  is not one. The slice ends at the element name, so a `badge={key === …}`
+ *  prop stays out of scope: the System attention badge picks its category that
+ *  way and hides nothing. */
+function expectRowGatedOnNothing(src: string, mapCall: string): void {
+  const map = src.indexOf(mapCall);
+  const row = src.indexOf('<SettingsNavRow', map);
+  expect(map, `\`${mapCall}\``).toBeGreaterThan(-1);
+  expect(row, 'the nav row element').toBeGreaterThan(map);
+  expect(src.slice(map, row)).not.toMatch(/key === '[a-z-]+'/);
+  expect(src.slice(map, row)).not.toMatch(/key !== '[a-z-]+'/);
+}
+
 describe('Settings nav structure', () => {
   const stripped = stripComments(SETTINGS_VIEW);
 
@@ -98,17 +116,29 @@ describe('Settings nav structure', () => {
     // from the platform that needs it.
     expect(stripped).toMatch(/SETTINGS_NAV_ITEMS\.map\(/);
     expect(stripped).not.toMatch(/SETTINGS_NAV_ITEMS\.filter\(/);
-    // Reachability is the BUTTON, the only way into a category, so a gate is
-    // any `key` comparison between the map and it. A decoration the row hangs
-    // off its own label is not one: the System attention badge picks its category
-    // out that way and hides nothing.
-    const map = stripped.indexOf('SETTINGS_NAV_ITEMS.map(');
-    const row = stripped.indexOf('<div class="settings-section settings-nav-item"', map);
-    const button = stripped.indexOf('<button', row);
-    expect(row, 'the nav row element').toBeGreaterThan(map);
-    expect(button, 'the row\'s button').toBeGreaterThan(row);
-    expect(stripped.slice(map, button)).not.toMatch(/key === '[a-z-]+'/);
-    expect(stripped.slice(map, button)).not.toMatch(/key !== '[a-z-]+'/);
+    expectRowGatedOnNothing(stripped, 'SETTINGS_NAV_ITEMS.map(');
+  });
+
+  it('lists every System sub-page in the submenu, gated on nothing', () => {
+    // The System submenu is the only way into a sub-page, so it maps
+    // SETTINGS_SYSTEM_SUBPANEL_ITEMS directly. Same rule as the home list
+    // above, and the same regression: a filter or a key comparison in front of
+    // the row hides a page from whoever needs it.
+    const submenu = stripComments(SYSTEM_SUBMENU);
+    expect(submenu).toMatch(/SETTINGS_SYSTEM_SUBPANEL_ITEMS\.map\(/);
+    expect(submenu).not.toMatch(/SETTINGS_SYSTEM_SUBPANEL_ITEMS\.filter\(/);
+    expectRowGatedOnNothing(submenu, 'SETTINGS_SYSTEM_SUBPANEL_ITEMS.map(');
+  });
+
+  it('opens every drilldown row with a real button, in the one row both lists share', () => {
+    // Reachability is the BUTTON: a clickable div puts the page it opens, and
+    // every control on it, out of keyboard reach. Both lists render
+    // `SettingsNavRow`, so the check lives where the element does rather than
+    // once per caller.
+    const row = stripComments(NAV_ROW);
+    expect(row).toContain('<button');
+    expect(row).toContain('type="button"');
+    expect(row).toContain('class="settings-section-title settings-nav-row"');
   });
 
   it('has a renderSubview case for every nav key, so no row opens onto nothing', () => {

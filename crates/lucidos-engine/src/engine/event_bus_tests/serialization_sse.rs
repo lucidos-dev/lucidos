@@ -818,6 +818,10 @@ fn reserved_type_names_match_event_type() {
             auth_type: "api_key".into(),
             actor: None,
         },
+        BackupKeyRevealed {
+            minted: false,
+            actor: None,
+        },
     ];
     for ev in &samples {
         let name = ev.event_type();

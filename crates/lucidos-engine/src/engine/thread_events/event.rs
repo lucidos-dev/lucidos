@@ -7,6 +7,7 @@ use crate::runtime::CodingAgent;
 use super::{
     AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, EventWaitCancelCause,
     MessageOrigin, QuestionOption, SessionEndReason, TodoItem, TriggerInvocation,
+    VoiceSessionEndReason,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -1267,6 +1268,58 @@ pub enum ThreadEvent {
         on: Vec<EventSubscription>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
+    },
+
+    /// A voice session opened on this thread (ADR 0148).
+    ///
+    /// Voice is a mode of a thread, so this changes no `source` and opens no
+    /// channel of its own. It is `Metadata`: the thread's status belongs to the
+    /// agent's turn, and a live microphone is not a turn.
+    ///
+    /// `session_id` pairs it with exactly one `VoiceSessionEnded`. That pairing
+    /// is what makes a session countable, and the engine refuses a second
+    /// session on a thread already holding one.
+    VoiceSessionStarted {
+        session_id: uuid::Uuid,
+    },
+
+    /// The voice session closed, and why.
+    ///
+    /// Every start reaches one of these. A killed engine cannot emit its own,
+    /// so the boot sweep settles the survivors with
+    /// [`VoiceSessionEndReason::EngineShutdown`].
+    ///
+    /// Carries no audio and no transcript. Audio is never persisted (parent
+    /// plan, decision 12), and a spoken turn is its own event.
+    VoiceSessionEnded {
+        session_id: uuid::Uuid,
+        reason: VoiceSessionEndReason,
+        /// How long the call lasted. Zero on a sweep-settled row, where the
+        /// engine that held the clock is gone.
+        duration_secs: u64,
+    },
+
+    /// The talker said something out loud, and this is what it said.
+    ///
+    /// One per talker turn, whether the talker composed the words itself or was
+    /// reading the reasoner's answer. Both are things the caller heard. So both
+    /// belong in the thread, and the reasoner has to read what was already said
+    /// in its name (ADR 0149).
+    ///
+    /// Authored by the talker, so it carries
+    /// `MessageOrigin::Agent { agent: Guest { .. } }` on its `EventMeta` and
+    /// renders to the reasoner under its own speaker label (ADR 0150).
+    ///
+    /// `Metadata`: the reasoner's turn owns the thread's status, and a talker
+    /// turn landing mid-turn must not settle it.
+    ///
+    /// Carries text, never audio (parent plan, decision 12).
+    SpokenReplyGenerated {
+        session_id: uuid::Uuid,
+        text: String,
+        /// The caller spoke over it, so only this much was heard. The reasoner's
+        /// own answer is in the thread in full either way.
+        interrupted: bool,
     },
 
     // ---- Transient — never persisted ----

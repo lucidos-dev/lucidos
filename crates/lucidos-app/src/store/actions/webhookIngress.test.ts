@@ -19,9 +19,11 @@ const LANDED = new Date('2026-08-27T06:00:00Z');
 
 function outage(over: Partial<WebhookIngressOutage> = {}): WebhookIngressOutage {
   return {
+    webhook_name: 'github-ci',
     host: 'hooks.example.ts.net',
     port: 8443,
     families: ['ipv4'],
+    addresses: [],
     down_since: '2026-08-26T22:00:00Z',
     down_secs: 120,
     ...over,

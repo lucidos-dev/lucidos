@@ -30,7 +30,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TMPROOT="$(mktemp -d -t lucidos-e2e-lock-test.XXXXXX)"
 export E2E_LOCK_DIR_OVERRIDE="$TMPROOT/lock-dir"
 mkdir -p "$E2E_LOCK_DIR_OVERRIDE"
-export E2E_WORKSPACE="$TMPROOT/ws"
+# Basename starts with `e2e-` so it satisfies
+# `assert_e2e_workspace_is_disposable` in scripts/lib/e2e.sh, which refuses
+# to drop a database or force-remove worktrees for any other name.
+export E2E_WORKSPACE="$TMPROOT/e2e-ws"
 mkdir -p "$E2E_WORKSPACE/.lucidos"
 OUT_DIR="$TMPROOT/out"
 mkdir -p "$OUT_DIR"

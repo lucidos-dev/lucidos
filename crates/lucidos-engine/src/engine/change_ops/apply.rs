@@ -1,11 +1,12 @@
 use super::*;
 use crate::engine::agent_session::InPlaceMergeStart;
 use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, auto_commit_worktree, branch_head_sha, catchup_and_ff_to_main,
-    commits_in_range, ff_main_to, files_have_client_update, find_branch_merge_in_main,
-    find_worktree_for_branch, has_branch_commits, is_harden_marker_present,
-    push_main_in_background, recover_no_commits_branch, worktree_add, worktrees_dir,
-    NoCommitsRecovery, WorktreeLookup, MERGE_MUTEX,
+    auto_commit_safe_files_if_dirty, auto_commit_worktree, bounded_fix_refusal_for,
+    branch_changed_files_checked, branch_head_sha, catchup_and_ff_to_main, commits_in_range,
+    ff_main_to, files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch,
+    git_ran_ok, has_branch_commits, is_harden_marker_present, push_main_in_background,
+    recover_no_commits_branch, worktree_add, worktree_dirty_files, worktrees_dir, BoundedFixInputs,
+    NoCommitsRecovery, PlanMarkerState, WorktreeLookup, MERGE_MUTEX,
 };
 use crate::engine::{ApplyResult, ApplyStatus};
 
@@ -59,10 +60,91 @@ pub(crate) async fn resolve_harden_worktree(
 }
 
 impl LucidosEngine {
+    /// Why a `BoundedSecurityFix` branch may not apply, or `None` when
+    /// everything it puts on main is inside the files it named.
+    ///
+    /// Three reads, then [`bounded_fix_refusal_for`] decides. The decision is a
+    /// pure function so its arms are testable without an engine, and this stays
+    /// the plumbing that fetches its inputs.
+    ///
+    /// `dirty` is passed in because callers know their worktree differently:
+    /// `apply_now` holds the path, while `apply_change` has to look it up and
+    /// must turn an unanswerable lookup into `Err` rather than "nothing dirty".
+    pub(crate) async fn bounded_fix_refusal(
+        &self,
+        repo_root: &Path,
+        dirty: Result<Vec<String>, String>,
+        branch_name: &str,
+    ) -> Option<String> {
+        bounded_fix_refusal_for(BoundedFixInputs {
+            bound: self.plan_marker_files(repo_root, branch_name).await,
+            committed: branch_changed_files_checked(repo_root, branch_name).await,
+            dirty,
+        })
+    }
+
+    /// The bound check for a conflict-resolution merge, `None` when the branch
+    /// is not in the lane or kept inside it.
+    ///
+    /// This is the one route the entry-point check cannot cover. A resolution
+    /// session edits AFTER that check, running `/harden` and fixing tests, and
+    /// its work is auto-committed and published. Rechecking here is safe where
+    /// rechecking at the tier fast paths was not: `completion.rs` treats a
+    /// failure as terminal, emitting `ChangeApplyFailed`, rather than as a cue
+    /// to escalate to a slower merge.
+    ///
+    /// Two branch names, because they differ here. The marker lives on the
+    /// CHANGE branch, while the merge publishes the session's own branch, which
+    /// for an original Tier-3 session is a temp one.
+    pub(crate) async fn bounded_fix_refusal_for_resolution(
+        &self,
+        repo_root: &Path,
+        worktree_path: &Path,
+        marker_branch: &str,
+        merge_source_branch: &str,
+    ) -> Option<String> {
+        match self.plan_marker_state(repo_root, marker_branch).await {
+            PlanMarkerState::Present(kind) if kind.is_file_bounded() => {}
+            _ => return None,
+        }
+        bounded_fix_refusal_for(BoundedFixInputs {
+            bound: self.plan_marker_files(repo_root, marker_branch).await,
+            committed: branch_changed_files_checked(repo_root, merge_source_branch).await,
+            dirty: worktree_dirty_files(worktree_path).await,
+        })
+    }
+
+    /// What is uncommitted on `branch_name`, for the bound check, when the
+    /// caller does not already hold the worktree path.
+    ///
+    /// A lookup that could not answer is `Err`, never "nothing dirty". Reading
+    /// `Unknown` as clean is how a saturated host would wave an out-of-bound
+    /// tree through: `git worktree list` times out, the dirty half is skipped,
+    /// and Tier 1 then commits and merges that very tree.
+    pub(crate) async fn dirty_files_for_bound(
+        &self,
+        repo_root: &Path,
+        branch_name: &str,
+    ) -> Result<Vec<String>, String> {
+        match find_worktree_for_branch(repo_root, branch_name).await {
+            WorktreeLookup::Found(wt) => worktree_dirty_files(&wt).await,
+            // No worktree on disk, so there is nothing for Apply to commit.
+            WorktreeLookup::NotFound => Ok(Vec::new()),
+            WorktreeLookup::Unknown => {
+                Err("git worktree list gave no answer, so its uncommitted files are unknown".into())
+            }
+        }
+    }
+
     /// Mark a change applied without merging anything: delete the branch ref,
     /// emit `ChangeApplied`, broadcast the projection, return `ApplyResult::noop`.
     /// Shared by the two `apply_change` recovery paths that resolve to a no-op
     /// (`LegitimateNoOp`, `AlreadyApplied`).
+    ///
+    /// The delete is logged either way, because `git branch -D` force-deletes
+    /// unmerged commits and every destructive git call has to leave a trace
+    /// (`.claude/rules/rust.md`). A failure is not fatal: the change still
+    /// resolves, and the cleanup worker collects the leftover ref.
     async fn finalize_change_as_noop(
         &self,
         change: &crate::core::changes::Change,
@@ -71,7 +153,14 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
         result_message: &'static str,
     ) -> ApplyResult {
-        let _ = git_cmd(&["branch", "-D", &change.branch_name], repo_root).await;
+        if let Err(e) = git_ran_ok(&["branch", "-D", &change.branch_name], repo_root).await {
+            log!(
+                "[Changes] Could not delete branch {} while resolving change {} as a no-op: {}",
+                change.branch_name,
+                change_id,
+                e
+            );
+        }
         self.emit_change_applied(
             change.thread_id.unwrap_or(change_id),
             change_id,
@@ -342,11 +431,9 @@ impl LucidosEngine {
         // App and external-repo changes are exempt — neither uses the
         // `docs/plans/` convention or the marker, so don't even query.
         if kind_ctx.is_lucidos_source() {
+            let plan_repo_root = std::path::PathBuf::from(&change.repo_root);
             let plan_state = self
-                .plan_marker_state(
-                    &std::path::PathBuf::from(&change.repo_root),
-                    &change.branch_name,
-                )
+                .plan_marker_state(&plan_repo_root, &change.branch_name)
                 .await;
             if !plan_state.satisfies_gate() {
                 let msg = if plan_state.is_present() {
@@ -374,6 +461,47 @@ impl LucidosEngine {
                 )
                 .await;
                 return Err(msg.into());
+            }
+
+            // The bounded-security-fix lane satisfied the gate above on a
+            // promise: an unattended run may commit a security fix WITHOUT a
+            // human plan decision, provided the branch stays inside the files
+            // it named. It refuses BEFORE the apply starts any merge, which
+            // is the only place a refusal reads as a refusal. An `Err` out of
+            // the merge helpers means "main diverged, escalate to a slower
+            // route". A bound enforced there would send the branch down the
+            // conflict tiers instead of stopping it. The boundary that leaves
+            // is recorded in ADR 0154.
+            //
+            // The list is re-derived from git rather than read off
+            // `change.files`: the recorded list is a projection a later commit
+            // can outrun, and the question here is what will land NOW. The
+            // worktree goes in for the same reason, since this function
+            // auto-commits it further down and merges the result.
+            if let PlanMarkerState::Present(kind) = plan_state {
+                if kind.is_file_bounded() {
+                    let dirty = self
+                        .dirty_files_for_bound(&plan_repo_root, &change.branch_name)
+                        .await;
+                    if let Some(msg) = self
+                        .bounded_fix_refusal(&plan_repo_root, dirty, &change.branch_name)
+                        .await
+                    {
+                        log!(
+                            "[Changes] Apply blocked: bounded security fix left its bound on branch {} (change {})",
+                            change.branch_name,
+                            change_id
+                        );
+                        self.emit_apply_failed(
+                            change.thread_id.unwrap_or(change_id),
+                            change_id,
+                            &msg,
+                            actor.clone(),
+                        )
+                        .await;
+                        return Err(msg.into());
+                    }
+                }
             }
         }
 

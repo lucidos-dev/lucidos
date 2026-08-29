@@ -221,19 +221,31 @@ impl ThreadQueueExecutor for EngineThreadQueueExecutor {
 impl LucidosEngine {
     /// Look up a live trigger config; `None` (logged) when the trigger was
     /// deleted while the entry waited.
+    ///
+    /// An unreadable registry is logged as its own cause. Both skip the fire,
+    /// but they send an operator to different places, and `.ok()` reported
+    /// either one as a deletion.
     fn queued_trigger_config(&self, trigger_id: &str) -> Option<crate::triggers::TriggerConfig> {
-        let config = self
-            .trigger_configs
-            .read()
-            .ok()
-            .and_then(|c| c.get(trigger_id).cloned());
-        if config.is_none() {
-            log!(
-                "[ThreadQueue] Trigger {} no longer exists — skipping queued fire",
-                trigger_id
-            );
+        match self.trigger_configs.read() {
+            Ok(configs) => {
+                let config = configs.get(trigger_id).cloned();
+                if config.is_none() {
+                    log!(
+                        "[ThreadQueue] Trigger {} no longer exists, skipping its queued fire",
+                        trigger_id
+                    );
+                }
+                config
+            }
+            Err(e) => {
+                log!(
+                    "[ThreadQueue] Trigger registry unreadable ({}), skipping {}'s queued fire",
+                    e,
+                    trigger_id
+                );
+                None
+            }
         }
-        config
     }
 
     /// Run one admitted Thread Queue entry. Mirrors the pre-queue spawn

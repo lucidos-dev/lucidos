@@ -15,6 +15,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **A blank `model_voice_talker` falling back to the catalog default removed no
+  "disable voice" switch.** A reviewer sees `voice::build::talker_model` treat an
+  empty preference as unset and reach for the catalog default. That reads as
+  overriding a user who deliberately blanked the key. Codex flagged it as P1.
+
+  There was never such a switch. `aux_purpose::read_set` collapses a blank value
+  to unset for every purpose, so the preference layer has no
+  missing-versus-blank distinction to preserve. `PrefValue::Text` rejects an
+  empty value, so the agent cannot write one. Neither the catalog entry nor
+  `system-knowhow/preferences.md` calls blanking a disable.
+
+  The documented veto is the provider switch, `provider_enabled_openai`, which
+  `provider_for` checks straight after the model. `voice-call-desktop.spec.ts`
+  used to blank the model to force a refusal, and flips that switch instead.
+
+  Re-flag if `read_set` grows a missing-versus-blank distinction, or if a doc
+  starts describing an empty model as a disable.
+
 - **Permission grants living under `<workspace>/.lucidos/` being agent-writable
   is the recorded non-property, not an escalation this introduced.** A reviewer
   reading `core/grants/mod.rs` correctly observes that an agent with `run_bash`
@@ -910,6 +928,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A guest agent's turn renders as the Lucidos Agent in the actor chip on
+  purpose. The user meets one entity, and the split is internal.** A reviewer
+  reading `originMode`'s `agent` case correctly observes that
+  `{ kind: 'guest', label }` collapses to mode `agent`. So `actorInitiator`
+  draws the Lucidos glyph and the "Lucidos Agent" label, and the guest's own
+  label never reaches the timeline. Codex flagged exactly this as P2 on the
+  branch that added the variant.
+
+  ADR 0149 decides it. The talker speaks as Lucidos in the first person, and the
+  persona never changes hands. A chip naming a second participant would show the
+  user a split they were deliberately never shown. The attribution is still on
+  the event, which is what a later surface can read to say a turn was spoken.
+
+  What the split IS for is `engine/chat/process/history.rs`, where the reasoner
+  must not read a guest's turn as its own prior turn. That is a different
+  reader with the opposite requirement, and ADR 0150 covers it.
+
+  Re-flag only for a guest that is not the voice *talker*. The one-entity
+  decision is about voice, and does not generalise on its own.
 
 - **`touchActivated` rules on a press by TRAVEL, not by whether the finger
   lifted inside the button's rect. The rect version was tried and it broke the

@@ -9,6 +9,7 @@ import {
   landingReport,
   deadPressReport,
   canceledPressReport,
+  noLiftReport,
   faceHitTestReport,
   pressIsWatchable,
   faceName,
@@ -314,7 +315,9 @@ describe('the breadcrumb channel', () => {
   });
 
   it('records every verdict a press can end on', () => {
-    for (const verdict of ['dead', 'clicked', 'canceled', 'missed']) {
+    for (const verdict of [
+      'dead', 'clicked', 'canceled', 'missed', 'no-lift', 'click-no-touch', 'unreachable',
+    ]) {
       expect(code).toContain(`'${verdict}'`);
     }
     // 'served' and 'swallowed' come from `takePressOutcome`, not from a
@@ -328,6 +331,32 @@ describe('the breadcrumb channel', () => {
     expect(code).not.toContain('getDraft');
     expect(code).not.toContain('composeDrafts');
     expect(code).not.toMatch(/\.value\b/);
+  });
+});
+
+// The lift that never came. WebKit owes a `touchend` or a `touchcancel` for
+// every `touchstart`. Neither arriving is the touch pipeline stopping
+// mid-gesture, rather than a button declining a press.
+describe('noLiftReport: the press arrived and the lift did not', () => {
+  const BASE = { face: 'Send message', movedPx: 0, viewport: VIEWPORT };
+
+  it('reports a stationary press whose lift never arrived', () => {
+    const report = noLiftReport(BASE);
+    expect(report).toMatch(/^Send message did not register/);
+    expect(report).toContain('the lift never arrived');
+  });
+
+  it('stays silent on a press that moved, which the page may hand to a scroller', () => {
+    expect(noLiftReport({ ...BASE, movedPx: 40 })).toBeNull();
+  });
+
+  it('shares the tap gate threshold rather than inventing a third one', () => {
+    expect(noLiftReport({ ...BASE, movedPx: 8 })).not.toBeNull();
+    expect(noLiftReport({ ...BASE, movedPx: 9 })).toBeNull();
+  });
+
+  it('carries the viewport numbers, like every other report here', () => {
+    expect(noLiftReport(BASE)).toContain('kbd on');
   });
 });
 
@@ -383,7 +412,9 @@ describe('the probe consumes no gesture', () => {
     // swapped under the finger.
     expect(code).toMatch(/onPressedFace = press\.el\.contains\(target\)/);
     expect(code).toMatch(/onReplacement = !press\.el\.isConnected && !!target\.closest\(ROW_SELECTOR\)/);
-    expect(code).toMatch(/if \(!onPressedFace && !onReplacement\) return/);
+    // `continue`, not `return`: more than one press can be settling at once, so
+    // a click has to be offered to each before it is called touchless.
+    expect(code).toMatch(/if \(!onPressedFace && !onReplacement\) continue/);
   });
 
   it('hears a touchend nothing else let through', () => {
@@ -403,11 +434,39 @@ describe('the probe consumes no gesture', () => {
     expect(code).not.toContain('defaultPrevented');
   });
 
-  it('reads the outcome in a window measured from THIS press', () => {
-    // A second composer touch inside the first one's grace window supersedes
-    // it without consuming its claim. A fixed window would let the second
-    // press read the first one's, and go quiet on a genuinely dead press.
-    expect(code).toContain('takePressOutcome(Date.now() - press.armedAt)');
+  it('takes the outcome a task after the press\u2019s OWN lift', () => {
+    // `takePressOutcome` is one consuming slot. Read at the end of a 600ms
+    // grace window, an earlier press swallows a later press's claim. Taking it
+    // right after each lift keeps every claim with the press that earned it.
+    // The window is still measured from that press's own arm.
+    expect(code).toContain('takePressOutcome(Date.now() - lifted.armedAt)');
+    // And the task is HELD, so a click that rules the press early can cancel
+    // it. `takePressOutcome` consumes, so a stray one eats the next claim.
+    expect(code).toMatch(/lifted\.outcomeTimer = setTimeout/);
+    expect(code).toMatch(/clearTimeout\(press\.outcomeTimer\)/);
+  });
+
+  it('rules an armed press that never lifted, rather than dropping it', () => {
+    // The shape a touch pipeline that stops mid-gesture leaves, and the one the
+    // eighth episode's silence points at.
+    expect(code).toContain('ruleArmedWithNoLift');
+    // And on a deadline, because a stopped pipeline delivers no next touch to
+    // notice the loss with.
+    expect(code).toContain('LIFT_DEADLINE_MS');
+  });
+
+  it('records a click that had no touch behind it', () => {
+    // A live click path over a dead touch path. The probe only ever armed from
+    // a `touchstart`, so it could not see that split at all.
+    expect(code).toContain('lastTouchStartAt');
+    // Gated on touch CAPABILITY, not on a narrow window: a mouse client cannot
+    // have a touch pipeline that stopped.
+    expect(code).toContain('isTouchDevice()');
+  });
+
+  it('carries the row and face boxes, so an offset is measured', () => {
+    expect(code).toContain('rowRect');
+    expect(code).toContain('faceRect');
   });
 
   it('watches the row by where it is, not by what has focus', () => {

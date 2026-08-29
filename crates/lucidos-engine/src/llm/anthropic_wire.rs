@@ -392,12 +392,15 @@ pub(crate) async fn parse_claude_stream(
                         })
                         .sum();
                     if new_text_len > prev_text_len {
-                        // Floor defensively — `raw_start` is byte-derived and
+                        let delta = new_text_len - prev_text_len;
+                        // Floor defensively: `raw_start` is byte-derived and
                         // could land mid-codepoint after future accumulator
-                        // changes.
+                        // changes. Saturate for the same reason. `delta` is
+                        // summed over every text block, so a delta appended to
+                        // an earlier block than the last one would underflow.
                         for block in blocks.iter().rev() {
                             if let AccumulatedBlock::Text(t) = block {
-                                let raw_start = t.len() - (new_text_len - prev_text_len);
+                                let raw_start = t.len().saturating_sub(delta);
                                 let delta_start = t.floor_char_boundary(raw_start);
                                 // `delta_start == 0` with earlier text already
                                 // streamed means this chunk is a new text

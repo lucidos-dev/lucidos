@@ -13,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, followIsCarrying, readerKeepsTheLiveEdge } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, followIsCarrying } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -350,6 +350,28 @@ function reachableScrollTop(target: number): number {
   return Math.round(target);
 }
 
+/** How many frames the correction may re-assert while the transcript settles.
+ *
+ *  WebKit does not settle a large reveal inside the frame its mutation commits,
+ *  and one next-frame re-assert is not enough. Unfolding a turn of 80 tool
+ *  steps left the reader 911px off, on a control at the foot of the pane.
+ *  Chromium held the same control exactly.
+ *
+ *  The mechanism is a CLAMP, not slow arithmetic. The old rows leave before the
+ *  new ones arrive, so the offset is clamped against a container that is
+ *  briefly tiny. The correction cannot reach its target, which becomes
+ *  reachable a frame or two later, by which time nothing was asking.
+ *
+ *  IT RUNS THE WHOLE BUDGET rather than converging. Two convergence rules were
+ *  tried and both stopped on a frame that was quiet only because the change had
+ *  not begun: a target that had not moved yet, then a height that had not moved
+ *  yet. A frame costs two rect reads, and writes only when the container is off
+ *  target. The budget is cheaper than another rule to get wrong.
+ *
+ *  12 frames is about 200ms, well inside `SCROLL_MIN_MS`. What ends it early is
+ *  the reader, never a guess about the layout. */
+const ANCHOR_SETTLE_FRAMES = 12;
+
 /** Where `top` will actually come to rest, the browser clamping a scroll offset
  *  to the container's own extent.
  *
@@ -493,10 +515,6 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   // Read BEFORE the mutation, while the container is still where the last
   // correction left it: after `fn` a shrink may have clamped it somewhere else.
   const carried = carriedAnchorDebt(container, held);
-  // Also before, and for a sharper reason: growth moves the live edge away
-  // while leaving `scrollTop` exactly where it was, so afterwards nothing can
-  // tell that the reader was resting on it. See `readerKeepsTheLiveEdge`.
-  const onTheLiveEdge = readerKeepsTheLiveEdge(container);
   const overflowBefore = container.style.overflow;
   let restored = false;
 
@@ -508,20 +526,19 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     restored = true;
     observer.disconnect();
 
-    // A reader who belongs on the NEWEST content asked for the opposite of an
-    // anchor correction: hold me on the last line, not on what was at the top.
-    // Correcting them and then letting `honourAnchoredMutation` bring them back
-    // down moves the transcript UP and then DOWN for one tap. The freeze has
-    // kept the container at `scrollBefore` through the mutation, so skipping the
-    // correction leaves the live-edge write as the ONE motion.
+    // THE RIDE IS THE ONE THING THAT OUTRANKS THE PRESS. It is already carrying
+    // the reader to the live edge, so any hold would be undone by the next
+    // growth round: one press, two motions. Correcting them and then letting
+    // `honourAnchoredMutation` bring them back down moves the transcript UP and
+    // then DOWN for one tap. The freeze has kept the container at
+    // `scrollBefore`, so skipping the correction leaves the live-edge write as
+    // the ONE motion.
     //
-    // The two terms are the two such readers, and `honourAnchoredMutation` is
-    // handed the same pair: this and it are ONE decision split across the
-    // DOM/layout line. `followIsCarrying` is the ride, and it stands down on an
-    // idle thread, which is why the edge reading is a term of its own. An armed
-    // reader clicking around a finished thread gets neither the correction nor
-    // the snap otherwise, and drifts on whatever grew above them.
-    const keepsTheLiveEdge = followIsCarrying() || onTheLiveEdge;
+    // ONE predicate, and `honourAnchoredMutation` reads the same one: this and
+    // it are ONE decision split across the DOM/layout line, so they cannot
+    // disagree. An armed reader on a QUIET thread is carried by nobody, and
+    // gets the correction from every park, the live edge included (ADR 0147).
+    const rideIsCarrying = followIsCarrying();
     // Did the anchor survive the mutation? A detached element does not say so by
     // measuring nothing: it answers an all-zero rect, which reads as content
     // that moved to the top of the thread and would send the reader there.
@@ -535,15 +552,13 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // the same question a frame later. `carried` repays what a previous reveal's
     // clamp ate out of the offset this derives from.
     const targetNow = (): number => {
-      if (!anchored) return scrollBefore;
       const offset = contentOffsetTop(container, held);
       return reachableScrollTop(scrollBefore + carried + (offset - offsetBefore));
     };
-    // A reader kept on the live edge owes and is owed nothing: that edge is
-    // always reachable, and they are about to be put on it. Nor does a press
-    // whose anchor left the DOM, since declining to correct is declining to
-    // know what the clamp would have eaten.
-    const wanted = targetNow();
+    // What the write carries. A press whose anchor left the DOM writes the
+    // offset the container already holds, so the MARK is the whole of it and
+    // nobody moves. See the try block below for why the mark is owed anyway.
+    const wanted = anchored ? targetNow() : container.scrollTop;
     // The unfreeze is the one step that MUST happen, so it goes in a `finally`.
     // `restored` is already true and the observer already gone, so the rAF
     // safety net below cannot lift the freeze a second time: a throw between
@@ -551,12 +566,24 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // reload. `markAnchorScroll` fans out to subscribers, which is the first
     // extensible call inside the freeze. The throw still propagates, since a
     // subscriber failing silently is its own bug (`frontend.md`).
+    //
+    // A CARRIED reader gets no write at all here: the snap below is their one
+    // motion. Everyone else gets the mark, whether or not it moves them. The
+    // mark is what stands the growth round's own edge write down
+    // (`keepTheLiveEdge`) and what re-bases the mobile header. Declining to
+    // correct is still the app deciding the reader stays put.
+    //
+    // The DEBT is narrower, and only a correction can earn one. A carried
+    // reader is owed nothing, since the live edge is always reachable. Nor is a
+    // press whose anchor left the DOM: declining to correct is declining to
+    // know what the clamp would have eaten.
     try {
-      if (keepsTheLiveEdge || !anchored) {
+      if (rideIsCarrying) {
         clearAnchorDebt();
       } else {
         markAnchorScroll(container, wanted);
-        rememberAnchorDebt(container, held, wanted);
+        if (anchored) rememberAnchorDebt(container, held, wanted);
+        else clearAnchorDebt();
       }
     } finally {
       container.style.overflow = overflowBefore;
@@ -569,22 +596,34 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
 
     // Tell the transcript that THIS correction was ours, so it cannot read as
     // the reader scrolling away and retire their standing follow. Only a scroll
-    // may do that (ADR 0064). It also lands the live-edge reader back on the
-    // newest content, which is why it is handed the reading taken before the
-    // mutation. Placed after the unfreeze and the repaint nudge, so any write it
+    // may do that (ADR 0064). It also lands a CARRIED reader back on the newest
+    // content. Placed after the unfreeze and the repaint nudge, so any write it
     // makes fights neither. Still inside this frame, so the reader never sees
     // the position the mutation left them at.
-    honourAnchoredMutation(container, onTheLiveEdge);
+    honourAnchoredMutation(container);
 
-    // iOS may adjust after unfreeze, so re-check in the next frame. Skipped
-    // while the app is driving this container's scroll: a tween may be in
-    // flight, and re-asserting a pre-tween offset against it is a frame of
-    // jitter for a correction the tween makes moot. Skipped for a reader kept on
-    // the live edge, for the stronger version of the same reason: there was no
-    // correction to re-assert, and asserting one would drag them off it.
-    if (wanted !== scrollBefore && !keepsTheLiveEdge && anchored) {
-      requestAnimationFrame(() => {
+    // iOS may adjust after unfreeze, so re-check on the frames that follow.
+    // Skipped while the app is driving this container's scroll: a tween may be
+    // in flight, and re-asserting a pre-tween offset against it is a frame of
+    // jitter for a correction the tween makes moot. Skipped for a carried
+    // reader, for the stronger version of the same reason: there was no
+    // correction to re-assert, and asserting one would drag them off the edge.
+    //
+    // NOT skipped for a correction that asked for no movement, which it used to
+    // be. That is the press whose turn is the last one, and a mid-mutation
+    // clamp moves the reader there as readily as anywhere else.
+    if (!rideIsCarrying && anchored) {
+      let framesLeft = ANCHOR_SETTLE_FRAMES;
+      // Where the correction left the container, re-read after each write so a
+      // clamp counts as ours. It is the whole reader-took-over test below.
+      let leftAt = container.scrollTop;
+      const reassert = () => {
         if (!held.isConnected || isOtherNavigationScroll(container)) return;
+        // THE READER ENDS IT. The container anywhere but where we left it is
+        // somebody else's scroll, and a press must never fight a flick made a
+        // moment after it. A content shrink clamping the offset reads the same
+        // way, which costs that press its re-assert and moves nobody.
+        if (Math.abs(container.scrollTop - leftAt) > 1) return;
         const target = targetNow();
         if (Math.abs(container.scrollTop - target) > 1) {
           markAnchorScroll(container, target);
@@ -594,7 +633,11 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
           rememberAnchorDebt(container, held, target);
           honourAnchoredMutation(container);
         }
-      });
+        leftAt = container.scrollTop;
+        if (--framesLeft <= 0) return;
+        requestAnimationFrame(reassert);
+      };
+      requestAnimationFrame(reassert);
     }
   };
 

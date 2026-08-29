@@ -604,3 +604,44 @@ fn account_name_preserves_case() {
         "MixedCase"
     );
 }
+
+/// The `data/` root holds gitignored config beside the typed subdirectories.
+/// An attachment path naming it would mail the workspace credentials to
+/// whatever address the caller asked for. No `..` is involved, which is why the
+/// traversal guard alone let this through.
+#[test]
+fn an_attachment_cannot_name_the_gitignored_data_root() {
+    for path in [".env", "data/.env", "postgres/pg_hba.conf", "secrets.txt"] {
+        let err = EmailAttachment::validate_paths(&[path.to_string()])
+            .expect_err("data-root attachment must be refused");
+        assert!(
+            err.contains("typed subdirectories"),
+            "wrong refusal for {path}: {err}"
+        );
+    }
+}
+
+/// The typed subdirectories still attach, in either spelling, and a leading
+/// `data/` is stripped so the caller-facing path joins onto `data/` exactly once.
+#[test]
+fn an_attachment_under_a_typed_subdirectory_is_accepted() {
+    let validated = EmailAttachment::validate_paths(&[
+        "artifacts/report.pdf".to_string(),
+        "data/knowhow/notes.md".to_string(),
+    ])
+    .expect("typed attachments are allowed");
+
+    assert_eq!(validated[0].rel_path, "artifacts/report.pdf");
+    assert_eq!(validated[0].filename, "report.pdf");
+    assert_eq!(validated[1].rel_path, "knowhow/notes.md");
+    assert_eq!(validated[1].filename, "notes.md");
+}
+
+/// The traversal guard stays in front of the prefix test: `artifacts/../.env`
+/// starts with a typed prefix and must still be refused.
+#[test]
+fn an_attachment_cannot_traverse_out_of_a_typed_subdirectory() {
+    let err = EmailAttachment::validate_paths(&["artifacts/../.env".to_string()])
+        .expect_err("traversal must be refused");
+    assert!(err.contains("no '..' components"), "wrong refusal: {err}");
+}

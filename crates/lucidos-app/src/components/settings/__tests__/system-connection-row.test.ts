@@ -1,5 +1,5 @@
 /**
- * Settings > System's Connection block: the state, and what it means.
+ * System > Overview's Connection block: the state, and what it means.
  *
  * The page reads a dozen signals and renders seven panels, so this scans the
  * source and the stylesheet rather than standing it up. What can go wrong is a

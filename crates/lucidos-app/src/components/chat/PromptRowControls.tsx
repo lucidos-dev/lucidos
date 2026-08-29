@@ -1,5 +1,6 @@
 import type { CodingAgent } from '../../api/types';
 import { FollowLiveEdgeIcon } from '../shared/icons';
+import { CallToggle } from './CallToggle';
 import { CodingAgentControlMenu } from './CodingAgentControlMenu';
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { followingLiveEdge, followLiveEdgeSeed, setFollowLiveEdge } from './scrollState';
@@ -10,17 +11,15 @@ import { WaitingIndicator } from './WaitingPanel';
  *  control menu the focused thread resolves to, the follow toggle, and the
  *  indicators that belong beside them.
  *
- *  **The first two slots are FIXED, and the conditional things come after
- *  them.** The control menu is the row's anchor, and the follow toggle is
- *  second, always: it is the one control here that renders in every state, so
- *  a reader reaching for it should find it in the same place on every thread.
- *  It sat after the indicators until 2026-08-11, which put it third on a
- *  Lucidos Agent thread, second on a coding-agent one, and fourth while a
- *  subscription was armed, so the button moved under the thumb depending on
- *  what the thread happened to be doing. Everything below this pair is
- *  conditional by nature (a todo list, a wait), so it floats
- *  behind the fixed pair rather than displacing it. A new control goes AFTER
- *  the follow toggle, never between it and the menu.
+ *  **The first three slots are FIXED, and the conditional things come after
+ *  them.** The control menu is the row's anchor, the follow toggle is second
+ *  and the call toggle third. Each renders in every state, so a reader
+ *  reaching for one finds it in the same place on every thread. The follow
+ *  toggle once sat after the indicators, which moved it under the thumb
+ *  depending on what the thread happened to be doing. Everything below the
+ *  fixed three is conditional by nature (a todo list, a wait), so it floats
+ *  behind them rather than displacing them. A new UNCONDITIONAL control joins
+ *  the end of the fixed run, and a conditional one goes after it.
  *
  *  A Fragment, deliberately: `.prompt-actions-row` is a flex row and its
  *  children are diffed positionally (see `prompt-vdom-keys.test.ts`), so this
@@ -106,6 +105,7 @@ export function PromptRowControls({
       >
         <FollowLiveEdgeIcon />
       </button>
+      <CallToggle />
       {codingAgent === null && <TodoListIndicator />}
       <WaitingIndicator />
     </>

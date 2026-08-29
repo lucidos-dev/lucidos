@@ -4,7 +4,6 @@ type Html2Canvas = (element: HTMLElement, opts: Record<string, unknown>) => Prom
 
 const DOM_MAX = 48000;
 const TEXT_MAX = 150;
-const HTML2CANVAS_URL = apiUrl('/static/html2canvas.min.js');
 
 let html2canvasPromise: Promise<Html2Canvas> | undefined;
 
@@ -15,7 +14,10 @@ function loadHtml2Canvas(): Promise<Html2Canvas> {
     html2canvasPromise = Promise.resolve(existing);
     return html2canvasPromise;
   }
-  // Clear the cached promise on failure so a later call can retry — without
+  // Resolved per call rather than at module load, because `apiUrl` reads a base
+  // URL that `configure({ baseUrl })` can still change.
+  const scriptUrl = apiUrl('/static/html2canvas.min.js');
+  // Clear the cached promise on failure so a later call can retry. Without
   // this, transient network errors poison capture for the iframe's lifetime.
   const promise = new Promise<Html2Canvas>((resolve, reject) => {
     const fail = (err: Error) => {
@@ -23,14 +25,14 @@ function loadHtml2Canvas(): Promise<Html2Canvas> {
       reject(err);
     };
     const script = document.createElement('script');
-    script.src = HTML2CANVAS_URL;
+    script.src = scriptUrl;
     script.async = true;
     script.onload = () => {
       const fn = (window as { html2canvas?: Html2Canvas }).html2canvas;
       if (fn) resolve(fn);
       else fail(new Error('html2canvas script loaded but window.html2canvas undefined'));
     };
-    script.onerror = () => fail(new Error(`Failed to load ${HTML2CANVAS_URL}`));
+    script.onerror = () => fail(new Error(`Failed to load ${scriptUrl}`));
     document.head.appendChild(script);
   });
   html2canvasPromise = promise;

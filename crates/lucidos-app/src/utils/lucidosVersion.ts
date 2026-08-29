@@ -1,9 +1,9 @@
 /** The one number that names LUCIDOS ITSELF: the umbrella release from the
- *  repo's `RELEASE` file, which the engine reports on `/health` and Settings >
- *  System labels "Lucidos".
+ *  repo's `RELEASE` file, which the engine reports on `/health` and System >
+ *  Overview labels "Lucidos".
  *
  *  It is deliberately the only version the Lucidos menu's identity row shows.
- *  The other three in Settings > System each identify a PART (the engine's
+ *  The other three on that page each identify a PART (the engine's
  *  CalVer, this client's build, the service worker's build), and which of them a
  *  client can honestly name changes with the platform: the row used to read
  *  "dev" on a Vite dev server, a hex build id on a built web client, and the

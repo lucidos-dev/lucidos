@@ -128,8 +128,9 @@ pub struct EmittedEvent {
     /// what makes the depth cap engage for a chain across triggers, where A's
     /// fire wakes B and B's fire wakes A. It reaches a chain routed through
     /// spawned work too, unlike `emitting_trigger_id` below. A domain event
-    /// carries the same number in its own
-    /// variant, where it IS persisted, so a replay reconstructs it.
+    /// carries the same number on its own variant, and the scheduler reads it
+    /// from there. That field is `skip_serializing` too, so the stored row
+    /// carries no depth and a replay cannot reconstruct one.
     pub depth: u32,
     /// Which trigger's fire emitted this, if any. Read from
     /// `scheduler::user_tasks::current_trigger_id`, or stated outright by a

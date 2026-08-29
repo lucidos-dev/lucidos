@@ -1297,36 +1297,43 @@ else
     fail "the repack gate does not follow the signing branch"
 fi
 
-# ── The camera capability ────────────────────────────────────────────────────
-# The composer's Camera item calls getUserMedia in the WKWebView. wry grants the
-# WebKit-level permission itself, so what decides is macOS TCC, and the shipped
-# bundle satisfied neither half of it: no NSCameraUsageDescription (so no consent
-# prompt, so getUserMedia hangs and the overlay sits on a black video) and no
-# camera entitlement under the hardened runtime the release path signs with. The
-# real proof is a build's readback assertions; these keep the wiring that feeds
-# them from being quietly undone.
+# ── The capture capabilities ─────────────────────────────────────────────────
+# The composer's Camera item and its call toggle both call getUserMedia in the
+# WKWebView. wry grants the WebKit-level permission itself, so what decides is
+# macOS TCC, and each device needs BOTH halves: a usage string, without which
+# there is no consent prompt and getUserMedia never settles, and an entitlement,
+# without which the hardened runtime the release path signs with denies the
+# device whatever Info.plist says. The camera shipped with neither. The real
+# proof is a build's readback assertions; these keep the wiring that feeds them
+# from being quietly undone.
+#
+# Each key is matched as a <key> element, so prose about one is never read as
+# the key itself. Add a pair here only in the change that starts using it: an
+# entitlement with no capture site behind it widens what the app may do for
+# nothing.
 echo ""
-echo "test: the packaged app claims the camera, and only the outer .app does"
+echo "test: the packaged app claims both capture devices, and only the outer .app does"
 ENT_PLIST="$PROJECT_DIR/crates/lucidos-app/Entitlements.plist"
 INFO_PLIST="$PROJECT_DIR/crates/lucidos-app/Info.plist"
-if grep -q 'com.apple.security.device.camera' "$ENT_PLIST" 2>/dev/null; then
-    pass "Entitlements.plist claims the camera"
-else
-    fail "no camera entitlement in $ENT_PLIST"
-fi
-if grep -q 'NSCameraUsageDescription' "$INFO_PLIST" 2>/dev/null; then
-    pass "Info.plist carries the consent-prompt string"
-else
-    fail "no NSCameraUsageDescription in $INFO_PLIST"
-fi
-# Audio is deliberately absent: getUserMedia is video-only. A key added here
-# without a capture site widens what the app may do for no reason. Matched as a
-# <key> element, so the comment explaining the absence isn't read as the key.
-if grep -q '<key>com.apple.security.device.audio-input</key>' "$ENT_PLIST" 2>/dev/null; then
-    fail "$ENT_PLIST claims audio input, which nothing in Lucidos captures"
-else
-    pass "no audio-input entitlement (nothing captures audio)"
-fi
+for capability in \
+    'camera:com.apple.security.device.camera:NSCameraUsageDescription' \
+    'microphone:com.apple.security.device.audio-input:NSMicrophoneUsageDescription'
+do
+    device="${capability%%:*}"
+    rest="${capability#*:}"
+    entitlement="${rest%%:*}"
+    usage_key="${rest#*:}"
+    if grep -q "<key>$entitlement</key>" "$ENT_PLIST" 2>/dev/null; then
+        pass "Entitlements.plist claims the $device"
+    else
+        fail "no $device entitlement ($entitlement) in $ENT_PLIST"
+    fi
+    if grep -q "<key>$usage_key</key>" "$INFO_PLIST" 2>/dev/null; then
+        pass "Info.plist carries the $device consent-prompt string"
+    else
+        fail "no $usage_key in $INFO_PLIST"
+    fi
+done
 if command -v plutil >/dev/null 2>&1; then
     if plutil -lint "$ENT_PLIST" >/dev/null 2>&1 && plutil -lint "$INFO_PLIST" >/dev/null 2>&1; then
         pass "both plists parse"
@@ -1367,10 +1374,21 @@ if printf '%s\n' "$APP_SIGN" | grep -q -- '--entitlements "\$APP_ENTITLEMENTS"';
 else
     fail "the outer .app codesign no longer passes --entitlements"
 fi
+# The loop carries entitlements for exactly one file. Everything else in it must
+# stay bare, so the check is on what supplies them: a `per_file` array that only
+# the engine's basename fills. A literal `--entitlements` on the codesign line
+# would mean all ~200 files got them.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
 if printf '%s\n' "$LOOP_SIGN" | grep -q -- '--entitlements'; then
-    fail "the per-file signing loop passes entitlements: $LOOP_SIGN"
+    fail "the per-file signing loop passes entitlements unconditionally: $LOOP_SIGN"
 else
-    pass "the loose Mach-O files are signed without entitlements"
+    pass "the signing loop takes its entitlements from the per-file array alone"
+fi
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$SIGN_FN" | grep -q 'basename "\$path")" = "\$JIT_EXECUTABLE"'; then
+    pass "the per-file array is gated on an exact basename match"
+else
+    fail "the engine's entitlements are no longer selected by exact filename"
 fi
 # Fail closed on a missing file: signing without it is precisely the state that
 # shipped, and it looks identical to a good build from the outside.
@@ -1380,14 +1398,120 @@ if printf '%s\n' "$SIGN_FN" | grep -q 'expected entitlements at \$APP_ENTITLEMEN
 else
     fail "sign_app_bundle no longer refuses a missing entitlements file"
 fi
-# Both halves are read back OFF THE ARTIFACT, so an upstream loss (a dropped
-# Tauri plist merge, an entitlements file that parsed to nothing) fails the
-# build rather than shipping.
+# Both halves of both devices are read back OFF THE ARTIFACT, so an upstream
+# loss (a dropped Tauri plist merge, an entitlements file that parsed to
+# nothing) fails the build rather than shipping.
 if printf '%s\n' "$SIGN_FN" | grep -q 'codesign -d --entitlements -' \
-   && printf '%s\n' "$SIGN_FN" | grep -q 'plutil -extract NSCameraUsageDescription'; then
-    pass "the signed bundle is re-read for both halves"
+   && printf '%s\n' "$SIGN_FN" | grep -q 'plutil -extract NSCameraUsageDescription' \
+   && printf '%s\n' "$SIGN_FN" | grep -q 'com.apple.security.device.audio-input' \
+   && printf '%s\n' "$SIGN_FN" | grep -q 'plutil -extract NSMicrophoneUsageDescription'; then
+    pass "the signed bundle is re-read for every capture half"
 else
-    fail "sign_app_bundle no longer verifies the camera halves off the artifact"
+    fail "sign_app_bundle no longer verifies the camera and microphone halves off the artifact"
+fi
+
+# ── The engine may execute the code it compiles ──────────────────────────────
+# The engine embeds wasmtime and compiles a signer module on the proxy auth
+# path. It is a separate process, so the outer .app entitlements never reach it,
+# and under the hardened runtime macOS SIGKILLed it the moment it called
+# compiled code. That shipped in 2026.08.28.0 and crashed the engine once per
+# turn. These keep the wiring that fixes it; the build's own selftest is the
+# real proof.
+echo ""
+echo "test: the bundled engine is allowed to run its own compiled code"
+ENGINE_ENT_PLIST="$PROJECT_DIR/crates/lucidos-app/EngineEntitlements.plist"
+EXEC_MEMORY_KEY="com.apple.security.cs.allow-unsigned-executable-memory"
+if grep -q "$EXEC_MEMORY_KEY" "$ENGINE_ENT_PLIST" 2>/dev/null; then
+    pass "EngineEntitlements.plist lets the engine execute compiled code"
+else
+    fail "no $EXEC_MEMORY_KEY in $ENGINE_ENT_PLIST"
+fi
+# allow-jit is NOT a milder version of the key above and must not be swapped in
+# for it. It covers MAP_JIT mappings, which wasmtime never asks for: measured
+# under a Developer ID signature, allow-jit alone still dies with SIGKILL.
+# Matched as a <key> element so the comment explaining its absence is not read
+# as the key itself.
+if grep -q '<key>com.apple.security.cs.allow-jit</key>' "$ENGINE_ENT_PLIST" 2>/dev/null; then
+    fail "$ENGINE_ENT_PLIST claims allow-jit, which is measured not to work here"
+else
+    pass "no allow-jit (it does not cover wasmtime's mappings)"
+fi
+# Least privilege in the other direction: the app process runs no Wasm.
+if grep -q 'com.apple.security.cs.allow-' "$ENT_PLIST" 2>/dev/null; then
+    fail "$ENT_PLIST claims a code-execution entitlement; it belongs on the engine"
+else
+    pass "the outer .app claims no code-execution entitlement"
+fi
+# Same AMFI parser trap as the sibling plist above, and the same consequence:
+# invisible until a signing run dies minutes into a release build.
+ENGINE_ENT_COMMENT="$(awk '/<!--/{f=1} f{print} /-->/{f=0}' "$ENGINE_ENT_PLIST" \
+    | sed -e 's/<!--//' -e 's/-->//')"
+if printf '%s\n' "$ENGINE_ENT_COMMENT" | grep -q -- '--'; then
+    fail "$ENGINE_ENT_PLIST has a double hyphen inside a comment; AMFI will reject it"
+else
+    pass "no double hyphen inside the engine entitlements comment"
+fi
+if command -v plutil >/dev/null 2>&1; then
+    if plutil -lint "$ENGINE_ENT_PLIST" >/dev/null 2>&1; then
+        pass "the engine entitlements plist parses"
+    else
+        fail "$ENGINE_ENT_PLIST does not parse (plutil -lint)"
+    fi
+fi
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$SIGN_FN" | grep -q 'expected entitlements at \$ENGINE_ENTITLEMENTS'; then
+    pass "a missing engine entitlements file kills the build"
+else
+    fail "sign_app_bundle no longer refuses a missing engine entitlements file"
+fi
+# The readback names the plist a future reader has to edit. The selftest below
+# is what proves the kernel agreed.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$SIGN_FN" | grep -q 'codesign -d --entitlements - "\$resources/\$JIT_EXECUTABLE"'; then
+    pass "the signed engine is re-read for its entitlement"
+else
+    fail "sign_app_bundle no longer verifies the engine entitlement off the artifact"
+fi
+# The gate that cannot pass while the app still crashes. A static entitlement
+# check reports what the plist asked for; only running the signed bytes reports
+# what macOS allowed.
+if printf '%s\n' "$SIGN_FN" | grep -q -- '--wasm-selftest'; then
+    pass "the build runs the engine's wasm selftest"
+else
+    fail "sign_app_bundle no longer runs --wasm-selftest against the signed engine"
+fi
+# Ordering, and it is the finding this test exists for. The selftest must run
+# on the bytes the function hands back, so it goes AFTER every step that can
+# write to the engine file, the outer .app codesign included. Run earlier it
+# proves the kernel accepted an intermediate artifact, which is a weaker claim
+# than the one the gate makes.
+L_SELFTEST="$(printf '%s\n' "$SIGN_FN" | grep -n -- '--wasm-selftest' | cut -d: -f1 | tail -1)"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+L_LOOP="$(printf '%s\n' "$SIGN_FN" | grep -n -- '--sign "\$identity" "\$path"' | cut -d: -f1 | head -1)"
+L_APPSIGN="$(printf '%s\n' "$SIGN_FN" | grep -n 'codesign --force --deep' | cut -d: -f1 | head -1)"
+if [ -n "$L_SELFTEST" ] && [ -n "$L_LOOP" ] && [ -n "$L_APPSIGN" ] \
+   && [ "$L_LOOP" -lt "$L_SELFTEST" ] && [ "$L_APPSIGN" -lt "$L_SELFTEST" ]; then
+    pass "the selftest runs after every step that can rewrite the engine binary"
+else
+    fail "the selftest does not run after the .app codesign; it would test an intermediate artifact"
+fi
+# A SIGKILL prints nothing and shows up only as a status over 128, which is the
+# exact shape of the defect. Reading `$?` after an `if !` would report 0.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if printf '%s\n' "$SIGN_FN" | grep -q 'selftest_rc=\$?'; then
+    pass "the selftest's real exit status is captured, signal included"
+else
+    fail "sign_app_bundle no longer captures the selftest exit status"
+fi
+# The flag must settle before the engine builds anything, or a packaging gate
+# would need a database to answer.
+ENGINE_MAIN="$PROJECT_DIR/crates/lucidos-engine/src/main.rs"
+L_FLAG="$(grep -n -- '--wasm-selftest' "$ENGINE_MAIN" | cut -d: -f1 | head -1)"
+L_RUN="$(grep -n 'block_on(run())' "$ENGINE_MAIN" | cut -d: -f1 | head -1)"
+if [ -n "$L_FLAG" ] && [ -n "$L_RUN" ] && [ "$L_FLAG" -lt "$L_RUN" ]; then
+    pass "the engine answers --wasm-selftest before it constructs anything"
+else
+    fail "--wasm-selftest is not an early exit in $ENGINE_MAIN"
 fi
 
 echo ""

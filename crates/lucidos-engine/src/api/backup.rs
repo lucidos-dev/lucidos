@@ -1,6 +1,16 @@
+use super::secret_reveal::{
+    forbidden, reveal_request_allowed, token_required, RefererRule, RevealSubject,
+    RevealTokenResponse,
+};
 use super::*;
 use crate::core::backup::{self, crypto};
 use crate::core::PreferenceStore;
+
+/// The route that mints a backup-key reveal token, named in its own refusal.
+const KEY_MINT_ROUTE: &str = "/api/v1/backup/key/reveal-token";
+
+/// What the 403 calls the secret these routes guard.
+const KEY_SUBJECT_LABEL: &str = "the backup key";
 
 #[derive(Serialize)]
 pub struct ProviderInfo {
@@ -80,6 +90,23 @@ fn resolve_provider(
     backup::get_provider(provider_id, pool).map_err(ApiError::bad_request)
 }
 
+/// The `Referer` rule a READ of the key runs.
+///
+/// A `GET` may arrive with no `Referer`, because `public/sw.js` re-issues every
+/// same-origin `GET /api/v1/*` except events, health and blobs. Refusing a
+/// missing one would take the installed PWA's key read down on every load, and
+/// close nothing: app JS reaches `window.top.fetch` and inherits the Settings
+/// document's own `Referer` (ADR 0156). The token is what gates this step.
+const READ_REFERER_RULE: RefererRule = RefererRule::WhenPresent;
+
+/// The `Referer` rule the two `POST`s run: the mint, and the generate.
+///
+/// `sw.js` returns early for any non-GET, so a `POST` reaches the engine as the
+/// browser sent it and always carries a `Referer`. A page that suppressed its
+/// own has removed the one signal telling it apart from an app. That is the
+/// credential mint's reasoning too (ADR 0117).
+const WRITE_REFERER_RULE: RefererRule = RefererRule::Required;
+
 pub async fn list_providers(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProviderInfo>>, ApiError> {
@@ -123,6 +150,80 @@ pub async fn list_providers(
     Ok(Json(result))
 }
 
+/// The token a key-bearing backup route has to be handed.
+///
+/// Optional in the SHAPE so a caller that omits it meets the handler's own
+/// refusal, which names the route that mints one. Left required, axum answers a
+/// 400 that says only "failed to deserialize query string".
+#[derive(Deserialize)]
+pub struct BackupKeyQuery {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Refuse this request unless it may see the backup key.
+///
+/// Both key-bearing routes run it, so the two cannot drift apart. The `rule`
+/// differs by method and the reasoning is ADR 0117's: a `GET` is re-issued by
+/// the service worker on iOS and may lose its `Referer`, a `POST` is not.
+fn check_key_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: Option<&str>,
+    rule: RefererRule,
+) -> Result<(), ApiError> {
+    if !reveal_request_allowed(headers, rule) {
+        log!("[Backup] refused a backup-key read from an app document");
+        let (status, message) = forbidden(KEY_SUBJECT_LABEL);
+        return Err(ApiError::new(status, message));
+    }
+    if !state
+        .reveal_tokens
+        .redeem(token.unwrap_or_default(), RevealSubject::BackupKey)
+    {
+        log!("[Backup] refused a backup-key read: no live reveal token");
+        let (status, message) = token_required(KEY_MINT_ROUTE);
+        return Err(ApiError::new(status, message));
+    }
+    Ok(())
+}
+
+/// Record that the key left the engine, naming the actor and never the key.
+async fn audit_key_revealed(state: &AppState, headers: &HeaderMap, minted: bool) {
+    state
+        .engine
+        .event_bus
+        .emit_user_system(
+            headers,
+            &state.pool,
+            "[Backup] BackupKeyRevealed",
+            |actor| crate::engine::event_bus::SystemEvent::BackupKeyRevealed { minted, actor },
+        )
+        .await;
+}
+
+/// POST /api/v1/backup/key/reveal-token: mint a one-shot token for the two
+/// routes below.
+///
+/// Step one of two, matching the credential reveal (ADR 0117). It takes no id:
+/// a workspace has exactly one backup key. It does not check that a key exists,
+/// because the generate route spends a token precisely when one does not.
+pub(super) async fn mint_backup_key_reveal_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<RevealTokenResponse>, ApiError> {
+    if !reveal_request_allowed(&headers, WRITE_REFERER_RULE) {
+        log!("[Backup] refused a backup-key reveal-token mint from an app document");
+        let (status, message) = forbidden(KEY_SUBJECT_LABEL);
+        return Err(ApiError::new(status, message));
+    }
+    let token = state
+        .reveal_tokens
+        .mint(RevealSubject::BackupKey)
+        .ok_or_else(|| ApiError::internal("reveal-token store is poisoned"))?;
+    Ok(Json(RevealTokenResponse::new(token)))
+}
+
 /// GET /api/v1/backup/key — reveal the EXISTING key. Read-only: returns 404 when
 /// no key has been generated yet (the page then offers "Generate new backup
 /// key"). It must NEVER mint a key as a side effect — the old behavior silently
@@ -130,13 +231,26 @@ pub async fn list_providers(
 /// key) and surfaced as a misleading "New backup key generated" toast when a
 /// user only meant to view their key. Generation now lives behind the explicit
 /// POST below.
-pub async fn get_backup_key(State(state): State<AppState>) -> Result<Json<KeyResponse>, ApiError> {
+///
+/// The key decrypts every archive this workspace uploaded. App UIs are
+/// same-origin with the engine, so this route sat one bare GET away from any
+/// installed app. It now takes a one-shot token, refuses an app `Referer`, and
+/// records the read. See `api::secret_reveal`.
+pub async fn get_backup_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BackupKeyQuery>,
+) -> Result<Json<KeyResponse>, ApiError> {
+    check_key_access(&state, &headers, query.token.as_deref(), READ_REFERER_RULE)?;
     let key_path = backup::key_file_path(&state.workspace_path);
     match crypto::load_key_file(&key_path) {
-        Ok(Some(key)) => Ok(Json(KeyResponse {
-            key: crypto::key_to_base64(&key),
-            is_new: false,
-        })),
+        Ok(Some(key)) => {
+            audit_key_revealed(&state, &headers, false).await;
+            Ok(Json(KeyResponse {
+                key: crypto::key_to_base64(&key),
+                is_new: false,
+            }))
+        }
         Ok(None) => Err(ApiError::not_found(
             "No backup key exists yet. Generate one to enable encrypted backups.",
         )),
@@ -151,11 +265,20 @@ pub async fn get_backup_key(State(state): State<AppState>) -> Result<Json<KeyRes
 /// `ensure_key`). Idempotent: if a key already exists it's returned unchanged
 /// with `is_new: false`, so a double-click — or a race with a scheduled backup —
 /// can never overwrite the key that protects existing backups.
+///
+/// That idempotence is why this route is gated exactly like the GET: on a
+/// workspace that already has a key, it hands back the same plaintext. It takes
+/// the strict `Referer` rule because a `POST` reaches the engine unmediated, so
+/// a browser here always has a `Referer` to present.
 pub async fn generate_backup_key(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BackupKeyQuery>,
 ) -> Result<Json<KeyResponse>, ApiError> {
+    check_key_access(&state, &headers, query.token.as_deref(), WRITE_REFERER_RULE)?;
     let (key, is_new) = crypto::ensure_key(&state.workspace_path)
         .map_err(|e| ApiError::internal(format!("Failed to generate backup key: {e}")))?;
+    audit_key_revealed(&state, &headers, is_new).await;
     Ok(Json(KeyResponse {
         key: crypto::key_to_base64(&key),
         is_new,
@@ -510,6 +633,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/backup/status", get(get_backup_status))
         .route("/backup/last-successful", get(get_last_successful_backup))
         .route("/backup/key", get(get_backup_key).post(generate_backup_key))
+        .route(
+            "/backup/key/reveal-token",
+            post(mint_backup_key_reveal_token),
+        )
         .route("/backup/key/exists", get(backup_key_exists))
         .route("/backup/providers", get(list_providers))
         .route("/backup/schedule", get(get_schedule).put(set_schedule))
@@ -522,6 +649,106 @@ mod tests {
     use crate::engine::event_bus::EventBus;
     use chrono::{Duration, Utc};
 
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Which `RefererRule` each route runs is the whole gate, and nothing
+    /// pinned it. It flipped `WhenPresent` to `Required` and back inside one
+    /// hardening cycle with no test going red either way, which is how the
+    /// over-correction got in. The e2e case sends no origin headers at all, so
+    /// it passes under either rule and cannot tell them apart.
+    ///
+    /// The rules are named constants for exactly that reason. Asserting on the
+    /// predicate alone repeats the blind spot, because it passes whichever rule
+    /// the handler went on to use.
+    #[test]
+    fn each_key_route_runs_the_rule_its_transport_needs() {
+        assert_eq!(
+            READ_REFERER_RULE,
+            RefererRule::WhenPresent,
+            "a GET is re-issued by sw.js and may lose its Referer"
+        );
+        assert_eq!(
+            WRITE_REFERER_RULE,
+            RefererRule::Required,
+            "sw.js returns early for a non-GET, so a POST always carries one"
+        );
+
+        // Naming the rules only pins them while the handlers READ the names. An
+        // inline `RefererRule::…` at a call site would flip a route with both
+        // assertions above still green, which is the original blind spot.
+        let source = include_str!("backup.rs");
+        let production = source
+            .split_once("mod tests")
+            .map(|(head, _)| head)
+            .expect("this module's own test block");
+        let literals: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains("RefererRule::"))
+            .collect();
+        assert_eq!(
+            literals.len(),
+            2,
+            "a handler names its rule, never spells one inline: {literals:?}"
+        );
+        assert!(
+            literals.iter().all(|l| l.contains("const ")),
+            "the only rule literals are the two constants: {literals:?}"
+        );
+    }
+
+    /// The reason `Required` was reverted on the read. The service worker
+    /// re-issues every same-origin `GET /api/v1/*` except events, health and
+    /// blobs, so the installed PWA can present no `Referer` at all. A
+    /// non-browser caller (the CLI, the API e2e suite) sends none either.
+    #[test]
+    fn a_caller_presenting_no_referer_still_reads_the_backup_key() {
+        assert!(
+            reveal_request_allowed(&HeaderMap::new(), READ_REFERER_RULE),
+            "a non-browser caller must still reach the key"
+        );
+        let browser_no_referer = hdrs(&[("sec-fetch-site", "same-origin")]);
+        assert!(
+            reveal_request_allowed(&browser_no_referer, READ_REFERER_RULE),
+            "a browser sending no Referer must still reach the key"
+        );
+        // The write side is stricter, and only a browser is held to it: a
+        // caller with no fetch metadata at all is the CLI, not a page.
+        assert!(
+            !reveal_request_allowed(&browser_no_referer, WRITE_REFERER_RULE),
+            "a browser hiding its Referer must not mint or generate"
+        );
+        assert!(
+            reveal_request_allowed(&HeaderMap::new(), WRITE_REFERER_RULE),
+            "the CLI and the API e2e suite must still generate"
+        );
+    }
+
+    /// The Settings page reaches every key route, direct and behind the
+    /// gateway. `demo-director` is an app id, so the same shape one segment
+    /// over is the refusal below.
+    #[test]
+    fn the_workspace_shell_still_reaches_the_key_routes() {
+        for referer in [
+            "https://host/settings",
+            "https://localhost:5251/",
+            "https://localhost:5251/dev/",
+        ] {
+            let h = hdrs(&[("sec-fetch-site", "same-origin"), ("referer", referer)]);
+            for rule in [READ_REFERER_RULE, WRITE_REFERER_RULE] {
+                assert!(reveal_request_allowed(&h, rule), "{referer}");
+            }
+        }
+    }
+
     fn entry(id: &str, age: Duration) -> backup::BackupEntry {
         backup::BackupEntry {
             id: id.to_string(),
@@ -529,6 +756,94 @@ mod tests {
             size_bytes: 1024,
             created_at: Utc::now() - age,
         }
+    }
+
+    /// Regression: the backup key was one bare GET away from any installed app.
+    ///
+    /// App UIs are same-origin with the engine, so `Sec-Fetch-Site` reads
+    /// `same-origin` for them exactly as for the Settings page. The `Referer`
+    /// is the only thing that differs, and every key route now reads it.
+    #[test]
+    fn an_app_document_cannot_reach_any_key_route() {
+        // Both rules, because the mint, the read and the generate between them
+        // use both. No route can be the one that forgets.
+        for rule in [READ_REFERER_RULE, WRITE_REFERER_RULE] {
+            for referer in [
+                "https://host/app/demo-director/index.html",
+                "https://localhost:5251/app/habit-tracker/",
+                "https://localhost:5251/dev/app/habit-tracker/index.html",
+            ] {
+                let h = hdrs(&[("sec-fetch-site", "same-origin"), ("referer", referer)]);
+                assert!(
+                    !reveal_request_allowed(&h, rule),
+                    "{referer} must not reach the key that decrypts every archive"
+                );
+            }
+        }
+    }
+
+    /// The refusal names the route that mints, and that route is the one the
+    /// router registers. A 403 pointing at a path nobody serves is a dead end.
+    #[test]
+    fn the_refusal_names_the_route_this_module_serves() {
+        let (status, body) = token_required(KEY_MINT_ROUTE);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("/backup/key/reveal-token"), "{body}");
+        assert!(
+            KEY_MINT_ROUTE.starts_with("/api/v1/"),
+            "the message quotes a full path, so the constant has to carry the mount"
+        );
+    }
+
+    /// The audit row records the act and the actor, never the key. Same
+    /// secrecy contract as `CredentialRevealed`.
+    ///
+    /// Asserted as the EXACT field set rather than by searching the payload for
+    /// the word "key". A substring search over a variant already named
+    /// `BackupKeyRevealed` answers on capitalisation, so it would pass whatever
+    /// a future field carried.
+    #[test]
+    fn the_audit_row_carries_no_key_material() {
+        use crate::engine::event_bus::SystemEvent;
+        use crate::engine::thread_events::MessageOrigin;
+
+        let fields = |event: &SystemEvent| -> Vec<String> {
+            let payload = event.to_payload();
+            assert_eq!(payload["type"], "BackupKeyRevealed");
+            let mut keys: Vec<String> = payload["data"]
+                .as_object()
+                .unwrap_or_else(|| panic!("a data object: {payload}"))
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        for minted in [true, false] {
+            let event = SystemEvent::BackupKeyRevealed {
+                minted,
+                actor: None,
+            };
+            assert_eq!(event.event_type(), "BackupKeyRevealed");
+            assert!(event.is_persisted(), "an audit row has to be durable");
+            assert_eq!(fields(&event), vec!["minted".to_string()]);
+            assert_eq!(event.to_payload()["data"]["minted"], minted);
+        }
+
+        // With an actor the row grows exactly one field, so the timeline can
+        // attribute the read and still nothing else rides along.
+        let attributed = SystemEvent::BackupKeyRevealed {
+            minted: false,
+            actor: Some(MessageOrigin::Device {
+                device_id: "device-1".to_string(),
+                label: "My MacBook".to_string(),
+            }),
+        };
+        assert_eq!(
+            fields(&attributed),
+            vec!["actor".to_string(), "minted".to_string()]
+        );
     }
 
     /// The page and the agent both read `missing_scopes` off this response, so

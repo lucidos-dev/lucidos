@@ -67,6 +67,40 @@ pub enum EngineReason {
     },
 }
 
+/// Which agent authored a thread event, when a thread carries more than one.
+///
+/// A thread had exactly one agent until voice put a rented *talker* beside the
+/// Lucidos Agent (ADR 0150). So `LucidosAgent` is the `Default`, and a payload
+/// naming the origin without naming a participant decodes to it.
+///
+/// An enum rather than a name string: our own agent is not something a caller
+/// could spell two ways, and telling it apart is a `match`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentParticipant {
+    /// The workspace's own Lucidos Agent.
+    #[default]
+    LucidosAgent,
+    /// An agent that is not ours, sharing a thread with the Lucidos Agent.
+    /// `label` is the speaker name the rendered history prints, so neither
+    /// participant reads the other's turn as its own.
+    Guest { label: String },
+}
+
+impl AgentParticipant {
+    /// The name the rendered conversation history calls this participant by.
+    ///
+    /// Our own agent keeps `Assistant`, unchanged from before a thread could
+    /// carry two. Every model reading a transcript already knows that word, and
+    /// renaming it would rewrite the history of every existing thread.
+    pub fn speaker_label(&self) -> &str {
+        match self {
+            Self::LucidosAgent => "Assistant",
+            Self::Guest { label } => label,
+        }
+    }
+}
+
 /// Direction of a `ThreadLink` origin: which end of the parent⇄child
 /// relationship the linked thread sits on relative to the receiving thread.
 ///
@@ -87,11 +121,16 @@ fn default_thread_direction_parent() -> ThreadDirection {
     ThreadDirection::Parent
 }
 
-/// Where an inbound `MessageReceived` originated. Stamped at the HTTP boundary
-/// in `api/chat.rs::chat_submit`. Optional on the wire so old DB rows
-/// deserialize cleanly; the frontend has a `legacyOrigin()` fallback that
-/// synthesizes Device / ThreadLink from the legacy `device_id` /
-/// `parent_thread_id` fields when origin is missing.
+/// Who this thread event is the work of.
+///
+/// Usually that is where an inbound `MessageReceived` entered, stamped at the
+/// HTTP boundary in `api/chat.rs::chat_submit`. `Agent` is the outbound case:
+/// an agent in the thread authored the event, and the variant names which one
+/// (ADR 0150).
+///
+/// Optional on the wire so old DB rows deserialize cleanly. The frontend has a
+/// `legacyOrigin()` fallback that synthesizes Device / ThreadLink from the
+/// legacy `device_id` / `parent_thread_id` fields when origin is missing.
 ///
 /// Invariants enforced at construction in `engine/chat/events.rs`:
 /// - `Device { .. }`            ⇒ `mode == ActorMode::Human` (intrinsic)
@@ -172,6 +211,16 @@ pub enum MessageOrigin {
         #[serde(default = "default_thread_direction_parent")]
         direction: ThreadDirection,
     },
+    /// Mode = Agent. An agent participating in this thread authored the event,
+    /// and `agent` names which one (ADR 0150). The outbound counterpart of the
+    /// variants above, which all name a way IN.
+    ///
+    /// Not stamped on a user action that merely ends an agent's turn: a
+    /// `ResponseCanceled` carries the person who clicked Stop.
+    Agent {
+        #[serde(default)]
+        agent: AgentParticipant,
+    },
     /// An inbound webhook fired. `name` is what the user called it, so the
     /// timeline says which hook rather than "API caller".
     ///
@@ -213,7 +262,16 @@ impl MessageOrigin {
             Self::Device { .. } => ActorMode::Human,
             Self::Api { mode, .. } => *mode,
             Self::Workspace { mode, .. } | Self::ThreadLink { mode, .. } => *mode,
+            Self::Agent { .. } => ActorMode::Agent,
             Self::Webhook { .. } | Self::Engine { .. } | Self::System => ActorMode::Engine,
+        }
+    }
+
+    /// The agent that authored this event, when an agent did.
+    pub fn agent(&self) -> Option<&AgentParticipant> {
+        match self {
+            Self::Agent { agent } => Some(agent),
+            _ => None,
         }
     }
 

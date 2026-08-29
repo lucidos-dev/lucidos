@@ -90,10 +90,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 ### Dead-press probe on the composer's action row
 
-- **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28.
+- **Added:** 2026-08-26. **Widened:** 2026-08-27, twice; 2026-08-28; 2026-08-29.
 - **Lives in:** `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, its
   install call in `src/main.tsx`, and
-  `src/components/chat/__tests__/dead-press-probe.test.ts`. The `PressOutcome`
+  `src/components/chat/__tests__/dead-press-probe.test.ts` and
+  `src/components/chat/__tests__/dead-press-probe-ledger.test.ts`. The `PressOutcome`
   pair in `src/utils/tapGesture.ts` is part of it: the probe cannot tell a
   served press from a swallowed one, so each consumer says which it was.
 - **Impermanent because:** It chases one bug and produces no feature. On an iOS
@@ -119,9 +120,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Its `touchend` arm read `defaultPrevented` as proof a path had worked, and the
   touch path cancels the default before running the action. The actions behind
   it were fixed instead, so a press that runs and does nothing now speaks for
-  itself. Two of the probe's own silences went with it: a click landing anywhere
-  else no longer settles a press, and the reachability check answers without
-  needing the finger to land inside a painted rect.
+  itself. One of the probe's own silences went with it: a click landing
+  anywhere else no longer settles a press.
+
+  It also claimed the reachability check had stopped needing the finger inside a
+  painted rect. That was never true of the shipped code, and the eighth report
+  below is what found the claim out.
 - **What the sixth report changed: the log, not the toast.** It stayed silent
   again, and four of its own branches explain that. It returned on
   `document.activeElement`, which excluded a keyboard iOS held up after focus
@@ -139,27 +143,45 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Cancel and dropped the click, and Cancel was click-only by decision. The fix
   gives a destructive face a touch path that RULES on the tap gate, in
   [`docs/plans/2026-08-28-cancel-survives-the-ios-keyboard.md`](plans/2026-08-28-cancel-survives-the-ios-keyboard.md).
+- **What the eighth report found: nothing at all, and that is the finding.** The
+  press left no line of any kind. The probe armed only from a `touchstart` it
+  could attribute to the row, so a gesture the page never received was invisible
+  by construction.
+
+  Three holes made that possible, and all three are closed. The immune
+  reachability check sat behind the gate a hit-test disagreement defeats. A
+  second touch inside the 600ms grace window erased the first press's verdict
+  outright. And no line carried the row's own box.
+
+  Two verdicts were added with them, and both watch the touch pipeline rather
+  than the geometry. `no-lift` is a press that arrived and never finished, and
+  `click-no-touch` is a click with no gesture behind it at all. iOS standalone
+  PWAs are reported to reach both states while `click` keeps working. The full
+  reconstruction, and what the platform reports do and do not support, is in
+  [`docs/plans/2026-08-29-the-composer-says-when-send-is-unreachable.md`](plans/2026-08-29-the-composer-says-when-send-is-unreachable.md).
 - **Reading an episode.** Grep for `composer-press` in whichever log the
   engine's stdout goes to. Under `web-dev.sh -b` that is the workspace's
   `engine.log`, and for a gateway-launched engine it is
   `~/.lucidos/gateway/gateway.log`. Check both, since the workspace file goes
   quiet rather than missing. Each line names the face, the verdict (`served`,
-  `swallowed`, `clicked`, `canceled`, `missed` or `dead`), the travel, the
+  `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `no-lift`,
+  `click-no-touch` or `unreachable`), the travel, the row and face boxes, the
   viewport block and the `data-keyboard-active` flag.
-- **Removal / resolution condition:** The Cancel face reports `served` after the
-  fix above, OR two months pass with no report. The cause is named, so the
-  probe's remaining job is to confirm the repair on the one device that
-  reproduces it. Then delete the module, its install call, its test, the
-  `PressOutcome` pair and its two callers, and flip this row to `removed`.
-  Verify with a tree-wide search for `deadPressProbe` and `notePressOutcome`,
-  which must return nothing.
+- **Removal / resolution condition:** An episode arrives carrying a verdict, and
+  the fix that verdict points at ships, OR two months pass with no report. The
+  eighth episode reopened this: the cause is NOT named, and the probe's job is
+  evidence again rather than confirmation. Then delete the module, its install
+  call, its two tests, the `PressOutcome` pair and its two callers. Flip this
+  row to `removed`. Verify with a tree-wide search for `deadPressProbe` and
+  `notePressOutcome`, which must return nothing.
 - **Investigation:** none. It is narrow enough to stand alone. The three plans
   behind it are
   [`docs/plans/2026-08-27-the-composer-row-reports-which-face-died.md`](plans/2026-08-27-the-composer-row-reports-which-face-died.md),
   [`docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md`](plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md)
   and
   [`docs/plans/2026-08-28-a-swallowed-tap-says-so.md`](plans/2026-08-28-a-swallowed-tap-says-so.md).
-- **Status:** `active`, and now awaiting confirmation rather than evidence.
+- **Status:** `active`, and back to gathering evidence rather than confirming a
+  repair.
 - **Not a workaround.** It changes no behaviour and takes no gesture. Real fixes
   ship beside it, and this only decides what the user is told when they fail.
 
@@ -1567,7 +1589,18 @@ event that retires it.
   the precedence test, and the runner's two test helpers collapsed into one. The
   release note is in `CHANGELOG.md`, and `system-knowhow/building-an-auth-handshake.md`
   no longer names the root as a place a script may sit.
-- **Status:** removed (2026-08-27)
+- **The audit above answered a different question, and the removal broke a live
+  workspace.** The condition asks for a script "present at `<ws>/<script>` but
+  absent at `<ws>/data/<script>`". The audit asked whether the scripts lived
+  under `data/`. For a config spelling its value `data/scripts/auth/x.py`, both
+  are true at once: the file is under `data/`, and `<ws>/data/<script>` resolves
+  to `data/data/...`, which is absent.
+
+  That workspace shipped in 0.32.0 with every handshake proxy dead. Superseded
+  by `config_path_under_data`, which strips one redundant `data/` so both
+  spellings resolve, with the `data/`-only property intact. See
+  `docs/plans/2026-08-29-handshake-path-spelling-and-injected-secret-binding.md`.
+- **Status:** removed (2026-08-27), superseded by a normalizer (2026-08-29)
 
 ### Scheduler one-time startup migrations (`migrate_db_triggers_to_events`, `migrate_stale_trigger_prompts`)
 

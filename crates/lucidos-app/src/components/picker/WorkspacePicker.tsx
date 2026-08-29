@@ -876,7 +876,9 @@ export function WorkspacePicker() {
           </button>
           <Overlay
             open={networkOpen.value}
-            onClose={() => (networkOpen.value = false)}
+            onClose={() => {
+              networkOpen.value = false;
+            }}
             anchor={networkAnchor.value}
             backdrop={false}
             panelClass="ws-picker-confirm ws-picker-net"
@@ -921,7 +923,9 @@ export function WorkspacePicker() {
               </button>
               <Overlay
                 open={reloadConfirmOpen.value}
-                onClose={() => (reloadConfirmOpen.value = false)}
+                onClose={() => {
+                  reloadConfirmOpen.value = false;
+                }}
                 anchor={reloadAnchor.value}
                 backdrop={false}
                 panelClass="ws-picker-confirm ws-picker-confirm-reload"
@@ -1147,7 +1151,9 @@ export function WorkspacePicker() {
                               ><StopIcon /></button>
                               <Overlay
                                 open={stopConfirmId.value === w.id}
-                                onClose={() => (stopConfirmId.value = null)}
+                                onClose={() => {
+                                  stopConfirmId.value = null;
+                                }}
                                 anchor={stopAnchor.value}
                                 backdrop={false}
                                 panelClass="ws-picker-confirm ws-picker-confirm-stop"
@@ -1210,7 +1216,9 @@ export function WorkspacePicker() {
                             ><MoreIcon /></button>
                             <Overlay
                               open={menuOpenId.value === w.id}
-                              onClose={() => (menuOpenId.value = null)}
+                              onClose={() => {
+                                menuOpenId.value = null;
+                              }}
                               anchor={menuAnchor.value}
                               backdrop={false}
                               panelClass="ws-picker-menu"

@@ -193,7 +193,7 @@ test_allows_install_when_other_checkout_frontend_running() {
 test_installs_when_no_frontend_running() {
     echo "test: installs when no frontend running"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local pkg="$SANDBOX/pkg-needs-install-2"
     make_pkg_dir "$pkg" 0
@@ -222,7 +222,7 @@ test_installs_when_no_frontend_running() {
 test_stale_pidfile_does_not_block() {
     echo "test: stale pidfile does not block install"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local pkg="$SANDBOX/pkg-needs-install-3"
     make_pkg_dir "$pkg" 0
@@ -249,7 +249,7 @@ test_stale_pidfile_does_not_block() {
 test_no_install_needed_skips_check() {
     echo "test: no install needed skips frontend check"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local pkg="$SANDBOX/pkg-fresh"
     make_pkg_dir "$pkg" 1       # node_modules present → no install needed
@@ -286,7 +286,7 @@ test_no_install_needed_skips_check() {
 test_resolves_bare_name_to_home_workspaces() {
     echo "test: resolve_workspace_path expands bare name"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
     mkdir -p "$HOME/workspaces/dev/.lucidos"
     # Get canonical path for comparison (handles macOS /private/var symlinks)
     local expected
@@ -307,7 +307,7 @@ test_resolves_bare_name_to_home_workspaces() {
 test_resolves_absolute_path_unchanged() {
     echo "test: resolve_workspace_path accepts absolute paths"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
     mkdir -p "$HOME/workspaces/dev/.lucidos"
     local expected
     expected="$(cd "$HOME/workspaces/dev" && pwd)"
@@ -323,7 +323,7 @@ test_resolves_absolute_path_unchanged() {
 test_errors_on_missing_workspace() {
     echo "test: resolve_workspace_path errors when workspace missing"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     WORKSPACE="ghost-ws"
     local err
@@ -345,7 +345,7 @@ test_errors_on_missing_workspace() {
 test_does_not_create_directories() {
     echo "test: resolve_workspace_path is side-effect free (no mkdir)"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     WORKSPACE="never-existed"
     resolve_workspace_path 2>/dev/null || true
@@ -368,7 +368,7 @@ test_does_not_create_directories() {
 test_workspace_member_with_root_deps_skips_install() {
     echo "test: workspace member skips install when root node_modules present"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     # Build the layout that npm workspaces produces:
     #   $root/package.json   { "workspaces": ["pkg-member"] }
@@ -417,7 +417,7 @@ EOF
 test_workspace_member_install_when_package_json_bumped() {
     echo "test: workspace member triggers install when its package.json content changes"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local root="$SANDBOX/wsroot2-$$"
     mkdir -p "$root/node_modules" "$root/pkg-member"
@@ -461,7 +461,7 @@ EOF
 test_noop_rewrite_does_not_trigger_install() {
     echo "test: no-op rewrite (mtime bump, same content) does not reinstall"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local PROJECT_DIR="$SANDBOX/proj-noop"
     local pkg="$PROJECT_DIR"
@@ -509,7 +509,7 @@ test_noop_rewrite_does_not_trigger_install() {
 test_workspace_member_install_when_root_node_modules_missing() {
     echo "test: workspace member triggers install when root node_modules missing"
 
-    rm -rf "$HOME/workspaces"
+    rm -rf "${HOME:?}/workspaces"
 
     local root="$SANDBOX/wsroot3-$$"
     mkdir -p "$root/pkg-member"
@@ -653,7 +653,7 @@ test_kills_shared_build_watch_when_no_workspace_serves() {
 
     local PROJECT_DIR="$SANDBOX/proj-bw-kill"
     mkdir -p "$PROJECT_DIR/crates/lucidos-app/.build-watch"
-    rm -rf "$HOME/workspaces"   # no workspace serving this checkout
+    rm -rf "${HOME:?}/workspaces"   # no workspace serving this checkout
 
     ( exec sleep 30 ) & local bw_pid=$!
     disown "$bw_pid" 2>/dev/null || true
@@ -1705,6 +1705,104 @@ test_the_bind_pin_never_claims_to_be_behind_a_gateway
 test_a_direct_launch_widens_nothing_by_default
 test_a_direct_launch_keeps_an_explicit_bind
 test_a_direct_launch_defers_to_network_toml
+
+# ── select_stale_dev_script_pids ───────────────────────────────────────
+#
+# The Claude-Code-shaped fixture ADR 0025 requires of every process-selection
+# guard, the same one `webkit_reaper_test.sh` and `e2e_lock_test.sh` carry. A
+# coding agent holds the engine's thread history in a roughly 22 KB
+# `--append-system-prompt` argument, so a thread merely DISCUSSING a dev script
+# and this workspace path used to match. The caller sends `pkill -P` and then a
+# `kill`, so a match takes that session's children with it.
+#
+# SYNTHETIC_PS is fail-closed: empty means "no candidates", never "go ask the
+# real ps". That fallback is what killed two sessions on 2026-08-03.
+SYNTHETIC_PS=""
+_dev_script_list_processes() {
+    [ -n "$SYNTHETIC_PS" ] || return 0
+    printf '%s\n' "$SYNTHETIC_PS"
+}
+
+selected_pids() {
+    SYNTHETIC_PS="$1" WORKSPACE="$2" select_stale_dev_script_pids | tr '\n' ' ' | sed 's/ $//'
+}
+
+test_a_dev_script_for_this_workspace_is_selected() {
+    local got
+    got="$(selected_pids "4242 /bin/bash /repo/scripts/web-dev.sh -w /ws/mine -b" "/ws/mine")"
+    if [ "$got" = "4242" ]; then
+        pass "an interpreter-invoked dev script for this workspace matches"
+    else
+        fail "expected 4242, got '$got'"
+    fi
+
+    got="$(selected_pids "4243 /repo/scripts/tauri-dev.sh -w /ws/mine" "/ws/mine")"
+    if [ "$got" = "4243" ]; then
+        pass "a shebang-invoked dev script matches"
+    else
+        fail "expected 4243, got '$got'"
+    fi
+}
+
+test_a_coding_agent_merely_mentioning_a_dev_script_is_not_selected() {
+    # argv[0] is the agent binary and argv[1] is a flag, so neither token is a
+    # dev script. The workspace path and the script name both appear, deep in
+    # the prompt, exactly as they do in a real session.
+    local agent="9001 /usr/local/bin/claude --append-system-prompt THREAD HISTORY: run ./scripts/web-dev.sh -w /ws/mine -b to restart"
+    local got
+    got="$(selected_pids "$agent" "/ws/mine")"
+    if [ -z "$got" ]; then
+        pass "a coding agent quoting web-dev.sh and the workspace is NOT a candidate"
+    else
+        fail "coding agent selected as stale dev script: '$got'"
+    fi
+
+    got="$(selected_pids "9002 /bin/bash -c echo /repo/scripts/web-dev.sh -w /ws/mine" "/ws/mine")"
+    if [ -z "$got" ]; then
+        pass "a bash -c whose argument names the script is NOT a candidate"
+    else
+        fail "bash -c selected: '$got'"
+    fi
+}
+
+test_another_workspaces_dev_script_is_not_selected() {
+    local got
+    got="$(selected_pids "4244 /bin/bash /repo/scripts/web-dev.sh -w /ws/other -b" "/ws/mine")"
+    if [ -z "$got" ]; then
+        pass "a dev script for ANOTHER workspace is left alone"
+    else
+        fail "other workspace's script selected: '$got'"
+    fi
+}
+
+test_init_and_self_are_never_selected() {
+    local got
+    got="$(selected_pids "1 /bin/bash /repo/scripts/web-dev.sh -w /ws/mine" "/ws/mine")"
+    if [ -z "$got" ]; then pass "pid 1 is never a candidate"; else fail "pid 1 selected: '$got'"; fi
+
+    got="$(selected_pids "$$ /bin/bash /repo/scripts/web-dev.sh -w /ws/mine" "/ws/mine")"
+    if [ -z "$got" ]; then pass "our own pid is never a candidate"; else fail "self selected: '$got'"; fi
+}
+
+# This one pins the FIXTURE, not workspace.sh: the empty feed is swallowed by
+# the override above. It is kept because that override is the guard, and a
+# later edit giving it a real-`ps` fallback is the 2026-08-03 hazard returning.
+# It also catches a fallback added inside the selector after the loop.
+test_an_empty_feed_never_reaches_the_real_ps() {
+    local got
+    got="$(selected_pids "" "/ws/mine")"
+    if [ -z "$got" ]; then
+        pass "an empty synthetic feed yields no candidates (the seam fails closed)"
+    else
+        fail "empty feed selected: '$got'"
+    fi
+}
+
+test_a_dev_script_for_this_workspace_is_selected
+test_a_coding_agent_merely_mentioning_a_dev_script_is_not_selected
+test_another_workspaces_dev_script_is_not_selected
+test_init_and_self_are_never_selected
+test_an_empty_feed_never_reaches_the_real_ps
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

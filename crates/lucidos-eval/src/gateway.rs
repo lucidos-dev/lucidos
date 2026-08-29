@@ -44,8 +44,10 @@ impl Gateway {
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty())?;
         let client = reqwest::Client::builder()
-            // The dev gateway's loopback certificate is self-signed, and the
-            // driver's own client already accepts it.
+            // The loopback pair `.claude/rules/rust.md` prescribes. The dev
+            // gateway's certificate is self-signed, and `no_proxy` keeps an
+            // `HTTPS_PROXY` out of a hop that never leaves this machine.
+            .no_proxy()
             .danger_accept_invalid_certs(true)
             .timeout(TIMEOUT)
             .build()

@@ -149,7 +149,9 @@ lsof() {
 # ── helpers ────────────────────────────────────────────────────────────
 reset_env() {
     unset LUCIDOS_HOST_PID LUCIDOS_FRONTEND_PID
-    rm -rf "$HOME/workspaces"
+    # `:?` because this is an rm -rf, and HOME is only a mktemp sandbox by
+    # convention here. An empty one would take the real home.
+    rm -rf "${HOME:?}/workspaces"
 }
 
 write_pidfile() {

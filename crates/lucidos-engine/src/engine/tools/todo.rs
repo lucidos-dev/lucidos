@@ -404,15 +404,7 @@ pub async fn settle_open_todos(
     // exactly the reported bug the Waiting split exists to fix. Read from the
     // in-memory registry, so it depends on no ordering.
     if holds_background_work {
-        settle_to(
-            event_bus,
-            pool,
-            thread_id,
-            items,
-            notes,
-            TodoStatus::Waiting,
-        )
-        .await;
+        settle_to(event_bus, thread_id, items, notes, TodoStatus::Waiting).await;
         return;
     }
 
@@ -432,22 +424,20 @@ pub async fn settle_open_todos(
         }
     };
 
-    settle_to(event_bus, pool, thread_id, items, notes, settled_status).await;
+    settle_to(event_bus, thread_id, items, notes, settled_status).await;
 }
 
 /// Rewrite every OPEN item to `settled_status` and re-emit the list.
 ///
 /// Extracted so the two ways a thread can be parked reach one writer: an
 /// unresolved *event wait* at the terminator, and unfinished background work
-/// the tail is about to subscribe to. `pool` is unused today and is taken so
-/// the signature does not change if the no-op check ever needs the store.
+/// the tail is about to subscribe to.
 ///
 /// `notes` rides through untouched. Replace-whole-list means this re-emit IS
 /// the list from here on. Dropping them would have the engine erase what the
 /// agent wrote, every time a turn ended with an item still open.
 async fn settle_to(
     event_bus: &EventBus,
-    _pool: &PgPool,
     thread_id: Uuid,
     items: Vec<TodoItem>,
     notes: Option<String>,

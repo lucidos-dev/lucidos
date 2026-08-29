@@ -21,6 +21,7 @@ path = "src/main.rs"
 [dependencies]
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-local-token = { path = "../lucidos-local-token" }
+lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +31,12 @@ chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
 axum = { version = "0.7", features = ["macros", "multipart"] }
+# The WebSocket upgrade hop (ADR 0151). `reqwest` cannot carry an upgrade, so
+# that one path speaks HTTP/1.1 directly and then splices the two byte streams.
+# No WebSocket library here on purpose: the gateway never parses a frame. Both
+# crates are already in the tree under `axum`, which is built on them.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util", "limit"] }
 # `catch-panic` and `timeout` are the hook socket's, and are load-bearing rather
 # than hygiene. That listener is the one surface a user may point at the open

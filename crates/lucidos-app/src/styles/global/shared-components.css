@@ -39,9 +39,20 @@ h2 { font-size: var(--font-size-xl); }
 h3 { font-size: var(--font-size-lg); }
 h4, h5, h6 { font-size: var(--font-size-md); }
 
-/* Shared segmented control — used for all toggle button groups */
+/* Shared segmented control: a few mutually exclusive options, one of them
+   picked. Every host caller is two or three segments wide.
+
+   Do NOT reach for it as page navigation. The strip has no room to say where a
+   link goes, and past a handful of segments it wraps into a slab that reads as
+   options to weigh. Settings > System is the worked example of both: it drilled
+   down to a nav list instead (`components/settings/SystemSubmenu.tsx`).
+
+   It still wraps, as a safety net for an app author whose segments pass their
+   container: without it the flex line squeezes instead, and every segment's own
+   LABEL breaks into two lines. No-op at the sizes the host uses. */
 .segmented-control {
     display: inline-flex;
+    flex-wrap: wrap;
     gap: 0.125rem;
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
@@ -51,7 +62,11 @@ h4, h5, h6 { font-size: var(--font-size-md); }
 .segmented-btn {
     background: none;
     border: none;
-    color: var(--text-muted);
+    /* One step up from --text-muted, which sits at about 2.9:1 on the control's
+       own --bg-tertiary and reads as disabled. An unpicked segment is still a
+       live choice, so it must not. The active one stays distinct on weight and
+       on its lifted surface, which leaves the extra dimming no work to do. */
+    color: var(--text-secondary);
     cursor: pointer;
     font-size: var(--font-size-xs);
     font-family: var(--font-ui);

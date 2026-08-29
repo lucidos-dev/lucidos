@@ -76,7 +76,7 @@ export function releaseNoticeSplit(view: ReleaseNoticeView): NoticeSplit {
  *
  *  `action_label` is optional. Without the first, a notice carrying no action
  *  could be answered nowhere but the modal, which Escape closes for the page's
- *  life. The *System attention badge* points at this tab, so the reader would
+ *  life. The *System attention badge* points at this page, so the reader would
  *  arrive at a dot with nothing to press. The second keeps an answered notice's
  *  button as a record of what it offered, greyed rather than gone. */
 function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: string }) {
@@ -137,7 +137,7 @@ function NoticeRow({ notice, state, blockedBy }: NoticeRow & { blockedBy?: strin
  * Settings > System > Release Notices: what the releases you have installed
  * need you to know or do.
  *
- * Its own tab rather than a block on What's New, because the two answer
+ * Its own page rather than a block on What's New, because the two answer
  * different questions. What's New says what CHANGED, release by release. A
  * notice says what you have to do about it, once.
  *

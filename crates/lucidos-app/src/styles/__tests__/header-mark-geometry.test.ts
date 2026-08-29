@@ -28,6 +28,25 @@ const switcherSource: string = readFileSync(
   'utf-8',
 );
 
+const MOBILE = '@media (max-width: 768px)';
+
+/** The `:root` declarations mobile.css makes at one scope. The sheet has two
+ *  such blocks, one inside the mobile breakpoint and one outside. A
+ *  first-textual-match `block()` reads whichever comes first in the file. */
+function mobileRoot(atRules: string): Map<string, string> {
+  const found = cssRules(mobileCss).filter(r => r.selector === ':root' && r.atRules === atRules);
+  expect(found.length, `expected exactly one \`:root\` in mobile.css at "${atRules}"`).toBe(1);
+  return found[0].props;
+}
+
+/** The gap between the two boxes of the content row's trailing cluster, which
+ *  the nav reserve has to hold room for. */
+function trailingClusterGap(): string {
+  const actions = cssRules(shellCss).find(r => r.selector === '.content-header-actions');
+  expect(actions?.props.get('gap'), '.content-header-actions declares no gap').toBeDefined();
+  return actions!.props.get('gap')!;
+}
+
 /** The menu carries the Restart control, and the toast most likely to be on
  *  screen when a user reaches for it is the persistent "Restart needed" one.
  *  `--z-modal` (2300) sits deliberately BELOW `--z-toast` (2400), so the
@@ -191,8 +210,7 @@ describe('mobile header rows share one height', () => {
   it('the height token is the tallest control the rows carry', () => {
     // The mark's tap target is the tallest thing on any of the three rows, so
     // sizing off it is what lets them agree without anything shrinking.
-    const mobileRoot = block(mobileCss, ':root {');
-    expect(decl(mobileRoot, '--mobile-header-row-height')).toBe('var(--header-mark-tap)');
+    expect(mobileRoot(MOBILE).get('--mobile-header-row-height')).toBe('var(--header-mark-tap)');
     expect(decl(block(markCss, ':root {'), '--header-mark-tap')).not.toBeNull();
   });
 
@@ -439,13 +457,28 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the cluster is a fixed-width centred box', () => {
     expect(decl(cluster, 'position')).toBe('absolute');
     expect(decl(cluster, 'justify-content')).toBe('space-between');
-    // The width is a NAMED quantity rather than an inline clamp, because the
-    // threads row's title reserve reads it too (see the reserve test below).
+    // The width is a NAMED quantity rather than an inline expression, because
+    // the threads row's title reserve reads it too (see the reserve test below).
     expect(decl(cluster, 'width')).toBe('var(--header-nav-cluster-width)');
-    const span = decl(block(markCss, ':root {'), '--header-nav-cluster-width') ?? '';
-    for (const token of ['--header-nav-min-span', '--header-nav-edge-reserve', '--header-nav-span']) {
-      expect(span, 'the span must clamp, or it overlaps the edge clusters at high ui-scale').toContain(token);
+    const width = decl(block(markCss, ':root {'), '--header-nav-cluster-width') ?? '';
+    for (const token of ['--header-nav-min-span', '--header-nav-edge-reserve']) {
+      expect(width, 'the width must be bounded, or it overlaps the edge clusters at high ui-scale')
+        .toContain(token);
     }
+  });
+
+  it('holds the chevrons at no fixed distance apart, only against the edges', () => {
+    // A preferred span is the one thing that can beat the reserve, and it beats
+    // it where the row is roomiest. The old 11rem arm won on any phone below
+    // ~124% ui-scale. It parked the chevrons inside the slot the reserve had
+    // already held, leaving nearly two empty boxes against the bell. Which rule
+    // placed them then depended on the user's scale.
+    const width = decl(block(markCss, ':root {'), '--header-nav-cluster-width') ?? '';
+    expect(width, 'the cluster takes what the row leaves, floored').toMatch(/^max\(/);
+    expect(width, 'a third clamp arm is a fixed distance the reserve cannot beat')
+      .not.toContain('clamp(');
+    expect(markCss, '--header-nav-span is a fixed distance apart, which mobile does not want')
+      .not.toContain('--header-nav-span:');
   });
 
   it('the cluster SPANS the row vertically, so its own height cannot place it', () => {
@@ -535,6 +568,65 @@ describe('the nav chevrons are pinned to one shared span', () => {
   it('the chevrons and the mark cannot be squeezed by a long title', () => {
     const fixed = cssRules(markCss).find(r => r.selector.includes('.header-nav-cluster > .icon-btn'));
     expect(fixed?.props.get('flex')).toBe('0 0 auto');
+  });
+});
+
+/** The clamp's middle arm is the one a phone actually sits on, so the reserve
+ *  IS the chevron position at every ordinary width. It is sized to the widest
+ *  edge cluster either pane can hold, with nothing held back beyond it. */
+describe('the nav reserve is the widest edge cluster, and no wider', () => {
+  const reserve = (): string => {
+    const value = decl(block(markCss, ':root {'), '--header-nav-edge-reserve');
+    expect(value, '--header-nav-edge-reserve is gone').not.toBeNull();
+    return value!;
+  };
+
+  it('is two icon boxes and the one gap between them', () => {
+    // Two, because the content row's trailing cluster collapses to the overflow
+    // trigger plus the bell and can hold no more (ContentHeaderActions). Written
+    // as arithmetic on the button box rather than as a length: every control in
+    // the row is rem-sized, so a constant is right at one ui-scale only.
+    expect(reserve()).toBe('calc(2 * var(--mobile-header-icon-box) + 0.25rem)');
+  });
+
+  it('counts the trailing cluster\'s OWN gap, not a number that once matched it', () => {
+    // The copy CSS cannot check for itself. The gap stays a literal because
+    // --pane-header-gap is declared on .pane-header. A custom property is
+    // substituted on the element that declares it, so :root cannot read it.
+    const gap = trailingClusterGap();
+    expect(
+      /\+ ([\d.]+rem)\)$/.exec(reserve())?.[1],
+      `the reserve drifted from the trailing cluster's ${gap} gap`,
+    ).toBe(gap);
+  });
+
+  it('clears that cluster exactly, so the chevron takes the slot inboard of it', () => {
+    // The retune this pins: one icon box more and the chevron sits a whole slot
+    // further in, which is the placement it replaced. Less, and the widest
+    // cluster paints over the chevron on the clamp's middle arm.
+    const box = parseFloat(mobileRoot('').get('--mobile-header-icon-box')!);
+    const gap = parseFloat(trailingClusterGap());
+    const boxes = Number(/calc\((\d+) \* var\(--mobile-header-icon-box\)/.exec(reserve())?.[1]);
+    const reserveRem = boxes * box + parseFloat(/\+ ([\d.]+rem)\)$/.exec(reserve())![1]);
+    const widestCluster = 2 * box + gap;
+    expect(reserveRem, 'the widest cluster would overlap the chevron').toBeGreaterThanOrEqual(widestCluster);
+    expect(reserveRem, 'a whole icon box of clearance pushes the chevrons in')
+      .toBeLessThan(widestCluster + box);
+  });
+
+  it('names a box declared for every width, or the clamp goes invalid', () => {
+    // --header-nav-cluster-width sits at an unscoped :root, so a box declared
+    // only inside the mobile breakpoint leaves the clamp nothing to substitute
+    // above 768px. An invalid custom property drops the cluster's width, and it
+    // does it in silence: no browser warning, no failing measurement.
+    expect(
+      mobileRoot('').get('--mobile-header-icon-box'),
+      'the box must be declared outside the mobile breakpoint',
+    ).toBe('1.75rem');
+    expect(
+      mobileRoot(MOBILE).get('--mobile-header-icon-box'),
+      'a second declaration inside the breakpoint is a copy that can drift',
+    ).toBeUndefined();
   });
 });
 

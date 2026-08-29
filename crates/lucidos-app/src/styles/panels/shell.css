@@ -708,10 +708,13 @@
         /* How far apart the back/forward chevrons are held, on BOTH panes. The
            point is that they hold still: a cluster sized to its contents put
            them wherever the current title or workspace name happened to leave
-           them, so they moved under the pointer on every navigation. Same idea
-           as --header-nav-span on mobile, at a desktop distance. A narrow pane
-           squeezes the span rather than the controls in it, down to the floor
-           below. */
+           them, so they moved under the pointer on every navigation. A narrow
+           pane squeezes the span rather than the controls in it, down to the
+           floor below.
+           Mobile deliberately carries no twin of this token. A pane can be far
+           wider than a phone row, so desktop wants a distance to hold; a phone
+           row has no width to spare, and there the chevrons take everything
+           outside the edge reserve. See --header-nav-cluster-width. */
         --desktop-nav-span: 20rem;
         /* The floor, and it IS the cluster's natural width: two chevrons and
            the mark's tap target, touching. This is what "the chevrons hug the

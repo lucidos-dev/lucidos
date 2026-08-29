@@ -1,31 +1,22 @@
 import { showToast } from '../../store/store';
-import { isMobile } from '../../utils/viewport';
+import { isMobile, isTouchDevice } from '../../utils/viewport';
 import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
 
 /** Reports a tap on a composer action button that produced nothing.
  *
  *  A DIAGNOSTIC, registered in `docs/temporary-measures.md` § 1 and removed once
- *  a report names the cause. The bug behind it has been reported six times and
+ *  a report names the cause. The bug behind it has been reported eight times and
  *  nobody can reproduce it: it strikes now and then on an iOS PWA and kills the
  *  composer's buttons wherever the finger presses. No emulator reproduces it, so
  *  the app has to be the one that says what happened.
  *
- *  Five questions, and the answers point at different halves of the stack.
- *
- *  Is the face reachable where it is drawn? That one is put to the face's own
- *  centre, so the finger plays no part in it. See `faceHitTestReport`.
- *
- *  Was the button still in the document when the finger lifted? A `touchend`
- *  goes to the element the press STARTED on, so a replaced node takes the touch
- *  path down with the click path. Apple's Handling Events page is explicit that
- *  a page change during the tap cascade stops the rest of it, `click` included.
- *  That answer is decisive, so it is asked first.
- *
- *  Did the press even reach the button? If not, paint and hit-testing disagree,
- *  and the viewport numbers say by how much. Did the system take the gesture,
- *  leaving no path to run? Or did the press arrive intact and both paths decline,
- *  which is code we own?
+ *  The eighth episode was SILENT, and that is what this round is shaped by. The
+ *  probe used to arm only from a `touchstart` it could attribute to the row. A
+ *  gesture the page never received therefore left no trace at all. It now
+ *  partitions the four ways a press can go missing, and the plan behind that
+ *  partition is
+ *  `docs/plans/2026-08-29-the-composer-says-when-send-is-unreachable.md`.
  *
  *  The decisions are pure functions of what was measured, so they test without a
  *  DOM. `installDeadPressProbe` is the shell that measures.
@@ -130,7 +121,10 @@ export function landingReport(f: LandingFacts): string | null {
  *  A coordinate space out of step with layout misses every rect, and the probe
  *  then said nothing about the very state it was built for. This one is immune:
  *  it compares where the row is PAINTED with what the page answers there, and
- *  both readings come from the browser at the same instant. */
+ *  both readings come from the browser at the same instant.
+ *
+ *  Immune, but for two rounds it was asked only AFTER a gate that the same fault
+ *  defeats. `installDeadPressProbe` now asks it in front of that gate. */
 export interface FaceHitTestFacts {
   face: string;
   centre: { x: number; y: number };
@@ -204,14 +198,82 @@ export function canceledPressReport(f: {
     + `${Math.round(f.movedPx)}px. ${viewportSuffix(f.viewport)}`;
 }
 
+/** The press arrived and the lift never did. WebKit owes a `touchend` or a
+ *  `touchcancel` for every `touchstart`, so neither arriving is the touch
+ *  pipeline stopping mid-gesture.
+ *
+ *  That is the shape the eighth episode's silence points at. The old probe
+ *  dropped such a press at the next `touchstart`, timer and all, so it produced
+ *  no line at all.
+ *
+ *  Null for a finger that travelled, on the same threshold as every other
+ *  report here: a gesture the page handed to a scroller is the platform
+ *  working. */
+export function noLiftReport(f: {
+  face: string;
+  movedPx: number;
+  viewport: ProbeViewport;
+}): string | null {
+  if (f.movedPx > TAP_MOVE_THRESHOLD_PX) return null;
+  return `${f.face} did not register: the touch began on the button and the `
+    + `lift never arrived. ${viewportSuffix(f.viewport)}`;
+}
+
 /** How long after `touchend` a `click` counts as belonging to that press.
  *  Longer than WebKit's synthetic-click delay, short enough that the toast still
  *  belongs to the tap the user just made. */
 const CLICK_GRACE_MS = 600;
 
+/** How long a `click` still counts as having a touch behind it.
+ *
+ *  Generous next to `CLICK_GRACE_MS`, because this window is not deciding a
+ *  verdict for a press. It is deciding whether the page saw ANY touch recently,
+ *  and a slow synthetic click must not be mistaken for a touchless one. */
+const TOUCH_BEHIND_CLICK_MS = 1500;
+
 /** What the press ended as. `served` and `swallowed` come from whoever took it;
- *  the other three are the probe's own readings. */
-type PressVerdict = PressOutcome | 'dead' | 'clicked' | 'canceled' | 'missed';
+ *  the rest are the probe's own readings.
+ *
+ *  `no-lift` and `click-no-touch` are the two halves of a touch pipeline that
+ *  stopped: a gesture that began and never finished, and a click arriving with
+ *  no gesture behind it at all. */
+type PressVerdict =
+  | PressOutcome
+  | 'dead'
+  | 'clicked'
+  | 'canceled'
+  | 'missed'
+  | 'no-lift'
+  | 'click-no-touch'
+  | 'unreachable';
+
+/** How often the reachability question may be asked.
+ *
+ *  It costs a hit test and a style read per face, and it is now asked for
+ *  touches that never reach the composer. A wedge persists, so asking on every
+ *  touch buys nothing that the user's second tap does not. */
+const REACHABILITY_THROTTLE_MS = 400;
+
+/** How long a press may stay armed before the lift is called lost.
+ *
+ *  Far beyond any tap, and beyond the long press that reveals a tooltip, so an
+ *  ordinary gesture always lifts first. Short enough that the report still
+ *  reaches a user who is looking at the screen wondering why nothing happened. */
+const LIFT_DEADLINE_MS = 4000;
+
+/** A rect as the log carries it: whole pixels, and only the four edges.
+ *
+ *  Rounded because a sub-pixel layout value is noise against a finger, and
+ *  because every line pays for its own width under the engine's 4KB cap. */
+function roundRect(rect: ProbeRect | null): ProbeRect | null {
+  if (!rect) return null;
+  return {
+    left: Math.round(rect.left),
+    right: Math.round(rect.right),
+    top: Math.round(rect.top),
+    bottom: Math.round(rect.bottom),
+  };
+}
 
 /** The engine-log breadcrumb, written for EVERY press the probe watches.
  *
@@ -229,8 +291,11 @@ function recordPress(facts: {
   rowMutations?: number;
   elementAtPoint?: string | null;
   pointerEventsAtPoint?: string | null;
-  unreachable?: boolean;
   toasted?: boolean;
+  /** Where the row and the pressed face WERE, so a report measures a
+   *  paint-versus-hit-test offset instead of implying one. */
+  rowRect?: ProbeRect | null;
+  faceRect?: ProbeRect | null;
 }): void {
   postClientLog('composer-press', `${facts.face}: ${facts.verdict}`, {
     ...facts,
@@ -288,6 +353,15 @@ function readViewport(): ProbeViewport {
   };
 }
 
+/** Can the document hit-test this point at all? `elementFromPoint` answers null
+ *  outside the viewport, which is indistinguishable from a covered element. */
+function onScreen(p: { x: number; y: number }): boolean {
+  const vv = window.visualViewport;
+  const height = vv?.height ?? window.innerHeight;
+  const width = vv?.width ?? window.innerWidth;
+  return p.x >= 0 && p.x <= width && p.y >= 0 && p.y <= height;
+}
+
 function describe(el: Element | null): string | null {
   if (!el) return null;
   const cls = el.classList.item(0);
@@ -327,13 +401,21 @@ const reportedUnreachable = new Set<string>();
  *  Silent while an overlay is open: that is the one time something is MEANT to
  *  cover the row, and the app inerts the shell behind it on purpose. Silent too
  *  for a face with no box, which is a row mid-layout rather than a fault. */
-function firstUnreachableFace(faces: HTMLButtonElement[]): string | null {
+function firstUnreachableFace(
+  faces: HTMLButtonElement[],
+): { face: string; report: string; rect: ProbeRect } | null {
   if (document.documentElement.hasAttribute('data-overlay-open')) return null;
-  let fresh: string | null = null;
+  let fresh: { face: string; report: string; rect: ProbeRect } | null = null;
   for (const face of faces) {
     const rect = face.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
     const centre = { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+    // `elementFromPoint` answers null for any point outside the viewport, so a
+    // face parked off-screen would read as unreachable on every touch. The
+    // mobile swipe track is 300% wide and keeps all three panes laid out. The
+    // composer therefore sits off-screen whenever the user is on another pane,
+    // and a point the document cannot hit-test answers no question.
+    if (!onScreen(centre)) continue;
     const at = document.elementFromPoint(centre.x, centre.y);
     const name = nameOf(face);
     const report = faceHitTestReport({
@@ -347,13 +429,22 @@ function firstUnreachableFace(faces: HTMLButtonElement[]): string | null {
     if (!report) { reportedUnreachable.delete(name); continue; }
     if (reportedUnreachable.has(name)) continue;
     reportedUnreachable.add(name);
-    fresh ??= report;
+    fresh ??= { face: name, report, rect: roundRect(rect) as ProbeRect };
   }
   return fresh;
 }
 
-/** The in-flight press. Held from `touchstart` until something activates or the
- *  grace window closes. */
+/** This event's entry for one finger, or null when another finger moved. */
+function touchOf(e: TouchEvent, id: number): Touch | null {
+  const changed = e.changedTouches;
+  if (!changed) return null;
+  for (let i = 0; i < changed.length; i++) {
+    if (changed[i].identifier === id) return changed[i];
+  }
+  return null;
+}
+
+/** The press between `touchstart` and the lift. */
 interface ArmedPress {
   el: HTMLButtonElement;
   face: string;
@@ -365,6 +456,44 @@ interface ArmedPress {
   movedPx: number;
   mutations: number;
   observer: MutationObserver | null;
+  /** Which finger this press belongs to. A second finger's lift, cancel or
+   *  travel must not settle or move somebody else's press. */
+  touchId: number;
+  faceRect: ProbeRect | null;
+  rowRect: ProbeRect | null;
+  /** Fires if no lift and no cancel ever arrive. Without it the probe reports a
+   *  missing lift only when the NEXT touch comes, and a pipeline that stopped
+   *  delivers no next touch. That is the episode being chased, so the press
+   *  would sit armed for good and write no line. */
+  liftDeadline: ReturnType<typeof setTimeout> | null;
+}
+
+/** The press after the lift, waiting out its grace window for a click.
+ *
+ *  A SET, not a slot. The previous probe held one press and dropped it at the
+ *  next `touchstart`, so the first of a double tap was never reported. Tapping
+ *  again is what a user does to a dead-feeling button. That made the gesture the
+ *  bug provokes the gesture that erased the evidence. */
+interface SettlingPress {
+  el: HTMLButtonElement;
+  face: string;
+  armedAt: number;
+  movedPx: number;
+  connectedAtLift: boolean;
+  rowMutations: number;
+  faceRect: ProbeRect | null;
+  rowRect: ProbeRect | null;
+  /** Who claimed the press, snapshotted right after ITS OWN lift.
+   *
+   *  `takePressOutcome` is one consuming slot, so reading it at the end of a
+   *  600ms window let an earlier press swallow a later press's claim. Taking it
+   *  a task after the lift keeps each claim with the press that earned it. */
+  outcome: PressOutcome | null;
+  /** The task that takes the claim above. Cleared with the press, because
+   *  `takePressOutcome` CONSUMES: left to fire on a press a click already
+   *  ruled, it would eat the claim of whichever press comes next. */
+  outcomeTimer: ReturnType<typeof setTimeout> | null;
+  graceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 let installed = false;
@@ -379,42 +508,130 @@ export function installDeadPressProbe(): void {
   installed = true;
 
   let armed: ArmedPress | null = null;
-  let graceTimer: ReturnType<typeof setTimeout> | null = null;
+  const settling = new Set<SettlingPress>();
+  /** When the document last saw ANY `touchstart`, wherever it landed.
+   *
+   *  The one reading that separates a dead touch pipeline from a dead button. A
+   *  click with nothing here behind it is a page taking clicks and no touches.
+   *  An iOS standalone PWA is reported to reach that state. */
+  let lastTouchStartAt: number | null = null;
+  /** When the reachability question was last asked. See its throttle. */
+  let lastReachabilityAt = Number.NEGATIVE_INFINITY;
 
-  /** Drop the in-flight press without ruling on it. */
-  const settle = () => {
-    armed?.observer?.disconnect();
-    armed = null;
-    if (graceTimer !== null) { clearTimeout(graceTimer); graceTimer = null; }
+  /** Rule a lifted press and write its line. Called by the grace timer, and by
+   *  the click handler when a click claims the press early. */
+  const rule = (press: SettlingPress, clicked: boolean) => {
+    if (!settling.delete(press)) return;
+    if (press.graceTimer !== null) { clearTimeout(press.graceTimer); press.graceTimer = null; }
+    if (press.outcomeTimer !== null) { clearTimeout(press.outcomeTimer); press.outcomeTimer = null; }
+    if (clicked) {
+      recordPress({
+        face: press.face,
+        verdict: 'clicked',
+        movedPx: press.movedPx,
+        rowRect: press.rowRect,
+        faceRect: press.faceRect,
+      });
+      return;
+    }
+    const outcome = press.outcome;
+    const report = deadPressReport({
+      face: press.face,
+      movedPx: press.movedPx,
+      connectedAtLift: press.connectedAtLift,
+      rowMutations: press.rowMutations,
+      outcome,
+      viewport: readViewport(),
+    });
+    recordPress({
+      face: press.face,
+      verdict: outcome ?? 'dead',
+      movedPx: press.movedPx,
+      connectedAtLift: press.connectedAtLift,
+      rowMutations: press.rowMutations,
+      toasted: report !== null,
+      rowRect: press.rowRect,
+      faceRect: press.faceRect,
+    });
+    if (report) showToast(report, 'warning');
+  };
+
+  /** Give up on an armed press whose lift never came, and SAY so.
+   *
+   *  Skipped while another finger is still down, because a second `touchstart`
+   *  during a two-finger gesture is not a lost lift. */
+  const ruleArmedWithNoLift = (press: ArmedPress, toast: boolean) => {
+    press.observer?.disconnect();
+    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    const report = noLiftReport({
+      face: press.face,
+      movedPx: press.movedPx,
+      viewport: readViewport(),
+    });
+    recordPress({
+      face: press.face,
+      verdict: 'no-lift',
+      movedPx: press.movedPx,
+      connectedAtLift: press.el.isConnected,
+      rowMutations: press.mutations,
+      toasted: toast && report !== null,
+      rowRect: press.rowRect,
+      faceRect: press.faceRect,
+    });
+    if (toast && report) showToast(report, 'warning');
   };
 
   // Capture, so an inert or covered target still reports.
   document.addEventListener('touchstart', (e) => {
-    settle();
+    // A second finger joining a live gesture is neither a new press nor a lost
+    // lift. Leave the armed press exactly as it is: its own lift still rules
+    // it. Clearing it here stranded the press with no line at all.
+    if (armed && e.touches.length > 1) return;
+    const previous = armed;
+    armed = null;
+    if (previous) ruleArmedWithNoLift(previous, true);
     if (!isMobile()) return;
+    lastTouchStartAt = Date.now();
     const touch = e.changedTouches?.[0];
     if (!touch) return;
     const row = watchableRow();
     if (!row) return;
-    // The cheap bail, before anything that costs a style read. Only the
-    // composer's own row is this module's business, and every other touch in
-    // the app arrives here now that the focus gate is gone. A touch counts as
-    // the row's when it was DISPATCHED there, or when it landed on the row's
-    // painted box: the second is the hit-test mismatch this chases, where the
-    // two disagree.
+    const rowRect = row.getBoundingClientRect();
     const target = e.target as Element | null;
     const onRow = !!target && !!target.closest(ROW_SELECTOR);
-    const inRow = inside(row.getBoundingClientRect(), touch.clientX, touch.clientY);
-    if (!onRow && !inRow) return;
+    const inRow = inside(rowRect, touch.clientX, touch.clientY);
     const faces = watchableFaces();
     if (faces.length === 0) return;
     const pressed = faces.find((f) => !!target && (target === f || f.contains(target)));
     if (!pressed) {
-      // Two questions worth asking, and only of a press that missed. Is any
-      // face unreachable at its own centre? And did this touch land on a
-      // face's painted box yet go somewhere else?
-      const unreachable = firstUnreachableFace(faces);
-      if (unreachable) showToast(unreachable, 'warning');
+      // The reachability question comes FIRST, in front of the row-attribution
+      // gate below. It is the one check immune to a coordinate space out of
+      // step with layout. For two rounds it sat behind the very gate such a
+      // disagreement defeats, so a wedge that moved the row reported nothing.
+      //
+      // It carries its own line and its own latch, rather than widening the
+      // gate. A wedge would otherwise put a `missed` line under every touch in
+      // the app for as long as it lasted.
+      const now = Date.now();
+      if (now - lastReachabilityAt >= REACHABILITY_THROTTLE_MS) {
+        lastReachabilityAt = now;
+        const unreachable = firstUnreachableFace(faces);
+        if (unreachable) {
+          recordPress({
+            face: unreachable.face,
+            verdict: 'unreachable',
+            movedPx: 0,
+            toasted: true,
+            rowRect: roundRect(rowRect),
+            faceRect: unreachable.rect,
+          });
+          showToast(unreachable.report, 'warning');
+        }
+      }
+      // Past that, only the composer's own row is this module's business. A
+      // touch counts as the row's when it was DISPATCHED there, or when it
+      // landed on the row's painted box.
+      if (!onRow && !inRow) return;
       const aimedAt = faces.find((f) => inside(f.getBoundingClientRect(), touch.clientX, touch.clientY));
       const at = document.elementFromPoint(touch.clientX, touch.clientY);
       // Read once: `pointerEventsOf` is a computed-style call, and the report
@@ -436,7 +653,8 @@ export function installDeadPressProbe(): void {
         movedPx: 0,
         elementAtPoint,
         pointerEventsAtPoint,
-        unreachable: unreachable !== null,
+        rowRect: roundRect(rowRect),
+        faceRect: roundRect(aimedAt?.getBoundingClientRect() ?? null),
       });
       if (report) showToast(report, 'warning');
       return;
@@ -450,7 +668,21 @@ export function installDeadPressProbe(): void {
       movedPx: 0,
       mutations: 0,
       observer: null,
+      touchId: touch.identifier,
+      faceRect: roundRect(pressed.getBoundingClientRect()),
+      rowRect: roundRect(rowRect),
+      liftDeadline: null,
     };
+    press.liftDeadline = setTimeout(() => {
+      press.liftDeadline = null;
+      if (armed !== press) return;
+      armed = null;
+      // The LOG only. The finger may still be down, so all this knows is that
+      // the lift is overdue, not that the press died. A toast asserting it died
+      // would contradict the send a late lift still runs. The user's next tap
+      // takes the path above, which does toast.
+      ruleArmedWithNoLift(press, false);
+    }, LIFT_DEADLINE_MS);
     // Watch the row, not the page: whether the composer rebuilds its own buttons
     // mid-press is the question, and a page-wide observer would answer a
     // different one at a much higher cost. The PRESSED face's own row, which
@@ -470,7 +702,7 @@ export function installDeadPressProbe(): void {
 
   document.addEventListener('touchmove', (e) => {
     if (!armed) return;
-    const touch = e.changedTouches?.[0];
+    const touch = touchOf(e, armed.touchId);
     if (!touch) return;
     // Screen coordinates, for the reason `TapPointer` records: with the keyboard
     // up the visual viewport settles under a stationary finger, so client ones
@@ -493,64 +725,63 @@ export function installDeadPressProbe(): void {
   //
   // And the touch path cancels the default BEFORE running its action, so
   // `defaultPrevented` never distinguished a press that ran from one that was
-  // eaten. Both now say which they were, through `takePressOutcome`. It is
-  // read in the grace callback, because the swallow runs after this listener.
-  document.addEventListener('touchend', () => {
+  // eaten. Both now say which they were, through `takePressOutcome`.
+  document.addEventListener('touchend', (e) => {
     const press = armed;
-    if (!press) return;
-    // Read both BEFORE the grace window. They describe this press, and a
-    // re-render arriving later would answer about something else.
-    const connectedAtLift = press.el.isConnected;
-    const rowMutations = press.mutations;
+    if (!press || !touchOf(e, press.touchId)) return;
+    armed = null;
     press.observer?.disconnect();
     press.observer = null;
+    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
+    const lifted: SettlingPress = {
+      el: press.el,
+      face: press.face,
+      armedAt: press.armedAt,
+      movedPx: press.movedPx,
+      connectedAtLift: press.el.isConnected,
+      rowMutations: press.mutations,
+      faceRect: press.faceRect,
+      rowRect: press.rowRect,
+      outcome: null,
+      outcomeTimer: null,
+      graceTimer: null,
+    };
+    settling.add(lifted);
+    // A task later, so the claim is this press's own. Both claimants run after
+    // this capture listener: the touch path's `notePressOutcome` bubbles to the
+    // button, and the overlay's paired swallow is a later capture registration.
+    // Both have run by the time a task does.
+    lifted.outcomeTimer = setTimeout(() => {
+      lifted.outcomeTimer = null;
+      lifted.outcome = takePressOutcome(Date.now() - lifted.armedAt);
+    }, 0);
     // A click may still be coming, so give it the grace window before calling
     // the press dead.
-    graceTimer = setTimeout(() => {
-      graceTimer = null;
-      if (armed !== press) return;
-      armed = null;
-      // Measured from the ARM, not from a constant: a claim recorded before
-      // this press began belongs to an earlier one, and reading it here would
-      // call a genuinely dead press served.
-      const outcome = takePressOutcome(Date.now() - press.armedAt);
-      // `movedPx` is read here rather than at the lift, so the whole gesture is
-      // measured. The report is null for a press that travelled, and for one
-      // somebody claimed.
-      const report = deadPressReport({
-        face: press.face,
-        movedPx: press.movedPx,
-        connectedAtLift,
-        rowMutations,
-        outcome,
-        viewport: readViewport(),
-      });
-      recordPress({
-        face: press.face,
-        verdict: outcome ?? 'dead',
-        movedPx: press.movedPx,
-        connectedAtLift,
-        rowMutations,
-        toasted: report !== null,
-      });
-      if (report) showToast(report, 'warning');
+    lifted.graceTimer = setTimeout(() => {
+      lifted.graceTimer = null;
+      rule(lifted, false);
     }, CLICK_GRACE_MS);
   }, { capture: true, passive: true });
 
-  document.addEventListener('touchcancel', () => {
-    if (!armed) return;
+  document.addEventListener('touchcancel', (e) => {
+    const press = armed;
+    if (!press || !touchOf(e, press.touchId)) return;
+    armed = null;
+    press.observer?.disconnect();
+    if (press.liftDeadline !== null) { clearTimeout(press.liftDeadline); press.liftDeadline = null; }
     const report = canceledPressReport({
-      face: armed.face,
-      movedPx: armed.movedPx,
+      face: press.face,
+      movedPx: press.movedPx,
       viewport: readViewport(),
     });
     recordPress({
-      face: armed.face,
+      face: press.face,
       verdict: 'canceled',
-      movedPx: armed.movedPx,
+      movedPx: press.movedPx,
       toasted: report !== null,
+      rowRect: press.rowRect,
+      faceRect: press.faceRect,
     });
-    settle();
     if (report) showToast(report, 'warning');
   }, { capture: true, passive: true });
 
@@ -561,15 +792,42 @@ export function installDeadPressProbe(): void {
   // The exception is the face Preact replaced under the finger: its successor is
   // a different node in the same row, and a click reaching that IS this press
   // being served. `isConnected` is what tells the two cases apart.
+  //
+  // A click matching NO press is the other half of this round. With no
+  // `touchstart` behind it, the page is taking clicks while the touch pipeline
+  // is dead. iOS standalone PWAs are reported to reach exactly that.
   document.addEventListener('click', (e) => {
-    const press = armed;
-    if (!press) return;
     const target = e.target as Element | null;
     if (!target) return;
-    const onPressedFace = press.el.contains(target);
-    const onReplacement = !press.el.isConnected && !!target.closest(ROW_SELECTOR);
-    if (!onPressedFace && !onReplacement) return;
-    recordPress({ face: press.face, verdict: 'clicked', movedPx: press.movedPx });
-    settle();
+    // Newest first. Two taps on one face can settle at once, and the click
+    // belongs to the later of them. Insertion order handed it to the older
+    // press, which reversed the evidence: the tap that died read `clicked` and
+    // the retry that worked read `dead`.
+    for (const press of Array.from(settling).reverse()) {
+      const onPressedFace = press.el.contains(target);
+      const onReplacement = !press.el.isConnected && !!target.closest(ROW_SELECTOR);
+      if (!onPressedFace && !onReplacement) continue;
+      rule(press, true);
+      return;
+    }
+    // A device that cannot produce a touch cannot have a touch pipeline that
+    // stopped. `isMobile` is a viewport width, so a narrow desktop window would
+    // otherwise log every composer click as the very split being chased.
+    if (!isMobile() || !isTouchDevice()) return;
+    const touchBehind = lastTouchStartAt !== null
+      && Date.now() - lastTouchStartAt < TOUCH_BEHIND_CLICK_MS;
+    if (touchBehind) return;
+    const face = watchableFaces().find((f) => target === f || f.contains(target));
+    if (!face) return;
+    // No toast. The click RAN the button's action, so the user got what they
+    // asked for. What the line records is that they got it through the path
+    // that was still alive.
+    recordPress({
+      face: nameOf(face),
+      verdict: 'click-no-touch',
+      movedPx: 0,
+      rowRect: roundRect(watchableRow()?.getBoundingClientRect() ?? null),
+      faceRect: roundRect(face.getBoundingClientRect()),
+    });
   }, { capture: true, passive: true });
 }

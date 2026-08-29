@@ -380,9 +380,10 @@ struct QueryHardenedResponse {
 
 /// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
 /// plan was written and awaits the user's approval — what the skill records),
-/// `"planned"` (legacy/approved), or `"acknowledged_simple"` (local fix);
-/// `plan_path` accompanies the plan states, `reason` the simple one (both
-/// optional and ignored for the other kind).
+/// `"planned"` (legacy/approved), `"acknowledged_simple"` (local fix), or
+/// `"bounded_security_fix"` (an unattended run's scoped security fix).
+/// `plan_path` accompanies the plan states, `reason` the other two, and `files`
+/// the bounded fix alone (each ignored for the kinds it does not belong to).
 #[derive(Deserialize)]
 pub(super) struct MarkPlannedRequest {
     pub repo_root: String,
@@ -393,6 +394,10 @@ pub(super) struct MarkPlannedRequest {
     pub plan_path: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Repo-relative paths a `bounded_security_fix` is confined to. Must be
+    /// empty for every other state.
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 /// POST /api/v1/internal/mark-planned — invoked by `lucidos planned mark` from
@@ -400,13 +405,43 @@ pub(super) struct MarkPlannedRequest {
 /// after it writes the plan file). Records the durable Planned marker that the
 /// `cc-plan-gate` PreToolUse hook and the Apply floor read. Mirrors
 /// `mark_hardened`.
+///
+/// A rejected file list answers 400 with the rejection's own text, not 500. The
+/// caller is an agent that can fix the call, so the body has to say how. A 500
+/// reads as an engine fault and gets retried unchanged.
 pub(super) async fn mark_planned(
     State(state): State<AppState>,
     Json(body): Json<MarkPlannedRequest>,
 ) -> impl IntoResponse {
-    use crate::engine::git_ops::PlanMarkerKind;
+    use crate::engine::git_ops::{validate_plan_files, PlanMarkerKind};
     let repo_root = std::path::PathBuf::from(&body.repo_root);
-    let kind = PlanMarkerKind::parse(&body.state);
+    // Strict on the WRITE path. The lenient `parse` reads an unknown value as
+    // `planned`, which on a write would record "a human approved this" for a
+    // typo. `bounded-security-fix` is the one that matters.
+    let Some(kind) = PlanMarkerKind::parse_strict(&body.state) else {
+        let msg = format!(
+            "Unknown plan-marker state {:?}. Use one of: proposed, planned, \
+             acknowledged_simple, bounded_security_fix (snake_case, not kebab-case).",
+            body.state
+        );
+        crate::log!(
+            "[Internal] mark-planned refused for {}: {}",
+            body.branch_name,
+            msg
+        );
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    };
+    let files = match validate_plan_files(kind, &body.files) {
+        Ok(files) => files,
+        Err(rejection) => {
+            crate::log!(
+                "[Internal] mark-planned refused for {}: {}",
+                body.branch_name,
+                rejection
+            );
+            return (StatusCode::BAD_REQUEST, rejection.to_string()).into_response();
+        }
+    };
     match state
         .engine
         .record_planned(
@@ -415,6 +450,7 @@ pub(super) async fn mark_planned(
             kind,
             body.plan_path.as_deref(),
             body.reason.as_deref(),
+            &files,
             &body.head_sha,
         )
         .await
@@ -438,9 +474,12 @@ pub(super) async fn mark_planned(
 /// GET /api/v1/internal/planned-state?repo_root=...&branch_name=... — invoked by
 /// `lucidos planned state` (printing) and the `cc-plan-gate` hook (deciding).
 /// Returns `{ state: "SATISFIED" | "PROPOSED" | "MISSING", kind: "planned" |
-/// "acknowledged_simple" | "proposed" | null }`. The three-way `state` lets the
-/// hook distinguish an awaiting-approval `PROPOSED` marker (deny: "get approval,
-/// then run `planned approve`") from a `MISSING` one (deny: "run the skill").
+/// "acknowledged_simple" | "proposed" | "bounded_security_fix" | null }`. The
+/// three-way `state` lets the hook distinguish an awaiting-approval `PROPOSED`
+/// marker (deny: "get approval, then run `planned approve`") from a `MISSING`
+/// one (deny: "run the skill"). `kind` is diagnostic: the hook decides on
+/// `state` alone, and the file bound a `bounded_security_fix` carries is
+/// enforced at the Apply floor rather than here.
 pub(super) async fn query_planned(
     State(state): State<AppState>,
     Query(q): Query<QueryHardenedQuery>,
@@ -653,6 +692,7 @@ pub(super) async fn seed_change_for_test(
                 crate::engine::git_ops::PlanMarkerKind::AcknowledgedSimple,
                 None,
                 Some("seeded test change"),
+                &[],
                 "seeded",
             )
             .await

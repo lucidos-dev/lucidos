@@ -514,11 +514,18 @@ fn short(s: &str) -> String {
     s[..s.floor_char_boundary(8)].to_string()
 }
 
+/// Shorten to at most `max` CHARACTERS, appending an ellipsis when it cuts.
+///
+/// Both halves count characters. The guard counted characters, the cut took a
+/// byte index. A description in a non-Latin script lost most of its intended
+/// length: 80 bytes of Japanese is roughly 26 characters. Mirrors
+/// `reconstruct::truncate`.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    format!("{}…", &s[..s.floor_char_boundary(max)])
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
 }
 
 fn build_note(

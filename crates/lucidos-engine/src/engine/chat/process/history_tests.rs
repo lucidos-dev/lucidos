@@ -5,9 +5,12 @@
 //! the first: a user turn is never represented by a summary alone.
 
 use super::context_mode::ContextMode;
-use super::history::{render_older_region, CoveredSummary, SummaryInFlight, SummaryPlan};
+use super::history::{
+    render_older_region, speaker_label, CoveredSummary, SummaryInFlight, SummaryPlan,
+};
 use crate::core::store::{newest_conversation_summary, CachedSummary, SessionMessage};
 use crate::core::EventRow;
+use crate::engine::thread_events::AgentParticipant;
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
@@ -31,17 +34,15 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
         request_event_id: None,
         event_id: event_id.map(str::to_string),
         thread_id: None,
+        agent: None,
     }
 }
 
-/// The renderer's formatter, reduced to what these tests need to read.
+/// The renderer's formatter, reduced to what these tests need to read. The
+/// speaker name comes from the real `speaker_label`, so this double cannot
+/// drift from what a turn actually prints.
 fn format_msg(m: &SessionMessage, _verbatim: bool, _img: usize, _idx: usize) -> String {
-    let role = if m.role == "user" {
-        "User"
-    } else {
-        "Assistant"
-    };
-    format!("{}: {}", role, m.content)
+    format!("{}: {}", speaker_label(m), m.content)
 }
 
 fn render(older: &[SessionMessage], covered: Option<CoveredSummary<'_>>) -> String {
@@ -580,4 +581,45 @@ fn no_chat_turn_reads_another_threads_messages() {
          get_recent_messages: {:?}",
         offenders
     );
+}
+
+/// THE attribution invariant (ADR 0150). A guest agent's turn reaches the
+/// reasoner under the guest's own name.
+///
+/// The two failures this rules out are not symmetric. `Assistant` makes the
+/// reasoner read the turn as its own, so two models converge on whatever the
+/// first one said. `User` makes it obey an instruction the user never gave.
+#[test]
+fn a_guest_turn_renders_under_its_own_speaker_name() {
+    let mut guest = msg("assistant", "I'll look that up.", None);
+    guest.agent = Some(AgentParticipant::Guest {
+        label: "Voice".into(),
+    });
+    let line = format_msg(&guest, false, 0, 0);
+    assert_eq!(line, "Voice: I'll look that up.");
+    assert!(!line.starts_with("Assistant:"), "{line}");
+    assert!(!line.starts_with("User:"), "{line}");
+}
+
+/// Our own agent still prints `Assistant`, whether the row names it or predates
+/// the actor. Every existing transcript reads that word, so a rename here would
+/// rewrite the history of every thread.
+#[test]
+fn our_own_agent_prints_assistant_named_or_not() {
+    let unattributed = msg("assistant", "done", None);
+    let mut ours = msg("assistant", "done", None);
+    ours.agent = Some(AgentParticipant::LucidosAgent);
+    assert_eq!(format_msg(&unattributed, false, 0, 0), "Assistant: done");
+    assert_eq!(format_msg(&ours, false, 0, 0), "Assistant: done");
+}
+
+/// A user turn is a user turn whatever the actor says. Nothing an agent stamps
+/// can relabel the person's own words.
+#[test]
+fn a_user_turn_is_never_relabelled_by_an_agent_actor() {
+    let mut spoken = msg("user", "what's on today?", None);
+    spoken.agent = Some(AgentParticipant::Guest {
+        label: "Voice".into(),
+    });
+    assert_eq!(speaker_label(&spoken), "User");
 }

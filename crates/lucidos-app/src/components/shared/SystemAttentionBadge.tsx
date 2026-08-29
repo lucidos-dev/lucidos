@@ -1,14 +1,15 @@
 /**
  * The *System attention badge*, drawn wherever the path into Settings > System
  * passes: the menu-drawer button, that drawer's Settings row, the Settings
- * home's System row, and the two System tabs that can owe something.
+ * home's System row, and the two System submenu rows that can owe something.
  *
  * It renders nothing when the workspace owes nothing, and nothing holds its
  * space, so no row moves as it comes and goes. The rule and the words are in
  * `store/systemAttentionBadge.ts`.
  *
- * **Each host passes the read it wants.** Upstream of the tabs one mark stands
- * for both causes, so those hosts pass the union. A TAB passes its own half.
+ * **Each host passes the read it wants.** Upstream of the split one mark stands
+ * for both causes, so those hosts pass the union. A submenu ROW passes the half
+ * its own page owes.
  *
  * **The mark is decorative, and the HOST says the words.** Off-screen text here
  * would land in `textContent`, fused with the label ("Settings1 thing to do").

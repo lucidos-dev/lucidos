@@ -319,6 +319,23 @@ pub fn detect_tailscale_ipv4() -> Option<String> {
     lucidos_tailscale::tailnet_ipv4().map(|ip| ip.to_string())
 }
 
+/// Install the one rustls crypto provider this crate uses.
+///
+/// **Nothing that opens a TLS connection works before this runs.** Several
+/// crates in the tree enable rustls' `aws-lc-rs` feature and several enable
+/// `ring`, so rustls refuses to pick one and panics at the first handshake.
+/// `reqwest` never hits it, because its own feature set builds a config per
+/// client. A bare `connect_async` does.
+///
+/// Idempotent. An `Err` means somebody already installed one, which is the
+/// outcome this wants: a second caller must not panic just for asking.
+///
+/// Call it from every entry point that reaches the network, including a test
+/// that does. The engine binary calls it first thing in `run`.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

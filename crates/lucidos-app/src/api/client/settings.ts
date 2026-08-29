@@ -37,7 +37,8 @@ export function listCredentials(): Promise<CredentialsListResponse> {
 
 export function createCredential(body: {
   service_name: string;
-  base_url: string;
+  /** The *credential scope*: every base URL the credential may be sent to. */
+  base_urls: string[];
   auth_type: AuthType;
   auth_value: string;
   /** Override the default `CRED_<NAME>` env var name. */
@@ -86,7 +87,7 @@ export function deletePreference(key: string): Promise<ApiResult> {
   return json(`${API}/preferences?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
 }
 
-// --- Network access (per-workspace engine bind; Settings → System) ---
+// --- Network access (per-workspace engine bind; Settings → Access) ---
 export function getNetworkConfig(): Promise<NetworkConfigResponse> {
   return json(`${API}/network-config`);
 }
@@ -119,7 +120,8 @@ export interface EmailAccountSettings {
 }
 
 export interface UpdateCredentialBody {
-  base_url: string;
+  /** The *credential scope*: every base URL the credential may be sent to. */
+  base_urls: string[];
   auth_type: AuthType;
   auth_header: string;
   /** Omitted / empty keeps the currently-stored secret. */
@@ -419,17 +421,55 @@ export async function getBackupProviders(): Promise<BackupProviderInfo[]> {
   return json(`${API}/backup/providers`);
 }
 
+/** Mint a one-shot token for the two key routes below. Step one of two.
+ *
+ *  The backup key takes the same shape as a credential reveal (ADR 0117): the
+ *  token lives 30 seconds, dies on use, and is bound to this one secret. It
+ *  takes no id, because a workspace has exactly one backup key. */
+async function mintBackupKeyRevealToken(): Promise<string> {
+  const { token } = await json<{ token: string; expires_in_secs: number }>(
+    `${API}/backup/key/reveal-token`,
+    { method: 'POST' }
+  );
+  return token;
+}
+
+/** Run one mint-then-spend round trip, retrying the pair once on a 403.
+ *
+ *  A spent token is a state only this function can recover from. The service
+ *  worker re-issues a request whose response was lost (`fetchWithRetry` in
+ *  `public/sw.js`), and the server already redeemed the token on the attempt
+ *  that vanished. So the retry that exists to rescue a flaky connection would
+ *  otherwise turn one into a hard failure. Re-minting is exactly what a second
+ *  click would do, and one retry means a real refusal still surfaces. */
+async function withBackupKeyToken(
+  spend: (token: string) => Promise<BackupKeyResponse>
+): Promise<BackupKeyResponse> {
+  const once = async () => spend(await mintBackupKeyRevealToken());
+  try {
+    return await once();
+  } catch (err) {
+    if (err instanceof ApiError && err.httpCode === 403) return once();
+    throw err;
+  }
+}
+
 /** Reveal the EXISTING backup key. Read-only — throws `ApiError` 404 when no key
  *  has been generated yet (call `generateBackupKey` for that). Never mints a key. */
 export async function getBackupKey(): Promise<BackupKeyResponse> {
-  return json(`${API}/backup/key`);
+  return withBackupKeyToken((token) =>
+    json(`${API}/backup/key?token=${encodeURIComponent(token)}`));
 }
 
 /** Generate the backup key if none exists yet, then return it. Idempotent on the
  *  engine: if a key already exists it's returned unchanged (`is_new: false`), so
- *  this can never overwrite the key that protects existing backups. */
+ *  this can never overwrite the key that protects existing backups.
+ *
+ *  That idempotence is why it spends a token too. On a workspace that already
+ *  has a key, this route hands back the same plaintext the reveal does. */
 export async function generateBackupKey(): Promise<BackupKeyResponse> {
-  return json(`${API}/backup/key`, { method: 'POST' });
+  return withBackupKeyToken((token) =>
+    json(`${API}/backup/key?token=${encodeURIComponent(token)}`, { method: 'POST' }));
 }
 
 export interface BackupKeyExists {

@@ -36,7 +36,7 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
     if (!secret.trim()) return;
     setSaving(true);
     try {
-      const ok = await submitNewCredential(service, baseUrl, 'api_key', secret.trim());
+      const ok = await submitNewCredential(service, [baseUrl], 'api_key', secret.trim());
       if (ok) setSecret('');
     } finally {
       setSaving(false);

@@ -263,6 +263,73 @@ else
 fi
 rm -rf "$PREFIX"
 
+# ── INTEGRATION: --force never leaves the SHARED runtime missing ─────────────
+echo ""
+echo "test: a --force re-extract keeps the shared runtime present the whole way"
+# Every registered instance's service runs <prefix>/runtime/current/<binary>, so
+# the old code's "rm -rf then untar" left those binaries gone for the length of
+# the extract and a KeepAlive respawn inside that window failed. The extract now
+# stages beside the live tree and swaps. Two things to hold: the tree is never
+# absent on the happy path, and a swap that fails restores the previous one.
+PREFIX="$(mktemp -d)"
+RUNTIME="$PREFIX/runtime/$STEM"
+bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch >/dev/null 2>&1
+printf 'old\n' > "$RUNTIME/.generation"
+out="$(bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch --force 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ -x "$RUNTIME/lucidos-gateway" ] && [ ! -e "$RUNTIME/.generation" ]; then
+    pass "--force swapped in a fresh runtime"
+else
+    fail "expected a clean swap (rc=$rc): $out"
+fi
+# No staging or rollback residue is left under runtime/.
+leftovers="$(find "$PREFIX/runtime" -maxdepth 1 -name '.staging-*' -o -maxdepth 1 -name '.previous-*' 2>/dev/null)"
+if [ -z "$leftovers" ]; then pass "left no .staging-/.previous- residue"; else fail "residue: $leftovers"; fi
+rm -rf "$PREFIX"
+
+echo ""
+echo "test: a --force whose swap cannot complete restores the previous runtime"
+# The rollback arm. Forcing the failure needs care: making the runtime parent
+# read-only fails the EARLIER `mkdir -p "$staging"`, so the run dies before it
+# has moved anything and the test passes without reaching the rollback at all.
+# Shim `mv` instead, and fail only the first move whose destination is the live
+# runtime dir. That is the staging swap; the rollback move that follows has the
+# same destination, so the shim is one-shot and lets it through.
+PREFIX="$(mktemp -d)"
+RUNTIME="$PREFIX/runtime/$STEM"
+bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch >/dev/null 2>&1
+printf 'original\n' > "$RUNTIME/.generation"
+MVBIN="$(mktemp -d)"; MVFIRED="$MVBIN/fired"
+# Quoted heredoc, and the three values arrive as env vars rather than being
+# baked in: nothing in the shim body may expand HERE, and taking them from the
+# environment says so without a suppression.
+cat > "$MVBIN/mv" <<'MV_SHIM'
+#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+if [ "$last" = "$SHIM_TARGET" ] && [ ! -f "$SHIM_FIRED" ]; then
+    : > "$SHIM_FIRED"
+    exit 1
+fi
+exec "$SHIM_REAL_MV" "$@"
+MV_SHIM
+chmod +x "$MVBIN/mv"
+# Resolve the real `mv` BEFORE the shim is on PATH. Doing it in the assignment
+# prefix resolves it through the prepended PATH, so the shim execs itself and
+# the run hangs.
+SHIM_REAL_MV="$(command -v mv)"; export SHIM_REAL_MV
+out="$(PATH="$MVBIN:$PATH" SHIM_TARGET="$RUNTIME" SHIM_FIRED="$MVFIRED" \
+        bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --no-launch --force 2>&1)"; rc=$?
+# Assert the shim actually fired, or the two checks below prove nothing: that is
+# how the first version of this test passed while never reaching the rollback.
+if [ -f "$MVFIRED" ]; then pass "the swap really did fail (shim fired)"; else fail "the shim never fired, so the rollback was not exercised: $out"; fi
+if [ $rc -ne 0 ]; then pass "a failed swap exits non-zero"; else fail "a failed swap reported success: $out"; fi
+if [ -x "$RUNTIME/lucidos-gateway" ] && [ -e "$RUNTIME/.generation" ]; then
+    pass "the previous runtime is restored for the running services"
+else
+    fail "the shared runtime went missing on a failed swap: $out"
+fi
+rm -rf "$PREFIX" "$MVBIN"
+
 # ── INTEGRATION: --from-tarball tamper → fail closed ─────────────────────────
 echo ""
 echo "test: --from-tarball with a tampered tarball fails closed"

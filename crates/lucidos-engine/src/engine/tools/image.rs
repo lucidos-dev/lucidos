@@ -443,15 +443,12 @@ impl LucidosEngine {
             let img = self.resolve_thread_image(reference, thread_id).await?;
             Ok(base64::engine::general_purpose::STANDARD.decode(&img.base64)?)
         } else {
-            // Artifact path — read from data/ directory
-            if crate::api::is_path_traversal(reference) {
-                return Err(format!(
-                    "Invalid image path (must not contain '..' or start with '/' or '\\'): {}",
-                    reference
-                )
-                .into());
-            }
-            let full_path = self.workspace_path.join("data").join(reference);
+            // Through `resolve_data_path`, never a bare `data/`-join. The join
+            // took any traversal-free name, so `.env` read the workspace's
+            // gitignored secrets and shipped them to the image provider.
+            // Normalization refuses the loose `data/` root and defaults a bare
+            // name under `artifacts/`, which is what this tool advertises.
+            let (_, full_path) = self.resolve_data_path(reference)?;
             if !full_path.exists() {
                 return Err(format!("Image file not found: {}", reference).into());
             }

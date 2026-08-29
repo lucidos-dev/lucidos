@@ -40,7 +40,7 @@ function releaseCheckOf(
   };
 }
 
-// The persistent Settings → System surface reads these, so the tests assert on
+// The persistent System > Overview surface reads these, so the tests assert on
 // the values that page would actually render. A `.value` box is all the action
 // touches, and it avoids importing the real store (and its whole dependency
 // graph) into a unit test.
@@ -498,7 +498,7 @@ describe('checkAppUpdateViaClient', () => {
     expect(mocks.showToast).not.toHaveBeenCalled();
   });
 
-  // The toast is transient; Settings → System is the surface that persists, so
+  // The toast is transient; System > Overview is the surface that persists, so
   // the outcome has to be RECORDED, not just announced.
   it('records the available version for the persistent System surface', async () => {
     mocks.checkAppUpdate.mockResolvedValue(offer('0.16.0'));
@@ -611,7 +611,7 @@ describe('refreshReleaseCheck', () => {
     const opts = lastToastOpts() as { action: { label: string; onClick: () => void } };
     expect(opts.action.label).toBe('How to update');
     opts.action.onClick();
-    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system-overview');
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
   });
 
@@ -627,7 +627,7 @@ describe('refreshReleaseCheck', () => {
   });
 
   // A headless install updates by re-running the installer, so the toast routes
-  // to Settings, System, which is where the composed command is shown.
+  // to System > Overview, which is where the composed command is shown.
   it('routes a headless install to the page carrying its command', async () => {
     mocks.isTauri.mockReturnValue(false);
     mocks.requestUpdateCheck.mockResolvedValue(
@@ -641,7 +641,7 @@ describe('refreshReleaseCheck', () => {
     const opts = lastToastOpts() as { action: { label: string; onClick: () => void } };
     expect(opts.action.label).toBe('How to update');
     opts.action.onClick();
-    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system-overview');
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
   });
 
@@ -1015,9 +1015,12 @@ describe('followUpdateRoute', () => {
 
   // Landing on the page is not enough: the installer command, the update button
   // and the rebuild control all live in Maintenance, further down it.
-  it('lands on the Maintenance section on the guide route', async () => {
+  //
+  // The page is `system-overview`, never `system`. `system` is the System
+  // submenu, a list of rows, and a Maintenance anchor there scrolls to nothing.
+  it('lands on the Maintenance section of Overview on the guide route', async () => {
     await followUpdateRoute('guide');
-    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system');
+    expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system-overview');
     expect(storeSignals.settingsScrollTarget.value).toBe('system:maintenance');
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
   });

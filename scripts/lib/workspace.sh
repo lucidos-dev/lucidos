@@ -1348,6 +1348,61 @@ wait_for_engine_shutdown() {
     return 1
 }
 
+# ── select_stale_dev_script_pids ────────────────────────────────────────
+# Print the PIDs of dev-script processes belonging to THIS workspace.
+#
+# CRITICAL: match the SCRIPT PATH token, never a substring of the whole
+# command line. `pgrep -f '<name>\.sh.*$WORKSPACE'` matches the phrase
+# ANYWHERE in a process's argv, and a coding agent carries the engine's thread
+# history inside a roughly 22 KB `--append-system-prompt` argument. Any thread
+# quoting a dev script and then this workspace path became a kill candidate,
+# and the caller sends `pkill -P` plus a SIGTERM, so it takes the session's
+# children with it. Same class as ADR 0025's webkit reaper, and as
+# `select_cargo_lock_holders` below.
+#
+# A shell script's argv[0] is the interpreter, so the script path is argv[1].
+# Testing that ONE token keeps `bash -c '<text naming web-dev.sh>'` out of
+# scope, because its argv[1] is `-c`. Only after that token matches is the
+# workspace path looked for in the remaining arguments.
+
+# ── _dev_script_list_processes ──────────────────────────────────────────
+# The one process listing the selector below samples. A test overrides it to feed
+# synthetic rows, exactly as `webkit_reaper.sh` does. Keep it a seam: every row
+# it emits becomes a `pkill -P` plus a `kill`, so a test that reached the real
+# `ps` would aim those at the host.
+_dev_script_list_processes() {
+    ps -Aww -o pid=,command= 2>/dev/null
+}
+
+select_stale_dev_script_pids() {
+    local pid argv0 argv1 rest script
+    _dev_script_list_processes | while read -r pid argv0 argv1 rest; do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        [ "$pid" -le 1 ] && continue
+        [ "$pid" = "$$" ] && continue
+        # argv[0] is the script when it was exec'd through its own shebang, and
+        # the interpreter when it was invoked as `bash scripts/web-dev.sh`.
+        script="$argv0"
+        case "${argv0##*/}" in
+            bash|sh|zsh|dash) script="$argv1" ;;
+        esac
+        case "${script##*/}" in
+            dev.sh|web-dev.sh|tauri-dev.sh) ;;
+            *) continue ;;
+        esac
+        case "$argv1 $rest" in
+            *"$WORKSPACE"*) ;;
+            *) continue ;;
+        esac
+        # Backstop for a matcher that ever broadens again: never signal another
+        # workspace's live engine or an ancestor of this process.
+        if command -v is_protected_host_pid >/dev/null 2>&1 && is_protected_host_pid "$pid"; then
+            continue
+        fi
+        printf '%s\n' "$pid"
+    done
+}
+
 # ── kill_stale_processes ────────────────────────────────────────────────
 # Kill stale dev script processes and old frontend for this workspace.
 # With -b: also kills the engine (need fresh build). Without -b: leaves
@@ -1370,7 +1425,7 @@ kill_stale_processes() {
             pkill -P "$stale_pid" 2>/dev/null || true
             kill "$stale_pid" 2>/dev/null || true
             killed=1
-        done < <(pgrep -f "(dev|web-dev|tauri-dev)\\.sh.*$WORKSPACE" 2>/dev/null || true)
+        done < <(select_stale_dev_script_pids)
     fi
 
     # Gateway-mode --engine-only (ADR 0014): leave the shared gateway AND this
@@ -1977,8 +2032,10 @@ network_toml_exists() {
 }
 
 # Bind for a directly-launched engine (start_engine): legacy no-gateway dev,
-# tauri-dev, and e2e. Nothing authenticates this port, so widening it is a
-# deliberate act by the developer, never a launch-script default.
+# tauri-dev, and e2e. Loopback is what makes this port safe to serve
+# unauthenticated, so widening it is a deliberate act by the developer, never a
+# launch-script default. Widened, the engine asks every caller for the local
+# token (ADR 0155), which a browser cannot present.
 #
 # e2e pins loopback instead of deferring, because both suites address the engine
 # as `localhost` and must not inherit a developer's tailnet bind.
@@ -2013,10 +2070,10 @@ apply_dev_gateway_bind() {
 # Sets ENGINE_PID.
 start_engine() {
     # Direct-front launch (legacy no-gateway dev, tauri-dev, e2e): the engine IS
-    # the user-facing door on its own port, and nothing authenticates it. So it
-    # stays on loopback unless the developer widens it deliberately. The gateway
-    # path does NOT use this function. It spawns engines itself with the right
-    # bind (see gateway stack.rs spawn_engine).
+    # the user-facing door on its own port. On loopback it serves every local
+    # caller without a credential, so it stays there unless the developer widens
+    # it deliberately. The gateway path does NOT use this function. It spawns
+    # engines itself with the right bind (see gateway stack.rs spawn_engine).
     apply_dev_engine_bind
 
     # Check if an existing engine is already healthy on our port
@@ -2690,7 +2747,7 @@ build_frontend_oneshot() {
     # Drop the atomic-publish scratch dirs a prior `vite build --watch` may have
     # left in this checkout; a plain `vite build` (no LUCIDOS_ATOMIC_DIST) empties
     # and writes dist/ itself, so dist/ is left for vite to manage.
-    rm -rf "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
+    rm -rf "${FRONTEND_DIR:?}/dist.staging" "$FRONTEND_DIR/dist.prev"
     (cd "$FRONTEND_DIR" && npx vite build) || {
         echo "ERROR: frontend build failed" >&2
         exit 1
@@ -2759,7 +2816,7 @@ start_frontend_built() {
         # each build builds into dist.staging and renames it onto dist/ only after a
         # complete build, so a failed/interrupted rebuild can't leave the engine
         # serving a shell-less dist/ (the "404 on every page" failure mode).
-        rm -rf "$FRONTEND_DIR/dist" "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
+        rm -rf "${FRONTEND_DIR:?}/dist" "$FRONTEND_DIR/dist.staging" "$FRONTEND_DIR/dist.prev"
         # dev-build-watch.mjs runs a clean `vite build` (fresh process, no
         # incremental cache → no stale-CSS wedge) on every change, setting
         # LUCIDOS_ATOMIC_DIST for each child build itself. Output goes to a log

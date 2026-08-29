@@ -229,6 +229,33 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "voice_enabled",
+        label: "Voice (experimental)",
+        scope: PrefScope::Global,
+        value: PrefValue::Bool,
+        default: "false",
+        description: "Off by default. When 'true', a thread can be called and spoken to: the composer grows a call control and /api/v1/voice accepts a socket. Experimental. It rents a speech-to-speech talker from OpenAI and needs that provider configured, and every spoken utterance starts an ordinary agent turn, so a short call can cost several turns. With this off nothing voice-shaped is reachable and the other voice keys do nothing.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "model_voice_talker",
+        label: "Voice talker model",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "gpt-realtime",
+        description: "Speech-to-speech model a voice session speaks through. It holds the conversation and nothing else: it has no tools and can change nothing, so every action still goes through the ordinary agent. Not a chat-model registry row, because a realtime model cannot serve an ordinary turn.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
+        key: "voice_resident_sections",
+        label: "Voice resident sections",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "who-and-where,this-thread,workspace-shape",
+        description: "Comma-separated ids of what a voice session loads at the start of a call. That block is the whole of what voice answers with no wait, since the talker cannot look anything up. Ids today: who-and-where, this-thread, workspace-shape. An unknown id is ignored.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "reasoning_conversation_summary",
         label: "Conversation-summary reasoning",
         scope: PrefScope::Global,
@@ -323,7 +350,6 @@ pub const CATALOG: &[PrefSpec] = &[
         value: PrefValue::Bool,
         default: "false",
         description: "EXPERIMENTAL, off by default. When 'true', a chat or trigger thread runs the self-curated context mode. Tool results are then swept away in batches: every ten rounds the sweep takes everything more than five rounds old, and the call that made each one leaves with it. Nothing stands in their place, and doing nothing holds a result until the sweep. The agent keeps its picture of the job in a working understanding it writes as ordinary text in its own reply, and holds one item longer by naming its evt-<hex> address under a [KEEP OPEN] heading there. A context panel rides at the tail of every round, stating how full the prompt is, what each item costs and how long it has left. Everything else rides as it always did, except that the previous turn's tool calls are not re-sent, the conversation summariser does not run, and `todo_write` is withdrawn because the checklist moved into the same block. Coding-agent threads are unaffected. The risk is a re-fetch: a result the agent needed and did not write down costs a round to read back. Leave it off unless the user asked for it.",
-
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {

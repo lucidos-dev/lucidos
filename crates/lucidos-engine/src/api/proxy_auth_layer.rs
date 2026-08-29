@@ -54,6 +54,47 @@ pub struct AuthMutation {
     pub outputs: Value,
 }
 
+/// What must cover the outbound URL before a layer's secret may travel.
+///
+/// Every layer declares one per secret it puts on the wire.
+/// `proxy::ScopedPipeline::bind` is the only place they are checked, and
+/// `dispatch_with_layers` accepts nothing else. So a new layer cannot reach
+/// the network without answering (ADR 0144 decision 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeBinding {
+    /// A stored credential. Its own recorded `base_url` is the scope, which is
+    /// what Settings edits and what `core::git_auth` already enforces.
+    StoredCredential(String),
+    /// A handshake script that mints its own token. No stored credential speaks
+    /// for it, so the scope is the one recorded against the script in
+    /// `.lucidos/approved-handshake-scripts`, outside anything `PUT
+    /// /api/v1/data/*path` can write. Carries the record key, not the
+    /// `apis.json` spelling.
+    HandshakeScript(String),
+    /// The secrets an `apis.json` entry asks the engine to inject into a
+    /// handshake script.
+    ///
+    /// **This is not `StoredCredential` in disguise.** A handshake credential
+    /// never reaches the entry's `base_url`: the engine puts it in the script's
+    /// environment, and the script presents it to whichever token endpoint it
+    /// was written for. So the credential's own scope answers a question about
+    /// a request that does not happen, and it refuses every ordinary OAuth
+    /// handshake.
+    ///
+    /// What an attacker can actually do is rewrite the entry to name a
+    /// different secret, and collect whatever the approved script does with it.
+    /// That is what this binds, in the same record and on the same terms as the
+    /// scope. Carries the script's record key, not the `apis.json` spelling.
+    HandshakeInjects {
+        script: String,
+        injects: std::collections::BTreeSet<String>,
+    },
+    /// A secret the engine paired with a fixed upstream when it resolved the
+    /// target, from an input no API caller can write. That upstream is the
+    /// scope. `what` names the secret for the refusal message.
+    Pinned { what: String, base_url: String },
+}
+
 /// Whether a layer wants the pipeline to retry once after a 401.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RetryHint {
@@ -70,6 +111,14 @@ pub trait AuthLayer: Send + Sync {
     /// the key in downstream layers' `prior_layer_outputs`). Must be unique
     /// within a pipeline.
     fn output_namespace(&self) -> &str;
+
+    /// Every secret this layer will put on the wire, and what binds each one
+    /// to a host.
+    ///
+    /// Deliberately has no default body. A new layer has to state its answer,
+    /// and an empty vector is that answer written down rather than one nobody
+    /// made. `layer_bindings_are_declared_not_defaulted` pins the absence.
+    fn scope_bindings(&self) -> Vec<ScopeBinding>;
 
     /// On 401 from upstream, should the pipeline blow away this layer's
     /// cache (if any) and retry once?
@@ -108,5 +157,22 @@ mod tests {
     #[test]
     fn retry_hint_default_is_never() {
         assert_eq!(RetryHint::default(), RetryHint::Never);
+    }
+
+    /// The gate works because a layer cannot stay silent. A default body here
+    /// would let a new layer inherit "nothing binds me" with nobody deciding.
+    /// That is how two arms drifted (ADR 0144 decision 4).
+    #[test]
+    fn layer_bindings_are_declared_not_defaulted() {
+        let source = include_str!("proxy_auth_layer.rs");
+        let after = source
+            .split("fn scope_bindings(&self)")
+            .nth(1)
+            .expect("the trait method must exist");
+        let signature = after.lines().next().unwrap_or_default();
+        assert!(
+            signature.trim_end().ends_with("-> Vec<ScopeBinding>;"),
+            "scope_bindings must have no default body, found: {signature}"
+        );
     }
 }

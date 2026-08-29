@@ -132,6 +132,44 @@ describe('a long toast body cannot swallow the viewport', () => {
   });
 
   /**
+   * The heading ends on a line boundary, never through the middle of one.
+   *
+   * The reported 503 card showed its title, then the TOP HALVES of the glyphs
+   * on the next line, then the sections. Flex had squeezed the heading to make
+   * room for `.toast-sections`. It has no reason to stop shrinking on a whole
+   * line, so the line carrying the actual error was sheared away.
+   *
+   * Two declarations answer it, and the assertion is that they agree. The
+   * heading hands the squeeze down to the sections box, and its own ceiling is
+   * a whole multiple of the line height it declares. A literal `1.4` restated
+   * in the `max-height` would keep passing while the line height moved out from
+   * under it. That is the one way the cap stops dividing.
+   */
+  it('bounds the heading in whole lines, and hands the squeeze downwards', () => {
+    const heading = block(componentsCss, '.toast-heading {');
+
+    // `flex: 0 0 auto`, i.e. shrink 0: a scroll box that cannot be squeezed
+    // cannot be squeezed to a fraction of a line.
+    expect(decl(heading, 'flex')).toBe('0 0 auto');
+
+    const lineHeight = decl(heading, 'line-height');
+    expect(lineHeight, 'a `normal` line height varies by font, so nothing divides')
+      .toBe('var(--toast-line-height)');
+
+    // Whole lines: `calc(<integer>em * <that same var>)`.
+    const maxHeight = decl(heading, 'max-height');
+    expect(maxHeight).toMatch(/^calc\(\d+em \* var\(--toast-line-height\)\)$/);
+
+    // And the var it multiplies is really declared on the card above it.
+    expect(decl(block(componentsCss, '.toast {'), '--toast-line-height')).not.toBeNull();
+
+    // The sections box is what absorbs the squeeze the heading refuses.
+    const sections = block(componentsCss, '.toast-sections {');
+    expect(decl(sections, 'flex')).toBe('1 1 auto');
+    expect(decl(sections, 'min-height')).toBe('0');
+  });
+
+  /**
    * The scroll box reserves nothing on its right, so its scrollbar lands in the
    * card's right rail instead of inside the text column.
    *

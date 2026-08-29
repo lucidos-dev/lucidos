@@ -224,13 +224,23 @@ source "$SCRIPT_DIR/lib/resource_contract.sh"
 BUNDLED_EXECUTABLES=($(resource_contract_executables))
 # shellcheck disable=SC2207
 RESOURCE_NAMES=($(resource_contract_names))
-# Hardened-runtime capabilities claimed by the OUTER .app signature, and by
-# nothing else in the bundle. Today that is the camera, which the composer's
-# Camera item reaches through getUserMedia in the WKWebView: the release path
+# Hardened-runtime capabilities claimed by the OUTER .app signature. Today those
+# are the camera and the microphone, which the composer's Camera item and its
+# call toggle reach through getUserMedia in the WKWebView: the release path
 # signs with --options runtime, and the hardened runtime denies capture to a
 # binary that doesn't claim it, whatever Info.plist says. The file itself
-# documents why it stays minimal and why the loose Mach-O files never get it.
+# documents why it stays minimal.
 APP_ENTITLEMENTS="$APP_DIR/Entitlements.plist"
+# Claimed by Contents/Resources/lucidos-engine, and by nothing else. The engine
+# is a SEPARATE PROCESS the gateway spawns, so the outer signature above never
+# governs it: entitlements are per binary. It embeds wasmtime and executes code
+# it compiled, which the hardened runtime kills unless the binary says so. Every
+# other loose Mach-O still gets none. See the file, and
+# docs/plans/2026-08-29-the-packaged-engine-is-allowed-to-jit.md.
+ENGINE_ENTITLEMENTS="$APP_DIR/EngineEntitlements.plist"
+# The one bundled executable that runs Wasm, and therefore the one that carries
+# entitlements and gets the post-signing selftest.
+JIT_EXECUTABLE="lucidos-engine"
 
 PG_VERSION="${PG_VERSION:-18.4.0}"   # match the dev/docker stack (pgvector/pgvector:pg18)
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-0.8.2}"
@@ -2727,17 +2737,32 @@ sign_app_bundle() {
 
     [ "${#macho_files[@]}" -gt 0 ] || die "no Mach-O binaries found inside $app"
 
+    # The engine is the ONE loose file that gets entitlements, selected by exact
+    # basename so a path merely containing the word cannot pick them up. Missing
+    # file is fatal for the same reason the outer one is: signing without it
+    # produces a bundle that looks perfect and dies on its first signer call.
+    [ -f "$ENGINE_ENTITLEMENTS" ] || die "expected entitlements at $ENGINE_ENTITLEMENTS"
+
     step "Signing ${#macho_files[@]} Mach-O binaries inside-out with $identity"
+    local -a per_file=()
     for path in "${macho_files[@]}"; do
-        codesign --force ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$path" \
+        # Reassigned rather than declared per iteration: a bare `[ … ] && x`
+        # list returns non-zero on every non-engine file, which `set -e` would
+        # read as the loop failing.
+        per_file=()
+        if [ "$(basename "$path")" = "$JIT_EXECUTABLE" ]; then
+            per_file=(--entitlements "$ENGINE_ENTITLEMENTS")
+        fi
+        codesign --force ${per_file[@]+"${per_file[@]}"} \
+            ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$path" \
             || die "codesign failed for $path"
     done
 
     # Sign the outer .app LAST. Keep --deep as belt-and-suspenders (re-seals any
     # nested bundle), but the loose payload above is what makes notarization pass.
     #
-    # --entitlements lands HERE and only here. The ~200 files above capture
-    # nothing, and least privilege is the whole point of the file; the bundle
+    # This entitlements file lands HERE and only here. The ~200 remaining files
+    # capture nothing, and least privilege is the whole point of it; the bundle
     # carries no nested bundles, frameworks or XPC services, so --deep has
     # nothing to propagate it to either. Missing file is fatal rather than
     # skipped: silently signing without it is exactly how the shipped app ended
@@ -2753,21 +2778,46 @@ sign_app_bundle() {
     codesign --verify --deep --strict --verbose=2 "$app" \
         || die "codesign --verify failed for $app"
 
-    # Prove BOTH halves the camera needs are on the bundle, at the one point in
-    # the build where both exist. The failure they guard is silent: a perfectly
-    # signed, perfectly notarized app whose Camera item opens a black rectangle
-    # and never errors, because getUserMedia waits forever on a consent prompt
-    # that cannot be shown. Read back from the artifact rather than trusting the
-    # arguments above, since either half can also be lost upstream (a dropped
-    # Tauri plist merge, an entitlements file that parsed to nothing).
+    # Prove BOTH halves of every capture device are on the bundle, at the one
+    # point in the build where both exist. The failure they guard is silent: a
+    # perfectly signed, perfectly notarized app whose Camera item opens a black
+    # rectangle and whose call toggle never connects, neither of them erroring,
+    # because getUserMedia waits forever on a consent prompt that cannot be
+    # shown. Read back from the artifact rather than trusting the arguments
+    # above, since either half can also be lost upstream (a dropped Tauri plist
+    # merge, an entitlements file that parsed to nothing).
     local entitlements
     entitlements="$(codesign -d --entitlements - "$app" 2>&1 || true)"
     case "$entitlements" in
         *com.apple.security.device.camera*) ;;
         *) die "signed $app carries no camera entitlement (from $APP_ENTITLEMENTS)" ;;
     esac
+    case "$entitlements" in
+        *com.apple.security.device.audio-input*) ;;
+        *) die "signed $app carries no audio-input entitlement (from $APP_ENTITLEMENTS)" ;;
+    esac
     plutil -extract NSCameraUsageDescription raw "$app/Contents/Info.plist" >/dev/null 2>&1 \
         || die "$app/Contents/Info.plist has no NSCameraUsageDescription (from $APP_DIR/Info.plist)"
+    plutil -extract NSMicrophoneUsageDescription raw "$app/Contents/Info.plist" >/dev/null 2>&1 \
+        || die "$app/Contents/Info.plist has no NSMicrophoneUsageDescription (from $APP_DIR/Info.plist)"
+
+    # The engine's own claim, read back from the engine's own signature. The
+    # cheaper of the two engine checks, and the one that names the plist a
+    # future reader has to edit. It also catches the outer signature quietly
+    # acquiring the key, which would widen what the app may do for no reason.
+    local engine_entitlements
+    engine_entitlements="$(codesign -d --entitlements - "$resources/$JIT_EXECUTABLE" 2>&1 || true)"
+    case "$engine_entitlements" in
+        *com.apple.security.cs.allow-unsigned-executable-memory*) ;;
+        *) die "signed $resources/$JIT_EXECUTABLE may not execute compiled code \
+(expected the key in $ENGINE_ENTITLEMENTS)" ;;
+    esac
+    case "$entitlements" in
+        *com.apple.security.cs.allow-*)
+            die "the outer $app claims a code-execution entitlement; it belongs \
+on $JIT_EXECUTABLE alone (see $ENGINE_ENTITLEMENTS)" ;;
+    esac
+
     for bin in "${BUNDLED_EXECUTABLES[@]}"; do
         codesign --verify --strict --verbose=2 "$resources/$bin" \
             || die "codesign --verify failed for $resources/$bin"
@@ -2778,6 +2828,27 @@ sign_app_bundle() {
                 || die "codesign --verify failed for $path"
         fi
     done
+
+    # LAST, and that placement is the point: prove the engine can run Wasm using
+    # the bytes this function is about to hand back. The readback above proves
+    # what the plist asked for; only running it proves the kernel agreed, and
+    # only running it HERE proves that of the artifact that ships.
+    #
+    # Every step above can write to the engine file. `codesign --deep` is
+    # documented not to touch a loose Mach-O, and this does not depend on that
+    # holding. The engine compiles a signer module on the proxy auth path, and
+    # 2026.08.28.0 shipped a bundle the hardened runtime SIGKILLed the instant it
+    # did so, once per turn, forever.
+    #
+    # A signal prints nothing and shows up only as a status over 128, which is
+    # the exact shape of that defect, so the status is reported.
+    step "Running the engine's wasm JIT selftest against the signed binary"
+    local selftest_rc=0
+    "$resources/$JIT_EXECUTABLE" --wasm-selftest || selftest_rc=$?
+    [ "$selftest_rc" -eq 0 ] || die "$resources/$JIT_EXECUTABLE failed \
+--wasm-selftest (exit $selftest_rc). Over 128 is a signal, which means the \
+hardened runtime killed it: the signature is missing what $ENGINE_ENTITLEMENTS \
+claims."
 }
 
 # repack_updater_payload: rebuild Lucidos.app.tar.gz from the app we just signed,

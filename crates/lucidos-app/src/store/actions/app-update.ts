@@ -165,7 +165,7 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
  *
  *  Best-effort (frontend.md carve-out): this runs at startup without user intent,
  *  and a failed subscription costs the narration, not the update — the install
- *  action's own error toast and Settings → System still report outcomes. It
+ *  action's own error toast and System > Overview still report outcomes. It
  *  leaves itself unsubscribed on failure, so the next mount retries. */
 export function startAppUpdateProgress(): void {
   if (!isTauri()) return;
@@ -214,7 +214,7 @@ export async function refreshReleaseCheck(force = false): Promise<UpdateCheckVer
   } catch (e) {
     // No gateway (a direct engine port), an older one with no such route, or a
     // transient blip. Leaves the last known answer standing and the next resume
-    // retries. Settings → System falls back to the client check while the
+    // retries. System > Overview falls back to the client check while the
     // gateway announces nothing at all.
     console.warn('[app-update] gateway release check unavailable; retried on next resume', e);
     const reason = errorDetail(e);
@@ -283,8 +283,9 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
  *
  *  - `install`: take it here. A Tauri client fronting a bundle.
  *  - `check`: no offer yet, and this session has a check it can run.
- *  - `guide`: the answer is on Settings, System. It carries the installer
- *    command for a headless install, and the rebuild for a source checkout. */
+ *  - `guide`: the answer is on Settings, System, Overview. It carries the
+ *    installer command for a headless install, and the rebuild for a source
+ *    checkout. */
 export type UpdateRoute = 'install' | 'check' | 'guide';
 
 /** Could this session install an offer, if one existed?
@@ -344,9 +345,11 @@ export function updateControlLabel(route: UpdateRoute, checking: boolean): strin
 
 /** Do what a route says. The click behind every label above.
  *
- *  `guide` lands on Settings, System and scrolls to Maintenance, which is where
- *  the installer command, the update button and the rebuild control all live.
- *  Nothing else in the app holds the whole account of how an install updates. */
+ *  `guide` lands on System > Overview and scrolls to Maintenance, which is
+ *  where the installer command, the update button and the rebuild control all
+ *  live. Nothing else in the app holds the whole account of how an install
+ *  updates. It opens the PAGE, never `system`: that key is the submenu now, and
+ *  a Maintenance anchor there would scroll to nothing. */
 export async function followUpdateRoute(route: UpdateRoute): Promise<void> {
   if (route === 'install') {
     await installAppUpdate();
@@ -357,7 +360,7 @@ export async function followUpdateRoute(route: UpdateRoute): Promise<void> {
     return;
   }
   settingsScrollTarget.value = 'system:maintenance';
-  openSettingsSubview('system');
+  openSettingsSubview('system-overview');
 }
 
 /** Say what a user-initiated check concluded.
@@ -385,7 +388,7 @@ async function runUserCheck(): Promise<UpdateCheckVerdict> {
 
 /** Ask the Tauri updater directly. The ADR 0105 degradation for a gateway too
  *  old to announce a release: the client is newer than the machine's gateway
- *  right after an update, and this keeps Settings → System working meanwhile.
+ *  right after an update, and this keeps System > Overview working meanwhile.
  *
  *  User-initiated only, and on no timer. The outcome is recorded so the
  *  persistent Settings surface can report a failed check rather than let it look

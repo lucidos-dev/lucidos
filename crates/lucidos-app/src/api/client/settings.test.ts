@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { getCredentialValue, handOverDevice } from './settings';
+import {
+  generateBackupKey,
+  getBackupKey,
+  getCredentialValue,
+  handOverDevice,
+} from './settings';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
 /**
@@ -126,6 +131,103 @@ describe('getCredentialValue', () => {
     await expect(getCredentialValue('cred-1')).rejects.toThrow();
     // Mint, then mint again. The first 403 is the mint's own refusal, so the
     // read never runs on either attempt.
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The backup key takes the same two steps as a credential value.
+ *
+ * It encrypts every archive this workspace ever uploaded, and it used to be one
+ * bare GET away from any installed app. Both key-bearing routes now spend a
+ * one-shot token, including the idempotent generate: on a workspace that
+ * already has a key, that route hands back the same plaintext the reveal does.
+ */
+describe('the backup key routes', () => {
+  const originalFetch = globalThis.fetch;
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  const okJson = (body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  const forbidden = () =>
+    new Response(JSON.stringify({ error: 'a one-shot reveal token is required' }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+  beforeEach(() => {
+    mockFetch = vi.fn();
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('mints a token, then spends it on the reveal', async () => {
+    mockFetch
+      .mockResolvedValueOnce(okJson({ token: 'tok-1', expires_in_secs: 30 }))
+      .mockResolvedValueOnce(okJson({ key: 'a2V5', is_new: false }));
+
+    expect(await getBackupKey()).toEqual({ key: 'a2V5', is_new: false });
+
+    const [mintUrl, mintInit] = mockFetch.mock.calls[0];
+    expect(mintUrl).toContain('/backup/key/reveal-token');
+    expect(mintInit.method).toBe('POST');
+    const [readUrl, readInit] = mockFetch.mock.calls[1];
+    expect(readUrl).toContain('/backup/key?token=tok-1');
+    expect(readInit?.method).toBeUndefined();
+  });
+
+  it('spends a token on the generate too, because it returns the same key', async () => {
+    mockFetch
+      .mockResolvedValueOnce(okJson({ token: 'tok-2', expires_in_secs: 30 }))
+      .mockResolvedValueOnce(okJson({ key: 'bmV3', is_new: true }));
+
+    expect(await generateBackupKey()).toEqual({ key: 'bmV3', is_new: true });
+
+    expect(mockFetch.mock.calls[0][0]).toContain('/backup/key/reveal-token');
+    const [genUrl, genInit] = mockFetch.mock.calls[1];
+    expect(genUrl).toContain('/backup/key?token=tok-2');
+    expect(genInit.method).toBe('POST');
+  });
+
+  it('re-mints once when the token was already spent', async () => {
+    mockFetch
+      .mockResolvedValueOnce(okJson({ token: 'spent', expires_in_secs: 30 }))
+      .mockResolvedValueOnce(forbidden())
+      .mockResolvedValueOnce(okJson({ token: 'fresh', expires_in_secs: 30 }))
+      .mockResolvedValueOnce(okJson({ key: 'a2V5', is_new: false }));
+
+    expect(await getBackupKey()).toEqual({ key: 'a2V5', is_new: false });
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch.mock.calls[3][0]).toContain('token=fresh');
+  });
+
+  it('gives up after one retry, so a real refusal is not a loop', async () => {
+    mockFetch.mockResolvedValue(forbidden());
+
+    await expect(getBackupKey()).rejects.toThrow();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets a 404 through untouched, so an absent key still offers generate', async () => {
+    // The Backup page catches this exact status and switches to generate. A
+    // retry here would spend a second token to learn the same thing.
+    mockFetch
+      .mockResolvedValueOnce(okJson({ token: 'tok-3', expires_in_secs: 30 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: 'No backup key exists yet.' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+
+    await expect(getBackupKey()).rejects.toMatchObject({ httpCode: 404 });
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });

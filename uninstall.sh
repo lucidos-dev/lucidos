@@ -154,8 +154,16 @@ instance_data_dir() {
 # "(stopped)" label for --list.
 instance_status() {
     local slug="$1"
-    if have launchctl && service_launchd_is_loaded "$(id -u)" "$(service_launchd_label "$slug")"; then
-        printf '(launchd loaded)'; return 0
+    if have launchctl; then
+        if service_launchd_is_loaded "$(id -u)" "$(service_launchd_label "$slug")"; then
+            printf '(launchd loaded)'; return 0
+        fi
+        # Same unknown-is-not-a-no rule remove_instance applies. A shell with no
+        # console session cannot see gui/<uid>, and calling that "(stopped)" is
+        # the reading a user takes before deciding to --purge.
+        if ! service_launchd_domain_reachable "$(id -u)"; then
+            printf '(unknown: launchd domain unreachable)'; return 0
+        fi
     fi
     if have systemctl && systemctl --user show-environment >/dev/null 2>&1 \
         && service_systemd_is_active "$(service_systemd_unit_name "$slug")"; then
@@ -171,7 +179,9 @@ do_list() {
     while IFS= read -r slug; do
         [ -n "$slug" ] || continue
         any=1
-        data="$(service_instance_data_dir "$LUCIDOS_PREFIX" "$slug")"
+        # `:?` because --prefix accepts an empty argument, and --purge
+        # rm -rf's the targets derived from this dir.
+        data="$(service_instance_data_dir "${LUCIDOS_PREFIX:?}" "$slug")"
         port="$(tr -d '[:space:]' < "$(service_instance_port_file "$data")" 2>/dev/null || true)"
         info "$(printf '%-16s port %-6s %s' "$slug" "${port:-?}" "$(instance_status "$slug")")"
     done <<EOF
@@ -198,7 +208,16 @@ remove_instance() {
         label="$(service_launchd_label "$slug")"
         plist="$(service_launchd_plist_path "$HOME" "$slug")"
         uid="$(id -u)"
-        if service_launchd_is_loaded "$uid" "$label"; then
+        if ! service_launchd_domain_reachable "$uid" && [ -f "$plist" ]; then
+            # Unknown, never a "no". A shell with no console session cannot see
+            # gui/<uid>, and `service_launchd_is_loaded` answers non-zero for
+            # that exactly as it does for "not loaded". Taking the second
+            # reading would report a live KeepAlive gateway as stopped and let
+            # the purge below delete the data dir it is still writing to.
+            warn "launchd domain gui/$uid is unreachable, so whether $label is running is unknown."
+            info "If it is, stop it from a login session:  launchctl bootout gui/$uid/$label"
+            service_stopped=0
+        elif service_launchd_is_loaded "$uid" "$label"; then
             # service_launchd_unload only succeeds once the job has actually left
             # the domain, so this "Stopped" is a fact rather than a hope. On
             # failure it leaves the launchctl diagnosis in SERVICE_LAUNCHD_ERR;
@@ -234,8 +253,19 @@ remove_instance() {
     unit_path="$(service_systemd_unit_path "$HOME" "$slug" "${XDG_CONFIG_HOME:-}")"
     if [ "$bus_ok" = "1" ]; then
         if service_systemd_is_active "$unit_name" || [ -f "$unit_path" ]; then
+            # `service_systemd_unload` swallows systemctl's status and can only
+            # return 0, so it is no evidence. Observe the unit afterwards, the
+            # way the launchd half observes its domain: a unit that outlives
+            # `disable --now` is still running, and the purge below must not
+            # delete the data dir underneath it.
             service_systemd_unload "$unit_name"
-            ok "Stopped + disabled $unit_name"
+            if service_systemd_is_active "$unit_name"; then
+                warn "$unit_name is still active after disable --now."
+                info "Stop it by hand with:  systemctl --user stop $unit_name"
+                service_stopped=0
+            else
+                ok "Stopped + disabled $unit_name"
+            fi
             removed=1
         fi
     elif [ -f "$unit_path" ]; then
@@ -359,7 +389,9 @@ run_uninstall() {
     # still running out of it: a gateway we could not stop is executing those
     # binaries, and launchd would try to respawn it from a path we just deleted.
     if [ -n "$LUCIDOS_ALL" ] && [ -n "$LUCIDOS_PURGE" ]; then
-        local runtime="$LUCIDOS_PREFIX/runtime"
+        # `:?` because --prefix accepts an empty argument, and this path is
+        # rm -rf'd below.
+        local runtime="${LUCIDOS_PREFIX:?}/runtime"
         if [ -n "$LIVE_SERVICE_LEFT" ]; then
             warn "NOT deleting the shared runtime $runtime: a gateway is still running out of it."
         elif [ -e "$runtime" ]; then

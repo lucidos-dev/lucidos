@@ -3,22 +3,28 @@
 //! and HTTP-to-parent-engine pattern). The marker is set by the skill
 //! (`mark --plan <docs/plans/file>` → records the awaiting-approval `proposed`
 //! state), approved by the agent after the user's chat approval
-//! (`approve` → flips `proposed` to gate-satisfying `planned`), or set directly
+//! (`approve` → flips `proposed` to gate-satisfying `planned`), set directly
 //! for a local fix (`mark --simple "<reason>"` → `acknowledged_simple`, no
-//! approval needed). `planned` and `acknowledged_simple` satisfy every gate;
-//! `proposed` and the absence of a marker both block.
+//! approval needed), or claimed by an unattended run for a scoped security fix
+//! (`mark --security-fix "<reason>" --files <csv>` → `bounded_security_fix`).
+//! Those last three satisfy every gate; `proposed` and the absence of a marker
+//! both block.
 
 use crate::hardened::git_context;
 use crate::http::client as http_client;
 use crate::workspace::{BoxError, Workspace};
 
 /// Which kind of planning decision is being recorded.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum MarkKind<'a> {
     /// A real plan was written to `docs/plans/`; carries the relative path.
     Plan(&'a str),
     /// The agent declared a local fix; carries the one-line reason.
     Simple(&'a str),
+    /// An unattended run is committing a security fix confined to `files`.
+    /// Carries the one-line reason and the repo-relative paths it is bounded
+    /// to. The engine caps the list and the Apply floor enforces it.
+    SecurityFix { reason: &'a str, files: Vec<String> },
 }
 
 /// Planned-marker gate state, mirroring the engine's three-way wire `state`
@@ -56,11 +62,14 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to read cwd: {}", e))?;
     let (repo_root, branch, head_sha) = git_context(&cwd)?;
     let url = format!("{}/api/v1/internal/mark-planned", ws.base_url());
-    let (state, plan_path, reason) = match kind {
+    let (state, plan_path, reason, files) = match &kind {
         // A written plan starts AWAITING APPROVAL — the skill records `proposed`,
         // the user approves in chat, then the agent runs `planned approve`.
-        MarkKind::Plan(p) => ("proposed", Some(p), None),
-        MarkKind::Simple(r) => ("acknowledged_simple", None, Some(r)),
+        MarkKind::Plan(p) => ("proposed", Some(*p), None, Vec::new()),
+        MarkKind::Simple(r) => ("acknowledged_simple", None, Some(*r), Vec::new()),
+        MarkKind::SecurityFix { reason, files } => {
+            ("bounded_security_fix", None, Some(*reason), files.clone())
+        }
     };
     let body = serde_json::json!({
         "repo_root": repo_root.to_string_lossy(),
@@ -69,6 +78,7 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         "state": state,
         "plan_path": plan_path,
         "reason": reason,
+        "files": files,
     });
     let resp = http_client()?
         .post(&url)
@@ -96,6 +106,17 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
             branch, p
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),
+        // The reminder is the only enforcement of the lane's other two
+        // preconditions. Apply checks the file bound. The unattended run and
+        // the regression test are claims the agent makes, so state them where
+        // the agent reads the result.
+        MarkKind::SecurityFix { reason, files } => println!(
+            "Bounded security fix recorded: {} ({}). Confined to {} file(s): {}. Apply refuses this branch if it touches anything else, so re-run this command with the full list if the fix has to grow. The lane is for an UNATTENDED run only, and it requires a regression test that fails without your fix: if either is untrue, write a plan instead and get it approved.",
+            branch,
+            reason,
+            files.len(),
+            files.join(", ")
+        ),
     }
     Ok(())
 }

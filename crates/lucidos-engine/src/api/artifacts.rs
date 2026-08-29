@@ -66,11 +66,23 @@ pub(super) async fn upload_file(
         }
     };
 
-    // Write to a temp file first, then import (since import_file expects a path)
-    let temp_dir = std::env::temp_dir();
+    // Write to a temp file first, then import (since import_file expects a path).
+    // The staging directory is unique per upload, matching the plugin-archive
+    // upload. A shared `temp_dir()/<filename>` is guessable. Another local user
+    // can pre-plant a symlink there and redirect the write, and two uploads of
+    // the same name race each other.
+    let temp_dir = std::env::temp_dir().join(format!("lucidos-upload-{}", Uuid::new_v4().simple()));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        return Json(UploadResponse {
+            success: false,
+            filename: Some(filename),
+            error: Some(format!("Failed to create temp directory: {}", e)),
+        });
+    }
     let temp_path = temp_dir.join(&filename);
 
     if let Err(e) = std::fs::write(&temp_path, &data) {
+        let _ = std::fs::remove_dir_all(&temp_dir);
         return Json(UploadResponse {
             success: false,
             filename: Some(filename),
@@ -84,7 +96,7 @@ pub(super) async fn upload_file(
     match state.engine.import_file_from_path(&temp_path, &dest).await {
         Ok((result, commit_sha, resolved_dest)) => {
             log!(@upload, "Import succeeded: {}", result);
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_dir_all(&temp_dir);
 
             // Reflect the ACTUAL final filename — a collision auto-suffix may
             // have landed the file at e.g. "imported/Brev (1).pdf".
@@ -110,7 +122,7 @@ pub(super) async fn upload_file(
         }
         Err(e) => {
             log!(@upload, "Import failed: {}", e);
-            let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_dir_all(&temp_dir);
             Json(UploadResponse {
                 success: false,
                 filename: Some(filename),

@@ -233,9 +233,9 @@ impl LucidosEngine {
             Err(e) => {
                 // No `BackgroundBashStarted` will be emitted, so the
                 // script file on disk has no event-store row to correlate
-                // back to. Drop it on the way out — mirrors the sync
-                // `execute_python_tool` cleanup pattern (python.rs
-                // `remove_dir_all(&staging_dir).ok()` on its error path).
+                // back to. Drop it on the way out, mirroring the sync tool's
+                // error-path cleanup in
+                // `execute_staged_and_clean_up_on_failure`.
                 // Without this, chronic spawn failure (sh fork EAGAIN,
                 // FD exhaustion, broken venv) would accumulate orphan
                 // dirs under `.lucidos/exhaust/` indefinitely — the
@@ -294,7 +294,23 @@ impl LucidosEngine {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            // A symlink is skipped, never followed. The staging redirect
+            // patches `open`, not `os.symlink`, so a script can leave one
+            // here: `link -> /` would commit host files into `data/`, and
+            // `link -> .` recurses until the stack goes and the engine aborts.
+            //
+            // `entry.file_type()` rather than a `symlink_metadata` call: it
+            // reads the type the directory scan already returned, does not
+            // follow the link, and costs no extra syscall. It also answers the
+            // is-a-directory question below, where `path.is_dir()` would
+            // follow one. An unreadable type is skipped, never assumed.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 Self::collect_staged_files(base, &path, workspace_data, created, updated)?;
             } else {
                 let relative = path

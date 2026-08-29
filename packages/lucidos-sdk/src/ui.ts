@@ -4,7 +4,8 @@ import { wsLocalGet } from './_storage';
 import {
   DEFAULT_FONT_FAMILY, FONT_FAMILY_VALUES, GOOGLE_FONT_URLS,
   SYSTEM_THEME_SETTLE_MS, THEME_BG,
-  fontFeaturesFor, parseUiScale, resolveFontKey, resolveTheme, resolveThemePreference,
+  fontFeaturesFor, parseStyleOverrides, parseUiScale, resolveFontKey, resolveTheme,
+  resolveThemePreference,
   type FontFamily, type ThemePref,
 } from './appearance';
 import { preferences as prefsModule } from './preferences';
@@ -293,54 +294,27 @@ function inIOSStandalone(): boolean {
 
 const HTTP_SCHEME_RE = /^https?:\/\//i;
 
+/** Names this module currently has written. A name dropped from the map is
+ *  then removed on a live re-apply, rather than stuck at its last value. */
+let appliedOverrideNames: string[] = [];
+
 /**
  * The live style remote, iframe realm.
  *
- * A fourth copy of the same validator, alongside `utils/styleOverrides.ts`,
- * the `index.html` FOUC block and `api/sdk_prefs.rs`. The SDK is a separate
- * package and cannot import the app's copy, exactly as it cannot import its
- * font map.
+ * The validator and its caps come from the shared appearance contract, which
+ * the boot script and the host's `utils/styleOverrides.ts` read too. Any app
+ * and the chat agent can write the preference. It is therefore an untrusted
+ * path into inline style, and a rule relaxed in one realm would be a hole in
+ * all of them. One copy is what stops that.
  *
- * The rules must stay identical in all four. The preference is writable by any
- * app and by the chat agent, so it is an untrusted path into inline style. A
- * rule relaxed in one realm is a hole in all of them.
+ * A corrupt map parses to empty, which costs the app no theme and also clears
+ * anything a previous apply had set.
  */
-const OVERRIDE_NAME_RE = /^--[a-z][a-z0-9-]*$/;
-const OVERRIDE_VALUE_BANNED_RE = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
-const MAX_OVERRIDES = 200;
-const MAX_OVERRIDE_VALUE_LENGTH = 120;
-
-/** Names this module currently has written, so one dropped from the map gets
- *  removed rather than left stuck at its last value on a live re-apply. */
-let appliedOverrideNames: string[] = [];
-
 function applyStyleOverrides(raw: string | null | undefined): void {
-  let map: Record<string, unknown> = {};
-  if (raw) {
-    try {
-      const parsed: unknown = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        map = parsed as Record<string, unknown>;
-      }
-    } catch {
-      // A corrupt map must not cost the app its theme; fall through to empty,
-      // which also clears anything a previous apply had set.
-    }
-  }
+  const map = parseStyleOverrides(raw);
   const root = document.documentElement;
-  const applied: string[] = [];
-  let n = 0;
-  for (const [name, value] of Object.entries(map)) {
-    if (n >= MAX_OVERRIDES) break;
-    if (!OVERRIDE_NAME_RE.test(name)) continue;
-    if (typeof value !== 'string') continue;
-    const trimmed = value.trim();
-    if (!trimmed || trimmed.length > MAX_OVERRIDE_VALUE_LENGTH) continue;
-    if (OVERRIDE_VALUE_BANNED_RE.test(trimmed)) continue;
-    root.style.setProperty(name, trimmed);
-    applied.push(name);
-    n++;
-  }
+  const applied = Object.keys(map);
+  for (const name of applied) root.style.setProperty(name, map[name]);
   for (const name of appliedOverrideNames) {
     if (!applied.includes(name)) root.style.removeProperty(name);
   }

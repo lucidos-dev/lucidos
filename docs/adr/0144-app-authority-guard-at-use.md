@@ -169,7 +169,9 @@ rest run a script from the engine's own checkout, resolved through
 - **App documents carry no CSP**, so an app can send anything it reads anywhere.
   Named here as a follow-up, deliberately not fixed in this change: locking
   `connect-src` reaches every app document and would break any app that calls a
-  public API directly.
+  public API directly. **Taken up by [ADR 0156](0156-app-boundary-is-egress-not-identity.md)**,
+  which makes egress the boundary and phases the rollout so nothing breaks
+  blind.
 - **The packaged install needs no terminal for the common path.** The agent
   writes and the record follows. The CLI is for a hand edit.
 

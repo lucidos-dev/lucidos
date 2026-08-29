@@ -114,6 +114,7 @@ export function CommunicationSurfacesPage() {
             layout: 'desktop',
             outage: SAMPLE_INGRESS_OUTAGE,
             onOpenWebhooks: () => {},
+            onDiscuss: () => {},
           })}
         </div>
       </div>

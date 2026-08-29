@@ -261,27 +261,23 @@ async function ensureState(page: Page, seq: string, role: string, state: 'true' 
   await waitForScrollSettled(page);
 }
 
-/** The three turn controls, each swept in both directions.
+/** The three turn controls, each swept in both directions, at every park.
  *
  *  The two reveals change every turn in the transcript, which is what puts
  *  content above the pressed control in motion. The fold changes only its own
  *  turn, and is swept because the reader is owed the same promise from it.
  *
- *  THE FOLD SKIPS THE BOTTOM-EDGE PARK, and that is a gap rather than a
- *  tidy-up. Folding the LAST turn from a control at the foot of the pane misses
- *  by 70px on WebKit, both ways. The correction reads the control's offset on
- *  the frame the mutation commits. The transcript has not settled there, and
- *  the next-frame re-assert re-reads the same unsettled number. Chromium
- *  settles inside the frame and holds the control exactly.
- *
- *  Left rather than fixed, since the fold had no anchoring at all before this
- *  change. It is no regression, and widening the correction past one frame
- *  touches the hot path of every reveal. Recorded as a non-goal in
- *  docs/plans/2026-08-28-a-turn-control-holds-what-you-pressed.md */
+ *  THE FOLD USED TO SKIP THE BOTTOM-EDGE PARK. It missed by 70px on WebKit
+ *  there, which ADR 0147 recorded as the transcript not having settled. It was
+ *  a CLAMP. The fold takes its rows out before the stub goes in, so the
+ *  offset is clamped against a container that is briefly tiny. The correction
+ *  cannot reach its target, and by the time it could, nothing was asking.
+ *  `ANCHOR_SETTLE_FRAMES` in `CreateThreadView.tsx` is what re-asserts now,
+ *  until the height stops moving. */
 const CONTROLS = [
   { role: 'toggle-steps', name: 'the steps', parks: PARK_FRACTIONS },
   { role: 'toggle-details', name: 'the full response', parks: PARK_FRACTIONS },
-  { role: 'toggle-collapsed', name: 'the fold', parks: PARK_FRACTIONS.filter(f => f < 0.9) },
+  { role: 'toggle-collapsed', name: 'the fold', parks: PARK_FRACTIONS },
 ] as const;
 
 test.describe('a turn control holds the element the reader clicked', () => {

@@ -1,5 +1,10 @@
-//! E2E coverage for credential editing — the full-field update path and the
-//! email_password → `email_accounts` sync that IMAP/SMTP actually read from.
+//! E2E coverage for credential editing: the full-field update path, the
+//! `email_password` sync into `email_accounts` that IMAP/SMTP read from, and
+//! the *credential scope* set.
+//!
+//! The first two tests deliberately POST and PUT the singular `base_url`. That
+//! is the permanent back-compat shape, so a script written before the scope
+//! became a set keeps working, and this is what proves it.
 
 use crate::support::{base_url, db_url, http_client, unique_marker};
 use serde_json::json;
@@ -34,7 +39,8 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     // Every verb below addresses the row by id, so resolve it once from the list.
     let id = credential_id(&client, &api, &service).await;
 
-    // Update base_url + auth_type + auth_header + secret.
+    // Update the scope + auth_type + auth_header + secret, through the legacy
+    // singular field.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
         .query(&[("id", &id)])
@@ -55,7 +61,7 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
 
     // List reflects the new non-secret fields.
     let listed = find_credential(&client, &api, &service).await;
-    assert_eq!(listed["base_url"], "https://api.new.example.com");
+    assert_eq!(listed["base_urls"], json!(["https://api.new.example.com"]));
     assert_eq!(listed["auth_type"], "bearer");
     assert_eq!(listed["auth_header"], "X-Api-Key");
 
@@ -77,7 +83,10 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     assert_eq!(resp.status(), 200);
 
     let listed = find_credential(&client, &api, &service).await;
-    assert_eq!(listed["base_url"], "https://api.newer.example.com");
+    assert_eq!(
+        listed["base_urls"],
+        json!(["https://api.newer.example.com"])
+    );
     assert_eq!(
         credential_value(&client, &api, &id).await,
         "k2",
@@ -135,7 +144,7 @@ async fn update_email_credential_syncs_email_accounts_row() {
         .put(format!("{}/api/v1/credentials", api))
         .query(&[("id", &id)])
         .json(&json!({
-            "base_url": "ignored — derived from smtp_host",
+            "base_urls": ["https://ignored.example.com"],
             "auth_type": "email_password",
             "auth_value": "newpass",
             "email": {
@@ -179,7 +188,7 @@ async fn update_email_credential_syncs_email_accounts_row() {
 
     // The credential's base_url is derived from the SMTP host, and its secret synced.
     let listed = find_credential(&client, &api, &service).await;
-    assert_eq!(listed["base_url"], "smtp://smtp.new.example.com");
+    assert_eq!(listed["base_urls"], json!(["smtp://smtp.new.example.com"]));
     assert_eq!(credential_value(&client, &api, &id).await, "newpass");
 
     // Cleanup.
@@ -256,6 +265,157 @@ async fn delete_credential(client: &reqwest::Client, api: &str, id: &str) {
         .await
         .expect("delete failed");
     assert_eq!(resp.status(), 200);
+}
+
+/// A credential's scope is a set, over the wire and from the CLI.
+///
+/// Three things at once, because they are one flow. A create declares two
+/// hosts. `PUT /api/v1/credential-base-urls` replaces the set without naming
+/// the auth type or the auth header, which is what `lucidos credentials
+/// set-base-urls` calls. A scope that is not a URL with a host is refused where
+/// the user typed it.
+#[tokio::test]
+async fn a_credential_carries_and_edits_a_set_of_base_urls() {
+    let client = http_client();
+    let api = base_url();
+    let service = unique_marker("e2e-scope");
+
+    let resp = client
+        .post(format!("{}/api/v1/credentials", api))
+        .json(&json!({
+            "service_name": service,
+            "base_urls": ["https://api.binance.test", "https://fapi.binance.test"],
+            "auth_type": "api_key",
+            "auth_header": "X-MBX-APIKEY",
+            "auth_value": "the-hmac-key",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+
+    let listed = find_credential(&client, &api, &service).await;
+    assert_eq!(
+        listed["base_urls"],
+        json!(["https://api.binance.test", "https://fapi.binance.test"])
+    );
+    let id = credential_id(&client, &api, &service).await;
+
+    // The narrow verb replaces the set and leaves everything else alone.
+    let resp = client
+        .put(format!("{}/api/v1/credential-base-urls", api))
+        .query(&[("id", &id)])
+        .json(&json!({
+            "base_urls": ["https://api.binance.test", "https://dapi.binance.test"],
+        }))
+        .send()
+        .await
+        .expect("set-base-urls failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+
+    let listed = find_credential(&client, &api, &service).await;
+    assert_eq!(
+        listed["base_urls"],
+        json!(["https://api.binance.test", "https://dapi.binance.test"])
+    );
+    assert_eq!(
+        listed["auth_header"], "X-MBX-APIKEY",
+        "widening a scope must not clobber the auth header"
+    );
+    assert_eq!(credential_value(&client, &api, &id).await, "the-hmac-key");
+
+    // A host-less value is refused here, not silently at the proxy gate.
+    let resp = client
+        .put(format!("{}/api/v1/credential-base-urls", api))
+        .query(&[("id", &id)])
+        .json(&json!({ "base_urls": ["api.binance.test"] }))
+        .send()
+        .await
+        .expect("request failed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("host"),
+        "the refusal must say what is wrong: {body}"
+    );
+
+    // An edit naming NO scope field keeps the stored set. Both fields are
+    // optional so the two spellings can coexist, so absence would otherwise
+    // deserialize as an empty set and refuse the credential everywhere.
+    let resp = client
+        .put(format!("{}/api/v1/credentials", api))
+        .query(&[("id", &id)])
+        .json(&json!({ "auth_type": "api_key", "auth_header": "X-Changed" }))
+        .send()
+        .await
+        .expect("update failed");
+    assert_eq!(resp.status(), 200);
+    let listed = find_credential(&client, &api, &service).await;
+    assert_eq!(
+        listed["base_urls"],
+        json!(["https://api.binance.test", "https://dapi.binance.test"]),
+        "an edit that named no scope must not empty it"
+    );
+    assert_eq!(listed["auth_header"], "X-Changed", "the edit still landed");
+
+    delete_credential(&client, &api, &id).await;
+}
+
+/// A create that names no scope field is refused, rather than storing a
+/// credential the proxy can only ever refuse. An empty list is a real answer
+/// and has to be written down.
+#[tokio::test]
+async fn creating_a_credential_without_a_scope_field_is_refused() {
+    let client = http_client();
+    let api = base_url();
+    let service = unique_marker("e2e-noscope");
+
+    let resp = client
+        .post(format!("{}/api/v1/credentials", api))
+        .json(&json!({
+            "service_name": service,
+            "auth_type": "api_key",
+            "auth_value": "k",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("base_urls"),
+        "the refusal must name the field: {body}"
+    );
+
+    // An explicit empty list IS accepted: that is what a `secret` carries.
+    let resp = client
+        .post(format!("{}/api/v1/credentials", api))
+        .json(&json!({
+            "service_name": service,
+            "base_urls": [],
+            "auth_type": "secret",
+            "auth_value": "shared-secret",
+        }))
+        .send()
+        .await
+        .expect("create failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
+    let listed = find_credential(&client, &api, &service).await;
+    assert_eq!(listed["base_urls"], json!([]));
+
+    delete_credential(&client, &api, &credential_id(&client, &api, &service).await).await;
 }
 
 /// Regression: the plaintext is not one bare GET away, and not reachable from

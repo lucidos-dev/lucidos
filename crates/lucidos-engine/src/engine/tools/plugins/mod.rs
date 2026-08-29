@@ -34,8 +34,8 @@ mod source;
 
 use merge::{LocalChangeOutcome, MergePlan, ResolvedChange};
 use registry::{
-    check_plugin_updates_impl, fetch_remote_manifest, latest_install, project_baselines,
-    resolve_plugin_query, PluginBaseline,
+    check_plugin_updates_impl, fetch_remote_manifest, latest_install, not_installed_error,
+    project_baselines, resolve_plugin_query, PluginBaseline,
 };
 use source::{
     copy_atomic, credentials_for_source, detect_source, fetch_source, git_file_mode, write_atomic,
@@ -158,12 +158,7 @@ impl LucidosEngine {
                 // bytes hit `data/`. Same code path means same UI.
                 let installed = match latest_install(&self.pool, &id).await {
                     Ok(Some(rec)) => rec,
-                    Ok(None) => {
-                        return Err(format!(
-                            "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
-                            id
-                        ));
-                    }
+                    Ok(None) => return Err(not_installed_error(&id)),
                     Err(e) => return Err(format!("Error: read install record: {}", e)),
                 };
                 let installed_version = installed.version().unwrap_or("unknown").to_string();
@@ -465,10 +460,7 @@ pub(crate) async fn prepare_uninstall_plugin(
             // concurrent uninstall — surface the same not-installed shape
             // so the LLM doesn't see a different error from the same
             // failure mode.
-            return format!(
-                "Error: plugin '{}' is not currently installed (no PluginInstalled event, or already uninstalled)",
-                id
-            );
+            return not_installed_error(&id);
         }
         Err(e) => return format!("Error: read install record: {}", e),
     };
@@ -1215,7 +1207,9 @@ pub async fn confirm_pending_install(
     // actually happens (the thread references the instructions via
     // `system-knowhow/plugin-setup`, see `build_setup_thread_request`); the id
     // flows back so the frontend can navigate the user straight to it.
-    if let (Some(_setup), Some(thread_id)) = (pending.setup.as_deref(), setup_thread_id) {
+    // `setup_thread_id` is minted only when `setup_is_new` said yes, and that
+    // is already false for an absent or blank `setup`.
+    if let Some(thread_id) = setup_thread_id {
         spawn_plugin_setup_thread(engine, thread_id, &pending.plugin_name, &occasion, actor).await;
     }
 

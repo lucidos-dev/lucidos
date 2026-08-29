@@ -23,6 +23,19 @@ pub const PREF_MODEL_CONVERSATION_SUMMARY: &str = "model_conversation_summary";
 /// middle (ADR 0002, Phase 3). Configurable so a workspace can trade
 /// accuracy/cost; defaults to [`DEFAULT_COMMAND_JUDGE_MODEL`] when unset.
 pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
+/// The rented *talker* a *voice session* speaks through (ADR 0149).
+///
+/// A bare model id, and deliberately NOT a chat-model registry row: the
+/// registry serves `RoutingProvider`, which speaks HTTP and cannot serve a
+/// model that holds a socket open.
+pub const PREF_MODEL_VOICE_TALKER: &str = "model_voice_talker";
+
+/// Which resident-block sections a *voice session* opens with, comma separated.
+///
+/// The block is what voice can answer with no wait, so which sections are in it
+/// is a product choice rather than tuning. Unset means the built-in default
+/// set; see `voice::resident`.
+pub const PREF_VOICE_RESIDENT_SECTIONS: &str = "voice_resident_sections";
 
 // The reasoning-effort half of each background *model selection*. Every one
 // defaults to the effort its call site used to hardcode, so splitting the knob
@@ -120,6 +133,11 @@ pub(crate) const PREF_CAPTURE_CONTEXT: &str = "capture_context";
 // ships dark and is enabled per-workspace. See `engine::command_guard`.
 pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
 
+// Master toggle for voice, the whole feature. Off by default: voice is
+// experimental, it spends on a rented talker, and every spoken turn runs an
+// ordinary agent turn. A workspace opts in. See `voice::`.
+pub const PREF_VOICE_ENABLED: &str = "voice_enabled";
+
 // Sub-toggle for the command-guard *judge* (ADR 0002, Phase 3). When the guard
 // is on, the LLM judge classifies the ambiguous middle (everything the static
 // fast-path doesn't settle). Default on; set to "false" to fall back to the
@@ -215,6 +233,19 @@ impl PreferenceStore {
     ///
     /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
     /// reachable mutators, and the first of them emits.
+    /// Write a global preference row with no announcement.
+    ///
+    /// Tests only. The announcing [`Self::set`] needs an `EventBus`, and a test
+    /// arranging a precondition has nothing to announce it to.
+    #[cfg(test)]
+    pub async fn set_row_for_test(
+        pool: &PgPool,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
+        Self::set_row(pool, key, value).await
+    }
+
     async fn set_row(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -462,6 +493,22 @@ impl PreferenceStore {
         Self::get(pool, PREF_COMMAND_GUARD)
             .await
             .map(|opt| opt.map(|v| v == "true").unwrap_or(false))
+    }
+
+    /// Read the master voice toggle.
+    ///
+    /// Total by construction, and the direction is deliberate. An absent row and
+    /// an unreadable one both resolve OFF, which is what an experiment nobody
+    /// opted into should do. Resolving ON would open a paid rented talker on a
+    /// transient database error (`.claude/rules/rust.md`).
+    pub async fn voice_enabled(pool: &PgPool) -> bool {
+        match Self::get(pool, PREF_VOICE_ENABLED).await {
+            Ok(value) => value.as_deref() == Some("true"),
+            Err(e) => {
+                log!("[Voice] Could not read {}: {}", PREF_VOICE_ENABLED, e);
+                false
+            }
+        }
     }
 
     /// Read the command-guard *judge* sub-toggle (ADR 0002, Phase 3). Returns

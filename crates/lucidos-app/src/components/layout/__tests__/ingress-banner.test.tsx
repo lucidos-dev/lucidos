@@ -29,9 +29,11 @@ const DESKTOP = { layout: 'desktop' as BannerLayout, mobileViewport: false };
 
 function outage(over: Partial<WebhookIngressOutage> = {}): WebhookIngressOutage {
   return {
+    webhook_name: 'github-ci',
     host: 'node.tailnet.ts.net',
     port: 8443,
     families: ['ipv4'],
+    addresses: [],
     down_since: '2026-08-26T22:10:00Z',
     down_secs: 28_800,
     ...over,
@@ -79,8 +81,11 @@ describe('the three banners never share a height reservation', () => {
 });
 
 describe('ingressBannerBody renders the bar', () => {
-  const body = (o: WebhookIngressOutage | null = outage(), onOpenWebhooks = () => {}) =>
-    ingressBannerBody({ layout: 'desktop', outage: o, onOpenWebhooks });
+  const body = (
+    o: WebhookIngressOutage | null = outage(),
+    onOpenWebhooks = () => {},
+    onDiscuss = () => {},
+  ) => ingressBannerBody({ layout: 'desktop', outage: o, onOpenWebhooks, onDiscuss });
 
   it('states the notice, from the table the Webhooks rows read too', () => {
     const notice = webhookIngressNotice(outage());
@@ -98,20 +103,25 @@ describe('ingressBannerBody renders the bar', () => {
     expect(textOf(body(outage({ families: ['ipv4', 'ipv6'] })))).toContain('IPv4 and IPv6');
   });
 
-  it('offers one button, and it only navigates', () => {
+  it('offers two buttons: one navigates, one starts a conversation', () => {
     const onOpenWebhooks = vi.fn();
-    const buttons = findByType(body(outage(), onOpenWebhooks), 'button');
-    expect(buttons).toHaveLength(1);
-    (buttons[0].props.onClick as () => void)();
+    const onDiscuss = vi.fn();
+    const buttons = findByType(body(outage(), onOpenWebhooks, onDiscuss), 'button');
+    expect(buttons.map((b) => textOf(b))).toEqual(['Discuss', 'Open Webhooks']);
+
+    (buttons[1].props.onClick as () => void)();
     expect(onOpenWebhooks).toHaveBeenCalledTimes(1);
+    expect(onDiscuss).not.toHaveBeenCalled();
   });
 
   it('promises no repair, because the engine performs none', () => {
     // It reports an ingress outage and never re-arms the funnel. A button
     // offering a fix would promise what nothing behind it does.
-    const label = textOf(findByType(body(), 'button')[0]);
-    for (const verb of ['Fix', 'Repair', 'Restart', 'Retry', 'Reconnect']) {
-      expect(label, `"${verb}" promises work the engine does not do`).not.toContain(verb);
+    for (const button of findByType(body(), 'button')) {
+      const label = textOf(button);
+      for (const verb of ['Fix', 'Repair', 'Restart', 'Retry', 'Reconnect']) {
+        expect(label, `"${verb}" promises work the engine does not do`).not.toContain(verb);
+      }
     }
   });
 
@@ -119,7 +129,7 @@ describe('ingressBannerBody renders the bar', () => {
     // It retracts itself on the next good probe, so a dismiss control would
     // only offer a way to hide a live fault.
     expect(findByClass(body(), 'icon-btn')).toHaveLength(0);
-    expect(findByType(body(), 'button')).toHaveLength(1);
+    expect(findByType(body(), 'button')).toHaveLength(2);
   });
 
   it('borrows no word from the connection light', () => {

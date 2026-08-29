@@ -71,9 +71,6 @@ fn ctx<'a>(
         workspace_path: Arc::new(PathBuf::from("/ws")),
         token_cache: Arc::new(ProxyTokenCache::new()),
         proxy_name,
-        // These cases fail before any credential is resolved, so the scope
-        // check never runs against it.
-        base_url: "https://upstream.test",
         proxy_modules: modules,
         wasm_engine: Arc::new(engine.clone()),
     }

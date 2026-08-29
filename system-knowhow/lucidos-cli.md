@@ -1080,7 +1080,7 @@ on: loopback `http://` under the gateway, `https://` self-signed in the legacy
 single-engine model. See `docs/apply-change-api.md` for the apply response shape
 and the full workflow.
 
-### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned approve` / `lucidos planned state`
+### `lucidos planned mark (--plan <path> | --simple "<reason>" | --security-fix "<reason>" --files <csv>)` / `lucidos planned approve` / `lucidos planned state`
 
 Record, approve, or query the *plan marker* — the durable enforcement that the `implementation-plan` skill ran AND the human approved its plan (or that a local fix was acknowledged) before a *Lucidos-source* coding-agent branch is edited and applied. A **gate-satisfying** marker MUST exist on the branch or Claude Code's first source edit is blocked (the `cc-plan-gate` PreToolUse hook) and Apply is refused (the engine's plan floor). Wraps `POST /api/v1/internal/mark-planned` / `POST /api/v1/internal/approve-plan` / `GET /api/v1/internal/planned-state`.
 
@@ -1098,11 +1098,31 @@ lucidos planned approve
 # Genuinely local fix that doesn't warrant a plan — acknowledge instead (no approval needed):
 lucidos planned mark --simple "rename a misspelled variable"
 
+# UNATTENDED run only (the nightly security pass): a security fix confined to named
+# files, with a regression test. No approval step, and Apply refuses the branch if it
+# touched anything outside the list:
+lucidos planned mark --security-fix "unscoped local proxy key; proxy_tests::refuses_foreign_host" \
+  --files crates/lucidos-engine/src/api/proxy_builtin.rs,crates/lucidos-engine/src/api/proxy_tests.rs
+
 # Inspect the current branch's marker (SATISFIED, PROPOSED, or MISSING):
 lucidos planned state
 ```
 
-`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool** (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), never in prose: approval is a DECISION question the agent is blocked on, and asked in prose it leaves the thread idle until the user types "approve" by hand. That option pair is a **floor**, not a fixed shape: the question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot and `Request changes` is dropped rather than carried as a third option, where it would mean only "I will type what I want changed". Only after the user approves does the agent run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying); a fork answer is an approval too, so the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand (the `implementation-plan` skill drives them), but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
+`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple` / `--security-fix`.
+
+**`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool**, never in prose. That is `AskUserQuestion` on Claude Code and `ask_user_question` on Codex, with options `Approve` / `Request changes`. Approval is a DECISION question the agent is blocked on. Asked in prose, it leaves the thread idle until the user types "approve" by hand.
+
+That option pair is a **floor**, not a fixed shape. The question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot. `Request changes` is then dropped rather than carried as a third option, where it would mean only "I will type what I want changed".
+
+Only after the user approves does the agent run `lucidos planned approve` to flip `proposed` to `planned` (gate-satisfying). A fork answer is an approval too: the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval.
+
+`mark --security-fix` is the **bounded security-fix lane**, and it exists for one case: a run nobody can be asked. An UNATTENDED session may commit a security fix with no prior plan decision. The fix must be confined to the files `--files` names, and must ship a regression test. It records `bounded_security_fix`, which satisfies the gate at once.
+
+The lane is a distinct state on purpose. It claims neither that the work is local nor that a human approved, only that an unattended run bounded itself. **Apply refuses the branch if it touched anything outside the list**, `docs/plans/` excepted. Re-run the command with the full list if the fix has to grow. The engine caps the list and refuses a mark with no bound. If you can ask the user, ask instead: the lane is not a general way past the gate, and it is for security work only.
+
+Anything wider stays gated. The session commits its plan, leaves the marker `proposed`, and reports that it is blocked on a decision. See ADR 0154.
+
+`planned`, `acknowledged_simple` and `bounded_security_fix` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand, since the `implementation-plan` skill drives them. `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
 
 ### `lucidos frontend-preview start [--thread-id <uuid>]` / `lucidos frontend-preview stop` / `lucidos frontend-preview status`
 
@@ -1194,6 +1214,10 @@ Call a backend configured in `data/config/apis.json` through the engine. The eng
 
 `auth.credential` (singular variants) and `auth.credentials` / `auth.key_credential` / `auth.secret_credential` (multi-credential variants) reference `service_name`s already in the engine credential store (the same store `request_credential` writes to). Entries without an `auth` block forward unauthenticated — useful for local services like Sonos.
 
+**A credential goes only where it is scoped.** The engine checks the entry's `base_url` against the *credential scope*, the set of base URLs the credential declares, before attaching it. Rewriting an entry's `base_url` therefore cannot redirect a secret (ADR 0144). One key covering several hostnames of one provider declares each of them, and `lucidos credentials` below is how you read and set that. A `script_handshake` credential is the exception, because the script presents it rather than the proxy: what binds there is the `injects` column of the approvals record, which pins the exact secret set that entry may hand the script.
+
+The engine also validates the upstream's certificate, and refuses a credential over plain `http://` unless the host is loopback. A self-signed dev backend or a keyed LAN device needs `"insecure_transport": true` on the entry, which is documented in `system-knowhow/building-an-auth-handshake.md`.
+
 #### Usage (curl-style ergonomics)
 
 ```bash
@@ -1262,6 +1286,60 @@ form, or an absolute path inside the workspace.
 browser-shaped caller. An app UI shares the shell's origin, so a button would
 let it approve a script it wrote itself. Revoking is a line deleted from
 `<workspace>/.lucidos/approved-handshake-scripts`.
+
+Each line there reads `<sha256>  <base_url>  <injects>  <path>`. `base_url` is
+the one host the script's minted token may be sent to. `injects` is the set of
+secrets `apis.json` may hand it, written `c:<credential>` and `o:<provider>`.
+`-` means that column is not bound yet.
+
+The first proxy call binds both from `apis.json`, and a later rewrite of either
+is refused. Edit a column by hand to move a script, to share it with a second
+provider, or to change which secret it receives.
+
+### `lucidos credentials list [--name <N>] [--json]` / `lucidos credentials set-base-urls --name <N> [--auth-type <T>] --url <U> ...`
+
+Read and set the *credential scope*: the base URLs one stored credential may be
+presented to. The proxy sends a credential nowhere else, so this is the setting
+behind a `will not be sent to` 502.
+
+**A scope is a SET, because one key often covers several hostnames.** Binance
+signs spot calls at `api.binance.com` and futures calls at `fapi.binance.com`
+with the same HMAC pair, and Helius issues one key for two hosts. Each host is
+named exactly. There is no wildcard, and nothing is inferred from a host's
+spelling (ADR 0161).
+
+```bash
+lucidos credentials list
+# binance-key              api_key          https://api.binance.com
+# google                   oauth_client     https://oauth2.googleapis.com
+# webhook-secret           secret           (no base URL, so it is sent nowhere)
+
+lucidos credentials set-base-urls --name binance-key \
+  --url https://api.binance.com --url https://fapi.binance.com
+# binance-key now covers https://api.binance.com, https://fapi.binance.com
+```
+
+`set-base-urls` **replaces** the whole set, so pass every host the credential
+should reach. Widening one is therefore `list`, then `set-base-urls` with the
+old hosts plus the new one. That keeps the command a statement of what the
+credential now covers, rather than a delta a reader has to reconstruct.
+
+`--json` prints the engine's own array, for a script that wants to read the set:
+
+```bash
+lucidos credentials list --name binance-key --json | jq -r '.[0].base_urls[]'
+```
+
+`--auth-type` picks a row when an OAuth client registration shares a name with
+an API key. Omit it unless the command asks; a name is otherwise unique.
+
+Each URL needs its scheme, so `https://api.example.com` rather than
+`api.example.com`. A value with no host is refused here rather than silently at
+the proxy gate.
+
+**Adding, rotating and deleting a credential are not here.** The secret itself
+belongs in Settings (or the agent's `request_credential`), which is where a
+person enters it. This command reads and moves the scope only.
 
 ### `lucidos pair` (mint a code that lets a device in)
 

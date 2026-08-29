@@ -16,13 +16,13 @@ mod question;
 mod session;
 mod todo;
 
-pub use actor::{ActorMode, EngineReason, MessageOrigin, ThreadDirection};
+pub use actor::{ActorMode, AgentParticipant, EngineReason, MessageOrigin, ThreadDirection};
 pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
 pub use meta::EventMeta;
 pub use question::{AnswerKind, QuestionOption};
-pub use session::{ChildCompletionStatus, SessionEndReason};
+pub use session::{ChildCompletionStatus, SessionEndReason, VoiceSessionEndReason};
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use emit::{

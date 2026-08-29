@@ -9,15 +9,13 @@
 //! there is no in-product button and there cannot be one: an app UI shares the
 //! shell's origin and would be able to press it.
 
-use crate::http::{client, send_expect_success};
+use crate::http::{client, send_expect_json};
 use crate::workspace::{BoxError, Workspace};
 
 /// `lucidos handshake list`, one line per script `apis.json` names.
 pub(crate) fn cmd_list(ws: &Workspace) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/handshake-scripts", ws.base_url());
-    let body = send_expect_success("GET", &url, client()?.get(&url))?;
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Unexpected response from {}: {}", url, e))?;
+    let parsed = send_expect_json("GET", &url, client()?.get(&url))?;
     let scripts = parsed["scripts"].as_array().cloned().unwrap_or_default();
     if scripts.is_empty() {
         println!("No handshake scripts are configured in data/config/apis.json.");
@@ -44,9 +42,7 @@ pub(crate) fn cmd_approve(ws: &Workspace, path: &str) -> Result<(), BoxError> {
     let req = client()?
         .post(&url)
         .json(&serde_json::json!({ "path": path }));
-    let body = send_expect_success("POST", &url, req)?;
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Unexpected response from {}: {}", url, e))?;
+    let parsed = send_expect_json("POST", &url, req)?;
     let approved = parsed["path"].as_str().unwrap_or(path);
     match parsed["changed"].as_bool().unwrap_or(true) {
         true => println!("Approved {}", approved),

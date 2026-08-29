@@ -214,54 +214,30 @@ async fn search_files_internal(
         .list_artifacts()
         .map_err(|e| format!("File listing failed: {}", e))?;
 
-    if query.is_empty() {
-        return Ok(artifacts
-            .into_iter()
-            .take(limit)
-            .map(|path| {
-                let filename = std::path::Path::new(&path)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.clone());
-                SearchResultItem {
-                    id: path.clone(),
-                    title: filename,
-                    subtitle: path,
-                    category: "files".into(),
-                    score: 1.0,
-                    last_activity: None,
-                }
-            })
-            .collect());
-    }
-
     let query_lower = query.to_lowercase();
-    let matched: Vec<SearchResultItem> = artifacts
+    Ok(artifacts
         .into_iter()
-        .filter_map(|path| {
+        .map(|path| {
             let filename = std::path::Path::new(&path)
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone());
-            if filename.to_lowercase().contains(&query_lower)
-                || path.to_lowercase().contains(&query_lower)
-            {
-                Some(SearchResultItem {
-                    id: path.clone(),
-                    title: filename,
-                    subtitle: path,
-                    category: "files".into(),
-                    score: 1.0,
-                    last_activity: None,
-                })
-            } else {
-                None
+            SearchResultItem {
+                id: path.clone(),
+                title: filename,
+                subtitle: path,
+                category: "files".into(),
+                score: 1.0,
+                last_activity: None,
             }
         })
+        .filter(|item| {
+            query_lower.is_empty()
+                || item.title.to_lowercase().contains(&query_lower)
+                || item.subtitle.to_lowercase().contains(&query_lower)
+        })
         .take(limit)
-        .collect();
-
-    Ok(matched)
+        .collect())
 }
 
 async fn search_apps_internal(
@@ -274,26 +250,12 @@ async fn search_apps_internal(
         .list_apps()
         .map_err(|e| format!("App listing failed: {}", e))?;
 
-    if query.is_empty() {
-        return Ok(apps
-            .into_iter()
-            .take(limit)
-            .map(|app| SearchResultItem {
-                id: app.id,
-                title: app.name,
-                subtitle: app.description,
-                category: "apps".into(),
-                score: 1.0,
-                last_activity: None,
-            })
-            .collect());
-    }
-
     let query_lower = query.to_lowercase();
-    let matched: Vec<SearchResultItem> = apps
+    Ok(apps
         .into_iter()
         .filter(|app| {
-            app.name.to_lowercase().contains(&query_lower)
+            query_lower.is_empty()
+                || app.name.to_lowercase().contains(&query_lower)
                 || app.description.to_lowercase().contains(&query_lower)
         })
         .take(limit)
@@ -305,9 +267,7 @@ async fn search_apps_internal(
             score: 1.0,
             last_activity: None,
         })
-        .collect();
-
-    Ok(matched)
+        .collect())
 }
 
 async fn search_triggers_internal(
@@ -319,25 +279,10 @@ async fn search_triggers_internal(
     let triggers = scheduler.list_trigger_configs();
     drop(scheduler);
 
-    if query.is_empty() {
-        return Ok(triggers
-            .into_iter()
-            .take(limit)
-            .map(|t| SearchResultItem {
-                id: t.id,
-                title: t.name,
-                subtitle: t.schedule.join(", "),
-                category: "triggers".into(),
-                score: 1.0,
-                last_activity: None,
-            })
-            .collect());
-    }
-
     let query_lower = query.to_lowercase();
-    let matched: Vec<SearchResultItem> = triggers
+    Ok(triggers
         .into_iter()
-        .filter(|t| t.name.to_lowercase().contains(&query_lower))
+        .filter(|t| query_lower.is_empty() || t.name.to_lowercase().contains(&query_lower))
         .take(limit)
         .map(|t| SearchResultItem {
             id: t.id,
@@ -347,9 +292,7 @@ async fn search_triggers_internal(
             score: 1.0,
             last_activity: None,
         })
-        .collect();
-
-    Ok(matched)
+        .collect())
 }
 
 async fn search_changes_internal(
@@ -364,24 +307,11 @@ async fn search_changes_internal(
     let applied = applied_r.map_err(|e| format!("DB error listing applied changes: {e}"))?;
     let all_changes = pending.into_iter().chain(applied.into_iter());
 
-    if query.is_empty() {
-        return Ok(all_changes
-            .take(limit)
-            .map(|c| SearchResultItem {
-                id: c.id.to_string(),
-                title: c.description.clone(),
-                subtitle: format!("{} - {}", c.branch_name, c.status),
-                category: "changes".into(),
-                score: 1.0,
-                last_activity: Some(c.created_at.to_rfc3339()),
-            })
-            .collect());
-    }
-
     let query_lower = query.to_lowercase();
-    let matched: Vec<SearchResultItem> = all_changes
+    Ok(all_changes
         .filter(|c| {
-            c.description.to_lowercase().contains(&query_lower)
+            query_lower.is_empty()
+                || c.description.to_lowercase().contains(&query_lower)
                 || c.branch_name.to_lowercase().contains(&query_lower)
         })
         .take(limit)
@@ -393,9 +323,7 @@ async fn search_changes_internal(
             score: 1.0,
             last_activity: Some(c.created_at.to_rfc3339()),
         })
-        .collect();
-
-    Ok(matched)
+        .collect())
 }
 
 /// Route for the global `/search` surface.

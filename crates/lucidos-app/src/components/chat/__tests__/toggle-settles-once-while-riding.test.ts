@@ -249,29 +249,22 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
    *
    *  The block above is the LIVE case, where "riding" and "reading" genuinely
    *  conflict: content is arriving and an armed reader asked for the newest of
-   *  it. On an idle thread nothing is arriving, so the ride carries nobody, and
-   *  a reader parked in HISTORY gets the correction. They expanded a turn and
-   *  want to see what they expanded.
+   *  it. On an idle thread nothing is arriving, so the ride carries nobody and
+   *  the press holds the control. That is true from every park, the live edge
+   *  included, which is the reported case: at the bottom with a folded turn,
+   *  unfolding it moved the icon.
    *
-   *  A reader sitting ON the live edge is the exception, and the two answers
-   *  cannot both be given. Rows revealed between the pressed control and the
-   *  end of the thread push that end off the bottom. So holding the control is
-   *  what moves them. ADR 0064 decides it: an armed reader on the live edge is
-   *  kept there, running thread or quiet one.
-   *
-   *  BOTH halves have to agree, or the reader gets neither treatment. The snap
-   *  lives in `honourAnchoredMutation` and the skip lives in `withScrollAnchor`.
-   *  Skip one without the other and the reader is frozen at their old offset
-   *  with the content above them grown, which is a drift. So the caller asks
-   *  `readerKeepsTheLiveEdge` once, before the mutation, and hands that one
-   *  answer to the other half.
+   *  The live-edge exception this replaced was taken when the anchor was a
+   *  GUESS at the reader's topmost line. Holding that guess while every turn
+   *  grew pushed the end of the thread 974px below the fold. ADR 0147 replaced
+   *  the guess with the element the reader clicked. The control is pinned to
+   *  the pixel, so that drift cannot recur through it.
    *
    *  A reveal is GROWTH too, so the resize handler runs for one. Its growth
-   *  branch keeps an armed reader who is still ON the live edge there
-   *  (`keepTheLiveEdge`). The two agree by construction: they read the same two
-   *  terms. This file drives the two anchor halves directly, so the cases below
-   *  are the correction's own answer rather than the whole app's. */
-  describe('and keeps an armed reader on the end of an IDLE thread', () => {
+   *  branch stands down for the correction's own anchor write, and that half is
+   *  pinned in `scroll-follow-the-live-edge.test.ts`. This file drives the
+   *  anchor correction directly, so the cases below are its own answer. */
+  describe('and holds the control for an armed reader on an IDLE thread', () => {
     /** Arm the follow, then let the thread go quiet. */
     function armedOnAFinishedThread(scrollTop = 2500) {
       const el = makeContainer({ scrollTop: 3000, scrollHeight: 3000, clientHeight: 500 });
@@ -285,33 +278,31 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       return el;
     }
 
-    it('keeps the newest content under their eye when the steps go on', () => {
+    it('holds the control when the steps go on, from the end of the thread', () => {
       const el = armedOnAFinishedThread();
 
       showSteps(el);
 
-      // 4500, the new live edge, in ONE write. Not 3700: holding their topmost
-      // line would push the end of the thread 800px below the fold, which is
-      // the report this case came from.
-      expect(el.settled).toEqual([4500]);
-      expect(el.settled).not.toContain(3700);
+      // 3700 holds the pressed control: its top fell 1200, so the offset rises
+      // by the same. 4500 is the live-edge snap they are no longer given.
+      expect(el.settled).toEqual([3700]);
+      expect(el.settled).not.toContain(4500);
     });
 
-    it('lets the shrink carry them when the steps go off', () => {
+    it('holds it when the steps go off, undoing the shrink clamp', () => {
       const el = armedOnAFinishedThread();
 
       hideSteps(el);
 
-      // The shrink's own clamp put them on the new end, so there is nothing
-      // left to write. 1300 is the correction they are NOT given.
-      expect(el.settled).toEqual([2300]);
-      expect(el.settled).not.toContain(1300);
+      // 2300 is the shrink's own clamp, which nobody chose; 1300 puts the
+      // pressed control back where it was.
+      expect(el.settled).toEqual([2300, 1300]);
     });
 
     it('still corrects an armed reader parked back in history', () => {
-      // The edge term is what makes this different, and it is why the ride's
-      // own flag cannot answer alone. Nothing is arriving, they are nowhere
-      // near the end, and the turn they expanded stays under their eye.
+      // Unchanged by this rule, and here because it is the case the edge term
+      // used to be weighed against. Nothing is arriving, and the turn they
+      // expanded stays under their eye.
       const el = armedOnAFinishedThread(1200);
 
       showSteps(el);
@@ -320,10 +311,10 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       expect(el.settled).not.toContain(4500);
     });
 
-    it('keeps the end when the reveal makes a short thread scrollable', () => {
+    it('holds it when the reveal makes a short thread scrollable', () => {
       // A transcript SHORTER than its pane has no overflow to be at the edge
-      // of, and the reveal is exactly what gives it one. An `isScrollable`
-      // term would drop the request for precisely that reader.
+      // of, and the reveal is exactly what gives it one. The reader is at the
+      // bottom by construction, and the control still holds.
       const el = makeContainer({ scrollTop: 0, scrollHeight: 400, clientHeight: 500 });
       setActiveScrollElement(el);
       setFollowLiveEdge(true);
@@ -338,8 +329,9 @@ describe('a turn-control toggle settles once while riding the live edge', () => 
       });
       vi.advanceTimersByTime(1500);
 
-      // The new end, not the 800 the anchor correction would have held them at.
-      expect(el.settled).toEqual([4500]);
+      // 800 holds the control; 4500 is the end of the thread it is nowhere near.
+      expect(el.settled).toEqual([800]);
+      expect(el.settled).not.toContain(4500);
     });
 
     it('keeps the ride armed through all of it', () => {

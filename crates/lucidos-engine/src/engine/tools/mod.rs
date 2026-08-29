@@ -2,7 +2,7 @@ mod apps;
 pub(crate) mod bash;
 pub(crate) mod bash_background;
 pub(crate) mod bash_background_recovery;
-mod browser;
+pub(crate) mod browser;
 mod bulk_limits;
 mod capabilities;
 pub(crate) mod credentials;

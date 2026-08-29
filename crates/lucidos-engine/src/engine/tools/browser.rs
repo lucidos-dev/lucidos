@@ -2,6 +2,24 @@ use super::super::LucidosEngine;
 use crate::runtime::BrowserLogins;
 use uuid::Uuid;
 
+/// The `artifacts/`-relative path out of `browser_screenshot`'s result line,
+/// `"Screenshot saved to artifacts/<path> (<n> bytes)"`. `None` when the line
+/// does not carry one.
+///
+/// The runtime stamps a timestamp into the name, so the caller's requested path
+/// is not the one on disk. Two consumers read it back: the commit below, and
+/// the agentic loop's screenshot list.
+///
+/// `rfind`, because the size marker is the LAST ` (` on the line. Under `find`
+/// a screenshot named `report (final).png` truncated at its own parenthesis,
+/// and the commit then named a file that does not exist.
+pub(crate) fn screenshot_artifact_path(result: &str) -> Option<&str> {
+    const PREFIX: &str = "artifacts/";
+    let start = result.find(PREFIX)?;
+    let rest = &result[start + PREFIX.len()..];
+    Some(&rest[..rest.rfind(" (")?])
+}
+
 impl LucidosEngine {
     pub(crate) async fn execute_browser_tool(
         &self,
@@ -123,16 +141,9 @@ impl LucidosEngine {
                     .await
                 {
                     Ok(result) => {
-                        // Extract the actual timestamped path from the result
-                        // Format: "Screenshot saved to artifacts/{path} ({size} bytes)"
-                        let actual_path = result
-                            .find("artifacts/")
-                            .and_then(|start| {
-                                result[start..]
-                                    .find(" (")
-                                    .map(|end| result[start + 10..start + end].to_string())
-                            })
-                            .unwrap_or_else(|| path.to_string());
+                        let actual_path = screenshot_artifact_path(&result)
+                            .unwrap_or(path)
+                            .to_string();
 
                         // Commit the screenshot to git
                         if let Err(e) = self
@@ -170,5 +181,36 @@ impl LucidosEngine {
             },
             _ => Ok(format!("Unknown browser tool: {}", name)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::screenshot_artifact_path;
+
+    #[test]
+    fn reads_the_timestamped_path_the_runtime_reports() {
+        assert_eq!(
+            screenshot_artifact_path(
+                "Screenshot saved to artifacts/shots/page-20260829.png (5120 bytes)"
+            ),
+            Some("shots/page-20260829.png")
+        );
+    }
+
+    /// The regression: `find(" (")` stopped at the name's own parenthesis, so
+    /// the commit named a file that does not exist.
+    #[test]
+    fn a_parenthesis_in_the_name_does_not_truncate_the_path() {
+        assert_eq!(
+            screenshot_artifact_path("Screenshot saved to artifacts/report (final).png (99 bytes)"),
+            Some("report (final).png")
+        );
+    }
+
+    #[test]
+    fn a_line_carrying_no_path_answers_none() {
+        assert_eq!(screenshot_artifact_path("Error: page did not load"), None);
+        assert_eq!(screenshot_artifact_path("saved to artifacts/x.png"), None);
     }
 }

@@ -7,6 +7,7 @@ import {
 } from '../../store/actions/threadQueue';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useServerBackedField, sameJson } from '../../hooks/useServerBackedField';
 import type { CapacityPolicy, ThreadQueueEntry } from '../../store/types';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
@@ -128,9 +129,14 @@ const POLICY_FIELDS: Array<{ key: keyof CapacityPolicy & string; label: string }
 ];
 
 function CapacityPolicyEditor({ policy }: { policy: CapacityPolicy }) {
-  const [draft, setDraft] = useState<CapacityPolicy>(policy);
+  // Server-backed: untouched the fields render the policy the store holds, so a
+  // `CapacityPolicyChanged` frame repaints them. Touched, they keep the user's
+  // draft. Seeding a `useState` from the entity kept the first snapshot for the
+  // life of the editor. It then read as dirty against a policy nobody had
+  // edited, and offered to save the values that frame had replaced (ADR 0118).
+  const [draft, setDraft] = useServerBackedField<CapacityPolicy>(policy, sameJson);
   const [saving, setSaving] = useState(false);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(policy);
+  const dirty = !sameJson(draft, policy);
 
   async function save() {
     setSaving(true);

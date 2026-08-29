@@ -1,3 +1,4 @@
+use crate::engine::thread_events::AgentParticipant;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -99,6 +100,15 @@ pub struct SessionMessage {
     /// Thread this message belongs to (from event payload's thread_id field).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Which agent wrote an assistant turn, read from the event's own actor
+    /// (ADR 0150). `None` on a user turn, and on an assistant turn whose author
+    /// nothing recorded, which is every row written before the actor existed.
+    ///
+    /// `history.rs` reads this to give a second agent its own speaker label. It
+    /// is never inferred from position: two agents can interleave, and only the
+    /// writer knew which one wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentParticipant>,
 }
 
 /// A message in a conversation snapshot (for time-travel view)

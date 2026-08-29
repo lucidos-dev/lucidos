@@ -121,8 +121,9 @@ impl EmailStore {
     /// account name, since `auth_type` carries what the old `email:` prefix used
     /// to say.
     ///
-    /// **Temporary measure (`credential-email-prefix-fallback` in
-    /// `docs/temporary-measures.md`).** The strip is for the rows
+    /// **Temporary measure**, registered in `docs/temporary-measures.md` under
+    /// "`email:`-prefixed credential fallback in `get_email_password`". The strip
+    /// is for the rows
     /// `20260805134838_drop_credential_name_prefixes_use_auth_type.sql` had to
     /// leave prefixed, because their bare name was already held by another
     /// non-oauth credential. Without it, editing such a credential resolves no
@@ -281,6 +282,11 @@ pub struct EmailAttachment {
 }
 
 /// A validated attachment path (path checked, filename extracted) but file not yet read.
+///
+/// `Debug` carries no secret: both fields are the path the caller supplied, and
+/// the refusals below already quote it back. The file CONTENTS live on
+/// `EmailAttachment`, which deliberately derives nothing.
+#[derive(Debug)]
 pub struct ValidatedAttachment {
     pub rel_path: String,
     pub filename: String,
@@ -289,19 +295,36 @@ pub struct ValidatedAttachment {
 impl EmailAttachment {
     /// Validate attachment paths without reading file data.
     /// Returns validated paths + basenames for use in confirmation previews.
+    ///
+    /// A traversal check alone is not enough here. The path joins onto the
+    /// workspace `data/` dir, and the file is mailed to whatever address the
+    /// caller named. So `.env` needs no `..` to leave the machine. Every
+    /// attachment must name a typed subdirectory from
+    /// [`super::KNOWN_DATA_PREFIXES`], the rule the file tools already apply.
     pub fn validate_paths(paths: &[String]) -> Result<Vec<ValidatedAttachment>, String> {
         let mut validated = Vec::new();
         for rel_path in paths {
             if super::is_path_traversal(rel_path) {
                 return Err(format!("Invalid attachment path '{}'. Paths must be relative to data/ with no '..' components.", rel_path));
             }
-            let filename = std::path::Path::new(rel_path)
+            // Callers pass either spelling, so strip a leading `data/` before
+            // the prefix test rather than refusing the fuller one.
+            let stripped = rel_path.strip_prefix("data/").unwrap_or(rel_path);
+            if !super::is_known_data_prefix(stripped) {
+                return Err(format!(
+                    "Invalid attachment path '{rel_path}'. An attachment must sit under one of \
+                     data/'s typed subdirectories ({}), not the data/ root, which holds \
+                     gitignored config.",
+                    super::KNOWN_DATA_PREFIXES.join(", ")
+                ));
+            }
+            let filename = std::path::Path::new(stripped)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
             validated.push(ValidatedAttachment {
-                rel_path: rel_path.clone(),
+                rel_path: stripped.to_string(),
                 filename,
             });
         }

@@ -50,6 +50,39 @@ impl EventStore {
         Ok(events)
     }
 
+    /// The newest `limit` events on a thread, still ordered chronologically.
+    ///
+    /// For a caller that wants recent turns rather than the whole history, and
+    /// is on somebody's latency path. A voice session builds its resident block
+    /// while a person waits for the first word. Reading every event of a long
+    /// thread there costs the call its opening seconds.
+    ///
+    /// A window can start mid-exchange, so the fold over it may produce a
+    /// partial leading message. Size the window well above what you keep, and
+    /// take from the tail.
+    pub async fn get_recent_thread_events(
+        &self,
+        thread_id: uuid::Uuid,
+        limit: i64,
+    ) -> Result<Vec<EventRow>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut events = sqlx::query_as::<_, EventRow>(
+            r#"
+            SELECT id, event_type, payload, created, thread_id, sequence
+            FROM events
+            WHERE thread_id = $1
+            ORDER BY created DESC, sequence DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(thread_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        events.reverse();
+        Ok(events)
+    }
+
     /// Get the content of the first user message in a thread (for title generation).
     /// Returns (text, image_description, image_count) for the first user message in a thread.
     ///

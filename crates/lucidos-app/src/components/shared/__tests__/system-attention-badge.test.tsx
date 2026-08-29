@@ -1,6 +1,6 @@
 /**
  * The *System attention badge* on the path in: the menu hamburger, the drawer's
- * Settings row, the Settings home's System row, and the System tab that owes
+ * Settings row, the Settings home's System row, and the System row that owes
  * the work.
  *
  * The two hook-free components are invoked directly and their vnode trees
@@ -24,7 +24,7 @@ import { findByClass, textOf, type AnyVNode } from '../../layout/__tests__/vnode
 import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from '../../../store/store';
 import {
   releaseNoticeBadge,
-  systemTabBadge,
+  systemPageBadge,
   updateBadge,
   systemAttentionBadge,
 } from '../../../store/systemAttentionBadge';
@@ -36,8 +36,13 @@ const DRAWER = readFileSync(
 const SETTINGS = readFileSync(
   fileURLToPath(new URL('../../settings/SettingsView.tsx', import.meta.url)), 'utf8',
 );
-const SYSTEM = readFileSync(
-  fileURLToPath(new URL('../../settings/SystemPage.tsx', import.meta.url)), 'utf8',
+const SUBMENU = readFileSync(
+  fileURLToPath(new URL('../../settings/SystemSubmenu.tsx', import.meta.url)), 'utf8',
+);
+// The one drilldown row both Settings lists render, so it owns the mark's
+// placement and the sentence the row speaks.
+const NAV_ROW = readFileSync(
+  fileURLToPath(new URL('../../settings/SettingsNavRow.tsx', import.meta.url)), 'utf8',
 );
 const BADGE = readFileSync(
   fileURLToPath(new URL('../SystemAttentionBadge.tsx', import.meta.url)), 'utf8',
@@ -140,16 +145,29 @@ describe('the rows that carry the mark inline', () => {
   });
 
   it('puts it on the System row alone, never on every Settings category', () => {
-    expect(SETTINGS)
-      .toContain('{key === \'system\' && <SystemAttentionBadge placement="inline" label={news} />}');
+    // The home list hands the shared row a badge for `system` and null for
+    // every other category, so no other row can draw a mark.
+    expect(SETTINGS).toContain('badge={key === \'system\' ? news : null}');
+  });
+
+  it('marks a System submenu row by its own source, never the union', () => {
+    // The submenu is the last step of the path, so a mark there promises work
+    // on the page the row opens. The union would dot Release Notices for a
+    // pending update, sending the reader to a page with nothing on it.
+    expect(SUBMENU).toContain('badge={systemPageBadge(key)}');
+    expect(SUBMENU).not.toContain('systemAttentionBadge(');
   });
 
   // The mark is decorative, so a host that CAN name itself has to say the
   // words. The drawer row cannot: it is a role-less div, and the hamburger
   // that opened it has already said them.
-  it('makes the badged buttons speak the sentence', () => {
-    expect(SETTINGS).toContain('aria-label={key === \'system\' && news ?');
-    expect(SYSTEM).toContain('aria-label={badge ? `${item.label} · ${badge}` : undefined}');
+  it('makes the badged row speak the sentence, and hug the word with the mark', () => {
+    // Both lists render `SettingsNavRow`, so one row owns both halves. The
+    // mark sits inside the span, so it hugs the label and leaves the chevron
+    // the trailing edge. The `aria-label` is what says the words.
+    expect(NAV_ROW).toContain('aria-label={badge ? `${label} · ${badge}` : undefined}');
+    expect(NAV_ROW)
+      .toContain('<span>{label}<SystemAttentionBadge placement="inline" label={badge} /></span>');
   });
 
   it('adds no off-screen text to any row', () => {
@@ -160,33 +178,33 @@ describe('the rows that carry the mark inline', () => {
 });
 
 /**
- * The last step of the path splits, because the two causes sit on two tabs.
+ * The last step of the path splits, because the two causes sit on two pages.
  *
- * A mark on a tab promises work on THAT tab. An update must never dot Release
+ * A mark on a row promises work on THAT page. An update must never dot Release
  * Notices, and an owed notice must never dot What's New.
  */
-describe('the two System tabs that can owe something', () => {
+describe('the two System sub-pages that can owe something', () => {
   it('dots Release Notices for an owed notice, and nothing else', () => {
     oweOne();
-    expect(systemTabBadge('release-notices')).toBe('1 thing to do');
-    expect(systemTabBadge('whats-new')).toBe(null);
-    expect(systemTabBadge('backup')).toBe(null);
-    // The path above the two tabs still leads to both, so it keeps the union.
+    expect(systemPageBadge('release-notices')).toBe('1 thing to do');
+    expect(systemPageBadge('whats-new')).toBe(null);
+    expect(systemPageBadge('backup')).toBe(null);
+    // The path above the two rows still leads to both, so it keeps the union.
     expect(systemAttentionBadge()).toBe('1 thing to do');
   });
 
   it('dots What\'s New for an available update, and nothing else', () => {
     releaseCheck.value = { latest: { version: '9.9.9' } } as typeof releaseCheck.value;
-    expect(systemTabBadge('whats-new')).toBe('Lucidos 9.9.9 available');
-    expect(systemTabBadge('whats-new')).toBe(updateBadge());
-    expect(systemTabBadge('release-notices')).toBe(releaseNoticeBadge());
-    expect(systemTabBadge('release-notices')).toBe(null);
+    expect(systemPageBadge('whats-new')).toBe('Lucidos 9.9.9 available');
+    expect(systemPageBadge('whats-new')).toBe(updateBadge());
+    expect(systemPageBadge('release-notices')).toBe(releaseNoticeBadge());
+    expect(systemPageBadge('release-notices')).toBe(null);
   });
 
-  it('leaves the switcher unable to mark a tab it has no sentence for', () => {
-    // Every other subpanel answers null, so a new one is unmarked until
+  it('leaves the submenu unable to mark a row it has no sentence for', () => {
+    // Every other sub-page answers null, so a new one is unmarked until
     // somebody names a source for it.
-    expect(systemTabBadge('thread-queue')).toBe(null);
-    expect(systemTabBadge('overview')).toBe(null);
+    expect(systemPageBadge('thread-queue')).toBe(null);
+    expect(systemPageBadge('system-overview')).toBe(null);
   });
 });

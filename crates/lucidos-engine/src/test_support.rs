@@ -292,7 +292,7 @@ pub async fn seed_credential(
         pool,
         &bus,
         service_name,
-        base_url,
+        &[base_url.to_string()],
         auth_type,
         auth_value,
         None,

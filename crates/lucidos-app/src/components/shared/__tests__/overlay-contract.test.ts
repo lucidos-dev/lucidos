@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error — Node APIs available at runtime via Vitest, no @types/node in project
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 // @ts-expect-error — same
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const source: string = readFileSync(resolve(here, '../Overlay.tsx'), 'utf-8');
+const SRC_ROOT: string = resolve(here, '../../..');
 
 // The whole point of <Overlay> is that the click-outside-dismiss contract is
 // centralized so no individual overlay can drop or mis-wire it (the
@@ -62,5 +63,51 @@ describe('Overlay — centralizes the dismiss contract', () => {
     // A bare addEventListener('pointerdown'|'mousedown'|'click', …) is exactly
     // the anti-pattern the central component exists to eliminate.
     expect(source).not.toMatch(/addEventListener\(\s*['"](?:pointerdown|mousedown|click)['"]/);
+  });
+});
+
+/** **An `onClose` must not RETURN the assignment that closes the overlay.**
+ *
+ *  `makeDismissHandlers` reads a `false` return as "that call was a no-op". It
+ *  then leaves the paired-click suppressor disarmed on purpose, so the user's
+ *  tap still reaches its target. An arrow with an expression body returns its
+ *  expression, so `onClose={() => (open.value = false)}` hands back exactly
+ *  that signal. The overlay closes and the control underneath the dismissing
+ *  click fires with it, which is the one thing the whole contract exists to
+ *  prevent. Four overlays shipped that way, because `useDismissOnOutside`'s own
+ *  doc comment recommended the form.
+ *
+ *  A source scan, because it is a per-callsite shape no type can catch: the
+ *  prop is typed `() => void | boolean` and `false` is a legal, meaningful
+ *  value. Braces are the fix, `() => { open.value = false; }`. */
+describe('every onClose keeps its no-op signal to itself', () => {
+  const overlayUsers: string[] = readdirSync(SRC_ROOT, { recursive: true, encoding: 'utf-8' })
+    .filter((f: string) => f.endsWith('.tsx') || f.endsWith('.ts'))
+    .map((f: string) => resolve(SRC_ROOT, f));
+
+  // An arrow whose body is an assignment, in the two spellings that compile:
+  // `() => (x.y = false)` and the bare `() => x.y = false`. Both evaluate to
+  // the assigned value. It anchors on `=>` rather than on `onClose=`, so it
+  // also catches a handler hoisted into a named const and passed as
+  // `onClose={close}`. The first version of this scan missed both shapes.
+  const ASSIGNMENT_ARROW = /\(\s*\)\s*=>\s*\(?\s*[A-Za-z_$][\w$.]*\s*=\s*(?:false|null|undefined|0|''|"")\s*\)?/;
+
+  it('never gives a dismiss callback an expression body that yields the assigned value', () => {
+    const offenders: string[] = [];
+    for (const file of overlayUsers) {
+      const text: string = readFileSync(file, 'utf-8');
+      for (const line of text.split('\n')) {
+        // Skip comments, so this guard's own doc quoting the bad form, and any
+        // other prose about it, is not read as a call site.
+        const trimmed: string = line.trim();
+        if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue;
+        // Only lines that are plausibly a dismiss callback or its definition.
+        if (!/onClose|onDismiss|\bdismiss\b|close/i.test(line)) continue;
+        if (ASSIGNMENT_ARROW.test(line)) {
+          offenders.push(`${file.slice(SRC_ROOT.length + 1)}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

@@ -101,7 +101,7 @@ impl LucidosEngine {
                 Ok(creds) if !creds.is_empty() => {
                     let cred_list: Vec<String> = creds
                         .iter()
-                        .map(|c| format!("  - {} ({})", c.service_name, c.base_url))
+                        .map(|c| format!("  - {} ({})", c.service_name, c.base_urls.join(", ")))
                         .collect();
                     format!("[CONFIGURED API CREDENTIALS - auth headers are auto-injected for these services]\n{}\nYou can use http_request directly with these APIs - credentials are automatically added.\n[END CREDENTIALS]", cred_list.join("\n"))
                 }

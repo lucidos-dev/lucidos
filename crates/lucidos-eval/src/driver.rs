@@ -489,7 +489,12 @@ pub struct ArmEndpoint {
 impl ArmEndpoint {
     /// Build a client that speaks for a registered device.
     pub async fn connect(base_url: &str, pool: PgPool) -> Fallible<ArmEndpoint> {
+        // `no_proxy()` + `danger_accept_invalid_certs(true)` is the loopback
+        // pair `.claude/rules/rust.md` prescribes: an arm's engine is on
+        // 127.0.0.1 with a self-signed cert, so an `HTTPS_PROXY` in the
+        // environment must never be consulted.
         let bootstrap = reqwest::Client::builder()
+            .no_proxy()
             .danger_accept_invalid_certs(true)
             .build()?;
         bootstrap
@@ -509,6 +514,7 @@ impl ArmEndpoint {
         Ok(ArmEndpoint {
             base_url: base_url.to_string(),
             client: reqwest::Client::builder()
+                .no_proxy()
                 .danger_accept_invalid_certs(true)
                 .default_headers(headers)
                 .build()?,

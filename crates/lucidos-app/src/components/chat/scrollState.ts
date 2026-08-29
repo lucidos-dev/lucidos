@@ -584,16 +584,19 @@ function threadIsLive(): boolean {
  *  being armed? Armed AND live. See `_followingBottom` for why those are two
  *  states, and ADR 0064 for the policy.
  *
- *  It answers for a reader who is somewhere OTHER than the live edge, which is
- *  the only place the liveness term decides anything. A reader ON the edge is
- *  kept there whatever the thread is doing, by `keepTheLiveEdge` and, for a
- *  turn control's reveal, by `readerKeepsTheLiveEdge`.
+ *  For GROWTH it answers for a reader somewhere OTHER than the live edge. Its
+ *  liveness term decides nothing for a reader ON the edge, whom
+ *  `keepTheLiveEdge` keeps there whatever the thread is doing.
+ *
+ *  For a turn control's PRESS it is the whole answer, edge or no edge. The
+ *  press names one thing to hold still, so only a ride already carrying the
+ *  reader outranks it (ADR 0147).
  *
  *  Three callers ask it: the growth branch (`honourGrowth`), the reveal snap
  *  (`honourAnchoredMutation`), and `withScrollAnchor`'s decision to skip the
  *  anchor correction. The last two are ONE act split across the DOM/layout
- *  line, so they must answer the same. Each of them ORs in the edge reading,
- *  and both take the same one, so the pair still cannot disagree.
+ *  line, so they must answer the same, and asking one predicate is what makes
+ *  that so.
  *
  *  Deliberately NOT asked by the reader's own explicit requests, which write the
  *  live edge directly: pressing the toggle, resuming a recorded request on
@@ -1047,46 +1050,22 @@ function carryHeldScroll(el: HTMLElement): void {
  *  taking over. The transcript-wide reveals grow every turn, including those
  *  BELOW the anchored root, so the correction leaves the reader short.
  *
- *  Then, for a reader who belongs on the NEWEST content, one held write puts
- *  them on the live edge, in the frame the caller unfreezes: `snapToLiveEdge`.
- *  That is not a position the reader ever occupied.
+ *  Then, for a reader the ride is CARRYING, one held write puts them on the
+ *  live edge, in the frame the caller unfreezes: `snapToLiveEdge`. That is not
+ *  a position the reader ever occupied.
  *
- *  TWO readers belong there, and the caller answers for the second. The follow
- *  is CARRYING one of them (`followIsCarrying`), carrying rather than merely
- *  ARMED. The other was armed AND already ON the live edge when the reveal
- *  began, and `onTheLiveEdge` is that reading, which only the caller can take.
- *  See `readerKeepsTheLiveEdge` for why it cannot be taken here.
+ *  CARRYING, rather than merely armed and sitting on the edge. A press asks for
+ *  one named thing to change, so the thing they pressed is what must not move
+ *  (ADR 0147). On a live thread the next growth round would undo that hold, so
+ *  one press would cost two motions and the ride wins. On a quiet thread
+ *  nothing is arriving to carry them toward.
  *
  *  Nothing at all for anyone else. A tween here was tried and rejected, see
  *  ADR 0064. */
-export function honourAnchoredMutation(el: HTMLElement, onTheLiveEdge = false): void {
+export function honourAnchoredMutation(el: HTMLElement): void {
   carryHeldScroll(el);
-  if (!(followIsCarrying() || onTheLiveEdge) || isAtLiveEdge(el)) return;
+  if (!followIsCarrying() || isAtLiveEdge(el)) return;
   snapToLiveEdge(el);
-}
-
-/** Does the reader KEEP the live edge across an anchored mutation: they asked
- *  for it, and they are on it?
- *
- *  `keepTheLiveEdge`'s two POSITION terms, asked of an event that is neither a
- *  scroll nor a resize. ADR 0064: "a reader ON the live edge is kept there,
- *  running thread or quiet one". No liveness term, for the reason given there.
- *  Its stand-downs are deliberately not repeated: `snapToLiveEdge` supersedes
- *  every tween here on purpose.
- *
- *  It has to be asked BEFORE the mutation. Growth moves the edge while leaving
- *  `scrollTop` where it was, so afterwards nothing can tell the reader was
- *  resting on it. Holding the control they pressed and holding the newest
- *  content agree everywhere but here: rows revealed between the two push the
- *  end of the thread off the bottom.
- *
- *  The BOX term stands in for the guard `keepTheLiveEdge` gets for free, which
- *  is a snapshot that starts false rather than measured. A boxless container
- *  answers `isAtLiveEdge` true, so a direct read has to ask. Height rather
- *  than `isScrollable`: a reveal can make a short transcript tall, and its
- *  reader is on the end of the thread like any other. */
-export function readerKeepsTheLiveEdge(el: HTMLElement): boolean {
-  return _followingBottom.value && el.clientHeight > 0 && isAtLiveEdge(el);
 }
 
 /** Is the container still exactly where our last held write left it? The exact
@@ -3168,11 +3147,25 @@ export function makeScrollObservers(el: HTMLElement) {
    *  more recently, and for a deep-link CLAIM that has not landed. Under a
    *  claim, `restoreAfterReflow` is the right answer instead. It cannot loop,
    *  because `markHeldScroll` stamps the position read back AFTER the write, so
-   *  a browser clamp is recorded as ours. */
+   *  a browser clamp is recorded as ours.
+   *
+   *  AND FOR AN ANCHOR WRITE, which is the app deciding a beat ago that this
+   *  reader stays on their own content across a mutation. Both readings above
+   *  describe where they were BEFORE it, so acting on either undoes the
+   *  correction. That is the reported bug. Unfolding a turn from the bottom
+   *  wrote nothing here, so this round hauled the reader to the new end. The
+   *  pressed icon went with them.
+   *
+   *  It belongs INSIDE this predicate, unlike the placement term `onScroll`
+   *  adds. That one also covers a HELD write. The growth branch takes one every
+   *  round, so asking it here would stand the branch down for its own writes.
+   *  An anchor write is a kind of its own, and this branch never makes one. The
+   *  narrow question is safe where the wide one is not. */
   function keepTheLiveEdge(): boolean {
     if (!_followingBottom.value) return false;
     if (!anchorAtLiveEdge && !heldOnTheLiveEdge(el)) return false;
     if (_scrollAnimRaf !== null || hasPendingEventScroll()) return false;
+    if (isAnchorScroll(el)) return false;
     markHeldScroll(el, liveEdgeTop(el));
     return true;
   }

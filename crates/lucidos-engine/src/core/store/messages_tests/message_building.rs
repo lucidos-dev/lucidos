@@ -449,3 +449,166 @@ fn build_session_messages_legacy_tool_result_without_success_defaults_to_true() 
         "missing success defaults to true"
     );
 }
+
+/// The projection reads the author off the persisted actor (ADR 0150), so a
+/// guest's turn arrives at `history.rs` already attributed. Nothing about the
+/// turn's POSITION is consulted: two agents interleave, and only the writer
+/// knew which one wrote.
+#[test]
+fn a_guest_authored_response_carries_its_agent_into_the_projection() {
+    let events = vec![
+        make_event("MessageReceived", json!({"text": "what's on today?"}), 0),
+        make_event(
+            "ResponseGenerated",
+            json!({
+                "text": "Let me look.",
+                "actor": {"kind": "agent", "agent": {"kind": "guest", "label": "Voice"}}
+            }),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let assistant = msgs
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("assistant");
+    assert_eq!(
+        assistant.agent,
+        Some(crate::engine::thread_events::AgentParticipant::Guest {
+            label: "Voice".into()
+        })
+    );
+    // The user's own turn is never given an author, whoever answered it.
+    let user = msgs.iter().find(|m| m.role == "user").expect("user");
+    assert_eq!(user.agent, None);
+}
+
+/// Our own agent stamps itself, and a row from before the actor existed reads
+/// as no author at all. Both render `Assistant`, so the distinction costs the
+/// reader nothing and keeps the projection honest about what was recorded.
+#[test]
+fn our_agent_is_named_and_a_legacy_row_names_nobody() {
+    let events = vec![
+        make_event(
+            "ResponseGenerated",
+            json!({"text": "ours", "actor": {"kind": "agent"}}),
+            0,
+        ),
+        make_event("MessageReceived", json!({"text": "again"}), 1),
+        make_event("ResponseGenerated", json!({"text": "legacy"}), 2),
+    ];
+    let msgs = build_session_messages(&events);
+    let assistants: Vec<_> = msgs.iter().filter(|m| m.role == "assistant").collect();
+    assert_eq!(assistants.len(), 2, "{msgs:?}");
+    assert_eq!(
+        assistants[0].agent,
+        Some(crate::engine::thread_events::AgentParticipant::LucidosAgent)
+    );
+    assert_eq!(assistants[1].agent, None);
+}
+
+/// A human actor names a way IN, not an author. The projection must not read
+/// the device that sent the prompt as the agent that answered it.
+#[test]
+fn a_human_actor_never_becomes_an_authoring_agent() {
+    let events = vec![make_event(
+        "ResponseGenerated",
+        json!({
+            "text": "hi",
+            "actor": {"kind": "device", "device_id": "dev-1", "label": "My MacBook"}
+        }),
+        0,
+    )];
+    let msgs = build_session_messages(&events);
+    assert_eq!(msgs[0].agent, None);
+}
+
+/// A spoken reply reaches the reasoner as the talker's turn, under the talker's
+/// own speaker label. Read as the reasoner's own prior turn it would agree with
+/// itself; read as the user's, it would obey an instruction nobody gave.
+#[test]
+fn a_spoken_reply_reaches_the_reasoner_under_its_own_label() {
+    let events = vec![
+        make_event("MessageReceived", json!({"text": "what have I got on?"}), 0),
+        make_event(
+            "SpokenReplyGenerated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Let me check.",
+                "interrupted": false,
+                "actor": {"kind": "agent", "agent": {"kind": "guest", "label": "Lucidos (aloud)"}}
+            }),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let spoken = msgs
+        .iter()
+        .find(|m| m.content == "Let me check.")
+        .expect("the spoken reply");
+    assert_eq!(spoken.role, "assistant");
+    assert_eq!(
+        spoken.agent,
+        Some(crate::engine::thread_events::AgentParticipant::Guest {
+            label: "Lucidos (aloud)".into()
+        })
+    );
+    // The label `history.rs` prints, read off the participant it reads it off.
+    assert_eq!(
+        spoken.agent.as_ref().expect("an author").speaker_label(),
+        "Lucidos (aloud)"
+    );
+}
+
+/// The talker speaks mid-call, often while the reasoner's own turn is still
+/// running. So its reply must consume none of that turn's pending steps.
+#[test]
+fn a_spoken_reply_takes_nothing_from_the_turn_around_it() {
+    let events = vec![
+        make_event("MessageReceived", json!({"text": "what have I got on?"}), 0),
+        make_event(
+            "ToolCalled",
+            json!({"name": "list_files", "args": {}, "tool_use_id": "t1"}),
+            1,
+        ),
+        make_event(
+            "SpokenReplyGenerated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "text": "Still looking.",
+                "interrupted": false
+            }),
+            2,
+        ),
+        make_event("ResponseGenerated", json!({"text": "Two things."}), 3),
+    ];
+    let msgs = build_session_messages(&events);
+    let spoken = msgs
+        .iter()
+        .find(|m| m.content == "Still looking.")
+        .expect("the spoken reply");
+    assert!(spoken.steps.is_empty(), "{:?}", spoken.steps);
+
+    let answer = msgs
+        .iter()
+        .find(|m| m.content == "Two things.")
+        .expect("the reasoner's answer");
+    assert_eq!(answer.steps.len(), 1, "the tool call went missing");
+    assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
+}
+
+/// A reply with no words is written down nowhere, so nothing here has to
+/// render an empty assistant turn.
+#[test]
+fn a_spoken_reply_with_no_words_makes_no_message() {
+    let events = vec![make_event(
+        "SpokenReplyGenerated",
+        json!({
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "text": "   ",
+            "interrupted": true
+        }),
+        0,
+    )];
+    assert!(build_session_messages(&events).is_empty());
+}

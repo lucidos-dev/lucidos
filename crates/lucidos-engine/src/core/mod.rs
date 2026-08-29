@@ -247,7 +247,10 @@ pub use artifacts::{
     is_vendored_path, list_searchable_data_files, ArtifactChange, ArtifactManager,
     WriteAnnouncement,
 };
-pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
+pub use credentials::{
+    credential_scope_covers, normalized_base_urls, AuthType, Credential, CredentialInfo,
+    CredentialStore,
+};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};
 pub use environment_variables::{EnvironmentVariable, EnvironmentVariableStore};
@@ -402,6 +405,25 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
     Ok(true)
 }
 
+/// Keep `<workspace>/.lucidos` out of Time Machine and every other file-level
+/// backup (ADR 0153). It holds `backup.key`, which decrypts every archive this
+/// workspace ever uploaded.
+///
+/// The gateway marks the same directory when it spawns an engine, so this
+/// covers the launch that skips the gateway: e2e, a test harness, an engine
+/// started by hand. Creating the directory first keeps the call quiet on a
+/// workspace that has none yet.
+///
+/// Returns whether the exclusion was newly set, so the caller logs the change
+/// alone and stays silent on every later boot.
+pub fn ensure_state_dir_excluded_from_file_backup(
+    workspace: &std::path::Path,
+) -> std::io::Result<bool> {
+    let state_dir = workspace.join(".lucidos");
+    std::fs::create_dir_all(&state_dir)?;
+    Ok(lucidos_file_backup_exclusion::ensure_excluded(&state_dir)?.changed())
+}
+
 pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
@@ -413,13 +435,13 @@ pub use preferences::{
     PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE, PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL,
     PREF_LOCAL_BASE_URL, PREF_MAX_TOOL_CALLS, PREF_MODEL_COMMAND_JUDGE,
     PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY,
-    PREF_MODEL_TITLE, PREF_OPENCODE_FREE_ENABLED, PREF_PROVIDER_ENABLED_ANTHROPIC,
-    PREF_PROVIDER_ENABLED_LOCAL, PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
-    PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI, PREF_REASONING_COMMAND_JUDGE,
-    PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY,
-    PREF_REASONING_TITLE, PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS,
-    PREF_SELF_CURATED_CONTEXT_MODE, PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS,
-    PREF_VERTEX_REGION,
+    PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER, PREF_OPENCODE_FREE_ENABLED,
+    PREF_PROVIDER_ENABLED_ANTHROPIC, PREF_PROVIDER_ENABLED_LOCAL, PREF_PROVIDER_ENABLED_OPENAI,
+    PREF_PROVIDER_ENABLED_OPENROUTER, PREF_PROVIDER_ENABLED_VERTEX, PREF_PROVIDER_ENABLED_XAI,
+    PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY,
+    PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_TITLE,
+    PREF_SELF_CURATED_CONTEXT_EXPIRE_AFTER_ROUNDS, PREF_SELF_CURATED_CONTEXT_MODE,
+    PREF_SELF_CURATED_CONTEXT_SWEEP_EVERY_ROUNDS, PREF_VERTEX_REGION, PREF_VOICE_RESIDENT_SECTIONS,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
@@ -627,7 +649,7 @@ pub fn commit_data_paths_with_overrides(
                     &blob_index_entry(&repo_relative, git2::Oid::zero(), *mode),
                     bytes,
                 )?,
-                None => index.add_path(std::path::Path::new(&repo_relative))?,
+                None => add_path_unless_ignored(&repo, &mut index, &repo_relative)?,
             }
         }
         index.write()?;
@@ -765,6 +787,71 @@ pub fn commit_index_unless_unchanged(
 /// a false negative costs a path escape.
 pub fn is_path_traversal(path: &str) -> bool {
     path.contains("..") || path.starts_with('/') || path.starts_with('\\')
+}
+
+/// Stage `repo_path` into `index`, unless git ignores it.
+///
+/// `index.add_path` does NOT consult `.gitignore`. It stages whatever path it
+/// is handed, so an ignored file enters a commit the moment a caller names it.
+/// The workspace ignores exactly what must never reach history: `data/.env`,
+/// `data/postgres/`, `data/blobs/`.
+///
+/// Every explicit `add_path` on a caller-supplied path goes through here, so
+/// the guard cannot be bypassed one module over. A whole-tree
+/// `add_all(.., IndexAddOption::DEFAULT, ..)` already honours ignores.
+///
+/// Skipping beats refusing: the file is on disk by then, and refusing would
+/// fail a script whose real output committed fine. The skip is logged.
+///
+/// **Ignored is not enough on its own: the path must also be untracked.**
+/// `is_path_ignored` answers the ignore RULES, blind to the index. So a rule
+/// added later would silently stop committing UPDATES to a file history
+/// already carries. `git add` keeps staging it, and so does `commit_all_dirty`
+/// through its `add_all`, which would leave the two disagreeing about one file.
+pub(crate) fn add_path_unless_ignored(
+    repo: &git2::Repository,
+    index: &mut git2::Index,
+    repo_path: &str,
+) -> Result<(), git2::Error> {
+    let path = std::path::Path::new(repo_path);
+    if repo.is_path_ignored(path)? && index.get_path(path, 0).is_none() {
+        crate::log!("[Git] not committing {repo_path}: git ignores it and it is untracked");
+        return Ok(());
+    }
+    index.add_path(path)
+}
+
+/// The typed `data/` subdirectories a caller-supplied path may name. Everything
+/// else under the `data/` root is gitignored config (`.env`, `postgres/`) that
+/// no caller-supplied path may reach.
+///
+/// `is_path_traversal` alone is not enough for a path that gets joined onto
+/// `data/`: it stops the path escaping the directory but says nothing about the
+/// secrets sitting inside it. A caller that only checks traversal accepts
+/// `.env` and hands the workspace credentials to whoever asked.
+///
+/// One definition, because a second copy drifts: the file tools reach it through
+/// `normalize_data_path`, email attachments through
+/// `EmailAttachment::validate_paths`. It mirrors `MUTABLE_PREFIXES` in
+/// `api/data_api.rs` (the HTTP data surface) plus `system-knowhow/`, which is
+/// engine-repo and read-only.
+pub const KNOWN_DATA_PREFIXES: [&str; 8] = [
+    "artifacts/",
+    "apps/",
+    "knowhow/",
+    "triggers/",
+    "scripts/",
+    "config/",
+    "auth-modules/",
+    "system-knowhow/",
+];
+
+/// Whether a `data/`-relative path names one of the typed subdirectories in
+/// [`KNOWN_DATA_PREFIXES`].
+pub fn is_known_data_prefix(relative_path: &str) -> bool {
+    KNOWN_DATA_PREFIXES
+        .iter()
+        .any(|p| relative_path.starts_with(p))
 }
 
 /// Whether a file extension indicates a binary file.

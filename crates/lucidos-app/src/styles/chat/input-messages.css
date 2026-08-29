@@ -312,6 +312,30 @@
     color: var(--accent);
 }
 
+/* CALL: a third shape, and the only one in this row that is not blue.
+ *
+ * The two above are modes the reader arms and forgets. A call is neither: it
+ * holds the microphone open, it is spending money, and pressing the button
+ * again ENDS it. Red is what a hang-up is on every phone ever made, so the
+ * on-state says what the next press does rather than only that a mode is on.
+ *
+ * Framed, like the WIP toggle, because a call is temporary and wants the box.
+ * The hover override IS needed here: `.icon-btn:hover`'s background would
+ * otherwise replace the tinted one, which reads as the frame vanishing under
+ * the pointer at the exact moment the reader is aiming at it. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"] {
+    color: var(--accent-red);
+    background: color-mix(in srgb, var(--accent-red) 15%, transparent);
+    border-radius: 0.375rem;
+}
+
+@media (hover: hover) {
+    .prompt-actions-row .icon-btn.header-icon.active[data-role="call-toggle"]:hover {
+        color: var(--accent-red);
+        background: color-mix(in srgb, var(--accent-red) 25%, transparent);
+    }
+}
+
 .prompt-actions-right {
     display: flex;
     align-items: center;

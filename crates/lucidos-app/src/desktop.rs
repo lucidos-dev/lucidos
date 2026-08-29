@@ -467,10 +467,17 @@ impl GatewayService {
         // SIGUSR1 is the gateway's graceful-stop signal, since it ignores
         // SIGTERM. It exits but deliberately LEAVES its engines running for
         // re-adoption, so we stop those explicitly below.
+        //
+        // Signalled through `libc::kill`, as `stop_workspace_engines` does.
+        // Forking `kill` would put a bare name on the PATH launchd hands this
+        // service, for a call the C library already makes directly.
         #[cfg(unix)]
         {
-            let pid = self.gateway.id().to_string();
-            let _ = Command::new("kill").args(["-USR1", &pid]).status();
+            // SAFETY: signalling our own still-running child; a pid that has
+            // already exited returns ESRCH, which is nothing to act on here.
+            unsafe {
+                libc::kill(self.gateway.id() as libc::pid_t, libc::SIGUSR1);
+            }
             for _ in 0..30 {
                 match self.gateway.try_wait() {
                     Ok(Some(_)) => break,

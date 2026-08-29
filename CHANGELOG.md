@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.33.0 — 2026-08-29
+
+### Added
+
+- Call a thread and speak to it. Experimental and off by default: turn on **Voice** in Settings to give the composer a call control. A spoken utterance starts the thread's ordinary turn, the agent's answer comes back out loud, and both sides are written into the transcript as thread events. Settings > Models gains a Voice section for the talker model and for what a call is told at the start.
+- A long press opens a mobile thread row's actions. On a phone the small overflow button in the pane's right corner is gone, and holding the row opens the same menu against the row's leading edge, where your thumb already is.
+- Discuss a webhook ingress outage. The ingress bar gains a Discuss button beside Open Webhooks. One tap starts a Lucidos Agent thread quoting the whole declaration. It names the webhook the probe knocked on, the public host and port, and the families that are down. It also carries the outage age and what each probed address answered.
+
+### Changed
+
+- Settings > System is a drilldown list, like the Settings home one level above it. Ten sub-pages used to sit under a four-row tab strip that took 290px off the top of every one of them. Overview is now a row like the rest.
+- The update-check row says how often the check runs and what it sends, behind its own explainer.
+- The image viewer's chrome fades out instead of snapping away.
+
+### Fixed
+
+- The packaged app no longer dies when a proxy signs a request. The engine compiles a signer module to run it, and macOS killed the process the moment it did, taking the in-flight chat turn with it. The engine now ships with the entitlement that permits it, checked against the signed bytes at build time.
+- One credential can cover several hostnames of a provider. A key pair signing both `api.binance.com` and `fapi.binance.com` used to be refused on the second, because a credential could name only one base URL. It now carries a list, and Settings edits it: the Base URL field became Base URLs, with a row per host. A script reads the same list with `lucidos credentials list` and replaces it with `lucidos credentials set-base-urls`. Nothing widens on upgrade, and nothing is guessed from a hostname's spelling: each host is named, and a request to any other is still refused.
+- Auth handshake proxies work again on a workspace upgraded from 0.32.0. A `script` path written as `data/scripts/auth/x.py` stopped resolving. That spelling only ever worked through a fallback the 0.32.0 hardening removed, so the engine looked for `data/data/...` and answered "auth handshake script not found". The same doubling reached the startup pass that approves the scripts a workspace already runs. It found nothing, approved nothing, and marked the workspace as done. Both spellings now name one file, and a workspace already marked can approve its scripts with `lucidos handshake approve`.
+- An OAuth proxy no longer refuses its own credential. A handshake script is handed a credential and presents it to the provider's token endpoint, not to the API the proxy calls. Requiring the credential to be scoped to that API refused every ordinary OAuth setup: a Google client belongs to `oauth2.googleapis.com` while the calendar API sits on `www.googleapis.com`. The approvals record now pins which secrets an entry may hand each script, in a file no app can write. That is stricter than the check it replaces, and it covers connected OAuth accounts too. Editing `data/config/apis.json` to hand a script a different secret is refused by name.
+- A working webhook ingress is no longer reported as dead. Two faults stacked up. The lookup stopped at the first public resolver that answered, so one resolver's intermittent "no such host" settled it and the second was never asked. That empty answer then became a verdict of unreachable over both address families, from a check that had sent no request at all. The lookup now takes the first resolver that names an address, and a family is only called down after something was actually sent to it.
+- The workspace backup key is no longer readable by an installed app. Revealing it takes a one-shot token, refuses a request coming from an app document, and leaves an audit row naming who asked.
+- Wrong guesses on the device pairing route are rate limited.
+- An error toast never shows a raw response body. A gateway error page used to arrive as eight kilobytes of markup rendered as a bulleted list of its own meta tags.
+- The mobile header's back and forward chevrons sit one slot inboard of the edge controls, at every UI scale. They used to be held a fixed distance apart whenever the row had the room, which parked them inside the space reserved for them.
+- Deep-linking Settings > System Overview lands on the Overview page, and How to Update opens the page it scrolls within.
+- A turn control holds the element you pressed when the transcript is at the live edge, and the scroll correction waits for the height rather than for the target.
+- A project-wide hardening sweep across the engine, the gateway and the frontend, including a gitignore guard that could be walked around one module over, engine credentials that could reach debug output, and a directly-launched engine that now demands a scoped credential when its bind faces a network.
 ## v0.32.0 — 2026-08-28
 
 ### Added

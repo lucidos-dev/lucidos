@@ -28,7 +28,23 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use local_token::{ct_eq, path as local_token_path, HEADER_LOCAL_TOKEN};
+pub use local_token::{ct_eq, path as local_token_path, HEADER_LOCAL_TOKEN, HEADER_WEBHOOK_TOKEN};
+
+/// A credential header value that stays out of debug output.
+///
+/// Every outbound credential goes through here, so no site has to remember the
+/// `set_sensitive` call. A `HeaderMap` reaches error and trace formatting on
+/// these paths, and a credential printed into a log is a credential leaked.
+///
+/// `None` when the value will not build, which sends no header at all. An empty
+/// one would be sent and refused, reading as a WRONG credential rather than an
+/// absent one. Mirrors `lucidos_engine::gateway_auth`, which made the same call
+/// for the engine's outbound half.
+pub fn sensitive_credential(value: &str) -> Option<axum::http::HeaderValue> {
+    let mut header = axum::http::HeaderValue::from_str(value).ok()?;
+    header.set_sensitive(true);
+    Some(header)
+}
 
 /// The cookie name every gateway wrote before the names were split.
 ///
@@ -274,6 +290,18 @@ pub fn digest(value: &str) -> String {
     s
 }
 
+/// Wrong guesses this gateway will answer in one window.
+///
+/// `/~/api/v1/auth/pair` is public by necessity, so on a wide bind it is
+/// reachable from the LAN or the tailnet. Without a cap, a caller may work
+/// through the code space as fast as the socket accepts connections. Ten a
+/// minute leaves brute force hopeless against eight digits, and forgives the
+/// handful of typos a real person makes.
+const FAILED_REDEMPTIONS_PER_WINDOW: u32 = 10;
+
+/// How long that budget takes to refill.
+const FAILED_REDEMPTION_WINDOW: Duration = Duration::from_secs(60);
+
 /// Pairing codes that have been minted and not yet redeemed.
 ///
 /// In memory only, and deliberately so. A code lives five minutes, so surviving
@@ -282,6 +310,24 @@ pub fn digest(value: &str) -> String {
 #[derive(Debug, Default)]
 pub struct PendingPairings {
     codes: HashMap<String, PendingPairing>,
+    /// Wrong guesses answered since [`Self::window_opened`].
+    failed: u32,
+    /// When the current window opened. `None` means no guess has failed yet.
+    window_opened: Option<Instant>,
+}
+
+/// What one redemption attempt produced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Redemption {
+    /// The code was good, carrying the label suggested when it was minted.
+    Redeemed(Option<String>),
+    /// Wrong, or expired.
+    Rejected,
+    /// Too many wrong guesses lately, so this one was not even compared.
+    ///
+    /// Refusing before the compare is what makes the cap mean anything. A
+    /// throttle that still checks the code slows nobody down.
+    Throttled,
 }
 
 /// One outstanding code, with the label whoever minted it suggested.
@@ -311,20 +357,58 @@ impl PendingPairings {
 
     /// Redeem a code, consuming it.
     ///
-    /// `None` means the code was wrong or expired. `Some(label)` carries the
-    /// name suggested when it was minted, which may itself be `None`. A code
-    /// works once: a second redemption of an observed code must not enrol a
-    /// second device.
-    pub fn redeem(&mut self, presented: &str) -> Option<Option<String>> {
+    /// A code works once: a second redemption of an observed code must not
+    /// enrol a second device.
+    ///
+    /// A CORRECT code clears the failure budget, so the throttle can never
+    /// stand between a person and a code they typed right. Only wrong guesses
+    /// spend it. That keeps this a brute-force defence, rather than a way for
+    /// an attacker to lock the user out of pairing.
+    pub fn redeem(&mut self, presented: &str) -> Redemption {
         self.drop_expired();
+        if self.guessing_is_throttled() {
+            return Redemption::Throttled;
+        }
         // Found by constant-time compare rather than `HashMap::remove`, so a
         // wrong code cannot be narrowed down by how long the lookup took.
         let key = self
             .codes
             .keys()
             .find(|k| ct_eq(k, presented.trim()))
-            .cloned()?;
-        self.codes.remove(&key).map(|pending| pending.label)
+            .cloned();
+        match key.and_then(|k| self.codes.remove(&k)) {
+            Some(pending) => {
+                self.failed = 0;
+                self.window_opened = None;
+                Redemption::Redeemed(pending.label)
+            }
+            None => {
+                self.record_failed_guess();
+                Redemption::Rejected
+            }
+        }
+    }
+
+    /// Has this gateway already answered its budget of wrong guesses?
+    fn guessing_is_throttled(&self) -> bool {
+        match self.window_opened {
+            Some(opened) if opened.elapsed() < FAILED_REDEMPTION_WINDOW => {
+                self.failed >= FAILED_REDEMPTIONS_PER_WINDOW
+            }
+            // No window yet, or the last one has rolled. Nothing is owed.
+            _ => false,
+        }
+    }
+
+    /// Spend one of the budget, opening a fresh window when the last has rolled.
+    fn record_failed_guess(&mut self) {
+        match self.window_opened {
+            Some(opened) if opened.elapsed() < FAILED_REDEMPTION_WINDOW => self.failed += 1,
+            _ => {
+                self.window_opened = Some(Instant::now());
+                self.failed = 1;
+            }
+        }
     }
 
     fn drop_expired(&mut self) {
@@ -418,6 +502,15 @@ fn mint_numeric_code() -> std::io::Result<String> {
 /// process that mints; everyone else calls `lucidos_local_token::read`.
 pub fn ensure_local_token() -> std::io::Result<String> {
     local_token::ensure()
+}
+
+/// Read the webhook-delivery token, minting it on first use.
+///
+/// Minted by the gateway on the same terms as the local token, and read by the
+/// engine to recognise a delivery hop. It authorizes ONE engine route, so a
+/// funnel-exposed hook cannot become a workspace restart.
+pub fn ensure_webhook_token() -> std::io::Result<String> {
+    local_token::ensure_named(local_token::WEBHOOK_TOKEN_FILE)
 }
 
 /// A fresh device id. Not a secret: it names a row in the paired-device store
@@ -721,12 +814,14 @@ mod tests {
         let code = pending.mint(None).unwrap();
         assert_eq!(code.len(), PAIRING_CODE_DIGITS as usize);
         assert!(code.chars().all(|c| c.is_ascii_digit()));
-        assert!(
-            pending.redeem(&code).is_some(),
+        assert_eq!(
+            pending.redeem(&code),
+            Redemption::Redeemed(None),
             "the first redemption must work"
         );
-        assert!(
-            pending.redeem(&code).is_none(),
+        assert_eq!(
+            pending.redeem(&code),
+            Redemption::Rejected,
             "an observed code must not enrol a second device"
         );
     }
@@ -735,8 +830,8 @@ mod tests {
     fn an_unminted_code_never_redeems() {
         let mut pending = PendingPairings::default();
         pending.mint(None).unwrap();
-        assert!(pending.redeem("00000000").is_none());
-        assert!(pending.redeem("").is_none());
+        assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
+        assert_eq!(pending.redeem(""), Redemption::Rejected);
     }
 
     #[test]
@@ -776,14 +871,111 @@ mod tests {
         // the device landed under the default. The label rides the code now.
         let mut pending = PendingPairings::default();
         let code = pending.mint(Some("My iPhone".into())).unwrap();
-        assert_eq!(pending.redeem(&code), Some(Some("My iPhone".into())));
+        assert_eq!(
+            pending.redeem(&code),
+            Redemption::Redeemed(Some("My iPhone".into()))
+        );
     }
 
     #[test]
     fn a_code_minted_without_a_label_redeems_to_no_label() {
         let mut pending = PendingPairings::default();
         let code = pending.mint(None).unwrap();
-        assert_eq!(pending.redeem(&code), Some(None));
+        assert_eq!(pending.redeem(&code), Redemption::Redeemed(None));
+    }
+
+    // ── Guessing is rate limited ────────────────────────────────────────────
+
+    #[test]
+    fn wrong_guesses_run_out_and_then_are_not_even_compared() {
+        // The public reachability of `/~/api/v1/auth/pair` is the whole reason.
+        // Unthrottled, eight digits fall to a caller on the LAN who can guess
+        // as fast as the socket accepts.
+        let mut pending = PendingPairings::default();
+        pending.mint(None).unwrap();
+        for i in 0..FAILED_REDEMPTIONS_PER_WINDOW {
+            assert_eq!(
+                pending.redeem("00000000"),
+                Redemption::Rejected,
+                "guess {i} is within the budget"
+            );
+        }
+        assert_eq!(
+            pending.redeem("00000000"),
+            Redemption::Throttled,
+            "the budget must run out"
+        );
+    }
+
+    #[test]
+    fn a_throttled_gateway_stops_answering_even_a_correct_code() {
+        // The cost of the cap, stated so nobody removes it by surprise. A
+        // throttle that still compared would slow an attacker down by nothing,
+        // so the refusal has to come first.
+        let mut pending = PendingPairings::default();
+        let code = pending.mint(None).unwrap();
+        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW {
+            pending.redeem("00000000");
+        }
+        assert_eq!(pending.redeem(&code), Redemption::Throttled);
+    }
+
+    #[test]
+    fn a_correct_code_clears_the_budget_so_a_typo_costs_the_next_person_nothing() {
+        // A person mistyping their code must not leave the next attempt, or the
+        // next device, throttled.
+        let mut pending = PendingPairings::default();
+        let first = pending.mint(None).unwrap();
+        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW - 1 {
+            assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
+        }
+        assert_eq!(pending.redeem(&first), Redemption::Redeemed(None));
+
+        let second = pending.mint(None).unwrap();
+        for _ in 0..FAILED_REDEMPTIONS_PER_WINDOW - 1 {
+            assert_eq!(pending.redeem("00000000"), Redemption::Rejected);
+        }
+        assert_eq!(
+            pending.redeem(&second),
+            Redemption::Redeemed(None),
+            "the budget must have been cleared by the first success"
+        );
+    }
+
+    #[test]
+    fn a_fresh_gateway_owes_nothing() {
+        let pending = PendingPairings::default();
+        assert!(!pending.guessing_is_throttled());
+    }
+
+    #[test]
+    fn an_outbound_credential_stays_out_of_debug_output() {
+        // Both engine credentials ride an outbound hop now, the proxy's and the
+        // hook socket's. A `HeaderMap` reaches error and trace formatting on
+        // those paths, so a credential that prints is a credential leaked.
+        // Both fixtures avoid any substring of a header NAME, since
+        // `x-lucidos-webhook-token` itself ends in "hook-token".
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_LOCAL_TOKEN,
+            sensitive_credential("aaaa1111").expect("a plain token builds"),
+        );
+        headers.insert(
+            HEADER_WEBHOOK_TOKEN,
+            sensitive_credential("bbbb2222").expect("a plain token builds"),
+        );
+        let rendered = format!("{headers:?}");
+        assert!(!rendered.contains("aaaa1111"), "{rendered}");
+        assert!(!rendered.contains("bbbb2222"), "{rendered}");
+    }
+
+    #[test]
+    fn a_credential_that_will_not_build_yields_no_header() {
+        // An empty or malformed value would be SENT and refused, which reads as
+        // a wrong credential rather than an absent one.
+        assert!(sensitive_credential("with a\nnewline").is_none());
+        assert!(sensitive_credential("\u{7f}").is_none());
+        assert!(sensitive_credential("ordinary-token").is_some());
     }
 
     #[test]

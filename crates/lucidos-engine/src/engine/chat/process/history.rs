@@ -26,6 +26,23 @@ use super::super::images::{
 use super::super::process_helpers::summarize_or_none;
 use super::context_build::summarize_user_topics;
 
+/// The speaker name a `[CONVERSATION HISTORY]` line is printed under.
+///
+/// A second agent on the thread speaks under its own name (ADR 0150). Print a
+/// guest as `Assistant` and the reasoner reads its turn as its own prior turn,
+/// so two models echo each other into agreement. Print it as `User` and the
+/// reasoner obeys an instruction nobody gave.
+///
+/// A free function rather than a line inside the formatter, so the rule has one
+/// definition that a test can reach.
+pub(super) fn speaker_label(m: &crate::core::store::SessionMessage) -> &str {
+    match (m.role.as_str(), m.agent.as_ref()) {
+        ("user", _) => "User",
+        (_, Some(agent)) => agent.speaker_label(),
+        _ => "Assistant",
+    }
+}
+
 /// Result of [`LucidosEngine::load_chat_history`]: everything derived from the
 /// single per-thread events fetch that the rest of the turn consumes.
 pub(super) struct ChatHistoryLoad {
@@ -99,8 +116,6 @@ impl LucidosEngine {
         // can be 5-50KB each so the prior triple-fetch wasted ~150KB clones
         // per turn.
         let mut loaded_knowhow_docs: Vec<crate::engine::loaded_knowhow::LoadedKnowhow> = Vec::new();
-        // Filled from the same events walk, for the same reason: the loaded set
-        // is keyed by doc id and the release key is the call's address.
         // The thread's cached conversation summary, from the same events walk.
         // `None` before its first successful summarisation (ADR 0102).
         let mut cached_summary: Option<crate::core::store::CachedSummary> = None;
@@ -227,11 +242,7 @@ impl LucidosEngine {
                                               img_start: usize,
                                               msg_idx: usize|
                      -> String {
-                        let role = if m.role == "user" {
-                            "User"
-                        } else {
-                            "Assistant"
-                        };
+                        let role = speaker_label(m);
                         let content = format_history_content(
                             &m.content,
                             &m.role,

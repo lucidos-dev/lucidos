@@ -121,8 +121,8 @@ pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
          # request does. Nothing else is sent, and nothing installs itself.\n\
          #\n\
          # enabled  false stops the automatic check. It is on by default, and\n\
-         #          the same switch lives in Settings, System. You can still\n\
-         #          check by hand there while it is off.\n\
+         #          the same switch lives in Settings, System, Overview. You\n\
+         #          can still check by hand there while it is off.\n\
          \n\
          [release_check]\n\
          enabled = {}\n",

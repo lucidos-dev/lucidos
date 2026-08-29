@@ -155,7 +155,7 @@ gives you the exact `install.sh` command to run.
 a consent dialog about it, for the same reason `npm`, `cargo`, `gh` and Homebrew
 do not. This page is the notice, and the switch named below is the control.
 
-**Turning it off.** Settings > System > Check for updates automatically, or set
+**Turning it off.** Settings > System > Overview > Check for updates automatically, or set
 `enabled = false` under `[release_check]` in `~/.lucidos/updates.toml`. The
 gateway re-reads that file on every tick, so it stops at once. The **Check for
 Updates** button on that same page still works while it is off. Turning it off

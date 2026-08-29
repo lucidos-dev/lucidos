@@ -15,40 +15,85 @@
 //! trust that already exists, since a local shell can read every credential and
 //! drive every workspace anyway. `tailscaled` uses the same pattern for its own
 //! LocalAPI, as do the Docker socket and kubeconfig.
+//!
+//! # Two credentials, because a scope must be a secret
+//!
+//! [`LOCAL_TOKEN_FILE`] carries full authority. [`WEBHOOK_TOKEN_FILE`] carries
+//! one route: the engine's webhook delivery. Two files rather than one token
+//! plus a scope field, because a scope the caller states is not a scope. The
+//! bearer would state the widest one.
+//!
+//! The split has a caller behind it. The gateway's hook socket forwards a
+//! delivery that arrived from the open internet (ADR 0097), and it strips every
+//! inbound `x-lucidos-*` before doing so. Handing that hop the full-authority
+//! token would put it one forwarding bug away from the whole engine API.
+//!
+//! Both are minted by the gateway, both are mode 0600, and both live beside
+//! `network.toml`. A reader that finds neither is on a machine with no gateway,
+//! which is a supported launch rather than an error.
 
 use std::path::{Path, PathBuf};
 
-/// Header carrying the token.
+/// Header carrying the full-authority token.
 pub const HEADER_LOCAL_TOKEN: &str = "x-lucidos-local-token";
+
+/// Header carrying the webhook-delivery token.
+///
+/// A separate name, not a scope claimed inside the local token's header. A
+/// scope the caller names is not a scope: whoever holds a credential would
+/// simply name the widest one. Which header the secret arrives in is the
+/// engine's own reading, and the two secrets differ.
+pub const HEADER_WEBHOOK_TOKEN: &str = "x-lucidos-webhook-token";
+
+/// The full-authority credential's file name.
+pub const LOCAL_TOKEN_FILE: &str = "local-token";
+
+/// The webhook-delivery credential's file name.
+///
+/// Distinct from [`LOCAL_TOKEN_FILE`] so the hook socket can prove exactly one
+/// thing. It is handed to whatever `tailscale funnel` exposes, which is the one
+/// Lucidos surface a user may point at the open internet (ADR 0097). A process
+/// holding it must not be able to restart a workspace.
+pub const WEBHOOK_TOKEN_FILE: &str = "webhook-token";
 
 /// Bytes of entropy behind a token. 32 bytes is 256 bits, far past what a
 /// guessing attack could reach through an HTTP endpoint.
 const TOKEN_BYTES: usize = 32;
 
-/// `~/.lucidos/local-token`. `None` only when `HOME` is unset.
+/// `~/.lucidos/<name>`. `None` only when `HOME` is unset.
 ///
 /// Machine-global and outside every git tree, alongside `network.toml`.
-pub fn path() -> Option<PathBuf> {
+pub fn path_for(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".lucidos/local-token"))
+    Some(PathBuf::from(home).join(".lucidos").join(name))
 }
 
-/// The token, or `None` when this machine has no gateway that minted one.
+/// `~/.lucidos/local-token`. `None` only when `HOME` is unset.
+pub fn path() -> Option<PathBuf> {
+    path_for(LOCAL_TOKEN_FILE)
+}
+
+/// The named token, or `None` when this machine has no gateway that minted one.
 ///
 /// A missing file is normal rather than an error. A workspace can be launched
 /// with no gateway at all, and callers treat the absence as "send no header".
-pub fn read() -> Option<String> {
-    let raw = std::fs::read_to_string(path()?).ok()?;
+pub fn read_named(name: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(path_for(name)?).ok()?;
     let token = raw.trim().to_string();
     (!token.is_empty()).then_some(token)
 }
 
-/// Read the token, minting it on first use. The gateway owns this call.
+/// The full-authority token. See [`read_named`].
+pub fn read() -> Option<String> {
+    read_named(LOCAL_TOKEN_FILE)
+}
+
+/// Read the named token, minting it on first use. The gateway owns this call.
 ///
 /// Re-asserts mode 0600 every time. A file left readable by a stray `chmod` is
 /// then repaired at startup rather than trusted as it stands.
-pub fn ensure() -> std::io::Result<String> {
-    let path = path()
+pub fn ensure_named(name: &str) -> std::io::Result<String> {
+    let path = path_for(name)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -63,6 +108,11 @@ pub fn ensure() -> std::io::Result<String> {
     let token = mint_hex(TOKEN_BYTES)?;
     write_owner_only(&path, &token)?;
     Ok(token)
+}
+
+/// Mint or read the full-authority token. See [`ensure_named`].
+pub fn ensure() -> std::io::Result<String> {
+    ensure_named(LOCAL_TOKEN_FILE)
 }
 
 /// `bytes` bytes from `/dev/urandom`, lowercase hex.
@@ -168,6 +218,31 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a world-readable token is a leaked token");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_two_credentials_are_two_files_and_two_headers() {
+        // The whole scope mechanism. One file, or one header carrying a scope
+        // field, would let the hook socket's credential name full authority.
+        assert_ne!(LOCAL_TOKEN_FILE, WEBHOOK_TOKEN_FILE);
+        assert_ne!(HEADER_LOCAL_TOKEN, HEADER_WEBHOOK_TOKEN);
+        // Both are `x-lucidos-*`, which is the prefix the gateway's hook socket
+        // strips from every inbound delivery.
+        assert!(HEADER_WEBHOOK_TOKEN.starts_with("x-lucidos-"));
+    }
+
+    #[test]
+    fn a_named_path_stays_inside_the_lucidos_directory() {
+        // `HOME` is set in every environment this runs in; skip rather than
+        // fail if it somehow is not, since the `None` arm is the contract.
+        let Some(local) = path_for(LOCAL_TOKEN_FILE) else {
+            return;
+        };
+        let hook = path_for(WEBHOOK_TOKEN_FILE).expect("HOME was readable a line ago");
+        assert_ne!(local, hook);
+        assert_eq!(local, path().expect("the same lookup"));
+        assert!(local.ends_with(".lucidos/local-token"), "{local:?}");
+        assert!(hook.ends_with(".lucidos/webhook-token"), "{hook:?}");
     }
 
     #[cfg(unix)]
