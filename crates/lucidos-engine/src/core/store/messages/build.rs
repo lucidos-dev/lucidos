@@ -806,12 +806,12 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                 });
             }
             "SpokenReplyGenerated" => {
-                // What the talker said out loud. It reaches the reasoner under
-                // the talker's own speaker label. So the reasoner reads what
+                // What the talker said out loud. It reaches the doer under
+                // the talker's own speaker label. So the doer reads what
                 // was already said in its name, never as its own turn.
                 //
                 // It consumes NOTHING pending. A spoken reply lands mid-call,
-                // often while the reasoner's turn is still running, and those
+                // often while the doer's turn is still running, and those
                 // steps and text belong to that turn.
                 let text = event
                     .payload
@@ -822,6 +822,71 @@ pub(crate) fn build_session_messages(events: &[EventRow]) -> Vec<SessionMessage>
                     messages.push(SessionMessage {
                         role: "assistant".to_string(),
                         content: text.to_string(),
+                        created_at: event.created,
+                        channel: None,
+                        steps: vec![],
+                        images: vec![],
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: Some(true),
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: vec![],
+                        events: vec![],
+                        request_event_id: None,
+                        event_id: Some(event.id.to_string()),
+                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                        agent: authoring_agent(event),
+                    });
+                }
+            }
+            "SpokenMessageReceived" => {
+                // Something the caller said that the talker answered alone. It
+                // started no turn, so it is not a `MessageReceived`. The doer
+                // still has to read it: the next question can lean on it.
+                //
+                // A `user` message, because the caller said it. Consumes
+                // nothing pending, exactly as a spoken reply does.
+                let text = event
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "user".to_string(),
+                        content: text.to_string(),
+                        created_at: event.created,
+                        channel: None,
+                        steps: vec![],
+                        images: vec![],
+                        user_image_hashes: vec![],
+                        image_description: None,
+                        completed: None,
+                        canceled: false,
+                        aborted: false,
+                        text_chunks: vec![],
+                        events: vec![],
+                        request_event_id: None,
+                        event_id: Some(event.id.to_string()),
+                        thread_id: get_thread_id(event).or_else(|| current_thread_id.clone()),
+                        agent: None,
+                    });
+                }
+            }
+            "WorkDelegated" => {
+                // Why the talker asked for this turn, in its own words. Under
+                // the talker's speaker label, so the doer reads it as the
+                // request it is rather than as its own earlier thought.
+                let reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !reason.trim().is_empty() {
+                    messages.push(SessionMessage {
+                        role: "assistant".to_string(),
+                        content: format!("[Asked for you] {}", reason.trim()),
                         created_at: event.created,
                         channel: None,
                         steps: vec![],

@@ -623,6 +623,7 @@ mod settle_orphaned_running_sweep {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "hi".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -766,6 +767,7 @@ mod restart_boundary_reads {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,

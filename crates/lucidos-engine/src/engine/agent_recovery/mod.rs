@@ -19,8 +19,8 @@ pub use helpers::*;
 // (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract
 // key on one definition.
 pub(crate) use recovery::{
-    preserve_question_park_at_shutdown, thread_has_unanswered_question,
-    unanswered_question_exists_sql,
+    newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
+    unanswered_question_exists_sql, OpenQuestion,
 };
 // "Does a boundary already cover this turn?", in its two strengths. The
 // recovery pass asks the window-only form before emitting its own boundary; a

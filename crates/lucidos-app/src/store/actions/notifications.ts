@@ -392,7 +392,16 @@ export async function viewNotification(id: string): Promise<void> {
       revealContentPane();
       notification = await getNotification(id);
     }
-    if (!notification) return;
+    if (!notification) {
+      // The tap resolved to nothing: a cold push-tap deep link into a
+      // notification the engine no longer has. It answers 200-with-null there,
+      // per `getNotification`'s `| null` type. The pane was revealed above, so
+      // say why instead of leaving it blank. Reset the dedup stamp, as the catch
+      // does, so a re-tap isn't swallowed for the next 10s.
+      _lastViewedId = null;
+      showToast('Notification not found', 'error');
+      return;
+    }
     // Open the detail in the content pane (not a modal): set the overlay,
     // reveal the pane, and push a nav entry so panel Back returns to the
     // inbox list and a reload restores the open detail. Mirrors openUrl /

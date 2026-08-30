@@ -39,8 +39,8 @@ talker" would be a guess, reconstructed by every reader. Any interleaving breaks
 it.
 
 Mis-attribution is the specific failure this prevents, and it has two shapes.
-Render a talker turn as `User:` and the reasoner obeys an instruction the user
-never gave. Render it as `Assistant:` and the reasoner reads it as its own prior
+Render a talker turn as `User:` and the doer obeys an instruction the user
+never gave. Render it as `Assistant:` and the doer reads it as its own prior
 turn, so two models echo each other into agreement.
 
 The variant belongs on `MessageOrigin` rather than beside it. That type is

@@ -331,6 +331,45 @@ impl EventStore {
         Ok(row.and_then(|(t,)| t))
     }
 
+    /// Titles of the threads whose agent is waiting on the user, newest first.
+    ///
+    /// Titles only, and never the questions themselves. This answers "is
+    /// anything waiting on me?" across the workspace, and a *voice session*
+    /// asks it while somebody holds a phone to their ear.
+    ///
+    /// Read off the projected status rather than swept out of the event log.
+    /// One row per thread against a table of thousands, versus a correlated
+    /// scan of every question ever asked.
+    ///
+    /// **Two axes, and BOTH are needed.** `state` covers a discarded or
+    /// still-composing draft. `archive_state` covers an archived thread, which
+    /// keeps `state = 'active'` on purpose, so a `state` filter alone lets
+    /// every archived thread through. Either way the user put the thread down,
+    /// and a card still open on it is waiting on nobody.
+    pub async fn titles_awaiting_answer(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            "SELECT title FROM thread_summaries \
+             WHERE status = 'waiting_for_user_answer' \
+               AND state = 'active' AND archive_state = 'inbox' \
+             ORDER BY last_activity DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(title,)| match title {
+                Some(title) if !title.trim().is_empty() => title,
+                // A thread whose title has not been generated yet is still
+                // waiting. Dropping it would report "nothing needs you".
+                _ => "Untitled".to_string(),
+            })
+            .collect())
+    }
+
     /// Check if a thread already has a generated title.
     pub async fn thread_has_title(
         &self,

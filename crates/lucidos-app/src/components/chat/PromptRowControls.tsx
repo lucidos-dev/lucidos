@@ -13,13 +13,16 @@ import { WaitingIndicator } from './WaitingPanel';
  *
  *  **The first three slots are FIXED, and the conditional things come after
  *  them.** The control menu is the row's anchor, the follow toggle is second
- *  and the call toggle third. Each renders in every state, so a reader
- *  reaching for one finds it in the same place on every thread. The follow
- *  toggle once sat after the indicators, which moved it under the thumb
- *  depending on what the thread happened to be doing. Everything below the
- *  fixed three is conditional by nature (a todo list, a wait), so it floats
- *  behind them rather than displacing them. A new UNCONDITIONAL control joins
- *  the end of the fixed run, and a conditional one goes after it.
+ *  and the call toggle third. What is fixed is the POSITION, so a reader
+ *  reaching for one finds it in the same place on every thread it appears on.
+ *  The follow toggle once sat after the indicators, which moved it under the
+ *  thumb depending on what the thread happened to be doing. What comes after
+ *  the fixed three varies with what the thread is DOING (a todo list, a wait).
+ *  So it floats behind them rather than displacing them.
+ *
+ *  The call toggle is the one fixed slot that can be empty. It empties on a
+ *  property of the thread rather than on its activity. Nothing after it moves
+ *  when it goes, because everything after it is already conditional.
  *
  *  A Fragment, deliberately: `.prompt-actions-row` is a flex row and its
  *  children are diffed positionally (see `prompt-vdom-keys.test.ts`), so this
@@ -44,10 +47,13 @@ import { WaitingIndicator } from './WaitingPanel';
  *  becomes will start as. Everywhere else the live flag is what shows, so the
  *  button can never sit lit over a transcript nothing is following.
  *
- *  **The split is by WHO OWNS the control, and only two of the three are
+ *  **The split is by WHO OWNS the control, and three of the four are
  *  backend-specific.** The control menu obviously is. `TodoListIndicator` is
  *  too, and it is the reason the branch exists at all: `TodoListWritten` is the
  *  Lucidos Agent's own todo list, so a coding-agent thread has none to show.
+ *  So is the call toggle, and for a stronger reason than either: a call
+ *  reaches the Lucidos Agent and nothing else (ADR 0165). Both engine layers
+ *  refuse one anyway, so this hides a control that could only fail.
  *  The *waiting indicator* is NOT, and it sits outside the branch for the
  *  same reason `await_event` has a CLI mirror: an *event wait* belongs to the
  *  thread, and both agents arm them (`system-knowhow/glossary.md` §§ "Event
@@ -105,7 +111,7 @@ export function PromptRowControls({
       >
         <FollowLiveEdgeIcon />
       </button>
-      <CallToggle />
+      <CallToggle available={codingAgent === null} />
       {codingAgent === null && <TodoListIndicator />}
       <WaitingIndicator />
     </>

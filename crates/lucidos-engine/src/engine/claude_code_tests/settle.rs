@@ -10,6 +10,7 @@ async fn seed_running_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,

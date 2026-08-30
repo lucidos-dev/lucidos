@@ -177,6 +177,8 @@ impl ThreadEvent {
             Self::VoiceSessionStarted { .. } => "VoiceSessionStarted",
             Self::VoiceSessionEnded { .. } => "VoiceSessionEnded",
             Self::SpokenReplyGenerated { .. } => "SpokenReplyGenerated",
+            Self::SpokenMessageReceived { .. } => "SpokenMessageReceived",
+            Self::WorkDelegated { .. } => "WorkDelegated",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -297,6 +299,8 @@ impl ThreadEvent {
         "ChildrenCountChanged",
         "VoiceSessionStarted",
         "VoiceSessionEnded",
+        "SpokenMessageReceived",
+        "WorkDelegated",
         "SpokenReplyGenerated",
     ];
 

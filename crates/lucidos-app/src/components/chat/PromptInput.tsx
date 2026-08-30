@@ -20,7 +20,6 @@ import { focusPane } from '../../store/actions/pane';
 import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
-import { CallStrip } from './CallStrip';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
 import { followAnsweredQuestion, followCanceledTurn, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
@@ -28,14 +27,15 @@ import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { PromptRowControls } from './PromptRowControls';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { composeHandlers } from './promptFocus';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
-import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
+import { syncTextareaValue, shouldSkipSyncWhileEditing, resolveEmptyDraftSync, promptOverrideSyncSeq, promptOverrideReplacesDraft } from './promptValueSync';
+import { reportDraftClobbered } from './deadKeystrokeProbe';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
@@ -243,6 +243,11 @@ export function PromptInput() {
   // Preserve cursor on same-thread re-syncs; let it end-snap on thread switch.
   // shouldSkipSyncWhileEditing protects in-flight keystrokes — see its docstring.
   const prevTidRef = useRef<string | null | undefined>(undefined);
+  // Whether the box holds characters the COMPOSER did not put there. Set by the
+  // user's own `onInput`, cleared by every write the composer makes through
+  // `writeComposerValue`. `resolveEmptyDraftSync` reads it to tell a keystroke
+  // the store is missing from a synced draft a peer is entitled to clear.
+  const typedSinceComposerWroteRef = useRef(false);
   // Whether the PREVIOUS render was the centered compose view. Drives the
   // compose-to-compose height animation, which must NOT fire on a
   // compose-to-active switch, where the ThreadPane FLIP owns the transition.
@@ -258,42 +263,56 @@ export function PromptInput() {
     const sameThread = prevTidRef.current === tid;
     const isComposeView = composeViewActive.value;
     const thisElementActive = document.activeElement === el;
-    // An empty canonical draft must reach the textarea even while it is
-    // focused. Clearing never clobbers in-flight typing: `composeText` is ''
-    // only when the draft is genuinely empty, since a keystroke updates it
-    // synchronously. The skip guard protects non-empty in-flight content, and
-    // letting it block an empty sync sticks stale text in a focused textarea.
-    const forceEmptySync = composeText === '';
     // A one-shot override, a suggestion replacing an in-progress draft, must
     // land in the textarea whatever the focus and content are.
     // `requestPromptOverrideSync` bumps the counter after the draft write, so
     // this render sees both.
     const forceOverride = overrideSyncSeq !== lastOverrideSyncSeqRef.current;
     lastOverrideSyncSeqRef.current = overrideSyncSeq;
+    // An empty canonical draft must still reach the textarea, or a cleared
+    // draft leaves stale text in a focused box. What it may NEVER do is erase
+    // characters the user typed. `resolveEmptyDraftSync` rules on that, and
+    // rules the same way `resolveComposerText` does at send time. An override
+    // outranks it: that write is deliberate and programmatic.
+    const adopting = !forceOverride && composeText === '' && resolveEmptyDraftSync({
+      domText: el.value,
+      typedSinceComposerWrote: typedSinceComposerWroteRef.current,
+      thisElementActive,
+      sameThread,
+    }) === 'adopt';
+    const forceEmptySync = composeText === '';
     // An override that REPLACED the draft end-snaps the caret, the same as a
     // thread switch: the old offset indexes text that is gone. An appending
     // override keeps it, since the prefix it points into is untouched.
     const preserveCursor = sameThread
       && !(forceOverride && promptOverrideReplacesDraft.value);
-    if ((forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))
-        && syncTextareaValue(el, composeText, preserveCursor)) {
-      // A compose-view to compose-view switch keeps the centered layout put, so
-      // the ThreadPane FLIP never fires and the textarea would insta-resize.
-      // Ease its height from the previous view's to the new one instead.
-      //
-      // Gated on `composeViewActive`, NOT on both being composing threads: the
-      // blank view has no thread id. A compose-to-active switch flips
-      // `composeViewActive`, so this is false there and the FLIP owns it.
-      // Capture the old inline height BEFORE `autoResize` overwrites it.
-      // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
-      const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
-        && !isMobile() && !prefersReducedMotion();
-      const fromHeight = animateSwitch ? el.style.height : '';
-      autoResize();
-      if (animateSwitch && fromHeight) {
-        animateTextareaHeightFrom(el, fromHeight);
-      } else {
-        requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
+    if (adopting) adoptComposerText(el);
+    if (!adopting
+        && (forceEmptySync || forceOverride || !shouldSkipSyncWhileEditing(el, sameThread, thisElementActive))) {
+      // The composer is claiming the box's value, so nothing standing in it is
+      // unaccounted-for typing any more. Set before the write, and whether or
+      // not the write changes anything: a box that already matches the draft
+      // holds no keystroke the store is missing either.
+      typedSinceComposerWroteRef.current = false;
+      if (syncTextareaValue(el, composeText, preserveCursor)) {
+        // A compose-view to compose-view switch keeps the centered layout put, so
+        // the ThreadPane FLIP never fires and the textarea would insta-resize.
+        // Ease its height from the previous view's to the new one instead.
+        //
+        // Gated on `composeViewActive`, NOT on both being composing threads: the
+        // blank view has no thread id. A compose-to-active switch flips
+        // `composeViewActive`, so this is false there and the FLIP owns it.
+        // Capture the old inline height BEFORE `autoResize` overwrites it.
+        // Desktop-only and motion-respecting, mirroring the ThreadPane FLIP.
+        const animateSwitch = !sameThread && wasComposeViewRef.current && isComposeView
+          && !isMobile() && !prefersReducedMotion();
+        const fromHeight = animateSwitch ? el.style.height : '';
+        autoResize();
+        if (animateSwitch && fromHeight) {
+          animateTextareaHeightFrom(el, fromHeight);
+        } else {
+          requestAnimationFrame(() => requestAnimationFrame(() => autoResize()));
+        }
       }
     }
     if (!sameThread && !isMobile()) {
@@ -314,6 +333,34 @@ export function PromptInput() {
   function autoResize() {
     const el = inputRef.current;
     if (el) resizeTextarea(el);
+  }
+
+  /** Write the composer's OWN value into the box. The only way to set it.
+   *
+   *  Every such write also says the box no longer holds anything the user
+   *  typed, and keeping the two in one call is the point: a bare `el.value =`
+   *  would leave the flag set, and the next empty-draft sync would then adopt
+   *  text the composer itself put there. Pinned by `promptValueSync.test.ts`. */
+  function writeComposerValue(el: HTMLTextAreaElement, text: string): void {
+    el.value = text;
+    typedSinceComposerWroteRef.current = false;
+  }
+
+  /** Take the characters standing in the box into the draft, because a clear
+   *  ran under the user's fingers. The box is left exactly as it is.
+   *
+   *  This is the send path's verdict, applied at sync time: see
+   *  `resolveEmptyDraftSync`. It goes through the store write a keystroke
+   *  takes, so the draft, the Send face and the debounced PUT agree afterwards.
+   *  The next render then takes the ordinary skip branch. */
+  function adoptComposerText(el: HTMLTextAreaElement): void {
+    const text = el.value;
+    const thread = tid ? threadMap.value.get(tid) : undefined;
+    reportDraftClobbered({
+      charCount: text.length,
+      threadStatus: thread ? effectiveThreadStatus(thread) : 'none',
+    });
+    updateCompose(ensureFocusedComposeThread(), { text });
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -393,6 +440,20 @@ export function PromptInput() {
       clearSubmittingThread(threadId);
       return Promise.resolve();
     }
+    // Empty the box HERE, where this send actually dispatches. `submit` cleared
+    // it at its own dispatch point and returned before that one, the send being
+    // owed to an upload. Left alone, the box would still claim to hold unsent
+    // typing. The next empty-draft sync would then adopt the message just sent
+    // straight back as a draft. Past the three returns above, each of which
+    // cancels the send and must leave what the user typed alone.
+    //
+    // Only when the box on screen is THIS thread's. A queued send is retried
+    // per thread, so it can fire after the reader has moved to another one.
+    // There the composer is showing somebody else's draft. An unfocused thread
+    // needs no clear anyway: its box is not mounted, and arriving at it later is
+    // a thread switch, which syncs from the draft this send just emptied.
+    const el = inputRef.current;
+    if (el && el.dataset.threadId === threadId) writeComposerValue(el, '');
     return beginSend(threadId, thread, msg, currentImages, intent);
   }
 
@@ -456,7 +517,7 @@ export function PromptInput() {
       showToast(UPLOAD_QUEUED_SEND_TOAST, 'info');
       return;
     }
-    if (el) el.value = '';
+    if (el) writeComposerValue(el, '');
     // In the centered compose layout the prompt re-docks on send. The height
     // collapse defers to the ThreadPane FLIP, so a tall draft shrinks *and*
     // slides into the docked state together rather than snapping short first.
@@ -525,6 +586,11 @@ export function PromptInput() {
     autoResize();
     const el = inputRef.current;
     if (!el) return;
+    // The box now holds the user's characters rather than the composer's. Set
+    // before every early return below, so a keystroke the rest of this function
+    // declines to store is still protected from the next empty-draft sync. See
+    // `resolveEmptyDraftSync`.
+    typedSinceComposerWroteRef.current = true;
     const val = el.value;
     // "/" prefix opens Claude Code slash commands. Codex shares the legacy
     // claude_code channel but has no slash-command surface, so Codex prompts
@@ -533,7 +599,7 @@ export function PromptInput() {
     const thread = tid ? threadMap.value.get(tid) : undefined;
     const isClaudeCodeMode = effectiveCodingAgentBackend(thread, resolveCodingAgent(tid)) === 'claude-code';
     if (isClaudeCodeMode && val.startsWith('/')) {
-      el.value = '';
+      writeComposerValue(el, '');
       autoResize();
       codingAgentMenuOpenRequest.value = val.slice(1);
       if (tid) updateCompose(tid, { text: '' });
@@ -900,7 +966,7 @@ export function PromptInput() {
     // all, only armed.
     followAnsweredQuestion(pendingMultiQ.toolUseId);
     if (el) {
-      el.value = '';
+      writeComposerValue(el, '');
       el.style.height = 'auto';
     }
     updateCompose(focused, { text: '' });
@@ -908,12 +974,24 @@ export function PromptInput() {
     if (isMobile()) el?.blur();
     const ok = await answerThreadQuestion(focused, pendingMultiQ.toolUseId, answer);
     if (!ok) {
-      // Drop optimistic so the question card un-resolves and the row
-      // re-shows Submit. The toast tells the user to retry; not restoring the
-      // cleared toggles + text avoids racing fresh input typed during the
-      // failure window.
+      // Drop optimistic so the question card un-resolves and the row re-shows
+      // Submit. The action owns the message, naming the cause once; a second
+      // toast here is what made one failed tap say two things.
       clearPendingAnswer(pendingMultiQ.toolUseId);
-      showToast('Could not send answer. Please try again.', 'error');
+      // Hand the answer back so a retry is one tap. See
+      // `recoverableAnswerDraft` for what a fresh pick or keystroke protects.
+      const box = inputRef.current;
+      const recovered = recoverableAnswerDraft({
+        sentIds: ids,
+        sentText: text,
+        currentIds: getMultiSelectedIds(pendingMultiQ.toolUseId),
+        currentDraft: getDraft(focused).text,
+        domText: box ? box.value : null,
+      });
+      if (recovered.ids) setMultiSelectedIds(pendingMultiQ.toolUseId, recovered.ids);
+      // Through the draft, never the box: the sync effect above writes the
+      // textarea from it and resizes, so the two cannot end up disagreeing.
+      if (recovered.text !== null) updateCompose(focused, { text: recovered.text });
     }
     restoreComposerFocus();
   }
@@ -1156,10 +1234,6 @@ export function PromptInput() {
           <span class="url-context-label">{panelTitle.value || 'Page content'}</span>
         </div>
       )}
-      {/* A live call, above the composer and never in place of it. The composer
-          stays usable throughout, so speech and typing interleave in one
-          transcript (the parent plan's decision 2). */}
-      <CallStrip />
       <div key="prompt-box" class="prompt-box">
         <div class="prompt-row">
           <textarea
@@ -1363,7 +1437,7 @@ export function PromptInput() {
               onClick={() => {
                 const el = inputRef.current;
                 if (!el) return;
-                el.value = '';
+                writeComposerValue(el, '');
                 const id = focusedThreadId.value;
                 if (id) updateCompose(id, { text: '' });
                 autoResize();

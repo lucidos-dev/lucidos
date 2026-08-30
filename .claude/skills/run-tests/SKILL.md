@@ -87,11 +87,12 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`8 ignored` in the lib run and `1 ignored` in the doctest run**,
+Expect **`9 ignored` in the lib run and `1 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The eight are two different things: **five
-codegen writers** and **three diagnostic printers**.
+no `#[ignore]` at all.) The nine are three different things: **five
+codegen writers**, **three diagnostic printers**, and **one
+live-provider check**.
 
 ### The five codegen writers
 
@@ -143,6 +144,29 @@ nothing, which buys no coverage. Giving it a real guard means checking
 in a frozen contract fixture and failing the suite on every deliberate
 schema change; that is a policy call for the maintainer, not something
 to decide from inside a test run.
+
+### The one live-provider check
+
+`voice::realtime::tests::a_real_session_accepts_the_opening_payload`
+arrived with the voice talker/doer refactor
+(`docs/plans/2026-08-29-a-voice-session-opens-behind-one-seam.md`). It
+opens a real session on the OpenAI realtime API. It needs a credential
+and a network. With no `OPENAI_API_KEY` it self-skips, printing a line
+rather than failing. It is the only test that can tell us the live
+provider still accepts the opening payload.
+
+It satisfies clause (a): the non-ignored sibling tests in the same file
+pin its payload construction and event mapping. Nothing is lost by
+keeping it out of the ordinary suite. Run it deliberately when you touch
+the realtime seam:
+
+```sh
+cargo test -p lucidos-engine --lib voice::realtime -- --ignored --nocapture
+```
+
+| `#[ignore]` live check | Non-ignored siblings over the same data |
+|---|---|
+| `a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
 
 **The 1 doctest** is a ```` ```ignore ```` fenced example in
 `crates/lucidos-engine/src/engine/event_bus/mod.rs` — illustrative usage,

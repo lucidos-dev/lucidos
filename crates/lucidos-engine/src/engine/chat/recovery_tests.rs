@@ -67,6 +67,7 @@ async fn emit_orphan_turn(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "stuck request".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -102,6 +103,7 @@ async fn emit_orphan_tool_call(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "trigger a tool".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -487,6 +489,7 @@ mod switch_resume {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,

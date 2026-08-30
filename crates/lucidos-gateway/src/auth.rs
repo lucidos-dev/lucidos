@@ -46,13 +46,14 @@ pub fn sensitive_credential(value: &str) -> Option<axum::http::HeaderValue> {
     Some(header)
 }
 
-/// The cookie name every gateway wrote before the names were split.
+/// The stem every device-credential cookie name shares.
 ///
-/// Still READ, never written. A browser paired before the split holds its
-/// credential here, and refusing it would meet that device with the pairing
-/// screen. [`authorize`] therefore falls back to it, and the response re-issues
-/// the same credential under this gateway's own name.
-pub const LEGACY_COOKIE_DEVICE_CREDENTIAL: &str = "lucidos_device";
+/// It is also the name every gateway wrote before the names were split, and it
+/// is still READ under that meaning. A browser paired before the split holds
+/// its credential here, and refusing it would meet that device with the pairing
+/// screen. [`authorize`] tries it like any other candidate, and the response
+/// re-issues the match under this gateway's own name.
+pub const DEVICE_COOKIE_STEM: &str = "lucidos_device";
 
 /// This gateway's cookie name, `lucidos_device_<id>`.
 ///
@@ -63,39 +64,38 @@ pub const LEGACY_COOKIE_DEVICE_CREDENTIAL: &str = "lucidos_device";
 ///
 /// The id digests the data dir, which is what scopes the device store too. So
 /// the cookie and the store agree on which gateway they belong to. Moving a
-/// data dir renames the cookie and asks its devices to pair again, which is
-/// what moving the store already does.
+/// data dir renames the cookie, and that costs its devices nothing:
+/// [`authorize`] matches every name in the family, so the credential under the
+/// OLD name still resolves and is re-issued under the new one.
 ///
 /// `HttpOnly` is load-bearing rather than hygiene, whatever the name. App
 /// iframes are served same-origin with `allow-same-origin`, so a credential
 /// JavaScript can read is one an app can ship off-machine.
 pub fn device_cookie_name(app_data: &Path) -> String {
     let id = &digest(&app_data.to_string_lossy())[..8];
-    format!("{LEGACY_COOKIE_DEVICE_CREDENTIAL}_{id}")
+    format!("{DEVICE_COOKIE_STEM}_{id}")
 }
 
-/// Which cookie carried the credential on this request.
+/// A device-credential cookie a request carried, and which name carried it.
 ///
-/// The distinction is what drives the one-time migration: a credential that
-/// arrived under the legacy name is re-issued under this gateway's own.
+/// The name drives the migration rather than the value: a credential that
+/// arrived under any name but this gateway's own is re-issued under ours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresentedCredential<'a> {
-    /// This gateway's own cookie.
-    Own(&'a str),
-    /// The pre-split shared name.
-    Legacy(&'a str),
+pub struct PresentedCredential<'a> {
+    value: &'a str,
+    own_name: bool,
 }
 
 impl<'a> PresentedCredential<'a> {
     pub fn value(self) -> &'a str {
-        match self {
-            PresentedCredential::Own(v) | PresentedCredential::Legacy(v) => v,
-        }
+        self.value
     }
 
-    /// Does this need re-issuing under the gateway's own name?
-    pub fn is_legacy(self) -> bool {
-        matches!(self, PresentedCredential::Legacy(_))
+    /// Did this arrive under a name that is not ours, so the response owes it a
+    /// re-issue? True for the pre-split name, for another gateway's name, and
+    /// for our own name from before a data-dir move.
+    pub fn is_renamed(self) -> bool {
+        !self.own_name
     }
 }
 
@@ -417,6 +417,47 @@ impl PendingPairings {
     }
 }
 
+/// How often the gateway will say that it turned a device away.
+///
+/// A refusal is not rare: an unpaired browser makes one per asset. One line a
+/// minute answers "the store lists my phone, so why the pairing screen?", and
+/// buries nothing under it.
+pub const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// What the gateway says when it turns a device away.
+///
+/// Pure, and built from counts and one cookie NAME. A credential in here would
+/// be a credential leaked, so nothing that could carry one is an argument.
+pub fn refusal_line(presented: usize, own_name: bool, cookie_name: &str, devices: usize) -> String {
+    format!(
+        "[Gateway] refused a device: {presented} credential cookie(s) presented, {} under this \
+         gateway's own name {cookie_name}, and none matched any of the {devices} paired device(s)",
+        if own_name { "one" } else { "none" },
+    )
+}
+
+/// A once-per-window gate for a log line on a hot path.
+///
+/// Pure, taking `now` rather than reading the clock, so the window is testable
+/// without sleeping.
+#[derive(Debug, Default)]
+pub struct LogThrottle {
+    opened: Option<Instant>,
+}
+
+impl LogThrottle {
+    /// May a line be written at `now`? Says yes once per `window`.
+    pub fn allow(&mut self, now: Instant, window: Duration) -> bool {
+        match self.opened {
+            Some(opened) if now.duration_since(opened) < window => false,
+            _ => {
+                self.opened = Some(now);
+                true
+            }
+        }
+    }
+}
+
 /// A fresh device credential: 32 bytes of entropy, lowercase hex.
 pub fn mint_credential() -> std::io::Result<String> {
     local_token::mint_hex(32)
@@ -528,24 +569,34 @@ fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
 ///
 /// Takes no peer address on purpose: see the module docs. A caller wanting to
 /// "just allow loopback" has nothing here to do it with.
-pub fn authorize(
-    headers: &HeaderMap,
+///
+/// It also hands back the cookie that resolved, so `enforce` can re-issue the
+/// credential under this gateway's own name when another name carried it.
+///
+/// That rides in the SECOND value rather than inside
+/// [`Authorization::Device`]. Putting a bearer secret in the value that names a
+/// device would carry it into every place that matches on one.
+pub fn authorize_with_match<'a>(
+    headers: &'a HeaderMap,
     local_token: &str,
     paired: &PairedDevices,
     cookie_name: &str,
-) -> Authorization {
+) -> (Authorization, Option<PresentedCredential<'a>>) {
     if presented_local_token(headers).is_some_and(|t| ct_eq(t, local_token)) {
-        return Authorization::LocalProcess;
+        return (Authorization::LocalProcess, None);
     }
-    if let Some(presented) = presented_credential(headers, cookie_name) {
+    for presented in presented_credentials(headers, cookie_name) {
         if let Some(device) = paired.match_credential(presented.value()) {
-            return Authorization::Device {
-                id: device.id.clone(),
-                label: device.label.clone(),
-            };
+            return (
+                Authorization::Device {
+                    id: device.id.clone(),
+                    label: device.label.clone(),
+                },
+                Some(presented),
+            );
         }
     }
-    Authorization::Unauthorized
+    (Authorization::Unauthorized, None)
 }
 
 /// The local token a request presented, trimmed and non-empty.
@@ -557,41 +608,88 @@ fn presented_local_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The device credential a request presented, and which name carried it.
+/// Every device-credential cookie the request carried, this gateway's own name
+/// first.
 ///
-/// This gateway's own name wins. The legacy name is the fallback, so a browser
-/// paired before the split still gets in. Both are read here rather than in
-/// [`authorize`], so one rule decides what counts as presented.
+/// Every candidate rather than the first one PRESENT, because presence is not
+/// the question. A browser on a host that has run two gateways holds several of
+/// these. The pre-split name is the slot they all used to share. Taking the
+/// first present one refuses a device whose credential sits in the second, with
+/// its row still in the store.
 ///
-/// Exposed so a caller re-issuing the cookie can read the value back off the
-/// request. The alternative was carrying it in [`Authorization::Device`]. That
-/// would put a bearer secret in the value naming a device, and so in every
-/// place that matches on one.
-pub fn presented_credential<'a>(
+/// Ours first, so the ordinary request costs one digest compare. The rest are
+/// tried only when it does not resolve, which is the migration case.
+pub fn presented_credentials<'a>(
     headers: &'a HeaderMap,
     cookie_name: &str,
-) -> Option<PresentedCredential<'a>> {
-    if let Some(v) = cookie_value(headers, cookie_name) {
-        return Some(PresentedCredential::Own(v));
+) -> Vec<PresentedCredential<'a>> {
+    let mut found = Vec::new();
+    for (name, value) in cookie_pairs(headers) {
+        if !is_device_cookie_name(name) {
+            continue;
+        }
+        let own_name = name == cookie_name;
+        let presented = PresentedCredential { value, own_name };
+        // A `Cookie` header may legally repeat a name, so this can front-insert
+        // more than once. Ours still all precede the rest, which is the order
+        // that matters.
+        if own_name {
+            found.insert(0, presented);
+        } else {
+            found.push(presented);
+        }
     }
-    cookie_value(headers, LEGACY_COOKIE_DEVICE_CREDENTIAL).map(PresentedCredential::Legacy)
+    found
 }
 
-/// One cookie's value out of the `Cookie` header.
+/// How many device-credential cookies arrived, and whether one was ours.
+///
+/// For the refusal log. Counts and one flag, never a value: the log says which
+/// door was tried, and a credential in it would be a credential leaked.
+///
+/// Counted off the header rather than through [`presented_credentials`], so a
+/// refused request allocates nothing. Every unpaired asset request lands here.
+pub fn presented_credential_summary(headers: &HeaderMap, cookie_name: &str) -> (usize, bool) {
+    let mut presented = 0;
+    let mut own = false;
+    for (name, _) in cookie_pairs(headers) {
+        if !is_device_cookie_name(name) {
+            continue;
+        }
+        presented += 1;
+        own |= name == cookie_name;
+    }
+    (presented, own)
+}
+
+/// Is `name` in the device-credential family?
+///
+/// The family is [`DEVICE_COOKIE_STEM`] itself, plus every `lucidos_device_<id>`
+/// under it. Matched on the whole name rather than by bare prefix, so
+/// `lucidos_devices` and `xlucidos_device` stay outside it and can never be
+/// read as a credential.
+fn is_device_cookie_name(name: &str) -> bool {
+    match name.strip_prefix(DEVICE_COOKIE_STEM) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('_') && rest.len() > 1,
+        None => false,
+    }
+}
+
+/// The `name=value` pairs in the `Cookie` header, trimmed, empty values dropped.
 ///
 /// Hand-parsed rather than pulling in a cookie crate: the gateway is the only
 /// network-facing process and its dependency list is kept short. The format is
-/// `name=value` pairs joined by `; `, and a name is matched exactly so
-/// `xlucidos_device` never satisfies a lookup for `lucidos_device`.
-fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+/// `name=value` pairs joined by `; `.
+fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
     headers
         .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())?
-        .split(';')
+        .and_then(|v| v.to_str().ok())
+        .into_iter()
+        .flat_map(|raw| raw.split(';'))
         .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| k.trim() == name)
-        .map(|(_, v)| v.trim())
-        .filter(|v| !v.is_empty())
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .filter(|(_, value)| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -610,8 +708,19 @@ mod tests {
     }
 
     /// One gateway's cookie name, so a test says which gateway it means. The
-    /// tests below present the LEGACY name on purpose, which is the fallback.
+    /// tests below present the pre-split name on purpose.
     const OWN_COOKIE: &str = "lucidos_device_deadbeef";
+
+    /// The decision alone, for the tests that do not care which cookie carried
+    /// it. `enforce` is the one caller that needs the second half.
+    fn authorize(
+        headers: &HeaderMap,
+        local_token: &str,
+        paired: &PairedDevices,
+        cookie_name: &str,
+    ) -> Authorization {
+        authorize_with_match(headers, local_token, paired, cookie_name).0
+    }
 
     fn paired_with(credential: &str) -> PairedDevices {
         PairedDevices {
@@ -734,45 +843,144 @@ mod tests {
         assert!(a.starts_with("lucidos_device_"), "{a}");
         // Stable, or every restart would sign every device out.
         assert_eq!(a, device_cookie_name(Path::new("/tmp/gw-a")));
-        // And never the legacy name, which is the contested slot itself.
-        assert_ne!(a, LEGACY_COOKIE_DEVICE_CREDENTIAL);
+        // And never the bare stem, which is the contested slot itself.
+        assert_ne!(a, DEVICE_COOKIE_STEM);
     }
 
     #[test]
-    fn this_gateways_own_cookie_wins_over_the_legacy_one() {
-        // A browser mid-migration holds both. The gateway's own is the fresher
-        // of the two, and the legacy slot may belong to another gateway by now.
+    fn this_gateways_own_cookie_is_tried_first() {
+        // A browser mid-migration holds both. Ours is the fresher of the two,
+        // and the shared slot may belong to another gateway by now. So the
+        // ordinary request costs one compare and never reaches the rest.
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let h = headers(&[(
             "cookie",
             &format!("lucidos_device=legacy-value; {own}=own-value"),
         )]);
-        assert_eq!(
-            presented_credential(&h, &own),
-            Some(PresentedCredential::Own("own-value"))
-        );
+        let candidates = presented_credentials(&h, &own);
+        assert_eq!(candidates[0].value(), "own-value");
+        assert!(!candidates[0].is_renamed());
+        assert_eq!(candidates.len(), 2);
     }
 
     #[test]
-    fn a_legacy_cookie_is_read_when_this_gateway_has_none_yet() {
+    fn a_pre_split_cookie_is_read_when_this_gateway_has_none_yet() {
         // Nobody paired before the split is locked out. The caller re-issues
         // under the gateway's own name once it sees this.
         let own = device_cookie_name(Path::new("/tmp/gw-a"));
         let h = headers(&[("cookie", "lucidos_device=legacy-value")]);
-        let presented = presented_credential(&h, &own).expect("the legacy name is a fallback");
-        assert_eq!(presented, PresentedCredential::Legacy("legacy-value"));
-        assert!(presented.is_legacy());
-        assert_eq!(presented.value(), "legacy-value");
+        let candidates = presented_credentials(&h, &own);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].is_renamed());
+        assert_eq!(candidates[0].value(), "legacy-value");
     }
 
     #[test]
-    fn another_gateways_cookie_is_not_read_as_ours() {
-        // The whole point of the split: B's cookie must not authorize at A,
-        // and must not be mistaken for the legacy fallback either.
+    fn a_stale_own_cookie_never_masks_a_credential_the_store_holds() {
+        // The bug the first-present-wins lookup had. The device is in the
+        // store, its credential is on the request, and it was refused because
+        // a dead value sat in our own slot.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let paired = paired_with("cred-abc");
+        let h = headers(&[(
+            "cookie",
+            &format!("{own}=long-dead; lucidos_device=cred-abc"),
+        )]);
+        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &own);
+        assert!(matches!(decision, Authorization::Device { .. }));
+        let matched = matched.expect("the match is handed back for the re-issue");
+        assert_eq!(matched.value(), "cred-abc");
+        assert!(matched.is_renamed(), "it must be moved to our own name");
+    }
+
+    #[test]
+    fn a_cookie_left_by_a_data_dir_move_still_authorizes() {
+        // Renaming the data dir renames the cookie. Every device would meet the
+        // pairing screen with its row still in the store, and the store's own
+        // migration would not help: the row was never the missing half.
+        let before = device_cookie_name(Path::new("/tmp/gw-old"));
+        let after = device_cookie_name(Path::new("/tmp/gw-new"));
+        let paired = paired_with("cred-abc");
+        let h = headers(&[("cookie", &format!("{before}=cred-abc"))]);
+        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &after);
+        assert!(matches!(decision, Authorization::Device { .. }));
+        assert!(matched.expect("matched").is_renamed());
+    }
+
+    #[test]
+    fn another_gateways_cookie_authorizes_nothing_it_does_not_match() {
+        // Reading every name is not trusting every name. B's credential is not
+        // in A's store, so A refuses it exactly as it always did.
         let a = device_cookie_name(Path::new("/tmp/gw-a"));
         let b = device_cookie_name(Path::new("/tmp/gw-b"));
+        let paired = paired_with("cred-abc");
         let h = headers(&[("cookie", &format!("{b}=b-value"))]);
-        assert_eq!(presented_credential(&h, &a), None);
+        assert_eq!(
+            authorize(&h, "secret", &paired, &a),
+            Authorization::Unauthorized
+        );
+    }
+
+    #[test]
+    fn only_the_device_cookie_family_is_read_as_a_credential() {
+        // A near-miss name must not become a door. Each of these is a caller's
+        // to send, and each carries a credential the store DOES hold.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let paired = paired_with("cred-abc");
+        for name in [
+            "xlucidos_device",
+            "lucidos_devices",
+            "lucidos_device_",
+            "lucidos_devicex",
+            "lucidos",
+        ] {
+            let h = headers(&[("cookie", &format!("{name}=cred-abc"))]);
+            assert_eq!(
+                authorize(&h, "secret", &paired, &own),
+                Authorization::Unauthorized,
+                "{name} was read as a credential cookie"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_summary_counts_names_and_carries_no_value() {
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let other = device_cookie_name(Path::new("/tmp/gw-b"));
+        let h = headers(&[(
+            "cookie",
+            &format!("theme=dark; {own}=v1; {other}=v2; lucidos_device=v3"),
+        )]);
+        assert_eq!(presented_credential_summary(&h, &own), (3, true));
+
+        let h = headers(&[("cookie", "theme=dark")]);
+        assert_eq!(presented_credential_summary(&h, &own), (0, false));
+    }
+
+    #[test]
+    fn a_refusal_line_names_the_door_and_never_a_credential() {
+        // Its whole job is to answer "the store lists my phone, so why the
+        // pairing screen?". Its whole constraint is to leak nothing doing it.
+        let line = refusal_line(2, true, OWN_COOKIE, 3);
+        assert!(line.contains(OWN_COOKIE), "{line}");
+        assert!(line.contains('2') && line.contains('3'), "{line}");
+        assert!(line.contains("one under"), "{line}");
+        assert!(refusal_line(1, false, OWN_COOKIE, 0).contains("none under"));
+    }
+
+    #[test]
+    fn a_hot_path_log_line_is_written_once_per_window() {
+        // A refusal happens per asset request, so an ungated line would bury
+        // the one thing a reader came for.
+        let mut throttle = LogThrottle::default();
+        let start = Instant::now();
+        assert!(throttle.allow(start, REFUSAL_LOG_WINDOW));
+        assert!(!throttle.allow(start + Duration::from_secs(1), REFUSAL_LOG_WINDOW));
+        assert!(!throttle.allow(
+            start + REFUSAL_LOG_WINDOW - Duration::from_millis(1),
+            REFUSAL_LOG_WINDOW
+        ));
+        assert!(throttle.allow(start + REFUSAL_LOG_WINDOW, REFUSAL_LOG_WINDOW));
     }
 
     // The local token's own behaviour (hex width, 0600 creation, mode repair,

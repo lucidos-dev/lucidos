@@ -1,4 +1,4 @@
-import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
+import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
@@ -427,23 +427,31 @@ async function loadAllThreadsInner(): Promise<void> {
   // option lists still work from loaded threads if this fails.
   void loadFilterFacets();
 
-  // Load events for the focused, active and saved threads. Everything else
-  // loads lazily on focus. The drawer does not need them: its status dot,
-  // sections, badges and counts are all `meta`, which the response above just
-  // refreshed. These are simply the threads the user is most likely to open
-  // next, and pre-loading them is what makes that open instant.
+  // The focused thread's events, ALONE and first. It is the only one the
+  // reader is looking at, and the only one whose latency they feel.
   //
-  // Pooled rather than fired at once (`THREAD_EVENTS_FETCH_CONCURRENCY`), with
-  // the focused thread first so it claims a slot immediately. Still awaited as
-  // a whole, so a caller ordering work after `loadAllThreads` is unaffected.
-  const loadIds: string[] = [];
-  if (focused && focused !== ghostFocusedThread) loadIds.push(focused);
-  for (const t of map.values()) {
-    if (t.meta.id !== focused && (activeSet.has(t.meta.id) || t.meta.saved)) {
-      loadIds.push(t.meta.id);
-    }
-  }
-  await runWithConcurrency(loadIds, THREAD_EVENTS_FETCH_CONCURRENCY, loadThreadEvents);
+  // Alone is the load-bearing word. This shared a four-wide pool with every
+  // active and saved thread. So the transcript on screen competed for
+  // bandwidth with a pile nobody had asked for. On a real workspace that pile
+  // was 46 threads and 21 MB, one of them 11 MB by itself.
+  if (focused && focused !== ghostFocusedThread) await loadThreadEvents(focused);
+
+  // Then a BOUNDED prefetch of the threads most likely to be opened next.
+  // The drawer needs none of it: its status dot, sections, badges and counts
+  // are all `meta`, which the response above just refreshed. This is purely
+  // what makes the next open instant, so it is worth having and not worth
+  // waiting on the whole list for.
+  //
+  // Newest first, capped at `THREAD_EVENTS_PREFETCH_LIMIT`. Everything past the
+  // cap still loads on focus, which is already the path every unsaved idle
+  // thread takes. Still awaited, so a caller ordering work after
+  // `loadAllThreads` is unaffected.
+  const prefetchIds = [...map.values()]
+    .filter(t => t.meta.id !== focused && (activeSet.has(t.meta.id) || t.meta.saved))
+    .sort((a, b) => Date.parse(b.meta.updatedAt) - Date.parse(a.meta.updatedAt))
+    .slice(0, THREAD_EVENTS_PREFETCH_LIMIT)
+    .map(t => t.meta.id);
+  await runWithConcurrency(prefetchIds, THREAD_EVENTS_FETCH_CONCURRENCY, loadThreadEvents);
 
   // Bump so CodingAgentControlMenu re-fetches commands after a reload, which
   // SSE does not replay.
@@ -509,10 +517,26 @@ export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> 
  *  a slot that is no longer its own. */
 let fetchAttemptSeq = 0;
 
-/** Threads with an in-flight load, mapped to the attempt token that owns it.
+/** Threads with an in-flight load, mapped to the attempt that owns it.
  *  Prevents duplicate concurrent fetches, and lets a superseded attempt tell
- *  that its own outcome is stale. */
-const loadingThreads = new Map<string, number>();
+ *  that its own outcome is stale.
+ *
+ *  `startedAt` is what separates a SLOW load from a STALLED one, which the
+ *  watchdog could not tell apart while this held a bare token. It spans the
+ *  whole attempt, retry backoff included, since that is the wait the reader is
+ *  actually sitting through. */
+const loadingThreads = new Map<string, { token: number; startedAt: number }>();
+
+/** How long this thread's load attempt has been in flight, in ms. `null` when
+ *  no attempt is running, which is a different answer from zero.
+ *
+ *  The watchdog's whole question. A thread with nothing in flight at two
+ *  seconds lost its fetch and is worth restarting. One still downloading is
+ *  just big, and restarting it means downloading it twice. */
+export function threadLoadInFlightMs(threadId: string): number | null {
+  const attempt = loadingThreads.get(threadId);
+  return attempt ? Date.now() - attempt.startedAt : null;
+}
 
 /** The newest refresh attempt claimed per thread, by token. EVERY attempt
  *  claims, and the claim does two jobs.
@@ -875,7 +899,7 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
   if (!thread || thread.eventsLoaded) return;
   if (loadingThreads.has(threadId)) return;
   const attemptToken = ++fetchAttemptSeq;
-  loadingThreads.set(threadId, attemptToken);
+  loadingThreads.set(threadId, { token: attemptToken, startedAt: Date.now() });
 
   // Perf: stamp the open-start for the `thread-render` mark, the moment the
   // focused thread's real event load begins. ThreadView reads and clears it on
@@ -1002,7 +1026,7 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
     }
   } finally {
     // Only while this attempt still owns the slot (see `fetchAttemptSeq`).
-    if (loadingThreads.get(threadId) === attemptToken) loadingThreads.delete(threadId);
+    if (loadingThreads.get(threadId)?.token === attemptToken) loadingThreads.delete(threadId);
   }
 }
 

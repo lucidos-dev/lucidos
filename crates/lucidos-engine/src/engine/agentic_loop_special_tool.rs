@@ -1515,6 +1515,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let explicit = crate::engine::chat::make_message_received(
             workspace,
@@ -1528,6 +1529,7 @@ mod tests {
             None,
             None,
             spawn_origin(spawning_thread, Some(tool_call)),
+            None,
         );
         let (
             ThreadEvent::MessageReceived { origin: a, .. },

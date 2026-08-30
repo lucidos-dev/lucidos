@@ -108,15 +108,29 @@ pub enum ThreadEvent {
         /// Reasoning effort the engine will use to answer this message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        /// Structured origin — captured from HTTP headers / device lookup at
+        /// Structured origin, captured from HTTP headers / device lookup at
         /// the API boundary. Optional on the wire so old DB rows deserialize
         /// cleanly; the frontend's `legacyOrigin()` synthesizes from the
         /// legacy `device_id` / `parent_thread_id` fields when this is None.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
+        /// The *voice session* this message was spoken on, when it was spoken
+        /// rather than typed. Absent means typed, which is every message
+        /// written before voice existed.
+        ///
+        /// It has to live on the message itself. Voice is a mode of a thread
+        /// (ADR 0148), so the composer stays live during a call. A typed
+        /// message therefore sits between the same pair of session events a
+        /// spoken one does, and the bounds cannot answer this.
+        ///
+        /// The id rather than a bare flag: `VoiceSessionStarted`,
+        /// `VoiceSessionEnded` and `SpokenReplyGenerated` all carry it, so one
+        /// call's rows join on one value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_session_id: Option<uuid::Uuid>,
     },
     /// User removed a queued chat follow-up before the agentic loop ingested it.
-    /// The original `MessageReceived` stays in the append-only log; renderers
+    /// The original `MessageReceived` stays in the append-only log. Renderers
     /// hide it while it is still stepless, and the agentic loop skips the
     /// matching injected prompt when it drains the queue.
     QueuedMessageRemoved {
@@ -130,11 +144,11 @@ pub enum ThreadEvent {
         text: String,
     },
     /// One captured context per LLM call. `usage` is None pre-call and on
-    /// providers that don't report it (OpenAI, Gemini); when present it
+    /// providers that don't report it (OpenAI, Gemini). When present it
     /// reflects the real prompt-token cost from the provider's `usage`
     /// block. `estimated_total_tokens` is the engine's pre-call estimate
-    /// (`estimate_tokens_from_chars`, a measured 2.5 chars/token; NOT the
-    /// trim budget's conservative 1.5); the modal renders both so the user
+    /// (`estimate_tokens_from_chars`, a measured 2.5 chars/token, NOT the
+    /// trim budget's conservative 1.5). The modal renders both so the user
     /// can spot estimator drift.
     ///
     /// A section's `budget_delta_chars` is the one that sums, and over a
@@ -220,15 +234,17 @@ pub enum ThreadEvent {
         #[serde(default = "default_true")]
         success: bool,
         /// Event id of the originating `ToolCalled`. Stamped on every live
-        /// emit by the chat agentic loop and on synthetic backfills by the
-        /// recovery sweep (`recover_orphan_tool_calls`); the frontend's
+        /// emit by the chat agentic loop, and on synthetic backfills by the
+        /// recovery sweep (`recover_orphan_tool_calls`). The frontend's
         /// `groupIntoExchanges` uses it (via `chatToolCallOwners`) to route
-        /// the result back to the call's exchange. Without explicit pairing,
+        /// the result back to the call's exchange.
+        ///
+        /// Without explicit pairing,
         /// an `ask_user_question` result followed the post-`UserQuestionAsked`
         /// request_id redirect into the question divider and left the
         /// original exchange's "Executing …" spinner pending forever.
         /// Server-side resume-block synthesis (LLM-message pairing) still
-        /// uses chronological name matching — see
+        /// uses chronological name matching. See
         /// `collect_tool_pairs_chronological`. Optional for legacy DB rows
         /// (pre-field): callers that fall back to chronological pairing
         /// continue to work when absent.
@@ -238,7 +254,7 @@ pub enum ThreadEvent {
     /// Lucidos Agent's current todo list, replaced wholesale on every
     /// `todo_write` tool call. Sticky UI panel reads the latest of these per
     /// thread; the empty list means the agent cleared the list. Not emitted
-    /// from coding-agent threads — CC's own `TodoWrite` continues to render
+    /// from coding-agent threads. CC's own `TodoWrite` continues to render
     /// inline on the tool-call step.
     TodoListWritten {
         items: Vec<TodoItem>,
@@ -250,16 +266,16 @@ pub enum ThreadEvent {
         notes: Option<String>,
     },
     /// Background task spawned via `run_bash_background` (shell command) OR
-    /// `run_python_background` (venv-rooted python script — the engine
+    /// `run_python_background` (venv-rooted python script: the engine
     /// wraps it as `bash -o pipefail -c "<venv-python> <script>"` and routes through
     /// the same `BackgroundBashRegistry`). The `command` field captures
     /// the exact shell invocation, so a reader can tell which spawning
     /// tool produced the row. Paired with a later `BackgroundBashCompleted`.
     /// The two events are the durable audit trail of every long-running
-    /// background task — `bash_output` reads from the in-memory registry
-    /// while a task runs and for the few minutes its completion is retained
-    /// there, then falls back to the `BackgroundBashCompleted` payload,
-    /// regardless of which tool spawned it.
+    /// background task. `bash_output` reads from the in-memory registry
+    /// while a task runs, and for the few minutes its completion is retained
+    /// there. It then falls back to the `BackgroundBashCompleted` payload,
+    /// whichever tool spawned it.
     BackgroundBashStarted {
         task_id: String,
         command: String,
@@ -273,12 +289,12 @@ pub enum ThreadEvent {
         command: String,
         /// The child's normal exit status. `None` whenever there isn't one:
         /// the child died on a signal (see `signal`), or the engine failed to
-        /// reap it at all. Never a stand-in number — a reader that sees
+        /// reap it at all. Never a stand-in number: a reader that sees
         /// `exit_code: 0` can trust the command really exited 0.
         exit_code: Option<i32>,
-        /// Unix signal that terminated the child, when one did (9 = SIGKILL
-        /// from the watchdog timeout or `bash_kill`, 11 = SIGSEGV, 13 =
-        /// SIGPIPE from a `pipefail` pipeline, …). Mutually exclusive with
+        /// Unix signal that terminated the child, when one did. 9 is SIGKILL
+        /// from the watchdog timeout or `bash_kill`, 11 is SIGSEGV, and 13 is
+        /// SIGPIPE from a `pipefail` pipeline. Mutually exclusive with
         /// `exit_code`; both `None` means the status was unavailable.
         /// Absent on rows written before the field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,13 +373,13 @@ pub enum ThreadEvent {
         /// "Engine · Auto-resumed after restart" for recovered sessions.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<MessageOrigin>,
-        /// Why the continuation opened — forwarded from the originating
+        /// Why the continuation opened, forwarded from the originating
         /// `ContinuationRequested.reason`. The frontend reads it to label the
         /// resume honestly: `user_clicked_continue` is genuinely a resume
         /// after an engine restart, but `auto_recovery_after_hang` fires for a
         /// hung subprocess OR a stray signal-kill (e.g. a cross-workspace
-        /// `cargo check` broad-kill) where NO engine restart happened —
-        /// labeling those "Resumed after engine restart" misattributes a local
+        /// `cargo check` broad-kill) where NO engine restart happened.
+        /// Labeling those "Resumed after engine restart" misattributes a local
         /// interruption to a restart. `None` for legacy rows and the chat
         /// rerun path (which carries its own engine note instead).
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,17 +413,19 @@ pub enum ThreadEvent {
         /// Which backend drives this thread (`claude-code` | `codex`).
         /// Locked in at first SessionStarted via the thread_summaries
         /// projection (COALESCE keeps the existing value) so follow-ups and
-        /// recovery resume on the same backend. Default covers legacy rows —
-        /// all Claude Code.
+        /// recovery resume on the same backend. The default covers legacy rows,
+        /// which are all Claude Code.
         #[serde(default = "default_coding_agent_claude_code")]
         coding_agent: CodingAgent,
     },
     SessionEnded {
-        /// Why the session ended. Always serialized — the frontend reads
+        /// Why the session ended. Always serialized, because the frontend reads
         /// `reason` to distinguish a normal completion from a system abort,
         /// and `Completed` must reach the wire as `"completed"`. The default
         /// applies only when reading old DB rows persisted before `reason`
-        /// existed.
+        /// existed. A row written before the terminal-only reasons still
+        /// carries a retired value. The snapshot serves the raw column, so a
+        /// reader must tolerate any string here.
         #[serde(default = "default_session_ended_reason")]
         reason: SessionEndReason,
     },
@@ -417,7 +435,7 @@ pub enum ThreadEvent {
         #[serde(default = "default_coding_agent_claude_code", alias = "agent")]
         coding_agent: CodingAgent,
     },
-    /// Streamed reasoning/thinking from a coding agent — the coding-agent mirror
+    /// Streamed reasoning from a coding agent, the coding-agent mirror
     /// of the chat agent's `ThoughtStreamed`. Carries plaintext reasoning the
     /// agent emitted before its visible output (CC's `thinking_delta`; Codex's
     /// `item/reasoning/*Delta` / `reasoning` item). Per-token streamed, persisted,
@@ -478,7 +496,7 @@ pub enum ThreadEvent {
     },
     /// Emitted when the engine detects that a coding-agent session ended without
     /// running the required hardening. A recovery hardening session is spawned
-    /// automatically. This is NOT a completion event — the thread stays active
+    /// automatically. This is NOT a completion event: the thread stays active
     /// until hardening finishes.
     MissingHardeningDetected {
         /// Engine-stamped origin (always `MessageOrigin::Engine { reason:
@@ -517,17 +535,17 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_path: Option<String>,
         /// `git rev-parse HEAD` in the worktree at the moment the agent went
-        /// idle. Phase 8.1 of the CC resume architecture: persisted so that
-        /// the next spawn can diff against this SHA + check `git status` to
-        /// detect external user edits made between turns and inject a note
-        /// into the resumed prompt. `None` on legacy rows, on idles emitted
+        /// idle. Phase 8.1 of the CC resume architecture. The next spawn
+        /// diffs against this SHA and checks `git status`, to detect external
+        /// user edits made between turns. It then injects a note into the
+        /// resumed prompt. `None` on legacy rows, on idles emitted
         /// without a worktree, or when `git rev-parse` fails (e.g. branch
         /// has zero commits yet).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_head_sha: Option<String>,
         /// True iff the agent went idle while the chat-agent's
         /// `run_bash_background` tool still had a task running for this thread.
-        /// **Recorded history only** — as of the bg-bash-gate removal this no
+        /// **Recorded history only.** As of the bg-bash-gate removal this no
         /// longer drives any projection or UI. The change proposes at idle
         /// regardless of background bash (correctness is covered by
         /// harden-at-apply), and the chat-agent bash auto-resumes CC via
@@ -536,7 +554,7 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         bg_bash_pending: bool,
     },
-    /// Continuation requested — emitted when a CC turn that was interrupted
+    /// Continuation requested, emitted when a CC turn that was interrupted
     /// (engine restart mid-turn, Q9a recovery path) needs to be resumed
     /// without a new user message. Four emit sites: HTTP `/continue`
     /// (user clicks Continue), the *in-loop watchdog* (10-min silence with
@@ -545,7 +563,9 @@ pub enum ThreadEvent {
     /// dispatcher (Phase 5, Task 5.2), which re-spawns CC via `--resume`
     /// with no new input. The dispatcher uses the event's id as the
     /// idempotency key so a single `ContinuationRequested` produces exactly
-    /// one spawn. Past name was `ContinueSignal`; the rename migration
+    /// one spawn.
+    ///
+    /// Past name was `ContinueSignal`. The rename migration
     /// (`20260518212540_rename_continue_signal_to_continuation_requested`)
     /// rewrote existing rows, and the serde alias remains as a safety net
     /// for any in-flight JSON not yet persisted. Renamed to past-tense
@@ -574,7 +594,7 @@ pub enum ThreadEvent {
     ThreadUnsaved,
     ThreadArchived,
     /// A thread was created in `composing` state. Emitted by the first
-    /// successful POST /threads (debounced first user input — keystroke,
+    /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
     /// be addressed by id immediately after this event lands.
     ThreadStarted {
@@ -587,9 +607,9 @@ pub enum ThreadEvent {
         actor: Option<MessageOrigin>,
     },
     /// A thread in `composing` state was explicitly discarded. Emitted by
-    /// DELETE /threads/:id. Terminal — the state-machine guard rejects
-    /// every subsequent compose PUT and message POST with 410 Gone, which
-    /// is the "make impossible states impossible" lever that replaces the
+    /// DELETE /threads/:id. Terminal: the state-machine guard rejects
+    /// every subsequent compose PUT and message POST with 410 Gone. That is
+    /// the "make impossible states impossible" lever that replaces the
     /// old LWW + tombstone machinery.
     ThreadDiscarded {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -599,11 +619,11 @@ pub enum ThreadEvent {
     /// POST /api/v1/threads/:id/blobs after the bytes are content-addressed
     /// to disk under `data/blobs/<hh>/<hash>.<ext>`. The `hash` is the sole
     /// identity used by every downstream consumer (compose payload, message
-    /// payload, LLM call); `mime` and `byte_size` are convenience fields so
+    /// payload, LLM call). `mime` and `byte_size` are convenience fields, so
     /// SSE subscribers can render the upload entry without fetching the
-    /// blob. Same blob attached to two threads = two events, one per thread
-    /// (the disk write is a no-op the second time, but the per-thread fact
-    /// stays distinct).
+    /// blob. One blob attached to two threads leaves two events, one per
+    /// thread. The disk write is a no-op the second time, and the per-thread
+    /// fact stays distinct.
     ImageUploaded {
         hash: String,
         mime: String,
@@ -619,10 +639,10 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         /// Which path fired this run. `None` only on legacy DB rows persisted
-        /// before this field existed — new emissions always set it.
+        /// before this field existed. New emissions always set it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invocation: Option<TriggerInvocation>,
-        /// Engine-stamped origin for scheduler-fired triggers — always set to
+        /// Engine-stamped origin for scheduler-fired triggers, always set to
         /// `Engine { Scheduler { trigger_id, trigger_name } }` so the route
         /// popover can render "Engine · Scheduled · <name>". `None` only on
         /// legacy DB rows persisted before this field existed.
@@ -669,7 +689,7 @@ pub enum ThreadEvent {
         requires_restart: bool,
         /// Engine-stamped origin for change proposals from engine-internal
         /// recovery paths (stale-session cleanup, orphan worktree cleanup).
-        /// `None` for proposals authored by a live agent session — those
+        /// `None` for proposals authored by a live agent session. Those
         /// inherit their origin from the surrounding `MessageReceived`.
         /// Surfaced in the route popover so users can render
         /// "Engine · Stale session cleanup" etc.
@@ -726,14 +746,14 @@ pub enum ThreadEvent {
         /// group entries without an extra lookup.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         thread_title: Option<String>,
-        /// Who applied the change — always the human/HTTP/SDK initiator
+        /// Who applied the change, always the human/HTTP/SDK initiator
         /// stamped by `api/actor::build_message_origin` from the originating
-        /// HTTP call. None on legacy DB rows or when the conflict-resolution
-        /// ff-merge path runs (the original applier's actor is dropped across
-        /// the async gap; popover then renders "Unknown").
+        /// HTTP call. None on legacy DB rows, and when the conflict-resolution
+        /// ff-merge path runs. That path drops the original applier's actor
+        /// across the async gap, and the popover then renders "Unknown".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
-        /// SHA of `main` before the merge — paired with `post_merge_sha` to
+        /// SHA of `main` before the merge, paired with `post_merge_sha` to
         /// give Revert the exact commit range to drop. `None` for events
         /// emitted before the projection rewrite.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -839,14 +859,14 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cc_session_id: Option<String>,
         /// Absolute `CLAUDE_CONFIG_DIR` the session was created under, stamped
-        /// alongside `cc_session_id` at the Init emit — the authoritative
+        /// alongside `cc_session_id` at the Init emit. It is the authoritative
         /// session↔config-dir pairing. CC keys each session's transcript on this
-        /// dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`), so a follow-up
-        /// resume re-injects it (see `lookup_pinned_cc_config_dir` +
-        /// `SpawnArgs::claude_config_dir`) so a mid-flight user toggle of the env
-        /// var can't strand the session (dev/bf997e21). `None` on legacy rows,
+        /// dir (`$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`). So a follow-up
+        /// resume re-injects it (see `lookup_pinned_cc_config_dir` and
+        /// `SpawnArgs::claude_config_dir`), and a mid-flight user toggle of the
+        /// env var cannot strand the session. `None` on legacy rows,
         /// on the pre-Init settings emit, and on mid-session settings-only emits
-        /// (model/effort/permission changes) — the Init emit is the carrier.
+        /// (model/effort/permission changes). The Init emit is the carrier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_config_dir: Option<String>,
     },
@@ -934,6 +954,7 @@ pub enum ThreadEvent {
         request_id: String,
         tool_use_id: String,
         tool_name: String,
+        /// The tool call's arguments, always a JSON object.
         input: Value,
         summary: String,
     },
@@ -957,7 +978,7 @@ pub enum ThreadEvent {
     },
 
     /// The Lucidos Agent's command guard (ADR 0002) paused a bash/python tool
-    /// call to ask the user for permission — the `IrreversibleDanger` lane on a
+    /// call to ask the user for permission: the `IrreversibleDanger` lane on a
     /// `Chat` channel. The chat counterpart of `CodingAgentPermissionRequest`:
     /// it renders the same `PermissionCard`, but the agent loop blocks
     /// in-process on `Engine.pending_command_permission` (no MCP subprocess).
@@ -987,13 +1008,15 @@ pub enum ThreadEvent {
     },
 
     /// The Lucidos Agent (chat) paused an MCP server tool call to ask the user
-    /// for permission — the chat counterpart of `CommandPermissionRequested` for
+    /// for permission, the chat counterpart of `CommandPermissionRequested` for
     /// MCP tools. Renders the same `PermissionCard`; the agentic loop blocks
     /// in-process on `Engine.pending_mcp_permission` until the user resolves it.
-    /// `server_id` is the MCP server registry key (stable, used to derive the
-    /// persisted `Mcp(server:tool)` / `Mcp(server:*)` grant pattern);
-    /// `server_name` is the human label shown on the card; `tool_name` is the
-    /// bare MCP tool; `arguments_summary` is the pretty-printed (truncated) args.
+    ///
+    /// `server_id` is the MCP server registry key. It is stable, and the
+    /// persisted `Mcp(server:tool)` / `Mcp(server:*)` grant pattern derives
+    /// from it. `server_name` is the human label shown on the card,
+    /// `tool_name` is the bare MCP tool, and `arguments_summary` is the
+    /// pretty-printed (truncated) args.
     /// Persisted so the card survives reload. Replaces the legacy transient
     /// `McpConsentPromptRequested` + `showConfirm` modal. Auto-approved silently
     /// (no event) in non-interactive trigger threads and when the server's
@@ -1008,10 +1031,11 @@ pub enum ThreadEvent {
     },
     /// User resolved an `McpPermissionRequested` (or the engine resolved it as
     /// superseded / orphaned). Chat counterpart of `CommandPermissionResolved`;
-    /// `persist_scope` records the "Always allow this tool" (`narrow` →
-    /// `Mcp(server:tool)`) / "Always allow this server" (`broad` →
-    /// `Mcp(server:*)`) / "Allow for this thread" (`session`) choice the user
-    /// picked so reload reproduces the answered card. `None` covers Allow-once,
+    /// `persist_scope` records which scope the user picked, so reload
+    /// reproduces the answered card. "Always allow this tool" is `narrow`
+    /// (`Mcp(server:tool)`), "Always allow this server" is `broad`
+    /// (`Mcp(server:*)`), and "Allow for this thread" is `session`.
+    /// `None` covers Allow-once,
     /// Deny, and the engine-emitted superseded/orphan resolutions.
     McpPermissionResolved {
         request_id: String,
@@ -1024,7 +1048,7 @@ pub enum ThreadEvent {
 
     /// The command guard bracketed a `ReversibleDanger` command (in-workspace
     /// destruction) with a snapshot of the workspace's git-visible content: ADR
-    /// 0002, Phase 4 and its 2026-08-06 addendum. The pre image lives on
+    /// 0002, Phase 4 and its counting addendum. The pre image lives on
     /// `refs/lucidos/command-checkpoints/<checkpoint_id>` and the post image on
     /// `refs/lucidos/command-post-images/<checkpoint_id>`; `command` is the
     /// command that ran and `summary` is the one-line card text. Persisted so
@@ -1063,9 +1087,9 @@ pub enum ThreadEvent {
     /// `.lucidos/cache/`) were stripped from a long-idle worktree; the
     /// worktree itself is still on disk. `tier=2` means the entire worktree
     /// directory was removed (long-idle, clean, unsaved). `freed_bytes` is
-    /// a best-effort sum of file sizes reclaimed; on filesystems where
-    /// metadata is partially unavailable it may be `0` even if real space was
-    /// freed. `branch_deleted` is `true` when Tier 2 also dropped a
+    /// a best-effort sum of file sizes reclaimed. Where metadata is partly
+    /// unavailable it can read `0` even though real space was freed.
+    /// `branch_deleted` is `true` when Tier 2 also dropped a
     /// fully-merged branch (Phase 10.3).
     WorktreeCleaned {
         tier: u8,
@@ -1088,7 +1112,7 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         child_thread_title: Option<String>,
         status: ChildCompletionStatus,
-        /// Free-form summary — prose body of the child's final
+        /// Free-form summary: the prose body of the child's final
         /// `ResponseGenerated` (truncated to 2000 chars), or the failure error
         /// for `Failure`. Indexed by [`ThreadEvent::indexable_text`].
         summary: String,
@@ -1140,7 +1164,7 @@ pub enum ThreadEvent {
 
     /// A background Flash call produced a text description for one of the
     /// images attached to a `MessageReceived`. Emitted from the agentic loop
-    /// after iteration 1 of a chat turn — one event per attached image hash,
+    /// after iteration 1 of a chat turn, one event per attached image hash,
     /// all carrying the same description text. Gated by
     /// `is_bad_image_description` so non-descriptions ("I don't see any
     /// image") never persist.
@@ -1189,8 +1213,8 @@ pub enum ThreadEvent {
 
     /// The thread registered an **event wait**. Emitted by the `await_event`
     /// tool between its `ToolCalled` and that call's `ToolResult`, and it is the
-    /// SOURCE OF TRUTH for the wait: there is no `thread_event_waits` table,
-    /// and the dispatcher's live set is a cache rebuilt from these events at
+    /// SOURCE OF TRUTH for the wait. There is no `thread_event_waits` table.
+    /// The dispatcher's live set is a cache rebuilt from these events at
     /// boot (ADR 0011's shape applied to a new wake).
     ///
     /// It does NOT end the turn and it does NOT set a status. Registering a
@@ -1221,9 +1245,9 @@ pub enum ThreadEvent {
         armed_at: chrono::DateTime<chrono::Utc>,
         expires_at: chrono::DateTime<chrono::Utc>,
         /// The event `sequence` at registration. Both the registration path and
-        /// the boot rebuild scan forward from here, which closes the restart
-        /// gap and the live race between this emit and the cache insert with
-        /// one mechanism.
+        /// the boot rebuild scan forward from here. One mechanism therefore
+        /// closes the restart gap and the live race between this emit and
+        /// the cache insert.
         watermark: i64,
     },
 
@@ -1302,24 +1326,62 @@ pub enum ThreadEvent {
     /// The talker said something out loud, and this is what it said.
     ///
     /// One per talker turn, whether the talker composed the words itself or was
-    /// reading the reasoner's answer. Both are things the caller heard. So both
-    /// belong in the thread, and the reasoner has to read what was already said
+    /// reading the doer's answer. Both are things the caller heard. So both
+    /// belong in the thread, and the doer has to read what was already said
     /// in its name (ADR 0149).
     ///
     /// Authored by the talker, so it carries
     /// `MessageOrigin::Agent { agent: Guest { .. } }` on its `EventMeta` and
-    /// renders to the reasoner under its own speaker label (ADR 0150).
+    /// renders to the doer under its own speaker label (ADR 0150).
     ///
-    /// `Metadata`: the reasoner's turn owns the thread's status, and a talker
+    /// `Metadata`: the doer's turn owns the thread's status, and a talker
     /// turn landing mid-turn must not settle it.
     ///
     /// Carries text, never audio (parent plan, decision 12).
     SpokenReplyGenerated {
         session_id: uuid::Uuid,
         text: String,
-        /// The caller spoke over it, so only this much was heard. The reasoner's
+        /// The caller spoke over it, so only this much was heard. The doer's
         /// own answer is in the thread in full either way.
         interrupted: bool,
+    },
+
+    /// The caller said something, and the talker answered it alone.
+    ///
+    /// The other half of a spoken utterance. One that needs the doer becomes a
+    /// `MessageReceived` carrying `voice_session_id`, exactly as a typed one
+    /// does, because it starts a turn. This is for the rest, and it starts
+    /// nothing.
+    ///
+    /// **`Metadata` is the whole reason it exists.** `MessageReceived` is
+    /// `EventClass::Start`, so recording a talker-handled utterance that way
+    /// would leave the thread claiming a turn that will never run.
+    ///
+    /// It carries the caller's own actor, not the talker's. The talker
+    /// answered it; the caller said it.
+    SpokenMessageReceived {
+        session_id: uuid::Uuid,
+        text: String,
+    },
+
+    /// The talker asked for the doer, and this is why.
+    ///
+    /// Its one tool, written down. The thread then names all three
+    /// participants: what the caller said, what the talker asked for, and what
+    /// the doer did (ADR 0150).
+    ///
+    /// Authored by the talker, so it carries the guest actor on its
+    /// `EventMeta`. The doer reads the reason as that speaker's line, which is
+    /// how it learns what it was woken for.
+    ///
+    /// `Metadata`, and it moves no section. The `MessageReceived` beside it is
+    /// what starts the turn, and two Start events for one utterance is a
+    /// thread counting a turn twice.
+    WorkDelegated {
+        session_id: uuid::Uuid,
+        /// The talker's own few words. Never empty: the seam substitutes a
+        /// stand-in rather than dropping a delegation over a missing argument.
+        reason: String,
     },
 
     // ---- Transient — never persisted ----
@@ -1347,18 +1409,19 @@ pub enum ThreadEvent {
     CredentialPromptRequested {
         payload: String,
     },
-    /// Plugin install request awaiting user confirmation. Carries the JSON
-    /// preview emitted by `install_plugin` (manifest, file list, overwrites,
-    /// optional `setup`) so the frontend can render the install panel.
+    /// Plugin install request awaiting user confirmation. It carries the
+    /// JSON preview `install_plugin` emitted: manifest, file list, overwrites
+    /// and an optional `setup`. The frontend renders the install panel from
+    /// it.
     /// Resolved by `POST /api/v1/plugins/install/{install_id}/{confirm|cancel}`.
     #[serde(alias = "PluginInstallRequest")]
     PluginInstallRequested {
         payload: String,
     },
-    /// Plugin uninstall request awaiting user confirmation. Carries the JSON
-    /// preview emitted by `uninstall_plugin` (plugin name + version, file
-    /// list partitioned into still-on-disk vs already-missing) so the
-    /// frontend can render the uninstall panel. Resolved by
+    /// Plugin uninstall request awaiting user confirmation. It carries the
+    /// JSON preview `uninstall_plugin` emitted: plugin name and version, plus
+    /// the file list split into still-on-disk and already-missing. The
+    /// frontend renders the uninstall panel from it. Resolved by
     /// `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm|cancel}`.
     #[serde(alias = "PluginUninstallRequest")]
     PluginUninstallRequested {

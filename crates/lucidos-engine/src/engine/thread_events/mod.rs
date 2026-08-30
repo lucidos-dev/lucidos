@@ -55,5 +55,8 @@ mod question_tests;
 #[path = "../thread_events_tests/todo.rs"]
 mod todo_tests;
 #[cfg(test)]
+#[path = "../thread_events_tests/ts_codegen.rs"]
+mod ts_codegen;
+#[cfg(test)]
 #[path = "../thread_events_tests/variants.rs"]
 mod variant_tests;

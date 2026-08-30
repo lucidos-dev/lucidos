@@ -11,8 +11,10 @@ import type { ComponentChildren, VNode } from 'preact';
 import { VoiceSection } from '../VoiceSection';
 import { preferences } from '../../../store/store';
 import {
-  DEFAULT_VOICE_RESIDENT_SECTIONS,
   DEFAULT_VOICE_TALKER_MODEL,
+  DEFAULT_VOICE_TALKER_VOICE,
+  DEFAULT_VOICE_TRANSCRIBER_MODEL,
+  VOICE_RESIDENT_SECTIONS,
 } from '../../../store/actions/preferences';
 
 /** Flatten a vnode tree to text, keeping scalar props. Same shallow walk as
@@ -54,19 +56,67 @@ describe('the Voice settings section', () => {
     expect(rendered).not.toContain('Resident context');
   });
 
-  it('carries both voice preferences once voice is on', () => {
+  it('carries every voice preference once voice is on', () => {
     const rendered = render({ voice_enabled: 'true' });
     expect(rendered).toContain('Talker model');
+    expect(rendered).toContain('Transcriber model');
+    expect(rendered).toContain('Spoken voice');
     expect(rendered).toContain('Resident context');
   });
 
-  /** Placeholder, never value. A field pre-filled with the default reads a
-   *  clear as an edit, and saves an empty string on every blur. */
-  it('shows each engine default as a placeholder over an empty field', () => {
+  /** The second and last model in the loop had no row at all. So a workspace
+   *  could not see what was transcribing it, let alone change it. */
+  it('shows the engine defaults for the transcriber and the spoken voice', () => {
     const rendered = render({ voice_enabled: 'true' });
-    expect(rendered).toContain(`placeholder="${DEFAULT_VOICE_TALKER_MODEL}"`);
-    expect(rendered).toContain(`placeholder="${DEFAULT_VOICE_RESIDENT_SECTIONS}"`);
-    expect(rendered).not.toContain(`value="${DEFAULT_VOICE_TALKER_MODEL}"`);
+    expect(rendered).toContain(`model="${DEFAULT_VOICE_TRANSCRIBER_MODEL}"`);
+    expect(rendered).toContain(`value="${DEFAULT_VOICE_TALKER_VOICE}"`);
+  });
+
+  /** A toggle per section, rather than a field of comma-separated ids. The
+   *  engine owns the registry and this list mirrors it. */
+  it('offers a toggle per resident section, on by default', () => {
+    const rendered = render({ voice_enabled: 'true' });
+    for (const section of VOICE_RESIDENT_SECTIONS) {
+      expect(rendered).toContain(`aria-label="${section.title}"`);
+    }
+    expect(rendered).not.toContain('who-and-where,this-thread');
+  });
+
+  /** A stored list is what the toggles read, and a section left out of it is
+   *  off however it ships. */
+  it('follows the stored list rather than the defaults', () => {
+    const rendered = render({
+      voice_enabled: 'true',
+      voice_resident_sections: 'this-thread',
+    });
+    const on = /aria-label="This conversation so far" checked="true"/;
+    const off = /aria-label="What this workspace has" checked="true"/;
+    expect(rendered).toMatch(on);
+    expect(rendered).not.toMatch(off);
+  });
+
+  /** Turning every section off has to stay off. An empty stored value used to
+   *  read as "never set", which brought all three back. */
+  it('leaves every toggle off when the stored list is empty', () => {
+    const rendered = render({ voice_enabled: 'true', voice_resident_sections: '' });
+    for (const section of VOICE_RESIDENT_SECTIONS) {
+      expect(rendered).toContain(`aria-label="${section.title}"`);
+      expect(rendered).not.toMatch(new RegExp(`aria-label="${section.title}" checked`));
+    }
+  });
+
+  /** The opposite rule for the picker, and the reason is the same one: it must
+   *  show what a call dials, and it has no placeholder to say it with. */
+  it('shows the engine default as the picked talker while nothing is stored', () => {
+    const rendered = render({ voice_enabled: 'true' });
+    expect(rendered).toContain(`model="${DEFAULT_VOICE_TALKER_MODEL}"`);
+  });
+
+  /** The agent can write any id through `set_preference`. A picker that only
+   *  knew its own list would render a model the call is not dialling. */
+  it('keeps a stored talker the curated list does not carry', () => {
+    const rendered = render({ voice_enabled: 'true', model_voice_talker: 'gpt-realtime-next' });
+    expect(rendered).toContain('model="gpt-realtime-next"');
   });
 
   /** The toast's Open settings button lands on the Models subview, and the

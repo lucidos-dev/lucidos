@@ -184,13 +184,29 @@ pub enum InjectedPromptKind {
     /// two come from different places and say so in the log; the *layout* they
     /// share is expressed once, by [`InjectedPromptGroup::Standalone`].
     ReentryFromWait,
+    /// What the *talker* said out loud while this turn was running.
+    ///
+    /// Same projection rule again, and here the reason is that the exchange
+    /// starter is somebody ELSE's. A spoken reply is `Metadata` and starts no
+    /// turn (ADR 0149): it lands beside the one already running. Emitting a
+    /// `UserPromptInjected` for it would claim the talker interrupted the
+    /// user, and `SpokenReplyGenerated` is already the record.
+    ///
+    /// **It never wakes an idle thread.** With no live handle there is nothing
+    /// to inject into, and history carries the turn to the next round anyway.
+    SpokenAside,
 }
 
 impl InjectedPromptKind {
-    /// True for the engine's own re-entries, which carry their exchange-starter
-    /// on the wire already and must never emit a second one.
+    /// True for every kind that must NOT emit its own exchange-starter.
+    ///
+    /// The two re-entries already put one on the wire. A spoken aside belongs
+    /// to somebody else's, which comes to the same rule from the other side.
     pub(crate) fn is_engine_reentry(&self) -> bool {
-        matches!(self, Self::ReentryFromEngine | Self::ReentryFromWait)
+        matches!(
+            self,
+            Self::ReentryFromEngine | Self::ReentryFromWait | Self::SpokenAside
+        )
     }
 }
 

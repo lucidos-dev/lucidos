@@ -15,6 +15,7 @@ async fn test_valid_request_event_id_accepted() {
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "fix this".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -94,6 +95,7 @@ async fn test_automated_prompt_creates_valid_origin() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "initial".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -191,6 +193,7 @@ async fn empty_coding_agent_prompt_sent_does_not_flip_status_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do the thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -369,6 +372,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "follow-up message".into(),
             user_image_hashes: vec![],
             device_id: None,

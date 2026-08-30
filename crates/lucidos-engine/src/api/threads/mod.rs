@@ -2,7 +2,7 @@
 //!
 //! Originally one large `api::threads` module; split by responsibility seam
 //! into child modules. This barrel re-exports the handler surface its own
-//! `router()`, `api/history.rs` (the three `/events/:event_id/*` routes) and
+//! `router()`, `api/history.rs` (the four `/events/:event_id/*` routes) and
 //! `api/search.rs` consume, so every `api::threads::*` path resolves
 //! unchanged. The request/response shapes stay reachable at
 //! `api::threads::<child>::<Type>`.
@@ -26,7 +26,8 @@ pub(super) use actions::{
 };
 pub(super) use archive::archive_thread;
 pub(super) use events_snapshot::{
-    get_context_capture, get_event_location, get_thread_events_snapshot, get_tool_result,
+    get_context_capture, get_event_location, get_thread_events_snapshot, get_tool_args,
+    get_tool_result,
 };
 pub(super) use list::{
     count_thread_summaries, get_archived_count, get_filter_facets, get_older_threads,

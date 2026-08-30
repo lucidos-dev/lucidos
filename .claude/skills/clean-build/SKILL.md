@@ -142,10 +142,10 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-29. Anything not
+The currently-accepted categories, counted as of 2026-08-30. Anything not
 on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 79 sites across 49 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 80 sites across 51 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -153,9 +153,9 @@ on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 79 shares an attribute with `format_in_format_args`, which is
+  One of the 80 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 78 across 48 files. Both numbers here count the shared attribute.
+  reports 79 across 50 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -177,8 +177,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 514 sites across 180 files, every one of them
-  test-only code: 172 `*.test.ts`, seven `*.test.tsx`
+  `@types/node` in project**, 532 sites across 186 files, every one of them
+  test-only code: 178 `*.test.ts`, seven `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -283,8 +283,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   It had one real error, `SharedWorkerGlobalScope` undeclared, which that run
   fixed by adding `WebWorker` to the SDK's `lib`.
 
-- **Phase 4's entry chunk is 692.35 kB against its 600 kB ceiling, and the
-  2026-08-29 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 713.53 kB against its 600 kB ceiling, and the
+  2026-08-30 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -304,26 +304,32 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.18 kB, against a 92.35 kB gap:
+  attribution now puts the whole list at 38.28 kB, against a 113.53 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
   | `PermissionCard` | 10.01 |
-  | `CodingAgentControlMenu` | 8.59 |
+  | `CodingAgentControlMenu` | 8.54 |
   | `ThreadFilterPanel` | 5.91 |
   | `WorkspaceSwitcher` | 4.36 |
   | `QuestionCard` | 3.98 |
   | `TodoListPanel` | 2.96 |
-  | `OverflowMenu` | 2.37 |
+  | `OverflowMenu` | 2.52 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 54 kB of it. The next
+  leave the advisory firing, and would now leave 75 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
-  Growth is diffuse rather than one mistake. The 2026-08-29 run added 6.50 kB
+  Two smaller menus of the same shape sit beside them, `ThreadOverflowMenu` at
+  1.26 kB and `DraftOverflowMenu` at 0.41 kB. They are left out of the table so
+  its total stays comparable with the `manualChunks` measurement below, which
+  covers the seven.
+
+  Growth is diffuse rather than one mistake. The 2026-08-30 run added 21.18 kB
   and re-ran the check for the usual culprit, a component gone from lazy to
-  eager. There was none, for the fourth run running.
+  eager. There was none, for the fifth run running. That run's growth arrived
+  with a wide batch of merged feature work, not from one module.
 
   **That check is two questions, not one.** Does any module sit in both the
   entry chunk and a separately emitted chunk? And does any target of a
@@ -332,33 +338,40 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   leaves no duplicate, so the first question misses it.
 
   The 2026-08-29 run widened the second question to every relative `import()`
-  in the app source and the SDK, all 114 of them. Scan the whole file list, not
+  in the app source and the SDK. Scan the whole file list, not
   a `src/**/*.ts` pathspec: git's default globbing lets `*` cross a slash, so
-  `**/` costs you the top-level files, and `main.tsx` holds the lazy views. The
-  one entry-chunk hit was `_fetch.ts`, which its own test imports dynamically
-  and the SDK barrel needs statically anyway.
+  `**/` costs you the top-level files, and `main.tsx` holds the lazy views.
 
-  The top is unchanged: `icons.tsx` at 20.17 kB, `ThreadDrawer.tsx` at 17.83
-  and `store.ts` at 17.18. The three thread-event exchange modules add
-  42.92 kB between them. A first paint reaches all of them. Two new
-  first-paint modules carried the 6.50 kB: `chat/scrollAnchor.ts` at 1.06 kB
-  and the SDK's `eventStream.ts` at 1.32 kB. The rest is growth in
-  `useScrollMemory.ts`, `scrollState.ts`, `deadPressProbe.ts` and
-  `ThreadView.tsx`, against a 2.29 kB saving in `CreateThreadView.tsx`.
+  **Two filters make that scan answerable, and the 2026-08-30 run needed both.**
+  It counted 462 relative `import()` sites, of which 420 sit in test files. A
+  test importing a module dynamically says nothing about bundling, so drop
+  `*.test.*`, `__tests__/` and `*.spec.ts` first. That leaves 42 sites across 9
+  files.
 
-  **The entry chunk carries no `node_modules` code at all**, measured on the
-  2026-08-29 run by grouping the sourcemap's sources. Every byte of it is code
-  we wrote, so no vendor-chunking idea can buy anything here.
+  Then drop TypeScript's type-position `import('...').Type`, which is erased at
+  compile time and reaches no bundle. All 6 apparent entry-chunk hits were that
+  form, in `api/threads.ts`, `api/types.ts`, `store/actions/navigation.ts` and
+  `store/store.ts`. So the real answer was zero.
 
-  **The SDK's `tooltip.ts` is 6.22 kB of the entry chunk and is NOT a cut**,
+  The top is unchanged: `icons.tsx` at 20.62 kB, `ThreadDrawer.tsx` at 17.93
+  and `store.ts` at 17.23. The three thread-event exchange modules add
+  43.07 kB between them. A first paint reaches all of them. The next tier is
+  `PromptInput.tsx` at 15.31 kB, `chat/scrollState.ts` at 14.36 and
+  `ChatExchange.tsx` at 14.31.
+
+  **The entry chunk carries no `node_modules` code at all**, measured again on
+  the 2026-08-30 run by grouping the sourcemap's sources. Every byte of it is
+  code we wrote, so no vendor-chunking idea can buy anything here.
+
+  **The SDK's `tooltip.ts` is 6.25 kB of the entry chunk and is NOT a cut**,
   measured on the 2026-08-28 run. It looks like one. `ui.ts` pulls the whole
   module in for `disableTooltips`, and `ui` rides the `lucidos` barrel that
   `api/client/settings.ts` imports at first paint. But the host shell installs
   tooltips itself, through `hooks/useTooltip.ts`. So the bytes are used rather
   than dragged, and moving the opt-out to its own module would free none.
 
-  The whole SDK is 14.44 kB of the entry chunk across 15 modules, measured on
-  the 2026-08-29 run. That bounds the barrel: dropping every SDK byte still
+  The whole SDK is 14.45 kB of the entry chunk across 14 modules, measured on
+  the 2026-08-30 run. That bounds the barrel: dropping every SDK byte still
   leaves the advisory firing.
 
   **`icons.tsx` is a barrel, and the 2026-08-25 run measured it. It is not
@@ -366,17 +379,17 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   The entry chunk holds every icon a lazy view reaches. Moving those out
   costs no round trip, because the lazy chunk already loads.
 
-  Only five of the 62 icons are reached by lazy chunks alone. They are
+  Only five of the 64 icons are reached by lazy chunks alone. They are
   `FolderUpIcon`, `FolderIcon`, `EyeOffIcon`, `ChevronLeftIcon` and
-  `ChevronRightIcon`, worth 4.2 kB of source and less once minified.
-  Re-measure before spending the churn, rather than assuming the split is
-  free money.
+  `ChevronRightIcon`, worth 4.17 kB of source and less once minified. The
+  2026-08-30 run re-measured and found the same five. Re-measure before
+  spending the churn, rather than assuming the split is free money.
 
   **`api/client.ts` is a second barrel, and the 2026-08-27 run measured it. It
-  is not a lever either.** 24.77 kB of `api/*` lands in the entry chunk across 17
+  is not a lever either.** 25.70 kB of `api/*` lands in the entry chunk across 17
   modules, and tree-shaking still works, though it now keeps less out: only
   `mcp.ts` and `data.ts`. `webhooks.ts` joined the entry chunk by the
-  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.34 kB,
+  2026-08-29 run, at 0.55 kB. The biggest resident is `settings.ts` at 5.64 kB,
   which first paint genuinely needs. It exports `getPreferences`,
   `setPreference` and the notification calls beside the backup, memory and
   OAuth ones. Splitting it is an API-client refactor rather than a clean cut.

@@ -194,6 +194,7 @@ impl LucidosEngine {
         pre_emitted_origin: Option<PreEmittedOrigin>, // skip MessageReceived: the caller already persisted it
         title: Option<&str>, // caller-provided title (skips async LLM title gen)
         origin: Option<MessageOrigin>,
+        voice_session_id: Option<Uuid>, // set when this message was spoken on a call
         external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
         urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -626,6 +627,7 @@ impl LucidosEngine {
                                 None,
                                 None,
                                 origin.clone(),
+                                voice_session_id,
                             ),
                             meta: EventMeta {
                                 event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
@@ -782,6 +784,7 @@ impl LucidosEngine {
                                 model_override,
                                 reasoning_effort,
                                 origin.clone(),
+                                voice_session_id,
                             ),
                             meta: EventMeta {
                                 event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
@@ -801,22 +804,18 @@ impl LucidosEngine {
                     .map(PreEmittedOrigin::event_id)
                     .or_else(|| event_id.and_then(|s| Uuid::parse_str(s).ok()));
                 let images = user_images.map(|imgs| imgs.to_vec());
-                let injected = {
-                    let threads = self.active_threads.lock().unwrap();
-                    if let Some(handle) = threads.get(&thread_id) {
-                        handle.inject(crate::engine::InjectedPrompt {
-                            text: user_message.to_string(),
-                            event_id: origin_event_id,
-                            mode,
-                            spawning_event_id,
-                            images,
-                            origin: origin.clone(),
-                            kind: inject_kind,
-                        })
-                    } else {
-                        false
-                    }
-                };
+                let injected = self.inject_into_live_turn(
+                    thread_id,
+                    crate::engine::InjectedPrompt {
+                        text: user_message.to_string(),
+                        event_id: origin_event_id,
+                        mode,
+                        spawning_event_id,
+                        images,
+                        origin: origin.clone(),
+                        kind: inject_kind,
+                    },
+                );
 
                 if injected {
                     log!(
@@ -944,6 +943,7 @@ impl LucidosEngine {
                         req_model,
                         req_effort,
                         origin.clone(),
+                        voice_session_id,
                     ),
                     EventMeta {
                         event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
@@ -1771,6 +1771,19 @@ impl LucidosEngine {
         let orphans = Self::finalize_turn_and_drain_injections(guard, injection_rx);
         let orphans =
             crate::engine::filter_removed_queued_prompts(&self.pool, thread_id, orphans).await;
+        // A spoken aside is not a follow-up, so it is never re-submitted.
+        //
+        // It tells a RUNNING round what the talker said out loud. Landing in
+        // the teardown window means that round is over, and re-submitting
+        // would start a NEW turn out of the talker's own stall. That is the
+        // spurious wake voice's one tool exists to end (ADR 0164).
+        //
+        // Nothing is lost: `SpokenReplyGenerated` is in the thread already, so
+        // the next round reads it from history.
+        let orphans: Vec<_> = orphans
+            .into_iter()
+            .filter(|p| !matches!(p.kind, crate::engine::InjectedPromptKind::SpokenAside))
+            .collect();
         if !orphans.is_empty() {
             log!(
                 "[Chat] {} orphaned injection(s) after turn exit for thread {}, re-submitting as follow-ups",

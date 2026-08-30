@@ -31,6 +31,9 @@ pub struct MockLog {
     /// Items the talker was asked to answer out loud, oldest first. Every one
     /// is in `history` too: a speak appends and then asks.
     pub asked_to_speak: Vec<String>,
+    /// Delegations answered, as `(delegation_id, note)`, oldest first. An
+    /// unanswered one leaves the talker holding a call it never heard back on.
+    pub resolved_delegations: Vec<(String, String)>,
     pub cancels: usize,
     pub closed: bool,
 }
@@ -162,6 +165,19 @@ impl VoiceSession for MockVoiceSession {
             .expect("mock log lock")
             .asked_to_speak
             .push(note.to_string());
+        Ok(())
+    }
+
+    async fn resolve_delegation(
+        &mut self,
+        delegation_id: &str,
+        note: &str,
+    ) -> Result<(), BoxError> {
+        self.log
+            .lock()
+            .expect("mock log lock")
+            .resolved_delegations
+            .push((delegation_id.to_string(), note.to_string()));
         Ok(())
     }
 

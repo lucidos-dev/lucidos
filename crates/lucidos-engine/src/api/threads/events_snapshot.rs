@@ -1,6 +1,11 @@
-//! Thread events snapshot endpoint, the lazy-fetch context-capture /
-//! tool-result endpoints, and the payload-stripping helpers the snapshot uses
-//! to keep heavy threads loadable.
+//! Thread events snapshot endpoint, the lazy-fetch context-capture,
+//! tool-result and tool-args endpoints, and the payload-stripping helpers the
+//! snapshot uses to keep heavy threads loadable.
+//!
+//! Every strip has a paired lazy fetch, and both sides ask the same predicate
+//! which event types they cover (`is_tool_result_event`, `is_tool_call_event`).
+//! A strip whose fetch does not recognise the type it stripped serves a 404
+//! where the modal expects content.
 
 use axum::{
     extract::{Path, Query, State},
@@ -65,6 +70,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         if !query.include_context {
             strip_context_capture_sections(row);
             strip_tool_result_content(row);
+            strip_tool_call_args(row);
         }
         // Sections that survive to the client are served verbatim, so a
         // pre-rename row has to be respelled the way the viewer reads it. Two
@@ -99,13 +105,31 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     }))
 }
 
-/// Rewrite `ToolResult.result` in place when `strip` recognises its sentinel.
-/// A no-op for any other event type, a missing `result`, or unrecognised text.
+/// The two event types carrying a tool's OUTPUT, one per channel. Every read
+/// path that rewrites a `result` asks here rather than naming a type inline.
+///
+/// One predicate, because the chat channel's name was the only one the strips
+/// knew for months. So the shape they never fired on was the coding-agent
+/// thread, the heaviest a workspace holds. A third channel joins in one place.
+pub(super) fn is_tool_result_event(event_type: &str) -> bool {
+    matches!(event_type, "ToolResult" | "CodingAgentToolResult")
+}
+
+/// The event type carrying a coding agent's tool INPUT. Its chat-channel
+/// sibling `ToolCalled` is deliberately absent: those args are small, and
+/// `thread-sync.ts` reads the write target straight off them.
+pub(super) fn is_tool_call_event(event_type: &str) -> bool {
+    event_type == "CodingAgentToolCalled"
+}
+
+/// Rewrite a tool result's `result` in place when `strip` recognises its
+/// sentinel. A no-op for any other event type, a missing `result`, or
+/// unrecognised text.
 ///
 /// Generic over `HasEventPayload` because the two read paths hold different row
 /// types: the snapshot serves `ThreadEventRow`, the lazy fetch serves `EventRow`.
 fn rewrite_tool_result<E: HasEventPayload>(row: &mut E, strip: impl Fn(&str) -> Option<String>) {
-    if row.event_type() != "ToolResult" {
+    if !is_tool_result_event(row.event_type()) {
         return;
     }
     let Some(result_str) = row.payload().get("result").and_then(|v| v.as_str()) else {
@@ -272,18 +296,18 @@ pub(super) fn strip_context_capture_sections(row: &mut ThreadEventRow) {
     );
 }
 
-/// Drop `result` from `ToolResult` payloads on the snapshot path and stamp a
+/// Drop `result` from a tool result's payload on the snapshot path and stamp a
 /// `result_stripped: true` marker so the frontend knows to lazy-fetch via
 /// `GET /events/:event_id/tool-result` when the user opens the step-detail
-/// modal. `ToolResult.result` is rendered ONLY inside the modal
+/// modal. A `result` is rendered ONLY inside the modal
 /// (`StepDetailModal.tsx`'s `<pre class="step-detail-result">{step.result}</pre>`)
 /// — never inline in the chat exchange. A single bash-output result can be
-/// 150 kB+, and a busy CC thread carries hundreds of them = ~2 MB of JSON
-/// that the events list never renders. Keeping `name` + `images` preserves
-/// the inline step row + the generated-image rendering paths in
-/// `thread-events.ts :: ToolResult` handler.
+/// 150 kB+, and a busy coding-agent thread carries hundreds of them = ~2 MB of
+/// JSON that the events list never renders. Keeping `name`, `images` and
+/// `tool_use_id` preserves the inline step row, the generated-image rendering
+/// paths, and the pairing the coding-agent arm settles its step by.
 pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
-    if row.event_type != "ToolResult" {
+    if !is_tool_result_event(&row.event_type) {
         return;
     }
     let Some(obj) = row.payload.as_object_mut() else {
@@ -291,6 +315,53 @@ pub(super) fn strip_tool_result_content(row: &mut ThreadEventRow) {
     };
     obj.remove("result");
     obj.insert("result_stripped".to_string(), serde_json::Value::Bool(true));
+}
+
+/// Drop `args` from a coding agent's tool call on the snapshot path. Stamp an
+/// `args_stripped: true` marker, so the frontend lazy-fetches via
+/// `GET /events/:event_id/tool-args` when the user opens the step-detail modal.
+///
+/// `args` is the single heaviest thing a coding-agent snapshot carries: an
+/// `Edit`'s two versions of a hunk, a `Write`'s whole file. Nothing inline
+/// renders it. The modal's un-elided command line is its only reader
+/// (`fullCommandForCCTool` in `exchange.ts`).
+///
+/// **`description` is filled first, and that ordering is the whole trick.**
+/// The inline label reads `description || describeCCTool(name, args)`, so
+/// dropping `args` from a row with no description would leave a bare tool
+/// name. The write path has stamped one since May 2026 (`run_session/run.rs`),
+/// so only older rows take this branch, and they take the very same function.
+pub(super) fn strip_tool_call_args(row: &mut ThreadEventRow) {
+    if !is_tool_call_event(&row.event_type) {
+        return;
+    }
+    let name = row
+        .payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let described = row
+        .payload
+        .get("description")
+        .and_then(|v| v.as_str())
+        .is_some_and(|d| !d.is_empty());
+    let fallback = (!described).then(|| {
+        let args = row
+            .payload
+            .get("args")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        crate::core::describe_cc_tool(&name, &args)
+    });
+    let Some(obj) = row.payload.as_object_mut() else {
+        return;
+    };
+    if let Some(description) = fallback {
+        obj.insert("description".to_string(), description.into());
+    }
+    obj.remove("args");
+    obj.insert("args_stripped".to_string(), serde_json::Value::Bool(true));
 }
 
 /// Lazy-fetch payload returned by `GET /events/:event_id/tool-result` — the
@@ -326,10 +397,10 @@ pub(in crate::api) async fn get_tool_result(
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
 
-    if row.event_type != "ToolResult" {
+    if !is_tool_result_event(&row.event_type) {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Event {} is not a ToolResult event", event_uuid),
+            format!("Event {} is not a tool result event", event_uuid),
         ));
     }
 
@@ -353,6 +424,62 @@ pub(in crate::api) async fn get_tool_result(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     Ok(Json(ToolResultPayload { result }))
+}
+
+/// Lazy-fetch payload returned by `GET /events/:event_id/tool-args`, carrying
+/// the stripped `args` field of one coding-agent tool call.
+#[derive(serde::Serialize)]
+pub struct ToolArgsPayload {
+    /// Original `args` value. `null` for a call that recorded none, where the
+    /// modal renders its label alone and elides the command block.
+    pub args: serde_json::Value,
+}
+
+/// GET /api/v1/events/:event_id/tool-args: the `args` for one coding-agent
+/// tool call. A single `Write` carries a whole file and a heavy thread carries
+/// hundreds, so the snapshot strips it. The step-detail modal fetches it on
+/// demand instead.
+///
+/// Keyed on `event_id` only, the same routing contract as `get_tool_result`.
+pub(in crate::api) async fn get_tool_args(
+    State(state): State<AppState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<ToolArgsPayload>, (StatusCode, String)> {
+    let event_uuid = Uuid::parse_str(&event_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid event_id: {}", e)))?;
+
+    let row = state
+        .event_store
+        .get_event_by_id(event_uuid)
+        .await
+        .map_err(|e| {
+            log!("[API] get_tool_args: db error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
+
+    if !is_tool_call_event(&row.event_type) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("Event {} is not a coding-agent tool call", event_uuid),
+        ));
+    }
+
+    let payload_obj = row.payload.as_object().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Payload not an object".to_string(),
+        )
+    })?;
+
+    // Absent is a real answer, not a missing one: a tool can be called with no
+    // arguments. Serving null lets the modal draw its label-only state rather
+    // than a failure.
+    let args = payload_obj
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(Json(ToolArgsPayload { args }))
 }
 
 /// Where one event lives, returned by `GET /events/:event_id/location`.

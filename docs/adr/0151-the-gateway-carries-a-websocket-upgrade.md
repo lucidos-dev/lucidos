@@ -73,12 +73,13 @@ code, and the refusal is loud rather than silent.
   injected, spoofed device id stripped.
 - A dropped socket needs no gateway cleanup beyond the splice ending, because
   the gateway holds no session state.
-- The engine's cross-origin guard covers the handshake, and every current
-  browser passes it. WebKit has sent `Sec-Fetch-Site` on a WebSocket handshake
-  since 2022, so an iOS PWA reaches a socket through the gateway. macOS Big Sur
-  and earlier send no fetch metadata there, and behind the gateway that is
-  refused. It is the SAME accepted limitation the HTTP path already documents in
-  `api::browser_origin`, not a new one voice introduces.
+- ~~The engine's cross-origin guard covers the handshake, and every current
+  browser passes it.~~ **Wrong, and corrected by ADR 0163.** WebKit does send
+  `Sec-Fetch-Site` on a handshake. Chromium and Gecko send no fetch metadata
+  there at all, so the guard's authoritative arm never runs for a socket. Behind
+  the gateway its fallback then compares against the internal upstream `Host`
+  and refuses our own page. Every call from Chrome was refused until the gateway
+  took the question over.
 
 ## Alternatives considered
 

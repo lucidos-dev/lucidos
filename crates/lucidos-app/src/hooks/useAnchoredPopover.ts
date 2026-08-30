@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { clampWithin } from '../utils/dom';
 import { notePressOutcome } from '../utils/tapGesture';
+import { primaryPointerIsDown } from '../utils/pointerPress';
 
 export interface AnchorPosition {
   top: number;
@@ -329,6 +330,15 @@ export function installPairedSwallow(arming?: Event): void {
  *  raw top, which is what lets a step inside a panel answer the key first. The
  *  `onKey` below is only its fallback, so it follows `isTop` like the rest.
  *
+ *  **`openedUnderPress` is the gesture-opened case, and it is not the fallback
+ *  above.** An overlay a long press opens has no anchor to exempt, and its
+ *  opening `pointerdown` fired before these listeners existed. That same
+ *  gesture's trailing click therefore arrives unpaired and reads as synthetic,
+ *  so the lift dismissed the menu the hold had just opened. Told that a press
+ *  was already down at open time, the handlers spend that one click and
+ *  dismiss nothing. `primaryPointerIsDown` answers it, and counts only TRUSTED
+ *  presses, since only those get a click from the browser.
+ *
  *  Exported as a pure factory so `.test.ts` can drive the handlers without
  *  jsdom — `useDismissOnOutside` is the hook that wires these to `document`
  *  (and passes `installPairedSwallow` as `onArm`).
@@ -339,6 +349,7 @@ export function makeDismissHandlers(
   onDismiss: () => void | boolean,
   onArm?: (arming: Event) => void,
   isTop: () => boolean = () => true,
+  openedUnderPress = false,
 ): {
   onPointerDown(e: PointerEvent): void;
   onTouchEnd(e: TouchEvent): void;
@@ -368,8 +379,23 @@ export function makeDismissHandlers(
   // would never arrive. The flag would strand set and eat the next synthetic
   // click's dismiss. `onCancel` covers the other way a gesture ends clickless.
   let awaitingPairedClick = false;
+  // The click that pairs with the press that OPENED this overlay has not
+  // arrived yet. A GESTURE-opened overlay has no anchor to exempt (see
+  // `OverflowMenu`'s `openRef`), and its opening `pointerdown` fired before
+  // these listeners existed. So its trailing click reaches the fallback below
+  // looking exactly like a synthetic one, and the lift that opened the menu
+  // dismissed it again.
+  //
+  // Held apart from `awaitingPairedClick`, which `onTouchEnd` clears. That
+  // clear is right for a DISMISSING tap, whose paired click the swallow
+  // cancels. It is wrong here: this gesture's click is not cancelled and is
+  // still coming.
+  let owedToOpeningPress = openedUnderPress;
   return {
     onPointerDown(e) {
+      // A new press ends the opening gesture, whichever side of the panel it
+      // lands on. Ahead of the inside/outside test for that reason.
+      if (e.isPrimary !== false) owedToOpeningPress = false;
       if (!isOutsidePointerTarget(e.target as Node, panelRef.current, anchor)) return;
       if (e.button === 0) awaitingPairedClick = true;
       if (!isTop()) return;
@@ -414,10 +440,18 @@ export function makeDismissHandlers(
     onCancel() {
       awaitingPairedClick = false;
       suppressNextClick = false;
+      // A cancelled gesture dispatches no click at all, the opening one
+      // included. Left set, the expectation would eat the next click's
+      // dismiss.
+      owedToOpeningPress = false;
     },
     onClickCapture(e) {
       const paired = awaitingPairedClick;
       awaitingPairedClick = false;
+      // Consumed here whatever the branch below does: the opening gesture has
+      // exactly one click, and this is it.
+      const opening = owedToOpeningPress;
+      owedToOpeningPress = false;
       if (suppressNextClick) {
         suppressNextClick = false;
         e.stopPropagation();
@@ -462,6 +496,9 @@ export function makeDismissHandlers(
       // pointerdown. So the gesture was never meant for this overlay, however
       // the stack looks now that the upper one has gone.
       if (paired) return;
+      // The tail of the gesture that opened this overlay. It has a pointerdown
+      // behind it too; that one simply predates these listeners.
+      if (opening) return;
       if (!isTop()) return;
       // Fallback for `click` events that weren't preceded by an outside
       // pointerdown — e.g. `HTMLElement.click()` (synthetic, common in e2e
@@ -545,6 +582,10 @@ export function useDismissOnOutside(
       () => dismissRef.current(),
       installPairedSwallow,
       () => isTopRef.current?.() ?? true,
+      // Asked HERE, as the overlay opens, because that is the only moment the
+      // answer means anything: a press still down now is the one that opened
+      // this overlay. See `makeDismissHandlers` on `openedUnderPress`.
+      primaryPointerIsDown(),
     );
     document.addEventListener('pointerdown', handlers.onPointerDown, true);
     // Capture phase so this precedes the target button's own bubble-phase

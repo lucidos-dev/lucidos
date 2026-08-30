@@ -1,6 +1,6 @@
 import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth } from '../store';
 import type { CodingAgent } from '../../api/types';
-import { toFailed } from '../types';
+import { failedIfFresh } from '../types';
 import { getPreferences, setPreference, isTransientFetchError, retryTransientRead } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
@@ -866,7 +866,11 @@ export async function loadPreferences(): Promise<void> {
     applyStyleOverridesFromPreferences();
   } catch (e) {
     if (mySeq !== preferencesLoadSeq) return;
-    preferences.value = toFailed(e);
+    // A failed REFETCH keeps the loaded preferences rather than blanking every
+    // setting to its default. SSE only re-fires an already-`loaded` value, so a
+    // flip to `failed` would never recover until a page reload. Only a first
+    // load records the failure. Matches `loadWebhookIngress`.
+    preferences.value = failedIfFresh(preferences.value, e);
   }
 }
 
@@ -1340,17 +1344,125 @@ export function setVoiceTalkerModel(model: string): Promise<void> {
   return savePreference('model_voice_talker', model.trim());
 }
 
-/** What a call loads before it starts, as comma-separated section ids. The
- *  talker can look nothing up mid-call, so this block is the whole of what it
- *  answers from. Mirrors the backend `voice_resident_sections` default. */
-export const DEFAULT_VOICE_RESIDENT_SECTIONS = 'who-and-where,this-thread,workspace-shape';
+/** The model that turns the caller's speech into text inside the talker's
+ *  socket. The second and last model in the voice loop: nothing translates and
+ *  nothing summarises. Mirrors the backend `model_voice_transcriber` default. */
+export const DEFAULT_VOICE_TRANSCRIBER_MODEL = 'gpt-4o-mini-transcribe';
 
-/** What is stored, empty until set. Raw for the same reason as the model. */
-export function storedVoiceResidentSections(): string {
+export function storedVoiceTranscriberModel(): string {
   if (preferences.value.status !== 'loaded') return '';
-  return preferences.value.data['voice_resident_sections'] ?? '';
+  return preferences.value.data['model_voice_transcriber'] ?? '';
 }
 
-export function setVoiceResidentSections(sections: string): Promise<void> {
+export function setVoiceTranscriberModel(model: string): Promise<void> {
+  return savePreference('model_voice_transcriber', model.trim());
+}
+
+/** The voice a call is spoken in, as the provider's own name for one. Not a
+ *  model, and not the language. Mirrors the backend `voice_talker_voice`. */
+export const DEFAULT_VOICE_TALKER_VOICE = 'marin';
+
+export function storedVoiceTalkerVoice(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['voice_talker_voice'] ?? '';
+}
+
+export function setVoiceTalkerVoice(voice: string): Promise<void> {
+  return savePreference('voice_talker_voice', voice.trim());
+}
+
+/**
+ * One section of the resident block, as the toggles need to draw it.
+ *
+ * What a call loads before it starts. The talker looks nothing up mid-call, so
+ * this block is the whole of what it answers without waiting for the agent.
+ *
+ * A mirror of `SECTIONS` in `crates/lucidos-engine/src/voice/sections.rs`,
+ * which is the registry: the ids, the headings and which ones ship on are all
+ * decided there, beside the builders that fill them. A Rust test reads this
+ * list and fails if the two drift, the way `voice::language` reads the Locale
+ * dropdown.
+ */
+export const VOICE_RESIDENT_SECTIONS: readonly {
+  id: string;
+  title: string;
+  onByDefault: boolean;
+}[] = [
+  { id: 'who-and-where', title: 'Who you are talking to, and when', onByDefault: true },
+  { id: 'this-thread', title: 'This conversation so far', onByDefault: true },
+  { id: 'workspace-shape', title: 'What this workspace has', onByDefault: true },
+];
+
+/** Write the whole list. Only {@link setVoiceSectionEnabled} calls it: the one
+ *  place that knows what turning a single toggle does to the rest. */
+function setVoiceResidentSections(sections: string): Promise<void> {
   return savePreference('voice_resident_sections', sections.trim());
+}
+
+/**
+ * The ids a call opens with right now.
+ *
+ * `null` means nothing is stored, which is the default set. It is NOT the same
+ * as the empty list: an empty stored value means the reader turned every
+ * section off, and the engine reads it that way too.
+ */
+export function voiceResidentSelection(): string[] | null {
+  if (preferences.value.status !== 'loaded') return null;
+  const stored = preferences.value.data['voice_resident_sections'];
+  if (stored === undefined) return null;
+  return stored
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
+/** Is this section in the block a call would open with? */
+export function voiceSectionEnabled(id: string): boolean {
+  const selection = voiceResidentSelection();
+  if (selection === null) {
+    return VOICE_RESIDENT_SECTIONS.some((s) => s.id === id && s.onByDefault);
+  }
+  return selection.includes(id);
+}
+
+/**
+ * Turn one section on or off, rewriting the whole stored list.
+ *
+ * The registry's order is what gets written, not the order they were toggled
+ * in: the block reads better the same way twice, and the engine renders the
+ * sections in its own order anyway.
+ *
+ * An id nothing in the registry carries is preserved. A newer engine may define
+ * one this client does not know, and dropping it would silently turn it off.
+ */
+export function setVoiceSectionEnabled(id: string, on: boolean): Promise<void> {
+  const current = new Set(
+    voiceResidentSelection() ??
+      VOICE_RESIDENT_SECTIONS.filter((s) => s.onByDefault).map((s) => s.id),
+  );
+  if (on) current.add(id);
+  else current.delete(id);
+  const registry = VOICE_RESIDENT_SECTIONS.map((s) => s.id);
+  const ordered = registry.filter((known) => current.has(known));
+  const unknown = [...current].filter((held) => !registry.includes(held));
+  return setVoiceResidentSections([...ordered, ...unknown].join(','));
+}
+
+/**
+ * Which microphone a call opens on THIS device.
+ *
+ * Device-scoped, because the value is a browser's own opaque handle for a
+ * microphone. It means nothing in another browser and nothing on another
+ * machine, which is exactly the scope a Lucidos device has.
+ *
+ * Empty means the system default, which is what every call did before this
+ * existed. So an untouched workspace behaves as it always has.
+ */
+export function storedVoiceInputDevice(): string {
+  if (preferences.value.status !== 'loaded') return '';
+  return preferences.value.data['voice_input_device'] ?? '';
+}
+
+export function setVoiceInputDevice(deviceId: string): Promise<void> {
+  return savePreference('voice_input_device', deviceId.trim(), undefined, true);
 }

@@ -8,10 +8,12 @@ import { dirname, resolve } from 'node:path';
 import {
   syncTextareaValue,
   shouldSkipSyncWhileEditing,
+  resolveEmptyDraftSync,
   requestPromptOverrideSync,
   promptOverrideSyncSeq,
   promptOverrideReplacesDraft,
 } from '../promptValueSync';
+import { resolveComposerText } from '../prompt-input-helpers';
 
 function makeTextarea(initial: { value: string; selectionStart: number; selectionEnd: number }) {
   const el = {
@@ -140,6 +142,85 @@ describe('shouldSkipSyncWhileEditing', () => {
     const unfocusedEl = makeEl('stale-from-prior-sync');
     expect(shouldSkipSyncWhileEditing(focusedEl, true, true)).toBe(true);
     expect(shouldSkipSyncWhileEditing(unfocusedEl, true, false)).toBe(false);
+  });
+});
+
+describe('resolveEmptyDraftSync', () => {
+  const typedInFocusedBox = {
+    domText: 'the follow-up I am typing',
+    typedSinceComposerWrote: true,
+    thisElementActive: true,
+    sameThread: true,
+  };
+
+  it('keeps characters the user typed when a clear runs under their fingers', () => {
+    expect(resolveEmptyDraftSync(typedInFocusedBox)).toBe('adopt');
+  });
+
+  it('clears a box the user has not typed into since the composer wrote it, so a peer clear still lands and no ghost draft survives', () => {
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, typedSinceComposerWrote: false })).toBe('clear');
+  });
+
+  it('clears an unfocused copy, which can hold no in-flight keystroke', () => {
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, thisElementActive: false })).toBe('clear');
+  });
+
+  it('clears on a thread switch, where the box holds the previous thread\'s text', () => {
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, sameThread: false })).toBe('clear');
+  });
+
+  it('clears an already-empty box, so the sync is the no-op it always was', () => {
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, domText: '' })).toBe('clear');
+  });
+
+  // Whitespace is not content by `composeHasContent`, so adopting it would
+  // write an empty draft. On a COMPOSING thread `updateCompose` reads that as
+  // the draft being emptied and auto-discards, which clears the draft again and
+  // re-enters this branch. Clearing is the terminating answer.
+  it('clears a whitespace-only box rather than looping against the compose auto-discard', () => {
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, domText: '   \n\t' })).toBe('clear');
+  });
+
+  // The defect this replaced: the send path and the sync path ruled on one
+  // disagreement in opposite directions. The sync path's answer destroyed the
+  // user's characters in silence.
+  it('agrees with the send path on the state that produced the bug', () => {
+    const typed = 'text the store never saw';
+    expect(resolveComposerText('', typed).text).toBe(typed);
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, domText: typed })).toBe('adopt');
+  });
+
+  // Adopting writes the box into the draft, so the next pass sees a NON-empty
+  // draft and never reaches this resolver at all. One repair per clear.
+  it('is unreachable once the adopt has landed, so the repair terminates', () => {
+    const typed = 'one write only';
+    expect(resolveEmptyDraftSync({ ...typedInFocusedBox, domText: typed })).toBe('adopt');
+    // What the next render carries: composeText is now `typed`, so PromptInput
+    // does not consult this resolver. `shouldSkipSyncWhileEditing` takes over.
+    expect(shouldSkipSyncWhileEditing({ value: typed } as HTMLTextAreaElement, true, true)).toBe(true);
+  });
+});
+
+describe('the sync effect is wired to the resolver', () => {
+  const source = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../PromptInput.tsx'),
+    'utf-8',
+  );
+
+  it('asks the resolver instead of forcing every empty sync through', () => {
+    expect(source).toContain('resolveEmptyDraftSync({');
+  });
+
+  // The flag the resolver reads is only trustworthy if EVERY composer-initiated
+  // write to the box clears it. A bare `el.value = ...` would leave it set, and
+  // the next empty-draft sync would then adopt text the composer itself wrote.
+  it('routes every write to the box through the one helper that also clears the typed flag', () => {
+    expect(source).toContain('function writeComposerValue');
+    const code = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/function writeComposerValue\([^)]*\)[^{]*\{[^}]*\}/, '');
+    expect([...code.matchAll(/\bel\.value\s*=[^=]/g)]).toHaveLength(0);
   });
 });
 

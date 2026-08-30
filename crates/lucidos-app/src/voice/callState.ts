@@ -16,19 +16,22 @@ import type { ClientControl, ServerFrame } from './frames';
  * Where a call is.
  *
  * `listening` and `speaking` are both live, and they differ only in who has the
- * floor. The barge-in gate is armed on `speaking`, and the strip reads the pair
- * as the call's state.
+ * floor. The barge-in gate is armed on `speaking`, and the toggle's status
+ * region reads the pair as the call's state.
  */
 export type CallPhase = 'idle' | 'connecting' | 'listening' | 'speaking' | 'ending';
 
+/**
+ * A call holds no words.
+ *
+ * Nothing captions a call in flight, so the utterances the engine reports are
+ * read for the phase they imply and dropped. What was said is written down by
+ * the engine as thread events, which is where the reader finds it.
+ */
 export interface CallState {
   phase: CallPhase;
   /** The thread this call belongs to. A call is bound to one for its life. */
   threadId: string | null;
-  /** The caller's last finished utterance, as the engine heard it. */
-  heard: string;
-  /** What the talker has said this turn, accumulated from its deltas. */
-  said: string;
   /**
    * Why a call could not start, or could not go on, in plain English.
    *
@@ -41,8 +44,6 @@ export interface CallState {
 export const CALL_IDLE: CallState = {
   phase: 'idle',
   threadId: null,
-  heard: '',
-  said: '',
   note: null,
 };
 
@@ -84,12 +85,12 @@ export function isLive(phase: CallPhase): boolean {
   return phase === 'listening' || phase === 'speaking';
 }
 
-/** True while a call is on screen in any form, so the strip is shown. */
+/** True while a call exists in any form, so the toggle reads as on. */
 export function isOnCall(phase: CallPhase): boolean {
   return phase !== 'idle';
 }
 
-/** What the strip says the call is doing. */
+/** What the toggle's status region says the call is doing. */
 export function callStatusLabel(phase: CallPhase): string {
   switch (phase) {
     case 'connecting':
@@ -169,22 +170,21 @@ function onFrame(
         ? { state: { ...state, phase: 'listening' }, effects: [] }
         : unchanged(state);
     case 'user_turn_ended':
-      // A finished utterance opens the next turn, so what the talker said about
-      // the last one stops being what is on screen.
-      return isLive(state.phase)
-        ? { state: { ...state, heard: frame.transcript, said: '' }, effects: [] }
-        : unchanged(state);
+      // The floor is already the caller's while they are speaking, so a
+      // finished utterance moves nothing. The words are the engine's to write
+      // down, not this reducer's to hold.
+      return unchanged(state);
     case 'talker_transcript':
+      // Read for what it means rather than what it says: the first delta of a
+      // reply is how the client learns the talker has taken the floor.
       return isLive(state.phase)
-        ? { state: { ...state, phase: 'speaking', said: state.said + frame.text }, effects: [] }
+        ? { state: { ...state, phase: 'speaking' }, effects: [] }
         : unchanged(state);
     case 'talker_turn_ended':
       return isLive(state.phase)
         ? { state: { ...state, phase: 'listening' }, effects: [] }
         : unchanged(state);
     case 'interrupted':
-      // The partial reply stays on screen. It is what the caller heard before
-      // cutting in, and blanking it would deny a word they know was said.
       return isLive(state.phase)
         ? { state: { ...state, phase: 'listening' }, effects: [STOP_PLAYBACK] }
         : unchanged(state);

@@ -83,14 +83,16 @@ pub(crate) fn resolve_with_override(
     // Best-effort port/proto — unused while the override is present, so tolerate
     // a missing/unreadable ports file. Derive the fallback proto from the
     // override's scheme purely for internal consistency.
-    let (api_port, proto) = read_ports(&root.join(".lucidos/ports")).unwrap_or_else(|_| {
-        let proto = if base.starts_with("https") {
-            "https"
-        } else {
-            "http"
-        };
-        (0, proto.to_string())
-    });
+    let (api_port, proto) = read_ports(&root.join(".lucidos/ports"))
+        .map(|(port, recorded)| (port, recorded.unwrap_or_else(|| DEFAULT_PROTO.to_string())))
+        .unwrap_or_else(|_| {
+            let proto = if base.starts_with("https") {
+                "https"
+            } else {
+                "http"
+            };
+            (0, proto.to_string())
+        });
     Ok(Workspace {
         root,
         api_port,
@@ -116,8 +118,9 @@ pub(crate) fn resolve(
 ) -> Result<Workspace, BoxError> {
     if let Some(root) = env_workspace {
         let ports_path = root.join(".lucidos/ports");
-        let (api_port, proto) = read_ports(&ports_path)
+        let (api_port, recorded) = read_ports(&ports_path)
             .map_err(|e| format!("LUCIDOS_WORKSPACE={}: {}", root.display(), e))?;
+        let proto = recorded.unwrap_or_else(|| DEFAULT_PROTO.to_string());
         return Ok(Workspace {
             root: root.to_path_buf(),
             api_port,
@@ -127,7 +130,8 @@ pub(crate) fn resolve(
     }
 
     if let Some(root) = walk_up_for_ports(start_dir) {
-        let (api_port, proto) = read_ports(&root.join(".lucidos/ports"))?;
+        let (api_port, recorded) = read_ports(&root.join(".lucidos/ports"))?;
+        let proto = recorded.unwrap_or_else(|| DEFAULT_PROTO.to_string());
         return Ok(Workspace {
             root,
             api_port,
@@ -155,9 +159,30 @@ fn walk_up_for_ports(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Read API_PORT and PROTO from the ports file. PROTO defaults to "https"
-/// for backward compatibility with ports files written before it was added.
-pub(crate) fn read_ports(path: &Path) -> Result<(u16, String), BoxError> {
+/// What to speak when the ports file names no protocol.
+///
+/// Kept for the files written before the key existed, where it is what they
+/// silently meant. A launch records the real answer, so an absent line now says
+/// only "written by an older launcher".
+pub(crate) const DEFAULT_PROTO: &str = "https";
+
+/// The clause a failed request adds when the protocol was a guess.
+///
+/// A guess that lands wrong surfaces as a TLS handshake against a plain-http
+/// socket, and that error names neither the file nor the assumption.
+pub(crate) fn assumed_proto_note(ports_path: &Path) -> String {
+    format!(
+        " ({} has no PROTO= line, so {DEFAULT_PROTO} was assumed; relaunch that \
+         workspace to have it record the protocol, or pass --insecure-http)",
+        ports_path.display(),
+    )
+}
+
+/// Read API_PORT and PROTO from the ports file.
+///
+/// `None` for the protocol means the file named none. Reported apart rather
+/// than defaulted here, so a caller can say the protocol was assumed.
+pub(crate) fn read_ports(path: &Path) -> Result<(u16, Option<String>), BoxError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
     let mut port: Option<u16> = None;
@@ -175,7 +200,7 @@ pub(crate) fn read_ports(path: &Path) -> Result<(u16, String), BoxError> {
         }
     }
     let port = port.ok_or_else(|| format!("API_PORT line not found in {}", path.display()))?;
-    Ok((port, proto.unwrap_or_else(|| "https".to_string())))
+    Ok((port, proto.filter(|p| !p.is_empty())))
 }
 
 #[cfg(test)]
@@ -202,6 +227,40 @@ mod tests {
         assert_eq!(ws.root, tmp.path());
         assert_eq!(ws.api_port, 1234);
         assert_eq!(ws.proto, "https");
+    }
+
+    #[test]
+    fn a_ports_file_with_no_proto_line_resolves_and_says_it_guessed() {
+        // Every ports file written before the key existed looks like this, so
+        // refusing them would break more than it fixed. The guess is recorded
+        // instead, and a failed request names it.
+        let tmp = tempdir().unwrap();
+        write_ports(tmp.path(), 1234);
+        let ports = tmp.path().join(".lucidos/ports");
+        let (port, recorded) = read_ports(&ports).unwrap();
+        assert_eq!(port, 1234);
+        assert_eq!(recorded, None);
+
+        let note = assumed_proto_note(&ports);
+        assert!(note.contains("PROTO="), "{note}");
+        assert!(note.contains(DEFAULT_PROTO), "{note}");
+        assert!(note.contains("--insecure-http"), "{note}");
+    }
+
+    #[test]
+    fn a_recorded_proto_is_taken_and_an_empty_one_is_not() {
+        // A truncating writer that got as far as the key is not a workspace
+        // that chose plain http.
+        let tmp = tempdir().unwrap();
+        let lucidos = tmp.path().join(".lucidos");
+        fs::create_dir_all(&lucidos).unwrap();
+        let ports = lucidos.join("ports");
+
+        fs::write(&ports, "API_PORT=1\nPROTO=http\n").unwrap();
+        assert_eq!(read_ports(&ports).unwrap().1.as_deref(), Some("http"));
+
+        fs::write(&ports, "API_PORT=1\nPROTO=\n").unwrap();
+        assert_eq!(read_ports(&ports).unwrap().1, None);
     }
 
     #[test]

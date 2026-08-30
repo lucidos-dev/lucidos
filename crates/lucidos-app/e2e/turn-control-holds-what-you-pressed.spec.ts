@@ -189,8 +189,8 @@ async function controlTop(page: Page, seq: string, role: string): Promise<number
  *  `drift` is what the container failed to absorb, so holding the control asks
  *  `scrollTop` to move by that much again. Outside the container's own extent,
  *  there was nothing to give and no anchor rule could have done better. The
- *  round trip is what the reader is owed there, and
- *  `toggle-round-trip-across-a-clamp.test.ts` is where it is pinned.
+ *  clamp is never repaid by a later press, and
+ *  `toggle-holds-its-control-across-a-clamp.test.ts` pins that.
  *
  *  It asks about the target, never about whether the container ended up pinned.
  *  A correction the clamp ate does not always come to rest ON the extreme: the
@@ -236,20 +236,16 @@ async function press(page: Page, seq: string, role: string, expected: 'true' | '
   await waitForScrollSettled(page);
 }
 
-/** Bring `seq`'s control to `state` without measuring anything, and leave the
- *  reader owed nothing by it.
+/** Bring `seq`'s control to `state` without measuring anything, and hand the
+ *  park a known place to start from.
  *
- *  The setup press is a real press, so a clamp it runs into is REMEMBERED and
- *  repaid by the next press of the same control. That is the round trip a
- *  reader is owed (`toggle-round-trip-across-a-clamp.test.ts`), and here it is
- *  a confound: the measured press would be the return leg of a journey the
- *  sweep only meant to arrange.
+ *  The setup press is a real press, so it leaves the reader wherever its own
+ *  correction put them. That place varies with the control and the turn. The
+ *  bottom-edge park of the last turn can land on it exactly, so the park
+ *  converges from a different distance every time.
  *
- *  A scroll retires the credit, and only a scroll can, because the position is
- *  the reader's the moment they choose it. So the setup ends by taking the
- *  reader to the top, which the park then converges back down from. Without it
- *  the last turn's bottom-edge park was the one place the park itself wrote
- *  nothing, so the credit survived into the measurement. */
+ *  So the setup ends by taking the reader to the top, which every park then
+ *  converges back down from. */
 async function ensureState(page: Page, seq: string, role: string, state: 'true' | 'false'): Promise<void> {
   const btn = control(page, seq, role);
   if (await btn.getAttribute('aria-pressed') !== state) await press(page, seq, role, state);

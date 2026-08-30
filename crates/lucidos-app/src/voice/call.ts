@@ -39,6 +39,14 @@ export interface CallRunnerOptions {
   onState(state: CallState): void;
   /** A problem the reader must know about, outside the call's own reporting. */
   onProblem(message: string): void;
+  /**
+   * The microphone this workspace picked on this device, asked per call.
+   *
+   * A function rather than a value. The picker writes it between calls, and a
+   * value captured at wiring time would be the one from app start. Absent, or
+   * `null`, means the system default.
+   */
+  microphone?: () => string | null;
   bargeIn?: BargeInSettings;
 }
 
@@ -87,7 +95,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     const mine = ++generation;
     let device: AudioDevice;
     try {
-      device = await options.ports.openAudio(captured);
+      device = await options.ports.openAudio(captured, options.microphone?.() ?? null);
     } catch (err) {
       if (mine === generation) {
         // Hand the woken audio context back. `teardown` cannot: it only knows
@@ -103,6 +111,10 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
       return;
     }
     audio = device;
+    // The call is going up on a microphone the reader did not choose, because
+    // the one they did choose was gone. Said now rather than never: a caller
+    // who thinks they are on a headset will hold it to their mouth.
+    if (device.note) options.onProblem(device.note);
     handshook = false;
     // The microphone is already open, so a throw from here MUST be caught.
     // `new WebSocket` throws outright on a URL the browser will not dial. This
@@ -146,7 +158,7 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
    *
    * The browser hides the response, so the two causes are told apart by asking
    * the engine's echo whether an upgrade survives the hops at all. Reported
-   * through `onProblem`, because the call and its strip are gone by the time
+   * through `onProblem`, because the call is already down by the time
    * the answer arrives.
    */
   async function explainRefusal(mine: number): Promise<void> {

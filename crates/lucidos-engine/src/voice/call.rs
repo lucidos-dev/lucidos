@@ -22,41 +22,124 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use uuid::Uuid;
 
+use super::doer::TurnStarter;
 use super::provider::{SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
-use super::reasoner::TurnStarter;
 use super::wire::{ClientControl, ServerFrame};
-use super::{resident, TALKER_INSTRUCTIONS};
+use super::{build, language, resident};
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
 use crate::engine::thread_events::{
-    AgentParticipant, CancelCause, EventMeta, MessageOrigin, ThreadEvent, VoiceSessionEndReason,
+    AgentParticipant, CancelCause, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
+    VoiceSessionEndReason,
 };
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
+use crate::llm::tool_names;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The voice the talker speaks in.
-///
-/// Fixed rather than configurable, because nothing can hear it yet: a setting
-/// nobody can evaluate is a setting nobody can choose. It becomes one alongside
-/// the resident block's own screen, in the phase that ships a client. Both
-/// deferrals are recorded in
-/// `docs/plans/2026-08-29-a-voice-session-opens-behind-one-seam.md`.
-const TALKER_VOICE: &str = "marin";
-
 /// What the rendered history calls the talker.
 ///
-/// Its own label, so the reasoner never reads a spoken turn as its own prior
+/// Its own label, so the doer never reads a spoken turn as its own prior
 /// turn (ADR 0150). The user never meets this name: they hear one entity, and
 /// the transcript renders a spoken turn as Lucidos.
 const TALKER_LABEL: &str = "Lucidos (aloud)";
 
-/// What the talker is told when the reasoner's turn did not finish.
+/// What the talker is told when the doer's turn did not finish.
 ///
 /// It is told what happened rather than handed a sentence, because the honesty
 /// constraint decides the words. Saying nothing would leave the caller waiting
 /// for an answer that is never coming.
 const UNFINISHED: &str =
     "[ANSWER] That did not finish. Tell the caller so, and offer to try again.";
+
+/// What the talker is told when the doer would not take an utterance at all.
+///
+/// A call reaches the Lucidos Agent and nothing else (ADR 0165). A compose
+/// draft can move to a coding agent while a call is already up. Distinct from
+/// [`UNFINISHED`], which reports work that started and stopped. Nothing started
+/// here, so "try again" would be advice that cannot work.
+///
+/// Said rather than swallowed, because a caller left waiting in silence is the
+/// one failure a call cannot recover from on its own.
+const NOT_TAKEN: &str = "[ANSWER] That could not be started on this conversation. \
+                         Tell the caller so, and say they can type it instead.";
+
+/// What the talker is told once the caller has answered.
+///
+/// Appended rather than spoken. The caller answered it themselves, on screen,
+/// so saying it back is news to nobody. What it prevents is the talker
+/// offering the same question again from a question note it still holds.
+const QUESTION_SETTLED: &str = "\
+[ANSWERED] The caller has answered that question on screen. It is settled, so \
+do not put it to them again.";
+
+/// What the talker is told when its `delegate` call landed.
+///
+/// Deliberately says nothing about timing or about who is doing the work. The
+/// talker already told the caller it is on it, and a second promise here is
+/// one more thing that can turn out false.
+const DELEGATION_TAKEN: &str = "Taken. The answer will arrive separately.";
+
+/// Above this many characters, an answer is offered rather than delivered.
+///
+/// The doer writes for a reader: headings, tables, code, links. Read out,
+/// any of it is unbearable, so the talker always says what an answer MEANS.
+/// Past this length there is more meaning than a listener can hold, and the
+/// talker gives the headline and offers the rest.
+///
+/// Roughly four spoken sentences. A guess until it has been heard, and the
+/// place to revisit it is
+/// `docs/plans/2026-08-29-a-spoken-turn-reads-as-spoken.md`.
+const OFFER_THE_DETAIL_ABOVE_CHARS: usize = 400;
+
+/// Hand the doer's answer to the talker, as something to say.
+///
+/// Never as something to read. The caller is on a phone, and the answer is a
+/// document. Both framings carry the text in FULL, for two reasons. The talker
+/// holds no tools, so a fact trimmed here is one it can only invent later (ADR
+/// 0149). And "yes, go on" is answerable only from what it was given.
+fn answer_to_say(text: &str) -> String {
+    let opening = if text.chars().count() > OFFER_THE_DETAIL_ABOVE_CHARS {
+        "[ANSWER] This came back for the caller. It is long, so say the short \
+         version out loud, then ask whether they want the detail. Do not read \
+         it out."
+    } else {
+        "[ANSWER] This came back for the caller. Say what it means out loud, in \
+         your own words. Do not read it out."
+    };
+    format!("{}\n\n{}", opening, text)
+}
+
+/// Hand the talker a question the doer parked on, as something to ask.
+///
+/// Spoken rather than appended, because the turn behind it is waiting on a
+/// person. Nothing else is coming, so a talker that stays quiet leaves the
+/// caller waiting for an answer that never arrives.
+///
+/// It says where the answer goes. No utterance routes back to
+/// `UserQuestionAnswered` yet, so a talker taking a spoken answer would be
+/// promising something no code keeps.
+fn question_to_ask(question: &str, options: &[QuestionOption], multi_select: bool) -> String {
+    let choices = super::choices_for(options, multi_select);
+    // Two openings, because a question with no options has no choices to
+    // read. Told to read them anyway, the talker either invents a set or
+    // stumbles over the gap, and both land on the caller.
+    let read_them = if choices.is_empty() {
+        ""
+    } else {
+        ", and read the choices"
+    };
+    // The question itself is NEVER cut, unlike everything else the talker
+    // reads. A truncated question is a different question, and the talker is
+    // about to state it as the one being asked.
+    format!(
+        "[QUESTION] The work is waiting on the caller's answer. Put this to \
+         them out loud, in your own words{}. They answer on screen, so never \
+         tell them you have recorded what they say.\n\n{}\n\n{}",
+        read_them,
+        question.trim(),
+        choices,
+    )
+}
 
 /// What arrived from the caller.
 #[derive(Debug, Clone, PartialEq)]
@@ -98,13 +181,13 @@ pub async fn run_call(
     bus: &EventBus,
     provider: &dyn VoiceProvider,
     transport: &mut dyn CallTransport,
-    reasoner: &dyn TurnStarter,
+    doer: &dyn TurnStarter,
     opening: SessionOpening,
     subject: CallSubject,
 ) -> Option<VoiceSessionEndReason> {
     let audio = opening.audio;
 
-    // Subscribed before the talker can produce a word. Nothing the reasoner
+    // Subscribed before the talker can produce a word. Nothing the doer
     // emits can then land in the gap between opening a session and watching
     // for one.
     let thread = bus.subscribe();
@@ -150,15 +233,23 @@ pub async fn run_call(
     let mut call = Call {
         bus: bus.clone(),
         provider,
-        reasoner,
+        doer,
         capture: AuxCapture::new(bus, subject.thread_id, ContextPurpose::Voice),
         subject: subject.clone(),
         thread,
         talker_has_the_floor: false,
         interrupted: false,
+        relaying: false,
         waiting_to_be_said: VecDeque::new(),
+        pending_utterance: None,
+        pending_delegation: None,
+        delegated_this_turn: false,
     };
     let reason = call.drive(&mut *session, transport).await;
+    // Before the session closes, and for EVERY end reason. A hangup, a dropped
+    // socket and a provider failure all leave the same thing held, and the
+    // caller said it whether or not anybody answered.
+    call.write_down_whatever_is_left().await;
     session.close().await;
 
     // Dropped on failure, deliberately. The call is already over, and the
@@ -208,7 +299,7 @@ enum Step {
 struct Call<'a> {
     bus: EventBus,
     provider: &'a dyn VoiceProvider,
-    reasoner: &'a dyn TurnStarter,
+    doer: &'a dyn TurnStarter,
     capture: AuxCapture,
     subject: CallSubject,
     thread: Receiver<EmittedEvent>,
@@ -216,10 +307,33 @@ struct Call<'a> {
     talker_has_the_floor: bool,
     /// The caller cut in. Read by the turn end that follows it.
     interrupted: bool,
-    /// Reasoner answers that arrived while the talker was speaking. A queue
+    /// The reply the talker is composing was handed to it, so a running round
+    /// already knows what it says. Set by [`Call::say`], read and cleared by
+    /// the turn end that follows.
+    relaying: bool,
+    /// Doer answers that arrived while the talker was speaking. A queue
     /// rather than a slot, because dropping one loses an answer the caller
     /// asked for and never hears.
     waiting_to_be_said: VecDeque<String>,
+    /// A finished utterance not yet written down.
+    ///
+    /// Held because how it is recorded depends on what the talker does next.
+    /// Delegated, it becomes a `MessageReceived` and runs a turn. Handled
+    /// alone, it becomes a `SpokenMessageReceived` and runs nothing. Recording
+    /// it on arrival would mean choosing before the answer is known.
+    pending_utterance: Option<String>,
+    /// The talker's reason from a `delegate` call with no utterance to pair
+    /// with yet.
+    ///
+    /// **Sticky on purpose, and it outlives the turn that made it.** The
+    /// transcript and the tool call come from two models on one socket, so a
+    /// short fast reply produces the call first. Cleared at the turn's end,
+    /// this would drop the caller's real question into a row that starts
+    /// nothing. That is the failure the whole tool exists to end.
+    pending_delegation: Option<String>,
+    /// The talker already asked once in the turn it is speaking now. Cleared
+    /// when that turn ends, so the next one may ask again.
+    delegated_this_turn: bool,
 }
 
 impl Call<'_> {
@@ -297,18 +411,33 @@ impl Call<'_> {
                 return delivered(transport.send_audio(pcm).await);
             }
             VoiceEvent::UserTurnEnded { transcript } => {
-                self.reasoner
-                    .heard(
-                        self.subject.thread_id,
-                        &transcript,
-                        self.subject.actor.clone(),
-                    )
-                    .await;
+                // Held rather than recorded. Which row it becomes depends on
+                // whether the talker asks for the doer, and it may already
+                // have. A second utterance arriving first flushes the one
+                // before it, so nothing is overwritten.
+                self.write_down_whatever_is_left().await;
+                // A transcript with no words is not held at all. Held, it
+                // would pair with a waiting ask and spend it on nothing: a
+                // `WorkDelegated` with no turn behind it, and the caller's
+                // real words then arriving with no ask left to claim them.
+                if !transcript.trim().is_empty() {
+                    self.pending_utterance = Some(transcript.clone());
+                    self.settle_the_pending_utterance(session).await;
+                }
                 ServerFrame::UserTurnEnded { transcript }
             }
             VoiceEvent::TalkerTranscript { text } => {
                 self.talker_has_the_floor = true;
                 ServerFrame::TalkerTranscript { text }
+            }
+            VoiceEvent::DelegationRequested {
+                delegation_id,
+                reason,
+            } => {
+                self.delegated(session, &delegation_id, reason).await;
+                // No frame. The caller hears one answer, and which model
+                // produced it is nothing they can act on.
+                return None;
             }
             VoiceEvent::TalkerTurnEnded { transcript, usage } => {
                 // Audio has no chars, so the estimate is zero and `usage`
@@ -318,6 +447,12 @@ impl Call<'_> {
                     .record_usage(self.provider.model(), 0, Some(usage))
                     .await;
                 self.record_spoken(transcript).await;
+                // The talker answered and asked for nothing, so the utterance
+                // it answered is its alone. `pending_delegation` is left as it
+                // is: a transcript still in flight belongs to it.
+                self.write_down_whatever_is_left().await;
+                // The next turn may ask again, and must be able to.
+                self.delegated_this_turn = false;
                 self.talker_has_the_floor = false;
                 self.say_what_is_waiting(session).await;
                 ServerFrame::TalkerTurnEnded
@@ -343,6 +478,12 @@ impl Call<'_> {
     /// Progress is appended silently, so the talker can answer "what are you
     /// doing?" truthfully without narrating every step unasked. An answer is
     /// spoken, because it is the thing the caller is waiting for.
+    ///
+    /// A QUESTION is spoken for the same reason, and it is the stronger case:
+    /// the turn behind it is parked on a person, so no answer follows it at
+    /// all. Its resolution is appended, the caller having answered on screen.
+    ///
+    /// Spoken, not read: see [`answer_to_say`] and [`question_to_ask`].
     async fn on_thread_event(&mut self, emitted: EmittedEvent, session: &mut dyn VoiceSession) {
         let BusEvent::Thread {
             thread_id, event, ..
@@ -354,12 +495,31 @@ impl Call<'_> {
             return;
         }
         match event {
+            // Silent, and the only tool that is. The `UserQuestionAsked` a
+            // beat behind it carries the question itself, which is the whole
+            // of what the caller needs. Beside that, `[WORKING] Using
+            // ask_user_question.` is only a tool name the talker is told
+            // never to say. Compared against the tool layer's own constant,
+            // so a rename cannot leave the suppression pointing at nothing.
+            ThreadEvent::ToolCalled { name, .. } if name == tool_names::ASK_USER_QUESTION => {}
             ThreadEvent::ToolCalled { name, .. } => {
                 let note = format!("[WORKING] Using {}.", name);
                 self.append(session, &note).await;
             }
+            ThreadEvent::UserQuestionAsked {
+                question,
+                options,
+                multi_select,
+                ..
+            } => {
+                let ask = question_to_ask(question, options, *multi_select);
+                self.say(session, ask).await;
+            }
+            ThreadEvent::UserQuestionAnswered { .. } => {
+                self.append(session, QUESTION_SETTLED).await;
+            }
             ThreadEvent::ResponseGenerated { text, .. } if !text.trim().is_empty() => {
-                let answer = format!("[ANSWER] Say this to the caller: {}", text.trim());
+                let answer = answer_to_say(text.trim());
                 self.say(session, answer).await;
             }
             ThreadEvent::ResponseFailed { .. } | ThreadEvent::ResponseAborted { .. } => {
@@ -381,6 +541,130 @@ impl Call<'_> {
         }
     }
 
+    /// The talker asked for the doer.
+    ///
+    /// The acknowledgement is owed whatever happens next. An unresolved call
+    /// leaves a dangling item in the talker's history, and it reads that as
+    /// work it never heard back about.
+    ///
+    /// **One ask per talker turn, and the rest are acknowledged only.** A model
+    /// that calls a tool twice in one response is asking about one utterance,
+    /// and both extra shapes are bugs.
+    ///
+    /// A duplicate arriving BEFORE the transcript would overwrite the reason.
+    /// One arriving after the first has already paired would outlive the turn
+    /// as a stale ask. It would then wake the doer on the NEXT utterance,
+    /// which the talker may be handling alone.
+    async fn delegated(
+        &mut self,
+        session: &mut dyn VoiceSession,
+        delegation_id: &str,
+        reason: String,
+    ) {
+        // Owed whatever happens next, duplicate or not. An unresolved call
+        // leaves a dangling item in the talker's history, and it reads that as
+        // work it never heard back about.
+        if let Err(e) = session
+            .resolve_delegation(delegation_id, DELEGATION_TAKEN)
+            .await
+        {
+            log!(
+                "[Voice] The talker would not take the acknowledgement: {}",
+                e
+            );
+        }
+        if self.delegated_this_turn {
+            log!(
+                "[Voice] The talker asked twice in one turn, ignoring: {}",
+                reason
+            );
+            return;
+        }
+        log!("[Voice] The talker asked for the doer: {}", reason);
+        self.delegated_this_turn = true;
+        self.pending_delegation = Some(reason);
+        self.settle_the_pending_utterance(session).await;
+    }
+
+    /// Pair a held utterance with a held ask, and send both on.
+    ///
+    /// Called from BOTH sides, so the order the two frames arrive in decides
+    /// nothing. The transcript comes from a different model than the tool
+    /// call, and on a short fast reply the call really does land first.
+    ///
+    /// Does nothing until it has both. An utterance with no ask is written
+    /// down elsewhere, when the talker's turn ends or the call does.
+    ///
+    /// **A doer that refuses is handled here, not ignored.** It writes nothing
+    /// when it refuses, so the caller's words would otherwise vanish and leave
+    /// a `WorkDelegated` beside no record of what was said.
+    async fn settle_the_pending_utterance(&mut self, session: &mut dyn VoiceSession) {
+        if self.pending_utterance.is_none() || self.pending_delegation.is_none() {
+            return;
+        }
+        let transcript = self.pending_utterance.take().unwrap_or_default();
+        let reason = self.pending_delegation.take().unwrap_or_default();
+
+        // The wake first, so the doer's history already carries the reason by
+        // the time the turn reading that history starts.
+        emit(
+            &self.bus,
+            self.subject.thread_id,
+            ThreadEvent::WorkDelegated {
+                session_id: self.subject.session_id,
+                reason,
+            },
+            EventMeta::NONE.authored_by(AgentParticipant::Guest {
+                label: TALKER_LABEL.to_string(),
+            }),
+        )
+        .await;
+        let taken = self
+            .doer
+            .wake(
+                self.subject.thread_id,
+                self.subject.session_id,
+                &transcript,
+                self.subject.actor.clone(),
+            )
+            .await;
+        if !taken {
+            // Put it back so the one writer of a spoken row stays the one
+            // writer, rather than a second emit growing beside it.
+            self.pending_utterance = Some(transcript);
+            self.write_down_whatever_is_left().await;
+            self.say(session, NOT_TAKEN.to_string()).await;
+        }
+    }
+
+    /// Write down a held utterance that started no turn.
+    ///
+    /// Two ways to get here: the talker answered it alone, or the doer refused
+    /// it. Either way no turn is running, and the words are the caller's.
+    ///
+    /// `SpokenMessageReceived`, which is `Metadata` and starts nothing. A
+    /// `MessageReceived` here would leave the thread claiming a turn that will
+    /// never run, because that variant is `EventClass::Start`.
+    ///
+    /// The caller's own actor, not the talker's. Whoever handled it, the
+    /// caller said it.
+    async fn write_down_whatever_is_left(&mut self) {
+        // Never empty: `UserTurnEnded` refuses to hold a wordless transcript.
+        let Some(transcript) = self.pending_utterance.take() else {
+            return;
+        };
+        emit(
+            &self.bus,
+            self.subject.thread_id,
+            ThreadEvent::SpokenMessageReceived {
+                session_id: self.subject.session_id,
+                text: transcript,
+            },
+            EventMeta::with_actor(self.subject.actor.clone()),
+        )
+        .await;
+    }
+
     /// Say this next, or queue it while the talker is mid-sentence.
     ///
     /// Two replies at once is the failure a listener cannot recover from. The
@@ -394,9 +678,13 @@ impl Call<'_> {
         // second answer landing in that window would otherwise be spoken over
         // the one already on its way.
         self.talker_has_the_floor = true;
+        // The turn about to start is a relay of what it was handed, so no
+        // running round needs to be told about it.
+        self.relaying = true;
         if let Err(e) = session.speak(&note).await {
             log!("[Voice] The talker would not take the answer: {}", e);
             self.talker_has_the_floor = false;
+            self.relaying = false;
         }
     }
 
@@ -416,15 +704,24 @@ impl Call<'_> {
     /// Write down what the caller just heard.
     ///
     /// Attributed to the talker, so `history.rs` gives it its own speaker label
-    /// and the reasoner never reads it as its own prior turn (ADR 0150).
+    /// and the doer never reads it as its own prior turn (ADR 0150).
     ///
     /// A reply with no words is not written. A cancelled response can end
     /// before the talker said anything, and an empty row would claim the caller
     /// heard something they did not.
     async fn record_spoken(&mut self, transcript: String) {
         let interrupted = std::mem::take(&mut self.interrupted);
+        let relaying = std::mem::take(&mut self.relaying);
         if transcript.trim().is_empty() {
             return;
+        }
+        // Offer the talker's OWN words to a turn already running. It then
+        // learns what the caller was told in its name, rather than reading it
+        // next round. A relay is skipped: the round wrote that answer itself.
+        if !relaying {
+            self.doer
+                .overheard(self.subject.thread_id, &transcript)
+                .await;
         }
         emit(
             &self.bus,
@@ -518,11 +815,18 @@ async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent, meta: EventMe
 /// Separate from [`run_call`] because it reads half the workspace, and driving
 /// a call reads none of it.
 pub async fn opening_for(engine: &LucidosEngine, thread_id: Uuid) -> SessionOpening {
+    let pool = engine.pool();
+    let language = language::for_workspace(pool).await;
     SessionOpening {
-        instructions: TALKER_INSTRUCTIONS.to_string(),
+        instructions: super::instructions_for(language.as_ref()),
         resident_block: resident::build_block(engine, thread_id).await,
-        voice: TALKER_VOICE.to_string(),
+        // Both resolve their catalog default, so neither is guarded here. The
+        // voice was a const while nothing could hear it: a setting nobody can
+        // evaluate is a setting nobody can choose. A client ships now.
+        voice: build::talker_voice(pool).await,
+        transcriber: build::transcriber_model(pool).await,
         audio: Default::default(),
+        language,
     }
 }
 

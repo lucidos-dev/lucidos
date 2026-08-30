@@ -1,24 +1,19 @@
-// Drift guard: the generated EVENT_CLASSIFICATION map (auto-generated from the
-// Rust `ThreadEvent` enum via thread_lifecycle.rs) must be fully covered by the
-// hand-maintained `ThreadEvent` discriminated union in
-// `store/thread-events/thread-event-types.ts`.
+// Drift guard between the TWO generated files: the `EVENT_CLASSIFICATION` map
+// in `thread-lifecycle.ts` must be fully covered by the `ThreadEvent` union in
+// `thread-event-wire.ts`.
 //
-// Why this exists: a new Rust `ThreadEvent` variant lands automatically in the
-// generated `EVENT_CLASSIFICATION` map but NOT in the hand-maintained payload
-// union until a human adds it. That drift used to be silent — `WorktreeCleaned`
-// shipped in the map but was missing from the union, and a test had to force
-// `as unknown as ThreadEvent` to construct it. This test makes the drift loud:
-// add a Rust variant, regenerate `thread-lifecycle.ts`, and this fails until the
-// matching member is added to the union (and to `THREAD_EVENT_TYPE_FLAGS`, whose
-// `satisfies` annotation keeps `THREAD_EVENT_TYPE_NAMES` in lockstep with the
-// union at compile time).
+// Both come from Rust now, but by different routes, which is why this is still
+// a real check. The map is `all_persisted_event_types()` filtered by
+// `classify_event`; the union is the `ThreadEvent` enum parsed out of the
+// source. `all_persisted_event_types_matches_the_enum` pins those two Rust
+// sources together. This pins the two emitted FILES together, so regenerating
+// one and not the other is loud.
 //
-// Direction is one-way by design (EVENT_CLASSIFICATION ⊆ union). The union
-// legitimately carries members absent from the classification map — retired
-// legacy events (`ContextTokensMeasured`, `ContextAssembled`) and the
-// `CommandCheckpointed` / `CommandCheckpointReverted` pair (rendered + persisted
-// but not part of the section/status classification surface) — so the reverse
-// containment is not asserted.
+// Direction is one-way by design (EVENT_CLASSIFICATION is a subset of the
+// union). The union legitimately carries members the map omits. Those are the
+// retired events in the generator's `LEGACY_VARIANTS` table, plus the
+// `CommandCheckpointed` / `CommandCheckpointReverted` pair. That pair is
+// rendered and persisted, but sits outside the classification surface.
 
 import { describe, it, expect } from 'vitest';
 import { EVENT_CLASSIFICATION } from './thread-lifecycle';
@@ -32,16 +27,30 @@ describe('ThreadEvent union covers the generated EVENT_CLASSIFICATION', () => {
     expect(
       missing,
       `These event types are in the generated EVENT_CLASSIFICATION but missing ` +
-        `from the ThreadEvent union — add each as a payload member in ` +
-        `store/thread-events/thread-event-types.ts (and its key to ` +
-        `THREAD_EVENT_TYPE_FLAGS): ${missing.join(', ')}`,
+        `from the generated ThreadEvent union. Regenerate both: ` +
+        `cargo test -p lucidos-engine generate_typescript_file -- --ignored && ` +
+        `cargo test -p lucidos-engine generate_thread_event_wire_file -- --ignored. ` +
+        `Missing: ${missing.join(', ')}`,
     ).toEqual([]);
   });
 
-  // Anchor: the live drift this guard was built for. WorktreeCleaned is in the
-  // generated map and must now be a first-class union member.
+  // Anchor: the live drift this guard was built for. WorktreeCleaned was in the
+  // generated map and missing from the hand-maintained union.
   it('includes WorktreeCleaned (the originally-drifted variant)', () => {
     expect(THREAD_EVENT_TYPE_NAMES.has('WorktreeCleaned')).toBe(true);
     expect(EVENT_CLASSIFICATION.WorktreeCleaned).toBe('metadata');
+  });
+
+  // The retired members are why containment is asserted one way only. They are
+  // read by `exchange-render.ts` and must survive every regeneration.
+  it('keeps the retired members the classification map omits', () => {
+    for (const retired of ['ContextTokensMeasured', 'ContextAssembled', 'MemorySearched']) {
+      expect(
+        THREAD_EVENT_TYPE_NAMES.has(retired as never),
+        `${retired} is read by exchange-render.ts for old DB rows. It belongs in ` +
+          `LEGACY_VARIANTS in thread_events_tests/ts_codegen.rs.`,
+      ).toBe(true);
+      expect(EVENT_CLASSIFICATION[retired]).toBeUndefined();
+    }
   });
 });

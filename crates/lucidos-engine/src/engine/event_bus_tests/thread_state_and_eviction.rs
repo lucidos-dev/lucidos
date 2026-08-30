@@ -288,6 +288,7 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "send via lucidos".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -345,6 +346,7 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "first message".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -431,6 +433,7 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "previous question".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -580,6 +583,7 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -602,6 +606,7 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "subtask".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -707,6 +712,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do a thing".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -810,6 +816,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     bus.emit(BusEvent::Thread {
         thread_id: live_thread,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "live".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -910,6 +917,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "fix the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1364,6 +1372,7 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1451,6 +1460,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "summarize the log".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1517,6 +1527,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "try again".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1598,6 +1609,7 @@ async fn message_received_clears_compose_selection() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "the actual message".into(),
             user_image_hashes: vec![],
             device_id: None,

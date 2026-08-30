@@ -959,6 +959,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "queued".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -999,6 +1000,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "remove me".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1062,6 +1064,7 @@ async fn persist_message(
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,

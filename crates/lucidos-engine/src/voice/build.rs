@@ -14,7 +14,10 @@ use sqlx::PgPool;
 
 use super::provider::VoiceProvider;
 use super::realtime::RealtimeProvider;
-use crate::core::{preference_catalog, CredentialStore, PREF_MODEL_VOICE_TALKER};
+use crate::core::{
+    preference_catalog, CredentialStore, PREF_MODEL_VOICE_TALKER, PREF_MODEL_VOICE_TRANSCRIBER,
+    PREF_VOICE_TALKER_VOICE,
+};
 use crate::engine::{aux_purpose, ContextPurpose, LucidosEngine};
 use crate::llm::{openai::codex_detect, resolve_openai_api_key};
 
@@ -36,6 +39,35 @@ async fn talker_model(pool: &PgPool) -> Result<String, String> {
         Some(spec) if !spec.default.trim().is_empty() => Ok(spec.default.to_string()),
         _ => Err("model_voice_talker resolves to nothing".to_string()),
     }
+}
+
+/// A preference's value, or its catalog default when nothing is stored.
+///
+/// The pattern [`talker_model`] spells out above, for the keys that have no
+/// second source to fall back to. A key missing from the catalog resolves to
+/// the empty string, and every reader of one treats that as "use your own".
+async fn or_catalog_default(pool: &PgPool, key: &'static str) -> String {
+    if let Some(stored) = super::read_pref(pool, key).await {
+        return stored;
+    }
+    preference_catalog::lookup(key)
+        .map(|spec| spec.default.to_string())
+        .unwrap_or_default()
+}
+
+/// The model this call transcribes the caller with.
+///
+/// Read here rather than through a [`ContextPurpose`]. That module pairs one
+/// purpose with one budget and one capture, and this model makes no HTTP call
+/// of its own: it is a field in the socket's opening frame. A purpose would add
+/// a deadline nothing enforces and a wire enum variant nobody reads.
+pub async fn transcriber_model(pool: &PgPool) -> String {
+    or_catalog_default(pool, PREF_MODEL_VOICE_TRANSCRIBER).await
+}
+
+/// The voice this call speaks in. A provider's own name for one, not a model.
+pub async fn talker_voice(pool: &PgPool) -> String {
+    or_catalog_default(pool, PREF_VOICE_TALKER_VOICE).await
 }
 
 /// The talker to open this call on.
@@ -127,5 +159,44 @@ mod tests {
 
         assert_eq!(model, "gpt-realtime-mini");
         teardown_test_db(&db).await;
+    }
+
+    /// Same promise as the talker's, for the two keys that arrived with the
+    /// settings screen. A workspace that never opened it opens the call it
+    /// always opened.
+    #[tokio::test]
+    async fn a_fresh_workspace_gets_the_transcriber_and_voice_it_always_had() {
+        let (pool, db) = setup_test_db().await;
+
+        assert_eq!(transcriber_model(&pool).await, "gpt-4o-mini-transcribe");
+        assert_eq!(talker_voice(&pool).await, "marin");
+
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_stored_transcriber_and_voice_win_over_their_defaults() {
+        let (pool, db) = setup_test_db().await;
+        seed_preference(&pool, PREF_MODEL_VOICE_TRANSCRIBER, "whisper-1")
+            .await
+            .expect("seed");
+        seed_preference(&pool, PREF_VOICE_TALKER_VOICE, "cedar")
+            .await
+            .expect("seed");
+
+        assert_eq!(transcriber_model(&pool).await, "whisper-1");
+        assert_eq!(talker_voice(&pool).await, "cedar");
+
+        teardown_test_db(&db).await;
+    }
+
+    /// Both keys are catalog rows, so both have a default to fall back on. An
+    /// empty one would open a mute call, or a call with no voice.
+    #[test]
+    fn the_catalog_names_a_transcriber_and_a_voice() {
+        for key in [PREF_MODEL_VOICE_TRANSCRIBER, PREF_VOICE_TALKER_VOICE] {
+            let spec = preference_catalog::lookup(key).expect("an agent-settable voice key");
+            assert!(!spec.default.trim().is_empty(), "{} has no default", key);
+        }
     }
 }

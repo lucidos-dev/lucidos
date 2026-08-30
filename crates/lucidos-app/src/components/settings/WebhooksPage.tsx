@@ -221,6 +221,21 @@ function SignatureRow({ hmac }: { hmac: NonNullable<Webhook['hmac']> }) {
   );
 }
 
+/** Ask before the endpoint goes.
+ *
+ *  The delivery path carries the hook's id, so a replacement is a different
+ *  URL rather than this one restored. Every sender then needs repointing,
+ *  which is work outside this workspace. */
+export function confirmWebhookDeletion(hook: Pick<Webhook, 'name'>): Promise<boolean> {
+  return showConfirm(
+    `Delete the webhook "${hook.name}"?\n\n` +
+      'Its endpoint stops answering, so any sender still posting to it starts ' +
+      'failing. A new webhook gets a different path, so this one cannot be restored.',
+    'Delete',
+    { variant: 'danger' },
+  );
+}
+
 function WebhookRow(
   { hook, outage, now, onChanged }: {
     hook: Webhook;
@@ -279,6 +294,13 @@ function WebhookRow(
     await change(async () => {
       revealSecret(await updateWebhook(hook.id, { hmac: null }));
       setEditing(null);
+    });
+  }
+
+  async function deleteHook() {
+    if (!(await confirmWebhookDeletion(hook))) return;
+    await change(async () => {
+      await deleteWebhook(hook.id);
     });
   }
 
@@ -363,9 +385,7 @@ function WebhookRow(
         <button
           class="action-btn action-btn-danger"
           disabled={busy}
-          onClick={() => void change(async () => {
-            await deleteWebhook(hook.id);
-          })}
+          onClick={() => void deleteHook()}
         >
           Delete
         </button>

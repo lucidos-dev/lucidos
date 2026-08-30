@@ -14,7 +14,7 @@ import { errorDetail } from '../utils/errorDetail';
  *
  * The runner prints a `CallSetupError` as it stands, and replaces anything else
  * with {@link UNEXPECTED_SETUP_FAILURE}. So a stray `TypeError` from a browser
- * internal cannot reach the strip as jargon.
+ * internal cannot reach the reader as jargon.
  */
 export class CallSetupError extends Error {
   constructor(message: string) {
@@ -74,10 +74,22 @@ export function isSettingsProblem(message: string): boolean {
   return message === NO_VOICE_MODEL;
 }
 
+/**
+ * The `name` a browser put on a refusal, or `''` for anything else.
+ *
+ * Read off the object rather than gated on `instanceof DOMException`, because
+ * `OverconstrainedError` is NOT one: the spec gives it its own interface so it
+ * can carry `constraint`. So the gate answered `''` for the one refusal a
+ * microphone constraint can raise, and every caller read it as unknown.
+ */
+export function refusalName(err: unknown): string {
+  const name = (err as { name?: unknown } | null)?.name;
+  return typeof name === 'string' ? name : '';
+}
+
 /** Why the microphone would not open, from what the browser threw. */
 export function microphoneRefusal(err: unknown): string {
-  const name = err instanceof DOMException ? err.name : '';
-  switch (name) {
+  switch (refusalName(err)) {
     case 'NotAllowedError':
     case 'SecurityError':
       return 'Lucidos needs permission to use the microphone. Allow it and try again.';

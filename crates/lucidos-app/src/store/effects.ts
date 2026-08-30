@@ -4,6 +4,7 @@ import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
+import { installSeenTargetWatch } from './actions/notification-visit';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
 
@@ -268,3 +269,10 @@ effect(() => {
     restartTimer = null;
   }
 });
+
+// The *seen target* rule: a notification clears once the reader has looked at
+// what its tap points at. Its own module owns the subscriptions it needs
+// (location, unread set, transcript, scroll, page wake). They stay beside the
+// rules they feed rather than spread across this file. See
+// actions/notification-visit.ts and system-knowhow/notifications.md §4.
+installSeenTargetWatch();

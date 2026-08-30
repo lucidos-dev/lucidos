@@ -1,5 +1,5 @@
 import { postCommandConsent, postMcpConsent, postMcpPermissionConsent } from '../../api/client';
-import type { PersistScope } from '../thread-events';
+import type { AllowScope } from '../thread-events';
 
 /* Resolving an in-thread permission card posts the consent and nothing else.
  *
@@ -27,7 +27,7 @@ import type { PersistScope } from '../thread-events';
 export function resolveCodingAgentPermission(
   requestId: string,
   allowed: boolean,
-  persist?: PersistScope,
+  persist?: AllowScope,
 ): Promise<void> {
   return postMcpConsent(requestId, allowed, persist);
 }
@@ -36,7 +36,7 @@ export function resolveCodingAgentPermission(
 export function resolveCommandPermission(
   requestId: string,
   allowed: boolean,
-  persist?: PersistScope,
+  persist?: AllowScope,
 ): Promise<void> {
   return postCommandConsent(requestId, allowed, persist);
 }
@@ -45,7 +45,7 @@ export function resolveCommandPermission(
 export function resolveMcpPermission(
   requestId: string,
   allowed: boolean,
-  persist?: PersistScope,
+  persist?: AllowScope,
 ): Promise<void> {
   return postMcpPermissionConsent(requestId, allowed, persist);
 }

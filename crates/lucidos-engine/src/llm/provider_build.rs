@@ -214,6 +214,28 @@ struct DirectProviders {
     search_backends: Vec<Arc<dyn WebSearchProvider>>,
 }
 
+/// Read a provider credential as an `(auth_type, auth_value)` pair. A read
+/// error logs and degrades to `None`, so boot still comes up on the other
+/// providers. `display_name` names the provider in that log line.
+async fn read_credential_pair(
+    pool: &PgPool,
+    service: &str,
+    display_name: &str,
+) -> Option<(AuthType, String)> {
+    match CredentialStore::get(pool, service).await {
+        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
+        Ok(None) => None,
+        Err(e) => {
+            crate::log!(
+                "[Startup] Failed to read {} credential: {}",
+                display_name,
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
 /// env. `pool == None` means the DB is unavailable (a degraded boot): the env
 /// fallbacks (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
@@ -276,14 +298,7 @@ async fn resolve_direct_providers(
     // backend is built from the same auth (`AnthropicProvider` keeps its copy
     // private), which is also what stops the two disagreeing about which source
     // won.
-    let anthropic_credential = match CredentialStore::get(pool, "anthropic").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read Anthropic credential: {}", e);
-            None
-        }
-    };
+    let anthropic_credential = read_credential_pair(pool, "anthropic", "Anthropic").await;
     // The veto is applied to the resolved AUTH rather than to the built
     // provider, so the search backend below drops with it: they are built from
     // this one value precisely so they cannot disagree.
@@ -292,14 +307,7 @@ async fn resolve_direct_providers(
     let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
 
     // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
-    let openai_credential = match CredentialStore::get(pool, "openai").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read OpenAI credential: {}", e);
-            None
-        }
-    };
+    let openai_credential = read_credential_pair(pool, "openai", "OpenAI").await;
     // Resolved once and reused: the provider needs it, and so does the OpenAI
     // search backend. Vetoed at the key, for the reason given above Anthropic's.
     let openai_key = resolve_openai_api_key(openai_credential, openai_env_key, openai_codex_key)
@@ -307,14 +315,7 @@ async fn resolve_direct_providers(
     let openai = build_openai_provider(openai_key.clone(), default_model);
 
     // OpenRouter: a stored `openrouter` credential wins; otherwise the env fallback.
-    let openrouter_credential = match CredentialStore::get(pool, "openrouter").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read OpenRouter credential: {}", e);
-            None
-        }
-    };
+    let openrouter_credential = read_credential_pair(pool, "openrouter", "OpenRouter").await;
     let openrouter = build_openrouter_provider(
         openrouter_credential,
         std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
@@ -323,14 +324,7 @@ async fn resolve_direct_providers(
     .filter(|_| switches.openrouter);
 
     // xAI: a stored `xai` credential wins; otherwise the env fallback.
-    let xai_credential = match CredentialStore::get(pool, "xai").await {
-        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
-        Ok(None) => None,
-        Err(e) => {
-            crate::log!("[Startup] Failed to read xAI credential: {}", e);
-            None
-        }
-    };
+    let xai_credential = read_credential_pair(pool, "xai", "xAI").await;
     let xai = build_xai_provider(
         xai_credential,
         std::env::var("LUCIDOS_XAI_API_KEY").ok(),

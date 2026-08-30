@@ -21,6 +21,10 @@ vi.mock('../store', () => ({ showToast, markThreadAnswering, clearThreadAnswerin
 vi.mock('../../api/client', () => ({
   answerThreadQuestion: apiAnswerThreadQuestion,
   ApiError,
+  // Inlined rather than re-exported: the real one lives in `_core`, which pulls
+  // in the store. Same three browser wordings (`isTransportError`).
+  isTransportError: (err: unknown) =>
+    err instanceof TypeError && /Load failed|Failed to fetch|NetworkError/i.test(err.message),
 }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom }));
 vi.mock('../../utils/threadOpenMarks', () => ({ markThreadRerenderStart, clearThreadRerenderStart }));
@@ -28,7 +32,7 @@ vi.mock('../../utils/renderPhaseTimers', () => ({ currentPerfBaseline: () => ({ 
 vi.mock('./thread-sync', () => ({}));
 vi.mock('./threads', () => ({}));
 
-const { answerThreadQuestion } = await import('./chat-claude-code');
+const { answerThreadQuestion, answerFailureMessage } = await import('./chat-claude-code');
 
 describe('answerThreadQuestion', () => {
   beforeEach(() => {
@@ -83,5 +87,58 @@ describe('answerThreadQuestion', () => {
     expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
     expect(showToast).toHaveBeenCalledTimes(1);
     expect(showToast.mock.calls[0][0]).toContain('boom');
+  });
+});
+
+/**
+ * One failed tap, one message, and it names the cause.
+ *
+ * The reported pair was "Could not send answer. Please try again." over
+ * "Failed to send answer: unknown error", twice each for two taps. The action
+ * raised one and the submit site raised the other, so the count is the
+ * contract: the callers roll their optimistic state back and stay quiet.
+ */
+describe('the one failure message', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    apiAnswerThreadQuestion.mockResolvedValue(true);
+  });
+
+  it('is raised exactly once when the request throws', async () => {
+    apiAnswerThreadQuestion.mockRejectedValueOnce(new TypeError('Load failed'));
+    await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+  });
+
+  it('is raised on a 409 too, which used to be the caller-only case', async () => {
+    apiAnswerThreadQuestion.mockResolvedValueOnce(false);
+    await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
+
+    expect(showToast).toHaveBeenCalledTimes(1);
+    expect(showToast.mock.calls[0][0]).toContain('no longer waiting');
+  });
+
+  it('names the dropped connection rather than an unknown error', () => {
+    // The exact rejection an iOS PWA hands back over a half-closed HTTP/2
+    // connection. `errorDetail` would have surfaced WebKit's "Load failed".
+    const msg = answerFailureMessage({ kind: 'error', err: new TypeError('Load failed') });
+    expect(msg).toContain('the connection dropped');
+    expect(msg).not.toContain('unknown error');
+    expect(msg).not.toContain('Load failed');
+  });
+
+  it('does not ask for a retry that would conflict forever', () => {
+    expect(answerFailureMessage({ kind: 'conflict' })).not.toMatch(/try again/i);
+  });
+
+  it('keeps the engine reason for a real HTTP verdict', () => {
+    expect(answerFailureMessage({ kind: 'error', err: new ApiError(500, 'boom') }))
+      .toBe('Could not send answer: boom');
+  });
+
+  it('falls back to the error detail for anything else', () => {
+    expect(answerFailureMessage({ kind: 'error', err: new Error('kaboom') }))
+      .toContain('kaboom');
   });
 });

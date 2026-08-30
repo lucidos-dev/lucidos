@@ -333,20 +333,10 @@ impl MemoryExtractor {
         // parse", governed by .claude/rules/temporary-measures.md). Drop the
         // intermediate Value step and deserialize Vec<ExtractedFact> directly once
         // extraction responses reliably contain no duplicate keys.
-        let value: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
-            format!(
-                "[Memory] Failed to parse extraction JSON: {} | raw: {}",
-                e,
-                &cleaned[..cleaned.floor_char_boundary(200)]
-            )
-        })?;
-        let mut facts: Vec<ExtractedFact> = serde_json::from_value(value).map_err(|e| {
-            format!(
-                "[Memory] Failed to deserialize extraction facts: {} | raw: {}",
-                e,
-                &cleaned[..cleaned.floor_char_boundary(200)]
-            )
-        })?;
+        let value: serde_json::Value = serde_json::from_str(&cleaned)
+            .map_err(|e| parse_failure("Failed to parse extraction JSON", e, &cleaned))?;
+        let mut facts: Vec<ExtractedFact> = serde_json::from_value(value)
+            .map_err(|e| parse_failure("Failed to deserialize extraction facts", e, &cleaned))?;
 
         // Drop facts that wouldn't survive RETRIEVAL_MIN_IMPORTANCE — pointless to embed.
         for fact in &mut facts {
@@ -387,13 +377,8 @@ impl MemoryExtractor {
         let raw = response.content.unwrap_or_default();
         let cleaned = strip_code_fences(&raw);
 
-        let classification: QueryClassification = serde_json::from_str(&cleaned).map_err(|e| {
-            format!(
-                "[Memory] Failed to parse query classification: {} | raw: {}",
-                e,
-                &cleaned[..cleaned.floor_char_boundary(200)]
-            )
-        })?;
+        let classification: QueryClassification = serde_json::from_str(&cleaned)
+            .map_err(|e| parse_failure("Failed to parse query classification", e, &cleaned))?;
 
         Ok(classification)
     }
@@ -499,6 +484,17 @@ pub(crate) fn is_fabricated_engine_internal_claim(text: &str) -> bool {
     }
 
     false
+}
+
+/// Format a memory-parse failure, appending the first 200 chars of the raw
+/// model output. Cut on a char boundary so multibyte output never panics.
+fn parse_failure(context: &str, e: impl std::fmt::Display, cleaned: &str) -> String {
+    format!(
+        "[Memory] {}: {} | raw: {}",
+        context,
+        e,
+        &cleaned[..cleaned.floor_char_boundary(200)]
+    )
 }
 
 /// Strip markdown code fences from LLM response.

@@ -911,6 +911,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "do the thing".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1209,6 +1210,7 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "so go?".into(),
                 user_image_hashes: vec![],
                 device_id: None,

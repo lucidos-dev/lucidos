@@ -371,6 +371,24 @@ export async function fetchToolResult(
   return json(`${API}/events/${eventId}/tool-result`);
 }
 
+/** Payload returned by the lazy-load endpoint for one coding-agent tool call.
+ *  The snapshot strips `args` to keep the events list small; the step-detail
+ *  modal fetches it on open. `args` is `null` for a call that recorded none.
+ *  Mirrors Rust `ToolArgsPayload` in `api/threads/events_snapshot.rs`. */
+export interface ToolArgsPayload {
+  args: unknown;
+}
+
+/** Lazy-fetch the `args` for one coding-agent tool call. Same event-id-only
+ *  routing as `fetchContextCapture`.
+ *
+ *  Returns the RAW args, not a rendered string: the modal runs them through
+ *  `fullCommandForCCTool`, the same helper the inline fold uses, so a stripped
+ *  row and a live one format identically. */
+export async function fetchToolArgs(eventId: string): Promise<ToolArgsPayload> {
+  return json(`${API}/events/${eventId}/tool-args`);
+}
+
 /** Where one event lives. `thread_id` is `null` for an event that belongs to no
  *  conversation (a workspace domain event, an app event, a trigger event): a
  *  real answer, distinct from the 404 an unknown event id returns. Mirrors Rust

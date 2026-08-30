@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.34.0 — 2026-08-30
+
+### Added
+
+- Hold the call control to pick which microphone a call uses. The list is the microphones the browser can see, and the choice is remembered.
+- Settings > Models gains a transcriber model and a spoken voice for calls, and the talker model is picked from a list.
+- A question the agent asks mid-call is put to you out loud. You answer by speaking, and the answer settles the question on screen.
+- A call leaves a full record in the thread. What you said takes a Spoken chip and a surface of its own, and what Lucidos said aloud becomes a Said aloud row inside the turn it happened in.
+- What a call is told at the start is a toggle per section, so you choose which of them a call carries.
+
+### Changed
+
+- A call runs on two models. A talker holds the conversation and hands work to the agent through a single tool, so a question the talker can answer from what it already knows costs no agent turn. What the talker says aloud reaches a turn that is already running.
+- The call control is absent when the thread's destination is a coding agent, and moving the destination to one ends a live call and says why.
+- A voice turn records its tokens per modality, so audio and text are priced apart.
+- A notification clears once you have looked at what it points at. The rule is standing rather than one-shot, so the needs-attention list and a resumed app clear the row too.
+- The update check names its version in its user agent.
+
+### Fixed
+
+- Answering a question survives a dropped connection. An iOS home-screen app waking from the background could fail the answer twice before it landed; the tap now retries once, and a failure raises one message that names the cause.
+- A coding-agent thread loads. The snapshot now strips the tool results and arguments that make those threads heavy, fetching them when you open a step, and a cold start no longer prefetches every active and saved thread.
+- A WebSocket handshake proves its origin at the gateway. Chrome and Firefox send no Sec-Fetch-Site on a handshake, and behind the gateway that left every desktop call refused with a 403 the browser hides.
+- A Host header with no port matches the default port and no other. Two gateways on one machine could otherwise wave each other's pages through the same-origin check.
+- A long press on a mobile thread row keeps its actions menu open. The lift that opened it used to close it again.
+- An installed home-screen app can re-pair from the phone it is on. A replayed launch code no longer spends the gateway's wrong-guess budget, and the screen now offers the browser on the same phone.
+- A device credential is matched, not merely found. A cookie left by a gateway that is gone no longer refuses a device whose good credential sits under another name.
+- A call is pinned to the workspace's language. The transcriber used to re-guess on every utterance, which is where Bokmal and Nynorsk flip on a short phrase.
+- Deleting a webhook asks first, naming the hook and saying that a replacement gets a different path.
+- The composer eases to a draft's height instead of snapping to it.
+- A turn control holds the element you pressed, with no clamp carried over to the next press.
+- A cross-workspace call that fails names the protocol it assumed and the ports file that did not say. Every writer of that file now preserves the keys it does not own.
+- The agent can request a secret credential. Its schema is rendered from the engine's own list, so it can no longer fall behind and tell you a type does not exist.
+- The frontend's event types are generated from the engine source, and the union stops declaring fields nothing emits.
+- A project-wide hardening sweep across the engine, the gateway and the frontend, including credentials that could reach a host by inference and an e2e handshake that dropped a header it needed.
 ## v0.33.0 — 2026-08-29
 
 ### Added

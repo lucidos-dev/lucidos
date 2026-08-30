@@ -1,6 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
-import { assertHealthy, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, waitForVisibleInput, waitForVisibleElement, waitForExchangeCount, gotoWithRetry } from './helpers';
+import { assertHealthy, clickThreadRow, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, openThreadDrawer, waitForVisibleInput, waitForVisibleElement, waitForExchangeCount, gotoWithRetry } from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
 /** Send a notification through the script-facing endpoint that powers the
@@ -352,6 +352,101 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
       }
       return false;
     }, lastEventId, { timeout: 10_000 });
+  });
+});
+
+/** One short exchange, which is what the seen rule needs from a fixture.
+ *
+ *  `seedTallChatThread` is deliberately taller than the viewport. The *standing
+ *  follow* seed ships armed, so such a thread opens on its live edge with the
+ *  early cards above the fold. This rule measures the CARD, so the fixture has
+ *  to fit whole on a phone. Returns the thread and its only `MessageReceived`,
+ *  which is the exchange's stamped id. */
+function seedShortChatThread(): { threadId: string; eventId: string } {
+  const threadId = randomUUID();
+  const eventId = randomUUID();
+  const respId = randomUUID();
+  const base = Date.now();
+  const msgCreated = new Date(base).toISOString();
+  const respCreated = new Date(base + 1000).toISOString();
+  const msgPayload = JSON.stringify({ text: 'Short seeded message.', channel: 'chat' });
+  const respPayload = JSON.stringify({ text: 'Response.', images: [] });
+  psql([
+    `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, state, is_coding_agent, active_children_count, total_children_count, coding_agent_proposed, coding_agent_requires_restart, coding_agent_is_external_repo) VALUES ('${threadId}', 'Seen target thread', 'chat', '${respCreated}', 1, false, true, 'idle', 'inbox', 'active', false, 0, 0, false, false, false)`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${eventId}', 'MessageReceived', '${msgPayload}'::jsonb, '${msgCreated}', 'thread', '${threadId}', '${threadId}')`,
+    `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${respId}', 'ResponseGenerated', '${respPayload}'::jsonb, '${respCreated}', 'thread', '${threadId}', '${threadId}')`,
+  ].join(';\n'));
+  return { threadId, eventId };
+}
+
+test.describe('A notification clears once its event card has been seen', () => {
+  let seeded: { threadId: string } | null = null;
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    clearNotifications();
+  });
+
+  test.afterEach(() => {
+    if (!seeded) return;
+    psql([
+      `DELETE FROM events WHERE aggregate_id = '${seeded.threadId}'`,
+      `DELETE FROM thread_summaries WHERE thread_id = '${seeded.threadId}'`,
+    ].join(';\n'));
+    seeded = null;
+  });
+
+  test('reading the thread from the drawer drops the bell badge, with the panel never opened', async ({ page }) => {
+    const short = seedShortChatThread();
+    seeded = short;
+    const { threadId, eventId } = short;
+
+    await navigateToApp(page);
+    // The bell first: it proves the page is up and subscribed. Posting before
+    // the SSE stream is open loses the NotificationCreated, so the badge below
+    // never bumps. That is a race rather than a verdict.
+    await ensureMobileView(page, 'content');
+    await expect(page.locator('.notifications-bell:visible').first())
+      .toBeVisible({ timeout: 10_000 });
+
+    await postNotification(page, {
+      title: 'Seen target',
+      message: 'cleared by reading the thread it points into',
+      thread_id: threadId,
+      event_id: eventId,
+    });
+
+    // Precondition: the badge is up. Without it the assertion below is vacuous.
+    await expect(page.locator('.notifications-bell:visible .badge').first())
+      .toHaveText('1', { timeout: 10_000 });
+
+    // Arrive the way the user does. The Notifications panel is never opened,
+    // the row is never tapped, and no deep link is dispatched.
+    await openThreadDrawer(page);
+    await clickThreadRow(page, threadId);
+    await ensureMobileView(page, 'thread');
+    await waitForExchangeCount(page, 1, 15_000);
+
+    // The card really is on screen, which is what the rule measures.
+    await page.waitForFunction((eid) => {
+      const els = document.querySelectorAll(`[data-event-id="${eid}"]`);
+      const vh = window.innerHeight || document.documentElement.clientHeight;
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue; // skip the dual-layout hidden copy
+        if (r.bottom > 0 && r.top < vh) return true;
+      }
+      return false;
+    }, eventId, { timeout: 10_000 });
+
+    // Hold the pane past SEEN_DWELL_MS. Swiping away earlier would cancel the
+    // wait, which is the anti-glimpse rule doing its job rather than a flake.
+    await page.waitForTimeout(2_000);
+
+    // The bell lives on the content pane on mobile, so read it there.
+    await ensureMobileView(page, 'content');
+    await expect(page.locator('.notifications-bell:visible .badge'))
+      .toHaveCount(0, { timeout: 10_000 });
   });
 });
 

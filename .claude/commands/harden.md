@@ -427,9 +427,28 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
 - `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
+- `crates/lucidos-app/src/components/settings/LocaleSection.tsx` → `./scripts/test-engine.sh -- -- voice::language` (subsumed by `make test` when the diff also touches Rust)
+- `crates/lucidos-app/src/store/actions/preferences.ts` → `./scripts/test-engine.sh -- -- voice::sections` (subsumed by `make test` when the diff also touches Rust)
 - `system-knowhow/**` → `./scripts/test-engine.sh -- -- always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized` (subsumed by `make test` when the diff also touches Rust)
 - Docs-only → skip, EXCEPT the `system-knowhow/**` row above
 - Mixed → run both **in parallel**
+
+**The Locale dropdown is gated by an ENGINE test, so a `.tsx`-only edit needs
+its row.** `voice/language.rs` maps that dropdown's names to the ISO-639-1 codes
+a call's transcriber is pinned with. Its guard `include_str!`s
+`LocaleSection.tsx` to check the two still agree. The drift it catches is a
+language added to the dropdown and to nothing else, which is a frontend-only
+diff. Without the row above, that diff runs `tsc` and Vitest, neither of which
+compiles the guard, so it is inert for exactly its trigger.
+
+**`preferences.ts` needs a row for exactly the same reason.**
+`voice/sections.rs` owns the resident-block registry, and the settings toggles
+are drawn from `VOICE_RESIDENT_SECTIONS`, a mirror of it. Its guard reads that
+mirror, and editing the mirror alone is a frontend-only diff.
+
+Both are the same shape as the `sdk_iframe.css` row, in the other direction.
+Neither is in `CLAUDE.md`'s table: that file is always-loaded and had 31 bytes of headroom
+under `CONTEXT_BUDGET_CEILING`, and this gate is what enforces the table anyway.
 
 **A `system-knowhow/**` edit is not a docs-only skip.** Its frontmatter `name`
 and `description` are spliced into the chat agent's routing list, which is

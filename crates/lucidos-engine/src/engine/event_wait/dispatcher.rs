@@ -492,6 +492,7 @@ impl LucidosEngine {
                 Some(PreEmittedOrigin::WaitReentry(reentry.anchor_event_id)),
                 None,
                 None,
+                None,
                 crate::engine::FollowUpUrgency::Normal,
             )
             .await

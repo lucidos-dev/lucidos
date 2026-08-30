@@ -10,7 +10,12 @@ import { Explainer } from '../shared/Explainer';
 
 /** Common languages offered up-front; the field is freeText, so any other
  *  language name can still be typed. The value stored is the plain name the
- *  engine echoes back ("Respond in {language}"). */
+ *  engine echoes back ("Respond in {language}").
+ *
+ *  A voice call reads the same value twice: the talker is told the name, and
+ *  the transcriber is pinned to the ISO-639-1 code it maps to. A name outside
+ *  this list still reaches the talker; only the code needs the mapping, which
+ *  lives in the engine's `voice/language.rs`. */
 const COMMON_LANGUAGES = [
   'English',
   'Norwegian',
@@ -89,6 +94,11 @@ export function LocaleSection() {
             <p>
               You can still write in any language; replies come in the language set
               here, or match yours when left on Auto.
+            </p>
+            <p>
+              A voice call speaks this language too, and listens for it. Leave it
+              on Auto and a call guesses per sentence, which is how Norwegian
+              drifts between Bokmål and Nynorsk.
             </p>
           </Explainer>
         </span>

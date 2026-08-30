@@ -94,6 +94,8 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   VoiceSessionStarted: 'metadata',
   VoiceSessionEnded: 'metadata',
   SpokenReplyGenerated: 'metadata',
+  SpokenMessageReceived: 'metadata',
+  WorkDelegated: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

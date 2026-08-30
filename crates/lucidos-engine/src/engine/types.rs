@@ -71,9 +71,9 @@ pub struct ContextSection {
     #[serde(default)]
     pub content_chars: Option<usize>,
     /// API role this section is sent under. Defaults to "user" for backward
-    /// compat with persisted ContextCaptured events from before this change —
-    /// every previous section was actually part of either the system prompt
-    /// (System Instructions) or the user message; the system row gets
+    /// compat with persisted ContextCaptured events from before this change.
+    /// Every previous section was actually part of either the system prompt
+    /// (System Instructions) or the user message. The system row gets
     /// migrated by name in the viewer fallback.
     #[serde(default = "default_context_role")]
     pub role: ContextRole,
@@ -151,6 +151,72 @@ mod tests {
         assert!(json.get("char_count").is_none());
     }
 
+    /// Every non-voice producer must keep writing the payload it always wrote.
+    /// A `"modality": null` key would change every stored row for nothing.
+    #[test]
+    fn a_usage_block_with_no_split_grows_no_key() {
+        let json = serde_json::to_value(ApiUsage {
+            input_tokens: 12_345,
+            output_tokens: 678,
+            cache_read_tokens: 10_000,
+            cache_creation_tokens: 200,
+            modality: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "input_tokens": 12_345,
+                "output_tokens": 678,
+                "cache_read_tokens": 10_000,
+                "cache_creation_tokens": 200
+            })
+        );
+    }
+
+    /// Rows written before the field existed still read. They are the whole
+    /// event store, so this is the one that must never break.
+    #[test]
+    fn a_stored_row_with_no_split_still_reads() {
+        let stored = serde_json::json!({
+            "input_tokens": 900,
+            "output_tokens": 40,
+            "cache_read_tokens": 800,
+            "cache_creation_tokens": 0
+        });
+        let usage: ApiUsage = serde_json::from_value(stored).unwrap();
+        assert_eq!(usage.input_tokens, 900);
+        assert_eq!(usage.modality, None);
+    }
+
+    /// The split rides along under one key, so a reader that knows nothing
+    /// about it reads the same four numbers it always did.
+    #[test]
+    fn a_split_serializes_under_one_key() {
+        let json = serde_json::to_value(ApiUsage {
+            input_tokens: 1200,
+            output_tokens: 64,
+            cache_read_tokens: 1024,
+            cache_creation_tokens: 0,
+            modality: Some(ModalityUsage {
+                input_text_tokens: 176,
+                input_audio_tokens: 1024,
+                input_image_tokens: 0,
+                cache_read_text_tokens: 100,
+                cache_read_audio_tokens: 924,
+                cache_read_image_tokens: 0,
+                output_text_tokens: 20,
+                output_audio_tokens: 44,
+            }),
+        })
+        .unwrap();
+        assert_eq!(json["input_tokens"], 1200);
+        assert_eq!(json["modality"]["input_audio_tokens"], 1024);
+        assert_eq!(json["modality"]["output_audio_tokens"], 44);
+        let back: ApiUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(back.modality.unwrap().cache_read_audio_tokens, 924);
+    }
+
     /// A session whose run loop still owns `msg_rx` is live.
     #[test]
     fn session_with_running_loop_is_live() {
@@ -204,7 +270,7 @@ mod tests {
 }
 
 /// CC can't expose its system prompt body or tool schemas via the
-/// stream-json envelope, only their token cost — the frontend uses this
+/// stream-json envelope, only their token cost. The frontend uses this
 /// discriminant to know whether to expect a section breakdown body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -312,10 +378,59 @@ impl ContextPurpose {
 /// the final delta.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiUsage {
+    /// The TOTAL, and it CONTAINS the two cache counts below. Derive fresh
+    /// input as `input_tokens - cache_read_tokens - cache_creation_tokens`,
+    /// saturating. Read as three classes, every cached token counts twice.
     pub input_tokens: u32,
+    /// May be zero on a snapshot emitted mid-stream, before the final delta.
     pub output_tokens: u32,
+    /// Set by both providers.
     pub cache_read_tokens: u32,
+    /// Anthropic-only. OpenAI charges nothing for a cache write.
     pub cache_creation_tokens: u32,
+    /// How the four counts above split across text, audio and image. Only a
+    /// realtime voice call reports one, so it is absent everywhere else and
+    /// every other producer writes the payload it always wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<ModalityUsage>,
+}
+
+/// How one call's tokens split across text, audio and image.
+///
+/// The realtime API bills per modality at rates an order of magnitude apart, so
+/// a blended total cannot be priced. Every field is a PART of a count on
+/// [`ApiUsage`], named after the count it belongs to. Three sums hold:
+///
+/// - input text + audio + image == `input_tokens`
+/// - cache-read text + audio + image == `cache_read_tokens`
+/// - output text + audio == `output_tokens`
+///
+/// **If a provider ever disagrees, the flat totals win and the parts are stored
+/// exactly as reported.** Rescaling would invent numbers no frame carried, and
+/// it would hide the drift from whoever has to fix it. The producer logs the
+/// mismatch instead.
+///
+/// A breakdown is all-or-nothing: a producer that cannot fill every field
+/// leaves `modality` as `None`. Zeros would read as a real turn that spoke
+/// nothing, and the consumer could not tell the two apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalityUsage {
+    /// Part of `input_tokens`, with the audio and image counts below.
+    pub input_text_tokens: u32,
+    /// Part of `input_tokens`.
+    pub input_audio_tokens: u32,
+    /// Part of `input_tokens`.
+    pub input_image_tokens: u32,
+    /// Part of `cache_read_tokens`, with the audio and image counts below.
+    pub cache_read_text_tokens: u32,
+    /// Part of `cache_read_tokens`.
+    pub cache_read_audio_tokens: u32,
+    /// Part of `cache_read_tokens`.
+    pub cache_read_image_tokens: u32,
+    /// Part of `output_tokens`, with the audio count below.
+    pub output_text_tokens: u32,
+    /// Part of `output_tokens`.
+    pub output_audio_tokens: u32,
 }
 
 /// Result of an App UI capture from the frontend

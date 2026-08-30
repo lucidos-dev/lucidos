@@ -1062,6 +1062,7 @@ async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
     bus.emit(BusEvent::Thread {
         thread_id: spawning_thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "spawn something independent".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1086,6 +1087,7 @@ async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
     bus.emit(BusEvent::Thread {
         thread_id: spawned_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "independent work".into(),
             user_image_hashes: vec![],
             device_id: None,

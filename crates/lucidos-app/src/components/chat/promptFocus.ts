@@ -3,8 +3,11 @@ import { isElementVisible } from './scrollState';
 /** The currently focused prompt textarea, or null if focus is elsewhere.
  *  Reads document.activeElement directly rather than locating the visible
  *  prompt-input and comparing: focus is exactly the question being asked, so the
- *  active element answers it without depending on layout or measurement. */
-function activePromptInput(): HTMLElement | null {
+ *  active element answers it without depending on layout or measurement.
+ *
+ *  Exported for the keystroke probe, which asks the same question with no thread
+ *  id to compare against, so `isComposeFocusedHere` cannot serve it. */
+export function activePromptInput(): HTMLElement | null {
   const el = document.activeElement as HTMLElement | null;
   return el?.dataset?.role === 'prompt-input' ? el : null;
 }

@@ -46,6 +46,50 @@ impl AuthType {
             _ => Self::Unknown,
         }
     }
+
+    /// Every variant. The requestable ones, in this order, are the
+    /// `request_credential` enum, so append rather than insert: moving a value
+    /// rewrites a cached prompt segment. Rust cannot enumerate a plain enum, so
+    /// `all_lists_every_variant` reads the declaration back to catch an
+    /// omission.
+    pub const ALL: &'static [Self] = &[
+        Self::ApiKey,
+        Self::Bearer,
+        Self::Basic,
+        Self::Password,
+        Self::OauthClient,
+        Self::EmailPassword,
+        Self::Secret,
+        Self::Unknown,
+    ];
+
+    /// Whether `request_credential` may ask the user for this type.
+    ///
+    /// Exhaustive on purpose: a new variant does not compile until it is
+    /// classified here, so the tool schema cannot fall behind the enum.
+    pub fn agent_requestable(self) -> bool {
+        match self {
+            Self::ApiKey
+            | Self::Bearer
+            | Self::Basic
+            | Self::Password
+            | Self::OauthClient
+            | Self::Secret => true,
+            // `configure_email` owns email_password, building a JSON value the
+            // credential modal has no fields for. `Unknown` is what a row from
+            // a newer engine parses to, never something to ask a user for.
+            Self::EmailPassword | Self::Unknown => false,
+        }
+    }
+
+    /// The `auth_type` values `request_credential` accepts, for its schema.
+    pub fn agent_requestable_values() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .filter(|t| t.agent_requestable())
+            .map(Self::to_string)
+            .collect()
+    }
 }
 
 impl fmt::Display for AuthType {
@@ -710,6 +754,12 @@ impl CredentialStore {
     /// also never APPENDS to a scope set: an entry naming an already-scoped
     /// credential says nothing about whether the user wants both hosts, and
     /// `apis.json` is writable over the API.
+    ///
+    /// A `secret` is skipped, because for that type an empty scope is the
+    /// answer rather than a gap. That value is only ever signed with, so
+    /// inferring a host for it grants the reach ADR 0144 exists to refuse.
+    /// Scoping one is a user's explicit act, through Settings or
+    /// `lucidos credentials set-base-urls`.
     pub async fn infer_scope_if_empty(
         pool: &PgPool,
         event_bus: &EventBus,
@@ -732,10 +782,12 @@ impl CredentialStore {
         let updated: Option<String> = sqlx::query_scalar(
             "UPDATE credentials SET base_urls = ARRAY[$1], updated_at = NOW() \
              WHERE service_name = $2 AND cardinality(base_urls) = 0 \
+             AND auth_type <> $3 \
              RETURNING service_name",
         )
         .bind(base_url)
         .bind(service_name)
+        .bind(AuthType::Secret.to_string())
         .fetch_optional(pool)
         .await?;
         if updated.is_none() {
@@ -995,6 +1047,67 @@ pub fn credential_env_vars_for(cred: Credential) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// Every agent-facing type list is rendered from `ALL`, so a variant
+    /// missing from it is a type no agent can see. That is how `secret` shipped
+    /// while `request_credential` still offered five.
+    ///
+    /// Nothing in the language enumerates a plain enum, so a hand-written `ALL`
+    /// can silently fall short: the exhaustive matches elsewhere force a new
+    /// variant to be CLASSIFIED, never to be LISTED. Reading the declaration
+    /// back is what closes that.
+    #[test]
+    fn all_lists_every_variant() {
+        let body = include_str!("credentials.rs")
+            .split_once("pub enum AuthType {")
+            .expect("the enum is declared in this file")
+            .1
+            .split_once('}')
+            .expect("its declaration closes")
+            .0;
+        let mut declared: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with('#'))
+            .map(|line| line.trim_end_matches(','))
+            .collect();
+        declared.sort_unstable();
+
+        let mut listed: Vec<String> = AuthType::ALL.iter().map(|t| format!("{t:?}")).collect();
+        listed.sort();
+        assert_eq!(
+            listed, declared,
+            "AuthType::ALL must hold every declared variant. A missing one is \
+             offered by no agent-facing surface, and a stale one names nothing"
+        );
+
+        for auth_type in AuthType::ALL {
+            assert_eq!(
+                AuthType::parse(&auth_type.to_string()),
+                *auth_type,
+                "every listed variant round-trips through its wire spelling"
+            );
+        }
+    }
+
+    /// The two exclusions are deliberate, and both would be a bug to offer.
+    #[test]
+    fn the_agent_may_request_every_type_but_email_and_unknown() {
+        assert_eq!(
+            AuthType::agent_requestable_values(),
+            vec![
+                "api_key",
+                "bearer",
+                "basic",
+                "password",
+                "oauth_client",
+                "secret"
+            ],
+            "the request_credential enum, in schema order"
+        );
+        assert!(!AuthType::EmailPassword.agent_requestable());
+        assert!(!AuthType::Unknown.agent_requestable());
+    }
 
     async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")

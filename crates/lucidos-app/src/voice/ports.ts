@@ -7,6 +7,7 @@
  * audio device that does not exist under Vitest.
  */
 import { CAPTURE_WORKLET_NAME, captureWorkletUrl } from './captureWorklet';
+import { microphoneConstraints, openWithFallback } from './microphone';
 import { CHANNELS, SAMPLE_RATE_HZ, pcm16DurationSeconds, pcm16ToFloat } from './pcm';
 import { CallSetupError, NO_MICROPHONE_API, NO_WEB_AUDIO, microphoneRefusal } from './refusals';
 import { scheduleChunk } from './schedule';
@@ -30,6 +31,13 @@ export interface SocketHandlers {
 
 /** The microphone and the speaker, as one open device. */
 export interface AudioDevice {
+  /** Why this is not the microphone that was asked for, or `null`.
+   *
+   *  Carried on the device rather than thrown, because the call went up: the
+   *  chosen microphone was gone and the default answered instead. The runner
+   *  reports it, so nobody spends a call believing they are on a device they
+   *  are not. */
+  note: string | null;
   play(pcm: ArrayBuffer): void;
   stopPlayback(): void;
   close(): Promise<void>;
@@ -52,7 +60,18 @@ export interface CallPorts {
    * awake for nothing. A context a call IS using is left alone.
    */
   release(): void;
-  openAudio(onFrame: (samples: Float32Array) => void): Promise<AudioDevice>;
+  /**
+   * Open the microphone the workspace picked, or the system default.
+   *
+   * `deviceId` is what the reader chose on this device, and `null` is every
+   * call placed before anybody chose. A chosen device that no longer resolves
+   * does NOT fail the call: the default answers instead, and the returned
+   * device carries the note saying so.
+   */
+  openAudio(
+    onFrame: (samples: Float32Array) => void,
+    deviceId: string | null,
+  ): Promise<AudioDevice>;
   openSocket(threadId: string, handlers: SocketHandlers): CallSocket;
   /**
    * Did an upgrade survive every hop between here and the engine?
@@ -105,7 +124,10 @@ function releaseContext(): void {
   void context.close().catch(() => undefined);
 }
 
-async function openAudio(onFrame: (samples: Float32Array) => void): Promise<AudioDevice> {
+async function openAudio(
+  onFrame: (samples: Float32Array) => void,
+  deviceId: string | null,
+): Promise<AudioDevice> {
   const Ctor = audioContextCtor();
   if (!Ctor) throw new CallSetupError(NO_WEB_AUDIO);
   if (!navigator.mediaDevices?.getUserMedia) throw new CallSetupError(NO_MICROPHONE_API);
@@ -114,18 +136,11 @@ async function openAudio(onFrame: (samples: Float32Array) => void): Promise<Audi
   const context = primed;
 
   let stream: MediaStream;
+  let note: string | null;
   try {
-    // No sample rate is asked of the device. The context runs at 24 kHz and
-    // resamples the stream itself. Asking hardware for a rate it does not have
-    // is an `OverconstrainedError`, and no call at all.
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: CHANNELS,
-      },
-    });
+    ({ stream, note } = await openWithFallback(deviceId, (id) =>
+      navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints(id) }),
+    ));
   } catch (err) {
     throw new CallSetupError(microphoneRefusal(err));
   }
@@ -179,6 +194,7 @@ async function openAudio(onFrame: (samples: Float32Array) => void): Promise<Audi
   }
 
   return {
+    note,
     play(pcm: ArrayBuffer): void {
       const samples = pcm16ToFloat(pcm);
       if (samples.length === 0) return;

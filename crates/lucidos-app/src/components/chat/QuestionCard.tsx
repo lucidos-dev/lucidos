@@ -1,6 +1,5 @@
 import { signal, useSignal } from '@preact/signals';
 import { useEffect, useMemo, useRef } from 'preact/hooks';
-import { showToast } from '../../store/store';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
@@ -194,10 +193,10 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     // `followAnsweredQuestion`.
     followAnsweredQuestion(toolUseId);
     const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
-    if (!ok) {
-      localPending.value = null;
-      showToast('Could not send answer. Please try again.', 'error');
-    }
+    // Roll the optimistic pick back so the card goes live again. The action
+    // owns the message: a second toast here made one failed tap say two things,
+    // neither of them the cause. See `answerFailureMessage`.
+    if (!ok) localPending.value = null;
   };
 
   return (

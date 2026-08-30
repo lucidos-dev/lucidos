@@ -181,13 +181,8 @@ describe('leaving the thread', () => {
   });
 });
 
-describe('what the caller and the talker said', () => {
-  it('shows the engine transcript of a finished utterance', () => {
-    const { state } = drive([frame({ type: 'user_turn_ended', transcript: 'what is on today' })], live());
-    expect(state.heard).toBe('what is on today');
-  });
-
-  it('accumulates the talker reply from its deltas', () => {
+describe('who has the floor', () => {
+  it('hands it to the talker on the first delta of a reply', () => {
     const { state } = drive(
       [
         frame({ type: 'talker_transcript', text: 'Two ' }),
@@ -195,19 +190,35 @@ describe('what the caller and the talker said', () => {
       ],
       live(),
     );
-    expect(state.said).toBe('Two things.');
     expect(state.phase).toBe('speaking');
   });
 
-  it('clears the last reply when the next utterance lands', () => {
-    const { state } = drive([frame({ type: 'user_turn_ended', transcript: 'and after that' })], talking());
-    expect(state.said).toBe('');
-    expect(state.heard).toBe('and after that');
-  });
-
-  it('returns the floor when the talker finishes', () => {
+  it('returns it when the talker finishes', () => {
     const { state } = drive([frame({ type: 'talker_turn_ended' })], talking());
     expect(state.phase).toBe('listening');
+  });
+
+  it('leaves a finished caller utterance alone: the floor was already theirs', () => {
+    const before = live();
+    const { state, effects } = drive(
+      [frame({ type: 'user_turn_ended', transcript: 'what is on today' })],
+      before,
+    );
+    expect(state).toEqual(before);
+    expect(effects).toEqual([]);
+  });
+
+  it('keeps no words of its own, so nothing on screen can go stale', () => {
+    const words = ['what is on today', 'one moment'];
+    const { state } = drive(
+      [
+        frame({ type: 'user_turn_ended', transcript: words[0] }),
+        frame({ type: 'talker_transcript', text: words[1] }),
+      ],
+      live(),
+    );
+    expect(JSON.stringify(state)).not.toContain(words[0]);
+    expect(JSON.stringify(state)).not.toContain(words[1]);
   });
 });
 
@@ -224,11 +235,6 @@ describe('barge-in', () => {
     expect(drive([{ kind: 'barge-in' }]).effects).toEqual([]);
   });
 
-  it('keeps the words the caller already heard', () => {
-    const { state } = drive([{ kind: 'barge-in' }], talking());
-    expect(state.said).toBe('one moment');
-  });
-
   it('stops playback when the engine confirms the cut', () => {
     const { state, effects } = drive([frame({ type: 'interrupted' })], talking());
     expect(state.phase).toBe('listening');
@@ -243,7 +249,7 @@ describe('reading a phase', () => {
     expect(phases.filter(isLive)).toEqual(['listening', 'speaking']);
   });
 
-  it('shows the strip for everything but idle', () => {
+  it('calls everything but idle a call', () => {
     expect(phases.filter(isOnCall)).toEqual(['connecting', 'listening', 'speaking', 'ending']);
   });
 

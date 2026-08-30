@@ -121,6 +121,18 @@ fn the_url_carries_exactly_three_parameters() {
 }
 
 #[test]
+fn the_user_agent_carries_the_version_and_nothing_else() {
+    assert_eq!(user_agent("0.33.0"), "lucidos-gateway/0.33.0");
+    // The whole value, so a field smuggled in beside the version fails here.
+    // ADR 0108 allows the version because the query string already carries it,
+    // and allows nothing further.
+    let ua = user_agent(crate::LUCIDOS_RELEASE);
+    let (product, version) = ua.split_once('/').expect("product/version");
+    assert_eq!(product, "lucidos-gateway");
+    assert_eq!(version, crate::LUCIDOS_RELEASE);
+}
+
+#[test]
 fn platform_and_arch_keys_cover_what_we_publish_and_nothing_else() {
     assert_eq!(platform_key("macos"), Some("macos"));
     assert_eq!(platform_key("linux"), Some("linux"));
@@ -340,7 +352,15 @@ async fn the_request_carries_three_parameters_and_no_cookie() {
     let lower = request.to_lowercase();
     assert!(!lower.contains("cookie:"), "{request}");
     assert!(!lower.contains("authorization:"), "{request}");
-    assert!(lower.contains("user-agent: lucidos-gateway"), "{request}");
+    // Match the header NAME case-insensitively and keep the value's own case,
+    // so a version carrying a letter compares as sent rather than folded.
+    let sent_ua = request
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("user-agent:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim())
+        .expect("the request names itself");
+    assert_eq!(sent_ua, user_agent(crate::LUCIDOS_RELEASE), "{request}");
     let target = request.split_whitespace().nth(1).unwrap();
     let query = target.split_once('?').unwrap().1;
     let keys: Vec<&str> = query
@@ -348,6 +368,14 @@ async fn the_request_carries_three_parameters_and_no_cookie() {
         .map(|p| p.split_once('=').unwrap().0)
         .collect();
     assert_eq!(keys, vec!["platform", "arch", "version"]);
+    // ONE SOURCE, read off the wire. The user agent repeats the query
+    // parameter. A second version source would show up here as a
+    // disagreement, rather than as two places to keep in step by hand.
+    let sent_version = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("version="))
+        .expect("the query carries a version");
+    assert_eq!(sent_ua, format!("lucidos-gateway/{sent_version}"));
 }
 
 #[tokio::test]

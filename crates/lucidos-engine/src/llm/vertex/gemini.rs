@@ -71,35 +71,20 @@ impl VertexProvider {
             .cloned()
             .unwrap_or_default();
 
-        let mut sources = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            if i >= max_results {
-                break;
-            }
+        let mut sources: Vec<(String, String)> = Vec::new();
+        for chunk in chunks.iter().take(max_results) {
             let title = chunk["web"]["title"].as_str().unwrap_or("Untitled");
             let uri = chunk["web"]["uri"].as_str().unwrap_or("");
             if !uri.is_empty() {
-                sources.push(format!("{}. {}\n   {}", i + 1, title, uri));
+                sources.push((title.to_string(), uri.to_string()));
             }
         }
 
-        if answer.is_empty() && sources.is_empty() {
-            return Ok(format!("No search results found for: {}", query));
-        }
-
-        let mut result = String::new();
-        if !answer.is_empty() {
-            result.push_str(&answer);
-        }
-        if !sources.is_empty() {
-            if !result.is_empty() {
-                result.push_str("\n\n");
-            }
-            result.push_str("Sources:\n\n");
-            result.push_str(&sources.join("\n\n"));
-        }
-
-        Ok(result)
+        // Shared with the Anthropic and OpenAI backends so all three render one
+        // shape; hand-rolling it here is what let this backend drift.
+        Ok(crate::llm::web_search::format_search_result(
+            &answer, &sources,
+        ))
     }
 
     pub(super) async fn chat_gemini(

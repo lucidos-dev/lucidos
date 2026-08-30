@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use crate::engine::agent_question::aq_test_helpers::{emit_user_question, seed_cc_thread};
 use crate::engine::agent_recovery::{
-    preserve_question_park_at_shutdown, thread_has_unanswered_question,
+    newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
     unanswered_question_exists_sql,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
@@ -387,4 +387,76 @@ fn both_teardown_sites_consult_the_preserve_guard() {
         "the preserve guard must be passed the widened `is_shutdown`; its \
          argument list reads:\n{guard_call}"
     );
+}
+
+/// The row half of the predicate, for a reader that needs the question rather
+/// than a yes or no. A *voice session* opens with it, and the talker holds no
+/// tools, so a question absent from that block is one it cannot look up.
+#[tokio::test]
+async fn the_open_question_reads_back_with_its_choices() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_user_question(&bus, thread_id, "toolu_park").await;
+
+    let open = newest_open_question(&pool, thread_id)
+        .await
+        .expect("the thread is parked, so it has an open question");
+    assert_eq!(open.question, "Pick one");
+    assert_eq!(open.options.len(), 1);
+    assert_eq!(open.options[0].label, "A");
+    assert!(!open.multi_select);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// It shares the park predicate with the bool guard, so an answer closes both.
+/// Reading out a settled question is the failure this prevents.
+#[tokio::test]
+async fn an_answered_question_reads_back_as_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+    emit_user_question(&bus, thread_id, "toolu_park").await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: "toolu_park".into(),
+            answer: AnswerKind::Canceled,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("UserQuestionAnswered emit")
+    .expect("UserQuestionAnswered persisted");
+
+    assert_eq!(newest_open_question(&pool, thread_id).await, None);
+    assert!(!thread_has_unanswered_question(&pool, thread_id).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A thread nobody asked anything has no open question, and the reader says so
+/// rather than erroring. Every call on an ordinary thread takes this path.
+#[tokio::test]
+async fn a_thread_with_no_question_reads_back_as_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    assert_eq!(newest_open_question(&pool, thread_id).await, None);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }

@@ -269,6 +269,12 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Why:** The tooltip system is hover-driven; touch devices have no hover state, and there is no universal longpress-tooltip fallback.
 - **Status:** Open — mobile users don't get tooltip text; important affordances need a visible label instead.
 
+### A mouse hold on the call control swallows one later keyboard activation
+- **Where:** `crates/lucidos-app/src/hooks/useLongPress.ts`, opened by `components/chat/CallToggle.tsx` through `MicrophonePicker`
+- **Gap:** Hold the call control with a MOUSE to open the microphone picker, then activate that same control with the keyboard. The first Enter does nothing; the second works. Any pointer press on it clears the state.
+- **Why:** The picker's overlay makes the shell behind it inert, and it names no anchor. A gesture-opened overlay must not, or one tap would both dismiss the menu and place a call. A mouse has no implicit pointer capture, so the release hit-tests elsewhere. `onPointerUp` then never runs, and the fuse bounding the click-swallow is never armed. Touch is unaffected: implicit capture delivers the release.
+- **Status:** Open. Two fixes were tried and both were worse. Arming the fuse at fire time cuts a long hold's own swallow short, which would let a drawer-row hold also focus the thread. `setPointerCapture` retargets the paired `click`, so a press dragged off a control and released would fire its action. It also suppresses the boundary events `onPointerLeave` cancels on.
+
 ### The thread drawer overlay is desktop-only
 - **Where:** `crates/lucidos-app/src/components/drawer/ThreadDrawer.tsx` ("The drawer overlay (threadDrawerOpen) is desktop-only")
 - **Gap:** The overlay thread drawer (browse/keyboard-nav threads while viewing one) does not exist on mobile.

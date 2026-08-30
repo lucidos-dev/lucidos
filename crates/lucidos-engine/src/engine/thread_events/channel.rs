@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Source channel for events — determines thread type and routing.
+/// Source channel for events, which determines thread type and routing.
 ///
 /// Variant names track the *coding agent product* the channel belongs to,
 /// not the role. `ClaudeCode` serializes to `"claude_code"` — the wire
@@ -60,10 +60,10 @@ pub enum TriggerInvocation {
     /// A domain event fired this run. `event_type` is the matched event name;
     /// `event_id` is the source `events.id` (when known) so the popover can
     /// deep-link back to the originating event row. `thread_id` is the thread
-    /// the source event lives on (only set for thread-scoped events) — exposed
-    /// to script triggers as `TRIGGER_EVENT_THREAD_ID` so a script can pass
-    /// `--tap navigate --thread-id` (with optional `--event-id`) to
-    /// `lucidos notify` and deep-link the resulting push back to the
+    /// the source event lives on (only set for thread-scoped events). It is
+    /// exposed to script triggers as `TRIGGER_EVENT_THREAD_ID`. A script can
+    /// then pass `--tap navigate --thread-id` (with optional `--event-id`) to
+    /// `lucidos notify`, which deep-links the resulting push back to the
     /// originating conversation.
     Event {
         event_type: String,

@@ -3,8 +3,8 @@ import { makeLongPressHandlers, type LongPressHandlers } from './useLongPress';
 
 const DELAY = 450;
 
-function pointerDown(over: Partial<{ button: number; clientX: number; clientY: number }> = {}, target: object = {}): PointerEvent {
-  return { button: 0, clientX: 0, clientY: 0, currentTarget: target, ...over } as unknown as PointerEvent;
+function pointerDown(over: Partial<{ button: number; clientX: number; clientY: number; pointerId: number }> = {}, target: object = {}): PointerEvent {
+  return { button: 0, clientX: 0, clientY: 0, pointerId: 1, currentTarget: target, ...over } as unknown as PointerEvent;
 }
 function pointerMove(clientX: number, clientY = 0): PointerEvent {
   return { clientX, clientY } as unknown as PointerEvent;
@@ -104,6 +104,22 @@ describe('makeLongPressHandlers', () => {
   it('cancel() clears a pending hold so the timer never fires (unmount mid-press)', () => {
     h.onPointerDown(pointerDown());
     h.cancel();
+    vi.advanceTimersByTime(DELAY);
+    expect(onLongPress).not.toHaveBeenCalled();
+  });
+
+  /** Capture would retarget the paired click to this element, so a press
+   *  dragged off the control and released would fire its action. */
+  it('never captures the pointer', () => {
+    const setPointerCapture = vi.fn();
+    h.onPointerDown(pointerDown({ pointerId: 7 }, { setPointerCapture }));
+    expect(setPointerCapture).not.toHaveBeenCalled();
+  });
+
+  /** Leaving the element cancels the hold, which capture would suppress. */
+  it('a pointer that leaves the element cancels the hold', () => {
+    h.onPointerDown(pointerDown());
+    h.onPointerLeave({} as PointerEvent);
     vi.advanceTimersByTime(DELAY);
     expect(onLongPress).not.toHaveBeenCalled();
   });

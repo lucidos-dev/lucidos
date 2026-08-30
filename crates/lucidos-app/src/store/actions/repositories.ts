@@ -8,7 +8,7 @@ import {
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
-import { toFailed, loadedOr, setLoadingIfFresh } from '../types';
+import { toFailed, failedIfFresh, loadedOr, setLoadingIfFresh } from '../types';
 import { openFilePreview } from './artifacts';
 import { revealContentPane } from './pane';
 // From the module that DEFINES it, not chat.ts's back-compat re-export: the
@@ -77,7 +77,11 @@ export async function loadRepoChanges(repoId: string): Promise<void> {
     const data = await getRepoChanges(repoId, 20);
     repoChanges.value = { status: 'loaded', data };
   } catch (e: unknown) {
-    repoChanges.value = toFailed(e);
+    // `setLoadingIfFresh` above keeps a loaded list visible through the round
+    // trip, so the failure path must match. A transient refetch failure (e.g.
+    // `refreshRepoView` after a change applies) keeps the last-good list rather
+    // than showing an error. Only a first load records failed.
+    repoChanges.value = failedIfFresh(repoChanges.value, e);
   }
 }
 
@@ -192,17 +196,24 @@ export async function viewChangeDiff(change: Change): Promise<void> {
   pushNavState();
 }
 
+/** Ensure the registered repositories are loaded, toasting and returning false
+ *  on failure. Shared by the two diff-restore paths below. Carries the reason
+ *  the Loadable already holds: a bare generic drops the last link of the error
+ *  chain (.claude/rules/frontend.md, no hidden errors). */
+async function ensureRepositoriesLoaded(): Promise<boolean> {
+  if (repositories.value.status !== 'loaded') await loadRepositories();
+  if (repositories.value.status === 'failed') {
+    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
+    return false;
+  }
+  return true;
+}
+
 /** Load the repo + diff state for a change without touching navigation/overlay.
  *  Used to restore diff context after a reload, when the panel overlay was
  *  re-hydrated from nav history but its repoDiff/repoSource backing state was lost. */
 export async function loadChangeContext(change: Change): Promise<void> {
-  if (repositories.value.status !== 'loaded') await loadRepositories();
-  if (repositories.value.status === 'failed') {
-    // Carry the reason the Loadable already holds: a bare generic drops the
-    // last link of the error chain (.claude/rules/frontend.md, no hidden errors).
-    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
-    return;
-  }
+  if (!(await ensureRepositoriesLoaded())) return;
   const repos = loadedOr(repositories.value, []);
   const repo = repos.find(r => r.path === change.repo_root);
   if (!repo) {
@@ -360,13 +371,7 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
   panelOverlay.value = null;
   revealContentPane();
 
-  if (repositories.value.status !== 'loaded') await loadRepositories();
-  if (repositories.value.status === 'failed') {
-    // Carry the reason the Loadable already holds: a bare generic drops the
-    // last link of the error chain (.claude/rules/frontend.md, no hidden errors).
-    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
-    return;
-  }
+  if (!(await ensureRepositoriesLoaded())) return;
 
   // Flip to loading before the await so a stale prior diff doesn't leak
   // through to the panel during the network round-trip.

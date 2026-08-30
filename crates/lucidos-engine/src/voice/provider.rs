@@ -5,12 +5,15 @@
 //! talks to those two traits. So swapping `Realtime` for `Cascaded` changes no
 //! socket payload and no event shape (ADR 0149).
 //!
-//! **There is no tool field here, on purpose.** ADR 0149 makes the talker
-//! tool-less. A field nobody can set beats a field every implementation must
-//! remember to leave empty.
+//! **There is still no tool field here, on purpose.** The talker holds exactly
+//! one tool, `delegate`, and it is named by this module rather than passed in.
+//! A list nobody can append to beats a list every caller must remember not to
+//! grow. ADR 0149 made the talker tool-less, and the ADR superseding that
+//! clause keeps its guarantee: the one tool mutates nothing.
 
 use async_trait::async_trait;
 
+use super::language::SpokenLanguage;
 use crate::engine::ApiUsage;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -44,13 +47,24 @@ impl Default for AudioFormat {
 /// wait. It enters as the FIRST history item rather than as instructions. That
 /// way a refresh appends beside it instead of rewriting it (parent plan,
 /// decision 16).
+///
+/// `language` is what the caller is expected to speak, and `instructions`
+/// already carries its name. The field is here for the half a sentence cannot
+/// express: a transcriber is configured with a code, not asked in prose.
 #[derive(Debug, Clone)]
 pub struct SessionOpening {
     pub instructions: String,
     pub resident_block: String,
     /// The provider's name for a voice. Opaque to everything above the seam.
     pub voice: String,
+    /// The provider's name for the model turning caller audio into text. Opaque
+    /// in the same way, and for the same reason: a cascaded talker would name
+    /// its transcriber differently, or hold none at all.
+    pub transcriber: String,
     pub audio: AudioFormat,
+    /// `None` leaves the transcriber to guess, which is what it did before
+    /// anything here named a language.
+    pub language: Option<SpokenLanguage>,
 }
 
 /// What a talker produced.
@@ -67,6 +81,22 @@ pub enum VoiceEvent {
     UserTurnEnded { transcript: String },
     /// A piece of what the talker is saying, as it says it.
     TalkerTranscript { text: String },
+    /// The talker called `delegate`: this needs the doer.
+    ///
+    /// It arrives DURING the talker's turn, before [`Self::TalkerTurnEnded`].
+    /// That is what makes delegation free: waiting for the turn to end would
+    /// cost a full spoken reply of latency on every real question.
+    ///
+    /// The talker is never told whether a turn is already running, so this
+    /// means "the caller needs the doer" and never "wake it". Deciding between
+    /// starting a turn and joining one is the engine's business.
+    DelegationRequested {
+        /// The provider's handle for this call, opaque above the seam. It goes
+        /// back on [`VoiceSession::resolve_delegation`] and nowhere else.
+        delegation_id: String,
+        /// The talker's own few words on what the caller wants.
+        reason: String,
+    },
     /// The talker finished a reply, and reported what it spent.
     TalkerTurnEnded { transcript: String, usage: ApiUsage },
     /// The talker stopped mid-utterance because the caller spoke over it.
@@ -107,7 +137,7 @@ pub trait VoiceSession: Send {
     ///
     /// The other half of [`Self::append_context`], and the difference is the
     /// whole point: appending is silent, so an answer appended alone reaches
-    /// the caller's ear never. This is what the reasoner's answer travels on.
+    /// the caller's ear never. This is what the doer's answer travels on.
     ///
     /// Append-only too. It adds an item exactly as the silent one does, and
     /// asks for a reply on top.
@@ -115,6 +145,17 @@ pub trait VoiceSession: Send {
     /// **The caller decides when.** A talker mid-sentence must not be asked for
     /// a second reply, and this makes no such check: `call.rs` owns the floor.
     async fn speak(&mut self, note: &str) -> Result<(), BoxError>;
+
+    /// Tell the talker its `delegate` call landed.
+    ///
+    /// An unresolved call leaves a dangling item in the session's history, and
+    /// the talker reads that as work it never got an answer about. So this is
+    /// owed even when the delegation went nowhere.
+    ///
+    /// It asks for no reply. The talker already spoke in the turn that made
+    /// the call, and the real answer arrives later on [`Self::speak`].
+    async fn resolve_delegation(&mut self, delegation_id: &str, note: &str)
+        -> Result<(), BoxError>;
 
     /// The next thing the talker produced, or `None` once the session is over.
     async fn next(&mut self) -> Option<VoiceEvent>;

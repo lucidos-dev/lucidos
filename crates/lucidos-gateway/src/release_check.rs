@@ -33,9 +33,18 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// into a burst of outbound requests.
 pub const FORCED_POLL_FLOOR: Duration = Duration::from_secs(60);
 
-/// A constant, carrying no version and nothing about the user. The version is
-/// already a query parameter, and an absent user agent invites a bot challenge.
-const USER_AGENT: &str = "lucidos-gateway";
+/// The product name and the running version, and nothing about the user.
+///
+/// This adds NO information to the request. The version is already a query
+/// parameter, and this repeats it where the origin's zone logs can group by it:
+/// the plan denies the query dimension and allows the user agent. An absent user
+/// agent invites a bot challenge, which is why the gateway sends one at all.
+///
+/// Nothing else may join it. ADR 0108 requires aggregate counts with no
+/// per-request identity, and rejected an anonymous install id outright.
+fn user_agent(version: &str) -> String {
+    format!("lucidos-gateway/{version}")
+}
 
 /// Cap on the response body. The contract answers one small JSON object, so
 /// anything larger is a wrong origin rather than a big answer.
@@ -328,10 +337,13 @@ pub fn version_is_newer(candidate: &str, current: &str) -> bool {
 /// It follows no redirect, so the answer comes from the origin we asked. It
 /// carries no cookie store, because the `cookies` feature is off. A system proxy
 /// is honoured, since a corporate network may require one.
-fn build_client() -> reqwest::Client {
+///
+/// `version` is the one the request also carries in its query string. The caller
+/// passes the same value to both, so the user agent cannot drift from it.
+fn build_client(version: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(USER_AGENT)
+        .user_agent(user_agent(version))
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .build()
@@ -422,6 +434,9 @@ impl ReleaseCheck {
             }
             _ => None,
         };
+        // Bound once, so the query parameter and the user agent read the same
+        // value by construction rather than by two lookups agreeing.
+        let current_version = crate::LUCIDOS_RELEASE;
         ReleaseCheck {
             origin: origin.to_string(),
             interval,
@@ -430,8 +445,8 @@ impl ReleaseCheck {
             command,
             target,
             config_path: dep.config_path.clone(),
-            current_version: crate::LUCIDOS_RELEASE,
-            client: build_client(),
+            current_version,
+            client: build_client(current_version),
             state: Mutex::new(ReleaseState::default()),
             poll_lock: AsyncMutex::new(()),
         }

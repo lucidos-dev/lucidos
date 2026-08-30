@@ -224,9 +224,19 @@ pub async fn spawn_coding_agent_in_workspace(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // A transport failure names the assumption when the scheme was a guess. A
+    // bare "record overflow" is a TLS handshake meeting a plain-http socket.
+    // Nothing in it points at the ports file that failed to say so.
     let resp = workspace_post(client, &url, &body, ctx, &target_workspace)
         .await
-        .map_err(|e| format!("cross-workspace POST to {} failed: {}", url, e))?;
+        .map_err(|e| {
+            format!(
+                "cross-workspace POST to {} failed: {}{}",
+                url,
+                e,
+                target.assumed_proto_note()
+            )
+        })?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -521,6 +531,7 @@ mod tests {
             workspace_path: std::path::PathBuf::from("/tmp/fake-ws"),
             api_port: port,
             proto: "http".to_string(),
+            proto_assumed: false,
         };
         let ctx = WorkspaceCallCtx {
             self_workspace: "dev".into(),
@@ -604,6 +615,7 @@ mod tests {
             workspace_path: std::path::PathBuf::from("/tmp/workspaces/myws"),
             api_port: port,
             proto: "http".to_string(),
+            proto_assumed: false,
         };
         let ctx = WorkspaceCallCtx {
             self_workspace: "dev".into(),
@@ -659,6 +671,7 @@ mod tests {
             workspace_path: std::path::PathBuf::from("/tmp/fake"),
             api_port: port,
             proto: "http".to_string(),
+            proto_assumed: false,
         };
         let client = cross_workspace_http_client();
         let err = spawn_coding_agent_in_workspace(

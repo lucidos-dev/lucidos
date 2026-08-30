@@ -356,10 +356,17 @@ impl LucidosEngine {
             "Settable preferences — set with set_preference(key, value). Device-scoped keys apply to the calling device only.\n",
         );
         for spec in preference_catalog::CATALOG {
-            let current = effective
-                .get(spec.key)
-                .map(String::as_str)
-                .unwrap_or("(unset)");
+            // An empty stored value is named, never rendered as `(unset)` or
+            // as a blank. It states the STATE, which is true of every key: the
+            // row exists and holds nothing. What that state MEANS is per-key,
+            // and the description is where each key says so. It matters for
+            // `voice_resident_sections`, where an empty row means no sections
+            // and an absent one means the three defaults.
+            let current = match effective.get(spec.key).map(String::as_str) {
+                None => "(unset)",
+                Some("") => "(empty)",
+                Some(v) => v,
+            };
             let scope = match spec.scope {
                 PrefScope::Device => "device",
                 PrefScope::Global => "global",

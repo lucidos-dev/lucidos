@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Why a session ended — used by frontend for status/display logic.
+/// Why a session ended. The frontend uses it for status and display logic.
 ///
 /// Mostly terminal-only (Phase 4 of the CC resume architecture): every CC turn
 /// ends with `CodingAgentIdled` as a turn boundary; `SessionEnded` fires when

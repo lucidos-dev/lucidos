@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, currentFontFamily, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -1512,5 +1512,71 @@ describe('notification_toasts: the mirror that survives a cold start', () => {
     vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
     void setNotificationToasts(false);
     expect(localStorage.getItem(KEY)).toBe('false');
+  });
+});
+describe('the resident-block sections a call opens with', () => {
+  const KEY = 'voice_resident_sections';
+
+  function stored(): string | undefined {
+    if (preferences.value.status !== 'loaded') return undefined;
+    return preferences.value.data[KEY];
+  }
+
+  beforeEach(() => {
+    _resetPendingPreferenceWritesForTesting();
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  afterEach(() => {
+    preferences.value = { status: 'not-loaded' };
+    vi.restoreAllMocks();
+  });
+
+  /** Nothing stored is the registry's own defaults, which is what the engine
+   *  falls back to for a workspace that never opened this screen. */
+  it('reads unset as the sections that ship on', () => {
+    for (const section of VOICE_RESIDENT_SECTIONS) {
+      expect(voiceSectionEnabled(section.id)).toBe(section.onByDefault);
+    }
+  });
+
+  it('reads a stored list as exactly that list', () => {
+    preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread' } };
+    expect(voiceSectionEnabled('this-thread')).toBe(true);
+    expect(voiceSectionEnabled('who-and-where')).toBe(false);
+  });
+
+  /** The first toggle-off has to write the OTHER two, not just its own absence:
+   *  an empty value would turn everything off at once. */
+  it('turning one off writes the rest', async () => {
+    await setVoiceSectionEnabled('this-thread', false);
+    expect(stored()).toBe('who-and-where,workspace-shape');
+  });
+
+  /** The whole point of an empty value meaning none. Without it the last
+   *  toggle reads as unset and brings all three back. */
+  it('turning the last one off stores an empty list', async () => {
+    preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread' } };
+    await setVoiceSectionEnabled('this-thread', false);
+    expect(stored()).toBe('');
+    expect(voiceSectionEnabled('this-thread')).toBe(false);
+  });
+
+  /** The registry's order, not the order they were clicked in. The engine
+   *  renders in its own order, so two workspaces with the same sections on
+   *  should store the same string. */
+  it('writes the registry order however they were toggled', async () => {
+    preferences.value = { status: 'loaded', data: { [KEY]: 'workspace-shape' } };
+    await setVoiceSectionEnabled('who-and-where', true);
+    expect(stored()).toBe('who-and-where,workspace-shape');
+  });
+
+  /** A newer engine can define a section this client has never heard of.
+   *  Dropping it on the next toggle would silently turn it off. */
+  it('keeps an id the registry does not carry', async () => {
+    preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread,from-the-future' } };
+    await setVoiceSectionEnabled('who-and-where', true);
+    expect(stored()).toBe('who-and-where,this-thread,from-the-future');
   });
 });

@@ -1,7 +1,13 @@
-# 0149: The talker is rented and tool-less; the reasoner is the standard Lucidos Agent, unmodified
+# 0149: The talker is rented and tool-less; the doer is the standard Lucidos Agent, unmodified
 
-- **Status**: Accepted
+- **Status**: Accepted, with the tool-less clause superseded by ADR 0164
 - **Date**: 2026-08-28
+
+**What changed.** The talker now holds exactly one tool, `delegate`, and it
+decides whether an utterance needs the doer. Read every "tool-less" and "empty
+tool list" below as one delegation tool. The guarantee is untouched: that tool
+mutates nothing, so a talker that gets something wrong still only says a wrong
+sentence. ADR 0164 has the reasoning, and it closes the last consequence here.
 
 ## Context
 
@@ -30,31 +36,30 @@ The **talker** is rented. It hears, it speaks, and it does nothing else. It
 holds no tool schemas, so it can mutate nothing. It is opened with an empty tool
 list, for every `VoiceProvider` implementation.
 
-The **reasoner** is the standard Lucidos Agent, unmodified. It owns every tool
-and does all the work. It is never told a voice session is live. It is shown
-one, by reading the talker's turns in the thread.
+The **doer** is the standard Lucidos Agent, unmodified. It owns every tool and
+does all the work. It is never told a voice session is live. It is shown one,
+by reading the talker's turns in the thread.
 
 **The user meets one entity.** The talker speaks as Lucidos, in the first
 person, and the persona never changes hands. It may stall truthfully while work
 runs, because work really is running on its behalf. It may not state a fact it
-did not receive from the reasoner. The split attribution in ADR 0150 is
-internal, and the user never meets it.
+did not receive from the doer. The split attribution in ADR 0150 is internal,
+and the user never meets it.
 
 ## Rationale
 
 This is the canonical Talker-Reasoner split, and the reason it is canonical is
 that the two roles have different failure modes. A talker that gets something
-wrong says a wrong sentence. A reasoner that gets something wrong sends an
-email.
+wrong says a wrong sentence. A doer that gets something wrong sends an email.
 
 A tool-less talker cannot make the second kind of mistake. That is a structural
 guarantee, not a prompt we hope holds.
 
-Keeping the reasoner unmodified is the other half. The philosophy rule is *own
-the surface, rent the model*: the model that speaks is rented and replaceable,
-and the agent that acts is ours. Telling the reasoner that voice is live would
-break that, because the same question would then get two answers depending on
-how it was asked. The user would have no way to predict which one they get.
+Keeping the doer unmodified is the other half. The philosophy rule is *own the
+surface, rent the model*: the model that speaks is rented and replaceable, and
+the agent that acts is ours. Telling the doer that voice is live would break
+that, because the same question would then get two answers depending on how it
+was asked. The user would have no way to predict which one they get.
 
 A second toolset is also a second thing to keep correct. Every tool added to the
 engine would need a decision about whether the voice model gets it too. There is
@@ -78,23 +83,24 @@ it.
 
 ## Consequences
 
-- Nothing spoken can act. Every action goes through the reasoner and its
-  ordinary turn, with its ordinary admission and its ordinary events.
-- A spoken turn is slower to *act* than a purpose-built voice agent would be. It
-  is not slower to *answer*, because the talker replies immediately.
-- The talker needs the reasoner's progress narrated to it, or it has nothing to
-  say while work runs. That is a real cost and it is what the appended summaries
-  in phase 5 pay.
+- Nothing spoken can act. Every action goes through the doer and its ordinary
+  turn, with its ordinary admission and its ordinary events.
+- A spoken turn is slower to *act* than a purpose-built voice agent would be.
+  It is not slower to *answer*, because the talker replies immediately.
+- The talker needs the doer's progress narrated to it, or it has nothing to say
+  while work runs. That is a real cost and it is what the appended summaries in
+  phase 5 pay.
 - Swapping the rented model changes no engine behaviour, because no engine
   behaviour depends on it.
-- The reasoner's assembled system prompt is byte-identical whether a session is
+- The doer's assembled system prompt is byte-identical whether a session is
   live or not. A test asserts it.
 - The transcript renders a spoken turn as Lucidos, because that is who the user
   heard. The agent actor stays on the event, so the route popover can still say
   the turn was spoken.
-- Every spoken turn starts a reasoner turn, because the engine decides and the
+- ~~Every spoken turn starts a doer turn, because the engine decides and the
   talker cannot. GPT-Live's talker delegates, so it can skip the frontier model
-  on a cheap turn. Ours cannot, and the plan carries that as an open question.
+  on a cheap turn. Ours cannot, and the plan carries that as an open question.~~
+  Closed by ADR 0164: ours delegates too, and a cheap turn now costs one model.
 - What voice answers instantly is bounded by the resident block, so that block
   is a product decision rather than a tuning detail.
 
@@ -117,13 +123,14 @@ agentic loop is dead air, which is the failure mode voice has to avoid first.
 The `Cascaded` implementation is close to this shape, and the seam keeps the
 option open.
 
-**The talker as a narrator, reporting on the reasoner in the third person.**
+**The talker as a narrator, reporting on the doer in the third person.**
 Structurally honest: it never claims first-hand knowledge, because it has none.
 Rejected: it costs the single-entity presentation for a problem a prompt
-constraint solves, and it makes reading a question aloud awkward. GPT-Live keeps
-the persona with the voice model for the same reason.
+constraint solves, and it makes reading a question aloud awkward. GPT-Live
+keeps the persona with the voice model for the same reason.
 
-**Telling the reasoner that voice is live.** Tempting, because it could then
-write shorter replies. Rejected: it makes the agent's answer depend on the input
-channel, which is the one thing a user cannot see and cannot predict. Shortening
-for speech is the talker's job, and the talker is the one with the microphone.
+**Telling the doer that voice is live.** Tempting, because it could then write
+shorter replies. Rejected: it makes the agent's answer depend on the input
+channel, which is the one thing a user cannot see and cannot predict.
+Shortening for speech is the talker's job, and the talker is the one with the
+microphone.

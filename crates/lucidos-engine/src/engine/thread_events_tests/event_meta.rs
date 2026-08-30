@@ -78,6 +78,7 @@ fn event_meta_actor_none_omits_field() {
 #[test]
 fn indexable_text_returns_content_for_chat_events() {
     let msg = ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "hello".into(),
         user_image_hashes: vec![],
         device_id: None,

@@ -32,6 +32,7 @@ async fn descendant_flip_broadcasts_ancestor_aggregate() {
     bus.emit(BusEvent::Thread {
         thread_id: grandparent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "root".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -55,6 +56,7 @@ async fn descendant_flip_broadcasts_ancestor_aggregate() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "mid".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -95,6 +97,7 @@ async fn descendant_flip_broadcasts_ancestor_aggregate() {
     bus.emit(BusEvent::Thread {
         thread_id: grandchild_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "cc task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -138,6 +141,7 @@ async fn descendant_flip_broadcasts_ancestor_aggregate() {
     bus.emit(BusEvent::Thread {
         thread_id: grandchild_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "wake".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -226,6 +230,7 @@ async fn no_blocking_flip_does_not_rebroadcast_ancestors() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "ping".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -318,6 +323,7 @@ async fn per_token_streaming_does_not_sample_blocking() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "ping".into(),
             user_image_hashes: vec![],
             device_id: None,

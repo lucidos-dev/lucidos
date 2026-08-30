@@ -1107,7 +1107,13 @@ mod tests {
     /// moved to a page of their own. Without a value naming that page, the
     /// model cannot ask for them at all. Knowhow cannot carry it: the enum is
     /// what the model picks from when it writes the argument.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_631;
+    ///
+    /// Raised by 132 to a measured 116,763 for the `secret` credential type.
+    /// The agent's only always-loaded list of the types omitted it, so it told
+    /// a user the type did not exist. The list is now rendered from `AuthType`,
+    /// and one line says what a `secret` is for. Knowhow cannot carry it: the
+    /// enum is what the model picks from when it writes the argument.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_763;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1356,9 +1362,13 @@ mod tests {
         ),
         (
             "request_credential",
-            2_150,
+            2_200,
             "thirteen properties, seven of them the oauth_client endpoint set, \
-             each already one line pointing at system-knowhow/oauth-providers",
+             each already one line pointing at system-knowhow/oauth-providers. \
+             Raised from 2,150 by the `secret` type: it adds a sixth enum \
+             value, and `base_url` left `required` because a secret declares \
+             no scope, so this schema is the only surface saying which types \
+             still need one",
         ),
         (
             "ask_user_question",

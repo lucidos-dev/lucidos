@@ -18,7 +18,12 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { installPlatformOf, installSteps, pairingScreenBranch } from '../PairingGate';
+import {
+  installPlatformOf,
+  installSteps,
+  onPhoneCodeSource,
+  pairingScreenBranch,
+} from '../PairingGate';
 import { clipboardAbilitiesOf } from '../../../utils/platform';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -138,5 +143,34 @@ describe('what the pasteboard can do here', () => {
   it('gates each control on its own ability', () => {
     expect(gateSrc).toMatch(/clipboardAbilities\(\)\.copy/);
     expect(gateSrc).toMatch(/clipboardAbilities\(\)\.paste/);
+  });
+});
+
+describe('where an installed app is told to get a code', () => {
+  it('names the phone browser, so recovery needs no second machine', () => {
+    // The container that loses its credential is the installed one. The browser
+    // on the same phone keeps its own, so it is a paired device and may mint a
+    // code. This screen is the only place that could say so.
+    const said = onPhoneCodeSource(true);
+    expect(said).toBeTruthy();
+    expect(said).toMatch(/phone browser/i);
+    expect(said).toMatch(/Settings → Access/);
+  });
+
+  it('says nothing in a browser, which has no second container to reach', () => {
+    expect(onPhoneCodeSource(false)).toBeNull();
+  });
+
+  it('shows it only when no launch code is being redeemed', () => {
+    // A code already in hand makes the whole question moot, and the screen is
+    // mid-redeem at that point.
+    expect(gateSrc).toMatch(/\{!scanned && onPhoneSource &&/);
+  });
+
+  it('redeems only a launch code this client has not spent', () => {
+    // An installed icon relaunches one `start_url` for good. An ungated
+    // auto-redeem therefore fails on every cold launch, and spends the
+    // gateway's wrong-guess budget doing it.
+    expect(gateSrc).toMatch(/takeUnspentPairingCodeFromUrl\(\)/);
   });
 });

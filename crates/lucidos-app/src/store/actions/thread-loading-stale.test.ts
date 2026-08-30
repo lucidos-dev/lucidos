@@ -39,6 +39,7 @@ import {
   refreshStaleThreadEvents,
   refreshThreadEvents,
   threadEventsStillArriving,
+  threadLoadInFlightMs,
 } from './thread-loading';
 import { focusThread } from './threads';
 import { fetchThreadEvents } from '../../api/threads';
@@ -358,5 +359,65 @@ describe('threadEventsStillArriving', () => {
 
   it('is false for a thread that has left the map', () => {
     expect(threadEventsStillArriving('gone')).toBe(false);
+  });
+});
+
+describe('threadLoadInFlightMs', () => {
+  // The watchdog's question, and the thing it could not ask while the
+  // in-flight map held a bare token. A thread showing nothing is either SLOW
+  // or STALLED, and only the second is worth restarting: restarting the first
+  // re-downloads the whole snapshot over the pipe already carrying it.
+  it('is null when nothing is in flight', () => {
+    putThreads([['t1', makeThreadState('t1')]]);
+    expect(threadLoadInFlightMs('t1')).toBeNull();
+  });
+
+  it('is null for a thread that has left the map', () => {
+    expect(threadLoadInFlightMs('gone')).toBeNull();
+  });
+
+  it('is an elapsed time while a load is running', async () => {
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockImplementation(() => new Promise(() => {})); // never settles
+    void loadThreadEvents('t1');
+    await settle();
+
+    const elapsed = threadLoadInFlightMs('t1');
+    expect(elapsed).not.toBeNull();
+    expect(elapsed).toBeGreaterThanOrEqual(0);
+  });
+
+  it('spans the retry backoff, not just one attempt', async () => {
+    // The reader is waiting through the whole chain, so that is what the
+    // watchdog has to measure. A per-attempt clock would reset mid-wait and
+    // read a long stall as three short ones.
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockRejectedValue(new Error('boom'));
+    void loadThreadEvents('t1');
+    await settle();
+
+    expect(threadLoadInFlightMs('t1')).not.toBeNull();
+  });
+
+  it('goes back to null once the load settles', async () => {
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockResolvedValue({ events: [], currentAggregate: null });
+    await loadThreadEvents('t1');
+
+    expect(threadLoadInFlightMs('t1')).toBeNull();
+  });
+
+  it('goes back to null when the guards are cleared on resume', async () => {
+    // `clearThreadFetchGuards` drops the claim, so the watchdog sees nothing
+    // in flight and may restart at once. That is right: a request WebKit left
+    // hanging holds no claim, and nothing else will finish it.
+    putThreads([['t1', makeThreadState('t1')]]);
+    fetchEvents.mockImplementation(() => new Promise(() => {}));
+    void loadThreadEvents('t1');
+    await settle();
+
+    clearThreadFetchGuards();
+
+    expect(threadLoadInFlightMs('t1')).toBeNull();
   });
 });

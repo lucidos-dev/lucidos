@@ -66,6 +66,8 @@ pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
         output_tokens: response.output_tokens.unwrap_or(0),
         cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
         cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
+        // Chat providers report one blended total per direction.
+        modality: None,
     })
 }
 
@@ -74,6 +76,7 @@ pub(crate) fn usage_from_response(response: &LlmResponse) -> Option<ApiUsage> {
 /// `None` when it reported no input tokens, which is Imagen: it prices per
 /// image, so a zeroed block would read as a call that cost nothing. Image
 /// endpoints have no prompt cache, so both cache counters are zero.
+/// `modality` stays `None`: these endpoints report one total per direction.
 pub(crate) fn usage_from_image(
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
@@ -83,6 +86,7 @@ pub(crate) fn usage_from_image(
         output_tokens: output_tokens.unwrap_or(0),
         cache_read_tokens: 0,
         cache_creation_tokens: 0,
+        modality: None,
     })
 }
 

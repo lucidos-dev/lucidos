@@ -116,6 +116,9 @@ mod context_capture_lazy_test;
 #[path = "api_support/tool_result_lazy_test.rs"]
 mod tool_result_lazy_test;
 
+#[path = "api_support/tool_args_lazy_test.rs"]
+mod tool_args_lazy_test;
+
 #[path = "api_support/event_location_test.rs"]
 mod event_location_test;
 

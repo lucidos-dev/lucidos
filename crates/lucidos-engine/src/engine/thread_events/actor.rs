@@ -30,7 +30,7 @@ impl ActorMode {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineReason {
     /// Resume after an interrupted response (chat/CC). Past name was
-    /// `session_recovered` — kept as serde alias for old DB rows. Renamed
+    /// `session_recovered`, kept as serde alias for old DB rows. Renamed
     /// alongside the `ContinuationStarted` event for the same reasons
     /// (session-vs-thread ambiguity; the new response is a continuation, not a
     /// recovery of the prior one).
@@ -39,7 +39,7 @@ pub enum EngineReason {
     /// Generic orphan thread recovery (non-CC).
     OrphanRecovery,
     /// Scheduled trigger fired. `trigger_id` is the trigger's user-facing
-    /// `config.id` (a string — typically a v4 UUID) so the route popover can
+    /// `config.id` (a string, typically a v4 UUID) so the route popover can
     /// match it directly against `/api/v1/triggers`.
     Scheduler {
         trigger_id: String,
@@ -56,7 +56,7 @@ pub enum EngineReason {
     MissingHardening,
     /// Historical: the engine used to silently apply marketplace plugin updates
     /// in the background and stamped the resulting `PluginInstalled` event with
-    /// this reason. That behavior was retired — the engine now checks for
+    /// this reason. That behavior was retired: the engine now checks for
     /// updates and notifies the user, who applies them from the Apps section.
     /// Retained (not constructed by new code) so old `PluginInstalled` events
     /// carrying this actor still deserialize.
@@ -189,7 +189,7 @@ pub enum MessageOrigin {
     },
     /// Mode = Human, Agent, or Engine (carried in `mode`). Bidirectional link
     /// to another thread in the same workspace. `direction = Parent` means
-    /// the linked thread *spawned* the receiving thread; `direction = Child`
+    /// the linked thread *spawned* the receiving thread. `direction = Child`
     /// means the linked thread is a child posting a callback back into the
     /// receiving (parent) thread.
     ///
@@ -233,7 +233,7 @@ pub enum MessageOrigin {
     /// Implies `ActorMode::Engine`.
     Engine { reason: EngineReason },
     /// The host system killed the underlying process (engine shutdown, OS signal,
-    /// crash, safety net catch). The engine only marks the abort — it didn't
+    /// crash, safety net catch). The engine only marks the abort; it didn't
     /// decide to abort. Distinct from `Engine` which represents engine-deliberate
     /// actions (hardening retrigger, merge conflict, scheduler). Renders as
     /// "System" in the UI. Implies `ActorMode::Engine` (deterministic, non-human,

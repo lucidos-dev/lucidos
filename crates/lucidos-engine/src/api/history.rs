@@ -1019,6 +1019,10 @@ pub(super) fn router() -> Router<AppState> {
             get(super::threads::get_tool_result),
         )
         .route(
+            "/events/:event_id/tool-args",
+            get(super::threads::get_tool_args),
+        )
+        .route(
             "/events/:event_id/location",
             get(super::threads::get_event_location),
         )

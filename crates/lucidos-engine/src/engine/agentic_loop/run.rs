@@ -777,6 +777,8 @@ impl LucidosEngine {
                     output_tokens: response.output_tokens.unwrap_or(0),
                     cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
                     cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
+                    // Chat providers report one blended total per direction.
+                    modality: None,
                 });
             // Calibration breadcrumb for the chars/token ratio baked into
             // `estimate_tokens_from_chars`. This line is what retuned it from

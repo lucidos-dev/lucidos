@@ -41,16 +41,36 @@ function componentsIn(node: ComponentChildren): unknown[] {
   return [...self, ...componentsIn(vnode.props?.children)];
 }
 
-const cluster = (codingAgent: 'claude-code' | 'codex' | null) =>
-  componentsIn(
-    PromptRowControls({
-      codingAgent,
-      codingAgentThreadId: codingAgent ? 'thread-1' : undefined,
-      composeThreadId: undefined,
-      lucidosThreadId: codingAgent ? undefined : 'thread-1',
-      composeContext: false,
-    }),
-  );
+const row = (codingAgent: 'claude-code' | 'codex' | null) =>
+  PromptRowControls({
+    codingAgent,
+    codingAgentThreadId: codingAgent ? 'thread-1' : undefined,
+    composeThreadId: undefined,
+    lucidosThreadId: codingAgent ? undefined : 'thread-1',
+    composeContext: false,
+  });
+
+const cluster = (codingAgent: 'claude-code' | 'codex' | null) => componentsIn(row(codingAgent));
+
+/** The props one component was handed, found by walking the same tree.
+ *
+ *  The walk above reports a vnode's TYPE, so it sees `CallToggle` whether or
+ *  not the toggle draws anything. Whether it draws is a prop, so reading the
+ *  prop is the only way to pin it without a DOM.
+ */
+function propsOf(node: ComponentChildren, component: unknown): AnyVNode['props'] | null {
+  if (node === null || node === undefined || typeof node === 'boolean') return null;
+  if (typeof node === 'string' || typeof node === 'number') return null;
+  if (Array.isArray(node)) {
+    return node.reduce<AnyVNode['props'] | null>(
+      (found, child) => found ?? propsOf(child, component),
+      null,
+    );
+  }
+  const vnode = node as AnyVNode;
+  if (vnode.type === component) return vnode.props;
+  return propsOf(vnode.props?.children, component);
+}
 
 describe('PromptRowControls', () => {
   it.each<['a Claude Code thread' | 'a Codex thread', 'claude-code' | 'codex']>([
@@ -101,5 +121,25 @@ describe('PromptRowControls', () => {
     expect(cluster('claude-code')).toEqual([
       CodingAgentControlMenu, FollowLiveEdgeIcon, CallToggle, WaitingIndicator,
     ]);
+  });
+
+  /** A call reaches the Lucidos Agent and nothing else (ADR 0165), so the row
+   *  tells the toggle whether this destination can take one.
+   *
+   *  The toggle stays MOUNTED and draws nothing, which is why the order test
+   *  above is unchanged. Its slot is fixed; only its contents go.
+   *
+   *  `codingAgent` is `effectiveCodingAgentBackend`, so one prop covers all
+   *  three cases: a started coding-agent thread, a composing draft, and the
+   *  fresh compose view with the destination picked and no draft yet. */
+  it.each<['a Claude Code thread' | 'a Codex thread', 'claude-code' | 'codex']>([
+    ['a Claude Code thread', 'claude-code'],
+    ['a Codex thread', 'codex'],
+  ])('tells the call toggle it is unavailable on %s', (_label, agent) => {
+    expect(propsOf(row(agent), CallToggle)?.available).toBe(false);
+  });
+
+  it('tells the call toggle it is available on a Lucidos Agent thread', () => {
+    expect(propsOf(row(null), CallToggle)?.available).toBe(true);
   });
 });

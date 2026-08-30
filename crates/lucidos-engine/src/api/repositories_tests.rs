@@ -494,6 +494,7 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "implement the ticket".into(),
             user_image_hashes: vec![],
             device_id: None,

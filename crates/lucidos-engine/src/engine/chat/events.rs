@@ -48,6 +48,7 @@ pub(crate) fn make_message_received(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     explicit_origin: Option<MessageOrigin>,
+    voice_session_id: Option<Uuid>,
 ) -> crate::engine::thread_events::ThreadEvent {
     let origin = explicit_origin.or_else(|| {
         synthesize_legacy_origin(
@@ -70,6 +71,7 @@ pub(crate) fn make_message_received(
         model,
         reasoning_effort,
         origin,
+        voice_session_id,
     )
     .expect("API boundary must build origin matching mode; legacy synthesis is always valid")
 }
@@ -90,6 +92,8 @@ pub(super) fn make_message_received_with_origin(
     model: Option<&str>,
     reasoning_effort: Option<&str>,
     origin: Option<MessageOrigin>,
+    // Set only by the voice path. Every other caller types.
+    voice_session_id: Option<Uuid>,
 ) -> Result<crate::engine::thread_events::ThreadEvent, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(o) = &origin {
         validate_origin_mode(o, mode)?;
@@ -106,6 +110,7 @@ pub(super) fn make_message_received_with_origin(
         model: model.map(|s| s.to_string()),
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         origin,
+        voice_session_id,
     })
 }
 
@@ -217,6 +222,10 @@ impl crate::engine::LucidosEngine {
         reasoning_effort: Option<&str>,
         event_id: Option<&str>,
         origin: Option<MessageOrigin>,
+        // The *voice session* this message was spoken on. `None` is typed.
+        // The voice path passes the same id to the turn it then starts, so a
+        // message this function declines to pre-emit still lands marked.
+        voice_session_id: Option<Uuid>,
     ) -> Option<crate::engine::PreEmittedOrigin> {
         let thread_id = thread_id?;
         if !chat_message_is_pre_emittable(mode, use_coding_agent, thread_exists) {
@@ -267,6 +276,7 @@ impl crate::engine::LucidosEngine {
                     model.as_deref(),
                     reasoning_effort.as_deref(),
                     origin,
+                    voice_session_id,
                 ),
                 meta: EventMeta {
                     event_id: event_id.and_then(|s| Uuid::parse_str(s).ok()),
@@ -413,7 +423,7 @@ pub(super) async fn emit_routing_failure(
 #[cfg(test)]
 mod origin_invariants {
     use super::*;
-    use crate::engine::thread_events::MessageOrigin;
+    use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
     use uuid::Uuid;
 
     #[test]
@@ -434,6 +444,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -456,6 +467,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_err(), "Device origin must reject non-Human mode");
     }
@@ -479,6 +491,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -503,6 +516,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(
             res.is_ok(),
@@ -530,6 +544,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok(), "Api origin must accept Engine mode");
     }
@@ -554,6 +569,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_err(), "Api origin mode must match request mode");
     }
@@ -579,6 +595,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -604,6 +621,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(
             res.is_err(),
@@ -632,6 +650,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -657,6 +676,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(
             res.is_err(),
@@ -681,6 +701,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -702,6 +723,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_err(), "Engine origin must reject non-Engine mode");
     }
@@ -725,6 +747,7 @@ mod origin_invariants {
             Some(parent_id),
             spawn_id,
             ActorMode::Agent,
+            None,
             None,
             None,
             None,
@@ -777,6 +800,7 @@ mod origin_invariants {
             None,
             None,
             Some(origin),
+            None,
         );
         assert!(res.is_ok());
     }
@@ -795,6 +819,7 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
         );
         assert!(res.is_ok());
         let res2 = make_message_received_with_origin(
@@ -809,8 +834,81 @@ mod origin_invariants {
             None,
             None,
             None,
+            None,
         );
         assert!(res2.is_ok());
+    }
+
+    /// A spoken message names its *voice session*, and a typed one names none.
+    ///
+    /// The field is the whole of how the transcript tells the two apart. Voice
+    /// is a mode of a thread (ADR 0148), so a typed message sits between the
+    /// same pair of session events a spoken one does.
+    #[test]
+    fn a_spoken_message_is_marked_and_a_typed_one_is_not() {
+        let session_id = Uuid::new_v4();
+        let spoken = make_message_received(
+            std::path::Path::new(""),
+            "what have I got running",
+            None,
+            Some("dev-1"),
+            None,
+            None,
+            None,
+            ActorMode::Human,
+            None,
+            None,
+            None,
+            Some(session_id),
+        );
+        let typed = make_message_received(
+            std::path::Path::new(""),
+            "what have I got running",
+            None,
+            Some("dev-1"),
+            None,
+            None,
+            None,
+            ActorMode::Human,
+            None,
+            None,
+            None,
+            None,
+        );
+        let ThreadEvent::MessageReceived {
+            voice_session_id: on_spoken,
+            ..
+        } = spoken
+        else {
+            panic!("not a MessageReceived");
+        };
+        let ThreadEvent::MessageReceived {
+            voice_session_id: on_typed,
+            ..
+        } = typed
+        else {
+            panic!("not a MessageReceived");
+        };
+        assert_eq!(on_spoken, Some(session_id));
+        assert_eq!(on_typed, None);
+    }
+
+    /// Every row written before voice existed still decodes, and reads typed.
+    #[test]
+    fn a_row_from_before_voice_decodes_as_typed() {
+        let legacy = serde_json::json!({
+            "type": "MessageReceived",
+            "text": "hi",
+            "mode": "human",
+        });
+        let event: ThreadEvent = serde_json::from_value(legacy).expect("decode a legacy row");
+        let ThreadEvent::MessageReceived {
+            voice_session_id, ..
+        } = event
+        else {
+            panic!("not a MessageReceived");
+        };
+        assert_eq!(voice_session_id, None);
     }
 }
 

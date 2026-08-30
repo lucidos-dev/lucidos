@@ -65,6 +65,17 @@ describe('animateTextareaHeightFrom', () => {
     el.dispatchEvent({ type: 'transitionend', target: el, propertyName: property });
   }
 
+  /** Hide the tab, through the document stub `test-setup.ts` installs. */
+  function hide(): void {
+    const doc = document as unknown as {
+      visibilityState: string;
+      dispatchEvent: (e: { type: string }) => boolean;
+    };
+    doc.visibilityState = 'hidden';
+    doc.dispatchEvent({ type: 'visibilitychange' });
+    doc.visibilityState = 'visible';
+  }
+
   it('no-ops when the height is unchanged', () => {
     const el = makeEl('120px');
     animate(el, '120px');
@@ -109,6 +120,57 @@ describe('animateTextareaHeightFrom', () => {
     flushRaf();
     fireTransitionEnd(el, 'transform');
     expect(el.style.transition).toBe('height 0.3s ease'); // still animating
+  });
+
+  /** The safety net must outlive the transition, not race its START.
+   *
+   *  The ease begins two frames after the call, and the net used to be armed at
+   *  the call. A main thread busy past the fuse therefore ran the expired timer
+   *  BEFORE the pending frames, and `finish` cancelled them: the box snapped to
+   *  the target with the transition never engaged. That is a slow device, and
+   *  under a loaded e2e suite it is the flake in `prompt-flip-height`. */
+  it('a stall past the fuse does not cancel the ease before it starts', () => {
+    const el = makeEl('200px');
+    animate(el, '80px');
+    expect(el.style.height).toBe('80px'); // inverted, waiting for its frames
+
+    vi.advanceTimersByTime(400);
+    flushRaf();
+
+    expect(el.style.transition).toBe('height 0.3s ease');
+    expect(el.style.height).toBe('200px');
+  });
+
+  /** The other side of the same net. Moving the fuse into the second frame
+   *  left one case with no net at all: a tab hidden before that frame suspends
+   *  `requestAnimationFrame`, so the ease never starts and no fuse is ever lit.
+   *  The box would sit at `fromHeight` with the animation pending for as long
+   *  as the tab is away. Visibility is what tells that apart from a merely late
+   *  frame, which must NOT be cancelled. */
+  it('lands the box when the tab hides before the ease starts', () => {
+    const el = makeEl('200px');
+    animate(el, '80px');
+    expect(el.style.height).toBe('80px'); // inverted, frames still pending
+
+    hide();
+
+    expect(el.style.height).toBe('200px');
+    expect(el.style.transition).toBe('');
+    // The pending frames are cancelled with it, so a later resume cannot
+    // re-enter the ease.
+    flushRaf();
+    expect(el.style.transition).toBe('');
+  });
+
+  it('a hidden tab does NOT disturb an ease that already started', () => {
+    const el = makeEl('200px');
+    animate(el, '80px');
+    flushRaf();
+    expect(el.style.transition).toBe('height 0.3s ease');
+
+    hide();
+
+    expect(el.style.transition).toBe('height 0.3s ease');
   });
 
   it('falls back to the safety timeout if transitionend never fires', () => {

@@ -114,8 +114,8 @@ async function openThread(page: Page, threadId: string, { disarm = true, renderA
   // The seed ships ARMED, and a rider is carried back to the live edge by any
   // scroll that is not their own gesture. Parking them anywhere would be undone
   // before the control was ever pressed. Most of this spec is about the reader
-  // who is READING, so it starts them disarmed. The tail case is the reader who
-  // never left the end of the thread, and it keeps the seeded arm.
+  // who is READING, so it starts them disarmed. The two live-edge cases keep the
+  // seeded arm, to press from the end of a quiet thread with the ride still on.
   if (disarm) await disarmFollowSeed(page);
   // Hide-on-scroll LIVE rather than inherited: see `disableMobileHeaderSticky`.
   await disableMobileHeaderSticky(page);
@@ -240,9 +240,10 @@ async function pressStepsOn(page: Page, seq: string, expected: 'true' | 'false')
 
 /** Take the reader to the END of the thread.
  *
- *  A direct `scrollTop` write, which is not a reader GESTURE, so the standing
- *  follow the seed armed survives it. That is the premise of both cases below:
- *  an armed reader sitting on the end of a quiet thread. */
+ *  A direct `scrollTop` write, which is not a reader GESTURE, so a standing
+ *  follow survives it where one is armed. Two of its three callers press from
+ *  the end with the seeded arm intact. The third runs disarmed, which is the
+ *  state the clamp round trip was reported from. */
 async function parkAtLiveEdge(page: Page): Promise<void> {
   await page.evaluate(() => {
     const el = Array.from(document.querySelectorAll<HTMLElement>('.thread-content'))
@@ -256,20 +257,12 @@ async function parkAtLiveEdge(page: Page): Promise<void> {
 /** Put `role` into the state the measured press moves OUT of, through STORAGE
  *  and a reload rather than through a setup press.
  *
- *  A setup press is a real press, so a clamp it runs into is REMEMBERED and
- *  repaid by the next press of the same control. That round trip is what the
- *  reader is owed (ADR 0147), and here it is a confound: the measured press
- *  becomes the return leg of a journey the case never asked for.
+ *  That is the shape reported for these cases: a thread OPENED with the log off
+ *  or a turn folded, rather than one the reader toggled a moment ago. The
+ *  toggled-a-moment-ago shape is its own case, `pressed a moment ago` below.
  *
- *  The sweep spends a SCROLL to retire the credit, and that is not available
- *  here. Hiding the steps can leave the transcript shorter than its own pane. A
- *  reader parked at the end of one has nowhere to scroll, so the credit
- *  survives into the measurement. It arrived as a 1333px correction.
- *
- *  Storage is also the shape reported: a thread OPENED with a turn folded,
- *  rather than one folded a moment ago. Both keys are `store.ts`'s
- *  (`STEPS_EXPANDED_KEY`, and the collapsed-exchange set keyed
- *  `threadId:userSeq`). */
+ *  Both keys are `store.ts`'s (`STEPS_EXPANDED_KEY`, and the collapsed-exchange
+ *  set keyed `threadId:userSeq`). */
 async function seedControlState(page: Page, threadId: string, role: string, seq: string): Promise<void> {
   await page.evaluate(({ r, tid, s }: { r: string; tid: string; s: string }) => {
     if (r === 'toggle-steps') localStorage.setItem('lucidos-steps-expanded-v2', 'false');
@@ -467,4 +460,64 @@ test.describe('the step-log control holds what the reader pressed', () => {
       }
     });
   }
+
+  /** **The log was pressed off a moment ago, from the same control.**
+   *
+   *  Hiding the steps at the end of a thread takes content out from UNDER the
+   *  pressed control. No offset holds it there, so the browser clamps and the
+   *  control slides down by what the clamp ate. That is geometry.
+   *
+   *  Showing them again must hold the control where the clamp left it. The
+   *  deficit used to be repaid here, which threw the control up the screen and
+   *  put the reader on the live edge. That is the reported bug (ADR 0147).
+   *
+   *  The turns are short with the log ON, so the last turn's header is reachable
+   *  from the end of the thread. That is what lets the first press be a real
+   *  one, unlike the storage seed the cases above use. */
+  test('the step log holds its control when it was pressed a moment ago', async ({ page }) => {
+    await assertHealthy(page);
+    const threadId = seedThread('Live edge clamp round trip', {
+      stepsPerChunk: 4,
+      chunks: 1,
+      proseLines: 0,
+      turns: 14,
+    });
+    try {
+      await openThread(page, threadId, { renderAll: false });
+      const seq = await lastTurnSeq(page);
+      await expect(controlOn(page, seq)).toHaveAttribute('aria-pressed', 'true');
+      await parkAtLiveEdge(page);
+      expect(
+        (await edgeState(page)).gap,
+        'the reader must start on the end of the thread',
+      ).toBeLessThanOrEqual(2);
+
+      const beforeHide = await geometry(page, seq);
+      expect(
+        beforeHide.top,
+        `the control is off screen at ${beforeHide.top}, so no finger could reach it`,
+      ).toBeGreaterThan(0);
+      expect(beforeHide.top).toBeLessThan(beforeHide.clientHeight);
+
+      await pressStepsOn(page, seq, 'false');
+      const clamped = await geometry(page, seq);
+      // Not vacuous: without a clamp here the reverse press has nothing to
+      // repay, and the case would pass whatever the correction remembered.
+      expect(
+        clamped.top - beforeHide.top,
+        `the hide did not clamp: the control sat at ${beforeHide.top} and now sits at ${clamped.top}`,
+      ).toBeGreaterThan(DRIFT_TOLERANCE_PX);
+
+      await pressStepsOn(page, seq, 'true');
+      const after = await geometry(page, seq);
+
+      expect(
+        Math.abs(after.top - clamped.top),
+        `the press moved its own control from ${clamped.top} to ${after.top}`
+        + ` (before ${JSON.stringify(clamped)}, after ${JSON.stringify(after)})`,
+      ).toBeLessThanOrEqual(DRIFT_TOLERANCE_PX);
+    } finally {
+      dropThread(threadId);
+    }
+  });
 });

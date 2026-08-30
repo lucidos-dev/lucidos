@@ -6,7 +6,8 @@ import { stepStatus } from '../../store/thread-events';
 import type { Loadable, StepOutcome } from '../../store/types';
 import { toFailed } from '../../store/types';
 import { highlightEllipsis } from './highlightEllipsis';
-import { fetchToolResult } from '../../api/threads';
+import { fetchToolArgs, fetchToolResult } from '../../api/threads';
+import { fullCommandForCCTool } from '../../store/thread-events/exchange';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 
 function close() {
@@ -99,6 +100,82 @@ function ResultArea({
   );
 }
 
+/** The un-elided primary argument, rendered above Reasoning.
+ *
+ *  Two sources, one look. `inlineFull` is what the fold computed when the row
+ *  still carried its args, which is every live SSE emission. A snapshot row has
+ *  had them stripped, so this fetches them. It then runs the SAME
+ *  `fullCommandForCCTool` the fold would have, rather than asking the server
+ *  for a rendered string. One formatter, so the two paths cannot drift.
+ *
+ *  Elided when it only repeats the description, which is the rule the inline
+ *  path has always applied. */
+function FullCommandArea({
+  inlineFull,
+  description,
+  toolName,
+  argsStripped,
+  callEventId,
+}: {
+  inlineFull: string | undefined;
+  description: string;
+  toolName: string | undefined;
+  argsStripped: boolean | undefined;
+  callEventId: string | undefined;
+}) {
+  const inlineLoadable: Loadable<{ full: string | undefined }> = useMemo(() => ({
+    status: 'loaded',
+    data: { full: inlineFull },
+  }), [inlineFull]);
+  const [loadable, setLoadable] = useState<Loadable<{ full: string | undefined }>>(
+    argsStripped ? { status: 'loading' } : inlineLoadable,
+  );
+
+  // Same shape as `ResultArea`'s effect, including the `cancelled` guard and
+  // the stable `inlineLoadable` identity. Keep both if you refactor the deps.
+  useEffect(() => {
+    if (!argsStripped) {
+      setLoadable(inlineLoadable);
+      return;
+    }
+    if (!callEventId) {
+      // Stripped marker with no event id is an upstream contract break. Mirrors
+      // ResultArea: warn for the developer console, and let the failed Loadable
+      // say so where the user is looking. Re-opening the step retries.
+      console.warn('[StepDetailModal] tool call is args_stripped but has no event_id; cannot lazy-fetch.');
+      setLoadable(toFailed<{ full: string | undefined }>(new Error('missing event id')));
+      return;
+    }
+    let cancelled = false;
+    setLoadable({ status: 'loading' });
+    fetchToolArgs(callEventId)
+      .then(payload => {
+        if (cancelled) return;
+        setLoadable({
+          status: 'loaded',
+          data: { full: fullCommandForCCTool(toolName ?? '', payload.args) },
+        });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setLoadable(toFailed<{ full: string | undefined }>(err));
+      });
+    return () => { cancelled = true; };
+  }, [argsStripped, callEventId, toolName, inlineLoadable]);
+
+  const showLoading = useDelayedLoading(loadable);
+  if (loadable.status === 'failed') {
+    return <div class="step-detail-result-error" data-role="command-error">Failed to load command: {loadable.error}</div>;
+  }
+  if (loadable.status !== 'loaded') {
+    if (!showLoading) return null;
+    return <div class="step-detail-result-loading" data-role="command-loading">Loading command…</div>;
+  }
+  const full = loadable.data.full;
+  if (!full || full === description) return null;
+  return <pre class="step-detail-full">{full}</pre>;
+}
+
 /** The one-line explanation under the description, for the two outcomes whose
  *  status word does not account for an EMPTY result area below it. Without one
  *  the emptiness reads as a second mystery on top of the first.
@@ -123,7 +200,6 @@ export function StepDetailModal() {
   if (!step) return null;
 
   const status = stepStatus(step.outcome);
-  const showFull = step.full && step.full !== step.description;
 
   return (
     <Overlay
@@ -146,7 +222,13 @@ export function StepDetailModal() {
           <div class="step-detail-note">{STEP_DETAIL_NOTE[step.outcome]}</div>
         )}
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
-        {showFull && <pre class="step-detail-full">{step.full}</pre>}
+        <FullCommandArea
+          inlineFull={step.full}
+          description={step.description}
+          toolName={step.tool_name}
+          argsStripped={step.args_stripped}
+          callEventId={step.call_event_id}
+        />
         {step.thinkingText && (
           <>
             <div class="step-detail-section-label">Reasoning</div>

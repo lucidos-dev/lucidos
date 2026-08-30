@@ -1,6 +1,7 @@
 use super::super::LucidosEngine;
 use crate::core::oauth;
 use crate::core::oauth_registry;
+use crate::core::AuthType;
 use crate::core::CredentialStore;
 
 /// Sentinel prefix on a tool result that the agentic loop strips off and
@@ -39,6 +40,9 @@ pub(crate) fn credential_request_payload(
 /// provider and expands the endpoint section for manual entry. A `None`/blank
 /// `env_var_name` omits the field, so the modal starts empty (default
 /// `CRED_<NAME>` injection).
+///
+/// A blank `base_url` drops that key too. A `secret` declares no scope, and the
+/// modal hides the field for it, so a seeded row would be an edit nobody sees.
 pub(crate) fn credential_request_with_defaults(
     service: &str,
     prompt: &str,
@@ -50,9 +54,11 @@ pub(crate) fn credential_request_with_defaults(
     let mut payload = serde_json::json!({
         "service": service,
         "prompt": prompt,
-        "base_url": base_url,
         "auth_type": auth_type,
     });
+    if !base_url.trim().is_empty() {
+        payload["base_url"] = serde_json::Value::String(base_url.to_string());
+    }
     if !defaults.is_empty() {
         payload["defaults"] = serde_json::Value::Object(defaults);
     }
@@ -60,6 +66,34 @@ pub(crate) fn credential_request_with_defaults(
         payload["env_var_name"] = serde_json::Value::String(name.to_string());
     }
     credential_request_envelope(payload)
+}
+
+/// The refusal a `request_credential` call earns, or `None` when it carries
+/// everything the modal needs.
+///
+/// A `secret` is the one type needing no base URL. It is signed with rather
+/// than sent, so it declares no scope and there is no host to name. Every other
+/// type is presented to one, and the proxy refuses a credential with no scope.
+fn missing_field_refusal(
+    service_name: &str,
+    prompt: &str,
+    base_url: &str,
+    auth_type: &str,
+) -> Option<&'static str> {
+    // Blank means blank on both sides: the payload drops a whitespace-only
+    // base_url, so accepting one here would open a modal with no scope and
+    // tell the agent nothing.
+    let needs_base_url = AuthType::parse(auth_type) != AuthType::Secret;
+    if service_name.is_empty()
+        || prompt.is_empty()
+        || (needs_base_url && base_url.trim().is_empty())
+    {
+        return Some(
+            "Error: service_name and prompt are required, and so is base_url for every \
+             auth_type but 'secret'",
+        );
+    }
+    None
 }
 
 /// The service name a `request_credential` call actually writes under.
@@ -228,8 +262,10 @@ impl LucidosEngine {
                 let base_url = args["base_url"].as_str().unwrap_or("");
                 let auth_type = args["auth_type"].as_str().unwrap_or("api_key");
 
-                if service_name.is_empty() || prompt.is_empty() || base_url.is_empty() {
-                    return Ok("Error: service_name, prompt, and base_url are required".to_string());
+                if let Some(refusal) =
+                    missing_field_refusal(service_name, prompt, base_url, auth_type)
+                {
+                    return Ok(refusal.to_string());
                 }
 
                 let service_name = requested_service_name(service_name, auth_type);
@@ -262,7 +298,7 @@ impl LucidosEngine {
                 match CredentialStore::get_typed(
                     &self.pool,
                     service_name,
-                    crate::core::AuthType::parse(auth_type),
+                    AuthType::parse(auth_type),
                 )
                 .await
                 {
@@ -426,6 +462,44 @@ mod tests {
         assert_eq!(parsed["prompt"], prompt);
         assert_eq!(parsed["base_url"], "https://api.binance.com");
         assert_eq!(parsed["auth_type"], "api_key");
+    }
+
+    /// A `secret` reaches scripts as `CRED_<NAME>` and no host, so the modal
+    /// hides its scope field. A seeded row there would be an edit nobody sees.
+    #[test]
+    fn a_secret_request_carries_no_base_url() {
+        let result = credential_request_payload(
+            "deploys-github",
+            "Paste the secret GitHub signs its webhooks with.",
+            "",
+            "secret",
+        );
+        let parsed = parse_payload(&result);
+        assert_eq!(parsed["auth_type"], "secret");
+        assert!(
+            parsed.get("base_url").is_none(),
+            "a blank base_url must be omitted, not sent as an empty string: {parsed}"
+        );
+    }
+
+    /// The one type that needs no base URL, and the five that do.
+    #[test]
+    fn base_url_is_required_for_every_type_but_secret() {
+        assert!(missing_field_refusal("svc", "prompt", "", "secret").is_none());
+        for auth_type in ["api_key", "bearer", "basic", "password", "oauth_client"] {
+            assert!(
+                missing_field_refusal("svc", "prompt", "", auth_type).is_some(),
+                "{auth_type} is presented to a host, so it must name one"
+            );
+        }
+        // Whitespace is blank, matching what the payload builder drops.
+        assert!(missing_field_refusal("svc", "prompt", "   ", "api_key").is_some());
+        // The other two fields are required whatever the type is.
+        assert!(missing_field_refusal("", "prompt", "", "secret").is_some());
+        assert!(missing_field_refusal("svc", "", "", "secret").is_some());
+        assert!(
+            missing_field_refusal("svc", "prompt", "https://api.example.com", "api_key").is_none()
+        );
     }
 
     #[test]

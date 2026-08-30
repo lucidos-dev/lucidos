@@ -64,6 +64,13 @@ alone, that credit was spent by a press of a DIFFERENT control. The reader then
 moved by a number describing somebody else's turn. It is the user's own first
 observation, the one they withdrew.
 
+> **Amended: the debt is deleted.** It spent one press's clamp on the next
+> press of the same control. Hiding the steps at the end of a thread clamps,
+> and the reverse press then threw the pressed control up the screen. So the
+> mechanism written to serve the decision above was the thing breaking it. A
+> press reads only its own two measurements now. The clamped press leaves the
+> reader off the live edge, so the reverse press has the slack it needs.
+
 **Only a text field is blurred before the mutation.** iOS scrolls a focused
 field clear of the soft keyboard, and that scroll fights the correction.
 Blurring any focused element instead takes a keyboard reader out of the
@@ -81,7 +88,8 @@ it.
   directly before this.
 - The `⋯` stub cannot collect a clamp debt the header control earned, because
   the two are different elements. Keying the debt on the turn would buy that
-  round trip and sell a credit shared by two unrelated controls.
+  round trip and sell a credit shared by two unrelated controls. Moot under the
+  amendment above: no press collects a debt at all.
 - Folding the LAST turn from a control at the foot of the pane missed by 70px on
   WebKit, and the sweep skipped that one park. Diagnosed a day later as a CLAMP
   rather than an unsettled read: the fold takes its rows out before the stub
@@ -119,3 +127,15 @@ through more code.
 **Key the clamp debt on the turn rather than on the element.** Rejected. It buys
 the header-then-stub round trip, and sells a credit shared between two unrelated
 controls on one turn.
+
+**Keep the clamp debt at all.** Rejected later, per the amendment above. Two
+readings of "hold them still" were in play: the control does not move, and the
+pair of presses ends where it began. The second buys the round trip by moving
+the reader on a press they made, and that breaks the first. A clamp the
+geometry forces is visible to the reader; a credit stored against a button is
+not.
+
+**Narrow the debt to a transcript shorter than its pane.** Rejected with it. The
+target exceeds the reachable maximum in exactly one situation, too little
+content below the anchor, and an unscrollable transcript is only its extreme. A
+line drawn there would be arithmetic dressed as a rule.

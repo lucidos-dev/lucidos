@@ -56,7 +56,10 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     }
 
     let target_root = resolve_target(&args.to)?;
-    let (api_port, ports_proto) = read_ports(&target_root.join(".lucidos/ports"))?;
+    let target_ports = target_root.join(".lucidos/ports");
+    let (api_port, recorded_proto) = read_ports(&target_ports)?;
+    let proto_assumed = recorded_proto.is_none();
+    let ports_proto = recorded_proto.unwrap_or_else(|| crate::workspace::DEFAULT_PROTO.to_string());
 
     let caller_workspace = std::env::var("LUCIDOS_WORKSPACE").ok().and_then(|p| {
         PathBuf::from(p)
@@ -198,7 +201,15 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         .header(crate::http::HEADER_TARGET_WORKSPACE, &target_basename)
         .json(&body)
         .send()
-        .map_err(|e| crate::http::format_request_error("POST", &url, &e, start.elapsed()))?;
+        // A scheme this had to guess is the likeliest reason for a transport
+        // failure here, so the message names the file that failed to say.
+        .map_err(|e| {
+            let mut msg = crate::http::format_request_error("POST", &url, &e, start.elapsed());
+            if proto_assumed && !args.insecure_http {
+                msg.push_str(&crate::workspace::assumed_proto_note(&target_ports));
+            }
+            msg
+        })?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {

@@ -1125,8 +1125,14 @@ export const composeViewActive = computed(() => {
 
 // --- Split layout ---
 export const SPLIT_RATIO_KEY = 'lucidos-split-ratio';
+// `Number.isFinite`, not `parseFloat(... || '0.4')`: a corrupt non-numeric
+// stored value parses to NaN, and NaN breaks every downstream `<= 0` / `>= 1`
+// comparison (both read false). `|| 0.4` would also be wrong here, since a
+// legitimately stored `0` (thread pane collapsed) is falsy. Matches the NaN
+// guards on `threadDrawerWidth` and `animationSpeed`.
+const storedSplitRatio = parseFloat(localStorage.getItem(SPLIT_RATIO_KEY) ?? '');
 export const splitRatio = signal(
-  parseFloat(localStorage.getItem(SPLIT_RATIO_KEY) || '0.4')
+  Number.isFinite(storedSplitRatio) ? storedSplitRatio : 0.4,
 );
 
 /** Which desktop pane currently holds focus. Drives the two-stage pane toggles
@@ -2484,6 +2490,20 @@ export const THREAD_EVENTS_REFRESH_TOAST_KEY = 'thread-events-refresh-failed';
  *  keys above do. Its other consumer is an action module that would otherwise
  *  import it across a mocked boundary. */
 export const THREAD_EVENTS_FETCH_CONCURRENCY = 4;
+
+/** How many threads a cold start may PREFETCH events for, after the focused
+ *  one. A count, because the list response carries no payload size and this
+ *  cannot ask how heavy a thread is before fetching it.
+ *
+ *  The prefetch is an optimization and nothing depends on it: everything past
+ *  the cap loads on focus, the path every unsaved idle thread already takes.
+ *  Uncapped it was the opposite of one. It covered every active and saved
+ *  thread, which on a real workspace is 46 threads and 21 MB. That ran on every
+ *  cold start, over a phone link, ahead of the one thread the reader wanted.
+ *
+ *  Eight is a guess at "the few I might open next", and a cheap one to revisit.
+ *  Sized against the concurrency above: two full rounds of the pool. */
+export const THREAD_EVENTS_PREFETCH_LIMIT = 8;
 
 /** How often the connection watchdog probes `/api/v1/health`. This poll alone
  *  drives the dot the user sees. So this number and the deadline below are the

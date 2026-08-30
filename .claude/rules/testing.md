@@ -84,36 +84,61 @@ Tests in `crates/lucidos-e2e/tests/api_support/` (workspace member crate `lucido
 
 ## Contract Tests (Rust ↔ TypeScript)
 
-Source of truth: `thread_lifecycle.rs`. TS is generated — never hand-edit.
+Rust is the source of truth. TS is generated, so never hand-edit `src/generated/`.
 
-Regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`
+Regenerate all three:
+
+```bash
+cargo test -p lucidos-engine generate_typescript_file -- --ignored
+cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored
+cargo test -p lucidos-engine generate_thread_event_wire_file -- --ignored
+```
 
 Staleness checks run as part of `cargo test`.
 
-**When to update:** Changes to `available_thread_actions()`, `display_section()`, or their types.
+**When to update:** changes to `available_thread_actions()`, `display_section()`,
+the `ThreadEvent` enum, or any payload type it reaches.
 
-### ThreadEvent union coverage (TS-side drift guard)
+### ThreadEvent payload types (generated, ADR 0166)
 
-`thread_lifecycle.rs` generates the `EVENT_CLASSIFICATION` map (event name → class)
-into `src/generated/thread-lifecycle.ts`, but the **payload** shapes live in a
-hand-maintained discriminated union (`ThreadEvent` in
-`src/store/thread-events/thread-event-types.ts`) — that union is NOT generated
-(its legacy-tolerant optional fields and frontend-only doc comments deliberately
-diverge from the strict Rust types, so a serde→TS codegen would regress them).
-Two guards keep the union from silently drifting behind the generated map:
+The **payload** shapes are generated too, into
+`src/generated/thread-event-wire.ts`, by the `syn` reader in
+`crates/lucidos-engine/src/engine/thread_events_tests/ts_codegen.rs`. It parses
+the `ThreadEvent` enum and its supporting types out of the engine source.
+`store/thread-events/thread-event-types.ts` re-exports them and keeps only what
+the wire does not decide (display labels, summary helpers, fingerprints).
 
-- **Compile-time:** `THREAD_EVENT_TYPE_FLAGS` (`satisfies Record<ThreadEvent['type'], true>`)
-  forces the runtime `THREAD_EVENT_TYPE_NAMES` set to match the union exactly —
-  `tsc` fails if a variant is added/removed without updating the set.
-- **Runtime contract test:** `src/generated/thread-event-union.test.ts` asserts
-  every key in the generated `EVENT_CLASSIFICATION` has a matching union member.
+What it emits is the **wire** shape, not the enum alone:
+`variant + EventMeta fields + API stamps - API strips`. Optionality is
+mechanical: `#[serde(default…)]` or `skip_serializing_if` makes the property
+optional, because both mean the key can be absent. `Option<T>` is `T`, never
+`T | null`.
 
-**When you add a Rust `ThreadEvent` variant:** after regenerating
-`thread-lifecycle.ts`, add the matching payload member to the `ThreadEvent` union
-AND its key to `THREAD_EVENT_TYPE_FLAGS` (both in `thread-event-types.ts`), or the
-contract test / `tsc` fails. The guard is one-way (`EVENT_CLASSIFICATION ⊆
-union`); the union may legitimately carry extra members (retired legacy events,
-the `CommandCheckpoint*` pair) that the classification map omits.
+**When you add a Rust `ThreadEvent` variant or field:** regenerate. Nothing to
+hand-write. Four things fail loudly instead:
+
+- **A new supporting type** fails the generator until you add it to
+  `TYPE_SOURCES` with the file that declares it.
+- **A carried doc comment** with an em dash or an ISO date fails the generator.
+  Rewrite the Rust line; the generated file ships and is scanned like any source.
+  Its FIRST PARAGRAPH is what gets carried, so that paragraph is bound by
+  `.claude/rules/prose.md` too. A sentence or paragraph over the limit surfaces
+  at `check-prose.sh` on the generated file, and the fix is always at the Rust
+  doc comment. Put a note a frontend reader needs in the first paragraph, or on
+  the field itself, since a later paragraph does not travel.
+- **A new persisted variant** fails `all_persisted_event_types_matches_the_enum`
+  until you add it to that list in `thread_lifecycle.rs`.
+- **A stale checked-in file** fails `generated_thread_event_wire_is_up_to_date`.
+
+Anything the wire carries but Rust does not is a row in a declared table in the
+generator, never a hand edit to the output. That covers a retired variant, a
+legacy field, and an API-layer stamp or strip.
+`src/generated/thread-event-union.test.ts` keeps the two generated files in
+agreement. Containment is one-way, because the union carries retired members the
+classification map omits.
+
+`src/generated/wire-types-have-one-spelling.test.ts` scans `src/` for a second
+declaration of any generated type. Re-export, never re-declare.
 
 ## WASM Signer E2E (Rust)
 

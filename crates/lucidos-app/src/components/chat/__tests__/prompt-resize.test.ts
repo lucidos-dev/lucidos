@@ -366,6 +366,11 @@ describe('isTextareaHeightAnimating', () => {
     vi.useFakeTimers();
     const { el } = animatingTextarea();
     animateTextareaHeightFrom(el, '44px');
+    // The ease STARTS on the second frame, and its fuse is lit there with it.
+    // A fuse lit at the call would race the start instead of outliving the
+    // transition. See `animateTextareaHeightFrom`.
+    frames.shift()?.();
+    frames.shift()?.();
     vi.advanceTimersByTime(400);
     expect(isTextareaHeightAnimating(el)).toBe(false);
   });

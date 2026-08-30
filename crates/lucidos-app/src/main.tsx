@@ -9,6 +9,7 @@ import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installDeadPressProbe } from './components/chat/deadPressProbe';
+import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
 import { installNoFunctionKeyText } from './utils/noFunctionKeyText';
@@ -68,8 +69,10 @@ if (isIOSPwa()) {
 }
 
 installActionBtnBlurListener();
-// A diagnostic, not a feature. See its header and docs/temporary-measures.md.
+// Two diagnostics, not features: the composer's buttons and its textarea. See
+// their headers and docs/temporary-measures.md.
 installDeadPressProbe();
+installDeadKeystrokeProbe();
 installNoAutofill();
 installNoDrag();
 installNoFunctionKeyText();

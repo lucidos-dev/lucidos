@@ -6,7 +6,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -23,7 +23,7 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenMessage, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setThreadLive } from './scrollState';
 
@@ -105,6 +105,19 @@ interface Props {
   threadAwaitingAnswer: boolean;
   /** Lifted from `cancelingThreadIds.value.has(threadId)`. */
   threadCanceling: boolean;
+  /** How many of this turn's leading rows the render window leaves out.
+   *  Non-zero only on the oldest turn on screen (`threadWindow.ts`), and only
+   *  while the reader has not scrolled up into it.
+   *
+   *  A coding-agent turn can hold 684 rows against a whole-transcript budget of
+   *  160, so gating whole turns left the transcript rendering one turn of
+   *  everything. This clamps the head of that one turn.
+   *
+   *  There is NO control that reveals it, deliberately. A per-turn "Show
+   *  earlier steps" expander shipped twice and was removed twice, the second
+   *  time because the user disliked it from the first message. The head arrives
+   *  by scrolling, through the same expansion older turns arrive through. */
+  rowsHidden?: number;
   /** First line of the in-thread `ChangeProposed` description + its file count
    *  for this exchange's change_id (built once per thread in `renderExchanges`).
    *  Seeds <ChangeBody> so a change-lifecycle panel paints at its final height
@@ -167,7 +180,7 @@ function heldOnThePress(fn: () => void): (e: MouseEvent) => void {
   return (e) => withScrollAnchor(e.currentTarget as HTMLElement | null, fn);
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, rowsHidden = 0, proposedChangeDesc, proposedChangeFileCount, matchedEventType, matchedEventId, matchedPayloadJson }: Props) {
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
   const artifactPaths = loadedOr(artifacts.value, NO_ARTIFACTS);
@@ -464,8 +477,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     let fallback = '';
     if (hasEvents) {
       if (showDetails || !dropsEarlierProse) {
-        visible = events;
+        // The render window's head clamp, applied HERE and nowhere earlier.
+        // Every verdict above reads the full `events`: whether this turn has
+        // sections, whether it is an empty continuation, whether its divider
+        // body is suppressed. Those describe the TURN and must not change
+        // because its head is off screen.
+        visible = rowsHidden > 0 ? events.slice(rowsHidden) : events;
       } else {
+        // A collapsed turn is already down to a handful of rows. The clamp has
+        // nothing to save there, and would cut into what the collapse chose to
+        // keep. `rowsHidden` counts the UNCOLLAPSED list either way.
         const collapsed = getCollapsedVisibleEvents(events);
         visible = collapsed.visibleEvents;
         if (collapsed.needsFallback) {
@@ -474,16 +495,21 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       }
     }
     return { visibleEvents: visible, collapsedFallbackText: fallback };
-  }, [hasEvents, showDetails, dropsEarlierProse, events, responseHtmlCombined]);
+  }, [hasEvents, showDetails, dropsEarlierProse, events, responseHtmlCombined, rowsHidden]);
 
   // Sections tagged with each section's base index in `visibleEvents`, so
   // `renderResponseEvents` can key rows stably as the list grows during
   // streaming. `splitEventSections` drops the break markers, so re-walking
-  // `visibleEvents` recovers each section's offset. The whole exchange renders,
-  // with no per-exchange clamp: the open cost is bounded by which EXCHANGES
-  // ThreadView renders, on a step budget (`threadWindow.seedRenderCount`). The
-  // clamp that used to sit here shipped a "Show earlier steps" expander the
-  // reader found confusing, and it is not coming back.
+  // `visibleEvents` recovers each section's offset.
+  //
+  // The open cost is bounded twice, both by ThreadView: which EXCHANGES render,
+  // on a step budget, and how many of the FLOOR exchange's rows do, on a row
+  // budget (`threadWindow.ts`). `visibleEvents` above already carries the
+  // second, so this walks only what is drawn.
+  //
+  // The clamp that used to sit here was a different thing: it shipped a "Show
+  // earlier steps" expander the reader found confusing, and THAT is not coming
+  // back. The head arrives by scrolling now, with no control of its own.
   const renderedSections = useMemo(() => {
     const sections = splitEventSections(visibleEvents);
     let cursor = 0;
@@ -581,7 +607,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const isChromeless = isUserMessageBubble || isChangePanel;
   const isAbortPanel = exchange.userEvent.type === 'ResponseAborted';
   const isCancelPanel = exchange.userEvent.type === 'ResponseCanceled';
-  const isUnansweredDivider = questionDividerResolution(exchange) !== null;
+  const isUnansweredDivider = dividerBodyIsSuppressed(exchange, events);
   // Change lifecycle, abort-boundary, cancel-boundary and answer-less question
   // dividers are terminal. They have no response, just the initiator panel with
   // optional actions. The exception is a change banner whose session KEPT
@@ -648,6 +674,11 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
       if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
+      // Ungated, like the event row below. It is what the caller HEARD, no
+      // audio is kept, and the written answer beside it is a different thing:
+      // the talker says what an answer means rather than reading it out.
+      if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
+      if (evt.type === 'spoken_message') return <SpokenMessage key={`sm${k}`} event={evt} />;
       // Ungated, like every other marker. The park is the transcript's only
       // record that the thread subscribed to something. The clock indicator
       // holds the LIVE half and drops the wait as it resolves. A toggle
@@ -670,7 +701,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
          data-thread-id={threadId} data-user-seq={exchange.userSeq} data-collapse-kind={collapseKind}>
       <InitiatorPanel
         initiator={isQueuedUserMessage
-          ? { ...initiator, status: queuedStatus }
+          // Appended, not replaced. A spoken message already put its own chip
+          // in this slot, and both facts are true of a queued utterance.
+          ? { ...initiator, status: <>{initiator.status}{queuedStatus}</> }
           : initiator}
         timestamp={formatMessageTimestamp(timestamp)}
         onActorClick={initiator.actorClickable === false
@@ -810,6 +843,10 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadIdle !== next.threadIdle) return false;
   if (prev.threadAwaitingAnswer !== next.threadAwaitingAnswer) return false;
   if (prev.threadCanceling !== next.threadCanceling) return false;
+  // Without this the memo swallows every scroll-up round into the floor turn:
+  // the window grows, nothing else about the turn changes, and the head the
+  // reader scrolled up for never draws.
+  if (prev.rowsHidden !== next.rowsHidden) return false;
   if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
   if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
   if (prev.matchedEventType !== next.matchedEventType) return false;
@@ -1186,8 +1223,38 @@ export function describeInitiator(
       if (ev.origin?.kind === 'api' || modeToInitiator(ev.mode) === 'system') {
         return { variant: actorVariant(ev.origin), summary, details, ...actorInitiator(ev.origin) };
       }
+      // A spoken message says so. The composer stays live during a call (ADR
+      // 0148), so the transcript interleaves speech and typing and the reader
+      // otherwise cannot tell which they did. The chip carries the fact; the
+      // accent gives the bubble a surface of its own.
+      if (ev.voice_session_id) {
+        return youInitiator({ details, status: <SpokenChip />, accent: 'spoken' });
+      }
       return youInitiator({ details });
     }
+    // The two spoken turns, reached ONLY when one opened a boundary of its
+    // own: a call greeting said before anything started a turn
+    // (`isSpokenTurn` in `exchange-grouping`). Inside a turn they are steps
+    // and render through `exchangeResponseEvents` instead.
+    case 'SpokenReplyGenerated':
+      return {
+        variant: 'lucidos',
+        icon: <LucidosGlyph />,
+        label: LUCIDOS_AGENT_LABEL,
+        details: (
+          <SpokenReply
+            event={{ type: 'spoken_reply', text: ev.text, interrupted: ev.interrupted === true }}
+          />
+        ),
+      };
+    case 'SpokenMessageReceived':
+      // The caller's own words, so the same chip and accent a spoken
+      // `MessageReceived` wears. What differs is that this one started no turn.
+      return youInitiator({
+        details: <SpokenMessage event={{ type: 'spoken_message', text: ev.text }} />,
+        status: <SpokenChip />,
+        accent: 'spoken',
+      });
     case 'ChildThreadCompleted':
       // The EventBus fan-in path raises this on the parent when a child thread
       // reaches a terminal event. That is deterministic engine plumbing, not

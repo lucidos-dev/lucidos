@@ -60,7 +60,7 @@ That trigger is already live. Install auto-registers it, subscribed to an event 
 
 Work in this order:
 
-1. **Get the shared secret.** Use `request_credential`, never chat. The sender generates it or the user invents one. Either way the same value must sit on both sides.
+1. **Get the shared secret.** Use `request_credential` with `auth_type: "secret"`, never chat. That type is signed with rather than sent, so it takes no base URL. The sender generates the value or the user invents one. Either way the same value must sit on both sides.
 2. **Create the hook.** Run `lucidos webhooks create --name "<plugin> <sender>" --event-type <TheEventTheTriggerSubscribesTo> --hmac '{...}'`, with `credential` naming the credential you just saved. `system-knowhow/lucidos-cli` § Webhooks carries the exact `--hmac` shape per sender, plus the header allow-list. Take the event type from the plugin's `trigger.toml`, not from your reading of the author's prose. A subscription matches the string exactly, and a near miss fires nothing.
 3. **Read the shipped trigger's condition against the delivery shape.** A delivery is always `{summary, headers, payload}`, with the sender's own body under `payload`. So a condition reads `payload.action`, never a bare `action`, and a header reads `headers.X-GitHub-Event`. An author who wrote theirs from the sender's API docs got this wrong, and it fails silently: the hook delivers, the trigger never fires. Fix the `trigger.toml` before you report done.
 4. **Read back the URL.** `lucidos webhooks list` prints the delivery path. The full address is `{host}:{hook_port}/<workspace-slug>/<webhook-id>`, and the id is minted at create time, so the value the sender needs does not exist before step 2.

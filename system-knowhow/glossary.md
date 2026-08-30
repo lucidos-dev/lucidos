@@ -744,23 +744,31 @@ See also: *child follow-up*, *coding agent*.
 ### Call toggle
 The handset button in the prompt input, beside the follow toggle, that starts and ends a *voice session*. One control for both directions: press it to call, press it again to ring off. It turns red while a call is up, because that is what the next press does.
 
-It is a toggle rather than a microphone you hold down. The microphone is open for the whole call, and holding a button through a conversation is not how a call works. It renders in every prompt input, the compose view included, so voice has no entry point of its own.
+It is a toggle rather than a microphone you hold down. The microphone is open for the whole call, and holding a button through a conversation is not how a call works. It sits in every prompt input, the compose view included, so voice has no entry point of its own.
 
-**It is absent until voice is turned on**, since voice ships off. Settings → Models → Voice is the switch.
-See also: *voice session*, *chat thread*.
+**Holding it picks which microphone a call opens**, from a list of the ones this browser can see. Lucidos names no device otherwise, so a call takes whatever your system calls the default, which on a Mac can be a nearby iPhone. The choice is per device, and it applies to your next call rather than the one you are on.
+
+**Two things make it absent, and a call already up overrides both** so you never lose the button you ring off with. Voice ships off, and Settings → Models → Voice is the switch. And a call runs on a *chat thread* the Lucidos Agent holds, so picking a coding agent as the destination takes the button away. Switch back to Lucidos and it returns.
+See also: *voice session*, *chat thread*, *coding-agent thread*.
 
 ### Voice session
 Talking to Lucidos out loud on a thread you already have. Voice is a **mode of a thread**, not a kind of one: the same *chat thread*, the same history, the same agent doing the work. The composer stays live, so you can speak a sentence and type the next one, and both land in the same conversation.
 
 A session starts from the **call toggle** in the prompt input, a handset beside the follow toggle. It is one control for both directions: press it to call, press it again to ring off. A session also ends when you open another thread, when the connection drops, or when the engine goes away under it. Starting one where no thread is open creates an ordinary chat thread, exactly as typing would.
 
-While a call is up, a strip above the composer says what it is doing: connecting, listening or speaking. It also shows the last thing each of you said. It reports only, and ending is the toggle's job. Speaking over the assistant stops it mid-word, as it would on the phone.
+**A call runs on a chat thread the Lucidos Agent holds, and nowhere else.** Moving the destination to a coding agent while a call is up therefore ends it, and says so. A *coding-agent thread* offers no call at all: the handset is absent there, and the engine refuses one placed any other way.
 
-**Experimental, and off until you turn it on.** The switch is **Settings → Models → Voice**. The same place holds which model does the talking, and what a call loads before it starts. A call that cannot find a talker says so and offers a button straight there.
+While a call is up, the handset turns red, and that is the whole of it on screen. There is no separate panel to watch: what each of you says lands in the thread itself, as it is said. Speaking over the assistant stops it mid-word, as it would on the phone.
+
+**Experimental, and off until you turn it on.** The switch is **Settings → Models → Voice**. The same place holds the two models a call uses, the voice it speaks in, and what it loads before it starts. One model does the talking, and the other turns your speech into text. A call that cannot find a talker says so and offers a button straight there.
 
 **Speaking wakes the thread.** Each finished sentence lands as a message and starts an ordinary turn, the same one typing would. So a spoken question costs a full turn, and a short call can cost several.
 
 **The audio is thrown away, the words are not.** Nothing is recorded. The thread keeps what you said, what the assistant answered, and what was actually said out loud. It also keeps when the session opened and closed, and what the call spent. Read the conversation back afterwards like any other.
+
+**The transcript says which of it was spoken.** A message you spoke is marked "Spoken", so a conversation you half spoke and half typed reads back correctly. What was said out loud appears in a "Said aloud" bubble inside the turn, marked as cut off if you talked over it.
+
+**What you hear is not what you read.** The written answer is for reading, and can carry tables, code and links. So the spoken reply is what that answer *means*, in a sentence or two. A long answer is spoken as the short version plus an offer of the detail. The full text is waiting in the thread either way.
 
 **One entity, honest about what it knows.** You hear one assistant, in the first person. What it answers instantly is bounded by what was loaded when the session opened. For anything else it says it is checking, and comes back. It will not tell you it did something it did not do.
 See also: *chat thread*, *thread*.

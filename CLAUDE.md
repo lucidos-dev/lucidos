@@ -52,7 +52,7 @@ A **workspace** is a user's live Lucidos instance: a workspace directory with gi
 - **Filtered Rust tests need `--lib`**: `cargo test -p lucidos-engine --lib "filter"`. Without `--lib`, runs zero tests silently. Verify `running N tests` line is > 0.
 - **Multiple test name filters need `--`**: `cargo test -p lucidos-engine --lib -- name1 name2 …`. Without the `--` separator, clap treats every name after the first as an unknown positional and fails with `error: unexpected argument 'X' found`.
 - **Integration tests for refactors.** A refactor that changes data flow MUST have integration tests: unit tests miss wiring bugs.
-- **Contract tests are sacred.** Change `thread_lifecycle.rs` and regenerate: `cargo test -p lucidos-engine generate_typescript_file -- --ignored && cargo test -p lucidos-engine generate_cross_validation_fixture_file -- --ignored`. Never hand-edit `src/generated/`.
+- **Contract tests are sacred.** Never hand-edit `src/generated/`; regenerate with the `generate_*_file` writer tests, listed in `.claude/rules/testing.md` § Contract Tests. Each staleness test names its own command.
 - **Zero warnings, errors, failing tests.** "Pre-existing" is never an excuse: if you see it, you own it.
 - **Test selection by what changed:**
   - Rust (`.rs`, `Cargo.toml`, `Cargo.lock`, `.sql`) → **`make lint`** + engine tests.

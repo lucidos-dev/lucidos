@@ -15,6 +15,38 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **`voice_resident_sections` is the one preference where an empty row and an
+  absent row mean opposite things, and `get_preferences` renders `(empty)` on
+  purpose.** A reviewer sees the tool listing print `(empty)` and objects: a blank
+  collapses to the default for every other Text key, so the word overstates.
+  A later reviewer sees `(unset)` and objects that the row exists.
+
+  Both renderings were shipped and reverted once each. `(empty)` is the settled
+  one, and it states the STATE rather than the meaning: the row exists and holds
+  nothing, which is true of every key. What that state MEANS is per-key, and the
+  catalog description is where each key says so. Only this key makes it
+  load-bearing: `voice::resident::sections_from` reads an absent row as the three
+  defaults and an empty one as no sections.
+
+  `(unset)` is the one spelling that is actually false, because it denies a row
+  that exists. A bare blank is the other rejected option: it makes no claim, but
+  it is indistinguishable from a key nobody set. Re-flagging needs a second key
+  whose empty value is meaningful, which would justify a `PrefSpec` field.
+
+- **A `voice_resident_sections` read error opens the call with NO sections, and
+  that is the deliberate direction.** A reviewer sees `enabled_sections` return `vec![]` on `Err` and cites the
+  unknown-is-not-a-no rule. Or they note that `voice::mod::read_pref` reads an
+  error as unset for every other voice key.
+
+  Neither direction destroys anything, so that rule does not decide it. The
+  choice is between handing the talker context the reader deliberately turned
+  off, and one call that knows less. The second is recoverable and visible; the
+  first is a silent surprise about what the assistant was told.
+
+  Nothing is hidden either way. `assemble_block` says in words that the call
+  opened with no context block and that everything must be looked up. The
+  talker is told rather than left guessing, and the log line names the key.
+
 - **A blank `model_voice_talker` falling back to the catalog default removed no
   "disable voice" switch.** A reviewer sees `voice::build::talker_model` treat an
   empty preference as unset and reach for the catalog default. That reads as
@@ -856,6 +888,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `oauth_client` treatment), or if the fan-out itself moves to an opt-in.
   (`crates/lucidos-engine/src/core/credentials.rs`.)
 
+- **A quoted engine log line carries TWO labels, and the `log!` string is only
+  the second.** A reviewer compares a log line quoted in a doc or an ADR against
+  the `crate::log!` call and reports a mismatch: the doc says
+  `[browser_origin] refused …` while the code writes `"[API] refused …"`. The
+  conclusion is that nobody can grep for the quoted prefix.
+
+  Both are real and both are printed. The engine's `log!` prepends
+  `module_label(module_path!())` (`crates/lucidos-engine/src/lib.rs`), whose
+  default arm is the module's own last segment. So `api::browser_origin` emits
+  `[browser_origin]`, and the message's own `[API]` follows it. The full line is
+  `HH:MM:SS [pid:N] [browser_origin] [API] refused …`, and a grep for either
+  prefix finds it.
+
+  Re-flag only where the quoted label matches NEITHER the module segment (after
+  `module_label`'s rename table) nor the message string.
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -929,6 +977,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`answerThreadQuestion`'s retry can report `false` for an answer that
+  landed, and that trade is deliberate.** A reviewer sees
+  `mutatingFetchIdempotent` on the answer POST and observes that a transport
+  `TypeError` does not prove the request never left the device. Lose the
+  response alone and the retry meets the documented duplicate 409. The client
+  returns `false`, and the UI toasts a failure for an answer that worked. Codex
+  flagged it as P1 on the branch that added the retry.
+
+  The trade is the one every sibling mutation already makes. `stopClaudeCode`,
+  `cancelChat`, `ensureThreadStarted`, `deleteThread` and the compose PUT all
+  retry the same way, under the rule `mutatingFetchIdempotent` states: the
+  handler must be safe to observe twice. This one is, and the API e2e
+  `answer_question_idempotent_409_on_duplicate` pins it.
+
+  What the retry buys is the reported failure. Over a stale iOS PWA connection
+  the answer was lost on EVERY tap, and the agent stayed blocked until the user
+  tapped again. What it costs is a rarer mismatch that heals itself: the
+  persisted `UserQuestionAnswered` arrives over SSE a moment later, and
+  `QuestionBody`'s drain effect clears the restored picks.
+
+  Re-flag only with a way to tell the two 409s apart that costs no engine-side
+  submission id, or with evidence the handler stopped being idempotent.
+
 - **A guest agent's turn renders as the Lucidos Agent in the actor chip on
   purpose. The user meets one entity, and the split is internal.** A reviewer
   reading `originMode`'s `agent` case correctly observes that
@@ -942,7 +1013,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   user a split they were deliberately never shown. The attribution is still on
   the event, which is what a later surface can read to say a turn was spoken.
 
-  What the split IS for is `engine/chat/process/history.rs`, where the reasoner
+  What the split IS for is `engine/chat/process/history.rs`, where the doer
   must not read a guest's turn as its own prior turn. That is a different
   reader with the opposite requirement, and ADR 0150 covers it.
 
@@ -1463,6 +1534,20 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 - **`e2e/*.spec.ts` use literal localStorage keys** (`lucidos-split-ratio`,
   …) rather than importing `SPLIT_RATIO_KEY` — deliberate: the literal in
   the spec is a canary that the *persisted* contract didn't silently change.
+- **A `browser.newPage()` inside an e2e `beforeAll` / `afterAll` DOES resolve a
+  relative API URL.** A reviewer reads the ad-hoc page as one built outside the
+  config. The relative `page.request.put('/api/v1/preferences?key=…')` then
+  looks certain to fail on a missing `baseURL`, taking the hook's restore with
+  it.
+
+  Playwright's `browser` fixture hands `newPage` the config's `use` options,
+  `baseURL` included, and a worker-scoped hook cannot take the `page` fixture at
+  all. Measured on 1.60. A `composer-row-fit-mobile.spec.ts` run whose last test
+  set `voice_enabled` to `true` leaves the workspace reading `false`, which only
+  the `afterAll` wrote.
+
+  Re-flag if Playwright drops that inheritance, or if the hook switches to a
+  browser it launched itself, which has no config to inherit.
 - **The Escape-capture handler cannot starve the keybinding recorder.**
   `handleEscapeCapture` (useKeyboardShortcuts) and the recorder's listener
   (KeyboardShortcutsSection) are both capture-phase listeners on `document`
@@ -2254,6 +2339,27 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   a component. Narrowing one of the pair and not the other is the drift.
 
   Re-flag only if the module stops testing its arithmetic directly.
+
+- **`deadKeystrokeProbe`'s `input` listener is deliberately NOT gated on
+  `isMobile()`, while its `beforeinput` one is.** A reviewer reads the two
+  listeners side by side, sees one guard, and calls the other an oversight.
+  Codex flagged exactly that on 2026-08-29, as desktop noise mixed into an iOS
+  investigation.
+
+  The gate is per VERDICT, not per module, and the docstring says so.
+  `input-never-arrived` asks whether WebKit delivered the edit it announced,
+  which is an iOS PWA question. `keystroke-lost` asks whether the draft took
+  the box's value. That is platform-independent, and a real defect wherever it
+  happens.
+
+  It also costs nothing on a healthy desktop. The comparison re-reads the box
+  at settle time, so every legitimate composer rewrite reads as healthy and
+  writes no line: the slash menu emptying the field, a send clearing it. Each
+  line carries the viewport block too, so a desktop episode and a phone episode
+  are told apart on the line itself.
+
+  Re-flag if a desktop false positive is actually observed in the log, or if
+  the settle-time re-read is removed.
 
 ## Scripts (bash)
 
@@ -3412,6 +3518,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if the popup's image loses that CSS containment, or if a caller starts
   passing an `imgW` measured somewhere the container does not bound.
+
+- **`SpokenReplyGenerated` carries no turn identifier, and a barge-in still
+  cannot land it in the wrong exchange.** A reviewer sees an event that groups
+  by position alone. A barge-in produces a new `MessageReceived` and a cut-off
+  spoken reply. So the reply looks free to land under the caller's follow-up
+  instead of under the answer it interrupted.
+
+  The order is fixed by the two events' own causes, not by luck. The client's
+  gate fires after 120 ms of continuous speech (`voice/bargeIn.ts`). So
+  `response.cancel` goes out near the START of the utterance, and
+  `response.done{cancelled}` returns one round trip later. `UserTurnEnded` maps
+  from `input_audio_transcription.completed`, which cannot arrive until the
+  caller STOPS speaking, plus transcription latency on the same socket. So the
+  cancel is acknowledged first, `record_spoken` emits first, and the reply takes
+  the lower sequence. `run_call`'s loop is serial, so nothing reorders them
+  after that.
+
+  Re-flag if the gate moves to end-of-utterance, or if the engine stops sending
+  `response.cancel` on `barge_in`. Also re-flag for a provider whose finished
+  response is reported out of band from its transcription.
 
 ## Product copy
 

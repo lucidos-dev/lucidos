@@ -17,6 +17,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -40,6 +41,7 @@ async fn spawn_parent_child(bus: &EventBus, child_channel: EventChannel) -> (Uui
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -115,6 +117,7 @@ async fn emit_thread_message(bus: &EventBus, thread_id: Uuid, parent: Option<Uui
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -326,6 +329,7 @@ async fn emit_cc_message_received(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,

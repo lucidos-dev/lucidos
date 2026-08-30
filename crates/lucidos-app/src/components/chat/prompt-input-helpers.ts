@@ -387,6 +387,34 @@ export function computeSubmitMultiCount(toggledCount: number, customAnswerText: 
   return toggledCount + (customAnswerText.trim().length > 0 ? 1 : 0);
 }
 
+/** What a FAILED multi-select answer hands back to the composer.
+ *
+ *  `submitMultiAnswer` clears the toggles and the box before the POST, because
+ *  that clearing is the send gesture. When the POST fails the card comes back
+ *  live and blank, so the user re-picks every option. The reported failure cost
+ *  three picks twice over before the third attempt landed.
+ *
+ *  Only where the user has put nothing new there since. A fresh pick made
+ *  during the failure window is the newer answer. Restoring text over a fresh
+ *  keystroke would also leave the draft and the box disagreeing, and
+ *  `resolveComposerText` settles that in favour of the stale copy. `null` for
+ *  either field means leave that one alone. */
+export function recoverableAnswerDraft(args: {
+  sentIds: string[];
+  sentText: string;
+  currentIds: string[];
+  currentDraft: string;
+  /** The textarea's live value, or null when no node is mounted. */
+  domText: string | null;
+}): { ids: string[] | null; text: string | null } {
+  const idsFree = args.currentIds.length === 0;
+  const textFree = args.currentDraft.length === 0 && (args.domText ?? '').length === 0;
+  return {
+    ids: args.sentIds.length > 0 && idsFree ? args.sentIds : null,
+    text: args.sentText.length > 0 && textFree ? args.sentText : null,
+  };
+}
+
 /** Latest unanswered `UserQuestionAsked` on the thread (single OR multi) —
  *  each pending question lives in its own divider exchange (the
  *  `UserQuestionAsked` is the exchange's `userEvent`). Returns `null` when the

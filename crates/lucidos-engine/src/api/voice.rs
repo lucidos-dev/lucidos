@@ -76,12 +76,12 @@ async fn voice(
             };
 
             let opening = crate::voice::call::opening_for(&state.engine, thread_id).await;
-            let reasoner = crate::voice::reasoner::ThreadTurn::new(state.engine.clone());
+            let doer = crate::voice::doer::ThreadTurn::new(state.engine.clone());
             crate::voice::call::run_call(
                 &state.engine.event_bus,
                 provider.as_ref(),
                 &mut transport,
-                &reasoner,
+                &doer,
                 opening,
                 crate::voice::call::CallSubject {
                     thread_id,
@@ -114,16 +114,35 @@ async fn admit(
         ));
     }
 
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT thread_id FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(ApiError::db)?;
-    if exists.is_none() {
-        return Err(ApiError::not_found(
-            "That thread does not exist, so there is nothing to talk about.",
-        ));
+    // Who holds this thread decides whether there is a call to place at all.
+    // A call reaches the Lucidos Agent and nothing else (ADR 0165). The doer
+    // asks the same question again, and is the floor under this one.
+    //
+    // **No browser reads this message.** A `WebSocket` hides the handshake's
+    // status and body alike, so our own client shows `CALL_REFUSED` whatever
+    // is written here (`voice/refusals.ts`). Keeping the sentence honest is
+    // still worth it: it reaches the log, the API tests, and any client that
+    // is not a browser. What keeps a person from meeting this refusal at all
+    // is the control being absent, which is the layer above.
+    match crate::voice::doer::doer_for(pool, thread_id).await {
+        crate::voice::doer::ThreadDoer::LucidosAgent => {}
+        crate::voice::doer::ThreadDoer::CodingAgent => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "A call runs on a Lucidos Agent conversation. Switch the \
+                 destination to Lucidos to talk.",
+            ));
+        }
+        crate::voice::doer::ThreadDoer::NoSuchThread => {
+            return Err(ApiError::not_found(
+                "That thread does not exist, so there is nothing to talk about.",
+            ));
+        }
+        crate::voice::doer::ThreadDoer::Unknown => {
+            return Err(ApiError::internal(
+                "Could not read that thread, so the call was not placed.",
+            ));
+        }
     }
 
     let session_id = Uuid::new_v4();
@@ -195,6 +214,24 @@ mod tests {
         thread_id
     }
 
+    /// A thread a coding agent holds.
+    ///
+    /// `source` reads `claude_code` for a started one and for a DRAFT alike.
+    /// The compose write mirrors the picked mode into it, so a draft says who
+    /// holds it before it carries a single message.
+    async fn a_coding_agent_thread(pool: &sqlx::PgPool, state: &str) -> Uuid {
+        let thread_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO thread_summaries (thread_id, source, state) VALUES ($1, 'claude_code', $2)",
+        )
+        .bind(thread_id)
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("create the thread");
+        thread_id
+    }
+
     /// Opt this workspace into voice. Every other test here is about a rule
     /// that only applies once somebody has.
     async fn voice_is_on(pool: &sqlx::PgPool) {
@@ -223,6 +260,44 @@ mod tests {
         admit(&pool, &sessions, thread_id)
             .await
             .expect("a call once voice is on");
+
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A call reaches the Lucidos Agent and nothing else (ADR 0165).
+    ///
+    /// Both states, because the draft is the one the user actually hits: they
+    /// pick Claude Code in the compose view and press the control before the
+    /// thread has a single message in it.
+    ///
+    /// The message names the way back rather than saying only "no". The
+    /// destination picker sits in the same row as the control they pressed.
+    #[tokio::test]
+    async fn a_call_on_a_coding_agent_thread_is_refused() {
+        let (pool, db_name) = setup_test_db().await;
+        let sessions = LiveVoiceSessions::new();
+        voice_is_on(&pool).await;
+
+        for state in ["composing", "active"] {
+            let thread_id = a_coding_agent_thread(&pool, state).await;
+            let error = admit(&pool, &sessions, thread_id)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("should refuse a {} coding-agent thread", state));
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+            assert!(
+                error.message.contains("Switch the destination"),
+                "the refusal must name the way back: {}",
+                error.message
+            );
+            assert_eq!(sessions.count(), 0, "a refusal must claim no slot");
+        }
+
+        // And it is who holds the thread that decides, nothing else about it.
+        let chat = a_chat_thread(&pool).await;
+        admit(&pool, &sessions, chat)
+            .await
+            .expect("a call on a Lucidos Agent thread");
 
         teardown_test_db(&db_name).await;
     }

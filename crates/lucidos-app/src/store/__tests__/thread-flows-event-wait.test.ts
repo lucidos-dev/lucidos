@@ -181,7 +181,7 @@ describe('a turn parked on an event wait', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
-      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: true },
+      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
       { type: 'ToolResult', name: 'await_event', result: 'ChangeProposed fired' },
       { type: 'ToolCalled', name: 'send_notification', args: { title: 'Build landed' } },
     ] as ThreadEvent[]);
@@ -205,7 +205,7 @@ describe('a turn parked on an event wait', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
-      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: true },
+      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' } },
       { type: 'ToolResult', name: 'await_event', result: 'ChangeProposed fired' },
     ] as ThreadEvent[]);
@@ -240,7 +240,7 @@ describe('a turn parked on an event wait', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
-      { type: 'EventWaitExpired', wait_id: 'w1', was_attached: true },
+      { type: 'EventWaitExpired', wait_id: 'w1' },
     ] as ThreadEvent[]);
 
     const exchange = getExchanges(map, id)[0];
@@ -257,7 +257,7 @@ describe('a turn parked on an event wait', () => {
     const { map, id } = makeThread();
     insertEvents(map, id, [
       ...park,
-      { type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop', was_attached: true },
+      { type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop' },
       { type: 'ToolResult', name: 'await_event', result: 'The wait was canceled.' },
     ] as ThreadEvent[]);
 
@@ -427,8 +427,8 @@ describe('a turn parked on an event wait', () => {
         { type: 'ResponseGenerated', text: "I'll watch for that." },
         { type: 'MessageReceived', text: 'any news?' },
         type === 'EventWaitDelivered'
-          ? { type, wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false }
-          : { type, wait_id: 'w1', was_attached: false },
+          ? { type, wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0 }
+          : { type, wait_id: 'w1' },
         { type: 'ResponseGenerated', text: 'Here it is.' },
       ] as ThreadEvent[]);
 
@@ -468,7 +468,7 @@ describe('a turn parked on an event wait', () => {
       { type: 'ToolResult', name: 'bash_kill', result: 'killed b1', request_event_id: 'req-1' },
       // The watch fires mid-turn. Its anchor is the delivery card; the loop it
       // was injected into keeps streaming under `req-1`.
-      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false },
+      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
       { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1' },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'req-1' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'req-1' },
@@ -509,7 +509,7 @@ describe('a turn parked on an event wait', () => {
     insertEvents(map, id, [
       ...park,
       { type: 'ResponseGenerated', text: "I'll watch for that." },
-      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false },
+      { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'del-1', event_type: 'ChangeProposed', payload: {}, matched_index: 0 },
       { type: 'UserPromptInjected', text: 'An event you subscribed to has arrived.', mode: 'agent', delivered_event_id: 'del-1', event_id: 'reentry-1' },
       { type: 'ToolCalled', name: 'read_file', args: { path: 'notes.md' }, request_event_id: 'reentry-1' },
       { type: 'ToolResult', name: 'read_file', result: 'ok', request_event_id: 'reentry-1' },

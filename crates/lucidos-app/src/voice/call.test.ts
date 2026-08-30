@@ -32,6 +32,8 @@ interface Harness {
   sockets: FakeSocket[];
   socket(): FakeSocket;
   device(): FakeDevice;
+  /** The device id each `openAudio` was asked for, newest last. */
+  askedFor: (string | null)[];
   /** Push captured microphone frames at the runner. */
   capture(rms: number, frames?: number): void;
   /** How many times a woken audio device was handed back untaken. */
@@ -54,6 +56,7 @@ class FakeDevice implements AudioDevice {
   stops = 0;
   closes = 0;
   closeError: unknown = null;
+  note: string | null = null;
 
   play(pcm: ArrayBuffer): void {
     this.played.push(pcm);
@@ -103,11 +106,13 @@ class FakeSocket {
   }
 }
 
-function harness(): Harness {
+function harness(opts: { microphone?: string; note?: string } = {}): Harness {
   const states: CallState[] = [];
   const problems: string[] = [];
   const devices: FakeDevice[] = [];
   const sockets: FakeSocket[] = [];
+  const askedFor: (string | null)[] = [];
+  const deviceNote = opts.note ?? null;
   let onFrame: ((samples: Float32Array) => void) | null = null;
   let pending: (() => void) | null = null;
   let slow = false;
@@ -122,11 +127,13 @@ function harness(): Harness {
     release: () => {
       releases++;
     },
-    openAudio: async (frameSink) => {
+    openAudio: async (frameSink, deviceId) => {
       onFrame = frameSink;
+      askedFor.push(deviceId);
       if (slow) await new Promise<void>((resolve) => (pending = resolve));
       if (failure !== null) throw failure;
       const device = new FakeDevice();
+      device.note = deviceNote;
       devices.push(device);
       return device;
     },
@@ -142,6 +149,7 @@ function harness(): Harness {
 
   const runner = createCallRunner({
     ports,
+    microphone: () => opts.microphone ?? null,
     onState: (state) => states.push(state),
     onProblem: (message) => problems.push(message),
   });
@@ -156,6 +164,7 @@ function harness(): Harness {
     last: () => states[states.length - 1],
     socket: () => sockets[sockets.length - 1],
     device: () => devices[devices.length - 1],
+    askedFor,
     capture(rms, frames = 1) {
       const samples = new Float32Array(CAPTURE_FRAME_SAMPLES).fill(rms);
       for (let i = 0; i < frames; i++) onFrame?.(samples);
@@ -219,6 +228,45 @@ describe('placing a call', () => {
   it('is listening once the engine says the call is up', async () => {
     const h = await liveCall();
     expect(h.last().phase).toBe('listening');
+  });
+});
+
+describe('which microphone a call opens', () => {
+  /** A workspace that never picked one asks for nothing in particular, which
+   *  is how every call worked before the picker existed. */
+  it('names none until the reader picks one', async () => {
+    const h = harness();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.askedFor).toEqual([null]);
+  });
+
+  it('carries the picked device down to the port', async () => {
+    const h = harness({ microphone: 'headset' });
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.askedFor).toEqual(['headset']);
+  });
+
+  /** The call still goes up, so the note is the only way anybody learns they
+   *  are not on the microphone they chose. */
+  it('says out loud when the port had to settle for another device', async () => {
+    const h = harness({ microphone: 'headset', note: 'the headset is gone' });
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.problems).toEqual(['the headset is gone']);
+    expect(h.last().phase).not.toBe('idle');
+  });
+
+  it('says nothing when the picked device opened', async () => {
+    const h = harness({ microphone: 'headset' });
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.problems).toEqual([]);
   });
 });
 

@@ -34,7 +34,7 @@ import { awayFromBottom, isFollowScroll, notAtTop, setActiveScrollElement, setFo
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
-import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded } from '../store';
+import { archiveThreadCount, archivingThreadIds, codingAgentPendingModel, codingAgentPendingReasoningEffort, focusedPane, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT } from '../store';
 import { loadAllThreads } from './thread-loading';
 import { focusThread, handleSaveThread, unfocusThread } from './threads';
 
@@ -475,18 +475,17 @@ describe('loadAllThreads', () => {
     expect(archiveThreadCount.value).toBe(247);
   });
 
-  it('resolves only after its eager per-thread loads settle, and bounds them', async () => {
-    // The eager loads run through a pool now (they used to be one unbounded
-    // `Promise.all`). Two things must survive that: callers ordering work after
-    // `loadAllThreads` still see every load finished, and a boot no longer fires
-    // one request per active thread at once.
-    const ids = Array.from({ length: 12 }, (_, i) => `a${i}`);
+  /** Mock a boot carrying `count` active threads, newest first by id order. */
+  function activeThreadsResponse(count: number) {
+    const ids = Array.from({ length: count }, (_, i) => `a${i}`);
     (fetchThreads as any).mockResolvedValue({
       saved: [], composing: [], family_threads: [], archive: [],
       active: ids,
-      active_threads: ids.map(id => ({
+      active_threads: ids.map((id, i) => ({
         thread_id: id, title: id, channel: 'chat', initiator: 'user',
-        last_activity: '2026-08-04T10:00:00Z', created_at: '2026-08-04T10:00:00Z',
+        // Descending, so the prefetch's newest-first sort has something to sort.
+        last_activity: `2026-08-04T10:${String(59 - i).padStart(2, '0')}:00Z`,
+        created_at: '2026-08-04T10:00:00Z',
         message_count: 1, section: 'inbox', status: 'idle',
         active_children_count: 0, total_children_count: 0,
         blocking_descendant_count: 0, attention_descendant_count: 0,
@@ -495,28 +494,82 @@ describe('loadAllThreads', () => {
         coding_agent_has_diff: false, last_revived_at: null, state: 'active',
       })),
     });
+    return ids;
+  }
 
+  /** Instrument `fetchThreadEvents` with the concurrency and order it saw. */
+  async function recordEventFetches() {
     const { fetchThreadEvents } = await import('../../api/threads');
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
     mock.mockReset();
+    const seen: string[] = [];
     let inFlight = 0;
-    let peak = 0;
-    let settled = 0;
-    mock.mockImplementation(async () => {
+    const stats = { peak: 0, settled: 0, seen };
+    mock.mockImplementation(async (threadId: string) => {
+      seen.push(threadId);
       inFlight++;
-      peak = Math.max(peak, inFlight);
+      stats.peak = Math.max(stats.peak, inFlight);
       await Promise.resolve();
       inFlight--;
-      settled++;
+      stats.settled++;
       return { events: [], currentAggregate: null };
     });
+    return {
+      stats,
+      restore: () => {
+        mock.mockReset();
+        mock.mockResolvedValue({ events: [], currentAggregate: null });
+      },
+    };
+  }
+
+  it('resolves only after its eager per-thread loads settle, and bounds them', async () => {
+    // The eager loads run through a pool (they used to be one unbounded
+    // `Promise.all`), and the pool is now CAPPED. Three things must hold. A
+    // caller ordering work after `loadAllThreads` still sees every load it
+    // started finished. A boot fires no request-per-active-thread burst. And
+    // the burst is bounded in TOTAL, not only in width.
+    activeThreadsResponse(12);
+    const { stats, restore } = await recordEventFetches();
 
     await loadAllThreads();
 
-    expect(settled).toBe(12);
-    expect(peak).toBeLessThanOrEqual(4);
-    mock.mockReset();
-    mock.mockResolvedValue({ events: [], currentAggregate: null });
+    // No focused thread here, so every fetch came from the capped prefetch.
+    expect(stats.settled).toBe(THREAD_EVENTS_PREFETCH_LIMIT);
+    expect(stats.peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
+    restore();
+  });
+
+  it('prefetches the most recently active threads, not an arbitrary slice', async () => {
+    // The cap only helps if it keeps the threads worth keeping. `a0` is newest.
+    activeThreadsResponse(12);
+    const { stats, restore } = await recordEventFetches();
+
+    await loadAllThreads();
+
+    expect([...stats.seen].sort()).toEqual(
+      Array.from({ length: THREAD_EVENTS_PREFETCH_LIMIT }, (_, i) => `a${i}`).sort(),
+    );
+    restore();
+  });
+
+  it('loads the focused thread first and alone, ahead of the prefetch', async () => {
+    // The reader is looking at exactly one thread, and it used to share a
+    // four-wide pool with every active and saved one. So its transcript
+    // competed for bandwidth with a pile nobody asked for, which is the whole
+    // reported symptom on a phone.
+    const ids = activeThreadsResponse(12);
+    focusedThreadId.value = ids[5];
+    const { stats, restore } = await recordEventFetches();
+
+    await loadAllThreads();
+
+    // First, and on its own: the prefetch rounds that follow are what raise
+    // the peak above one.
+    expect(stats.seen[0]).toBe(ids[5]);
+    expect(stats.settled).toBe(THREAD_EVENTS_PREFETCH_LIMIT + 1);
+    restore();
+    focusedThreadId.value = null;
   });
 
   it('falls back to 0 when archive_count is omitted (older engine / mock)', async () => {

@@ -691,6 +691,7 @@ mod tests {
             bus.emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::MessageReceived {
+                    voice_session_id: None,
                     text: "so go?".into(),
                     user_image_hashes: vec![],
                     device_id: None,

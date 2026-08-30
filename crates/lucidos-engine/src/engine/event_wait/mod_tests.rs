@@ -1921,6 +1921,7 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
         bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "start the work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -2303,6 +2304,7 @@ async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
         &bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "[CHILD THREAD COMPLETED]".into(),
             user_image_hashes: vec![],
             device_id: None,

@@ -922,6 +922,99 @@ describe('makeDismissHandlers', () => {
       expect(onDismiss).toHaveBeenCalledTimes(1);
     });
   });
+
+  /** A gesture-opened overlay: a long press on a mobile drawer row opens its
+   *  actions menu, and the menu has no anchor to exempt. The lift ending that
+   *  press dispatches a click these handlers saw no pointerdown for. The
+   *  fallback read it as synthetic and dismissed the menu the hold had just
+   *  opened. */
+  describe('when a press was already down as the overlay opened', () => {
+    const openedUnderPress = (panel: HTMLElement, onDismiss: () => void) =>
+      makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => true, true);
+
+    it('spends the opening gesture click instead of dismissing on it', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      const click = clickEvent(elWith());
+      h.onClickCapture(click);
+      expect(onDismiss).not.toHaveBeenCalled();
+      expect(click.stopPropagation).not.toHaveBeenCalled();
+      expect(click.preventDefault).not.toHaveBeenCalled();
+    });
+
+    it('dismisses on the NEXT outside click, the opening one being spent', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      h.onClickCapture(clickEvent(elWith()));
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the expectation across the touchend that ends the press', () => {
+      // `onTouchEnd` clears the ordinary pairing, because a dismissing tap's
+      // click is cancelled by the swallow. This gesture's click is not.
+      const panel = elWith();
+      const row = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      h.onTouchEnd(touchEndAt(row));
+      h.onClickCapture(clickEvent(row));
+      expect(onDismiss).not.toHaveBeenCalled();
+    });
+
+    it('drops the expectation when a NEW press starts', () => {
+      const panel = elWith();
+      const elsewhere = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      // A second gesture: its own pointerdown dismisses, and the click it
+      // pairs with is swallowed rather than read as the opening one.
+      h.onPointerDown(pointerDownAt(elsewhere));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+      const click = clickEvent(elsewhere);
+      h.onClickCapture(click);
+      expect(click.stopPropagation).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the expectation when the gesture is cancelled', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      h.onCancel();
+      h.onClickCapture(clickEvent(elWith()));
+      expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves a click INSIDE the panel alone, as always', () => {
+      const panel = elWith();
+      const onDismiss = vi.fn();
+      const h = openedUnderPress(panel, onDismiss);
+
+      const click = clickEvent(panel);
+      h.onClickCapture(click);
+      expect(onDismiss).not.toHaveBeenCalled();
+      expect(click.preventDefault).not.toHaveBeenCalled();
+    });
+  });
+
+  it('an overlay opened with NO press down still dismisses on a synthetic click', () => {
+    // The canary the fix must not break: `e2e/overlay-dismiss-swallow.spec.ts`
+    // opens the same menu with dispatched (untrusted) pointer events, which
+    // the browser pairs no click with, and then dismisses it synthetically.
+    const panel = elWith();
+    const onDismiss = vi.fn();
+    const h = makeDismissHandlers({ current: panel }, null, onDismiss, undefined, () => true, false);
+
+    h.onClickCapture(clickEvent(elWith()));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────

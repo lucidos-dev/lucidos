@@ -171,6 +171,7 @@ fn cc_tool_called_backward_compat_no_description() {
 #[test]
 fn message_received_with_image_hashes() {
     let event = ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "look at this".into(),
         user_image_hashes: vec!["abcd1234".into(), "ef567890".into()],
         device_id: Some("phone-1".into()),
@@ -199,6 +200,7 @@ fn message_received_with_image_hashes() {
 #[test]
 fn message_received_without_optional_fields() {
     let event = ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "hello".into(),
         user_image_hashes: vec![],
         device_id: None,

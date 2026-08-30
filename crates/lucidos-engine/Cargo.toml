@@ -112,3 +112,9 @@ tokio = { version = "1", features = ["test-util"] }
 # WAT (WebAssembly text format) compiler — used by proxy_wasm_signer tests
 # to build minimal WASM modules at test time without an external toolchain.
 wat = "1"
+# Rust parser. Reads the ThreadEvent enum and its payload types out of the
+# source, so the frontend's wire types can be generated from them
+# (`thread_events_tests/ts_codegen.rs`). Test-only on purpose: no production
+# type carries a codegen derive.
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+proc-macro2 = "1"

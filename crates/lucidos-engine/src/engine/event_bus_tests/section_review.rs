@@ -13,6 +13,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "do something".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -45,6 +46,7 @@ async fn test_chat_parent_stays_default_on_child_spawn() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -90,6 +92,7 @@ async fn test_section_inbox_on_child_complete() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "parent task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -114,6 +117,7 @@ async fn test_section_inbox_on_child_complete() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "child task".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -213,6 +217,7 @@ async fn test_section_marked_read() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -453,6 +458,7 @@ async fn trigger_followup_response_goes_to_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "Can you elaborate on the report?".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -541,6 +547,7 @@ async fn engine_message_received_does_not_promote_trigger_thread_to_review() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "## Triggering Event\n\n```json\n{\"date\":\"2026-05-11\"}\n```".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -598,6 +605,7 @@ fn message_received_destructures_parent_thread_id() {
     let thread_id = Uuid::new_v4();
 
     let event = ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "fan-out message".into(),
         user_image_hashes: vec![],
         device_id: None,
@@ -646,6 +654,7 @@ fn message_received_destructures_parent_thread_id() {
 
     // Verify None parent_thread_id doesn't appear in SSE JSON
     let event_no_parent = ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "follow-up".into(),
         user_image_hashes: vec![],
         device_id: None,

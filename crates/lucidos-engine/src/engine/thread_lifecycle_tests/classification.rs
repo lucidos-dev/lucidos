@@ -361,3 +361,49 @@ fn no_transition_produces_illegal_section() {
         }
     }
 }
+
+// 16. a_call_writes_only_metadata
+//
+// Every row a voice call adds is Metadata, and none of them moves a section.
+// Both properties matter, for reasons that differ per event.
+//
+// `SpokenReplyGenerated` lands while the doer's own turn is still running, so
+// Terminal would settle a turn it has no part in. `SpokenMessageReceived`
+// starts nothing, so Start would leave the thread waiting on a turn that never
+// runs. `WorkDelegated` sits beside a `MessageReceived` that already started
+// one, so Start would count that utterance twice.
+#[test]
+fn a_call_writes_only_metadata() {
+    let voice_events = [
+        "VoiceSessionStarted",
+        "VoiceSessionEnded",
+        "SpokenReplyGenerated",
+        "SpokenMessageReceived",
+        "WorkDelegated",
+    ];
+    for event_type in voice_events {
+        assert_eq!(
+            classify_event(event_type),
+            Some(EventClass::Metadata),
+            "'{}' must not touch the thread's status",
+            event_type
+        );
+        assert!(
+            all_persisted_event_types().contains(&event_type),
+            "'{}' is what a call leaves behind, so it has to be persisted",
+            event_type
+        );
+        for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
+            for section in [ArchiveState::Archived, ArchiveState::Inbox] {
+                let result = resolve_transition(event_type, thread_type, section, false)
+                    .unwrap_or_else(|e| panic!("'{}' was rejected: {:?}", event_type, e));
+                assert_eq!(
+                    result.new_section, None,
+                    "'{}' moved a {:?} thread out of {:?}. The caller is on the \
+                     call, so surfacing it asks for attention they already give",
+                    event_type, thread_type, section
+                );
+            }
+        }
+    }
+}

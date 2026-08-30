@@ -1506,10 +1506,16 @@ impl EventBus {
             // and a trigger can subscribe.
             | ThreadEvent::VoiceSessionStarted { .. }
             | ThreadEvent::VoiceSessionEnded { .. }
-            // A spoken reply touches no column either. The reasoner's turn
+            // A spoken reply touches no column either. The doer's turn
             // owns the thread's status, and the talker is its peer on the
             // thread rather than the author of that turn.
-            | ThreadEvent::SpokenReplyGenerated { .. } => Vec::new(),
+            //
+            // Nor does an utterance the talker handled alone, nor the
+            // delegation asking for the doer. A call is one exchange however
+            // its halves are split, and only the turn it starts moves a column.
+            | ThreadEvent::SpokenReplyGenerated { .. }
+            | ThreadEvent::SpokenMessageReceived { .. }
+            | ThreadEvent::WorkDelegated { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.

@@ -351,6 +351,16 @@ function requestEventIdOf(event: { type: string }): string | undefined {
   return (event as { request_event_id?: string }).request_event_id;
 }
 
+/** A turn of a call: what Lucidos said out loud, or what the caller said when
+ *  the talker answered it alone.
+ *
+ *  Neither is an exchange boundary in the ordinary case. A spoken turn lands
+ *  inside whatever turn was running when it was said, which is where it
+ *  happened. This names them for the one case where there is no such turn. */
+export function isSpokenTurn(event: { type: string }): boolean {
+  return event.type === 'SpokenReplyGenerated' || event.type === 'SpokenMessageReceived';
+}
+
 /** Read `tool_use_id` from a CodingAgentTool* event payload. Empty string in
  *  legacy DB rows from before the field existed — normalize to `undefined`. */
 export function toolUseIdOf(event: { type: string }): string | undefined {
@@ -1141,6 +1151,19 @@ function foldEvent(
       // thread shows the "Messages could not be displayed" empty state. Modern
       // threads always have a proper boundary first, so `current` is non-null
       // and the step branch below takes them.
+      current = { userEvent: event, userSeq: seq, steps: [] };
+      exchanges.push(current);
+      touched?.add(current);
+    } else if (isSpokenTurn(event) && !current) {
+      // A call opens with a greeting, and it is said before anything has
+      // started a turn. So there is no exchange for the row to land in, and
+      // the `current` fallthrough below drops it silently. No audio is kept,
+      // which makes a dropped spoken turn gone rather than merely unrendered:
+      // a call where nobody delegates leaves a thread rendering nothing at all.
+      //
+      // Promoted to a boundary of its own, as the legacy prompt above is. It
+      // takes NO steps: the words are in the event, and its initiator panel
+      // draws them. Anything landing after it belongs to it as usual.
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
       touched?.add(current);

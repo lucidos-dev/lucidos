@@ -125,10 +125,12 @@ impl BrowserRuntime {
 
         // Truncate if too long
         let content = if content.len() > 50000 {
+            // `chars().count()`, not `len()`: the message says characters, and
+            // `len()` is a byte count that over-reports any non-ASCII page.
             format!(
                 "{}...\n\n[Content truncated, {} total characters]",
                 &content[..content.floor_char_boundary(45000)],
-                content.len()
+                content.chars().count()
             )
         } else {
             content

@@ -1,5 +1,32 @@
-import { test, expect } from './fixtures';
+import { test, expect, type Locator } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileViewport } from './helpers';
+
+/** Resolve once the container's scroll position has stopped changing.
+ *
+ *  Chromium ANIMATES a keyboard scroll (Home / End / Space) on its own,
+ *  independently of CSS `scroll-behavior`, which computes to `auto` here. A key
+ *  pressed inside that animation's last frame is DROPPED: no scroll event, no
+ *  `preventDefault`, focus untouched, the container still scrollable. Measured
+ *  over eight runs, every press 1ms or 9ms after the previous animation's final
+ *  frame was swallowed, and every press about 270ms after it scrolled.
+ *
+ *  Polling for the target VALUE returns on the very frame that value lands,
+ *  which is exactly that window. So each press waits for the animation to
+ *  RETIRE as well, and three unchanged frames is what says it has: a running
+ *  animation advances the position every frame. */
+async function scrollSettled(area: Locator): Promise<void> {
+  await area.evaluate((el) => new Promise<void>((resolve) => {
+    let last = el.scrollTop;
+    let still = 0;
+    const tick = () => {
+      if (el.scrollTop === last) still += 1;
+      else { still = 0; last = el.scrollTop; }
+      if (still >= 3) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }));
+}
 
 /** Keyboard scrolling of the conversation transcript. Two behaviors:
  *  1. `.thread-content` is a keyboard-focusable scroll region — once focused, the
@@ -30,16 +57,22 @@ test.describe('Keyboard scrolling of the conversation (desktop)', () => {
     await expect(tc).toHaveAttribute('role', 'region');
 
     // Focus it and confirm native keyboard scrolling: Home → top, End → down.
+    // Every press waits out the previous one's animation first. That is what
+    // `scrollSettled` is for, and the whole reason these waits are here.
     await tc.evaluate((el) => (el as HTMLElement).focus());
+    await scrollSettled(tc);
     await page.keyboard.press('Home');
     await expect.poll(() => tc.evaluate((el) => el.scrollTop)).toBeLessThan(2);
+    await scrollSettled(tc);
     await page.keyboard.press('End');
     await expect.poll(() => tc.evaluate((el) => el.scrollTop)).toBeGreaterThan(2);
 
     // Space with the transcript focused pages it down — it must NOT be captured by
     // type-to-focus (focus stays on the transcript, and it scrolled).
+    await scrollSettled(tc);
     await page.keyboard.press('Home');
     await expect.poll(() => tc.evaluate((el) => el.scrollTop)).toBeLessThan(2);
+    await scrollSettled(tc);
     await page.keyboard.press('Space');
     expect(
       await page.evaluate(() => document.activeElement?.classList.contains('thread-content') ?? false),

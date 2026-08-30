@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 /// Why a `ResponseCanceled` was emitted. Cancellation is always a user-driven
-/// action that interrupts a *real* in-flight response — the actor on
-/// `EventMeta` identifies the user, this enum identifies what they did. New
+/// action that interrupts a *real* in-flight response. The actor on
+/// `EventMeta` identifies the user, and this enum identifies what they did. New
 /// emit sites must specify the cause; `Unknown` only appears on legacy DB
 /// rows persisted before the field existed.
 ///
@@ -32,11 +32,11 @@ pub enum CancelCause {
     Unknown,
 }
 
-/// Why a `ResponseAborted` was emitted. Aborts are system-driven cleanup —
+/// Why a `ResponseAborted` was emitted. Aborts are system-driven cleanup:
 /// the engine or the OS terminated the process, or the engine settled a
 /// projection whose live process was already gone. The actor on `EventMeta`
 /// records *who triggered* the cleanup (a user button can fire stale-settle),
-/// not who decided to terminate the work — that's always the system. New emit
+/// not who decided to terminate the work. That is always the system. New emit
 /// sites must specify the cause; `Unknown` only appears on legacy DB rows
 /// persisted before the field existed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

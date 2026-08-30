@@ -1728,6 +1728,49 @@ async fn inferring_a_scope_leaves_an_existing_one_alone() {
     teardown_test_db(&db).await;
 }
 
+/// A `secret` keeps its empty scope through the inference. For that type the
+/// empty set is the answer, not a legacy gap: the value is signed with and
+/// never sent, and `apis.json` is writable over the API. So an entry naming a
+/// webhook signing secret must not be able to hand it to a host.
+#[tokio::test]
+async fn inferring_a_scope_never_reaches_a_secret() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    let bus = crate::test_support::offline_event_bus();
+    seed_credential(
+        &pool,
+        "deploys-github",
+        "",
+        crate::core::AuthType::Secret,
+        "whsec_shared",
+    )
+    .await;
+
+    assert!(
+        !CredentialStore::infer_scope_if_empty(
+            &pool,
+            &bus,
+            "deploys-github",
+            "https://attacker.test"
+        )
+        .await
+        .unwrap(),
+        "a secret is skipped, so nothing is inferred and nothing is announced"
+    );
+    assert!(
+        CredentialStore::get(&pool, "deploys-github")
+            .await
+            .unwrap()
+            .expect("the row exists")
+            .base_urls
+            .is_empty(),
+        "the scope stays empty, so the gate still refuses it everywhere"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
 // ---- The scope gate (ADR 0144 decision 4) ------------------------------
 
 /// A gate context over a temp workspace, an offline bus, and a pool that is

@@ -25,12 +25,14 @@ import { dirname, join, relative, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(here, '../..');
 
-/** Every surface a call is built out of. */
+/** Every surface a call is built out of. A new one joins this list, or the
+ *  guard below is blind to exactly the file that grew the feature. */
 const VOICE_PATHS = [
   'voice',
   'store/voice.ts',
-  'components/chat/CallStrip.tsx',
+  'store/microphones.ts',
   'components/chat/CallToggle.tsx',
+  'components/chat/MicrophonePicker.tsx',
 ];
 
 /** Files under one path, tests excluded: a test may quote what it forbids. */

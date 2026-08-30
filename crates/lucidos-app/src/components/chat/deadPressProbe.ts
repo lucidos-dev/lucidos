@@ -2,6 +2,11 @@ import { showToast } from '../../store/store';
 import { isMobile, isTouchDevice } from '../../utils/viewport';
 import { TAP_MOVE_THRESHOLD_PX, takePressOutcome, type PressOutcome } from '../../utils/tapGesture';
 import { postClientLog } from '../../utils/clientLog';
+import { readViewport, type ProbeViewport } from './probeViewport';
+
+// Re-exported so this module stays the one import for a press report's types.
+// The reading itself is shared with the keystroke probe, which is why it moved.
+export type { ProbeViewport };
 
 /** Reports a tap on a composer action button that produced nothing.
  *
@@ -38,24 +43,6 @@ export interface ProbeRect {
   right: number;
   top: number;
   bottom: number;
-}
-
-/** The state that separates a layout fault from an event fault. Carried in every
- *  report, because the reporter is a phone with a screenshot.
- *
- *  `keyboardActive` is the `data-keyboard-active` flag on `<html>`. A whole block
- *  of `styles/mobile.css` inerts the header, the title row, the edge-swipe zones
- *  and the transcript's children off it, and re-enables `.prompt-area`. A flag
- *  out of step with the keyboard would read exactly like this bug. */
-export interface ProbeViewport {
-  vvHeight: number;
-  vvOffsetTop: number;
-  innerHeight: number;
-  appHeight: string;
-  keyboardActive: boolean;
-  /** `window.scrollY`. A LAYOUT viewport scrolled under a fixed shell is the
-   *  textbook form of this bug on iOS, and no report has carried the number. */
-  pageScrollY: number;
 }
 
 export interface LandingFacts {
@@ -339,18 +326,6 @@ function watchableFaces(): HTMLButtonElement[] {
     disabled: btn.disabled,
     placeholder: btn.classList.contains('morph-placeholder'),
   }));
-}
-
-function readViewport(): ProbeViewport {
-  const vv = window.visualViewport;
-  return {
-    vvHeight: vv?.height ?? window.innerHeight,
-    vvOffsetTop: vv?.offsetTop ?? 0,
-    innerHeight: window.innerHeight,
-    appHeight: document.documentElement.style.getPropertyValue('--app-height'),
-    keyboardActive: document.documentElement.hasAttribute('data-keyboard-active'),
-    pageScrollY: window.scrollY,
-  };
 }
 
 /** Can the document hit-test this point at all? `elementFromPoint` answers null

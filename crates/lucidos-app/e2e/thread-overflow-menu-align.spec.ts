@@ -87,11 +87,27 @@ test.describe('Thread overflow menu alignment', () => {
     });
     expect(menu).not.toBeNull();
 
-    // The pinned edge sits on its anchor's. Pre-fix the panel was clamped to
-    // the ~8px left margin, tens of px adrift; the tolerance absorbs only
-    // sub-pixel and offsetWidth-vs-getBoundingClientRect rounding.
+    // The pinned edge sits on its anchor's, AS FAR AS THE VIEWPORT CLAMP
+    // ALLOWS. `useAnchoredPosition` keeps CLAMP_MARGIN of breathing room at
+    // either end, and a mobile drawer row is full-bleed: its leading edge IS
+    // the screen edge, so the clamp owns the last few px and no panel is ever
+    // drawn flush there. Demanding the raw row edge asks for a position the
+    // positioner will never produce.
+    //
+    // What survives on the left-pinned arm is still worth having: a panel
+    // right-aligned to the row instead, hung off the wrong element, or pushed
+    // off-screen all land tens of px away. What it CANNOT see is the bug this
+    // file guards, a panel measured ~viewport-wide, since `left` there does not
+    // read the width at all. The width assertion below is that half.
+    //
+    // The tolerance absorbs only sub-pixel and
+    // offsetWidth-vs-getBoundingClientRect rounding.
+    const CLAMP_MARGIN = 8; // useAnchoredPopover.ts, not importable from e2e/
     const pinned = anchor!.mode === 'end' ? menu!.right : menu!.left;
-    expect(Math.abs(pinned - anchor!.edge)).toBeLessThanOrEqual(5);
+    const owed = anchor!.mode === 'end'
+      ? Math.min(anchor!.edge, menu!.viewport - CLAMP_MARGIN)
+      : Math.max(anchor!.edge, CLAMP_MARGIN);
+    expect(Math.abs(pinned - owed)).toBeLessThanOrEqual(5);
 
     // The measurement itself. A panel measured ~viewport-wide is the fault
     // behind the misplacement. On the left-pinned arm it is the only half the

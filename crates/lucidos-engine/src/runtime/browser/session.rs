@@ -376,9 +376,11 @@ impl BrowserRuntime {
                 .map_err(|e| format!("Failed to delete browser profile: {}", e))?;
         }
 
-        if let Err(e) = BrowserLogins::clear(&self.pool).await {
-            log!("[Browser] Failed to clear browser_logins table: {}", e);
-        }
+        // Propagate rather than log-and-claim-success: the message below states
+        // logins were cleared, so a failed clear must not report as done.
+        BrowserLogins::clear(&self.pool)
+            .await
+            .map_err(|e| format!("Failed to clear browser logins: {}", e))?;
 
         Ok("All browser data cleared (cookies, logins, localStorage, cache)".to_string())
     }

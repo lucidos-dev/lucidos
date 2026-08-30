@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { availableReasoningLevels, clampReasoningEffort } from '../models';
+import { availableReasoningLevels } from '../models';
 
 // The no-`supported` cases below exercise the ID-SHAPE HEURISTIC, which is now
 // only the fallback for a model the registry cannot answer for (the picker
@@ -38,30 +38,6 @@ describe('availableReasoningLevels', () => {
     const values = availableReasoningLevels('gemini-3.1-pro-preview').map(l => l.value);
     expect(values).not.toContain('xhigh');
     expect(values).toContain('max');
-  });
-});
-
-describe('clampReasoningEffort', () => {
-  it('keeps effort when supported', () => {
-    expect(clampReasoningEffort('xhigh', 'claude-opus-4-7')).toBe('xhigh');
-    expect(clampReasoningEffort('max', 'claude-opus-4-6')).toBe('max');
-  });
-
-  it('snaps xhigh to max on non-Opus-4.7 Claude', () => {
-    expect(clampReasoningEffort('xhigh', 'claude-opus-4-6')).toBe('max');
-  });
-
-  it('snaps max to xhigh on pre-5.6 OpenAI', () => {
-    expect(clampReasoningEffort('max', 'gpt-5.4')).toBe('xhigh');
-  });
-
-  it('keeps max on the GPT-5.6 family', () => {
-    expect(clampReasoningEffort('max', 'gpt-5.6-sol')).toBe('max');
-    expect(clampReasoningEffort('max', 'gpt-5.6-luna')).toBe('max');
-  });
-
-  it('snaps xhigh to max on Gemini (ties break toward higher effort)', () => {
-    expect(clampReasoningEffort('xhigh', 'gemini-3.1-pro-preview')).toBe('max');
   });
 });
 
@@ -107,35 +83,5 @@ describe('availableReasoningLevels with the registry answer', () => {
       .toEqual(['none', 'low', 'medium', 'high', 'xhigh']);
     expect(availableReasoningLevels('gpt-5.4', ['nonsense']).map(l => l.value))
       .toEqual(['none', 'low', 'medium', 'high', 'xhigh']);
-  });
-});
-
-describe('clampReasoningEffort with the registry answer', () => {
-  const LOCAL = ['none', 'low', 'medium', 'high'];
-
-  // The exact turn that failed: the account effort was xhigh, the picker
-  // snapped it to max, and the wire layer then sent xhigh.
-  it('snaps a local model off xhigh and off max, onto high', () => {
-    expect(clampReasoningEffort('xhigh', 'muse-glimmer:30b-mlx', LOCAL)).toBe('high');
-    expect(clampReasoningEffort('max', 'muse-glimmer:30b-mlx', LOCAL)).toBe('high');
-  });
-
-  it('never yields a level outside the registry set', () => {
-    for (const effort of ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', '']) {
-      expect(LOCAL).toContain(clampReasoningEffort(effort, 'muse-glimmer:30b-mlx', LOCAL));
-    }
-  });
-
-  it('leaves a supported level alone', () => {
-    expect(clampReasoningEffort('medium', 'muse-glimmer:30b-mlx', LOCAL)).toBe('medium');
-  });
-
-  // Deliberately NOT what `llm::reasoning::clamp_effort` does, which drops an
-  // unrecognised value so the provider default applies. This caller is a
-  // dropdown that must show something selected, and its answer is re-checked at
-  // the wire, so the top offered level is a display choice rather than a
-  // billing one. See the divergence note on `clampReasoningEffort`.
-  it('sends an off-ladder value to the top supported level', () => {
-    expect(clampReasoningEffort('ultra', 'muse-glimmer:30b-mlx', LOCAL)).toBe('high');
   });
 });

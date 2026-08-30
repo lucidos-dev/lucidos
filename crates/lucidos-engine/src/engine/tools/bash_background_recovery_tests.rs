@@ -12,6 +12,7 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
         bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "kick off the release".into(),
             user_image_hashes: vec![],
             device_id: None,

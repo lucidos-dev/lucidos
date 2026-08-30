@@ -19,7 +19,7 @@ import { eventNameChip, eventRowBody } from './EventRow';
 import type { EventRowChip, EventRowFact, EventRowMark, EventRowTone } from './EventRow';
 import { followContinuedThread } from './scrollState';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
-import { ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon } from '../shared/icons';
+import { CallIcon, ClaudeIcon, CodexIcon, CollapseTurnIcon, FullResponseIcon, StepLogIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
 import { getSessionBlobUrlForHash } from './pastedImages';
 import { useSignal } from '@preact/signals';
@@ -945,6 +945,72 @@ const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
   thread_canceled: 'stopped by a thread Stop',
   unknown: 'stopped',
 };
+
+/** The mark on a user message that was spoken rather than typed.
+ *
+ *  It sits in the bubble header's status slot, where a queued message shows
+ *  "Queued". A user bubble is chromeless and carries no actor chip. So this is
+ *  the one place in the header a fact about the message can go.
+ *
+ *  It names the ACT, never a second speaker. The user meets one Lucidos, and
+ *  the split behind a call is internal (ADR 0149). */
+export function SpokenChip() {
+  return (
+    <span class="spoken-chip" data-role="spoken-chip">
+      <CallIcon />
+      {'Spoken'}
+    </span>
+  );
+}
+
+/** What Lucidos said out loud, one row per talker turn.
+ *
+ *  It sits inside the doer's turn, which is where it happened, but it is
+ *  NOT the doer's words. The written answer above is what the reader reads;
+ *  this is the short spoken version the caller heard. So it wears a label of
+ *  its own rather than blending into the response body (ADR 0150).
+ *
+ *  Plain text, never markdown. This is a transcript of speech, and there was
+ *  no formatting to lose.
+ *
+ *  Not a `.step`: a reply the caller heard is a *transcript marker*. No audio
+ *  is kept, so the steps control would hide the only record of it. */
+export function SpokenReply({ event }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }> }) {
+  return (
+    <div class="spoken-reply" data-role="spoken-reply">
+      <span class="spoken-reply-who">
+        <CallIcon />
+        {'Said aloud'}
+      </span>
+      <span class="spoken-reply-text">
+        {event.text}
+        {/* The caller talked over it, so the text stops where they cut in. */}
+        {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
+      </span>
+    </div>
+  );
+}
+
+/** What the caller said out loud, when the talker answered it alone.
+ *
+ *  Its twin above is what Lucidos said back, and the two share a row shape so
+ *  a call reads as the conversation it was. They differ in label and in tint.
+ *  The tint is the accent a spoken user bubble carries, so a caller's words
+ *  look the same wherever they land.
+ *
+ *  An utterance the talker delegated is not this: it opens a turn as a
+ *  `MessageReceived` and gets a bubble of its own. */
+export function SpokenMessage({ event }: { event: Extract<ResponseEvent, { type: 'spoken_message' }> }) {
+  return (
+    <div class="spoken-message" data-role="spoken-message">
+      <span class="spoken-message-who">
+        <CallIcon />
+        {'You said'}
+      </span>
+      <span class="spoken-message-text">{event.text}</span>
+    </div>
+  );
+}
 
 /** An event wait, as an **event row** (ADR 0047). It shares one marker with the
  *  event delivery, the child callback and the trigger fire.

@@ -1624,6 +1624,9 @@ impl LucidosEngine {
                                 output_tokens,
                                 cache_read_tokens,
                                 cache_creation_tokens,
+                                // A coding agent reports one blended total
+                                // per direction.
+                                modality: None,
                             };
                             self.event_bus
                                 .emit_or_log(

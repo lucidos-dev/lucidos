@@ -23,10 +23,10 @@ pub enum AnswerKind {
         text: String,
     },
     /// Multi-select answer. `text` carries optional freetext typed alongside
-    /// the toggled options — the prompt textarea folds into the answer when a
+    /// the toggled options. The prompt textarea folds into the answer when a
     /// multi-select question is pending. Backend joins the resolved labels and
     /// the freetext together when relaying to CC. Either side may be empty
-    /// (but not both — see `validate_answer`).
+    /// (but not both: see `validate_answer`).
     MultiSelected {
         option_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

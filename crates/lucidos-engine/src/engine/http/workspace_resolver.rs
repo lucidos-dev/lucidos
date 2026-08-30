@@ -7,7 +7,9 @@
 //!      else beside `$LUCIDOS_WORKSPACE`, else `~/workspaces`.
 //!   2. Each workspace publishes its API port in `<root>/<name>/.lucidos/ports`
 //!      as a `KEY=VALUE` line `API_PORT=<u16>`.
-//!   3. The ports file may contain `PROTO=http|https` (defaults to `https`).
+//!   3. The ports file may contain `PROTO=http|https`. An absent line means the
+//!      file predates the key, so `https` is assumed and the guess is recorded
+//!      (`CrossWorkspaceTarget::proto_assumed`) for a failure to name.
 //!
 //! If the CLI ever changes either contract, this file MUST follow — otherwise
 //! `lucidos spawn-thread --to <ws>` and `run_coding_agent(workspace=<ws>)` would
@@ -23,6 +25,32 @@ pub struct CrossWorkspaceTarget {
     pub workspace_path: PathBuf,
     pub api_port: u16,
     pub proto: String,
+    /// True when the ports file named no protocol and `https` was assumed.
+    ///
+    /// Carried so a FAILED call can say so. The guess is right for most
+    /// workspaces. Where it is wrong the caller gets a raw TLS error ("record
+    /// overflow") naming neither the file nor the assumption.
+    pub proto_assumed: bool,
+}
+
+impl CrossWorkspaceTarget {
+    /// The clause a failed call adds when the protocol was a guess, else empty.
+    pub fn assumed_proto_note(&self) -> String {
+        if !self.proto_assumed {
+            return String::new();
+        }
+        format!(
+            " ({} has no PROTO= line, so {} was assumed; relaunch that workspace \
+             to have it record the protocol)",
+            ports_file_path(&self.workspace_path).display(),
+            self.proto,
+        )
+    }
+}
+
+/// Where a workspace publishes its port and protocol.
+pub fn ports_file_path(workspace_path: &Path) -> PathBuf {
+    workspace_path.join(".lucidos/ports")
 }
 
 /// Resolve `workspace_name` to a `CrossWorkspaceTarget`.
@@ -59,13 +87,24 @@ pub fn resolve_workspace(
         )?,
     };
     let workspace_path = root.join(workspace_name);
-    let ports_file = workspace_path.join(".lucidos/ports");
-    let (api_port, proto) = read_ports(workspace_name, &workspace_path, &ports_file)?;
+    let ports_file = ports_file_path(&workspace_path);
+    let (api_port, recorded) = read_ports(workspace_name, &workspace_path, &ports_file)?;
     Ok(CrossWorkspaceTarget {
         workspace_path,
         api_port,
-        proto,
+        proto: recorded.clone().unwrap_or_else(default_proto),
+        proto_assumed: recorded.is_none(),
     })
+}
+
+/// What to speak when the ports file names no protocol.
+///
+/// `https` because that is what a dev workspace with certs serves, and it is
+/// what every ports file written before the key existed silently meant. A
+/// launch records the real answer, so an absent line now means only "written by
+/// an older launcher".
+fn default_proto() -> String {
+    "https".to_string()
 }
 
 /// The directory a bare workspace name is resolved against, in priority order:
@@ -108,13 +147,17 @@ fn workspaces_root_from_env(
 }
 
 /// Parse `API_PORT=` and `PROTO=` out of a `.lucidos/ports` KEY=VALUE file.
-/// `PROTO` defaults to `"https"` for backward compatibility with ports files
-/// written before it was added. Maps `NotFound` to a friendly hint.
+///
+/// `None` for the protocol means the file named none, which the caller turns
+/// into [`default_proto`] and remembers as a guess. Reported apart rather than
+/// defaulted here, so a failure can say the protocol was assumed.
+///
+/// Maps `NotFound` to a friendly hint.
 fn read_ports(
     workspace_name: &str,
     workspace_path: &Path,
     ports_file: &Path,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, Option<String>), String> {
     let text = std::fs::read_to_string(ports_file).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -141,7 +184,7 @@ fn read_ports(
     }
     let port =
         port.ok_or_else(|| format!("API_PORT= line not found in {}", ports_file.display()))?;
-    Ok((port, proto.unwrap_or_else(|| "https".to_string())))
+    Ok((port, proto.filter(|p| !p.is_empty())))
 }
 
 #[cfg(test)]
@@ -164,6 +207,7 @@ mod tests {
         assert_eq!(target.api_port, 5174);
         assert_eq!(target.workspace_path, tmp.path().join("dev"));
         assert_eq!(target.proto, "https");
+        assert!(target.proto_assumed, "no PROTO= line means a guess");
     }
 
     #[test]
@@ -176,6 +220,38 @@ mod tests {
         );
         let target = resolve_workspace("dev", Some(tmp.path())).unwrap();
         assert_eq!(target.proto, "http");
+        assert!(!target.proto_assumed);
+        assert_eq!(target.assumed_proto_note(), "");
+    }
+
+    #[test]
+    fn a_ports_file_with_no_proto_line_resolves_and_says_it_guessed() {
+        // Every ports file written before the key existed looks like this, so
+        // refusing them would break more than it fixed. What must not happen is
+        // a silent guess: a wrong one surfaces as a raw TLS error naming
+        // neither the file nor the assumption.
+        let tmp = TempDir::new().unwrap();
+        write_ports(tmp.path(), "old", "API_PORT=5180\nVITE_PORT=5180\n");
+        let target = resolve_workspace("old", Some(tmp.path())).unwrap();
+        assert_eq!(target.api_port, 5180);
+        assert_eq!(target.proto, "https");
+        assert!(target.proto_assumed);
+
+        let note = target.assumed_proto_note();
+        assert!(note.contains("PROTO="), "{note}");
+        assert!(note.contains("https"), "{note}");
+        assert!(note.contains(".lucidos/ports"), "{note}");
+    }
+
+    #[test]
+    fn an_empty_proto_value_is_no_answer_at_all() {
+        // A truncating writer that got as far as the key is not a workspace
+        // that chose plain http. Read it as absent and say so.
+        let tmp = TempDir::new().unwrap();
+        write_ports(tmp.path(), "ws", "API_PORT=5181\nPROTO=\n");
+        let target = resolve_workspace("ws", Some(tmp.path())).unwrap();
+        assert_eq!(target.proto, "https");
+        assert!(target.proto_assumed);
     }
 
     #[test]

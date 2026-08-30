@@ -216,6 +216,7 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -239,6 +240,7 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
         bus.emit(BusEvent::Thread {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -336,6 +338,7 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "fan out".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -359,6 +362,7 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
         bus.emit(BusEvent::Thread {
             thread_id: cid,
             event: ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "child".into(),
                 user_image_hashes: vec![],
                 device_id: None,

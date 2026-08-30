@@ -6,6 +6,17 @@ import type {
   EventSubscription,
   EventWaitCancelCause,
 } from './thread-events/thread-event-types';
+import type { ApiUsage, ContextProducer, ContextSection } from '../generated/thread-event-wire';
+
+// Generated from the Rust payload types. Re-exported so a consumer reaching
+// for the wire shape and one reaching for a view model share one spelling.
+export type {
+  ApiUsage,
+  ContextProducer,
+  ContextRole,
+  ContextSection,
+  ModalityUsage,
+} from '../generated/thread-event-wire';
 
 // --- Async data loading ---
 // Every piece of async data must be in one of these states.
@@ -148,72 +159,6 @@ export interface Step {
   thinkingText?: string;
 }
 
-/** API role bucket a `ContextSection` belongs to. Mirrors the three buckets
- *  in the LLM API call: the system prompt, prior messages (verbatim resume
- *  tool blocks), and this turn's user message. Wire values come from the
- *  Rust `ContextRole` enum with `#[serde(rename_all = "snake_case")]`. */
-export type ContextRole = 'system' | 'prior_message' | 'user';
-
-/** One labeled chunk of the LLM's assembled prompt. `content` is omitted when
- *  the `capture_context` preference is off (the modal still renders the
- *  section with its name and its sizes, just without the body). */
-export interface ContextSection {
-  name: string;
-  content?: string;
-  /** Chars this section ADDS to the request, beyond what other sections
-   *  already count. Sum it over a capture and you get the budget the request
-   *  spent, which is what `sectionTokenScale` divides the headline by.
-   *
-   *  On most sections nothing else counts their bytes, so the delta happens
-   *  to equal `content_chars`. `Conversation` is where the two part: every
-   *  other section is already concatenated into the first message, so its
-   *  delta is what the tool loop added on top.
-   *
-   *  Mirrors the Rust `budget_delta_chars`. A row stored under the old
-   *  `char_count` name is renamed at the read boundary by the engine
-   *  (`api::threads::events_snapshot`), so it never arrives here. */
-  budget_delta_chars: number;
-  /** True length of this section's own content, whatever `content` shows. A
-   *  dropped body and a head-and-tail truncation both leave it untouched.
-   *
-   *  Absent means the row predates the field, never a zero-size section. Do
-   *  NOT sum it against the headline total: on `Conversation` it counts the
-   *  bundle a second time. */
-  content_chars?: number;
-  /** Optional for backward compatibility with snapshots persisted before
-   *  role-tagging existed. Default is `'user'` (matches Rust
-   *  `default_context_role`). */
-  role?: ContextRole;
-  /** Inner-group label used by the viewer to nest sections within the
-   *  user-message role. Absent for system-role sections, prior-message rows,
-   *  and legacy events. */
-  group?: string;
-}
-
-/** Tokens one API call reported.
- *
- *  **`input_tokens` is a TOTAL and it CONTAINS the two cache counts.** Both
- *  providers are normalised to that convention. So the three input fields are a
- *  total and two of its parts, never three classes to add up. Derive fresh
- *  input as `Math.max(0, input_tokens - cache_read_tokens -
- *  cache_creation_tokens)`, the way `ContextCapturePanel` does. Read as
- *  classes, every cached token counts twice.
- *
- *  `cache_creation_tokens` is Anthropic-only, since OpenAI charges nothing for
- *  a cache write and reports no count. `cache_read_tokens` is set by both. */
-export interface ApiUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_creation_tokens: number;
-}
-
-/** `auxiliary` is a model call the engine made for itself rather than as an
- *  agent's turn. The transcript never renders one (`isAuxiliaryCapture` drops
- *  it from the exchange fold), so it reaches this type only through a raw
- *  event payload. */
-export type ContextProducer = 'main_llm' | 'claude_code' | 'codex' | 'auxiliary';
-
 /** Mirrors the Rust `ContextCaptured` ThreadEvent. `usage` is absent on
  *  pre-call snapshots and on providers that don't report it (OpenAI,
  *  Gemini). `legacy` is set by `synthesizeContextCapture` for old rows.
@@ -277,6 +222,18 @@ export type ResponseEvent =
        *  emits also stamp it. Used as the route key for
        *  `GET /events/:event_id/tool-result`. */
       result_event_id?: string;
+      /** `true` when the source coding-agent tool call had its `args` field
+       *  stripped on the snapshot endpoint (see `strip_tool_call_args` in
+       *  `api/threads/events_snapshot.rs`). Paired with `call_event_id` so the
+       *  step-detail modal can lazy-fetch the un-elided command on open.
+       *
+       *  The step's inline label never needs the args: the strip fills
+       *  `description` from the same Rust helper the write path uses. */
+      args_stripped?: boolean;
+      /** The `_eventId` of the source tool-call event, stamped whenever the
+       *  call named this step. The route key for
+       *  `GET /events/:event_id/tool-args`. */
+      call_event_id?: string;
       /** @deprecated kept for legacy backend payloads. */
       context?: ContextAssembledData;
       contextCapture?: ContextCapture;
@@ -388,6 +345,40 @@ export type ResponseEvent =
       /** Set on `canceled`: how it was stopped, which is what the row's note
        *  says. Absent on a pre-2026-08-07 row. */
       cause?: EventWaitCancelCause;
+    }
+  | {
+      /** What Lucidos said out loud during a *voice session*, one row per
+       *  talker turn (`SpokenReplyGenerated`).
+       *
+       *  A **transcript marker**, not step mechanics (see `isStepMechanics`),
+       *  so it renders ungated. The caller heard it and no audio is kept, so
+       *  this row is the only place it exists: hiding it behind the default-off
+       *  steps control would put it nowhere.
+       *
+       *  It sits INSIDE the doer's turn but is not the doer's words.
+       *  The talker says what an answer means; the written answer beside it is
+       *  what the reader reads. The row wears its own speaker label so the two
+       *  are never confused (ADR 0150).
+       *
+       *  `interrupted` is set when the caller talked over it, so the text is
+       *  what was said before they cut in rather than the whole reply. */
+      type: 'spoken_reply';
+      text: string;
+      interrupted: boolean;
+    }
+  | {
+      /** What the CALLER said during a *voice session*, when the talker
+       *  answered it alone (`SpokenMessageReceived`).
+       *
+       *  An utterance the talker delegated becomes a `MessageReceived` and
+       *  opens its own turn, wearing the spoken chip. One it handled itself
+       *  starts nothing, so this row is the only place it appears.
+       *
+       *  A **transcript marker** for the same reason `spoken_reply` is: no
+       *  audio is kept, so hiding it behind the steps control would put half a
+       *  conversation nowhere. */
+      type: 'spoken_message';
+      text: string;
     }
   | {
       /** The model ended its turn cleanly but produced no text (a benign empty

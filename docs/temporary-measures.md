@@ -180,10 +180,51 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   [`docs/plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md`](plans/2026-08-27-the-composer-sends-the-draft-it-is-showing.md)
   and
   [`docs/plans/2026-08-28-a-swallowed-tap-says-so.md`](plans/2026-08-28-a-swallowed-tap-says-so.md).
+- **What the ninth report found: the other half of the composer.** The user
+  typed and the characters never appeared, so no button was ever pressed. This
+  probe was silent and correct, and the textarea had nothing watching it. The
+  dead-keystroke probe below covers that half now.
 - **Status:** `active`, and back to gathering evidence rather than confirming a
   repair.
 - **Not a workaround.** It changes no behaviour and takes no gesture. Real fixes
   ship beside it, and this only decides what the user is told when they fail.
+
+### Dead-keystroke probe on the composer's textarea
+
+- **Added:** 2026-08-29
+- **Lives in:** `crates/lucidos-app/src/components/chat/deadKeystrokeProbe.ts`,
+  its install call in `src/main.tsx`, its `reportDraftClobbered` caller in
+  `src/components/chat/PromptInput.tsx`, and
+  `src/components/chat/__tests__/dead-keystroke-probe.test.ts`.
+  `src/components/chat/probeViewport.ts` is shared with the press probe above,
+  so it goes with whichever of the two is removed last.
+- **Impermanent because:** It is the sibling of the press probe and chases the
+  same bug from the other side. Nine reports of a dead composer, and the ninth
+  is the first to say the TEXTAREA died rather than the buttons: the box took
+  focus, the keyboard came up, the user typed, and nothing appeared. No emulator
+  reproduces it and the user cannot reproduce it on demand, so the app has to
+  report the next episode itself.
+- **The three verdicts, and what each settles.** `input-never-arrived` is a
+  `beforeinput` with no `input` behind it, which puts the fault in WebKit rather
+  than in our code. That is the question nine reports have not been able to
+  answer. `keystroke-lost` is the edit reaching the box and not the store.
+  `draft-clobbered` is both of those working and a draft clear wiping the
+  result, which the composer now repairs rather than obeying.
+- **Reading an episode.** Grep for `composer-typing` in whichever log the
+  engine's stdout goes to, the same two candidates the press row names. Each
+  line carries the verdict, the lengths involved, and the same viewport block a
+  press line does, so the two read side by side.
+- **Removal / resolution condition:** An episode arrives carrying a verdict, and
+  the fix that verdict points at ships, OR two months pass with no report. Then
+  delete the module, its install call, the `reportDraftClobbered` call in
+  `PromptInput`, and the test. Verify with a tree-wide search for
+  `deadKeystrokeProbe` and `reportDraftClobbered`, which must return nothing.
+  `resolveEmptyDraftSync` STAYS: it is a behaviour fix, not a diagnostic.
+- **Investigation:** none, same as the press probe. The plan behind it is
+  [`docs/plans/2026-08-29-the-composer-never-erases-what-you-typed.md`](plans/2026-08-29-the-composer-never-erases-what-you-typed.md).
+- **Status:** `active`
+- **Not a workaround.** Every listener is passive and consumes nothing. The
+  behaviour fix ships beside it, in `resolveEmptyDraftSync`.
 
 ### Recorded mirror-history exceptions
 
@@ -273,7 +314,16 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   - Drop the fallback sentence from ADR 0132 § Decision.
 
   A device that never comes back was never going to authorize again anyway.
-- **Status:** open
+- **Resolved (2026-08-29):** ADR 0162 removed the special case rather than
+  waiting it out. Authorization reads every name in the `lucidos_device*`
+  family and takes the first that MATCHES a stored device. Whichever name
+  carried the match, the response re-issues under this gateway's own.
+
+  So the pre-split name is still read, as one ordinary candidate. There is no
+  fallback arm, no `migrating` branch and no const to delete, and a data-dir
+  rename is covered by the same rule. `LEGACY_COOKIE_DEVICE_CREDENTIAL` became
+  `DEVICE_COOKIE_STEM`, which every name derives from and which is permanent.
+- **Status:** resolved
 
 ### Legacy paired-device store seed
 

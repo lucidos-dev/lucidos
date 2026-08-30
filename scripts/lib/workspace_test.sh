@@ -21,6 +21,17 @@ pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 # shellcheck source=workspace.sh
 source "$SCRIPT_DIR/workspace.sh"
 
+# No `lsof` stub here, unlike `ports_test.sh`, and deliberately.
+#
+# That rule (ADR 0025) exists because `ports.sh`'s reclaim path resolves a
+# port's occupier and SIGUSR1s it. Nothing in this suite reaches that path: it
+# calls neither `allocate_ports` nor `start_gateway`, the only two callers.
+#
+# The suite's own probes DO shell out to `lsof`, to ask whether a frontend of
+# this project is running, and a stub answering "nothing is listening" makes
+# eight tests measure the wrong thing. Add one only alongside a test that can
+# reach a signal.
+
 # ── fixture helpers ────────────────────────────────────────────────────
 make_pkg_dir() {
     # Creates a package dir with a package.json and (optionally) a node_modules.
@@ -769,6 +780,51 @@ test_swap_ports_writes_shared_database_url() {
     fi
 }
 
+# detect_tls used to APPEND its line, so a workspace relaunched N times carried
+# N PROTO lines and a reader took whichever it parsed last.
+test_relaunching_leaves_exactly_one_proto_line() {
+    echo "test: relaunching leaves exactly one PROTO line"
+
+    local PROJECT_DIR="$SANDBOX/proj-proto-once"
+    mkdir -p "$PROJECT_DIR" "$HOME/workspaces/proto-once/.lucidos"
+    WORKSPACE="$HOME/workspaces/proto-once"
+    LUCIDOS_TLS_CERT=""
+    LUCIDOS_TLS_KEY=""
+
+    detect_tls
+    detect_tls
+    detect_tls
+
+    local count
+    count=$(grep -c '^PROTO=' "$WORKSPACE/.lucidos/ports")
+    if [ "$count" = "1" ]; then
+        pass "three launches wrote one PROTO line"
+    else
+        fail "expected one PROTO line, got $count: $(cat "$WORKSPACE/.lucidos/ports")"
+    fi
+}
+
+# It also skipped the write entirely when no ports file existed yet, so a launch
+# that reached here first recorded no scheme at all.
+test_detect_tls_records_the_scheme_with_no_ports_file_yet() {
+    echo "test: detect_tls records the scheme even with no ports file yet"
+
+    local PROJECT_DIR="$SANDBOX/proj-proto-fresh"
+    mkdir -p "$PROJECT_DIR" "$HOME/workspaces/proto-fresh/.lucidos"
+    WORKSPACE="$HOME/workspaces/proto-fresh"
+    LUCIDOS_TLS_CERT=""
+    LUCIDOS_TLS_KEY=""
+    rm -f "$WORKSPACE/.lucidos/ports"
+
+    detect_tls
+
+    if grep -qx "PROTO=http" "$WORKSPACE/.lucidos/ports" 2>/dev/null; then
+        pass "the scheme was recorded into a file that did not exist"
+    else
+        fail "no PROTO line: $(cat "$WORKSPACE/.lucidos/ports" 2>/dev/null)"
+    fi
+}
+
 # Every launcher runs detect_tls before swap_ports, and swap_ports rewrites the
 # same file. A reader that finds no PROTO falls back to https, so a dropped
 # line makes every caller fail the TLS handshake against a plain http engine.
@@ -885,6 +941,8 @@ test_legacy_pg_volume_layout_detects_parent_pgdata
 test_legacy_pg_volume_layout_detects_root_pgdata
 test_swap_ports_writes_shared_database_url
 test_swap_ports_keeps_the_proto_detect_tls_wrote
+test_relaunching_leaves_exactly_one_proto_line
+test_detect_tls_records_the_scheme_with_no_ports_file_yet
 test_seed_gateway_registry_removes_legacy_database_url
 
 # ── worktree-pinned stack guard ────────────────────────────────────────

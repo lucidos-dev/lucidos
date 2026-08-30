@@ -36,6 +36,7 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid, text: &str) -> U
         bus,
         thread_id,
         ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,

@@ -1,85 +1,104 @@
-/* The call strip: what a live call looks like, above the prompt row.
+/* What a call leaves in the transcript.
  *
- * A raised neutral surface rather than a bordered callout, and no left stripe
- * (frontend-css.md bans it outright). The dot carries the state and the two
- * lines carry the conversation.
+ * Three marks, answering three different questions. The chip on a user bubble
+ * says the message was spoken. The two bubbles inside a turn are the call
+ * itself: what Lucidos said out loud, which is never the written answer beside
+ * it, and what the caller said when the talker fielded it alone.
  *
- * The toggle that starts and ends a call is NOT here. It lives with the prompt
- * row's other toggle paints in input-messages.css, which is that row's one
- * registry of on-state shapes. */
+ * A live call paints nothing else. The call toggle says a call is up, and the
+ * words land here as they are spoken. That toggle's on-state lives with the
+ * prompt row's other toggle paints in input-messages.css, which is that row's
+ * one registry of on-state shapes. */
 
-.call-strip {
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-    padding: 0.375rem 0.625rem;
-    margin-bottom: 0.375rem;
-    background: var(--bg-tertiary);
-    border-radius: 0.5rem;
-    font-size: var(--font-size-sm);
-    max-width: 100%;
-}
-
-.call-strip-state {
+/* The chip rides `.initiator-meta`, the bubble header's right-hand cluster,
+   next to the timestamp and the optional "Queued" mark. Muted, because it
+   qualifies the message rather than competing with it. */
+.spoken-chip {
     display: inline-flex;
     align-items: center;
+    gap: 0.25rem;
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+}
+
+.spoken-chip svg {
+    width: 0.75rem;
+    height: 0.75rem;
+}
+
+/* A spoken bubble takes a surface of its own, so a mixed transcript can be
+   read at a glance without stopping at each header. Quiet on purpose: it is
+   the same message either way, and the chip carries the fact. */
+.initiator-panel-bubble.initiator-panel-spoken .user-bubble {
+    background: color-mix(in srgb, var(--accent-notable) 14%, var(--bg-tertiary));
+}
+
+/* The row, in both directions. It shares the response body's left inset so it
+   sits on the same column as the prose it is interleaved with.
+
+   Both sides keep that one column rather than mirroring, because these rows
+   are interleaved with a left-aligned response body. A right-hand side would
+   read as a second conversation running beside the turn. */
+.spoken-reply,
+.spoken-message {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
     gap: 0.375rem;
-    font-size: var(--font-size-xs);
-    color: var(--text-secondary);
+    padding: 0.25rem 0 0.25rem var(--turn-body-inset);
+    font-size: var(--font-size-sm);
 }
 
-.call-strip-dot {
-    width: 0.4375rem;
-    height: 0.4375rem;
-    border-radius: 50%;
+.spoken-reply-who,
+.spoken-message-who {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
     flex-shrink: 0;
-    background: var(--text-muted);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
 }
 
-/* Connecting is the only state the caller waits through, so it is the only one
- * that moves. An indefinite animation carries a literal duration and no token
- * (frontend-css.md): it is an activity indicator, not a transition. */
-.call-strip[data-phase="connecting"] .call-strip-dot {
-    background: var(--accent-notable);
-    animation: call-strip-pulse 1.2s ease-in-out infinite;
+.spoken-reply-who svg,
+.spoken-message-who svg {
+    width: 0.75rem;
+    height: 0.75rem;
 }
 
-.call-strip[data-phase="listening"] .call-strip-dot {
-    background: var(--accent-green);
-}
-
-.call-strip[data-phase="speaking"] .call-strip-dot {
-    background: var(--accent);
-}
-
-@keyframes call-strip-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .call-strip[data-phase="connecting"] .call-strip-dot {
-        animation: none;
-    }
-}
-
-/* One line each, truncated. The strip sits above the composer and must not
- * grow the prompt area as a reply streams in. */
-.call-strip-line {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-secondary);
-}
-
-.call-strip-said {
+/* The words, in a bubble of their own: this is speech, not a status line.
+ *
+ * It hugs its text rather than filling the row, so a short reply reads as one
+ * utterance. The surface is the raised neutral one, a step lighter than the
+ * transcript in the dark theme and a step darker in the light one, and that is
+ * the whole tint. A spoken reply is not a message the reader sent, so it must
+ * stay well under the accent a user bubble carries. */
+.spoken-reply-text,
+.spoken-message-text {
+    flex: 0 1 auto;
+    min-width: 0;
+    padding: 0.25rem 0.625rem;
+    background: var(--bg-secondary);
+    border-radius: 0.75rem;
     color: var(--text-primary);
+    overflow-wrap: break-word;
 }
 
-.call-strip-who {
-    display: inline-block;
-    margin-right: 0.375rem;
+/* The caller's own words take the tint a spoken user bubble takes, so what
+   they said looks the same whether it opened a turn or the talker fielded it
+   alone. It is the one thing telling the two sides of a call apart at a
+   glance, the label being the same size and colour on both. */
+.spoken-message-text {
+    background: color-mix(in srgb, var(--accent-notable) 14%, var(--bg-tertiary));
+}
+
+/* The caller cut in, so the text stops mid-thought. Says so rather than
+   leaving the reader to wonder why it trails off. */
+.spoken-reply-cut {
+    margin-left: 0.375rem;
     font-size: var(--font-size-2xs);
     text-transform: uppercase;
     letter-spacing: 0.03em;

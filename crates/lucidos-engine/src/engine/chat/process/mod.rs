@@ -183,6 +183,7 @@ impl LucidosEngine {
             None,
             None,
             None,
+            None,
             external_cancel,
             crate::engine::FollowUpUrgency::Normal,
         )
@@ -216,6 +217,13 @@ impl LucidosEngine {
         pre_emitted_origin: Option<PreEmittedOrigin>,
         title: Option<&str>,
         origin: Option<MessageOrigin>,
+        // The *voice session* this message was spoken on. `None` is typed,
+        // which is every caller but the voice one. It rides beside `origin`
+        // because it answers the same question: how this message got here.
+        //
+        // Threaded even though the voice path normally pre-emits, so a
+        // pre-emit that failed still writes a message that says it was spoken.
+        voice_session_id: Option<Uuid>,
         // `Normal` for every caller but a child follow-up the parent marked
         // urgent, which preempts the child's in-flight turn instead of queueing
         // behind it. Named rather than a bare `bool` so the call sites stay
@@ -245,6 +253,7 @@ impl LucidosEngine {
             pre_emitted_origin,
             title,
             origin,
+            voice_session_id,
             None,
             urgency,
         )

@@ -3,7 +3,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
-import { changeKindName, type PersistScope } from '../../store/thread-events';
+import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { followResolvedPermission } from './scrollState';
@@ -18,7 +18,7 @@ interface PermissionEvent {
 
 interface PermissionBodyProps {
   event: PermissionEvent;
-  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: AllowScope };
   /** Surrounding response was canceled / aborted / failed / superseded
    *  without a resolution landing — render every button disabled. */
   terminated?: boolean;
@@ -311,7 +311,7 @@ export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad'
  *  surviving outcome even though the user never clicked. */
 export function resolvedChoice(resolved: {
   allowed: boolean;
-  persist_scope?: PersistScope;
+  persist_scope?: AllowScope;
 }): PermissionChoice {
   if (!resolved.allowed) return 'deny';
   return resolved.persist_scope ?? 'allow';
@@ -452,10 +452,10 @@ function PermissionBodyShell({
  *  / `resolveMcpPermission`), which posts the consent and nothing else. */
 function usePermissionDecide(
   requestId: string,
-  resolve: (id: string, allowed: boolean, persist?: PersistScope) => Promise<void>,
+  resolve: (id: string, allowed: boolean, persist?: AllowScope) => Promise<void>,
 ) {
-  const pending = useSignal<{ allowed: boolean; persist_scope?: PersistScope } | null>(null);
-  const decide = async (allowed: boolean, persist?: PersistScope) => {
+  const pending = useSignal<{ allowed: boolean; persist_scope?: AllowScope } | null>(null);
+  const decide = async (allowed: boolean, persist?: AllowScope) => {
     pending.value = { allowed, persist_scope: persist };
     // Deciding a card is a SUBMIT: the agent is expected to respond to it, so it
     // gets the same one reaction every other submit gets, anchored on this card's
@@ -571,7 +571,7 @@ interface CommandPermissionEvent {
 
 interface CommandPermissionBodyProps {
   event: CommandPermissionEvent;
-  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: AllowScope };
   terminated?: boolean;
 }
 
@@ -828,7 +828,7 @@ interface McpPermissionEvent {
 
 interface McpPermissionBodyProps {
   event: McpPermissionEvent;
-  resolved?: { allowed: boolean; reason?: string; persist_scope?: PersistScope };
+  resolved?: { allowed: boolean; reason?: string; persist_scope?: AllowScope };
   terminated?: boolean;
 }
 

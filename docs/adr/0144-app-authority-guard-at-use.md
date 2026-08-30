@@ -129,10 +129,16 @@ established here, not invented.
 
 **Inferring a missing scope, rather than refusing it.** Refusing is fail-closed
 and would be defensible. It also breaks a working proxy entry on upgrade, for a
-user who did nothing wrong. `request_credential` has always required a
-`base_url`, so the rows affected are legacy or hand-made. The inference reads
-the config as it stands, announces what it did, and leaves the user able to
-correct it in Settings.
+user who did nothing wrong. The rows affected are legacy or hand-made: every
+other way of saving a credential names a host. The inference reads the config as
+it stands, announces what it did, and leaves the user able to correct it in
+Settings.
+
+**Amended by the `secret` type**, which is signed with rather than sent and so
+names no host by design. An empty scope is that type's answer, not a gap, so the
+inference skips it: see `CredentialStore::infer_scope_if_empty`. The sentence
+above once read that `request_credential` had always required a `base_url`.
+It no longer does, for exactly that type.
 
 **The handshake runner is the only place the engine executes a file from
 workspace data.** Every other `Command::new` in the engine spawns a fixed

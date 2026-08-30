@@ -1,7 +1,8 @@
 use super::events_snapshot::{
     rename_legacy_section_size, rename_legacy_section_size_in_payload,
     strip_app_capture_in_tool_result, strip_context_capture_sections,
-    strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_result_content,
+    strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_call_args,
+    strip_tool_result_content,
 };
 use crate::core::ThreadEventRow;
 use chrono::Utc;
@@ -334,6 +335,124 @@ fn tool_result_strip_handles_missing_result_field() {
     assert!(!obj.contains_key("result"), "no result to begin with");
     assert_eq!(obj.get("result_stripped"), Some(&json!(true)));
     assert_eq!(obj.get("images"), Some(&json!(["abc"])));
+}
+
+// ── the coding-agent channel's own tool events ──────────────────────
+
+/// The strips above were written for the chat channel's `ToolResult`, gated on
+/// that exact name. So the shape they never fired on was the coding-agent
+/// thread, the heaviest a workspace holds.
+#[test]
+fn tool_result_strip_covers_the_coding_agent_channel() {
+    let huge_output = "bash output line\n".repeat(10_000);
+    let mut row = row(
+        "CodingAgentToolResult",
+        json!({ "name": "Bash", "result": huge_output, "tool_use_id": "tu-A" }),
+    );
+    strip_tool_result_content(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("result"), "result must be dropped");
+    assert_eq!(obj.get("result_stripped"), Some(&json!(true)));
+    // The inline step row pairs by `tool_use_id` and labels by `name`.
+    assert_eq!(obj.get("name"), Some(&json!("Bash")));
+    assert_eq!(obj.get("tool_use_id"), Some(&json!("tu-A")));
+}
+
+#[test]
+fn combined_strip_covers_the_coding_agent_channel() {
+    let b64 = "A".repeat(2000);
+    let mut image_row = row(
+        "CodingAgentToolResult",
+        json!({ "name": "Read", "result": format!("[IMAGE_CONTENT:image/png]\n{}", b64) }),
+    );
+    strip_inline_image_payloads(&mut image_row);
+    assert!(!image_row.payload["result"].as_str().unwrap().contains(&b64));
+
+    let mut capture_row = row(
+        "CodingAgentToolResult",
+        json!({ "name": "Read", "result": format!("[APP_CAPTURE:{}]\nDOM", b64) }),
+    );
+    strip_inline_image_payloads(&mut capture_row);
+    assert!(!capture_row.payload["result"]
+        .as_str()
+        .unwrap()
+        .contains(&b64));
+}
+
+#[test]
+fn tool_call_strip_drops_args_keeps_the_label_fields_stamps_marker() {
+    let mut row = row(
+        "CodingAgentToolCalled",
+        json!({
+            "name": "Write",
+            "description": "Write shell.css",
+            "args": { "file_path": "/a/shell.css", "content": "x".repeat(90_000) },
+            "tool_use_id": "tu-A",
+            "coding_agent": "claude-code",
+        }),
+    );
+    strip_tool_call_args(&mut row);
+    let obj = row.payload.as_object().unwrap();
+    assert!(!obj.contains_key("args"), "args must be dropped");
+    assert_eq!(obj.get("args_stripped"), Some(&json!(true)));
+    assert_eq!(obj.get("description"), Some(&json!("Write shell.css")));
+    assert_eq!(obj.get("name"), Some(&json!("Write")));
+    assert_eq!(obj.get("tool_use_id"), Some(&json!("tu-A")));
+}
+
+/// The write path has stamped `description` since May 2026, but every older
+/// row carries none and the frontend rebuilt the label from `args`. Dropping
+/// `args` alone would degrade those rows to a bare tool name. So the strip
+/// fills the gap from the same Rust function the write path calls.
+#[test]
+fn tool_call_strip_fills_a_missing_description_before_dropping_the_args() {
+    let mut row = row(
+        "CodingAgentToolCalled",
+        json!({ "name": "Read", "args": { "file_path": "/a/b/main.rs" } }),
+    );
+    strip_tool_call_args(&mut row);
+    assert_eq!(row.payload.get("description"), Some(&json!("Read main.rs")));
+    assert!(!row.payload.as_object().unwrap().contains_key("args"));
+}
+
+#[test]
+fn tool_call_strip_treats_an_empty_description_as_missing() {
+    let mut row = row(
+        "CodingAgentToolCalled",
+        json!({ "name": "Bash", "description": "", "args": { "command": "git status" } }),
+    );
+    strip_tool_call_args(&mut row);
+    assert_eq!(
+        row.payload.get("description"),
+        Some(&json!("Run git status"))
+    );
+}
+
+#[test]
+fn tool_call_strip_is_idempotent() {
+    let mut row = row(
+        "CodingAgentToolCalled",
+        json!({ "name": "Read", "args": { "file_path": "/a/b.rs" } }),
+    );
+    strip_tool_call_args(&mut row);
+    let after_first = row.payload.clone();
+    strip_tool_call_args(&mut row);
+    assert_eq!(row.payload, after_first, "second call is a no-op");
+}
+
+/// The chat channel's own `ToolCalled` is left alone: its args are small, and
+/// `thread-sync.ts` reads the write target straight off them.
+#[test]
+fn tool_call_strip_ignores_the_chat_channel_and_other_event_types() {
+    for event_type in ["ToolCalled", "ContextCaptured", "MessageReceived"] {
+        let mut row = row(
+            event_type,
+            json!({ "name": "write_file", "args": { "path": "notes.md" } }),
+        );
+        let before = row.payload.clone();
+        strip_tool_call_args(&mut row);
+        assert_eq!(row.payload, before, "{event_type} must be untouched");
+    }
 }
 
 // ── event-wait routes are the calling thread's own ──────────────────

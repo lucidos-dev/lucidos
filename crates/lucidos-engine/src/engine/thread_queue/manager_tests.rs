@@ -1488,6 +1488,7 @@ async fn emit_message_received(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "hello".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1805,6 +1806,7 @@ async fn reconcile_ignores_background_thread() {
         .emit(BusEvent::Thread {
             thread_id: tid,
             event: crate::engine::thread_events::ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "spawned".into(),
                 user_image_hashes: vec![],
                 device_id: None,
@@ -1902,6 +1904,7 @@ fn affects_user_running_selects_status_transitions() {
     // Gate-covered starts: the gate owns the add, so reconcile must NOT fire on
     // these (a reconcile add would race the gate's unconditional add).
     assert!(!affects_user_running(&ThreadEvent::MessageReceived {
+        voice_session_id: None,
         text: "hi".into(),
         user_image_hashes: vec![],
         device_id: None,

@@ -584,10 +584,10 @@ fn no_chat_turn_reads_another_threads_messages() {
 }
 
 /// THE attribution invariant (ADR 0150). A guest agent's turn reaches the
-/// reasoner under the guest's own name.
+/// doer under the guest's own name.
 ///
 /// The two failures this rules out are not symmetric. `Assistant` makes the
-/// reasoner read the turn as its own, so two models converge on whatever the
+/// doer read the turn as its own, so two models converge on whatever the
 /// first one said. `User` makes it obey an instruction the user never gave.
 #[test]
 fn a_guest_turn_renders_under_its_own_speaker_name() {

@@ -445,6 +445,7 @@ impl LucidosEngine {
                     None, // pre_emitted_origin — router emits MR itself
                     None, // title — already emitted placeholder above
                     origin,
+                    None,
                     crate::engine::FollowUpUrgency::Normal,
                 )
                 .await;

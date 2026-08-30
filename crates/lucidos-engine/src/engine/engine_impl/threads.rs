@@ -99,6 +99,23 @@ impl LucidosEngine {
             .map(|h| (h.injection_notify.clone(), h.pending_injections.clone()))
     }
 
+    /// Hand a prompt to the turn running on this thread, if one is.
+    ///
+    /// Returns whether it landed. **`false` is an ordinary answer, not an
+    /// error**: an idle thread has no loop to inject into, and this never
+    /// starts one. A caller that needs a turn to run sends a message instead.
+    ///
+    /// For a prompt whose exchange-starter is already on the wire, or belongs
+    /// to somebody else. Anything user-shaped goes through the chat path,
+    /// which handles the idle case and the persistence this skips.
+    pub fn inject_into_live_turn(&self, thread_id: Uuid, prompt: InjectedPrompt) -> bool {
+        let threads = self.active_threads.lock().unwrap();
+        match threads.get(&thread_id) {
+            Some(handle) => handle.inject(prompt),
+            None => false,
+        }
+    }
+
     /// Admit one run on `thread_id`, or refuse because a turn already owns it.
     /// The engine's entry point to [`crate::engine::try_register_thread`], where
     /// the single-flight contract is documented.
@@ -354,6 +371,7 @@ impl LucidosEngine {
             Some(PreEmittedOrigin::EngineReentry(child_completed_event_id)),
             None,
             callback_origin,
+            None,
             crate::engine::FollowUpUrgency::Normal,
         )
         .await

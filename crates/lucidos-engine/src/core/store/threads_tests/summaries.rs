@@ -1193,3 +1193,99 @@ async fn fetch_family_extension_respects_max_family() {
 
     teardown_test_db(&db).await;
 }
+
+/// Two axes decide whether a thread is still waiting on the user, and only one
+/// of them is obvious. Archiving sets `archive_state` and deliberately leaves
+/// `state = 'active'`, so a `state` filter alone lets every archived thread
+/// through. A *voice session* reads this list out loud, so the cost of the
+/// wrong axis is a call announcing work the user already put down.
+#[tokio::test]
+async fn titles_awaiting_answer_excludes_every_thread_the_user_put_down() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    // (title, status, state, archive_state) → listed?
+    let rows: &[(&str, &str, &str, &str)] = &[
+        (
+            "Waiting and live",
+            "waiting_for_user_answer",
+            "active",
+            "inbox",
+        ),
+        (
+            "Waiting but archived",
+            "waiting_for_user_answer",
+            "active",
+            "archived",
+        ),
+        (
+            "Waiting but discarded",
+            "waiting_for_user_answer",
+            "discarded",
+            "inbox",
+        ),
+        (
+            "Waiting but composing",
+            "waiting_for_user_answer",
+            "composing",
+            "inbox",
+        ),
+        ("Live but working", "running", "active", "inbox"),
+        ("Live and idle", "idle", "active", "inbox"),
+    ];
+    for (title, status, state, archive_state) in rows {
+        sqlx::query(
+            "INSERT INTO thread_summaries \
+                 (thread_id, title, source, message_count, last_activity, has_response, \
+                  status, state, archive_state) \
+                 VALUES ($1, $2, 'chat', 1, NOW(), TRUE, $3, $4, $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(*title)
+        .bind(*status)
+        .bind(*state)
+        .bind(*archive_state)
+        .execute(&pool)
+        .await
+        .expect("insert thread_summaries");
+    }
+
+    let titles = store
+        .titles_awaiting_answer(20)
+        .await
+        .expect("titles_awaiting_answer");
+
+    assert_eq!(titles, vec!["Waiting and live".to_string()]);
+
+    teardown_test_db(&db).await;
+}
+
+/// A thread can be waiting before its title is generated, and it is still
+/// waiting. Dropping the row would tell the caller nothing needs them.
+#[tokio::test]
+async fn titles_awaiting_answer_names_a_thread_with_no_title_yet() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, last_activity, has_response, \
+              status, state, archive_state) \
+             VALUES ($1, NULL, 'chat', 1, NOW(), TRUE, \
+                     'waiting_for_user_answer', 'active', 'inbox')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    assert_eq!(
+        store
+            .titles_awaiting_answer(20)
+            .await
+            .expect("titles_awaiting_answer"),
+        vec!["Untitled".to_string()]
+    );
+
+    teardown_test_db(&db).await;
+}

@@ -285,6 +285,7 @@ mod tests {
 
     fn user_msg(text: &str) -> ThreadEvent {
         ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: text.into(),
             user_image_hashes: vec![],
             device_id: None,

@@ -1090,9 +1090,13 @@ test_registry_save_failure_propagates() {
     local ws
     ws="$(make_workspace "$SANDBOX/ws-fail-prop")"
 
-    # Force registry_save to fail. The override stays in effect only for
-    # this test (reset_state restores the function table on next run via
-    # re-source) — but reset_state doesn't re-source, so unset explicitly.
+    # Force registry_save to fail, then put the real one back. Restored by
+    # replaying its definition, never by `unset -f`: nothing re-sources
+    # ports.sh, so unsetting leaves the function GONE for every later test.
+    # allocate_ports then fails there too, and the file it would have written
+    # is silently the one it started with.
+    local real_registry_save
+    real_registry_save="$(declare -f registry_save)"
     # shellcheck disable=SC2329 # a seam: invoked indirectly by allocate_ports, not from this file
     registry_save() { return 1; }
 
@@ -1102,7 +1106,122 @@ test_registry_save_failure_propagates() {
         pass "allocate_ports propagated registry_save failure"
     fi
 
-    unset -f registry_save
+    eval "$real_registry_save"
+}
+
+# ── Test 26: allocate_ports preserves every key it did not come to set.
+# The ports file has several owners: detect_tls writes PROTO, swap_ports the
+# Postgres keys, the gateway republishes API_PORT and PROTO. A truncating write
+# here dropped PROTO on any launch path that stopped before detect_tls, and a
+# reader that finds no PROTO assumes https.
+test_allocating_ports_keeps_the_keys_other_writers_own() {
+    reset_state
+    echo "test: allocate_ports preserves PROTO and the Postgres keys"
+    local ws
+    ws="$(make_workspace "$SANDBOX/ws-preserve")"
+    local ports_file="$ws/.lucidos/ports"
+    cat > "$ports_file" <<'EOF'
+API_PORT=9999
+VITE_PORT=9999
+PG_PORT=5435
+PG_DATABASE=lucidos_preserve
+DATABASE_URL=postgres://lucidos:lucidos@localhost:5435/lucidos_preserve
+PROTO=http
+EOF
+
+    allocate_ports "$ws" > /dev/null 2>&1
+
+    local missing=""
+    for key in PG_PORT PG_DATABASE DATABASE_URL PROTO; do
+        grep -q "^$key=" "$ports_file" || missing="$missing $key"
+    done
+    if [ -z "$missing" ]; then
+        pass "every key another writer owns survived"
+    else
+        fail "allocate_ports dropped:$missing, leaving $(cat "$ports_file")"
+    fi
+
+    if grep -qx "PROTO=http" "$ports_file"; then
+        pass "PROTO kept its value, not just its line"
+    else
+        fail "PROTO changed: $(cat "$ports_file")"
+    fi
+
+    # And it still did its own job.
+    if grep -qx "API_PORT=5173" "$ports_file"; then
+        pass "API_PORT was rewritten in place"
+    else
+        fail "expected API_PORT=5173: $(cat "$ports_file")"
+    fi
+}
+
+# ── Test 27: setting a key twice rewrites its line rather than stacking one.
+# detect_tls used to append, so a workspace relaunched N times carried N PROTO
+# lines and a reader took whichever it happened to parse last.
+test_setting_a_key_twice_leaves_one_line() {
+    reset_state
+    echo "test: ports_file_set rewrites a key in place rather than appending"
+    local file="$SANDBOX/ws-once/.lucidos/ports"
+
+    ports_file_set "$file" "API_PORT=5173"
+    ports_file_set "$file" "PROTO=https"
+    ports_file_set "$file" "PROTO=http"
+    ports_file_set "$file" "PROTO=http"
+
+    local count
+    count=$(grep -c '^PROTO=' "$file")
+    if [ "$count" = "1" ] && grep -qx "PROTO=http" "$file"; then
+        pass "one PROTO line, holding the last value written"
+    else
+        fail "expected one PROTO=http line, got $count: $(cat "$file")"
+    fi
+
+    # A file that did not exist is created with exactly what was asked for.
+    if [ "$(wc -l < "$file" | tr -d ' ')" = "2" ]; then
+        pass "no blank lines crept in"
+    else
+        fail "unexpected line count: $(cat -A "$file")"
+    fi
+}
+
+# ── Test 28: a file that ALREADY carries duplicates is collapsed.
+# The migration case. Every workspace relaunched under the appending detect_tls
+# holds one PROTO line per launch, and rewriting each of them in place would
+# keep all of them.
+test_setting_a_key_collapses_duplicates_a_previous_writer_left() {
+    reset_state
+    echo "test: ports_file_set collapses duplicate keys left by the old writer"
+    local file="$SANDBOX/ws-dupes/.lucidos/ports"
+    mkdir -p "$(dirname "$file")"
+    cat > "$file" <<'EOF'
+API_PORT=5173
+VITE_PORT=5173
+PROTO=https
+PG_PORT=5435
+PROTO=https
+PROTO=https
+EOF
+
+    ports_file_set "$file" "PROTO=http"
+
+    local count
+    count=$(grep -c '^PROTO=' "$file")
+    if [ "$count" = "1" ] && grep -qx "PROTO=http" "$file"; then
+        pass "three PROTO lines collapsed to one"
+    else
+        fail "expected one PROTO=http line, got $count: $(cat "$file")"
+    fi
+
+    # And it collapsed only what it was asked to set. The first occurrence keeps
+    # its position, so nothing else moved.
+    if [ "$(cat "$file")" = "API_PORT=5173
+VITE_PORT=5173
+PROTO=http
+PG_PORT=5435" ]; then
+        pass "every other line kept its value and its place"
+    else
+        fail "unexpected file: $(cat "$file")"
+    fi
 }
 
 # ── run all ────────────────────────────────────────────────────────────
@@ -1141,6 +1260,9 @@ test_ports_file_records_user_facing_port
 test_ports_file_correct_in_engine_only_mode
 test_registry_save_handles_concurrent_writers
 test_registry_save_failure_propagates
+test_allocating_ports_keeps_the_keys_other_writers_own
+test_setting_a_key_twice_leaves_one_line
+test_setting_a_key_collapses_duplicates_a_previous_writer_left
 
 # ── final host-safety assertion ────────────────────────────────────────
 # Anything still on the refusal log means a test reached for a pid it doesn't

@@ -194,9 +194,29 @@ pub(crate) fn format_request_error(
              engine accepted the request but never responded. \
              See the engine log under `.lucidos/engine.log` for a stalled upstream call."
         )
+    } else if is_tls_against_plain_http(&cause) {
+        format!(
+            "{method} {url} failed after {elapsed_s:.1}s: {cause}. That is a TLS \
+             handshake meeting a plain-http socket. The scheme comes from PROTO= \
+             in the target's .lucidos/ports, and an absent line is read as https."
+        )
     } else {
         format!("{method} {url} failed after {elapsed_s:.1}s: {cause}")
     }
+}
+
+/// Does this root cause say "we spoke TLS and got plain HTTP back"?
+///
+/// Named because the raw text is unreadable. Rustls reports these two when it
+/// reads an HTTP status line as a TLS record header. Neither points at the
+/// scheme, the port, or the file that chose them.
+///
+/// Deliberately narrow. A certificate complaint is a different fault with a
+/// different remedy, and blaming `PROTO=` for one would send the reader to the
+/// wrong file.
+fn is_tls_against_plain_http(cause: &str) -> bool {
+    let lower = cause.to_ascii_lowercase();
+    lower.contains("record overflow") || lower.contains("invalidcontenttype")
 }
 
 /// Walk the error's `source()` chain to the leaf and render that. Avoids the
@@ -272,6 +292,22 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn a_tls_handshake_on_a_plain_socket_is_recognised_and_named() {
+        // "record overflow" is what a caller saw when a workspace's ports file
+        // had lost its PROTO line. It names neither the scheme nor the file.
+        assert!(is_tls_against_plain_http(
+            "received corrupt message of type InvalidContentType: record overflow"
+        ));
+        assert!(is_tls_against_plain_http("Record overflow"));
+        assert!(!is_tls_against_plain_http("connection refused"));
+        assert!(!is_tls_against_plain_http("operation timed out"));
+        // A certificate complaint is a different fault, and PROTO= is not it.
+        assert!(!is_tls_against_plain_http(
+            "invalid peer certificate: Expired"
+        ));
+    }
 
     fn spawn_delayed_server(delay: Duration) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

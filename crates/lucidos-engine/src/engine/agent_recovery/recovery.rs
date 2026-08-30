@@ -9,7 +9,7 @@ use super::super::git_ops::{
     describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
     main_worktree, proposal_files_for_branch, worktrees_dir, WorktreeLookup,
 };
-use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin};
+use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin, QuestionOption};
 use super::super::LucidosEngine;
 use super::*;
 use std::path::{Path, PathBuf};
@@ -1162,18 +1162,96 @@ pub(crate) async fn preserve_question_park_at_shutdown(
 /// no longer preserved" cannot disagree.
 pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
     format!(
-        "EXISTS ( \
-            SELECT 1 FROM events uqa \
-            WHERE uqa.aggregate_id = {id} AND uqa.event_type = 'UserQuestionAsked' \
-              AND NOT EXISTS ( \
-                  SELECT 1 FROM events later \
-                  WHERE later.aggregate_id = {id} AND later.sequence > uqa.sequence \
-                    AND later.event_type IN ({park_ending}) \
-              ) \
-         )",
+        "EXISTS ( SELECT 1 FROM events uqa WHERE {} )",
+        unanswered_question_predicate_sql(id_expr),
+    )
+}
+
+/// The predicate itself, over one `events uqa` row.
+///
+/// Split out so the yes/no guard above and [`newest_open_question`] below
+/// cannot drift on what "still parked" means. They differ in what they select
+/// and in nothing else.
+fn unanswered_question_predicate_sql(id_expr: &str) -> String {
+    format!(
+        "uqa.aggregate_id = {id} AND uqa.event_type = 'UserQuestionAsked' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM events later \
+               WHERE later.aggregate_id = {id} AND later.sequence > uqa.sequence \
+                 AND later.event_type IN ({park_ending}) \
+           )",
         id = id_expr,
         park_ending = &*PARK_ENDING_EVENT_TYPES_SQL,
     )
+}
+
+/// A question a thread is parked on, as a reader of it needs it.
+///
+/// The event carries resume plumbing beside these three: a `tool_use_id`, a
+/// Claude Code session id, a worktree path. None of that means anything to
+/// somebody being asked the question, so none of it is here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenQuestion {
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+
+/// The question this thread is parked on, or `None` when it is not parked.
+///
+/// The row half of [`thread_has_unanswered_question`], built from the same
+/// predicate. The bool answers the restart preserve guard. This answers a
+/// *voice session* opening on a thread whose agent is waiting on a person: the
+/// talker holds no tools, so a question absent from its opening block is one
+/// it cannot go and look up (ADR 0149).
+///
+/// Newest first, so a thread carrying more than one live card reads out the
+/// one the reader is looking at.
+///
+/// A read error, a missing question or a blank one all yield `None`. A call
+/// that opens knowing less beats a call that does not open.
+pub(crate) async fn newest_open_question(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<OpenQuestion> {
+    let sql = format!(
+        "SELECT uqa.payload FROM events uqa WHERE {} \
+         ORDER BY uqa.sequence DESC LIMIT 1",
+        unanswered_question_predicate_sql("$1"),
+    );
+    let payload = match sqlx::query_scalar::<_, serde_json::Value>(&sql)
+        .bind(thread_id.to_string())
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(payload) => payload?,
+        Err(e) => {
+            log!(
+                "[Recovery] Could not read {}'s open question: {}",
+                thread_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    let question = payload.get("question")?.as_str()?.trim();
+    if question.is_empty() {
+        return None;
+    }
+    let options = payload
+        .get("options")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<Vec<QuestionOption>>(v).ok())
+        .unwrap_or_default();
+    Some(OpenQuestion {
+        question: question.to_string(),
+        options,
+        multi_select: payload
+            .get("multi_select")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// Park-ending events that are NOT in

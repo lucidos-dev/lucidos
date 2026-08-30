@@ -13,6 +13,29 @@ pub enum ThreadType {
     CodingAgent,
 }
 
+/// The wire and DB spelling of [`ThreadType::CodingAgent`].
+///
+/// One copy, because the string is compared against `thread_summaries.source`
+/// in several places and a fourth hand-written literal is how the two spellings
+/// drift. The authority is the `#[serde(rename)]` above.
+pub const CODING_AGENT_SOURCE: &str = "claude_code";
+
+impl ThreadType {
+    /// Read a `thread_summaries.source` as the type it names.
+    ///
+    /// Everything that is not a coding agent is `Chat`, `trigger` included: a
+    /// trigger thread's turns run the Lucidos Agent, so it is a chat thread in
+    /// every way this enum decides. Not a silent default, since the enum has
+    /// exactly two members and this is the whole of one of them.
+    pub fn from_source(source: &str) -> Self {
+        if source == CODING_AGENT_SOURCE {
+            Self::CodingAgent
+        } else {
+            Self::Chat
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveState {
@@ -259,12 +282,20 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Terminal. A live microphone is not a turn: the thread's status
         // belongs to the agent's turn, and voice is a mode of the thread
         // (ADR 0148). An end that settled status would terminate a turn the
-        // reasoner is still running.
+        // doer is still running.
         "VoiceSessionStarted" | "VoiceSessionEnded" => EventClass::Metadata,
         // A spoken reply, for the same reason. The talker authors it mid-call,
-        // often while the reasoner's own turn is still running. Classifying it
+        // often while the doer's own turn is still running. Classifying it
         // as a response would settle a turn it has no part in.
         "SpokenReplyGenerated" => EventClass::Metadata,
+        // An utterance the talker handled alone, and the delegation that
+        // asked for the doer. Metadata on both, for opposite reasons.
+        //
+        // SpokenMessageReceived starts nothing, so Start would leave the
+        // thread waiting on a turn that never runs. WorkDelegated sits BESIDE
+        // a turn the `MessageReceived` next to it already started, so Start
+        // would count one utterance twice.
+        "SpokenMessageReceived" | "WorkDelegated" => EventClass::Metadata,
         "MergeConflictDetected" | "MissingHardeningDetected" => EventClass::Start,
         // Activity
         "TextStreamed" | "ThoughtStreamed" | "MemoryRecalled" => EventClass::Activity,
@@ -461,6 +492,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // What the caller actually heard. Persisted because the audio is not,
         // so this text is the only record of a spoken turn.
         "SpokenReplyGenerated",
+        // The other half of a call's transcript: an utterance the talker
+        // answered alone, and the talker's own request for the doer. Persisted
+        // for the same reason, since neither has a row anywhere else.
+        "SpokenMessageReceived",
+        "WorkDelegated",
     ]
 }
 
@@ -743,14 +779,21 @@ pub fn resolve_transition(
         // settled the thread would terminate work the agent is still doing.
         //
         // Legal on both thread types, matching the event-wait pair above.
-        // Nothing offers voice on a coding-agent thread today, and the rule
-        // that decides is what a session touches rather than who opened it.
+        // Nothing may offer voice on a coding-agent thread (ADR 0165), so this
+        // arm is reachable on one only through a row written before that rule.
+        // It stays legal because the question here is what a session TOUCHES,
+        // and the answer is nothing either way.
         | "VoiceSessionStarted"
         | "VoiceSessionEnded"
         // A spoken reply moves nothing either. The caller is on the call, so
         // surfacing the thread to the Inbox would ask for attention they are
         // already giving.
-        | "SpokenReplyGenerated" => no_change,
+        //
+        // Nor does an utterance the talker handled alone, nor the talker's
+        // request for the doer. Same caller, same call, same reason.
+        | "SpokenReplyGenerated"
+        | "SpokenMessageReceived"
+        | "WorkDelegated" => no_change,
         _ => violation("Unknown event type"),
     }?;
 

@@ -75,6 +75,135 @@ export function exchangeRenderCost(exchange: { steps: readonly unknown[] }): num
   return exchange.steps.length + 1;
 }
 
+/** How many of the FLOOR exchange's rendered rows the window may draw.
+ *
+ *  The budget above picks WHICH turns render, and it has one hard floor: a turn
+ *  larger than the whole budget must still draw, or the transcript is blank.
+ *  On a coding-agent thread every turn is larger than the whole budget. The
+ *  reported one holds five turns costing 1, 65, 684, 425 and 1 steps, against a
+ *  budget of 160. So "at least one" was the only rule that ever applied, and
+ *  the window did nothing.
+ *
+ *  This is that floor made finer. The oldest turn on screen draws its TAIL. Its
+ *  head arrives as the reader scrolls toward it, through the same expansion
+ *  older turns arrive through.
+ *
+ *  Counted in RENDERED rows, not raw events, unlike `STEP_BUDGET`. In a
+ *  tool-heavy turn about half the raw events draw no row of their own, a result
+ *  settling the row its call opened. So 80 rows is about what 160 raw events
+ *  cost. */
+export const ROW_BUDGET = 80;
+
+/** The window's top edge. Two dimensions, because one turn can outweigh a whole
+ *  transcript.
+ *
+ *  An EDGE rather than a count, in both dimensions, and for one reason: no turn
+ *  and no row the reader has already been shown may leave the DOM. A count
+ *  slides forward as the live turn grows. See `renderCountFromFloor`. */
+export interface WindowEdge {
+  /** Index of the oldest exchange rendered. */
+  exchange: number;
+  /** How many of THAT exchange's leading rendered rows are left out. Always 0
+   *  for every other exchange in the window: they were admitted whole. */
+  rowsHidden: number;
+}
+
+/** The whole window, rendered. What a deep link and the scroll-to-top chevron
+ *  set, and the only edge that is safe to compare against by value. */
+export const WHOLE_THREAD: WindowEdge = { exchange: 0, rowsHidden: 0 };
+
+/** Must a deep link's render-all be WRITTEN to this thread's stored edge?
+ *
+ *  `undefined` is the case worth naming, and it answers YES. A cold push tap
+ *  finds `threadMap` empty, so the claim lands before the seed does. Read as
+ *  `WHOLE_THREAD` instead, an absent edge would skip the write. The seed would
+ *  then store the tail, and the thread would snap back to it the moment the
+ *  claim cleared.
+ *
+ *  A function rather than an inline test because that is the arm the inline
+ *  test got wrong, and it is invisible on a warm thread. */
+export function deepLinkMustPersist(stored: WindowEdge | undefined): boolean {
+  return !stored || edgeHasMoreAbove(stored);
+}
+
+/** How many leading rows to hide in an exchange drawing `rowCount` of them.
+ *
+ *  Never all of them: a turn admitted to the window draws something, the same
+ *  floor `countWithinBudget` keeps one level up. */
+export function seedRowsHidden(rowCount: number, budget = ROW_BUDGET): number {
+  return Math.max(0, rowCount - Math.max(1, budget));
+}
+
+/** Is anything left above this edge, whether a whole turn or the head of one? */
+export function edgeHasMoreAbove(edge: WindowEdge): boolean {
+  return edge.exchange > 0 || edge.rowsHidden > 0;
+}
+
+/** The edge a thread opens at.
+ *
+ *  `rowCountAt` folds one exchange and reports how many rows it draws. A
+ *  callback rather than a number, because only the FLOOR exchange's row count
+ *  is ever needed. Folding every exchange to find out would be the cost the
+ *  window exists to avoid. `exchangeRenderCost` stays O(1) for that reason and
+ *  counts raw events, which is a different unit and cannot answer this. */
+export function seedWindowEdge(
+  costs: readonly number[],
+  rowCountAt: (index: number) => number,
+): WindowEdge {
+  const exchange = computeRenderFromIndex(costs.length, seedRenderCount(costs));
+  return { exchange, rowsHidden: seedRowsHidden(rowCountAt(exchange)) };
+}
+
+/** The edge after one scroll-up round.
+ *
+ *  Rows first, then turns. Scrolling up into a turn is a request for its head,
+ *  and uncovering that is the cheaper of the two moves. Only once the turn is
+ *  whole does the window reach past it, and the turn it reaches is clamped in
+ *  its own turn.
+ *
+ *  Returns the same edge when nothing is left, which is how every caller's
+ *  re-entrancy guard tells a real grow from a no-op. */
+export function expandWindowEdge(
+  edge: WindowEdge,
+  costs: readonly number[],
+  rowCountAt: (index: number) => number,
+): WindowEdge {
+  if (edge.rowsHidden > 0) {
+    return { exchange: edge.exchange, rowsHidden: Math.max(0, edge.rowsHidden - ROW_BUDGET) };
+  }
+  const current = renderCountFromFloor(costs.length, edge.exchange);
+  const next = expandRenderCount(costs, current);
+  if (next === current) return edge;
+  const exchange = computeRenderFromIndex(costs.length, next);
+  return { exchange, rowsHidden: seedRowsHidden(rowCountAt(exchange)) };
+}
+
+/** Is the exchange at `index` rendered WHOLE?
+ *
+ *  Whole, not merely present, and that is what the *reading position* needs.
+ *  ADR 0152 restores a turn by its own `relTop`, measured from its top edge. A
+ *  turn whose head is still clamped off cannot place the reader. */
+export function edgeReachesIndex(edge: WindowEdge, index: number): boolean {
+  if (index > edge.exchange) return true;
+  return index === edge.exchange && edge.rowsHidden === 0;
+}
+
+/** Does the window owe another round to reach `index` whole?
+ *
+ *  ThreadView's `reachAnchor` decision in one place, so the walk's termination
+ *  is answerable without a component. Three ways it is already done, and each
+ *  ends the walk for good. A negative index is a saved position naming a turn
+ *  this thread has not got. The turn is rendered whole. Nothing is left above.
+ *
+ *  It shrinks monotonically under `expandWindowEdge`, which always takes either
+ *  a budget of rows or at least one exchange while any remain. So a walk driven
+ *  off this terminates. */
+export function edgeMustReachIndex(edge: WindowEdge, index: number): boolean {
+  if (index < 0) return false;
+  if (edgeReachesIndex(edge, index)) return false;
+  return edgeHasMoreAbove(edge);
+}
+
 /** How many contiguous exchanges ending just before `endExclusive` fit in
  *  `budget`, walking backwards from the newest.
  *
@@ -166,42 +295,6 @@ export function computeRenderFromIndex(total: number, renderCount: number): numb
   return Math.max(0, total - Math.max(0, Math.floor(renderCount)));
 }
 
-/** Whether more (older) exchanges remain above the current window. */
-export function hasMoreAbove(total: number, renderCount: number): boolean {
-  return computeRenderFromIndex(total, renderCount) > 0;
-}
-
-/** Is the exchange at `index` inside the window, i.e. rendered?
- *
- *  The stop condition for ThreadView's walk up to a saved *reading position*.
- *  That position names a TURN (`hooks/useScrollMemory.ts`), and the restore
- *  cannot place the reader until the turn is in the DOM.
- *
- *  The walk goes one budgeted round per commit rather than seeding straight to
- *  `index`. A seed that jumped would render every turn in between in ONE pass,
- *  which is the blocking render the window exists to prevent (ADR 0081).
- *  Chunking is the answer that ADR names, beside windowing and moving work off
- *  the main thread. */
-export function windowReachesIndex(total: number, renderCount: number, index: number): boolean {
-  return index >= computeRenderFromIndex(total, renderCount);
-}
-
-/** Does the window owe another round to reach `index`?
- *
- *  The whole of ThreadView's `reachAnchor` decision, so the walk's termination
- *  is answerable without a component. Three ways it is already done, and each
- *  ends the walk for good. A negative index is a saved position naming a turn
- *  this thread has not got. The turn is rendered. Nothing is left above.
- *
- *  It shrinks monotonically under `expandRenderCount`, which always takes at
- *  least one exchange while any remain. So a walk driven off this reaches false
- *  in at most one round per remaining exchange. */
-export function windowMustReachIndex(total: number, renderCount: number, index: number): boolean {
-  if (index < 0) return false;
-  if (windowReachesIndex(total, renderCount, index)) return false;
-  return hasMoreAbove(total, renderCount);
-}
-
 /** Next `renderCount` after a scroll-up expansion: one more budget's worth of
  *  older exchanges, capped so it never exceeds the total (keeps the value stable
  *  once everything is shown).
@@ -232,10 +325,9 @@ export function expandRenderCount(costs: readonly number[], renderCount: number)
  *  either a transcript that scrolls or a thread rendered whole. */
 export function windowNeedsFill(
   view: { scrollHeight: number; clientHeight: number },
-  total: number,
-  renderCount: number,
+  edge: WindowEdge,
 ): boolean {
-  if (!hasMoreAbove(total, renderCount)) return false;
+  if (!edgeHasMoreAbove(edge)) return false;
   return view.scrollHeight <= view.clientHeight + SCROLLABLE_SLACK_PX;
 }
 
@@ -248,9 +340,13 @@ export function windowNeedsFill(
  *  stalling the scroll partway. The user then had to click the chevron once per
  *  chunk to crawl to the genuine top (the "needed N clicks" bug). When older
  *  exchanges remain above the window, the chevron renders everything first (set
- *  renderCount = Infinity) and only then scrolls — landing at the true top in one
- *  action. Equivalent to hasMoreAbove, named for the scroll-to-top contract that
- *  depends on it. */
-export function scrollToTopNeedsRenderAll(total: number, renderCount: number): boolean {
-  return hasMoreAbove(total, renderCount);
+ *  the edge to `WHOLE_THREAD`) and only then scrolls, landing at the true top
+ *  in one action. Equivalent to `edgeHasMoreAbove`, named for the
+ *  scroll-to-top contract that depends on it.
+ *
+ *  A clamped floor turn counts as "more above" too. One smooth scroll can no
+ *  more reach its head than it can reach an older turn, and the true top is
+ *  that turn's first row. */
+export function scrollToTopNeedsRenderAll(edge: WindowEdge): boolean {
+  return edgeHasMoreAbove(edge);
 }

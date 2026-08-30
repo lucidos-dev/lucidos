@@ -14,9 +14,15 @@
  *    inside the row's content box. The leading icons hold their positions when
  *    the first character lands. The clear button mounts at the END of their
  *    cluster, whose next sibling takes the free space.
+ *
+ * Both are measured with voice off and with voice on, since the call toggle
+ * is what costs the row its fourth box. The spec arms that switch itself and
+ * puts it back, so neither reading depends on what ran before it.
  */
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, uniqueMessage, assertHealthy, waitForVisibleInput } from './helpers';
+import {
+  navigateToApp, uniqueMessage, assertHealthy, setVoiceEnabled, waitForVisibleInput,
+} from './helpers';
 import { createCCThreadWithChange, cleanupCCThread } from './db-helpers';
 
 interface RowMetrics {
@@ -120,15 +126,15 @@ async function settledMetrics(
 
 /** Apply a ui-scale, then take a settled reading. Everything in this row is
  *  rem-sized, so the scale change relays the whole row out. */
-async function setScaleAndSettle(page: Page, scale: number): Promise<RowMetrics> {
+async function setScaleAndSettle(page: Page, scale: number, where: string): Promise<RowMetrics> {
   await page.evaluate(
     (s) => document.documentElement.style.setProperty('--user-ui-scale', `${s}%`),
     scale,
   );
-  const m = await settledMetrics(page, `ui-scale ${scale}`, bannerShowing);
+  const m = await settledMetrics(page, where, bannerShowing);
   // `.icon-btn.header-icon` is 2.25rem, against a root of `--user-ui-scale`
   // percent of the browser's own 16px default. Proves the scale really applied.
-  expect(m.iconWidth, `ui-scale ${scale}: the root font size never took`)
+  expect(m.iconWidth, `${where}: the root font size never took`)
     .toBeCloseTo(2.25 * 16 * (scale / 100), 0);
   return m;
 }
@@ -154,23 +160,37 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
     await assertHealthy(page);
   });
 
-  // Two scales, because the default root has room to spare at this width and
-  // proves nothing on its own. 112.5% is the one pinning the arithmetic.
+  // Voice is global and ships off, so put it back for every later spec.
+  test.afterAll(async ({ browser }) => {
+    const page = await browser.newPage();
+    await setVoiceEnabled(page, false);
+    await page.close();
+  });
+
+  // Four configurations, and each names the row it measures.
   //
-  // `liftsDiff` is measured, not chosen. The *call toggle* gave the leading
-  // cluster a fourth box. At 112.5% the row's six items now ask for 327.9px of
-  // a 317.1px content box. That IS a genuine overflow, so lifting is the row
-  // keeping its promise rather than breaking it. Promise 1 is unchanged: Diff
-  // shares the row while the row can hold it.
+  // `voice` is the experimental switch. Off is the row every user gets: the
+  // agent menu, the follow toggle and the attach button. On adds the call
+  // toggle as a fourth 2.25rem box, and that box is the only difference
+  // between the two halves of this table.
   //
-  // A control added or removed here moves that number. Re-measure and re-set
-  // the flag. Do not relax the assertion to accept either answer, which is
-  // what would stop this spec noticing the next control.
-  for (const { scale, liftsDiff } of [
-    { scale: 100, liftsDiff: false },
-    { scale: 112.5, liftsDiff: true },
+  // Two scales, because the default root has room to spare at this width.
+  // 112.5% is the one pinning the arithmetic, and the only cell that
+  // overflows. With the call toggle, six items there ask for 327.9px of a
+  // 317.1px content box. That lift is the row keeping promise 1.
+  //
+  // `boxes` and `liftsDiff` are measured, not chosen. A control added or
+  // removed moves them. Re-measure and re-set the row rather than relaxing
+  // an assertion, which is what would stop this spec noticing the next
+  // control.
+  for (const { voice, scale, boxes, liftsDiff } of [
+    { voice: false, scale: 100, boxes: 3, liftsDiff: false },
+    { voice: false, scale: 112.5, boxes: 3, liftsDiff: false },
+    { voice: true, scale: 100, boxes: 4, liftsDiff: false },
+    { voice: true, scale: 112.5, boxes: 4, liftsDiff: true },
   ]) {
-    test(`Diff keeps the seat the row can afford at ui-scale ${scale}, and typing moves no icon`, async ({ page }) => {
+    const where = `voice ${voice ? 'on' : 'off'}, ui-scale ${scale}`;
+    test(`Diff keeps the seat the row can afford with ${where}, and typing moves no icon`, async ({ page }) => {
       const suffix = uniqueMessage('rowfit').replace(/[^a-z0-9-]/g, '');
       const { threadId, changeId, branch, file } = createCCThreadWithChange(
         'E2E Row Fit', suffix, { requiresRestart: true },
@@ -180,11 +200,14 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
         await page.addInitScript((tid: string) => {
           localStorage.setItem('lucidos-focused-thread', tid);
         }, threadId);
+        // Set the state, never inherit it. The app reads its preferences at
+        // boot, so this lands before the navigation.
+        await setVoiceEnabled(page, voice);
         await navigateToApp(page);
         await expect(page.locator('.thread-action-buttons:visible .split-button-primary'))
           .toBeVisible({ timeout: 15_000 });
 
-        const empty = await setScaleAndSettle(page, scale);
+        const empty = await setScaleAndSettle(page, scale, where);
 
         // Promise 1: the row lifts Diff exactly when it cannot hold it, and
         // never with room to spare.
@@ -197,52 +220,52 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
         expect(
           empty.stacked,
           liftsDiff
-            ? `ui-scale ${scale}: the row kept Diff on one row. ${arithmetic}`
-            : `ui-scale ${scale}: the row lifted Diff. ${arithmetic}`,
+            ? `${where}: the row kept Diff on one row. ${arithmetic}`
+            : `${where}: the row lifted Diff. ${arithmetic}`,
         ).toBe(liftsDiff);
-        // Same vertical middle means one row. On the scale that overflows, the
+        // Same vertical middle means one row. On the cell that overflows, the
         // lift is the point, so they must NOT share one.
         const middles = Math.abs(empty.diffMiddle! - empty.applyMiddle!);
         if (liftsDiff) {
-          expect(middles, `ui-scale ${scale}: Diff did not leave Apply's row`)
+          expect(middles, `${where}: Diff did not leave Apply's row`)
             .toBeGreaterThan(2);
         } else {
-          expect(middles, `ui-scale ${scale}: Diff and Apply are on different rows`)
+          expect(middles, `${where}: Diff and Apply are on different rows`)
             .toBeLessThan(2);
         }
-        // The half that holds at BOTH scales, and the one that matters most:
+        // The half that holds in EVERY cell, and the one that matters most:
         // lifted or not, nothing may cross the row's content edge.
-        expectNoOverflow(empty, `ui-scale ${scale}, empty draft`);
+        expectNoOverflow(empty, `${where}, empty draft`);
 
-        // The empty row carries no clear-draft box: the agent menu, the follow
-        // toggle, the call toggle and the attach button. A clear button would
-        // be a FIFTH 2.25rem box. Reserving one with nothing to clear is what
-        // used to push Diff off the row at both scales.
+        // The empty row carries no clear-draft box. A clear button would be
+        // one more 2.25rem box on the end of the cluster. Reserving one with
+        // nothing to clear is what used to push Diff off the row at both
+        // scales.
         expect(
           empty.leadingDesc,
-          `ui-scale ${scale}: an empty draft still reserves a clear button`,
+          `${where}: an empty draft still reserves a clear button`,
         ).not.toContain('Clear draft');
         expect(
           empty.leadingDesc.length,
-          `ui-scale ${scale}: leading cluster is [${empty.leadingDesc.join(' | ')}]`,
-        ).toBe(4);
-        expect(empty.sendCount, `ui-scale ${scale}: the banner owns the send slot`).toBe(0);
+          `${where}: leading cluster is [${empty.leadingDesc.join(' | ')}]`,
+        ).toBe(boxes);
+        expect(empty.sendCount, `${where}: the banner owns the send slot`).toBe(0);
 
         // Promise 2: the first character mounts the clear button and the send
         // morph, and takes the banner away. Nothing already drawn moves.
         await (await waitForVisibleInput(page)).fill('x');
-        const typed = await settledMetrics(page, `ui-scale ${scale}, typed`, draftShowing);
+        const typed = await settledMetrics(page, `${where}, typed`, draftShowing);
 
-        expect(typed.leadingDesc, `ui-scale ${scale}: the clear button never arrived`)
+        expect(typed.leadingDesc, `${where}: the clear button never arrived`)
           .toContain('Clear draft');
-        expect(typed.leadingDesc.slice(0, 4), `ui-scale ${scale}: the cluster reordered`)
+        expect(typed.leadingDesc.slice(0, boxes), `${where}: the cluster reordered`)
           .toEqual(empty.leadingDesc);
         expect(
-          typed.iconLefts.slice(0, 4),
-          `ui-scale ${scale}: the leading icons moved when the draft opened`,
+          typed.iconLefts.slice(0, boxes),
+          `${where}: the leading icons moved when the draft opened`,
         ).toEqual(empty.iconLefts.map(x => expect.closeTo(x, 1)));
-        expect(typed.sendCount, `ui-scale ${scale}: the send morph replaces the banner`).toBe(1);
-        expectNoOverflow(typed, `ui-scale ${scale}, one character typed`);
+        expect(typed.sendCount, `${where}: the send morph replaces the banner`).toBe(1);
+        expectNoOverflow(typed, `${where}, one character typed`);
       } finally {
         cleanupCCThread(threadId, changeId, branch, file);
       }

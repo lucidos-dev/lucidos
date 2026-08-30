@@ -29,9 +29,9 @@ use super::context_build::summarize_user_topics;
 /// The speaker name a `[CONVERSATION HISTORY]` line is printed under.
 ///
 /// A second agent on the thread speaks under its own name (ADR 0150). Print a
-/// guest as `Assistant` and the reasoner reads its turn as its own prior turn,
+/// guest as `Assistant` and the doer reads its turn as its own prior turn,
 /// so two models echo each other into agreement. Print it as `User` and the
-/// reasoner obeys an instruction nobody gave.
+/// doer obeys an instruction nobody gave.
 ///
 /// A free function rather than a line inside the formatter, so the rule has one
 /// definition that a test can reach.

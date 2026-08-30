@@ -657,17 +657,34 @@ Somebody who wants the browser paired anyway taps **Pair this browser instead**.
 
 **That code is fixed at install time, and it still lasts five minutes.** An
 install slower than that opens on the pairing screen with the code refused, and
-the two routes below are how it recovers. A fresh code on the host does not
-reach it: the app's launch URL was written when it was installed.
+the routes below are how it recovers. A fresh code on the host does not reach
+it: the app's launch URL was written when it was installed.
+
+**The app spends that code once and then ignores it.** iOS relaunches from the
+launch URL it stored, so the code comes back on every cold start. Trying it each
+time would fail, and each failure spends part of the gateway's wrong-guess
+budget for the minute. After the first attempt the app treats the launch as
+carrying no code at all.
 
 **An app already on the home screen cannot be reached that way**, since its
-launch URL is fixed. Two ways across for that case, both on the pairing screen
+launch URL is fixed. Three ways across for that case, all on the pairing screen
 inside the app:
 
+- **From the browser on the same phone.** It is a separate device with its own
+  credential, so it is often still paired when the app is not. Open the same
+  address there and mint a code under Settings → Access. The screen says so
+  when it is running as an installed app.
 - **Paste code.** The browser screen offers Copy, and the pasteboard is shared.
 - **Scan QR.** The app opens its own camera and reads the QR off the host's
   screen. It appears on a phone over HTTPS, where a camera can be opened at all.
   An expired code leaves no QR to read, so the host makes a fresh one first.
+
+**A paired app that suddenly asks again has lost its cookie, not its row.** The
+credential lives only in the container's cookie jar, and an iOS home-screen app
+can drop that while keeping everything else it stored. Lucidos hands the app a
+fresh copy on every page load for exactly this reason. When one is lost anyway,
+the device is still listed under Settings → Devices. Pairing again adds a second
+row rather than repairing the first, so revoke the older one.
 
 Typing the eight digits still works everywhere, and is what a desktop browser
 does.

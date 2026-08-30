@@ -77,15 +77,15 @@ fraction is only an engine-dependent error term.
 
 ## Consequences
 
-- A rounded target makes the clamp deficit measurable. The clamp is an integer
-  target minus the integer offset the container can reach, and nothing else. A
-  fractional target would leave a sub-pixel remainder on every reveal for the
-  carried-debt slack to absorb.
-- That reachable offset is DERIVED from the container's extent
-  (`landingScrollTop`), never read back from the write. Reading `scrollTop` in
-  the write's own task does not reliably answer the new value. The deficit
-  measured that way was intermittent, and the reverse press paid out a debt
-  nobody owed.
+- A rounded target made the clamp deficit measurable, which is what the debt a
+  reveal carried to the next press was built on. ADR 0147 deleted that debt, so
+  nothing measures a deficit now and the rounding rests on the quantisation
+  argument above alone.
+- The clamp deficit was DERIVED from the container's extent, never read back
+  from the write. Reading `scrollTop` in the write's own task does not reliably
+  answer the new value. The deficit measured that way was intermittent, and the
+  reverse press paid out a debt nobody owed. Kept as history: the read-back trap
+  is a property of the platform, not of the debt.
 - The correction still carries a sub-pixel residual, bounded at half a pixel on
   both engines. That is the floor, not a defect.
 - `scrollTop` is a double on the way in and out, which makes the rounding look

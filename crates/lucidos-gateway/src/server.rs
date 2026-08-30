@@ -184,6 +184,10 @@ struct GatewayInner {
     /// Pairing codes minted and not yet redeemed. Never persisted: a code lives
     /// five minutes, so surviving a restart would buy nothing.
     pending_pairings: Mutex<auth::PendingPairings>,
+    /// Keeps [`GatewayState::log_device_refusal`] to one line a minute. An
+    /// unpaired browser is refused once per asset, so an ungated line would
+    /// bury the one a reader came for.
+    refusal_log: Mutex<auth::LogThrottle>,
     /// Whether this process terminates TLS on its own socket. Decides only
     /// whether a credential cookie is marked `Secure`.
     serves_tls: bool,
@@ -317,6 +321,7 @@ impl GatewayState {
                 paired_devices: Mutex::new(auth::PairedDevices::default()),
                 paired_devices_writing: Mutex::new(()),
                 pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                refusal_log: Mutex::new(auth::LogThrottle::default()),
                 serves_tls: false,
                 engine_bin: scratch.join("lucidos-engine"),
                 static_dir,
@@ -361,15 +366,60 @@ impl GatewayState {
     /// is right here: the alternative is admitting an unauthenticated caller
     /// because an unrelated thread panicked.
     pub fn authorize(&self, headers: &axum::http::HeaderMap) -> auth::Authorization {
+        self.authorize_with_match(headers).0
+    }
+
+    /// [`Self::authorize`], also handing back the cookie that resolved.
+    ///
+    /// `enforce` wants both halves off one scan of the `Cookie` header, because
+    /// it runs on every proxied request and has to re-issue what it matched.
+    pub fn authorize_with_match<'a>(
+        &self,
+        headers: &'a axum::http::HeaderMap,
+    ) -> (auth::Authorization, Option<auth::PresentedCredential<'a>>) {
         match self.inner.paired_devices.lock() {
-            Ok(paired) => auth::authorize(
+            Ok(paired) => auth::authorize_with_match(
                 headers,
                 &self.inner.local_token,
                 &paired,
                 &self.inner.device_cookie_name,
             ),
-            Err(_) => auth::Authorization::Unauthorized,
+            Err(_) => (auth::Authorization::Unauthorized, None),
         }
+    }
+
+    /// Say that a caller presenting a device cookie was turned away.
+    ///
+    /// The one question this answers is the one a refused user asks: the store
+    /// lists my phone, so why the pairing screen? Names and counts only, never
+    /// a credential, and at most one line a minute.
+    ///
+    /// A caller with no device cookie at all is silent. That is a browser that
+    /// has never paired, which is the ordinary first run rather than a fault.
+    pub fn log_device_refusal(&self, headers: &axum::http::HeaderMap) {
+        let (presented, own_name) =
+            auth::presented_credential_summary(headers, &self.inner.device_cookie_name);
+        if presented == 0 {
+            return;
+        }
+        let allowed = self
+            .inner
+            .refusal_log
+            .lock()
+            .map(|mut t| t.allow(std::time::Instant::now(), auth::REFUSAL_LOG_WINDOW))
+            .unwrap_or(false);
+        if !allowed {
+            return;
+        }
+        crate::log!(
+            "{}",
+            auth::refusal_line(
+                presented,
+                own_name,
+                &self.inner.device_cookie_name,
+                self.paired_devices().devices.len(),
+            )
+        );
     }
 
     /// The credential cookie name this gateway writes (`auth::device_cookie_name`).
@@ -2845,6 +2895,7 @@ pub async fn run() -> Result<(), BoxError> {
                 paired_devices: Mutex::new(paired_devices),
                 paired_devices_writing: Mutex::new(()),
                 pending_pairings: Mutex::new(auth::PendingPairings::default()),
+                refusal_log: Mutex::new(auth::LogThrottle::default()),
                 serves_tls,
                 engine_bin,
                 static_dir,

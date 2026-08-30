@@ -87,6 +87,7 @@ pub(crate) fn eager_sub_thread_message(
         model.as_deref(),
         reasoning_effort.as_deref(),
         origin.clone(),
+        None,
     ))
 }
 
@@ -494,6 +495,7 @@ impl LucidosEngine {
                         None,
                         title.as_deref(),
                         origin,
+                        None,
                         crate::engine::FollowUpUrgency::Normal,
                     )
                     .await;

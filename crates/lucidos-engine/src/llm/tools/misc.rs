@@ -218,12 +218,12 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Base URL for the API."
+                        "description": "Base URL for the API. Required except for 'secret'."
                     },
                     "auth_type": {
                         "type": "string",
-                        "enum": ["api_key", "bearer", "basic", "password", "oauth_client"],
-                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
+                        "enum": crate::core::AuthType::agent_requestable_values(),
+                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. 'secret' is signed with rather than sent: no base_url, no host, read by scripts as CRED_<NAME>. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
                     "auth_url": {
                         "type": "string",
@@ -259,7 +259,10 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
                     }
                 },
-                "required": ["service_name", "prompt", "base_url", "auth_type"]
+                // `base_url` is required for every type but `secret`, which is
+                // sent nowhere. A JSON Schema cannot say that, so the handler
+                // enforces it and names the type in its refusal.
+                "required": ["service_name", "prompt", "auth_type"]
             }),
         },
     ]

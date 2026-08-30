@@ -13,7 +13,7 @@ pub(super) fn exec_tools() -> Vec<ToolDefinition> {
             description: format!(
                 "Create and process data files. Write to data/artifacts/ with open(); changes are staged and committed atomically, so apps see the old files until the commit. Print freely for debugging, since stdout is never captured as file content. Declare third-party packages in `packages` and they are auto-installed. \
                 Hard {MAX_TIMEOUT_SECS}s ceiling: use run_python_background for slower work. \
-                Credentials arrive as env vars: CRED_{{NAME}} for an api_key, bearer or basic credential, CRED_{{NAME}}_USERNAME and CRED_{{NAME}}_PASSWORD for a password one (which has no bare CRED_{{NAME}}), and OAUTH_{{PROVIDER}}_ACCESS_TOKEN plus OAUTH_{{PROVIDER}}_EMAIL for a connected account, auto-refreshed. The name is uppercased with hyphens, spaces and dots replaced by underscores."
+                Credentials arrive as env vars: CRED_{{NAME}} for an api_key, bearer, basic or secret credential, CRED_{{NAME}}_USERNAME and CRED_{{NAME}}_PASSWORD for a password one (which has no bare CRED_{{NAME}}), and OAUTH_{{PROVIDER}}_ACCESS_TOKEN plus OAUTH_{{PROVIDER}}_EMAIL for a connected account, auto-refreshed. The name is uppercased with hyphens, spaces and dots replaced by underscores."
             ),
             parameters: json!({
                 "type": "object",

@@ -19,6 +19,69 @@
 LUCIDOS_PORT_REGISTRY="$HOME/.lucidos/port-registry"
 LUCIDOS_PORT_WALK_LIMIT=1000
 
+# ── ports_file_set ──────────────────────────────────────────────────────
+# Set KEY=VALUE lines in a workspace's ports file, preserving every other line.
+#
+# The shell twin of merge_ports_file in crates/lucidos-gateway/src/stack.rs, and
+# it exists for the same reason: this file has several owners. allocate_ports
+# writes the two port keys, detect_tls writes PROTO, swap_ports writes the
+# Postgres keys, and the gateway republishes API_PORT and PROTO on every spawn
+# and re-adoption. scripts/status.sh sources the result.
+#
+# A truncating write is what broke that. _finalize_ports used to `cat >` the
+# file with the two port keys, so any launch path that allocated ports without
+# going on to detect_tls left no PROTO line behind. read_ports then defaults an
+# absent PROTO to https, and a cross-workspace call into a plain-http engine
+# dies on a TLS handshake with nothing naming the cause.
+#
+# Setting an existing key rewrites it IN PLACE, so repeated launches cannot
+# stack duplicate lines the way an append did.
+ports_file_set() {
+    local file="$1"; shift
+    mkdir -p "$(dirname "$file")"
+    # An `if` rather than `[ -f … ] && …`: the entry scripts run under `set -e`,
+    # where an and-list whose left side fails takes the whole list's status.
+    local existing=""
+    if [ -f "$file" ]; then
+        existing="$(cat "$file")"
+    fi
+    local out="" line pair key replaced written=" "
+    while IFS= read -r line; do
+        # A blank line is dropped rather than carried: an empty $existing reads
+        # as one, and the format has none anyway.
+        [ -n "$line" ] || continue
+        replaced=""
+        for pair in "$@"; do
+            key="${pair%%=*}"
+            if [ "${line#*=}" != "$line" ] && [ "${line%%=*}" = "$key" ]; then
+                # The FIRST occurrence becomes the new value and every later one
+                # is dropped. A file that accumulated duplicates under the old
+                # appending writer is collapsed here, which is the whole repair:
+                # rewriting each of them in place would keep all of them.
+                case "$written" in
+                    *" $key "*) ;;
+                    *)
+                        out+="$pair"$'\n'
+                        written+="$key "
+                        ;;
+                esac
+                replaced=1
+                break
+            fi
+        done
+        [ -n "$replaced" ] || out+="$line"$'\n'
+    done <<< "$existing"
+    # Whatever the file did not already carry goes on the end, in the order the
+    # caller gave. Tracked by name rather than re-scanned, so a VALUE that looks
+    # like another key cannot answer for one.
+    for pair in "$@"; do
+        key="${pair%%=*}"
+        case "$written" in *" $key "*) continue ;; esac
+        out+="$pair"$'\n'
+    done
+    printf '%s' "$out" > "$file"
+}
+
 # Check if a port is available for binding. Only LISTEN sockets prevent a
 # fresh bind() — outbound client sockets that happen to have a remote port
 # matching `port` (e.g. a stale browser tab still pointing at our previous
@@ -438,10 +501,8 @@ _finalize_ports() {
     # Both keys record the user-facing engine port (== post-swap VITE_PORT).
     # The raw API_PORT (3000-range) is Vite's internal port after swap and
     # must not leak to consumers.
-    cat > "$workspace/.lucidos/ports" <<EOF
-API_PORT=$VITE_PORT
-VITE_PORT=$VITE_PORT
-EOF
+    ports_file_set "$workspace/.lucidos/ports" \
+        "API_PORT=$VITE_PORT" "VITE_PORT=$VITE_PORT"
 
     local suffix=""
     [ -n "$mode" ] && suffix=" ($mode)"

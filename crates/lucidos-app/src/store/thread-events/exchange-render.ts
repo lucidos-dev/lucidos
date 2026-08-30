@@ -783,7 +783,11 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         pushStep({ type: 'step', description: 'Thinking', outcome: 'pending', created });
         break;
       case 'CodingAgentToolCalled': {
-        const e = event as { name: string; args: unknown; description?: string };
+        const e = event as { name: string; args?: unknown; description?: string; args_stripped?: boolean };
+        // Always stamp the source event id so the modal can address this call,
+        // and stamp `args_stripped` only when the snapshot dropped the args.
+        // Live SSE leaves the marker absent and `full` is computed inline, the
+        // same split the `ToolResult` arm below draws.
         const naming = {
           description: e.description || describeCCTool(e.name, e.args),
           tool_name: e.name,
@@ -791,6 +795,8 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           full: fullCommandForCCTool(e.name, e.args),
           outcome: callOutcome(exchange, seq),
           created,
+          ...(event._eventId ? { call_event_id: event._eventId } : {}),
+          ...(e.args_stripped ? { args_stripped: true } : {}),
         };
         if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', ...naming });
         terminal = null; // CC resumed, not finished yet
@@ -799,13 +805,21 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'CodingAgentToolResult': {
         // See exchangeSteps for the pairing rationale.
         const id = toolUseIdOf(event);
-        const ccResult = (event as { result?: string }).result;
+        const cc = event as { result?: string; result_stripped?: boolean };
+        // Carry the result onto whichever step this settled, and the address of
+        // the row it came from. A stripped snapshot row has no text, so the
+        // marker is what tells the modal to fetch rather than render nothing.
+        const land = (step: Extract<ResponseEvent, { type: 'step' }>) => {
+          if (cc.result !== undefined) step.result = cc.result;
+          if (event._eventId) step.result_event_id = event._eventId;
+          if (cc.result_stripped) step.result_stripped = true;
+        };
         let resolved = false;
         if (id) {
           for (const e of events) {
             if (e.type === 'step' && e.tool_use_id === id) {
               settleMatchedCallStep(e);
-              if (ccResult !== undefined) e.result = ccResult;
+              land(e);
               resolved = true;
               break;
             }
@@ -813,7 +827,7 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         }
         if (!resolved) {
           const fallback = resolveLastPendingResponseStep(events, isNotThinking);
-          if (fallback && ccResult !== undefined) fallback.result = ccResult;
+          if (fallback) land(fallback);
         }
         break;
       }
@@ -849,6 +863,34 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       case 'CodingAgentUserMessageSent':
         // An exchange boundary in groupIntoExchanges, never a step.
         break;
+      case 'SpokenReplyGenerated': {
+        // What the caller actually heard. It lands inside the doer's turn
+        // because that is when it was said: the talker stalls truthfully while
+        // the turn runs, then says what the answer means once it lands.
+        //
+        // No audio is kept, so this row is the whole record of a spoken turn.
+        // It is a marker rather than a step, and renders ungated.
+        const e = event as { text: string; interrupted?: boolean };
+        if (!hasVisibleText(e.text)) break;
+        events.push({
+          type: 'spoken_reply',
+          text: e.text,
+          interrupted: e.interrupted === true,
+        });
+        break;
+      }
+      case 'SpokenMessageReceived': {
+        // What the caller said when the talker answered it alone. It started
+        // no turn, so unlike a delegated utterance it becomes no
+        // `MessageReceived` and has no bubble of its own anywhere.
+        //
+        // Without this row half of a call is missing from the thread: every
+        // question the caller asked and the talker fielded itself.
+        const e = event as { text: string };
+        if (!hasVisibleText(e.text)) break;
+        events.push({ type: 'spoken_message', text: e.text });
+        break;
+      }
       case 'CommandCheckpointed': {
         // Command guard snapshot pair around a ReversibleDanger command (ADR
         // 0002, Phase 4). Renders inline with a one-click Undo and the diff.
@@ -1085,6 +1127,30 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
  *  header always carries the control that reveals it. */
 export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
   return events.some(e => e.type !== 'text' || isMeaningfulText(e));
+}
+
+/** True when this body carries something said out loud, in either direction. */
+function hasSpokenRow(events: ResponseEvent[]): boolean {
+  return events.some(e => e.type === 'spoken_reply' || e.type === 'spoken_message');
+}
+
+/** True when a question divider draws its header and nothing else.
+ *
+ *  A question resolved without an answer normally has no body: the card says
+ *  what happened, and `ensure_resume_after_answer` short-circuits on both
+ *  kinds, so nothing follows it in THIS exchange. A superseded question's next
+ *  turn belongs to the follow-up's own exchange.
+ *
+ *  On a VOICE thread something does follow. The divider is an exchange
+ *  boundary, so a spoken turn said while the card sat open folds in here as a
+ *  step. No other surface carries a spoken row, so suppressing the body took a
+ *  whole call with it.
+ *
+ *  The test is a spoken row rather than `hasRenderableResponseContent`. That
+ *  one is true of a step or a cancel too, so it would un-suppress every typed
+ *  thread's canceled question as well. */
+export function dividerBodyIsSuppressed(exchange: Exchange, events: ResponseEvent[]): boolean {
+  return questionDividerResolution(exchange) !== null && !hasSpokenRow(events);
 }
 
 /** User-facing presentation of a `StepOutcome`. The outcome IS the CSS class,

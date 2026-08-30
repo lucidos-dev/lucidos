@@ -9,7 +9,7 @@ import {
   focusedThreadId,
 } from '../store';
 import { loadedOr } from '../types';
-import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
+import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError, isTransportError } from '../../api/client';
 import type { AnswerKind } from '../thread-events';
 import { markThreadRerenderStart, clearThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
@@ -134,11 +134,45 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   }
 }
 
-/** Answer a pending question card on a thread. Returns true on success,
- *  false on 409 (stale or duplicate). Toasts and returns false on other
- *  errors — callers branch on the boolean, none rely on a throw.
+/** Why an answer did not land, said once and naming the cause.
+ *
+ *  The two submit sites roll their optimistic state back and stay quiet, so
+ *  this string is the whole account the user gets. One failed tap used to raise
+ *  two toasts, and the pair a user reported read "Could not send answer. Please
+ *  try again." over "Failed to send answer: unknown error". Between them they
+ *  named neither the cause nor a way out.
+ *
+ *  A transport rejection is the iOS PWA's stale connection, which the client
+ *  already retried once (`answerThreadQuestion` in api/client/chat.ts). Not
+ *  `getUnreachableEngineMsg`, the canonical copy for the same condition: it
+ *  names the engine's URL and asks for a reload, and a tap the client just
+ *  retried wants neither. A conflict is a question nobody is waiting on any
+ *  more, so it says that rather than asking for a retry that would 409
+ *  forever. */
+export function answerFailureMessage(
+  failure: { kind: 'conflict' } | { kind: 'error'; err: unknown },
+): string {
+  if (failure.kind === 'conflict') {
+    return 'Could not send answer: that question is no longer waiting for one.';
+  }
+  const { err } = failure;
+  if (isTransportError(err)) {
+    return 'Could not send answer: the connection dropped. Try again.';
+  }
+  if (err instanceof ApiError) return `Could not send answer: ${err.reason}`;
+  return `Could not send answer: ${errorDetail(err)}`;
+}
+
+/** Answer a pending question card on a thread. Returns true on success, false
+ *  on 409 (stale or duplicate) and false on any other error. Callers branch on
+ *  the boolean, none rely on a throw.
+ *
+ *  This owns the failure message for BOTH outcomes (see
+ *  `answerFailureMessage`). A caller adding its own is how one failure came to
+ *  say two things.
+ *
  *  Used for both CC's `AskUserQuestion` and the chat agent's
- *  `ask_user_question` — the QuestionCard component is agent-agnostic and
+ *  `ask_user_question`: the QuestionCard component is agent-agnostic and
  *  the backend dispatches on the originating event's channel. */
 export async function answerThreadQuestion(
   threadId: string,
@@ -164,13 +198,13 @@ export async function answerThreadQuestion(
     if (!ok) {
       clearThreadAnswering(threadId); // 409 — stale/duplicate, no resume
       clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
+      showToast(answerFailureMessage({ kind: 'conflict' }), 'error');
     }
     return ok;
   } catch (err) {
     clearThreadAnswering(threadId);
     clearThreadRerenderStart(threadId);
-    const detail = err instanceof ApiError ? err.reason : 'unknown error';
-    showToast(`Failed to send answer: ${detail}`, 'error');
+    showToast(answerFailureMessage({ kind: 'error', err }), 'error');
     return false;
   }
 }

@@ -5,6 +5,9 @@ import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { MoreIcon, InfoIcon } from './icons';
 import type { TooltipRow } from '../drawer/threadRowInfo';
 
+/** What counts as a row for roving focus and for the keyboard-open focus. */
+const MENU_ITEM_ROLES = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
+
 /** Roving-focus index for a ⋯ menu's ↑/↓/Home/End keys. `current` is the
  *  focused item's index (-1 when focus isn't yet on an item); ↑/↓ wrap at both
  *  ends. Pure — exported for unit testing. */
@@ -172,7 +175,10 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
     const panel = menuRef.current;
     if (!panel) return;
-    const menuItems = Array.from(panel.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+    // Every menu role, not just the plain one. A menu whose rows record a
+    // CHOICE marks them `menuitemradio`. That is the only role able to carry
+    // `aria-checked`, and such rows have to rove like any other.
+    const menuItems = Array.from(panel.querySelectorAll<HTMLElement>(MENU_ITEM_ROLES));
     if (menuItems.length === 0) return;
     e.preventDefault();
     const current = menuItems.indexOf(document.activeElement as HTMLElement);
@@ -188,7 +194,7 @@ export function OverflowMenu({ ariaLabel, stopPropagation, extraClass, tabIndex,
     if (!open || !openedViaKeyboard || !pos) return;
     const panel = menuRef.current;
     if (!panel || panel.contains(document.activeElement)) return;
-    panel.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
+    panel.querySelector<HTMLElement>(MENU_ITEM_ROLES)?.focus();
   }, [open, openedViaKeyboard, pos]);
 
   // Info rows drive both the Info menu item's presence and the Info popover body.

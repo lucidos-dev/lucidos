@@ -1,6 +1,7 @@
 use super::actor::build_message_origin;
 use super::*;
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
+use crate::engine::thread_lifecycle::ThreadType;
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
 use crate::engine::PreEmittedOrigin;
@@ -314,6 +315,7 @@ pub(crate) async fn process_orphan_chain(
                     origin_event_id.map(PreEmittedOrigin::EngineReentry),
                     None,
                     None,
+                    None,
                     crate::engine::FollowUpUrgency::Normal,
                 )
                 .await
@@ -481,12 +483,6 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, ApiE
     })
 }
 
-/// Wire-format string for `ThreadType::CodingAgent` (`thread_summaries.source`
-/// and the `channel` payload field). Mirrored here rather than pulling the
-/// engine enum across the API boundary for one comparison. The source of truth
-/// is the `#[serde(rename = "claude_code")]` on `ThreadType::CodingAgent`.
-const CC_SOURCE: &str = "claude_code";
-
 /// A thread is locked to the (mode, repo) it picked on its first message.
 /// Switching either makes the executor card disagree with the commands menu,
 /// and breaks the assumption that the thread's worktree branch lives in one
@@ -506,7 +502,9 @@ pub(super) fn validate_thread_continuity(
     let Some(source) = existing_source else {
         return Ok(());
     };
-    let existing_is_cc = source == CC_SOURCE;
+    // One reader of the source string, shared with the voice admission and the
+    // bus projection, so the three cannot spell `claude_code` differently.
+    let existing_is_cc = ThreadType::from_source(source) == ThreadType::CodingAgent;
     let requested_is_cc = requested_use_cc == Some(true);
     if existing_is_cc != requested_is_cc {
         let from = if existing_is_cc {
@@ -1235,6 +1233,9 @@ pub(super) async fn chat_submit(
             reasoning_effort.as_deref(),
             event_id.as_deref(),
             origin.clone(),
+            // Typed. A spoken message arrives on the voice socket instead,
+            // never through this handler.
+            None,
         )
         .await;
 
@@ -1278,6 +1279,7 @@ pub(super) async fn chat_submit(
                 pre_emitted_origin,
                 title.as_deref(),
                 origin,
+                None,
                 crate::engine::FollowUpUrgency::Normal,
             )
             .await;

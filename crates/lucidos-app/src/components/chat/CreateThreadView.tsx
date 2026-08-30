@@ -122,6 +122,11 @@ export function renderExchanges(
    *  `renderCount`). Default 0 renders all, which is what the tests and the
    *  deep-link path use. */
   renderFromIndex = 0,
+  /** Windowing, one grain finer: how many of the FLOOR exchange's leading rows
+   *  to leave out. A coding-agent turn can outweigh a whole transcript, so
+   *  gating whole exchanges is not enough on its own. Zero for every other
+   *  exchange, which is what keeps the window a contiguous tail. */
+  floorRowsHidden = 0,
 ): VNode[] {
   // Compute once which abort exchange (if any) gets the Continue button: the
   // most recent ResponseAborted the user may actually resume from. See
@@ -220,6 +225,7 @@ export function renderExchanges(
         threadIdle={threadIdle}
         threadAwaitingAnswer={threadAwaitingAnswer}
         threadCanceling={threadCanceling}
+        rowsHidden={i === renderFromIndex ? floorRowsHidden : 0}
         proposedChangeDesc={proposedSeed?.description}
         proposedChangeFileCount={proposedSeed?.fileCount}
         matchedEventType={matchedEvent?.eventType}
@@ -340,12 +346,7 @@ function contentOffsetTop(container: HTMLElement, el: HTMLElement): number {
  */
 /** The correction to write, snapped to a whole pixel because that is all a
  *  scroll offset can hold. The tween deliberately does the opposite, and both
- *  measurements are in ADR 0078.
- *
- *  Rounding also makes the clamp deficit below measurable. An integer target
- *  minus the integer offset the container can reach is the clamp and nothing
- *  else. A fractional target would leave a sub-pixel remainder on every reveal
- *  for the debt's own slack to absorb. */
+ *  measurements are in ADR 0078. */
 function reachableScrollTop(target: number): number {
   return Math.round(target);
 }
@@ -372,122 +373,14 @@ function reachableScrollTop(target: number): number {
  *  the reader, never a guess about the layout. */
 const ANCHOR_SETTLE_FRAMES = 12;
 
-/** Where `top` will actually come to rest, the browser clamping a scroll offset
- *  to the container's own extent.
- *
- *  DERIVED, never read back from the write. Reading `scrollTop` in the write's
- *  own task, on a container whose children changed a moment earlier, does not
- *  reliably answer with the new value. The debt below was measured that way,
- *  and on WebKit it drifted the reader by several hundred pixels in one run out
- *  of a few. An intermittent debt is worse than none, and the deficit is a
- *  property of the geometry, so the geometry is what is read. */
-function landingScrollTop(container: HTMLElement, top: number): number {
-  const max = Math.max(0, container.scrollHeight - container.clientHeight);
-  return Math.min(Math.max(top, 0), max);
-}
-
-/* --- The correction the clamp ate, carried to the next reveal ---------------
- *
- * A reveal that SHRINKS the transcript can leave the anchor unreachable. With
- * less content below it than the viewport is tall, no offset puts it back, so
- * the browser clamps and the turn slides.
- *
- * That much is geometry. What is not is the ROUND TRIP. The reverse toggle
- * restores its own delta from wherever the clamp left the reader. It therefore
- * lands short of where they started, and every pair of taps drifts again. The
- * clamp was never chosen by the reader. So the deficit is remembered and paid
- * back by the next anchored mutation on the same container.
- *
- * IT IS OWED TO THE ELEMENT IT WAS MEASURED FOR, and to no other. The
- * correction holds the control the reader pressed, so a deficit is a deficit in
- * THAT control's offset. Pay it out on a press of a different control and the
- * reader is moved by a number that describes somebody else's turn. That is the
- * reported "it goes back to where it was when the steps were open": hide from
- * one turn's control, show from another's, and the second press spent the
- * first's clamp.
- *
- * It is dropped the moment the reader scrolls. `anchorDebtAt` records where our
- * write landed, and a container sitting anywhere else has been moved by somebody
- * whose position now counts. `anchorDebtHeight` is the other half of that test, and
- * what keeps the debt inside ONE thread. The transcript element is REUSED
- * across threads. So an offset `useScrollMemory` restores could land on the
- * remembered one by coincidence and collect a debt it never earned. Same
- * element, same offset AND same content height is a coincidence not worth
- * engineering further against.
- *
- * One container's worth, not a per-container map: a reveal is transcript-wide
- * and there is one transcript. */
-let anchorDebtEl: HTMLElement | null = null;
-let anchorDebtAnchor: HTMLElement | null = null;
-let anchorDebt = 0;
-let anchorDebtAt = -1;
-let anchorDebtHeight = -1;
-
-/** What a previous reveal still owes `anchor` on this container, or 0. */
-function carriedAnchorDebt(container: HTMLElement, anchor: HTMLElement): number {
-  if (anchorDebtEl !== container || anchorDebtAnchor !== anchor) return 0;
-  if (container.scrollHeight !== anchorDebtHeight) return 0;
-  // 1px of slack for a browser re-rounding a fractional offset, matching
-  // `isWhereWeHeldIt` in scrollState.ts.
-  return Math.abs(container.scrollTop - anchorDebtAt) <= 1 ? anchorDebt : 0;
-}
-
-/** Retire the debt the moment the reader takes the container somewhere else.
- *
- *  Watched as an EVENT, and the comparison above cannot stand in for it. That
- *  one is asked once, at the next reveal, so it sees only where the reader
- *  ENDED UP. The clamped offset IS the live edge of the shrunk transcript. A
- *  reader who scrolled up to read comes back to it, to the pixel. Asked per
- *  scroll event, the trip away is seen even though the return hides it, and a
- *  bottom the reader chose stays theirs.
- *
- *  Our own correction's echo is not a trip away. A `scrollTop` write dispatches
- *  its event a frame later. By then the recorded offset IS where we put the
- *  container, so the same 1px of slack ignores it. */
-function anchorDebtScrolled(): void {
-  if (anchorDebtEl && Math.abs(anchorDebtEl.scrollTop - anchorDebtAt) > 1) clearAnchorDebt();
-}
-
-function clearAnchorDebt(): void {
-  if (anchorDebtEl && typeof anchorDebtEl.removeEventListener === 'function') {
-    anchorDebtEl.removeEventListener('scroll', anchorDebtScrolled);
-  }
-  anchorDebtEl = null;
-  anchorDebtAnchor = null;
-  anchorDebt = 0;
-  anchorDebtAt = -1;
-  anchorDebtHeight = -1;
-}
-
-/** Record what the clamp will eat out of `wanted`, and the state it leaves the
- *  container in. A debt inside the same 1px of slack is no debt at all.
- *
- *  It takes the TARGET rather than a deficit, so the clamp is derived once, in
- *  `landingScrollTop`. The debt and the position it is watched against come
- *  from one reading. Neither can be a `scrollTop` the browser has yet to apply.
- *
- *  Clears first unconditionally. Re-recording on the same container cannot then
- *  leave two watchers on it. A debt moving to another container takes its
- *  watcher off the old one. */
-function rememberAnchorDebt(container: HTMLElement, anchor: HTMLElement, wanted: number): void {
-  clearAnchorDebt();
-  const landed = landingScrollTop(container, wanted);
-  const debt = wanted - landed;
-  if (Math.abs(debt) <= 1) return;
-  anchorDebtEl = container;
-  anchorDebtAnchor = anchor;
-  anchorDebt = debt;
-  anchorDebtAt = landed;
-  anchorDebtHeight = container.scrollHeight;
-  // A container with no `addEventListener` is a test double, as elsewhere in the
-  // scroll code; the offset comparison above still covers it.
-  if (typeof container.addEventListener === 'function') {
-    container.addEventListener('scroll', anchorDebtScrolled, { passive: true });
-  }
-}
-
 /** Hold `anchor` exactly where it is while `fn` mutates the DOM around it.
- *  `anchor` is THE ELEMENT THE READER CLICKED, per the block above. */
+ *  `anchor` is THE ELEMENT THE READER CLICKED, per the block above.
+ *
+ *  ONE PRESS READS ONLY ITS OWN TWO MEASUREMENTS. A press that shrinks the
+ *  content below its control cannot hold it, so the browser clamps and the
+ *  control slides. Nothing carries that deficit to the next press. Repaying it
+ *  there would move the control the reader just pressed, which is the one
+ *  thing this function exists to prevent. See ADR 0147. */
 export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
   const container = anchor?.closest('.thread-content') as HTMLElement | null;
   if (!container || !anchor) { fn(); return; }
@@ -512,9 +405,6 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   const held = anchor as HTMLElement;
   const offsetBefore = contentOffsetTop(container, held);
   const scrollBefore = container.scrollTop;
-  // Read BEFORE the mutation, while the container is still where the last
-  // correction left it: after `fn` a shrink may have clamped it somewhere else.
-  const carried = carriedAnchorDebt(container, held);
   const overflowBefore = container.style.overflow;
   let restored = false;
 
@@ -549,11 +439,10 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     const anchored = held.isConnected;
     // Where the correction wants the container, read from the layout the
     // mutation left. One definition, because the next-frame re-check has to ask
-    // the same question a frame later. `carried` repays what a previous reveal's
-    // clamp ate out of the offset this derives from.
+    // the same question a frame later.
     const targetNow = (): number => {
       const offset = contentOffsetTop(container, held);
-      return reachableScrollTop(scrollBefore + carried + (offset - offsetBefore));
+      return reachableScrollTop(scrollBefore + (offset - offsetBefore));
     };
     // What the write carries. A press whose anchor left the DOM writes the
     // offset the container already holds, so the MARK is the whole of it and
@@ -572,19 +461,8 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
     // mark is what stands the growth round's own edge write down
     // (`keepTheLiveEdge`) and what re-bases the mobile header. Declining to
     // correct is still the app deciding the reader stays put.
-    //
-    // The DEBT is narrower, and only a correction can earn one. A carried
-    // reader is owed nothing, since the live edge is always reachable. Nor is a
-    // press whose anchor left the DOM: declining to correct is declining to
-    // know what the clamp would have eaten.
     try {
-      if (rideIsCarrying) {
-        clearAnchorDebt();
-      } else {
-        markAnchorScroll(container, wanted);
-        if (anchored) rememberAnchorDebt(container, held, wanted);
-        else clearAnchorDebt();
-      }
+      if (!rideIsCarrying) markAnchorScroll(container, wanted);
     } finally {
       container.style.overflow = overflowBefore;
     }
@@ -627,10 +505,6 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
         const target = targetNow();
         if (Math.abs(container.scrollTop - target) > 1) {
           markAnchorScroll(container, target);
-          // Re-assert the debt against where this write comes to rest. Without
-          // it, a target the clamp cannot reach would be re-written every frame
-          // AND recorded against a stale position.
-          rememberAnchorDebt(container, held, target);
           honourAnchoredMutation(container);
         }
         leftAt = container.scrollTop;

@@ -74,6 +74,9 @@ export function makeLongPressHandlers(
       startX = e.clientX;
       startY = e.clientY;
       const target = e.currentTarget as HTMLElement;
+      // No `setPointerCapture`: it retargets the paired `click`, and it
+      // suppresses the boundary events `onPointerLeave` cancels on
+      // (`docs/known-gaps.md`).
       timer = setTimeout(() => {
         timer = null;
         armed = true;
@@ -89,7 +92,7 @@ export function makeLongPressHandlers(
     },
     onPointerUp() {
       clearTimer();
-      // If a long-press fired, the paired click is imminent — keep the arm
+      // If a long-press fired, the paired click is imminent: keep the arm
       // alive just long enough to swallow it, then auto-disarm.
       if (armed && fuse === null) armFuse();
     },

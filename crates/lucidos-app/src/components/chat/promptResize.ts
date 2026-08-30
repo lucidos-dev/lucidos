@@ -184,17 +184,30 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
   el.style.height = fromHeight;
   void el.offsetHeight; // commit the start height before transitioning
 
-  let timer: ReturnType<typeof setTimeout>;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let raf1: number | undefined;
   let raf2: number | undefined;
+  let started = false;
+  /** The frames below are the only thing that starts the ease, and a hidden tab
+   *  SUSPENDS them. The box would then sit at `fromHeight` with the ease
+   *  pending for as long as the tab is away. That is the safety net's own case
+   *  going unanswered, so land the box and let go instead.
+   *
+   *  Visibility is the discriminator, and a second timer cannot be. A timer
+   *  cannot tell a suspended frame from a late one, and cancelling a late one
+   *  is the bug the net was moved to fix. */
+  const onHidden = () => {
+    if (!started && document.visibilityState === 'hidden') finish();
+  };
   const cancel = () => {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     // Cancel the pending frames too — a same-frame re-switch calls cancel()
     // before raf1 fires, so without this the stale inner rAF would still add a
     // finish listener that never gets removed.
     if (raf1 !== undefined) cancelAnimationFrame(raf1);
     if (raf2 !== undefined) cancelAnimationFrame(raf2);
     el.removeEventListener('transitionend', finish);
+    document.removeEventListener('visibilitychange', onHidden);
     el.style.transition = '';
     pendingHeightAnim.delete(el);
   };
@@ -204,16 +217,29 @@ export function animateTextareaHeightFrom(el: HTMLTextAreaElement, fromHeight: s
     el.style.height = target;
   };
   pendingHeightAnim.set(el, cancel);
+  document.addEventListener('visibilitychange', onHidden);
 
   raf1 = requestAnimationFrame(() => {
     raf2 = requestAnimationFrame(() => {
+      started = true;
       el.addEventListener('transitionend', finish);
       el.style.transition = 'height 0.3s ease';
       el.style.height = target;
+      // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
+      //
+      // Armed HERE, with the transition, and never at the call above. The ease
+      // does not begin until this frame, so a fuse lit two frames earlier is
+      // racing its own START rather than outliving it. A main thread busy past
+      // the fuse then runs the expired timer BEFORE these pending frames, and
+      // `finish` cancels them: the box snaps to the target having never
+      // animated. That is a slow device, and under a loaded e2e suite it is the
+      // `prompt-flip-height` flake.
+      //
+      // The window before this frame is covered by `onHidden`, which is the
+      // only case that can keep the frame from arriving at all.
+      timer = setTimeout(finish, 400);
     });
   });
-  // Safety net if transitionend never fires (e.g. tab hidden mid-switch).
-  timer = setTimeout(finish, 400);
 }
 
 /** Watch one box and re-measure it on a WIDTH change. Returns the teardown.

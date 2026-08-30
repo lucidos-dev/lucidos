@@ -30,6 +30,16 @@ pub const PREF_MODEL_COMMAND_JUDGE: &str = "model_command_judge";
 /// model that holds a socket open.
 pub const PREF_MODEL_VOICE_TALKER: &str = "model_voice_talker";
 
+/// The model turning the caller's speech into text, inside the talker's socket.
+///
+/// The second model in the voice loop, and the only other one: nothing
+/// translates and nothing summarises. Resolved in `voice::build`, which says
+/// why it reads no `ContextPurpose`.
+pub const PREF_MODEL_VOICE_TRANSCRIBER: &str = "model_voice_transcriber";
+
+/// The voice the talker speaks in. A provider's own name for one, not a model.
+pub const PREF_VOICE_TALKER_VOICE: &str = "voice_talker_voice";
+
 /// Which resident-block sections a *voice session* opens with, comma separated.
 ///
 /// The block is what voice can answer with no wait, so which sections are in it

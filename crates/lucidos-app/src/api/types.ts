@@ -2,10 +2,11 @@
 
 import type { ActorMode } from '../store/thread-events';
 import type { AuthType, CredentialInfo } from '../store/types';
+import type { CodingAgent } from '../generated/thread-event-wire';
 
-/** Coding-agent backend discriminator — mirrors the Rust `CodingAgent` enum
- *  (kebab-case wire values). */
-export type CodingAgent = 'claude-code' | 'codex';
+/** Coding-agent backend discriminator, generated from the Rust `CodingAgent`
+ *  enum. Re-exported here because this is where API callers reach for it. */
+export type { CodingAgent } from '../generated/thread-event-wire';
 
 export interface ChatRequestBody {
   message: string;
@@ -220,7 +221,9 @@ export interface CronPreview {
 export interface ApiResult {
   success: boolean;
   error?: string;
-  credential_request?: { service: string; prompt: string; base_url: string; auth_type: AuthType };
+  /** `base_url` is absent for a `secret`, which declares no scope and is sent
+   *  to no host. Every other type names the API it belongs to. */
+  credential_request?: { service: string; prompt: string; base_url?: string; auth_type: AuthType };
   auth_url?: string;
   cron_preview?: CronPreview;
   /** Non-fatal notes about a write that succeeded. Today: an event type in a

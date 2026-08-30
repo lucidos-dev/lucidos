@@ -81,6 +81,7 @@ fn context_captured_event_type_and_persistence() {
             output_tokens: 678,
             cache_read_tokens: 10_000,
             cache_creation_tokens: 200,
+            modality: None,
         }),
         trimmed: false,
         trim_passes: Vec::new(),

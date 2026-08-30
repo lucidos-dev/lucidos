@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   pairingCodeToAdopt,
   takePairingCodeFromUrl,
+  takeUnspentPairingCodeFromUrl,
   resetPairingCodeSeedForTest,
   PAIR_CODE_PARAM,
 } from './pairingCodeSeed';
@@ -108,5 +109,65 @@ describe('takePairingCodeFromUrl', () => {
     const { code, after } = takeAt('?pick=');
     expect(code).toBeNull();
     expect(after).toBe('?pick=');
+  });
+});
+
+// A minimal localStorage, since Vitest runs in Node with none.
+const stored = new Map<string, string>();
+Object.defineProperty(window, 'localStorage', {
+  configurable: true,
+  value: {
+    getItem: (k: string) => stored.get(k) ?? null,
+    setItem: (k: string, v: string) => void stored.set(k, v),
+    removeItem: (k: string) => void stored.delete(k),
+  },
+});
+
+describe('takeUnspentPairingCodeFromUrl', () => {
+  beforeEach(() => {
+    resetPairingCodeSeedForTest();
+    stored.clear();
+  });
+
+  /** Land on a launch URL carrying `code` and ask for it, as a cold start does. */
+  function launchWith(code: string): string | null {
+    resetPairingCodeSeedForTest();
+    currentUrl.value = `https://mac.tail1234.ts.net/~/?${PAIR_CODE_PARAM}=${code}`;
+    return takeUnspentPairingCodeFromUrl();
+  }
+
+  it('hands back a code this client has not tried', () => {
+    expect(launchWith(CODE)).toBe(CODE);
+  });
+
+  it('refuses the same code on a later launch', () => {
+    // iOS relaunches from the `start_url` it stored at install, so an installed
+    // icon carries one code for good. Redeeming it again fails and spends part
+    // of the gateway's wrong-guess budget.
+    expect(launchWith(CODE)).toBe(CODE);
+    expect(launchWith(CODE)).toBeNull();
+    expect(launchWith(CODE)).toBeNull();
+  });
+
+  it('still takes a different code', () => {
+    expect(launchWith(CODE)).toBe(CODE);
+    expect(launchWith('76543210')).toBe('76543210');
+    // And the first stays spent, so both records are kept.
+    expect(launchWith(CODE)).toBeNull();
+  });
+
+  it('is null when the launch URL carries no code', () => {
+    resetPairingCodeSeedForTest();
+    currentUrl.value = 'https://mac.tail1234.ts.net/~/';
+    expect(takeUnspentPairingCodeFromUrl()).toBeNull();
+  });
+
+  it('answers the same code twice within one page load', () => {
+    // Handing it out is what spends it, so an unmemoized second call would
+    // answer null to the same document. A remount of the pairing form would
+    // then lose the code the first mount was still redeeming.
+    expect(launchWith(CODE)).toBe(CODE);
+    expect(takeUnspentPairingCodeFromUrl()).toBe(CODE);
+    expect(takeUnspentPairingCodeFromUrl()).toBe(CODE);
   });
 });

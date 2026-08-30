@@ -11,6 +11,7 @@ async fn response_aborted_surfaces_chat_thread_to_inbox() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -92,6 +93,7 @@ async fn response_canceled_sets_has_response_true() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::MessageReceived {
+            voice_session_id: None,
             text: "fix the bug".into(),
             user_image_hashes: vec![],
             device_id: None,

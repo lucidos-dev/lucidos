@@ -39,9 +39,6 @@ export const REASONING_LEVELS = [
   { value: 'max', label: 'Max' },
 ];
 
-/** Levels in ascending order — used for clamping when a level is unavailable. */
-const REASONING_ORDER = REASONING_LEVELS.map(l => l.value);
-
 /** Filter REASONING_LEVELS to those the given model actually supports.
  *
  *  `supported` is the model's `reasoning_efforts` from the `/models` registry:
@@ -90,35 +87,4 @@ export function availableReasoningLevels(
     return REASONING_LEVELS;
   }
   return REASONING_LEVELS.filter(l => l.value !== 'xhigh');
-}
-
-/** Snap an effort to the nearest level the given model supports.
- *  Ties break toward the higher level — switching providers shouldn't quietly
- *  reduce the user's effort intent (e.g. xhigh on a Claude budget model snaps to
- *  max, not high). Mirrors `llm::reasoning::clamp_effort`, which enforces the
- *  same nearest-with-ties-upward rule on the request itself; keep the two in
- *  step. `supported` is the registry's answer, see `availableReasoningLevels`.
- *
- *  They diverge in ONE case, deliberately: a value that is not a level at all.
- *  Rust DROPS it and lets the provider default apply, because inventing a tier
- *  would make a typo silently buy the most expensive reasoning the model has.
- *  Here the caller is a dropdown that has to show something selected, so an
- *  unrecognised value takes the top offered level. Safe because it is a display
- *  choice, not a billing one: whatever this returns is re-checked at the wire,
- *  and the two paths that could carry junk are already filtered before they
- *  reach here (`currentChatReasoningEffort` validates against REASONING_LEVELS,
- *  and a picked value comes from the offered list). */
-export function clampReasoningEffort(
-  effort: string,
-  model: string,
-  supported?: readonly string[],
-): string {
-  const available = availableReasoningLevels(model, supported);
-  if (available.some(l => l.value === effort)) return effort;
-  const target = REASONING_ORDER.indexOf(effort);
-  if (target === -1) return available[available.length - 1].value;
-  return available
-    .map(l => ({ value: l.value, dist: Math.abs(REASONING_ORDER.indexOf(l.value) - target) }))
-    .reduce((best, cur) => (cur.dist <= best.dist ? cur : best))
-    .value;
 }

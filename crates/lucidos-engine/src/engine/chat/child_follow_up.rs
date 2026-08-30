@@ -471,6 +471,7 @@ pub(crate) fn build_follow_up_message(
         None,
         None,
         Some(origin.clone()),
+        None,
     )
 }
 
@@ -675,6 +676,7 @@ impl crate::engine::LucidosEngine {
                             pre_emitted_origin,
                             None,
                             Some(spawn_origin),
+                            None,
                             urgency,
                         )
                         .await;

@@ -99,6 +99,8 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'image':
     case 'checkpoint':
     case 'event_wait':
+    case 'spoken_reply':
+    case 'spoken_message':
     case 'empty':
       return true;
     // Drawn somewhere else, or not at all. A question and a permission are

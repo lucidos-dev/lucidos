@@ -28,6 +28,11 @@
 WORKSPACE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/docker.sh
 source "$WORKSPACE_LIB_DIR/docker.sh"
+# For `ports_file_set`, which detect_tls and swap_ports both write through. The
+# entry scripts source this first anyway, so re-sourcing only redefines the same
+# functions. What it buys is that a caller of workspace.sh alone still has it.
+# shellcheck source=scripts/lib/ports.sh
+source "$WORKSPACE_LIB_DIR/ports.sh"
 
 # ── path_is_in_cc_worktree ──────────────────────────────────────────────
 # True (exit 0) when $1 lies inside a coding-agent worktree — one of the
@@ -354,10 +359,12 @@ detect_tls() {
     else
         PROTO="http"
     fi
-    local ports_file="$WORKSPACE/.lucidos/ports"
-    if [ -f "$ports_file" ]; then
-        echo "PROTO=$PROTO" >> "$ports_file"
-    fi
+    # Set rather than appended, and whether or not the file exists yet. An
+    # append stacked a duplicate on every launch, and the existence guard meant
+    # a launch that reached here first recorded nothing at all. Key-preserving,
+    # so the port and Postgres keys the other writers own survive
+    # (ports_file_set in lib/ports.sh says why they need to).
+    ports_file_set "$WORKSPACE/.lucidos/ports" "PROTO=$PROTO"
 }
 
 # ── setup_postgres ──────────────────────────────────────────────────────
@@ -1952,21 +1959,18 @@ swap_ports() {
 
     # The ports file records the engine's direct port — the CLI / cross-workspace
     # callers talk to the engine, not the gateway.
-    cat > "$WORKSPACE/.lucidos/ports" <<EOF
-API_PORT=$ENGINE_PORT
-VITE_PORT=$ENGINE_PORT
-PG_PORT=$PG_PORT
-PG_DATABASE=$(workspace_database_name)
-DATABASE_URL=$(workspace_database_url)
-EOF
-
-    # That truncated the file detect_tls appended PROTO to, so write it again.
-    # Every reader falls back to https when the line is missing. On a machine
-    # with no dev certs the engine then serves plain http, and each caller
-    # fails at the TLS handshake with "record overflow".
-    if [ -n "${PROTO:-}" ]; then
-        echo "PROTO=$PROTO" >> "$WORKSPACE/.lucidos/ports"
-    fi
+    #
+    # Key-preserving, so the PROTO line detect_tls wrote survives. It used to
+    # truncate and write PROTO back afterwards, which held only while both ran
+    # in that order. Every reader falls back to https when the line is missing.
+    # On a machine with no dev certs the engine then serves plain http, and each
+    # caller fails at the TLS handshake with "record overflow".
+    ports_file_set "$WORKSPACE/.lucidos/ports" \
+        "API_PORT=$ENGINE_PORT" \
+        "VITE_PORT=$ENGINE_PORT" \
+        "PG_PORT=$PG_PORT" \
+        "PG_DATABASE=$(workspace_database_name)" \
+        "DATABASE_URL=$(workspace_database_url)"
 
     # LUCIDOS_API_PORT here is the ENGINE's port (the legacy/direct + tauri/e2e
     # paths spawn the engine on it). start_gateway overrides LUCIDOS_API_PORT to

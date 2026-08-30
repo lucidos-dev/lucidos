@@ -67,6 +67,7 @@ fn thread_event_type_name_extraction() {
     let cases: Vec<(ThreadEvent, &str)> = vec![
         (
             ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: "hi".into(),
                 user_image_hashes: vec![],
                 device_id: None,

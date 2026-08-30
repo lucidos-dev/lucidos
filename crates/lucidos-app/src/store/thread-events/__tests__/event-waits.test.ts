@@ -43,8 +43,8 @@ describe('eventWaitProjection', () => {
   });
 
   it.each([
-    ['EventWaitDelivered', { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'e', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: true }],
-    ['EventWaitExpired', { type: 'EventWaitExpired', wait_id: 'w1', was_attached: true }],
+    ['EventWaitDelivered', { type: 'EventWaitDelivered', wait_id: 'w1', event_id: 'e', event_type: 'ChangeProposed', payload: {}, matched_index: 0 }],
+    ['EventWaitExpired', { type: 'EventWaitExpired', wait_id: 'w1' }],
     ['EventWaitCanceled', { type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop' }],
   ] as const)('removes the wait on %s', (_name, event) => {
     const m = meta();

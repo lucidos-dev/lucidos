@@ -1071,11 +1071,7 @@ impl EventBus {
                 .fetch_optional(&mut **tx)
                 .await
                 .unwrap_or(None);
-        if source.as_deref() == Some("claude_code") {
-            ThreadType::CodingAgent
-        } else {
-            ThreadType::Chat
-        }
+        ThreadType::from_source(source.as_deref().unwrap_or_default())
     }
 
     /// Get the current stored section from thread_summaries.

@@ -28,7 +28,11 @@
 
 import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { PAIRING_CODE_LENGTH, takePairingCodeFromUrl } from '../../utils/pairingCodeSeed';
+import {
+  PAIRING_CODE_LENGTH,
+  takePairingCodeFromUrl,
+  takeUnspentPairingCodeFromUrl,
+} from '../../utils/pairingCodeSeed';
 import { pairingCodeFromText } from '../../utils/pairingCodeText';
 import { suggestDeviceLabelHere } from '../../utils/deviceLabel';
 import { pairDesktopWindow, redeemPairingCode } from '../../api/client/pairing';
@@ -435,10 +439,29 @@ export function PairingCodeBoxes({ code }: { code: string }) {
   );
 }
 
+/**
+ * Pure: the sentence a home-screen app is owed about where a code comes from.
+ *
+ * An installed app has its own storage container, so it can lose its credential
+ * while the browser on the same phone keeps one. That browser is then a paired
+ * device, and a paired device may mint a code. So the phone can recover itself,
+ * and this is the only screen in a position to say so.
+ */
+export function onPhoneCodeSource(standalone: boolean): string | null {
+  if (!standalone) return null;
+  return (
+    'No other machine to hand? Open the same address in your phone browser. ' +
+    'If it is still paired, Settings → Access mints a code you can copy and paste here.'
+  );
+}
+
 function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: string | null }) {
-  // A scanned QR seeds this. The read is memoized, and the parameter is off the
-  // address bar by now. So a re-render never re-seeds a field the user edited.
-  const [scanned] = useState(() => takePairingCodeFromUrl());
+  // A launch code seeds this, and only one this client has not already spent.
+  // The read is memoized, and the parameter is off the address bar by now. So a
+  // re-render never re-seeds a field the user edited.
+  const [scanned] = useState(() => takeUnspentPairingCodeFromUrl());
+  // Read once: an installed app cannot stop being one mid-screen.
+  const [onPhoneSource] = useState(() => onPhoneCodeSource(isStandalone()));
   const [code, setCode] = useState(scanned ?? '');
   // Suggested, not demanded: the browser knows what it is, so offer that and
   // let the user overwrite it. Empty when the browser is unrecognised, which
@@ -600,6 +623,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
             </li>
           </ol>
         )}
+        {!scanned && onPhoneSource && <p class="pairing-lede">{onPhoneSource}</p>}
         <label class="pairing-label" for="pairing-code">
           Pairing code
         </label>

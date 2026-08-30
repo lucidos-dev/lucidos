@@ -2,7 +2,7 @@ import { toFailed } from '../../store/types';
 import { HEALTH_PROBE_TIMEOUT_MS } from '../../store/store';
 import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import type { DiffFile } from '../../store/store';
-import type { AnswerKind, PersistScope } from '../../store/thread-events';
+import type { AnswerKind, AllowScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { ChatRequestBody, CodingAgent } from '../types';
 
@@ -257,13 +257,26 @@ export async function discardCCChanges(threadId: string): Promise<void> {
  *  matching tool_result; for chat threads it wakes the in-process
  *  `ask_user_question` tool which returns the answer as a tool_result on
  *  the same turn. Returns true on success; false for 409 (stale/duplicate)
- *  so the UI can re-sync from events. */
+ *  so the UI can re-sync from events.
+ *
+ *  Idempotent + iOS PWA retry, for the same reason `stopClaudeCode` takes one.
+ *  A PWA waking from the background writes its first POST into a half-closed
+ *  HTTP/2 connection. WebKit rejects that as `TypeError("Load failed")` before
+ *  the request leaves the device. This is the one tap the agent is blocked on.
+ *  A retry that lands twice writes one answer and 409s the second, pinned by
+ *  `answer_question_idempotent_409_on_duplicate`.
+ *
+ *  A response lost AFTER the request landed makes that 409 the retry's own, so
+ *  an answer that worked reports `false`. Accepted rather than engineered
+ *  away: SSE renders the truth a moment later, and telling the two apart needs
+ *  a submission id the engine would have to store and compare. See
+ *  `docs/code-review-priors.md`. */
 export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
 ): Promise<boolean> {
-  const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
+  const res = await mutatingFetchIdempotent(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool_use_id: toolUseId, answer }),
@@ -279,7 +292,7 @@ export async function answerThreadQuestion(
 export async function postMcpConsent(
   requestId: string,
   allowed: boolean,
-  persistScope?: PersistScope,
+  persistScope?: AllowScope,
 ): Promise<void> {
   const body: Record<string, unknown> = { request_id: requestId, allowed };
   if (persistScope) body.persist_scope = persistScope;
@@ -296,7 +309,7 @@ export async function postMcpConsent(
 export async function postCommandConsent(
   requestId: string,
   allowed: boolean,
-  persistScope?: PersistScope,
+  persistScope?: AllowScope,
 ): Promise<void> {
   const body: Record<string, unknown> = { request_id: requestId, allowed };
   if (persistScope) body.persist_scope = persistScope;
@@ -313,7 +326,7 @@ export async function postCommandConsent(
 export async function postMcpPermissionConsent(
   requestId: string,
   allowed: boolean,
-  persistScope?: PersistScope,
+  persistScope?: AllowScope,
 ): Promise<void> {
   const body: Record<string, unknown> = { request_id: requestId, allowed };
   if (persistScope) body.persist_scope = persistScope;

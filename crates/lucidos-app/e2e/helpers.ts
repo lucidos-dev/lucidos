@@ -28,10 +28,21 @@ export function isMobileViewport(page: Page): boolean {
   return vp ? vp.width < 769 : false;
 }
 
+/** Distinguishes one settle wait from the next, for `ensureMobileView`'s pane
+ *  and `openThreadDrawer`'s drawer. Both compare a measurement against the
+ *  frame before, and both keep that frame on `window`. Without a token the
+ *  PREVIOUS call's verdict would answer this call's first frame. */
+let settleToken = 0;
+
 /** Navigate to a mobile pane by name. No-op on desktop, or when already there.
  *  Re-clicks the dot inside the wait loop, so a click absorbed by a concurrent
  *  re-render is retried. `polling: 250` caps re-clicks at 4/sec instead of the
- *  rAF default, to avoid event-storming Preact while the pane settles. */
+ *  rAF default, to avoid event-storming Preact while the pane settles.
+ *
+ *  It returns on the SIGNAL, not on the pane arriving: the header attribute is
+ *  written the instant the dot is clicked. A caller that then measures pane
+ *  geometry wants `waitForPaneAtRest` after it. `openThreadDrawer` is the one
+ *  that does, and it says why. */
 export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads' | 'content'): Promise<void> {
   if (!isMobileViewport(page)) return;
   await page.waitForFunction((target) => {
@@ -41,6 +52,38 @@ export async function ensureMobileView(page: Page, viewName: 'thread' | 'threads
     if (dot) (dot as HTMLElement).click();
     return false;
   }, viewName, { timeout: 10_000, polling: 250 });
+}
+
+/** Wait until the mobile pane track has STOPPED MOVING.
+ *
+ *  `.mobile-swipe-track` slides for `--duration-slow` (300ms) after the view
+ *  signal flips, and `ensureMobileView` returns on the signal. Its click
+ *  happens inside a 250ms poll, so a caller measuring straight afterwards reads
+ *  geometry about 290ms in, every time. A drawer row is then a fraction of a
+ *  pixel off the left edge. That is why an on-screen test over one failed
+ *  deterministically rather than flakily.
+ *
+ *  Index-free on purpose: at rest exactly one pane sits at viewport left 0, and
+ *  mid-slide none does. Held across two frames, so a transition that has not
+ *  started yet cannot answer for one that has ended.
+ *
+ *  **Called by `openThreadDrawer` alone, deliberately.** Inside
+ *  `ensureMobileView` it would hand every mobile spec up to 300ms of extra
+ *  settling. One of them measures a sub-pixel invariant that the shift
+ *  disturbs: `turn-control-holds-the-reader-still` went from 0 failures in 24
+ *  runs to 3. A spec that needs the pane still asks for it. */
+export async function waitForPaneAtRest(page: Page): Promise<void> {
+  if (!isMobileViewport(page)) return;
+  const token = ++settleToken;
+  await page.waitForFunction((token) => {
+    const panes = Array.from(document.querySelectorAll('.mobile-swipe-pane'));
+    if (panes.length === 0) return true; // desktop layout, nothing slides
+    const atRest = panes.some(p => Math.abs(p.getBoundingClientRect().left) < 0.5);
+    const win = window as unknown as { __luPaneSettle?: { token: number; atRest: boolean } };
+    const prev = win.__luPaneSettle;
+    win.__luPaneSettle = { token, atRest };
+    return atRest && prev?.token === token && prev.atRest;
+  }, token, { timeout: 5_000 });
 }
 
 /** On mobile, navigate to the thread pane (pane 1). No-op on desktop. */
@@ -469,6 +512,11 @@ export async function openThreadDrawer(page: Page): Promise<void> {
       const drawer = document.querySelector('.mobile-threads-pane .thread-drawer');
       return drawer && drawer.getBoundingClientRect().width > 0;
     }, undefined, { timeout: 5_000 });
+    // A drawer with WIDTH is not a drawer that has ARRIVED: the pane is still
+    // sliding, so its rows sit a hair off the left edge. Callers hunt rows by
+    // geometry and by hit-testing right after this. So the mobile branch
+    // settles its pane, exactly as the desktop branch below settles its width.
+    await waitForPaneAtRest(page);
     return;
   }
   const isOpen = await page.evaluate(() => {
@@ -491,21 +539,35 @@ export async function openThreadDrawer(page: Page): Promise<void> {
   // Wait for the drawer's open width-transition to SETTLE, not merely to be
   // non-zero. Returning at width > 0 catches the drawer mid-slide, where the
   // still-narrow title column wraps a long title to one character per line.
-  // Geometry assertions then read a degenerate layout. Poll until the width is
-  // stable across two frames and past the collapsed strip.
-  await page.waitForFunction(() => {
+  // Geometry assertions then read a degenerate layout.
+  //
+  // **The running transition is ASKED FOR, not inferred from two equal
+  // samples.** A tolerance of half a pixel across two frames was the earlier
+  // test, and it let a drawer through at two thirds open: the poll can sample
+  // twice inside one compositor frame and read one width twice, mid-slide.
+  //
+  // What that cost is not cosmetic. The conversation pane is the drawer's flex
+  // sibling, so the composer is still being resized. The composer's own
+  // `ResizeObserver` then ABANDONS an in-flight height ease whose target the
+  // new width has invalidated. Clicking a drawer row there lands the new
+  // draft's height with no animation, which is the `prompt-flip-height` flake.
+  // Driven deliberately it reproduced three times out of three, while a settled
+  // drawer animated three out of three.
+  const token = ++settleToken;
+  await page.waitForFunction((token) => {
     const drawer = Array.from(document.querySelectorAll('.thread-drawer:not(.thread-drawer-collapsed)'))
       .find(el => {
         const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       });
     if (!drawer) return false;
+    if (drawer.getAnimations().some(a => a.playState === 'running')) return false;
     const w = drawer.getBoundingClientRect().width;
-    const win = window as unknown as { __luDrawerW?: number };
-    const prev = win.__luDrawerW;
-    win.__luDrawerW = w;
-    return w > 100 && prev !== undefined && Math.abs(prev - w) < 0.5;
-  }, undefined, { timeout: 5_000 });
+    const win = window as unknown as { __luDrawerSettle?: { token: number; w: number } };
+    const prev = win.__luDrawerSettle;
+    win.__luDrawerSettle = { token, w };
+    return w > 100 && prev?.token === token && prev.w === w;
+  }, token, { timeout: 5_000 });
 }
 
 export function uniqueMessage(prefix = 'e2e-test'): string {
@@ -562,6 +624,23 @@ export async function disableMobileHeaderSticky(page: Page): Promise<void> {
 export async function enableMobileHeaderSticky(page: Page): Promise<void> {
   const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'true' },
+  });
+  expect(res.ok()).toBeTruthy();
+}
+
+/** Arm or disarm the experimental voice switch. Voice ships OFF, so the call
+ *  toggle is absent from every prompt input until a spec turns it on. The
+ *  composer's leading cluster is one box narrower without it. Call this BEFORE
+ *  navigating: the app reads its preferences at boot.
+ *
+ *  PUT IT BACK. `voice_enabled` is GLOBAL, and the e2e database resets only
+ *  between projects. A spec that left voice on would hand every later one a
+ *  control the product does not ship. Pair every `true` with a `false` in an
+ *  `afterAll`. Never assume the previous spec's value: a spec that needs voice
+ *  off sets it off, so it passes alone and in any order. */
+export async function setVoiceEnabled(page: Page, on: boolean): Promise<void> {
+  const res = await page.request.put('/api/v1/preferences?key=voice_enabled', {
+    data: { value: String(on) },
   });
   expect(res.ok()).toBeTruthy();
 }

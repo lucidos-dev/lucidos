@@ -6,9 +6,11 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
 import {
+  dividerBodyIsSuppressed,
   questionDividerResolution,
   type StoredEvent,
 } from '../../../store/thread-events';
+import type { ResponseEvent } from '../../../store/types';
 import { makeExchange, step } from '../../../store/__tests__/fixtures';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -104,9 +106,53 @@ describe('questionDividerResolution', () => {
   });
 });
 
-describe('ChatExchange wires questionDividerResolution into showResponsePanel', () => {
+/** The suppression itself. It is `questionDividerResolution` plus one carve-out:
+ *  a body carrying a spoken row is the transcript of a call, and nothing else
+ *  in the app draws one. */
+describe('dividerBodyIsSuppressed', () => {
+  const canceled = () =>
+    makeExchange(askedEvent, [
+      step(1, {
+        type: 'UserQuestionAnswered',
+        tool_use_id: 'tu_div',
+        answer: { kind: 'Canceled' },
+      } as StoredEvent),
+    ]);
+
+  it('hides the body of a typed thread canceled divider', () => {
+    expect(dividerBodyIsSuppressed(canceled(), [])).toBe(true);
+  });
+
+  it('keeps a body carrying what Lucidos said out loud', () => {
+    const events: ResponseEvent[] = [
+      { type: 'spoken_reply', text: 'The codebase is clean.', interrupted: false },
+    ];
+    expect(dividerBodyIsSuppressed(canceled(), events)).toBe(false);
+  });
+
+  it('keeps a body carrying what the caller said out loud', () => {
+    const events: ResponseEvent[] = [{ type: 'spoken_message', text: 'Anything for me?' }];
+    expect(dividerBodyIsSuppressed(canceled(), events)).toBe(false);
+  });
+
+  // The carve-out is a SPOKEN row, not renderable content. A cancel step and a
+  // step row land in every canceled divider, so the wider test would un-hide
+  // the body on every typed thread.
+  it('still hides a body whose only content is an ordinary step', () => {
+    const events: ResponseEvent[] = [
+      { type: 'step', description: 'Ran a query', outcome: 'success' },
+    ];
+    expect(dividerBodyIsSuppressed(canceled(), events)).toBe(true);
+  });
+
+  it('is false for a divider still awaiting its answer, whatever the body', () => {
+    expect(dividerBodyIsSuppressed(makeExchange(askedEvent, []), [])).toBe(false);
+  });
+});
+
+describe('ChatExchange wires the suppression into showResponsePanel', () => {
   it('imports the helper from ../../store/thread-events', () => {
-    expect(source).toMatch(/questionDividerResolution/);
+    expect(source).toMatch(/dividerBodyIsSuppressed/);
     expect(source).toMatch(/from\s+['"]\.\.\/\.\.\/store\/thread-events['"]/);
   });
 
@@ -116,8 +162,10 @@ describe('ChatExchange wires questionDividerResolution into showResponsePanel', 
     const fnMatch = source.match(/function ChatExchangeImpl[\s\S]*?^\}/m);
     expect(fnMatch, 'ChatExchangeImpl function not found').not.toBeNull();
     const fn = fnMatch![0];
+    // The events list, not the exchange alone: the carve-out is decided by
+    // what the body would DRAW, and only the rendered list knows that.
     expect(fn).toMatch(
-      /isUnansweredDivider\s*=\s*questionDividerResolution\(exchange\)\s*!==\s*null/,
+      /isUnansweredDivider\s*=\s*dividerBodyIsSuppressed\(exchange,\s*events\)/,
     );
     expect(fn).toMatch(/showResponsePanel\s*=[^;]*!isUnansweredDivider/);
   });

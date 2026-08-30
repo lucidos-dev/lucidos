@@ -80,7 +80,72 @@ export function takePairingCodeFromUrl(): string | null {
   return taken;
 }
 
-/** Testing seam: forget the memoized read. Never called by the app. */
+/**
+ * Where a client remembers the launch codes it has already tried.
+ *
+ * Per storage container, which is the point: a home-screen app and the browser
+ * on the same phone hold separate ones, and each spends its own code.
+ */
+const SPENT_KEY = 'lucidos.pairing.spentLaunchCodes';
+
+/** How many to remember. A launch URL carries one, so this is only slack. */
+const SPENT_LIMIT = 8;
+
+function spentLaunchCodes(): string[] {
+  try {
+    const raw = window.localStorage.getItem(SPENT_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((c): c is string => typeof c === 'string') : [];
+  } catch {
+    // No storage, or something else wrote the key. Either way this device has
+    // no record, which reads as "not spent" and costs one redeem attempt.
+    return [];
+  }
+}
+
+function rememberSpentLaunchCode(code: string): void {
+  try {
+    const next = [code, ...spentLaunchCodes().filter((c) => c !== code)].slice(0, SPENT_LIMIT);
+    window.localStorage.setItem(SPENT_KEY, JSON.stringify(next));
+  } catch {
+    // Storage refused. The cost is one dead redeem per launch, which is what
+    // this exists to avoid, not something worth a toast on the pairing screen.
+  }
+}
+
+/**
+ * The launch code to REDEEM, which is one this client has not tried before.
+ *
+ * A code works once, and `takePairingCodeFromUrl` cannot make the launch URL
+ * forget it: the strip rewrites the address bar, while iOS relaunches from the
+ * `start_url` it stored at install. So an installed icon carries the same code
+ * for good, and redeeming on sight would fail on every cold launch.
+ *
+ * That failure is not free. Each one spends part of the gateway's wrong-guess
+ * budget, and a run of launches leaves it refusing even a correct code.
+ *
+ * Marked spent when it is handed out rather than when the attempt is answered.
+ * A code lives five minutes, so one lost to a blip is dead by the next launch,
+ * and the form still takes a fresh one.
+ *
+ * Memoized for the page load, like the read it wraps, and for a sharper reason.
+ * Handing the code out is what spends it, so an unmemoized second call would
+ * answer `null` to the same document. A remount of the pairing form would then
+ * lose the code the first mount was still redeeming.
+ */
+export function takeUnspentPairingCodeFromUrl(): string | null {
+  if (unspent !== undefined) return unspent;
+  const code = takePairingCodeFromUrl();
+  unspent = !code || spentLaunchCodes().includes(code) ? null : code;
+  if (unspent) rememberSpentLaunchCode(unspent);
+  return unspent;
+}
+
+/** The result of the one unspent read, or `undefined` before it happened. */
+let unspent: string | null | undefined;
+
+/** Testing seam: forget both memoized reads. Never called by the app. */
 export function resetPairingCodeSeedForTest(): void {
   taken = undefined;
+  unspent = undefined;
 }

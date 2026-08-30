@@ -361,6 +361,7 @@ impl LucidosEngine {
                         Some(PreEmittedOrigin::EngineReentry(anchor_event_id)),
                         None,
                         Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
+                        None,
                         crate::engine::FollowUpUrgency::Normal,
                     )
                     .await
@@ -701,6 +702,7 @@ mod tests {
         }
         fn message(text: &str) -> ThreadEvent {
             ThreadEvent::MessageReceived {
+                voice_session_id: None,
                 text: text.to_string(),
                 user_image_hashes: vec![],
                 device_id: None,

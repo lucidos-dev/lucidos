@@ -50,6 +50,25 @@ private fields make the overlapping total unreachable from a price. The eval
 priced the total flat until 2026-08-23, which overstated every dollar figure it
 had ever printed about fourfold (ADR 0110).
 
+### Modality split
+How one call's tokens divide across text, audio and image. Carried by
+`ModalityUsage` on the `usage` block's optional `modality` key, and only a
+*voice session*'s talker reports one: the realtime API bills audio at eight
+times the text input rate, so its four flat counts cannot be priced.
+
+Every field is a PART of a flat count, named after the count it belongs to.
+Three sums hold: input text + audio + image is `input_tokens`, cache-read text
++ audio + image is `cache_read_tokens`, output text + audio is
+`output_tokens`. Same shape as *fresh input*: a total and its parts, never
+classes to add up.
+
+Absent on every other producer, so a chat or coding-agent payload is
+byte-identical to what it always was. It is all-or-nothing: `done_usage` fills
+it only when the `response.done` frame carries both detail blocks, because a
+zeroed split reads as a real turn that spoke nothing. When the parts stop
+summing to the totals, the totals win, the parts are stored as reported, and
+the engine logs the drift. Nothing rescales.
+
 ### Reconstructed capture
 A `ContextCaptured` rebuilt after the fact from events that were never
 captured live, stamped `reconstructed: true` by
@@ -530,10 +549,12 @@ The wrapper enum the EventBus routes. Two variants: `BusEvent::Thread { .. }` (p
 ### Callback linkage
 The `parent_thread_id` field on a spawned thread's first `MessageReceived` (projected onto `thread_summaries.parent_thread_id`), and the single field that makes a thread somebody's *child thread*: it is what fires the parent callback when the child terminates (`notify_parent_if_child`), what increments `active_children_count` / `total_children_count`, what sets `parent_callback_pending`, and what `resolve_attend_mode` hops along when deciding whether a coding-agent permission card inherits a trigger's *side-effect grant*. Deliberately NOT the same thing as the *attribution* carried in `MessageOrigin::ThreadLink`, which only names the *spawning thread* for the message route popover. A `relation: "child"` spawn carries both; a *top-thread* and a *child follow-up* carry attribution with no linkage. Conflating them is what made a top-thread render its Origin as "Unknown" (`agentic_loop_special_tool::spawn_origin` versus `Relation::spawn_linkage`); anything deciding parent-ness reads the linkage, never the origin.
 
-### Call strip
-The row above the composer that shows a live *voice session*: what the call is doing, what the caller last said, and what the talker is saying now (`components/chat/CallStrip.tsx`, mounted by `PromptInput` above `.prompt-box`). It **reports and carries no control**. Ending a call belongs to the *call toggle* beside the follow toggle, so a second end button would be a second thing to find.
+### Call phase
+Where a live *voice session* is, as the client models it: `idle` | `connecting` | `listening` | `speaking` | `ending` (`voice/callState.ts`). `listening` and `speaking` are both live and differ only in who has the floor, which is what arms the barge-in gate.
 
-It renders only while a call is up, which is why a reason a call could not run does NOT live here: the strip goes with the call, so `store/voice.ts` toasts the note instead when the phase reaches `idle`. Nothing in a call is persisted this phase, so the strip and that toast are the whole visible surface. The state label is the one `role="status"` region. The transcript deliberately is not: announcing every delta of a reply being spoken aloud would talk over it.
+**A call draws no surface of its own.** The *call toggle* turns red while one is up, and everything said lands in the transcript as thread events, so the phase paints nothing. It is announced rather than drawn: the toggle carries the call's one `role="status"` region, empty at `idle`, so each state a call arrives at is spoken. Ringing off is the button's own announcement, since emptying a live region says nothing. The transcript deliberately is not a live region either, because announcing every delta of a reply being spoken aloud would talk over it.
+
+The client holds no words at all. `user_turn_ended` and `talker_transcript` are read for the floor they imply, and their text dropped: a caption nothing draws is state that can only go stale. One thing does outlive a call, the reason it could not run. `store/voice.ts` toasts that note when the phase reaches `idle`, rather than leaving it on a surface that has gone.
 See also: *voice session* and *call toggle* (`system-knowhow/glossary.md`), `docs/plans/2026-08-29-a-microphone-reaches-the-call.md`.
 
 ### Capability parity manifest
@@ -775,6 +796,8 @@ Reversing it took a second half. A reveal is GROWTH, so the resize handler's `ke
 
 An armed reader gets the correction wherever they are parked, in HISTORY and on the END alike. Nothing is arriving on a quiet thread, and the turn they expanded is what they want to see.
 
+**Amended: there is no clamp debt.** The `carriedAnchorDebt` / `rememberAnchorDebt` sentences above are retired, and both functions are gone. One press reads only its own two measurements, so a clamp is never repaid by a later press. Repaying it threw the pressed control up the screen and put the reader on the live edge (ADR 0147). A pair of presses that clamped is lossy by that clamp, once.
+
 **That last rule now takes a POSITION term: a deep-link landing retires the ride only where it comes to rest OFF the live edge.** The ride asks for one place, and a landing resting there has asked for the same thing. So a link to the BOTTOM of a thread ends nothing, and the reader keeps riding as they answer it. Turn stepping measured its own landing from the start, and the deep link did not: it retired on every tap. That cost the reader a ride over a navigation that never happened (reported 2026-08-14). One threshold answers for both now (`isLiveEdgeTop`), and the link measures the number its own scroll aims at (`landingTargetOf`).
 
 **Pixels moved is the wrong measure.** A link carrying a scrolled-up rider back down to the live edge moves them a long way. It puts them exactly where the ride wanted them, so the question is the PLACE and never the distance.
@@ -867,6 +890,19 @@ It was reserved AIR, and air below the last turn misreports how much thread ther
 
 What replaced it is nothing: the transcript ends where its content ends, and the landing measures instead of reserving. A long reply reaches the line on its own once it has streamed past a screenful; a fresh turn does not, and gets shown rather than clamped. Pinned by `e2e/transcript-ends-where-its-content-ends-desktop.spec.ts`, which has to be a browser test because air is layout and the unit suite drives a fake container with a hand-set `scrollHeight`.
 
+### Render window
+How much of a thread the transcript actually draws (`components/chat/threadWindow.ts`, applied by `ThreadView`). Always a contiguous TAIL ending at the newest turn, because the streaming turn must stay in the DOM. Four readers depend on it being one: `edgeHasMoreAbove`, the scroll-up expansion, the up chevron, and the *reading position*'s walk. It exists because rendering a large thread whole blocks the main thread for hundreds of ms, which a skeleton cannot cover (ADR 0081).
+
+**Its top edge has two dimensions**, and the second is what the first could never bound. `exchange` is the index of the oldest turn drawn. `rowsHidden` is how many of THAT turn's leading rows are left out. It is zero for every other turn in the window, which is what keeps the slice contiguous. Admission is budgeted in each: `STEP_BUDGET` raw events picks the turns, `ROW_BUDGET` drawn rows clamps the oldest one.
+
+The row dimension was added because the turn budget did nothing on the shape that needed it most. A coding-agent turn routinely outweighs a whole transcript. The reported thread held five turns costing 1, 65, 684, 425 and 1 steps against a budget of 160. So "at least one turn must draw" was the only rule that ever fired, and the window drew a turn of everything (`docs/plans/2026-08-30-what-a-thread-open-costs-on-mobile.md`).
+
+**An EDGE, never a count, in both dimensions.** A count slides forward as the live turn grows, so appending a turn would evict the oldest one the reader was shown. Stored per thread in a module Map, so it survives a switch-away-and-back. A *deep-link anchor* and the scroll-to-top chevron set it to `WHOLE_THREAD`.
+
+**Growth is scroll-driven and has no control of its own.** Rows first, then turns: scrolling up into the oldest turn uncovers a budget of its head, and only once that turn is whole does the window reach past it. A per-turn "Show earlier steps" expander shipped twice and was removed twice. The second removal happened because the user disliked it from the first message, so a source-scan tripwire fails if one comes back (`components/chat/__tests__/floor-turn-row-clamp.test.ts`). `windowNeedsFill` covers the case a scroll cannot: a slice shorter than the pane produces no scroll event, so the window grows until the transcript scrolls or the thread is whole.
+
+A turn the *reading position* names must render WHOLE, not merely be present, because the restore measures that turn's own top edge (ADR 0152).
+
 ### Reading position
 Where a reader had parked in a transcript, remembered across a thread switch, a reload, and the app being backgrounded (`lucidos-scroll-thread-<id>` in localStorage, written and restored by `hooks/useScrollMemory.ts`). Since the transcript stopped scrolling itself to the bottom (see *navigation scroll*, and *standing follow* for the one thing that rides the bottom now, on request and never on open), this is the ONLY thing that decides where a thread opens, and it answers every form of the question: a saved position is restored, and a thread with none opens at the TOP of what is rendered (`resetOnEmpty`, which matters because `.thread-content` is one element reused across threads and would otherwise inherit the previous one's offset). There is a THIRD answer, because the transcript is WINDOWED: an offset recorded against a taller render (a session that scrolled up, a *deep-link anchor*'s render-all) is routinely out of reach of the trailing slice the next open renders, and an offset that cannot be honoured opens the thread at the top as well. Never at the bottom. `Math.min(saved.top, max)` used to say otherwise in both places that gave up (the restore deadline, the dead-link rescue below), and since a clamp can only run when the offset is unreachable, `max` was the whole of it: the live edge, three seconds after the reader arrived and settled. The wait itself is spent parked at the top for the same reason rather than on the borrowed offset the shared container arrived holding, so a restore that never becomes possible has already left the reader somewhere honest instead of on a number the save listener would then persist as theirs. EVERY position is saved, the bottom included, and `0` persists as a real position distinct from no save at all. The save is debounced and committed from the attachment's teardown AND on `onPageHide`, because a background is neither: a frozen page's pending timer never runs if the page is then discarded, so the reader's last act would be lost, and the direction that does damage is a lost DISARM (the stale live edge outliving them, so the next open drags them to a bottom they scrolled away from).
 
@@ -887,6 +923,15 @@ The element a deep-link into a transcript actually targets, which is not always 
 
 **The link's budget is ELASTIC, and the report at the end of it is a VERDICT.** A target's absence says nothing while the thread's events are still arriving, so the resolve deadline re-arms while `threadEventsStillArriving` says more are coming. `EVENT_RESOLVE_MAX_WAIT_MS` bounds the total, so a stalled thread still gets an answer. The dead-link rescue in `useScrollMemory` defers on the same budget, reading the held claim rather than `shouldRestore`. A flat wall-clock deadline ran shorter than the load it was racing, and reported a change the reader could see on screen. ThreadView's own stuck-load fuse waits 8s, against the 4s the link used to spend.
 See also: `system-knowhow/notifications.md` § "Where a `navigate` tap LANDS".
+
+### Seen target
+The place a notification points at, once the reader has actually looked at it. Looking at it is what clears the row (`store/actions/notification-visit.ts`). A tap naming an event is seen when that event's own card is in the transcript's visible band. The measure is `isEventInViewport`, the same one the *PresenceCheck* pong uses.
+
+A tap naming a place with no card is seen when that place is on screen. That covers an app, a file, a trigger, a settings sub-section and a panel. On screen means the current pane on mobile, or a pane the *split* gives real width on desktop. A desktop reader is therefore at two places at once.
+
+Either form must hold for `SEEN_DWELL_MS` (1000 ms) with the page active, because a glimpse is not a read. Five things put a target briefly in front of somebody who never asked for it. Drawer browsing, a swipe through the middle pane, an archive hand-off, an optimistic bootstrap, a fast scroll. Leaving cancels the wait rather than pausing it, so the time has to be continuous.
+
+This is Row 1 of the §4 matrix made STANDING rather than one-shot. Being the same test is what leaves the matrix undisturbed: Row 2 still toasts a notification whose card is scrolled away. A `modal` tap has no seen target, its place being the notification detail, which opening already marks read. Neither does a notification's own `thread_id`, which is provenance rather than a destination. One set of constructors (`store/actions/visitKeys.ts`) spells both the place a tap names and the place the shell shows, so the two cannot disagree. See `system-knowhow/notifications.md` §4.
 
 ### Content-pane navigation cover
 The opaque theme surface every arriving content-pane view fades in from, so a view switch is a crossfade rather than a hard cut (`.content-nav-cover` in `styles/panels/shell.css`, mounted by `components/layout/ContentPane.tsx`). It hides the swap frame, which is busier than it looks: the old subtree unmounts, a lazy chunk that may not have arrived mounts, a remembered scrollTop is restored and the incoming view's own skeleton settles. It never *waits* on any of that, so content shows through the moment it paints and a slow view uncovers its own skeleton. Generalises `.app-ui-cover`, which had covered an app open since 2026-07-31; the two differ only in what ends them, and that is the point. The app cover waits on the frame's `load` because it hides a document the host does not author and cannot otherwise time; this one is the switch frame alone and clears on its own `content-nav-cover-clear` animation, with a fuse (`NAV_COVER_ANIM_MS` under the *animation speed scale*, plus fixed slack) that unmounts it even when `prefers-reduced-motion` drops the animation entirely. Three shape decisions: a **cover** rather than an opacity on the content, because half these views host an iframe and a frame WebKit must re-composite up from transparent is the shape of this pane's iOS paint-loss bugs; a **keyed element replaying an animation** rather than a class-toggled transition, whose opaque start has to reach the screen before the clearing class lands and silently hard-cuts when it loses that double-rAF race; and mounted **outside** `.content-pane-body`, so it does not scroll away with the content it covers. A **cover**, never a "reveal": `revealContentPane()` is an established and different thing in this pane (swipe to it on mobile, focus its pane group on desktop), and every other surface that hides a not-yet-ready view is a cover too (`.app-ui-cover`, the *quiet boot cover*).
@@ -1490,6 +1535,19 @@ See also: `.claude/rules/frontend.md` § "Async Data Loading".
 ### Max tool calls
 The per-turn tool-call cap for *Lucidos Agent* turns, chat and trigger alike: how many tool calls a single turn may make before the engine ends it with an `[ENGINE-LIMIT]` *ResponseGenerated* terminator naming the cap and pointing at the setting. Counts **calls, not LLM rounds** (`tool_calls_made`, incremented inside the per-call loop, distinct from `iterations`), because one response can carry several tool calls and the system prompt asks for exactly that when writing N files; counting rounds would let a cap of 500 pass well over 500 calls while every user-facing string says "tool calls". The response that crosses the line completes first, since every `tool_use` needs a matching `tool_result` or the provider rejects the next request, so the overshoot is bounded by one response's worth of calls. Stored as the global `max_tool_calls` *preference*, defaulting to `DEFAULT_MAX_TOOL_CALLS` (500, the value of the former hardcoded `MAX_ITERATIONS`), resolved per turn by `PreferenceStore::max_tool_calls`. **No maximum** (a high cap costs the user time and tokens, which is theirs to spend); `MIN_MAX_TOOL_CALLS` is 1, ruling out only `0`, which would fire the backstop before the first LLM call. Absent or unparseable resolves to the default rather than failing the turn. Human-only: it is in `INTERNAL_KEYS`, because it is the backstop over the agent's own loop and the agent must not raise its own limit. The turn's resolved cap is read ONCE in `process_message_with_steps_internal` and passed to both the system-prompt builder and `run_agentic_loop`, so the number the prompt quotes to the model is the number enforced, and a mid-turn Settings change cannot move it. Distinct from the *circuit breakers*, which fire much earlier and on a different signal (3 consecutive identical FAILURES warn, 5 break) rather than on volume; a cap set below 5 pre-empts them, which is the honest consequence of asking for a tiny cap. Settings → Models → Chat & triggers.
 
+### Wire shape
+What a *thread event*'s JSON actually looks like by the time the frontend reads it, as opposed to what the Rust `ThreadEvent` variant declares. The two differ, and the difference is the whole reason the frontend types are generated rather than derived:
+
+```
+wire = ThreadEvent variant  +  EventMeta fields  +  API stamps  -  API strips
+```
+
+`EventMeta::apply` merges `request_event_id`, `channel` and `actor` into every payload at persist and broadcast time. So all three appear on every member even though no variant declares them. The snapshot endpoint then strips `ContextCaptured.sections` / `tools` and `ToolResult.result` for size, and stamps `sections_stripped` / `result_stripped` to say it did. A stripped field is required in Rust and optional on the wire.
+
+Two more things widen it. The snapshot serves the raw JSONB column, so an old row reaches the client exactly as written: a retired variant name, a retired enum arm, or a field since dropped. And a field carrying `#[serde(default)]` or `skip_serializing_if` can be absent, on an old row or a new one. Either attribute therefore makes the TypeScript property optional.
+
+`crates/lucidos-app/src/generated/thread-event-wire.ts` is the wire shape as a type, generated by `thread_events_tests/ts_codegen.rs`. Every divergence above is a declared row in that generator, never a hand edit to the output. Distinct from a *view model* such as `ContextCapture`, which adds frontend-only fields on purpose and is not a mirror of anything. See ADR 0166.
+
 ### Wire tool name
 The name a tool is offered to the model under. Lucidos's canonical identifier for an *MCP* tool: `mcp__<server_id>__<tool>`, rewritten to satisfy the Messages API pattern `^[a-zA-Z0-9_-]{1,128}$`. Every other character becomes `_`, and the result is truncated to 128.
 
@@ -1626,7 +1684,7 @@ Optional on `SystemEvent` variants (`actor: Option<MessageOrigin>`); the four le
 ### agent participant
 Which agent authored a thread event, once a thread can carry more than one (`AgentParticipant` in `engine/thread_events/actor.rs`, ADR 0150). Two variants. `LucidosAgent` is the workspace's own agent and the `Default`. `Guest { label }` is any other agent sharing the thread, where `label` is the speaker name the rendered history prints. An enum rather than a name string, because our own agent is not something a caller could spell two ways.
 
-It exists because `engine/chat/process/history.rs` renders each turn as `User:` or `Assistant:`, and with two agents writing, `Assistant:` stops being a name and becomes a collision. `history::speaker_label` is the single definition of what a line prints under. The two mis-attributions it rules out are not symmetric. `Assistant` makes the reasoner read a guest's turn as its own prior turn, so the two converge on whatever the first said. `User` makes it obey an instruction the user never gave.
+It exists because `engine/chat/process/history.rs` renders each turn as `User:` or `Assistant:`, and with two agents writing, `Assistant:` stops being a name and becomes a collision. `history::speaker_label` is the single definition of what a line prints under. The two mis-attributions it rules out are not symmetric. `Assistant` makes the doer read a guest's turn as its own prior turn, so the two converge on whatever the first said. `User` makes it obey an instruction the user never gave.
 
 Carried into the projection as `SessionMessage.agent`, read off the persisted actor by `messages::build::authoring_agent` rather than inferred from position: two agents interleave, and only the writer knew which one wrote. `None` there means a user turn, or an assistant turn from before the actor existed; both render `Assistant`. The first *guest* is the voice *talker* (`docs/plans/2026-08-28-voice-joins-a-thread-as-a-participant.md`), which is also why the label is a free string: the surface that adds a participant names it.
 
@@ -2128,20 +2186,42 @@ How a reaped child process ended, as a typed enum (`crates/lucidos-engine/src/co
 The interpreter engine-spawned shell commands run under (`core::shell::command_shell`): a resolved `bash` invoked with `-o pipefail`, falling back to `/bin/sh` with a logged warning where no bash exists. `pipefail` is load-bearing rather than cosmetic — a POSIX shell reports the exit status of the *last* stage of a pipeline, so `cargo clippy … | tee build.log` returned `tee`'s `0` and a build that exited `101` reached the agent as a clean success (the 2026-07-26 nightly hit this four times in one pipeline, and every step had to cross-check a sidecar `.ec` file to catch it). What `pipefail` guarantees precisely: the pipeline's status is that of the *rightmost failing* stage, and `0` only when every stage succeeded — so a failing stage can never be masked by a later succeeding one, though with several fallible stages the reported code doesn't identify which failed first. Applied at all three shell call sites: `run_bash`, the *background task* registry, and trigger/scheduled scripts. Accepted consequence: a producer SIGPIPE'd by an early-closing consumer (`yes | head -1`) now reports failure instead of `0` — as exit code `141`, since the shell exits normally carrying `128 + signum` when a *pipeline stage* (rather than the shell itself) is signalled, which *TaskOutcome* renders as `exit code 141 (probable SIGPIPE)` rather than a bare number.
 
 ### Talker
-The rented speech-to-speech model that holds a *voice session*: it hears, it speaks, and it does nothing else (ADR 0149). It is opened with an **empty tool list**, so it can mutate nothing, and `SessionOpening` (`voice/provider.rs`) has no tool field for anyone to fill wrongly. A talker that gets something wrong says a wrong sentence; only the *reasoner* beside it can send an email.
+The rented speech-to-speech model that holds a *voice session*: it hears, it speaks, and it decides whether an utterance needs the *doer*. It is opened with **exactly one tool**, `delegate`, which mutates nothing (see *delegation*). `SessionOpening` (`voice/provider.rs`) still has no tool field, so nothing above the seam can add a second. A talker that gets something wrong says a wrong sentence; only the doer beside it can send an email.
 
-What it can answer with no wait is whatever was loaded at session open, the *resident block*. A tool-less model cannot look anything up mid-sentence. For anything else it stalls truthfully while the reasoner works, and says what it is handed. It may not state a fact it did not receive.
+What it can answer with no wait is whatever was loaded at session open, the *resident block*. It can look nothing up mid-sentence, so for anything else it delegates, stalls truthfully while the doer works, then says what it was handed MEANS. It may not state a fact it did not receive.
 
-Internally it is a *guest* participant (`AgentParticipant::Guest`). So `history.rs` prints its turns under their own speaker label, and the reasoner never reads one as its own. **The user never meets that split**: the talker speaks as Lucidos, in the first person, and the transcript renders a spoken turn as Lucidos. `SpokenReplyGenerated` is what it leaves behind.
-See also: *reasoner*, *voice session* (user-facing), *resident block*.
+That block is a snapshot and nothing corrects it, which is why the tool's description biases hard toward calling. Under-calling is the expensive mistake: it answers confidently from what was true when the call opened. Over-calling costs one turn nobody hears.
 
-### Reasoner
+**A second model runs inside its socket**, the transcriber, turning the caller's audio into text. It is the only other model in the voice loop: nothing translates, and nothing summarises, because the doer's answer reaches the talker as written and the language is a rule in its instructions. `model_voice_transcriber` names it, and `voice_talker_voice` names the voice the talker speaks in. Both are read in `voice::build`, which records why neither takes a `ContextPurpose`.
+
+Internally it is a *guest* participant (`AgentParticipant::Guest`). So `history.rs` prints its turns under their own speaker label, and the doer never reads one as its own. **The user never meets that split**: the talker speaks as Lucidos, in the first person, and the transcript renders a spoken turn as Lucidos. `SpokenReplyGenerated` is what it leaves behind.
+
+Its own words also reach a doer turn already running, as an `InjectedPromptKind::SpokenAside`. That round then learns what the caller was told in its name. Offered, not forced: an idle thread has no loop to inject into, and history carries the turn to the next round anyway. A reply the talker was HANDED is skipped, since the round wrote that answer itself.
+See also: *doer*, *delegation*, *voice session* (user-facing), *resident block*.
+
+### Doer
 The standard Lucidos Agent, in the setting where a *talker* shares its thread. Not a second agent and not a mode: the same agent, the same tools, the same admission, the same assembled prompt. The word names a role in the pair, nothing more.
+
+**It is the Lucidos Agent and never a coding agent** (ADR 0165). `doer_for` (`voice/doer.rs`) reads `thread_summaries.source` and answers which agent holds a thread, and `wake` refuses anything but the Lucidos Agent. `api::voice::admit` asks the same question at the socket, and the *call toggle* is absent whenever the resolved destination is a coding agent. A refusal is not silent. `wake` reports that it did not take the utterance, so `call.rs` writes the caller's words down as a `SpokenMessageReceived`. The talker then says that nothing started.
+
+**Named for what it can DO.** It holds every tool and the talker holds one, so the split the pair turns on is capability rather than thinking (ADR 0149). That is the whole reason the talker delegates: not to borrow better thinking, but to reach what it cannot reach.
 
 **It is never told a session is live** (ADR 0149). It is *shown* one, by reading the talker's turns in the thread. Telling it would make one question get two answers by input channel, which the user cannot see coming. `voice::purity_tests` is a source scan over the prompt-assembly path, so a file that names nothing voice-shaped cannot say a call is up.
 
-A finished utterance wakes it through the `TurnStarter` seam (`voice/reasoner.rs`): a `MessageReceived` and then `process_message_with_steps`, exactly as a typed message does. Its answer reaches the caller's ear because `call.rs` appends it to the talker's session and asks the talker to say it.
-See also: *talker*, *single-flight admission*.
+A *delegated* utterance wakes it through the `TurnStarter` seam (`voice/doer.rs`): a `MessageReceived` and then `process_message_with_steps`, exactly as a typed message does. That `MessageReceived` carries `voice_session_id`, which is what marks it spoken; the composer stays live during a call, so nothing around it can say. An utterance the talker answers alone never reaches it as a turn, only as a `SpokenMessageReceived` row in the history it reads next time.
+
+Its answer reaches the caller's ear because `call.rs` appends it to the talker's session and asks the talker to SAY it. Never to read it: the doer writes for a reader, and `answer_to_say` is where that framing lives. Past 400 characters it asks for the headline plus an offer of the detail, and it carries the text in full either way.
+See also: *talker*, *delegation*, *single-flight admission*.
+
+### Delegation
+The talker handing an utterance to the *doer*, through its one tool. That tool is `delegate` (`voice/mod.rs`), taking one required argument: a short reason. It is the whole of the talker's reach, and it mutates nothing, so ADR 0149's guarantee survives its own reversal: a talker that gets something wrong still only says a wrong sentence.
+
+**An ask, never a wake.** The talker cannot see whether a doer turn is running, and is never told. It delegates every request needing the doer, including one made mid-turn, and *single-flight admission* decides whether that starts a turn or joins one. So an utterance during a running round still reaches that round.
+
+Two rows land per delegation: a `WorkDelegated` naming the talker and its reason, and the `MessageReceived` that starts the turn. An utterance with no delegation lands as one `SpokenMessageReceived`, which starts nothing. Every utterance is written down exactly once either way.
+
+`call.rs` holds a finished utterance until one of the two arrives. The transcript and the tool call come from different models on one socket, so either can land first. The ask outlives the talker turn that made it, since a transcript still in flight belongs to it. Whatever is still held when the call ends is written down, for every end reason.
+See also: *talker*, *doer*, *voice session* (user-facing).
 
 ### ThreadEvent
 The per-thread event enum (`crates/lucidos-engine/src/engine/thread_events.rs`). Every variant is past-tense (the events-only model — see user-facing *Event*); the `is_persisted()` method routes between *persisted event* and *transient event* on emit. Variant added/removed/renamed, payload changed, persistence flipped, or alias added → MUST update `system-knowhow/thread-events.md` in the same change (and `coding-agent-events.md` if the change touches `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*`).
@@ -2331,7 +2411,22 @@ The half of a chat turn's prompt that is sized by what the USER put in their wor
 ### Resident block
 What a *voice session* opens knowing. The talker holds no tools (ADR 0149), so this block plus the conversation is the whole of what voice can answer with no wait. It enters the session as its FIRST history item, never as instructions, which is what lets a refresh append beside it rather than rewrite it. Rewriting would invalidate the cached prefix behind it, and one such deletion was measured to triple full-price input for that turn.
 
-Built from a registry of named **resident sections** (`voice::sections::SECTIONS`), each an id, a title and a builder that runs at session open. So a section reports the workspace as it is now, and adding one is a single entry plus its builder. The `voice_resident_sections` preference names which are on, defaulting to `who-and-where`, `this-thread` and `workspace-shape`. A section id is a value the user types, so it stays kebab-case and stable. An unknown one is ignored with a log line rather than costing the whole block. What is in it is a product decision, not tuning: it bounds what voice answers instantly.
+Built from a registry of named **resident sections** (`voice::sections::SECTIONS`), each an id, a title and a builder that runs at session open. So a section reports the workspace as it is now, and adding one is a single entry plus its builder. What is in it is a product decision, not tuning: it bounds what voice answers instantly.
+
+**What is WAITING on the reader is in it, in two places.** `this-thread` carries the question this thread is parked on, in full, with its choices. `workspace-shape` names every other thread waiting on an answer. Neither is a new section id on purpose: a workspace that already wrote `voice_resident_sections` gets exactly what that row lists, so a new id would reach the readers who need it least.
+
+The `voice_resident_sections` preference names which are on, as comma-separated ids. Settings draws it as one toggle per section, over `VOICE_RESIDENT_SECTIONS` in `store/actions/preferences.ts`, a mirror of the registry that `voice::sections`'s own guard pins. An id nothing defines is ignored with a log line, rather than costing the whole block. An id the registry does not carry survives a toggle, since a newer engine may define one this client has not heard of.
+
+**A row that exists means exactly what it lists, and an EMPTY one means none.** Only a row that was never written falls back to `who-and-where`, `this-thread` and `workspace-shape`. The two used to be one case, which would have made the last toggle impossible to turn off.
+
+### Spoken language
+What a *voice session* is pinned to, derived from the one global `language` preference (`voice::language`). A call reads that preference twice, because its two halves want different things. The *talker* is told the **name**, as the user wrote it, and speaks in it. The transcriber is configured with an **ISO-639-1 code**, which is a value no sentence can carry.
+
+Only the code needs a lookup, so `SpokenLanguage` holds `Option<String>` beside the name. A name outside the table still reaches the talker, and the transcriber payload is then what it was before any of this existed. A typo in Settings costs nothing.
+
+**Said once, in the instructions, never in the *resident block*.** The block is what the talker KNOWS; which language to speak is a rule it follows. Stating it in both is how the two come to disagree. It is a workspace-level fact, so the cached prefix stays stable across that workspace's calls.
+
+The defect that produced it: with no code sent, the transcriber re-guesses per utterance, and Bokmål and Nynorsk are separate labels in its language set. A short Bokmål phrase duly came back as Nynorsk (`docs/plans/2026-08-29-a-call-speaks-one-language-and-gives-one-answer.md`).
 
 ### Voice provider
 The seam a talker sits behind (`voice::provider`). `VoiceProvider` opens a `VoiceSession`, which hears audio, speaks audio and yields `VoiceEvent`. Swapping the implementation changes no socket payload and no event shape, because nothing above the seam names a provider. Two exist: `RealtimeProvider`, one speech-to-speech model over a WebSocket, and a scripted mock the tests drive.

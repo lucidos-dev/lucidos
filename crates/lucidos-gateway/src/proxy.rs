@@ -16,7 +16,7 @@
 //! connection management.
 
 use axum::body::Body;
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use reqwest::Client;
 
@@ -43,22 +43,19 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, `x-lucidos-device-id`
 /// and the two engine credentials. A client-supplied one must never reach the
 /// engine. The caller re-injects the prefix, the device id and the local token
-/// with the gateway's own values. `HOST` and `CONTENT_LENGTH` are re-framed by
-/// whoever sends the upstream request.
+/// with its own values, and whoever sends the upstream request re-frames `HOST`
+/// and `CONTENT_LENGTH`.
 ///
 /// The two credentials are here for the reason the device id is, one step
 /// sharper. A wide-bound engine reads them as authorization
-/// (`lucidos_engine::api::local_auth`), so a value a client chose would BE the
-/// authorization.
+/// (`lucidos_engine::api::local_auth`), so a client-chosen value would BE the
+/// authorization. Only the hook socket presents the webhook one.
 ///
-/// The webhook one is owned but never re-injected on this path. Only the hook
-/// socket presents it. Injecting it here would hand every proxied request a
-/// second and narrower credential to be confused by.
-///
-/// `keep_handover` is the only difference between the two paths. The HTTP path
-/// drops every hop-by-hop header. The upgrade path keeps `connection` and
-/// `upgrade`, which ARE the handshake it forwards rather than framing to
-/// discard (ADR 0151).
+/// `keep_handover` marks the upgrade path, where three headers differ.
+/// `connection` and `upgrade` are kept: there they ARE the handshake, not
+/// framing to discard (ADR 0151). `origin` goes the other way. The HTTP path
+/// forwards it for the engine's gate, and the upgrade path judges it here, in
+/// [`foreign_handshake_origin`], and consumes it (ADR 0163).
 fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     let n = name.as_str();
     if name == header::HOST
@@ -71,11 +68,71 @@ fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     {
         return true;
     }
-    if keep_handover && (n.eq_ignore_ascii_case("connection") || n.eq_ignore_ascii_case("upgrade"))
-    {
-        return false;
+    if keep_handover {
+        if n.eq_ignore_ascii_case("connection") || n.eq_ignore_ascii_case("upgrade") {
+            return false;
+        }
+        if name == header::ORIGIN {
+            return true;
+        }
     }
     is_hop_by_hop(name)
+}
+
+/// Whether `origin` and `host` name the same authority, with the scheme's
+/// default port filled in so `https://name.ts.net` matches `name.ts.net`.
+///
+/// A copy of the engine's `api::browser_origin` function of the same name. This
+/// crate has no dependency on the engine, and its Cargo header says a small
+/// shared surface is duplicated rather than shared. [`is_hop_by_hop`] above is
+/// the same trade.
+///
+/// The hostname-only arm takes an https origin on its default port, and nothing
+/// else. `port()` is `None` for exactly that, since the URL parser normalizes a
+/// default port away. Two gateways run on one machine, so unguarded a portless
+/// `Host` would match a page on the other one's port.
+///
+/// A `Host` carries no scheme, and every topology sending a portless one reaches
+/// us on 443. So `http://name` is a page on port 80, not this origin.
+fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    let Some(origin_host) = url.host_str() else {
+        return false;
+    };
+    let origin_authority = match url.port_or_known_default() {
+        Some(port) => format!("{origin_host}:{port}"),
+        None => origin_host.to_string(),
+    };
+    let host = host.trim();
+    if origin_authority.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    url.scheme() == "https" && url.port().is_none() && origin_host.eq_ignore_ascii_case(host)
+}
+
+/// The page this handshake came from, when it is not one of ours.
+///
+/// A browser sends no `Sec-Fetch-Site` on a WebSocket handshake: Chromium and
+/// Gecko send no fetch metadata there at all. So the engine's same-origin gate
+/// has no input, and behind this hop its `Host` is the internal upstream rather
+/// than what the client dialled. The question is answered here instead, in the
+/// one place that still holds the client's own authority.
+///
+/// `Origin` carries the answer unforgeably, on the same terms `Sec-Fetch-Site`
+/// does for an ordinary request: the `WebSocket` constructor takes no headers,
+/// so page script cannot touch it. A handshake with no `Origin` is not from a
+/// browser and is left to the bind topology, exactly as the engine's gate
+/// leaves it. An `Origin` with no `Host` to compare against is refused rather
+/// than guessed at, for the same reason the engine refuses it.
+fn foreign_handshake_origin(headers: &HeaderMap) -> Option<&str> {
+    let origin = headers.get(header::ORIGIN)?.to_str().ok()?;
+    let ours = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|host| origin_authority_matches_host(origin, host));
+    (!ours).then_some(origin)
 }
 
 /// Is this a WebSocket upgrade request?
@@ -267,6 +324,27 @@ async fn proxy_upgrade(
     local_token: &str,
     mut req: axum::extract::Request,
 ) -> Response {
+    // The same-origin question, answered where the client's own authority still
+    // is. Refused before the engine is dialled, so a foreign page cannot even
+    // open the connection. See `foreign_handshake_origin` for why this hop owns
+    // the question rather than the engine's gate.
+    if let Some(origin) = foreign_handshake_origin(req.headers()) {
+        // Named in full, because the browser hides a refused handshake's
+        // response and this log line is the only place the reason appears.
+        crate::log!(
+            "[Gateway] websocket upgrade to /{}{} refused: it came from {}, and this gateway \
+             is reached at {:?}",
+            slug,
+            rest,
+            origin,
+            req.headers().get(header::HOST),
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "cross-origin websocket handshakes are not allowed",
+        )
+            .into_response();
+    }
     // Plain http only. `engine_tls` is false in both shipped topologies, and
     // only the retired pre-0096 one turns it on. A TLS leg here would be code
     // nothing reaches, so refuse loudly instead of failing obscurely.
@@ -1613,6 +1691,94 @@ mod upgrade_tests {
         assert!(!got.contains("x-lucidos-device-id"), "{got}");
     }
 
+    /// A browser handshake carries an `Origin` and no fetch metadata, because
+    /// Chromium and Gecko send none on one. The engine's own gate therefore has
+    /// nothing to decide with: behind this hop its `Host` is the internal
+    /// upstream, so the fallback would compare our own page against the wrong
+    /// authority and refuse it. The question is answered here, and the header
+    /// is consumed with it.
+    #[tokio::test]
+    async fn a_handshake_from_our_own_page_upgrades_and_leaves_its_origin_here() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        let (head, _client) = upgrade_through(gw, "Origin: https://gateway.example\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let got = captured.lock().await.clone();
+        assert!(
+            !got.contains("origin:"),
+            "the engine would refuse a handshake carrying one: {got}"
+        );
+    }
+
+    /// The attack this closes. A page on another port of this machine is
+    /// same-site, so its cookie rides along and pairing alone lets it through.
+    #[tokio::test]
+    async fn a_handshake_from_another_page_is_refused_and_the_engine_never_dialled() {
+        let (upstream_port, captured) = upgrading_upstream().await;
+        let gw = gateway_serving(format!("http://127.0.0.1:{upstream_port}"), None).await;
+        // Another host, then the same host on another port. The second is the
+        // sharper one: this `Host` carries no port, so a hostname-only compare
+        // would have waved it through.
+        for origin in ["http://localhost:5252", "https://gateway.example:10000"] {
+            let (head, _client) = upgrade_through(gw, &format!("Origin: {origin}\r\n")).await;
+            assert!(head.starts_with("HTTP/1.1 403"), "{origin}: {head}");
+        }
+        assert!(
+            captured.lock().await.is_empty(),
+            "a refused handshake must not reach the engine at all"
+        );
+    }
+
+    /// A phone's handshake compares a MagicDNS name against itself, because
+    /// `tailscale serve` passes the client's `Host` through. Both shipped serve
+    /// shapes are here: the browser omits `:443` from `Host` and writes it in
+    /// neither half of the `:10000` one.
+    #[test]
+    fn a_default_port_is_filled_in_before_comparing() {
+        assert!(origin_authority_matches_host(
+            "https://name.ts.net",
+            "name.ts.net"
+        ));
+        assert!(origin_authority_matches_host(
+            "https://name.ts.net:10000",
+            "name.ts.net:10000"
+        ));
+        assert!(origin_authority_matches_host(
+            "http://LOCALHOST:5251",
+            "localhost:5251"
+        ));
+        assert!(!origin_authority_matches_host(
+            "http://localhost:5252",
+            "localhost:5251"
+        ));
+        assert!(!origin_authority_matches_host("not a url", "localhost"));
+    }
+
+    /// Two gateways run on one machine, each with its own `tailscale serve`
+    /// route. A portless `Host` means the default port, so the page on the
+    /// other route is foreign. Matching by hostname alone was the bypass.
+    #[test]
+    fn a_portless_host_matches_the_default_port_and_no_other() {
+        assert!(!origin_authority_matches_host(
+            "https://name.ts.net:10000",
+            "name.ts.net"
+        ));
+        assert!(origin_authority_matches_host(
+            "https://name.ts.net:443",
+            "name.ts.net"
+        ));
+        // Port 80 is not port 443. A `Host` carries no scheme, so a plain-http
+        // page of the same name is another origin, not this one.
+        assert!(!origin_authority_matches_host(
+            "http://name.ts.net",
+            "name.ts.net"
+        ));
+        assert!(!origin_authority_matches_host(
+            "http://name.ts.net:443",
+            "name.ts.net"
+        ));
+    }
+
     /// An engine that declines answers for itself. The gateway must not turn a
     /// 404 into its own error, or the client cannot tell a missing route from
     /// a broken proxy.
@@ -1678,11 +1844,11 @@ mod upgrade_tests {
         assert!(!is_websocket_upgrade(&plain));
     }
 
-    /// The trust boundary is one predicate for both paths, and the handover is
-    /// the only thing that differs. Pinned here so a future edit cannot widen
-    /// the upgrade path's exception past those two headers.
+    /// The trust boundary is one predicate for both paths, and only three
+    /// headers differ. Pinned here so a future edit cannot widen the upgrade
+    /// path's exception past them.
     #[test]
-    fn only_the_handover_headers_differ_between_the_two_paths() {
+    fn the_two_paths_differ_only_in_the_handover_and_the_origin() {
         for owned in [
             header::HOST.as_str(),
             header::CONTENT_LENGTH.as_str(),
@@ -1701,7 +1867,21 @@ mod upgrade_tests {
             assert!(gateway_owns_header(&name, false), "{handover}");
             assert!(!gateway_owns_header(&name, true), "{handover}");
         }
-        for forwarded in ["accept-encoding", "sec-websocket-key", "cookie"] {
+        // The other way round. An ordinary request's `Origin` is the engine
+        // gate's to read, and stripping it there would blind the gate on the
+        // one path where it works.
+        let origin = HeaderName::from_static("origin");
+        assert!(!gateway_owns_header(&origin, false));
+        assert!(gateway_owns_header(&origin, true));
+        // `sec-fetch-site` crosses both paths on purpose. WebKit sends it on a
+        // handshake, page script cannot forge it, and it tells same-site from
+        // cross-site where a host compare cannot.
+        for forwarded in [
+            "accept-encoding",
+            "sec-websocket-key",
+            "cookie",
+            "sec-fetch-site",
+        ] {
             let name = HeaderName::from_static(forwarded);
             assert!(!gateway_owns_header(&name, false), "{forwarded}");
             assert!(!gateway_owns_header(&name, true), "{forwarded}");

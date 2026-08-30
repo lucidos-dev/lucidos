@@ -96,31 +96,39 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
     if is_public_path(req.uri().path()) {
         return next.run(req).await;
     }
-    match state.authorize(req.headers()) {
+    // One scan of the `Cookie` header for a decision this then acts on twice:
+    // stamp the device, and re-issue the credential it presented.
+    let (decision, matched) = state.authorize_with_match(req.headers());
+    match decision {
         Authorization::Device { id, .. } => {
+            // Three reasons to hand this device a cookie. All are decided here,
+            // before the request moves into the handler.
+            //
+            // A PAGE LOAD. A browser certainly stores what we send there, and a
+            // launch is a handful of them rather than one per request. So the
+            // credential's window restarts on every launch. Renewing once a day
+            // instead asked the browser to hold a year-long cookie untouched,
+            // and an iOS home-screen container does not.
+            //
+            // A NAME THAT IS NOT OURS, at once and whatever the beat says. That
+            // is the whole migration: a device on the pre-split name holds the
+            // one slot every gateway on this host writes, so the next pairing
+            // there evicts it. It also covers a data-dir move, which renames
+            // our own cookie under a device that did nothing wrong.
+            //
+            // A DAY SINCE WE LAST SAW IT, which is the liveness stamp for the
+            // devices list. Only that third reason writes the store, so an
+            // active device still pays one whole-file save per day.
+            let renaming = matched.is_some_and(auth::PresentedCredential::is_renamed);
+            let page_load = wants_html(req.headers());
+            let due = state.touch_device(&id, chrono::Utc::now());
+            let refresh = matched
+                .filter(|_| renaming || page_load || due)
+                .and_then(|p| refreshed_credential_cookie(&state, req.headers(), p));
             // Tell the proxy who this is. The engine keys push, preferences and
             // actor attribution on the same id. So the device the gateway let
             // in and the device the workspace knows are one row, not two.
-            req.extensions_mut()
-                .insert(auth::AuthenticatedDevice(id.clone()));
-            // A day since we last saw this device means two things at once: a
-            // fresh liveness stamp for the devices list, and a fresh cookie so
-            // a device in use never reaches its `Max-Age`. Both ride the same
-            // beat, so an active device pays one whole-file save per day.
-            //
-            // A credential that arrived under the LEGACY name is re-issued at
-            // once instead, whatever the beat says. That is the whole migration
-            // off the shared cookie: until it happens, this device holds the one
-            // slot every gateway on the host writes, so the next one to pair
-            // there evicts it.
-            // Read once. This runs on every proxied request, and `authorize`
-            // has already scanned the same header.
-            let presented = auth::presented_credential(req.headers(), state.device_cookie_name());
-            let migrating = presented.is_some_and(auth::PresentedCredential::is_legacy);
-            let due = state.touch_device(&id, chrono::Utc::now());
-            let refresh = presented
-                .filter(|_| migrating || due)
-                .and_then(|p| refreshed_credential_cookie(&state, req.headers(), p));
+            req.extensions_mut().insert(auth::AuthenticatedDevice(id));
             let cookie_name = state.device_cookie_name().to_string();
             let mut response = next.run(req).await;
             if let Some(cookie) = refresh {
@@ -136,6 +144,7 @@ pub async fn enforce(State(state): State<GatewayState>, mut req: Request, next: 
         Authorization::LocalProcess => return next.run(req).await,
         Authorization::Unauthorized => {}
     }
+    state.log_device_refusal(req.headers());
     if wants_html(req.headers()) {
         // Show the pairing screen here, rather than a bare 401 with no
         // affordance. In place rather than redirected: see `serve_pairing_shell`.
@@ -676,15 +685,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_device_seen_today_is_not_rewritten_and_gets_no_cookie() {
+    async fn a_fetch_by_a_device_seen_today_is_not_rewritten_and_gets_no_cookie() {
         // The throttle. Without it every authorized request rewrites the whole
-        // store and re-sets the cookie, on a path that runs constantly.
+        // store and re-sets the cookie, on a path that runs constantly. A page
+        // load DOES get a fresh cookie now, which is why this one says it is a
+        // fetch rather than leaving the metadata off.
         let dir = tempfile::tempdir().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let state = state_with_device(dir.path(), Some(&now));
 
         let own = own_device_cookie(&state);
-        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &own)]).await;
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[("cookie", &own), ("sec-fetch-mode", "cors")],
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
         assert!(response.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(
@@ -765,6 +781,91 @@ mod tests {
             &StatusCode::OK.into_response(),
             TEST_COOKIE
         ));
+    }
+
+    /// The `Set-Cookie` on a response, or the empty string when there is none.
+    fn set_cookie(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn every_page_load_restarts_the_credential_s_window() {
+        // The reported failure, from the one angle a server can address. The
+        // credential lives only in a cookie, so a browser that lets one lapse
+        // is unpaired with its row still in the store. A launch is where a
+        // browser certainly stores what we send, so the window restarts there
+        // rather than once a day.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let own = own_device_cookie(&state);
+
+        let response = get(
+            &state,
+            "/dev/",
+            &[("cookie", &own), ("sec-fetch-mode", "navigate")],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.contains(&own), "{cookie}");
+        assert!(cookie.contains("Max-Age="), "{cookie}");
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+
+        // The renewal is a header and nothing else: no store write, and no
+        // second device. Otherwise every launch would grow the devices list.
+        let devices = state.paired_devices().devices;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].last_seen_at.as_deref(), Some(now.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_cookie_left_by_a_data_dir_move_is_migrated_rather_than_refused() {
+        // The store's own migration carries the ROW across a data-dir move. The
+        // cookie name is the other half. It has to move too, or every device
+        // meets the pairing screen while the store still lists it.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let before = auth::device_cookie_name(std::path::Path::new("/tmp/its-old-data-dir"));
+        assert_ne!(before, state.device_cookie_name());
+
+        let response = get(
+            &state,
+            "/dev/api/v1/threads/list",
+            &[("cookie", &format!("{before}=cred-abc"))],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
+    }
+
+    #[tokio::test]
+    async fn a_dead_value_in_our_own_slot_does_not_lock_the_device_out() {
+        // A cookie is scoped to the HOST and ignores the port. So a slot on this
+        // hostname can hold a value from a gateway that is long gone. Reading
+        // only the first name PRESENT refused a device whose credential was on
+        // the very same request.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+        let sent = format!(
+            "{}=long-dead; lucidos_device=cred-abc",
+            state.device_cookie_name()
+        );
+
+        let response = get(&state, "/dev/api/v1/threads/list", &[("cookie", &sent)]).await;
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        let cookie = set_cookie(&response);
+        assert!(cookie.starts_with(state.device_cookie_name()), "{cookie}");
+        assert!(cookie.contains("cred-abc"), "{cookie}");
     }
 
     #[tokio::test]

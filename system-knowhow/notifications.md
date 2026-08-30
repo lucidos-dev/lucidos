@@ -259,6 +259,28 @@ if (onSource) {
 
 **Cross-device OS-banner dismiss (macOS desktop only).** Beyond clearing the in-app badge, a read also removes the *already-delivered OS banner* on other devices, but only on the native macOS desktop client. When a read flips (`NotificationRead`, or `NotificationsAllRead` for mark-all), the engine broadcasts a transient `NativePushDismissRequested` (`notification_id: Some(id)` for one, `None` for all; carries `sent_at_ms`). A connected Tauri desktop app removes the matching delivered banner(s) via `UNUserNotificationCenter.removeDeliveredNotifications(withIdentifiers:)`, dropping the stashed deep link so a phantom tap can't route (see the native section below). A `None` removes every banner **the reading workspace raised**, never another workspace's. This is the **one platform where cross-device dismiss is both possible and deterministic**: the desktop app stays SSE-connected, and native notifications have no "must show something" rule. The **open web cannot** do this, because Safari revokes a Web Push subscription after 3 silent pushes and Chrome/Firefox show a default "site updated in background" banner on a silent push, so browser / PWA banners persist until manually swiped (the in-app badge still syncs via `NotificationRead`). The page handler `handleNativePushDismiss` gates on `isTauri()` (browser / PWA ignore the event) and on the `sent_at_ms` freshness budget, which bounds without fully eliminating (a dismiss-all still sweeps the whole workspace) the window in which a late dismiss-all could clear a banner for a notification created after an all-read; there is **no** `isPageActive()` gate, because removal is a harmless no-op when nothing matches. A **native iOS app** could dismiss via the same UN API, but it is deferred and best-effort (a backgrounded iOS app's SSE is suspended, so it would need a silent/background APNs push to wake it): see `docs/plans/2026-06-19-ios-native-apns-app.md`. The abandoned web-only approach (replace the banner with a visible "✓ Read on another device" tombstone) is in `docs/plans/2026-05-18-cross-device-notification-dismiss-design.md`.
 
+### A notification also clears once you have looked at what it points at
+
+Row 1 above is a one-shot. It runs on the SSE that announces the notification and never again. Reaching the same event a minute later left the row unread, owing the Notifications panel a second read. The **seen target** rule (`store/actions/notification-visit.ts`) makes the same test standing. It is what clears a row reached from the drawer's needs-attention list, or by foregrounding an app that already had the thread open.
+
+**Seen means the same thing Row 1 means.** A tap naming an event is seen when that event's own card is in the transcript's visible band. The measure is the same `isInViewport` the pong uses. A tap naming a place with no card is seen when that place is on screen: an app, a file, a trigger, a settings sub-section, a panel. The pane showing it must be the current mobile pane, or a desktop pane the split gives real width. A desktop split puts a thread and a panel in front of the reader at once, so both count.
+
+**It must hold for `SEEN_DWELL_MS` (1000 ms) with the page active.** A glimpse is not a read. Five things put a target briefly in front of a reader who never asked for it:
+
+- Drawer browsing with the arrow keys, which moves the focused thread per keypress.
+- A mobile swipe, which passes through the middle pane.
+- The focus hand-off after an archive.
+- A deep-link bootstrap, which focuses before its fetch lands.
+- A fast scroll.
+
+Leaving cancels the wait rather than pausing it, so time in the band has to be continuous. A background cancels it too, and the paired wake starts it over.
+
+**The matrix above is untouched, and the strict measure is why.** This rule's condition IS Row 1's condition, so a notification arriving while its card is on screen was already being auto-read. Row 2 is the case a looser "the thread is open" reading would have broken: on the source thread with the event scrolled away, the card is out of band, so this rule stays silent and the toast still fires. Rows 3, 4 and 5 name places the card cannot be visible in. Row 1 keeps its own code because it does a second job this rule does not, suppressing the toast.
+
+**A `modal` tap is never cleared this way**, since its place is the notification detail and opening that already marks it read. Neither is a notification matched on its own `thread_id`: that column is provenance, not a destination (see "Why `event_id` and not `thread_id`?" above), so reading a trigger's own transcript must not clear the daily summary it produced there. Only `tap.to` names a target. The rule marks read and nothing else: it never scrolls, never archives, and never clears the needs-attention state.
+
+One set of constructors (`store/actions/visitKeys.ts`) spells both the place a tap names and the place the shell is showing, so the two cannot drift apart. Four navigate targets name no revisitable place and are excluded: `url`, `new-chat`, `new-app` and `new-trigger`. A test walks the generated `NAVIGATE_TARGETS` so a new one has to say which it is.
+
 ### Native desktop OS surface (Tauri)
 
 The Tauri desktop app embeds a WKWebView, which has no service worker and can't subscribe to Web Push — so the web-push half of the *OS surface* (§1) never reaches it. The native banner fills that gap, driven page-side from the same SSE stream:

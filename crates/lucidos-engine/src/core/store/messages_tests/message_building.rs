@@ -523,11 +523,11 @@ fn a_human_actor_never_becomes_an_authoring_agent() {
     assert_eq!(msgs[0].agent, None);
 }
 
-/// A spoken reply reaches the reasoner as the talker's turn, under the talker's
-/// own speaker label. Read as the reasoner's own prior turn it would agree with
+/// A spoken reply reaches the doer as the talker's turn, under the talker's
+/// own speaker label. Read as the doer's own prior turn it would agree with
 /// itself; read as the user's, it would obey an instruction nobody gave.
 #[test]
-fn a_spoken_reply_reaches_the_reasoner_under_its_own_label() {
+fn a_spoken_reply_reaches_the_doer_under_its_own_label() {
     let events = vec![
         make_event("MessageReceived", json!({"text": "what have I got on?"}), 0),
         make_event(
@@ -560,7 +560,7 @@ fn a_spoken_reply_reaches_the_reasoner_under_its_own_label() {
     );
 }
 
-/// The talker speaks mid-call, often while the reasoner's own turn is still
+/// The talker speaks mid-call, often while the doer's own turn is still
 /// running. So its reply must consume none of that turn's pending steps.
 #[test]
 fn a_spoken_reply_takes_nothing_from_the_turn_around_it() {
@@ -592,7 +592,7 @@ fn a_spoken_reply_takes_nothing_from_the_turn_around_it() {
     let answer = msgs
         .iter()
         .find(|m| m.content == "Two things.")
-        .expect("the reasoner's answer");
+        .expect("the doer's answer");
     assert_eq!(answer.steps.len(), 1, "the tool call went missing");
     assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
 }
@@ -611,4 +611,91 @@ fn a_spoken_reply_with_no_words_makes_no_message() {
         0,
     )];
     assert!(build_session_messages(&events).is_empty());
+}
+
+/// An utterance the talker answered alone still reaches the doer, as the user
+/// speaking. It started no turn, so nothing else would carry it, and the next
+/// question can lean on it.
+#[test]
+fn an_utterance_the_talker_handled_reaches_the_doer_as_the_user() {
+    let events = vec![make_event(
+        "SpokenMessageReceived",
+        json!({
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "text": "hei"
+        }),
+        0,
+    )];
+    let msgs = build_session_messages(&events);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].content, "hei");
+    // The caller said it, so no agent authored it.
+    assert_eq!(msgs[0].agent, None);
+}
+
+/// Why the talker asked for this turn, in its own words and under its own
+/// label. The doer reads it as the request it is.
+#[test]
+fn a_delegation_tells_the_doer_what_it_was_asked_for() {
+    let events = vec![
+        make_event(
+            "WorkDelegated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "reason": "they want today's threads",
+                "actor": {"kind": "agent", "agent": {"kind": "guest", "label": "Lucidos (aloud)"}}
+            }),
+            0,
+        ),
+        make_event(
+            "MessageReceived",
+            json!({"text": "what have I got running"}),
+            1,
+        ),
+    ];
+    let msgs = build_session_messages(&events);
+    let asked = msgs
+        .iter()
+        .find(|m| m.content.contains("they want today's threads"))
+        .expect("the delegation");
+    assert_eq!(asked.role, "assistant");
+    assert_eq!(
+        asked.agent.as_ref().expect("an author").speaker_label(),
+        "Lucidos (aloud)"
+    );
+}
+
+/// A delegation consumes none of the turn it started. Its steps and text
+/// belong to the turn the `MessageReceived` beside it opened.
+#[test]
+fn a_delegation_takes_nothing_from_the_turn_it_started() {
+    let events = vec![
+        make_event(
+            "WorkDelegated",
+            json!({
+                "session_id": "11111111-1111-4111-8111-111111111111",
+                "reason": "they want today's threads"
+            }),
+            0,
+        ),
+        make_event(
+            "MessageReceived",
+            json!({"text": "what have I got running"}),
+            1,
+        ),
+        make_event(
+            "ToolCalled",
+            json!({"name": "list_files", "args": {}, "tool_use_id": "t1"}),
+            2,
+        ),
+        make_event("ResponseGenerated", json!({"text": "Two things."}), 3),
+    ];
+    let msgs = build_session_messages(&events);
+    let answer = msgs
+        .iter()
+        .find(|m| m.content == "Two things.")
+        .expect("the doer's answer");
+    assert_eq!(answer.steps.len(), 1, "the tool call went missing");
+    assert_eq!(answer.steps[0].tool_name.as_deref(), Some("list_files"));
 }
