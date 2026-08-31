@@ -47,8 +47,13 @@ function firstUserMessageText(thread: ThreadState): string {
     // we hit is the one with the lowest seq. Out-of-order SSE on reconnect can
     // theoretically swap, but only AFTER a generated title arrived (which
     // short-circuits this path) — in practice we never run when that matters.
+    //
+    // `SpokenMessageReceived` counts too. It is the caller's own words on a
+    // call the talker answered alone, and such a call writes no
+    // `MessageReceived` at all. The engine's `format_display_title` takes the
+    // same row from `first_message`, so the two surfaces agree.
     for (const ev of thread.events.values()) {
-        if (ev?.type === 'MessageReceived') return ev.text;
+        if (ev?.type === 'MessageReceived' || ev?.type === 'SpokenMessageReceived') return ev.text;
     }
     if (thread.pendingUserMessages.length > 0) return thread.pendingUserMessages[0].text;
     return '';

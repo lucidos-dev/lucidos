@@ -756,6 +756,8 @@ Talking to Lucidos out loud on a thread you already have. Voice is a **mode of a
 
 A session starts from the **call toggle** in the prompt input, a handset beside the follow toggle. It is one control for both directions: press it to call, press it again to ring off. A session also ends when you open another thread, when the connection drops, or when the engine goes away under it. Starting one where no thread is open creates an ordinary chat thread, exactly as typing would.
 
+**The first word said on a call makes that thread real.** It leaves the drafts and joins the list, whether or not the assistant ends up doing any work for you. A call you had and hung up on is a conversation you can find afterwards, titled by the first thing you said. A call you drop before saying anything leaves your draft where it was.
+
 **A call runs on a chat thread the Lucidos Agent holds, and nowhere else.** Moving the destination to a coding agent while a call is up therefore ends it, and says so. A *coding-agent thread* offers no call at all: the handset is absent there, and the engine refuses one placed any other way.
 
 While a call is up, the handset turns red, and that is the whole of it on screen. There is no separate panel to watch: what each of you says lands in the thread itself, as it is said. Speaking over the assistant stops it mid-word, as it would on the phone.

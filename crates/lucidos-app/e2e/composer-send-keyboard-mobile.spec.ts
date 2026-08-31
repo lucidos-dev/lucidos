@@ -350,7 +350,7 @@ test.describe('Composer Send with the mobile keyboard up', () => {
       await page.waitForTimeout(LATE_CLICK_GRACE_MS);
       await expect(page.locator('html')).not.toHaveAttribute('data-keyboard-active', '');
     } finally {
-      cleanupCCThread(cc);
+      cleanupCCThread(cc.threadId, cc.changeId, cc.branch, cc.file);
     }
   });
 });

@@ -127,7 +127,7 @@ pub(super) async fn post_blob(
 
     // Pre-generate the browser-display preview off the request path so the
     // first GET /blobs/:hash/preview always hits the warm cache. Lazy
-    // generation took 16-25 s for large iPhone JPEGs in dev — long enough
+    // generation took 16-25 s for large iPhone JPEGs in dev, long enough
     // for iOS Safari to abort the fetch and leave the page with broken
     // `<img>` elements until reload.
     let workspace = state.workspace_path.clone();

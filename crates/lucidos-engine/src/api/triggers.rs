@@ -350,13 +350,14 @@ pub(super) async fn create_trigger(
         Err(msg) => return ApiResult::err(msg),
     };
 
-    // Read timezone from preferences (default to UTC) before validating cron: the
-    // guard reports its next-run preview in the trigger's own timezone.
-    let timezone = PreferenceStore::get(&state.pool, "timezone")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "UTC".to_string());
+    // Read timezone from preferences before validating cron: the guard reports its
+    // next-run preview in the trigger's own timezone. A missing preference defaults
+    // to UTC; a read failure surfaces instead of silently scheduling the wrong zone.
+    let timezone = match PreferenceStore::get(&state.pool, "timezone").await {
+        Ok(Some(tz)) => tz,
+        Ok(None) => "UTC".to_string(),
+        Err(e) => return ApiResult::err(format!("Failed to read timezone preference: {}", e)),
+    };
 
     // Validate cron expressions if provided. This rejects a schedule that can
     // never fire (Feb 31 and friends), not just a malformed one.

@@ -48,6 +48,50 @@ const COMPOSE_TRIM_CHARS: &str = " \t\n\r\u{000b}\u{000c}";
 /// reported bug (the client's write was still in flight, so the engine had
 /// nothing yet), so staying quiet there would be quiet precisely when it
 /// matters most.
+/// A word was spoken on this thread, so the draft it was placed from becomes
+/// an ordinary thread (ADR 0167).
+///
+/// Called from both spoken rows, because either can be the first. The talker
+/// usually greets before the caller says anything, and a slow greeting lets
+/// the caller's transcript land first.
+///
+/// **Only a draft moves, and the gate is what makes the call idempotent.** A
+/// thread already active must keep its *compose epoch* still, or the reply
+/// draft the reader is typing is refused by the write fence.
+///
+/// The epoch bump and its broadcast are what a send does, and for the same
+/// reason: a device holding this draft must hear that the slot is gone (see
+/// [`compose_cleared_broadcast`]).
+///
+/// The CALLERS set `has_response` rather than this helper, folding it into the
+/// recency write each already makes. Both facts are owed on every spoken row,
+/// promotion or not: that column is the listing gate `get_recent_threads`
+/// filters on, so a promoted thread without it is neither a draft nor a listed
+/// thread. That is worse than the draft it replaced.
+async fn a_call_makes_the_thread_real(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    thread_id: Uuid,
+) -> Result<Vec<BusEvent>, sqlx::Error> {
+    let promoted: Option<(i64,)> = sqlx::query_as(
+        "UPDATE thread_summaries \
+         SET state = 'active', \
+             compose_text = '', \
+             compose_images = '[]'::jsonb, \
+             compose_mode = NULL, \
+             compose_selection = NULL, \
+             compose_epoch = compose_epoch + 1 \
+         WHERE thread_id = $1 AND state = 'composing' \
+         RETURNING compose_epoch",
+    )
+    .bind(thread_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match promoted {
+        Some((epoch,)) => vec![compose_cleared_broadcast(thread_id, epoch)],
+        None => Vec::new(),
+    })
+}
+
 fn compose_cleared_broadcast(thread_id: Uuid, compose_epoch: i64) -> BusEvent {
     BusEvent::System(
         crate::engine::event_bus::SystemEvent::ThreadComposeChanged {
@@ -1422,6 +1466,64 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // Recency, and nothing else. Placing a call is a user action on
+            // whatever thread it was placed from, so the drawer's sort keys
+            // move. Status does not: the doer's turn owns it (ADR 0149), and a
+            // live microphone is not a turn.
+            //
+            // A draft is NOT promoted here. Connecting is not a conversation,
+            // and a draft with nothing said in it is one the reader can still
+            // see and discard. The first spoken word promotes it instead
+            // (ADR 0167).
+            ThreadEvent::VoiceSessionStarted { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET last_activity = NOW(), last_user_action = NOW() \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            // What the caller said when the talker answered it alone. It starts
+            // no turn, so it moves no column a turn owns. It is still the user
+            // speaking to the thread, so it carries recency like a typed
+            // message does.
+            //
+            // `first_message` is how a voice-only thread gets a readable row:
+            // `format_display_title` falls back to it, and nothing else on this
+            // path would ever fill it. COALESCE, so the caller's FIRST words
+            // win and a later utterance cannot rewrite the title.
+            ThreadEvent::SpokenMessageReceived { text, .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET last_activity = NOW(), last_user_action = NOW(), \
+                         has_response = TRUE, \
+                         first_message = COALESCE(first_message, $2) \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .bind(text)
+                .execute(&mut **tx)
+                .await?;
+                a_call_makes_the_thread_real(tx, thread_id).await?
+            }
+            // What the caller heard. Agent recency, because the talker is an
+            // agent on this thread, and never status: the doer's turn owns
+            // that, and the talker often speaks while one is still running.
+            ThreadEvent::SpokenReplyGenerated { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries \
+                     SET last_activity = NOW(), last_agent_action = NOW(), \
+                         has_response = TRUE \
+                     WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                a_call_makes_the_thread_real(tx, thread_id).await?
+            }
             // Events that don't affect thread_summaries metadata or status.
             // Exhaustive match — adding a new ThreadEvent variant forces you to decide
             // whether it needs a projection update. Never use `_ =>` here.
@@ -1500,21 +1602,12 @@ impl EventBus {
             // resurface the thread. Both are pure card/audit projection.
             | ThreadEvent::CommandCheckpointed { .. }
             | ThreadEvent::CommandCheckpointReverted { .. }
-            // Voice-session lifecycle. Voice is a mode of the thread (ADR
-            // 0148), so a session touches no summary column: not `source`,
-            // not status, not activity. Persisted so a session is countable
-            // and a trigger can subscribe.
-            | ThreadEvent::VoiceSessionStarted { .. }
-            | ThreadEvent::VoiceSessionEnded { .. }
-            // A spoken reply touches no column either. The doer's turn
-            // owns the thread's status, and the talker is its peer on the
-            // thread rather than the author of that turn.
+            // The end of a call says nothing a column holds. Persisted so a
+            // session is countable and a trigger can subscribe.
             //
-            // Nor does an utterance the talker handled alone, nor the
-            // delegation asking for the doer. A call is one exchange however
-            // its halves are split, and only the turn it starts moves a column.
-            | ThreadEvent::SpokenReplyGenerated { .. }
-            | ThreadEvent::SpokenMessageReceived { .. }
+            // Nor does the delegation asking for the doer. It sits beside a
+            // `MessageReceived` that moves every column this one would.
+            | ThreadEvent::VoiceSessionEnded { .. }
             | ThreadEvent::WorkDelegated { .. } => Vec::new(),
         };
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.34.1 — 2026-08-31
+
+### Changed
+
+- A typed answer on a question card is drawn as your own message, in the same bubble the transcript uses for everything you say. The CUSTOM ANSWER label sits above the bubble as a header.
+
+### Fixed
+
+- A call reads back in the order it happened. The reply was written down before the words it answered, so every answer sat above its question.
+- A call makes the thread real. One the assistant handled without doing any work stayed a draft called "Empty draft", with the whole conversation stuck in the compose view. It now joins the thread list as soon as either of you says something, titled by the first thing you said. Calls already stranded that way are recovered.
+- A call that ended reads Done. It carried a red "Aborted" warning, because a conversation with no agent turn in it looks like a turn that crashed.
+- Creating a trigger says so when the timezone preference cannot be read, instead of scheduling the trigger in UTC.
 ## v0.34.0 — 2026-08-30
 
 ### Added

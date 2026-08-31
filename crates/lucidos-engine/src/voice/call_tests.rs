@@ -829,6 +829,24 @@ fn voice_rows(events: &[(String, serde_json::Value)]) -> Vec<(String, serde_json
         .collect()
 }
 
+/// Both halves of a talker-only exchange, as type names, oldest first.
+///
+/// Wider than `voice_kinds`, which leaves the reply out because it answers a
+/// different question: how many rows one utterance produced. This one is about
+/// the order a reader meets the two in.
+fn spoken_kinds(events: &[(String, serde_json::Value)]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|(kind, _)| {
+            matches!(
+                kind.as_str(),
+                "SpokenMessageReceived" | "SpokenReplyGenerated"
+            )
+        })
+        .map(|(kind, _)| kind.clone())
+        .collect()
+}
+
 /// The same rows, as their type names only.
 fn voice_kinds(events: &[(String, serde_json::Value)]) -> Vec<String> {
     voice_rows(events)
@@ -866,6 +884,46 @@ async fn an_utterance_the_talker_handles_alone_wakes_nobody() {
     assert_eq!(rows[0].0, "SpokenMessageReceived");
     assert_eq!(rows[0].1["text"], "hei");
     assert_eq!(rows[0].1["session_id"], session_id.to_string());
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The transcript reads in the order the call happened.
+///
+/// Both rows of a talker-only exchange leave one handler, so the order they
+/// are emitted in IS the order a reader meets them. Recording the reply first
+/// put every answer above the question it answered.
+#[tokio::test]
+async fn a_spoken_answer_never_lands_above_its_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        uuid::Uuid::new_v4(),
+        vec![
+            the_caller_says("what happened"),
+            the_talker_says("The codebase is clean."),
+            the_caller_says("anything for me"),
+            the_talker_says("Nothing urgent."),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        spoken_kinds(&did.events),
+        vec![
+            "SpokenMessageReceived",
+            "SpokenReplyGenerated",
+            "SpokenMessageReceived",
+            "SpokenReplyGenerated",
+        ],
+        "{:?}",
+        spoken_kinds(&did.events)
+    );
 
     teardown_test_db(&db_name).await;
 }

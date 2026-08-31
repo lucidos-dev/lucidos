@@ -58,7 +58,7 @@ pub struct AuthMutation {
 ///
 /// Every layer declares one per secret it puts on the wire.
 /// `proxy::ScopedPipeline::bind` is the only place they are checked, and
-/// `dispatch_with_layers` accepts nothing else. So a new layer cannot reach
+/// `dispatch_scoped` accepts nothing else. So a new layer cannot reach
 /// the network without answering (ADR 0144 decision 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeBinding {

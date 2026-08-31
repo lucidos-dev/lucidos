@@ -342,7 +342,7 @@ export function AnsweredBody({
       {customText && customText.length > 0 && (
         <div class="question-freetext">
           <span class="question-freetext-label">Custom answer</span>
-          <span class="question-freetext-text">{customText}</span>
+          <div class="user-bubble question-freetext-text">{customText}</div>
         </div>
       )}
       {resolved.kind === 'Canceled' && (

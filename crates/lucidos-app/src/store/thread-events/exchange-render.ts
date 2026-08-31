@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { toolUseIdOf } from './exchange-grouping';
+import { isSpokenTurn, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -1385,6 +1385,57 @@ export function abortTookEngineDown(ev: ThreadEvent): boolean {
   return ev.type === 'ResponseAborted' && isEngineDownAbort(ev.cause);
 }
 
+/** Everything a call can leave in an exchange without a turn behind it.
+ *
+ *  The two spoken rows are what a reader sees. The session pair and the
+ *  delegation marker draw nothing, yet they still fold in as steps. A set
+ *  naming only the visible two would answer `false` for most real calls.
+ *
+ *  A delegation is in the set deliberately. It sits beside a `MessageReceived`,
+ *  which is a boundary, so that turn opens an exchange of its own. The marker
+ *  left here reports no work landing HERE. */
+const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
+  'SpokenMessageReceived',
+  'SpokenReplyGenerated',
+  'VoiceSessionStarted',
+  'VoiceSessionEnded',
+  'WorkDelegated',
+]);
+
+/** True when this exchange is a stretch of a call and holds no turn at all.
+ *
+ *  A call is not a turn (ADR 0148), so such an exchange never gets a
+ *  terminator: nothing was running to end. Read as an unterminated turn it
+ *  looks exactly like a crash, which is what stamped "Aborted" on every
+ *  finished call.
+ *
+ *  Both halves are required. The boundary must be a spoken turn, so an ordinary
+ *  turn that merely OVERLAPPED a call is untouched. And every step must be a
+ *  voice row, so a delegation landing here later takes the exchange back to the
+ *  ordinary machinery. */
+function isCallOnly(exchange: Exchange): boolean {
+  if (!isSpokenTurn(exchange.userEvent)) return false;
+  return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
+}
+
+/** True when the call this exchange holds has rung off.
+ *
+ *  Keyed on the LAST session event, not on whether an end exists anywhere. A
+ *  second call on the same thread then reads as live until its own end lands.
+ *
+ *  No session event at all means live, not ended. A call's first
+ *  `VoiceSessionStarted` precedes every exchange, so the fold has nowhere to
+ *  put it and drops it (`foldEvent`). Its end always lands, including the one
+ *  the boot sweep writes for a call whose engine died. */
+function callHasEnded(exchange: Exchange): boolean {
+  for (let i = exchange.steps.length - 1; i >= 0; i--) {
+    const type = exchange.steps[i].event.type;
+    if (type === 'VoiceSessionEnded') return true;
+    if (type === 'VoiceSessionStarted') return false;
+  }
+  return false;
+}
+
 /** True when this event is an abort the engine has PROMISED to resume: the
  *  teardown boundary of a user-initiated *Switch to new version*. The
  *  event-shaped reading of `isSwitchTeardownAbort`, where the fingerprint is
@@ -2037,6 +2088,22 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // branch above bypasses. It must not read as a crash, which is why `isStale`
   // excludes it outright rather than relying on this line's position.
   if (isAbsorbedUpiPlaceholder) return 'done';
+
+  // A call the talker answered alone, which holds no turn at all. So the
+  // stale detector below has nothing to have caught: it reads a transcript
+  // with no terminator as a crash, and every finished call rendered "Aborted"
+  // until this arm.
+  //
+  // A call still up is NOT terminal, and the thread cannot say so: voice never
+  // moves `status`, so `threadIdle` is true for the whole of a talker-only
+  // call. The session's own end is the signal, and one always lands, so
+  // nothing can spin here forever.
+  //
+  // `threadIdle` still guards the arm, to keep it off a doer turn running
+  // elsewhere on the thread.
+  if (threadIdle && isCallOnly(exchange)) {
+    return callHasEnded(exchange) ? 'done' : 'streaming';
+  }
 
   if (isStale) return 'aborted';
 

@@ -174,3 +174,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0164: The talker holds one delegation tool and decides when the doer runs](0164-the-talker-holds-one-tool-and-it-delegates.md)
 - [0165: Voice runs on a Lucidos Agent thread, and refuses a coding-agent one](0165-voice-runs-on-a-lucidos-agent-thread.md)
 - [0166: The frontend's ThreadEvent payload types are generated from the Rust source by a syn reader, not hand-mirrored and not by a derive macro](0166-generate-thread-event-wire-types.md)
+- [0167: A call makes the thread real, and moves nothing a turn owns](0167-a-call-makes-the-thread-real.md)
+- [0168: A thread acts in its own subtree on its own authority; anything wider is the workspace owner's button, and a thread may press it only while carrying a standing instruction from the owner, which is a turn they opened or a trigger firing they authorized](0168-a-thread-acts-in-its-own-subtree.md)
+- [0169: Every caller to the engine identifies itself: the mode-human default dies, and four credentials that already exist cover the engine's own machinery, a thread's subprocess, a browser and a paired device](0169-every-caller-identifies-itself.md)

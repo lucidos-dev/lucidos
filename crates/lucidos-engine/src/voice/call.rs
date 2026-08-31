@@ -446,11 +446,16 @@ impl Call<'_> {
                 self.capture
                     .record_usage(self.provider.model(), 0, Some(usage))
                     .await;
-                self.record_spoken(transcript).await;
                 // The talker answered and asked for nothing, so the utterance
                 // it answered is its alone. `pending_delegation` is left as it
                 // is: a transcript still in flight belongs to it.
+                //
+                // The utterance goes down BEFORE the reply, because the caller
+                // spoke first. Both rows leave this one handler, so the order
+                // here is the order the transcript reads. The other way round
+                // put every answer above its question.
                 self.write_down_whatever_is_left().await;
+                self.record_spoken(transcript).await;
                 // The next turn may ask again, and must be able to.
                 self.delegated_this_turn = false;
                 self.talker_has_the_floor = false;

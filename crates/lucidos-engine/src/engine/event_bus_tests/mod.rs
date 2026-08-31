@@ -425,3 +425,4 @@ mod serialization_persistence;
 mod serialization_sse;
 mod session_lifecycle;
 mod thread_state_and_eviction;
+mod voice_session_projection;

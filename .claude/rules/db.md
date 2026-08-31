@@ -203,6 +203,29 @@ device holds a value its next write can be fenced against. See
 optional-filter idiom (`$n::uuid IS NULL OR t.parent_thread_id = $n`). Direct
 children only, never the recursive ancestor CTE.
 
+**A voice call writes four of these columns, and the table row above predates
+it** (ADR 0167). Placing one (`VoiceSessionStarted`) bumps `last_activity` and
+`last_user_action`, and nothing else: it is a user action on whatever thread it
+was placed from.
+
+Each spoken row then bumps the same pair, `SpokenReplyGenerated` taking
+`last_agent_action` in place of the user one, since the talker is an agent. Both
+also set **`has_response`**, and `SpokenMessageReceived` fills **`first_message`**
+under a `COALESCE` when it is still null.
+
+Both of those last two are what make a call the agent never worked on
+*reachable*. `get_recent_threads` filters on `has_response`, and
+`format_display_title` falls back to `first_message`. Without them a promoted
+call is a row nothing lists and nothing can name.
+
+The same two rows promote **`state`** from `composing` to `active`, clearing the
+compose fields and bumping **`compose_epoch`** exactly as a send does. The
+session start deliberately does not: a call nobody spoke on stays a draft the
+reader can see and discard.
+
+**`status` is never touched by any of them.** The agent's turn owns it (ADR
+0149), and a live microphone is not a turn (ADR 0148).
+
 **`webhooks.last_accepted_at`**, **`last_refused_at`** and
 **`last_refusal_reason`** are the *delivery outcome stamps*
 (`20260827085700_webhook_delivery_outcome_stamps.sql`, ADR 0143): what the last

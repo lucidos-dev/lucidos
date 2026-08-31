@@ -15,9 +15,11 @@
  *    the first character lands. The clear button mounts at the END of their
  *    cluster, whose next sibling takes the free space.
  *
- * Both are measured with voice off and with voice on, since the call toggle
- * is what costs the row its fourth box. The spec arms that switch itself and
- * puts it back, so neither reading depends on what ran before it.
+ * On a coding-agent destination the call toggle is absent whatever voice reads
+ * (ADR 0165), so voice adds no box to this row. The spec still measures voice
+ * off and on, to prove that. It arms the switch itself and puts it back, so
+ * neither reading depends on what ran before it. The overflow that lifts Diff
+ * is driven by ui-scale, which a user can raise as high as 200%.
  */
 import { test, expect, Page } from './fixtures';
 import {
@@ -169,15 +171,16 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
 
   // Four configurations, and each names the row it measures.
   //
-  // `voice` is the experimental switch. Off is the row every user gets: the
-  // agent menu, the follow toggle and the attach button. On adds the call
-  // toggle as a fourth 2.25rem box, and that box is the only difference
-  // between the two halves of this table.
+  // `voice` is the experimental switch. On a coding-agent destination the call
+  // toggle is absent whatever it reads (ADR 0165), so voice adds no box here.
+  // The row is three boxes either way: the agent menu, the follow toggle and
+  // the attach button. Measuring voice off AND on is the guard that a call
+  // toggle wrongly returning to this row fails the box count.
   //
-  // Two scales, because the default root has room to spare at this width.
-  // 112.5% is the one pinning the arithmetic, and the only cell that
-  // overflows. With the call toggle, six items there ask for 327.9px of a
-  // 317.1px content box. That lift is the row keeping promise 1.
+  // ui-scale drives the lift, not voice. 100% has room to spare at this width.
+  // 137.5% is the cell that overflows: the five items ask for more than the
+  // content box holds, so the row lifts Diff onto a sub-row. That lift is the
+  // row keeping promise 1, reachable because a user can raise the root to 200%.
   //
   // `boxes` and `liftsDiff` are measured, not chosen. A control added or
   // removed moves them. Re-measure and re-set the row rather than relaxing
@@ -185,9 +188,9 @@ test.describe('Composer action row - Diff keeps its seat while the row fits', ()
   // control.
   for (const { voice, scale, boxes, liftsDiff } of [
     { voice: false, scale: 100, boxes: 3, liftsDiff: false },
-    { voice: false, scale: 112.5, boxes: 3, liftsDiff: false },
-    { voice: true, scale: 100, boxes: 4, liftsDiff: false },
-    { voice: true, scale: 112.5, boxes: 4, liftsDiff: true },
+    { voice: false, scale: 137.5, boxes: 3, liftsDiff: true },
+    { voice: true, scale: 100, boxes: 3, liftsDiff: false },
+    { voice: true, scale: 137.5, boxes: 3, liftsDiff: true },
   ]) {
     const where = `voice ${voice ? 'on' : 'off'}, ui-scale ${scale}`;
     test(`Diff keeps the seat the row can afford with ${where}, and typing moves no icon`, async ({ page }) => {

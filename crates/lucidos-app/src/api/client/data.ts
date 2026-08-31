@@ -1,4 +1,4 @@
-import { API, mutatingFetch, throwIfNotOk } from './_core';
+import { API, json, mutatingFetch, throwIfNotOk } from './_core';
 
 export interface SaveDataFileResult {
   success: boolean;
@@ -38,8 +38,6 @@ export interface HandshakeScriptState {
  *  Read-only: approving one is refused to a browser and belongs to
  *  `lucidos handshake approve` (ADR 0144). */
 export async function fetchHandshakeScripts(): Promise<HandshakeScriptState[]> {
-  const res = await fetch(`${API}/handshake-scripts`);
-  await throwIfNotOk(res);
-  const body = await res.json();
+  const body = await json<{ scripts?: HandshakeScriptState[] }>(`${API}/handshake-scripts`);
   return body.scripts ?? [];
 }

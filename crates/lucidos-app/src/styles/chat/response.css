@@ -1276,29 +1276,36 @@
     }
 }
 
-/* FreeText resolution block — borderless accent tint echoing the selected-option
-   surface and the user message bubble, so the user's typed answer reads as the
-   equivalent "picked" surface rather than a separate outlined card. */
+/* FreeText resolution block. The answer is the one thing on the card the user
+   wrote, so it takes `.user-bubble`, the transcript's shape for exactly that:
+   a right-aligned tinted pill hugging its text. Reuse the class rather than
+   restate it, so the two surfaces cannot drift apart.
+
+   The label stays OUTSIDE the bubble, as a header above it. Inside, it makes
+   the answer a card of its own, competing with the option rows it sits under.
+   It rides the right edge with the bubble, which is what keeps the pair reading
+   as one unit at any answer length. */
 .question-freetext {
     display: flex;
     flex-direction: column;
+    align-items: flex-end;
     gap: 0.25rem;
-    padding: 0.5rem 0.75rem;
-    border-radius: 0.375rem;
-    background: var(--picked-surface);
 }
 
+/* The recipe the voice-call rows use for a "who said this" mark
+   (`.spoken-message-who`), which is the same job this does. */
 .question-freetext-label {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
-    color: var(--text-secondary);
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.03em;
 }
 
+/* Surface, radius, padding and leading all come from `.user-bubble`. What is
+   added here is what a typed answer carries and a message bubble does not: its
+   own line breaks, and a long unbroken token that must not widen the card. */
 .question-freetext-text {
     color: var(--text-primary);
-    line-height: 1.5;
     word-break: break-word;
     white-space: pre-wrap;
 }

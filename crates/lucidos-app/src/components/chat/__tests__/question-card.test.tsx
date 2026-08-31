@@ -157,6 +157,54 @@ describe('AnsweredBody — Canceled state', () => {
   });
 });
 
+/** Two halves, both pinned. The CLASS, so the answer keeps the transcript's
+ *  shape for the user's own words instead of growing a private surface again.
+ *  The ORDER, so the label stays a header above the bubble and cannot slide
+ *  back inside it. `styles/chat/response.css` § FreeText says why. */
+describe('AnsweredBody: the custom answer wears the user bubble', () => {
+  // Tolerant of a class added or reordered on the bubble, so only the two
+  // things this pins can fail it: the header comes first, and the answer
+  // still wears `.user-bubble`.
+  const LABEL_THEN_BUBBLE =
+    /class="question-freetext-label">Custom answer<\/span><div class="[^"]*\buser-bubble\b[^"]*">/;
+
+  it('renders a FreeText answer in a user bubble under its header', () => {
+    const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
+      question: 'q',
+      options: [],
+      multiSelect: false,
+      resolved: { kind: 'FreeText', text: 'neither, ask me later' },
+    }));
+    expect(text).toMatch(LABEL_THEN_BUBBLE);
+    expect(text).toContain('neither, ask me later');
+  });
+
+  it('renders the freetext typed alongside a MultiSelected pick the same way', () => {
+    const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
+      question: 'q',
+      options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
+      multiSelect: true,
+      resolved: { kind: 'MultiSelected', option_ids: ['a'], text: 'and also this' },
+    }));
+    expect(text).toMatch(LABEL_THEN_BUBBLE);
+    expect(text).toContain('and also this');
+  });
+
+  it('renders no freetext block at all when the answer carries no text', () => {
+    const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
+      question: 'q',
+      options: [{ id: 'a', label: 'A' }],
+      multiSelect: false,
+      resolved: { kind: 'Selected', option_id: 'a' },
+    }));
+    expect(text).not.toContain('question-freetext');
+    expect(text).not.toContain('Custom answer');
+  });
+});
+
 /** A DEAD card says so in its class, and the scroll landing reads that straight
  *  off the DOM. `followSentMessage` asks the newest `.question-body` whether it
  *  is still open. A TYPED answer then lands on the card, rather than on the

@@ -1126,6 +1126,12 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "CodingAgentThoughtStreamed",
     "CodingAgentToolCalled",
     "CodingAgentToolResult",
+    // A call is activity on the thread it runs on, whichever half speaks.
+    // Placing one is a user action, and the two spoken rows keep the timestamp
+    // current through a call nobody delegates from (ADR 0167).
+    "VoiceSessionStarted",
+    "SpokenMessageReceived",
+    "SpokenReplyGenerated",
 ];
 
 /// Event types that increment message_count in the thread_summaries projection.

@@ -206,14 +206,28 @@ Four details worth having in the record:
   authentication (`docs/glossary.md` § unattributed caller, ADR 0050). So a
   subprocess that DROPS its origin token reads as an ordinary local caller and
   keeps full reach. Every route here has that property, and closing it is owed
-  its own ADR. The fix would require device attribution on the un-tokened path,
-  refusing the e2e suite and every external client. What the gate buys is that a
-  caller presenting its credential is bound by it.
+  its own ADR. That ADR is 0169. The fix would require device attribution on the
+  un-tokened path, refusing the e2e suite and every external client. What the
+  gate buys is that a caller presenting its credential is bound by it.
 
 Coverage is named rather than claimed, for the reason ADR 0043's own amendment
 names it: only a spawned subprocess holds a token, and a test-only minter was
 rejected there. So the agent paths are covered in the engine tests
 (`api/thread_reach_tests.rs`) and the API e2e suite covers the user-device path.
+
+## Superseded in scope by ADR 0168
+
+This ADR governs what one agent may SAY to another, and that half stands
+unchanged. It never classified the verbs that are not an agent speaking: Apply,
+Discard, answering a question card, resolving a permission card, restarting a
+turn. ADR 0168 classifies them, and two of its findings correct this document.
+
+The refusal above tells an agent to "say so to your parent thread", which a
+*top-thread* does not have. Under ADR 0168 the workspace is the root, so two
+top-threads are siblings and their shared parent is the *workspace owner*. The
+enforced-versus-convention table also has no row for those five verbs. Read this
+document for the sibling-addressing rule, and ADR 0168 for everything wider than
+a thread's own subtree.
 
 ## Alternatives considered
 

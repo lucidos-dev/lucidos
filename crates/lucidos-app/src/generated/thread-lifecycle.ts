@@ -144,6 +144,9 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'CodingAgentThoughtStreamed',
   'CodingAgentToolCalled',
   'CodingAgentToolResult',
+  'VoiceSessionStarted',
+  'SpokenMessageReceived',
+  'SpokenReplyGenerated',
 ]);
 
 export function isSectionLegal(threadType: ThreadType, section: ArchiveState): boolean {

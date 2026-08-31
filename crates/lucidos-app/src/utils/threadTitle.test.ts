@@ -13,6 +13,7 @@ function makeThread(opts: Partial<{
     composeText: string;
     pendingText: string;
     firstMessageText: string;
+    spokenText: string;
 }> = {}): ThreadState {
     const t = makeOptimisticThreadState({
         id: 'tid',
@@ -30,6 +31,9 @@ function makeThread(opts: Partial<{
     }
     if (opts.firstMessageText !== undefined) {
         t.events.set(1, { type: 'MessageReceived', text: opts.firstMessageText });
+    }
+    if (opts.spokenText !== undefined) {
+        t.events.set(2, { type: 'SpokenMessageReceived', session_id: 'sess-1', text: opts.spokenText });
     }
     return t;
 }
@@ -103,6 +107,24 @@ describe('threadDisplayTitle', () => {
     it('returns "Untitled Thread" only when no title and no message text exists', () => {
         const t = makeThread({ state: 'active', title: '' });
         expect(threadDisplayTitle(t)).toBe('Untitled Thread');
+    });
+
+    // A call the talker answered alone writes no MessageReceived at all, so
+    // without this the whole thread read "Untitled Thread". The engine takes
+    // the same row into `first_message`, so both surfaces say one thing.
+    it('falls back to the caller spoken words on a call nobody delegated from', () => {
+        const t = makeThread({ state: 'active', title: '', spokenText: 'what happened overnight' });
+        expect(threadDisplayTitle(t)).toBe('what happened overnight');
+    });
+
+    it('prefers a typed first message over a later spoken one', () => {
+        const t = makeThread({
+            state: 'active',
+            title: '',
+            firstMessageText: 'typed first',
+            spokenText: 'said later',
+        });
+        expect(threadDisplayTitle(t)).toBe('typed first');
     });
 
     it('treats whitespace-only meta.title as empty (defends against bad backend data)', () => {
