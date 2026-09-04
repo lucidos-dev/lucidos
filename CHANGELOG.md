@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.35.1 — 2026-09-04
+
+### Fixed
+
+- A standing apply can no longer be armed on a coding-agent thread working in an external repository. Lucidos never applies into one, so the arm would wait forever. Apply All passes those threads over, and both the HTTP route and the apply-on-settle tool refuse them.
+- The standing-apply control no longer appears on a coding-agent thread working in an external repository, where there is never a change for it to apply.
 ## v0.35.0 — 2026-09-04
 
 ### Added

@@ -151,6 +151,48 @@ async fn an_arm_refuses_a_change_belonging_to_another_thread() {
     );
 }
 
+/// A standing apply is an Apply, one settle later, so it is offered exactly
+/// where Apply is. Lucidos never merges into an external repo. Such a thread
+/// proposes nothing either, so an arm on one waits for a change that never
+/// comes.
+#[tokio::test]
+async fn an_arm_refuses_a_repo_lucidos_never_applies_into() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread_summary(&pool, thread_id, "running").await;
+    sqlx::query(
+        "UPDATE thread_summaries \
+            SET coding_agent_kind = 'external', coding_agent_is_external_repo = TRUE \
+          WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .expect("mark the thread as external-repo");
+
+    let resp = client
+        .post(format!("{}/api/v1/standing-applies", base_url()))
+        .json(&json!({ "thread_id": thread_id }))
+        .send()
+        .await
+        .expect("arm request failed");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "arming an external-repo thread must be refused"
+    );
+    assert!(
+        !armed_threads(&client)
+            .await
+            .contains(&thread_id.to_string()),
+        "a refused arm must leave nothing behind"
+    );
+}
+
 /// The workspace-scope off, which the Changes panel's toggle presses. It takes
 /// back every arm here, whether a sweep set it or the owner armed one change.
 ///

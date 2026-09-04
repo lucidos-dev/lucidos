@@ -112,7 +112,18 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   // before ThreadArchived). Mirror `is_blocking`'s carve-out: replace the
   // change layer (discard + apply) with a single Archive. Draft + save toggle
   // are untouched.
-  const isExternalRepo = threadType === 'claude_code' && (ccInfo?.isExternalRepo ?? false);
+  //
+  // Read off `meta`, never off `ccInfo`. That helper answers null while the
+  // thread runs AND whenever nothing is proposed, and an external-repo thread
+  // never proposes at all (`may_touch_change_state_at_idle` refuses). So it is
+  // null in every state such a thread can reach, and this whole carve-out sat
+  // dead. `codingAgentKind` is the fact that survives: written at
+  // `SessionStarted` and locked, so it is there from the thread's first moment,
+  // which is the only time the standing apply is offered. The legacy bool is
+  // read with it, because an old row carries it with no kind.
+  const isExternalRepo =
+    threadType === 'claude_code' &&
+    (thread.meta.codingAgentKind === 'external' || thread.meta.codingAgentIsExternalRepo);
   let kinds: Action[] = raw;
   if (isExternalRepo && (raw.includes('apply') || raw.includes('discard'))) {
     kinds = raw.flatMap((a): Action[] => {

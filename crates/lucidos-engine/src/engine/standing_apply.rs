@@ -92,6 +92,30 @@ pub const DISARMED_BY_OWNER: &str = "Canceled.";
 /// for rather than dropping the moment it is set.
 const SWEEPABLE_THREAD_STATUSES: [&str; 2] = ["running", "paused"];
 
+/// A `thread_summaries` row whose change Lucidos would apply. The standing
+/// apply IS an Apply, one settle later, so it is offered exactly where Apply
+/// is. An external repo is reviewed and pushed from the repo itself.
+///
+/// Such a thread never proposes at all (`may_touch_change_state_at_idle`), so
+/// an arm on one reads `Unproposed` forever, and its branch diff keeps the
+/// verdict at `Wait`. That is the one shape breaking this module's promise
+/// that an arm always ends, which is why the refusal is structural.
+///
+/// Both columns are read. `coding_agent_kind` is written at `SessionStarted`
+/// and is the modern fact. A legacy row carries the bool with a NULL kind (see
+/// `core::store::threads::backfill`), and reading the kind alone would let one
+/// through.
+///
+/// The column names are unqualified, so a query joining a second table must
+/// keep `thread_summaries` the only source of them.
+const LUCIDOS_APPLIES_SQL: &str =
+    "coding_agent_kind IS DISTINCT FROM 'external' AND coding_agent_is_external_repo = FALSE";
+
+/// Refused when the owner arms an apply on a repo Lucidos does not merge into.
+const EXTERNAL_REPO_REFUSAL: &str =
+    "Lucidos does not apply changes into an external repo. Review and push that \
+     work from the repo itself.";
+
 /// Which arms one bulk disarm takes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisarmScope {
@@ -398,13 +422,35 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
 /// they settle" with nothing pending. The panel cannot derive it: its thread
 /// map holds only the loaded window.
 pub(crate) async fn count_sweep_candidates(pool: &sqlx::PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
+    sqlx::query_scalar(&format!(
         "SELECT count(*) FROM thread_summaries \
-          WHERE is_coding_agent = TRUE AND status = ANY($1)",
-    )
+          WHERE is_coding_agent = TRUE AND status = ANY($1) AND {LUCIDOS_APPLIES_SQL}"
+    ))
     .bind(&SWEEPABLE_THREAD_STATUSES[..])
     .fetch_one(pool)
     .await
+}
+
+/// Refuse a thread whose repo Lucidos never applies into.
+///
+/// Same shape as [`check_binding`] and for the same reason: the instruction
+/// could never be carried out, so it is refused at the door. A thread the
+/// query cannot find falls through, because the arm's own resolution answers
+/// `THREAD_GONE` and that is the honest report.
+async fn check_repo_is_appliable(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let appliable: Option<bool> = sqlx::query_scalar(&format!(
+        "SELECT {LUCIDOS_APPLIES_SQL} FROM thread_summaries WHERE thread_id = $1"
+    ))
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+    match appliable {
+        Some(false) => Err(EXTERNAL_REPO_REFUSAL.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Refuse a binding that names a change this thread does not own, or one that
@@ -478,14 +524,15 @@ async fn read_scoped_arms(
 async fn read_sweep_candidates(
     pool: &sqlx::PgPool,
 ) -> Result<Vec<(Uuid, Option<Uuid>)>, sqlx::Error> {
-    sqlx::query_as(
+    sqlx::query_as(&format!(
         "SELECT t.thread_id, \
                 (SELECT c.id FROM changes c \
                   WHERE c.thread_id = t.thread_id AND c.status = 'pending' \
                   ORDER BY c.created_at LIMIT 1) \
            FROM thread_summaries t \
-          WHERE t.is_coding_agent = TRUE AND t.status = ANY($1)",
-    )
+          WHERE t.is_coding_agent = TRUE AND t.status = ANY($1) \
+            AND {LUCIDOS_APPLIES_SQL}"
+    ))
     .bind(&SWEEPABLE_THREAD_STATUSES[..])
     .fetch_all(pool)
     .await
@@ -503,9 +550,10 @@ impl LucidosEngine {
     /// settles. Re-arming a thread replaces the previous arm, because the new
     /// one may name a different change.
     ///
-    /// A named change must be that thread's own pending one. The check lives
-    /// here rather than in one caller, so the HTTP route and the agent tool are
-    /// held to the same rule.
+    /// A named change must be that thread's own pending one, and the thread's
+    /// repo must be one Lucidos applies into. Both checks live here rather than
+    /// in one caller, so the HTTP route and the agent tool are held to the same
+    /// rule.
     ///
     /// Resolves once immediately, so arming a thread that has already settled
     /// applies now rather than waiting for an event that will not come.
@@ -513,6 +561,7 @@ impl LucidosEngine {
         self: &Arc<Self>,
         arm: StandingApply,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        check_repo_is_appliable(self.pool(), arm.thread_id).await?;
         if let Some(change_id) = arm.change_id {
             check_binding(self.pool(), arm.thread_id, change_id).await?;
         }
@@ -873,6 +922,30 @@ mod db_tests {
         .expect("seed thread_summary");
     }
 
+    /// Mark a seeded thread as running against an external repo.
+    ///
+    /// `kind` carries the modern `coding_agent_kind`, `bool_flag` the legacy
+    /// `coding_agent_is_external_repo`. They are set separately so a test can
+    /// reproduce the legacy row that has the bool and no kind.
+    async fn set_external_repo(
+        pool: &PgPool,
+        thread_id: Uuid,
+        kind: Option<&str>,
+        bool_flag: bool,
+    ) {
+        sqlx::query(
+            "UPDATE thread_summaries \
+                SET coding_agent_kind = $2, coding_agent_is_external_repo = $3 \
+              WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .bind(kind)
+        .bind(bool_flag)
+        .execute(pool)
+        .await
+        .expect("mark external repo");
+    }
+
     async fn set_status(pool: &PgPool, thread_id: Uuid, status: &str) {
         sqlx::query("UPDATE thread_summaries SET status = $2 WHERE thread_id = $1")
             .bind(thread_id)
@@ -1158,6 +1231,67 @@ mod db_tests {
         let candidates = read_sweep_candidates(&pool).await.expect("sweep read");
         let ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![running]);
+        teardown_test_db(&db).await;
+    }
+
+    /// **A standing apply is offered exactly where Apply is.** An external repo
+    /// is one Lucidos never merges into, so the sweep passes it over rather
+    /// than arming something that can never fire.
+    #[tokio::test]
+    async fn the_sweep_passes_over_a_repo_lucidos_never_applies_into() {
+        let (pool, db) = setup_test_db().await;
+        let lucidos = Uuid::new_v4();
+        let external = Uuid::new_v4();
+        let legacy_external = Uuid::new_v4();
+        seed_thread(&pool, lucidos, "running").await;
+        seed_thread(&pool, external, "running").await;
+        seed_thread(&pool, legacy_external, "running").await;
+        set_external_repo(&pool, external, Some("external"), true).await;
+        // The legacy shape: the bool was written before the kind column existed.
+        set_external_repo(&pool, legacy_external, None, true).await;
+
+        let candidates = read_sweep_candidates(&pool).await.expect("sweep read");
+        let ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![lucidos]);
+        assert_eq!(
+            count_sweep_candidates(&pool).await.expect("sweep count"),
+            1,
+            "the count the panel offers its sweep from must agree with the sweep"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// **An arm always ends, so one that never could is refused at the door.**
+    /// An external-repo thread proposes nothing, ever, and its branch diff
+    /// holds the verdict at `Wait`. Both the HTTP route and the
+    /// `apply_when_settled` tool reach `arm_standing_apply`, so the refusal
+    /// lives there and covers both.
+    #[tokio::test]
+    async fn arming_a_repo_lucidos_never_applies_into_is_refused() {
+        let (pool, db) = setup_test_db().await;
+        let lucidos = Uuid::new_v4();
+        let external = Uuid::new_v4();
+        let legacy_external = Uuid::new_v4();
+        seed_thread(&pool, lucidos, "running").await;
+        seed_thread(&pool, external, "running").await;
+        seed_thread(&pool, legacy_external, "running").await;
+        set_external_repo(&pool, external, Some("external"), true).await;
+        set_external_repo(&pool, legacy_external, None, true).await;
+
+        assert!(check_repo_is_appliable(&pool, lucidos).await.is_ok());
+        assert!(
+            check_repo_is_appliable(&pool, external).await.is_err(),
+            "an external-repo thread must be refused"
+        );
+        assert!(
+            check_repo_is_appliable(&pool, legacy_external)
+                .await
+                .is_err(),
+            "a legacy row carrying the bool with no kind must be refused too"
+        );
+        // A thread the query cannot find falls through: the arm's own
+        // resolution answers THREAD_GONE, which is the honest report.
+        assert!(check_repo_is_appliable(&pool, Uuid::new_v4()).await.is_ok());
         teardown_test_db(&db).await;
     }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { threadMap, focusedThreadId, changes, confirmState, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds } from '../store';
-import type { ThreadState } from '../thread-events';
+import type { ThreadMeta, ThreadState } from '../thread-events';
 import type { Change } from '../../api/client';
 import { makeThreadState } from './threads-test-helpers';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -104,6 +104,66 @@ describe('resolveThreadActions', () => {
     }));
     const actions = resolveThreadActions('t1');
     expect(kinds(actions)).toEqual(['archive', 'save']);
+  });
+
+  // The standing apply is an Apply the owner presses early, so it belongs
+  // wherever Apply does. Lucidos never merges into an external repo, and such a
+  // thread proposes nothing, so the flag offered to apply a change that could
+  // never exist.
+  //
+  // Both statuses matter: those are the two the core offers the action in. Both
+  // facts matter too: `codingAgentKind` is what a live thread carries, and the
+  // legacy bool is what an old row carries instead.
+  describe('the standing apply is withheld where Lucidos never applies', () => {
+    const externalFacts: [string, Partial<ThreadMeta>][] = [
+      ['by coding-agent kind', { codingAgentKind: 'external' }],
+      ['by the legacy external-repo flag', { codingAgentIsExternalRepo: true }],
+    ];
+    for (const status of ['running', 'paused'] as const) {
+      for (const [label, meta] of externalFacts) {
+        it(`withholds it from a ${status} external-repo thread, ${label}`, () => {
+          setThread(makeThreadState('t1', {
+            meta: { channel: 'claude_code', section: 'inbox', status, ...meta },
+          }));
+          expect(kinds(resolveThreadActions('t1'))).not.toContain('apply_when_settled');
+        });
+      }
+
+      it(`still offers it on a ${status} Lucidos-source thread`, () => {
+        setThread(makeThreadState('t1', {
+          meta: { channel: 'claude_code', section: 'inbox', status, codingAgentKind: 'lucidos' },
+        }));
+        expect(kinds(resolveThreadActions('t1'))).toContain('apply_when_settled');
+      });
+    }
+
+    // An app thread merges into the workspace git, so Lucidos does apply it.
+    it('still offers it on an app thread, which Lucidos does apply', () => {
+      setThread(makeThreadState('t1', {
+        meta: {
+          channel: 'claude_code',
+          section: 'inbox',
+          status: 'running',
+          codingAgentKind: 'app',
+        },
+      }));
+      expect(kinds(resolveThreadActions('t1'))).toContain('apply_when_settled');
+    });
+
+    // The regression: `getCodingAgentWaitingInfo` returns null for a running
+    // thread, so a carve-out reading it could never fire where the flag lives.
+    it('withholds it before the thread has ever proposed anything', () => {
+      setThread(makeThreadState('t1', {
+        meta: {
+          channel: 'claude_code',
+          section: 'inbox',
+          status: 'running',
+          codingAgentProposed: false,
+          codingAgentKind: 'external',
+        },
+      }));
+      expect(kinds(resolveThreadActions('t1'))).toEqual(['save']);
+    });
   });
 
   it('an unsent draft is the front-most close action', () => {

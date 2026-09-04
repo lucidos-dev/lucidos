@@ -179,6 +179,34 @@ describe('the icon says which state it is in', () => {
   });
 });
 
+// The surface the bug was reported on. Lucidos never merges into an external
+// repo, and such a thread proposes nothing, so the flag offered to apply a
+// change that could never exist.
+describe('the prompt row draws no flag where Lucidos never applies', () => {
+  function markExternal(meta: Partial<ThreadState['meta']>): void {
+    const thread = makeThread();
+    threadMap.value = new Map([[THREAD, { ...thread, meta: { ...thread.meta, ...meta } }]]);
+  }
+
+  it('draws nothing for a thread on an external repo', () => {
+    markExternal({ codingAgentKind: 'external' });
+    expect(getStandingApplyControl()).toBeNull();
+  });
+
+  // An old row carries the bool and no kind.
+  it('draws nothing for a legacy external-repo row', () => {
+    markExternal({ codingAgentIsExternalRepo: true });
+    expect(getStandingApplyControl()).toBeNull();
+  });
+
+  // The regression: this thread is running, which is exactly when the flag is
+  // drawn and exactly when `getCodingAgentWaitingInfo` answers null.
+  it('draws nothing before the thread has proposed anything', () => {
+    markExternal({ codingAgentKind: 'external', codingAgentProposed: false });
+    expect(getStandingApplyControl()).toBeNull();
+  });
+});
+
 describe('the icon keeps the word it stopped showing', () => {
   it('names the action for a reader in both states', () => {
     expect(control().getAttribute('aria-label')).toBe('Apply as it settles');
