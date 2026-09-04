@@ -134,19 +134,90 @@ fn build_origin_user_short_label_handles_short_id() {
     }
 }
 
+/// A bare curl is nobody, not the owner. Stamping it human is the inversion
+/// ADR 0169 removes: dropping a credential used to buy more than presenting
+/// one, because a tokened caller was stamped `Agent`.
 #[test]
-fn build_origin_user_no_device_no_caller_yields_api() {
+fn a_caller_with_no_credential_yields_no_actor_at_all() {
     let h = headers_with(&[("user-agent", "curl/8")]);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    assert_eq!(
+        origin, None,
+        "an unidentified caller must not be recorded as the user"
+    );
+}
+
+/// The engine's own build-watch. It belongs to no thread, so it carries no
+/// origin token, and it is not a person. The machine-local token is the
+/// credential ADR 0169 gives it, and `Engine` mode is what the chip reads as
+/// "Lucidos Engine".
+#[test]
+fn the_machine_local_token_names_the_engines_own_machinery() {
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[
+        ("user-agent", "lucidos-cli"),
+        (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
+    ]);
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
     match origin {
         Some(MessageOrigin::Api {
-            user_agent,
             mode,
             source_thread_id,
+            ..
         }) => {
-            assert_eq!(user_agent.as_deref(), Some("curl/8"));
-            assert_eq!(mode, ActorMode::Human);
-            assert_eq!(source_thread_id, None);
+            assert_eq!(mode, ActorMode::Engine);
+            assert_eq!(source_thread_id, None, "a machine belongs to no thread");
+        }
+        other => panic!("expected Api, got {:?}", other),
+    }
+}
+
+/// A device names a person and the local token names a machine, so the person
+/// wins. Nothing sends both today, and the order says which would.
+#[test]
+fn a_device_outranks_the_machine_local_token() {
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    let origin = build_message_origin(
+        &h,
+        ActorMode::Human,
+        Some("dev-1"),
+        Some("My MacBook".into()),
+        None,
+        None,
+        None,
+        None,
+    );
+    match origin {
+        Some(MessageOrigin::Device { label, .. }) => assert_eq!(label, "My MacBook"),
+        other => panic!("expected Device, got {:?}", other),
+    }
+}
+
+/// The thread-bound origin token still wins. An agent holding the machine
+/// token too stays traceable to its own thread, rather than collapsing into
+/// one machine identity.
+#[test]
+fn a_thread_bound_token_outranks_the_machine_local_token() {
+    let thread = Uuid::new_v4();
+    init_agent_origin_secret("secret-for-actor-tests".into());
+    let Some(agent_token) = mint_agent_origin_token(Some(thread), 0, None) else {
+        panic!("the secret was just installed");
+    };
+    let local = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[
+        (HEADER_AGENT_ORIGIN_TOKEN, agent_token.as_str()),
+        (lucidos_local_token::HEADER_LOCAL_TOKEN, local),
+    ]);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    match origin {
+        Some(MessageOrigin::Api {
+            mode,
+            source_thread_id,
+            ..
+        }) => {
+            assert_eq!(mode, ActorMode::Agent);
+            assert_eq!(source_thread_id, Some(thread));
         }
         other => panic!("expected Api, got {:?}", other),
     }
@@ -373,23 +444,123 @@ async fn user_actor_resolved_uses_explicit_device_id_override() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// The pair a mutating handler chooses between. The `Option` form answers
+/// honestly, and the `require` form turns that answer into the refusal.
+///
+/// 401 rather than 403, and the message names all four credentials. A caller
+/// does not know which class the engine put it in. Naming only the one this
+/// route wanted would send it to the wrong door.
 #[tokio::test]
-async fn user_actor_resolved_no_caller_no_device_yields_api() {
+async fn an_unidentified_caller_resolves_to_nobody_and_is_refused() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[("user-agent", "curl/8")]);
-    let actor = user_actor_resolved(&h, &pool, None).await;
+
+    assert_eq!(user_actor_resolved(&h, &pool, None).await, None);
+
+    let refusal = require_user_actor(&h, &pool, None)
+        .await
+        .expect_err("a bare curl must be refused");
+    assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+    for credential in [
+        "thread-bound origin token",
+        "machine-local token",
+        "x-lucidos-device-id",
+        "caller_workspace",
+    ] {
+        assert!(
+            refusal.message.contains(credential),
+            "the refusal must name {credential}: {}",
+            refusal.message
+        );
+    }
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A registered device is identity, so the same call succeeds. Guards against
+/// a refusal that fires on every caller, which the test above cannot see.
+#[tokio::test]
+async fn a_registered_device_passes_the_same_gate() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "gate-device", Some("Mozilla/5.0"), None)
+        .await
+        .unwrap();
+
+    let h = headers_with(&[(HEADER_DEVICE_ID, "gate-device")]);
+    let actor = require_user_actor(&h, &pool, None)
+        .await
+        .expect("a registered device identifies itself");
+    assert!(matches!(actor, MessageOrigin::Device { .. }));
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The gate's whole point. Attribution stamps any non-empty id as a `Device`,
+/// so a bare curl could otherwise type one header and be recorded as the owner.
+/// That id is the evidence ADR 0168 clause 4 will read, so it must name a row.
+#[tokio::test]
+async fn an_unregistered_device_id_is_not_evidence() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = headers_with(&[(HEADER_DEVICE_ID, "never-registered")]);
+
+    // Attribution still stamps it, which is the behaviour the gate must not
+    // inherit. A device that was removed keeps its name on what it already did.
+    assert!(matches!(
+        user_actor_resolved(&h, &pool, None).await,
+        Some(MessageOrigin::Device { .. })
+    ));
+
+    let refusal = require_user_actor(&h, &pool, None)
+        .await
+        .expect_err("an id naming no device is a header, not identity");
+    assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An unregistered id is suppressed, not fatal. The caller falls through to
+/// whatever else it holds. So a script sending a stale device id and the
+/// machine token is still the engine's own machinery.
+#[tokio::test]
+async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[
+        (HEADER_DEVICE_ID, "never-registered"),
+        (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
+    ]);
+
+    let actor = require_user_actor(&h, &pool, None)
+        .await
+        .expect("the machine token still identifies the caller");
     match actor {
-        Some(MessageOrigin::Api {
-            user_agent,
-            mode,
-            source_thread_id,
-        }) => {
-            assert_eq!(user_agent.as_deref(), Some("curl/8"));
-            assert_eq!(mode, ActorMode::Human);
-            assert_eq!(source_thread_id, None);
-        }
+        MessageOrigin::Api { mode, .. } => assert_eq!(mode, ActorMode::Engine),
         other => panic!("expected Api, got {:?}", other),
     }
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A blank source is filtered before the fallback, never after it. Filtering
+/// the winner instead would let a blank body field swallow a real header.
+#[tokio::test]
+async fn a_blank_override_does_not_swallow_a_real_device_header() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "blank-test-device", Some("Mozilla/5.0"), None)
+        .await
+        .unwrap();
+
+    let h = headers_with(&[(HEADER_DEVICE_ID, "blank-test-device")]);
+    let actor = require_user_actor(&h, &pool, Some("   "))
+        .await
+        .expect("the header is the surviving source");
+    match actor {
+        MessageOrigin::Device { device_id, .. } => assert_eq!(device_id, "blank-test-device"),
+        other => panic!("expected Device, got {:?}", other),
+    }
+
     crate::test_support::teardown_test_db(&db_name).await;
 }
 

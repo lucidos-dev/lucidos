@@ -18,13 +18,8 @@
  */
 import { test, expect, type Page } from './fixtures';
 import {
-  assertHealthy,
-  ensureOnThreadPane,
-  waitForVisibleInput,
-  openFilesPanel,
-  waitForVisibleElement,
-  clickVisibleElement,
-  gotoWithRetry,
+  apiRequest, assertHealthy, clickVisibleElement, ensureOnThreadPane, gotoWithRetry,
+  openFilesPanel, waitForVisibleElement, waitForVisibleInput,
 } from './helpers';
 
 /** The screen this project is emulating, as the popup measures it.
@@ -83,9 +78,15 @@ async function openImageOfWidth(page: Page, width: number): Promise<void> {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const blob = await new Promise<Blob | null>(done => canvas.toBlob(done, 'image/png'));
     if (!blob) return 0;
+    // The device header the app's own `mutatingFetch` sends. A raw fetch is
+    // an unidentified caller, which `PUT /api/v1/data/*path` refuses (ADR 0169).
+    const deviceId = localStorage.getItem('lucidos-device-id');
     const resp = await fetch(`/api/v1/data/${target}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'image/png' },
+      headers: {
+        'Content-Type': 'image/png',
+        ...(deviceId ? { 'x-lucidos-device-id': deviceId } : {}),
+      },
       body: blob,
     });
     return resp.status;
@@ -128,7 +129,7 @@ test.describe('the image popup counts physical screen pixels', () => {
   });
 
   test.afterEach(async ({ page }) => {
-    for (const path of created) await page.request.delete(`/api/v1/data/${path}`);
+    for (const path of created) await apiRequest(page).delete(`/api/v1/data/${path}`);
     created = [];
   });
 

@@ -77,11 +77,13 @@ async fn voice(
 
             let opening = crate::voice::call::opening_for(&state.engine, thread_id).await;
             let doer = crate::voice::doer::ThreadTurn::new(state.engine.clone());
+            let decisions = crate::voice::decision::ThreadDecisions::new(state.engine.clone());
             crate::voice::call::run_call(
                 &state.engine.event_bus,
                 provider.as_ref(),
                 &mut transport,
                 &doer,
+                &decisions,
                 opening,
                 crate::voice::call::CallSubject {
                     thread_id,

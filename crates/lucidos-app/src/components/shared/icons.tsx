@@ -244,6 +244,29 @@ export function FollowLiveEdgeIcon() {
   );
 }
 
+/** A flag planted on the change: apply it once this thread settles. The
+ *  *standing apply*'s toggle, two slots along from the magnet above.
+ *
+ *  On and off by FILL, the shape `PinIcon` uses. That wants one large closed
+ *  path, so the banner is the whole glyph and the pole is a bare stroke.
+ *
+ *  A flag is a standing instruction left behind: plant it, walk away, and it
+ *  is still there when the thread finishes. Three other marks say the wrong
+ *  thing. A tick says the apply already happened. A clock says what the
+ *  *waiting indicator* beside it says, and both can be lit at once. A bolt is
+ *  `TriggerFiredIcon`, whose note records that a bolt cannot be outlined at
+ *  this size, so it carries no off state at all.
+ *
+ *  No inline size: this renders inside `.icon-btn`, which sizes the svg. */
+export function StandingApplyIcon({ armed = false }: { armed?: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/>
+      <path d="M4 22v-7"/>
+    </svg>
+  );
+}
+
 /** One chevron: there is more of this response than you are being shown.
  *  Worn by the response header's full-response toggle.
  *

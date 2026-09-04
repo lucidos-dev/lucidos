@@ -7,7 +7,7 @@
 //! exercises bus paths.
 
 use super::{
-    merge_thread_queue_policy_patch, parent_filter_arg, parse_apply_change_id, parse_source_arg,
+    merge_thread_queue_policy_patch, parent_filter_arg, parse_required_uuid, parse_source_arg,
     parse_status_arg, query_events_impl, status_filter_arg, BACKUP_SETTINGS_NAVIGATED,
 };
 use crate::core::store::{EventStore, StatusFilter};
@@ -705,7 +705,8 @@ mod build_query_events_response_tests {
 }
 
 // ============================================================================
-// `parse_apply_change_id` — the `apply_change` tool's required-UUID guard.
+// `parse_required_uuid`: the required-UUID guard behind `apply_change`'s
+// `change_id` and `apply_when_settled`'s `thread_id`.
 //
 // Pure synchronous fn (factored out of the handler so these validation
 // branches need no engine). The handler refuses to call the heavyweight
@@ -721,7 +722,7 @@ fn apply_change_rejects_missing_change_id() {
         json!({"change_id": ""}),
         json!({"change_id": "   "}),
     ] {
-        let out = parse_apply_change_id(&bad);
+        let out = parse_required_uuid(&bad, "change_id");
         assert!(
             matches!(&out, Err(msg) if msg.contains("change_id is required")),
             "{bad:?} should error as required, got: {out:?}"
@@ -731,7 +732,7 @@ fn apply_change_rejects_missing_change_id() {
 
 #[test]
 fn apply_change_rejects_malformed_change_id() {
-    let out = parse_apply_change_id(&json!({"change_id": "not-a-uuid"}));
+    let out = parse_required_uuid(&json!({"change_id": "not-a-uuid"}), "change_id");
     assert!(
         matches!(&out, Err(msg) if msg.contains("not a valid UUID")),
         "malformed change_id should error, got: {out:?}"
@@ -743,7 +744,7 @@ fn apply_change_accepts_valid_uuid_trimming_whitespace() {
     let id = Uuid::new_v4();
     // Surrounding whitespace is trimmed before parsing — the LLM occasionally
     // pads string args.
-    let out = parse_apply_change_id(&json!({"change_id": format!("  {id}  ")}));
+    let out = parse_required_uuid(&json!({"change_id": format!("  {id}  ")}), "change_id");
     assert_eq!(out.expect("valid padded UUID must parse"), id);
 }
 

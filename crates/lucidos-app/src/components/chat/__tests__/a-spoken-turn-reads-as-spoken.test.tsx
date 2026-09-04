@@ -8,11 +8,15 @@
  *  answer beside it: the talker says what an answer means. It is a transcript
  *  marker rather than step mechanics, so no control may hide it. No audio is
  *  kept, so the row is the only record that exists.
+ *
+ *  Both marks are the call icon alone. Neither may lose its accessible name
+ *  with its word, which is what the screen-reader cases here pin.
  */
 import { describe, expect, it } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { SpokenMessage, SpokenReply } from '../chat-exchange-parts';
-import { describeInitiator } from '../ChatExchange';
+import { SpokenChip, SpokenReply } from '../chat-exchange-parts';
+import { describeInitiator, isUserBubbleEvent } from '../ChatExchange';
+import { vnodeToText } from './vnodeToText';
 import { drawsResponseRow, getCollapsedVisibleEvents } from '../../../store/event-rendering';
 import { exchangeResponseEvents } from '../../../store/thread-events';
 import type { Exchange } from '../../../store/thread-events';
@@ -49,6 +53,16 @@ function findByRole(node: ComponentChildren, role: string): AnyVNode | null {
   return findByRole(v.props?.children, role);
 }
 
+/** Is `text` carried by a `.visually-hidden` span, i.e. present for a screen
+ *  reader and absent from the page? That is how both call marks keep the word
+ *  they no longer print.
+ *
+ *  Over `vnodeToText`, the shared walker, which surfaces `class` for exactly
+ *  this kind of structural assertion. */
+function hasHiddenName(node: ComponentChildren, text: string): boolean {
+  return vnodeToText(node).includes(`<span class="visually-hidden">${text}</span>`);
+}
+
 const spokenRow = (over: Partial<Extract<ResponseEvent, { type: 'spoken_reply' }>> = {}) =>
   ({ type: 'spoken_reply', text: 'Both of them answered.', interrupted: false, ...over }) as const;
 
@@ -71,7 +85,6 @@ describe('a spoken message says so', () => {
       'tid',
     );
     expect(spoken.label).toBe('You');
-    expect(spoken.accent).toBe('spoken');
     expect(vnodeText(spoken.status)).toContain('Spoken');
 
     const typed = describeInitiator(
@@ -85,8 +98,31 @@ describe('a spoken message says so', () => {
       [],
       'tid',
     );
-    expect(typed.accent).toBeUndefined();
     expect(typed.status).toBeUndefined();
+  });
+
+  // The tint went with the word. A spoken bubble is the same message as a typed
+  // one, so it takes the same surface and the mark carries the whole fact.
+  it('takes no surface of its own', () => {
+    const spoken = describeInitiator(
+      exchangeWith({
+        type: 'MessageReceived',
+        text: 'is the deploy finished',
+        mode: 'human',
+        voice_session_id: 'sess-1',
+      }),
+      '<p>is the deploy finished</p>',
+      [],
+      'tid',
+    );
+    expect(spoken.accent).toBeUndefined();
+  });
+
+  it('is the call icon alone, and still says "spoken" to a screen reader', () => {
+    const chip = SpokenChip();
+    expect(findByRole(chip, 'spoken-chip')).not.toBeNull();
+    expect(vnodeText(chip)).toBe('Spoken');
+    expect(hasHiddenName(chip, 'Spoken')).toBe(true);
   });
 });
 
@@ -147,11 +183,12 @@ describe('what was said out loud is in the transcript', () => {
 });
 
 describe('a spoken reply is not the written answer', () => {
-  it('wears its own label, outside the response prose', () => {
+  it('wears its own mark, outside the response prose', () => {
     const row = SpokenReply({ event: spokenRow({ text: 'Both of them answered.' }) });
     expect(findByRole(row, 'spoken-reply')).not.toBeNull();
-    expect(vnodeText(row)).toContain('Said aloud');
     expect(vnodeText(row)).toContain('Both of them answered.');
+    // The word went; the accessible name it carried did not.
+    expect(hasHiddenName(row, 'Said aloud')).toBe(true);
   });
 
   it('says so when the caller talked over it', () => {
@@ -162,10 +199,52 @@ describe('a spoken reply is not the written answer', () => {
   });
 });
 
-describe('what the caller said out loud is in the transcript too', () => {
-  it('a spoken message the talker fielded alone becomes a row of its own', () => {
-    // It started no turn, so unlike a delegated utterance it is no
-    // `MessageReceived` and has no bubble anywhere else.
+/** One act, one shape. Which model fielded an utterance is a fact about
+ *  Lucidos, not about the reader, so it may not change how their own words
+ *  look. `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`. */
+describe('a caller utterance reads the same either way', () => {
+  const HTML = '<p>what happened?</p>';
+
+  const delegated = () => describeInitiator(
+    exchangeWith({
+      type: 'MessageReceived',
+      text: 'what happened?',
+      mode: 'human',
+      channel: 'chat',
+      voice_session_id: 'sess-1',
+    }),
+    HTML,
+    [],
+    'tid',
+  );
+
+  const fieldedAlone = () => describeInitiator(
+    exchangeWith({ type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'what happened?' }),
+    HTML,
+    [],
+    'tid',
+  );
+
+  it('is the same panel, whoever answered it', () => {
+    const a = delegated();
+    const b = fieldedAlone();
+    expect(b.variant).toBe(a.variant);
+    expect(b.label).toBe(a.label);
+    expect(b.accent).toBe(a.accent);
+    expect(b.summary).toBe(a.summary);
+    expect(vnodeToText(b.details)).toBe(vnodeToText(a.details));
+    expect(vnodeText(b.status)).toBe(vnodeText(a.status));
+  });
+
+  it('draws the right-aligned user bubble on both', () => {
+    expect(isUserBubbleEvent({ type: 'MessageReceived' })).toBe(true);
+    expect(isUserBubbleEvent({ type: 'SpokenMessageReceived' })).toBe(true);
+    expect(delegated().variant).toBe('user');
+    expect(fieldedAlone().variant).toBe('user');
+  });
+
+  it('carries the words, and never an inline row of its own', () => {
+    expect(vnodeToText(fieldedAlone().details)).toContain('what happened?');
     const events = exchangeResponseEvents(
       exchangeWith({ type: 'MessageReceived', text: 'hi', mode: 'human' }, [
         {
@@ -174,20 +253,12 @@ describe('what the caller said out loud is in the transcript too', () => {
         },
       ]),
     );
-    expect(events).toContainEqual({ type: 'spoken_message', text: 'What happened?' });
-  });
-
-  it('wears the caller label, and draws with the steps control OFF', () => {
-    const row = SpokenMessage({ event: { type: 'spoken_message', text: 'What happened?' } });
-    expect(findByRole(row, 'spoken-message')).not.toBeNull();
-    expect(vnodeText(row)).toContain('You said');
-    expect(vnodeText(row)).toContain('What happened?');
-    expect(drawsResponseRow({ type: 'spoken_message', text: 'What happened?' }, false)).toBe(true);
+    expect(events).toEqual([]);
   });
 });
 
-describe('a spoken turn said before any turn existed still draws', () => {
-  it('a greeting boundary carries the words in its own panel', () => {
+describe('a greeting said before any turn existed still draws', () => {
+  it('carries the words in its own panel', () => {
     const panel = describeInitiator(
       exchangeWith({
         type: 'SpokenReplyGenerated',
@@ -200,17 +271,5 @@ describe('a spoken turn said before any turn existed still draws', () => {
       'tid',
     );
     expect(vnodeText(panel.details)).toContain('Hi there. How can I help?');
-  });
-
-  it('a caller utterance boundary reads as theirs, spoken', () => {
-    const panel = describeInitiator(
-      exchangeWith({ type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'Are you there?' }),
-      '',
-      [],
-      'tid',
-    );
-    expect(panel.label).toBe('You');
-    expect(panel.accent).toBe('spoken');
-    expect(vnodeText(panel.details)).toContain('Are you there?');
   });
 });

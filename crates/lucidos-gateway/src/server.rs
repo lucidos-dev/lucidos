@@ -388,18 +388,19 @@ impl GatewayState {
         }
     }
 
-    /// Say that a caller presenting a device cookie was turned away.
+    /// Say that a caller carrying cookies was turned away.
     ///
     /// The one question this answers is the one a refused user asks: the store
     /// lists my phone, so why the pairing screen? Names and counts only, never
     /// a credential, and at most one line a minute.
     ///
-    /// A caller with no device cookie at all is silent. That is a browser that
-    /// has never paired, which is the ordinary first run rather than a fault.
+    /// Silence is [`auth::refusal_is_worth_logging`]'s call, and it turns on
+    /// having no cookie AT ALL rather than no credential. Counting credentials
+    /// alone made the split-jar bug silent: the reader saw none and read a
+    /// paired phone as a browser that had never paired.
     pub fn log_device_refusal(&self, headers: &axum::http::HeaderMap) {
-        let (presented, own_name) =
-            auth::presented_credential_summary(headers, &self.inner.device_cookie_name);
-        if presented == 0 {
+        let audit = auth::presented_credential_summary(headers, &self.inner.device_cookie_name);
+        if !auth::refusal_is_worth_logging(audit) {
             return;
         }
         let allowed = self
@@ -414,8 +415,7 @@ impl GatewayState {
         crate::log!(
             "{}",
             auth::refusal_line(
-                presented,
-                own_name,
+                audit,
                 &self.inner.device_cookie_name,
                 self.paired_devices().devices.len(),
             )

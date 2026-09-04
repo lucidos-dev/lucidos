@@ -48,6 +48,7 @@ mod pending_apply_actors;
 pub(crate) mod preferences;
 pub mod release_notices;
 mod session_seed;
+pub mod standing_apply;
 pub mod startup_lease;
 pub mod supervisor_respawn_sidecar;
 pub mod thread_events;
@@ -207,6 +208,17 @@ impl InjectedPromptKind {
             self,
             Self::ReentryFromEngine | Self::ReentryFromWait | Self::SpokenAside
         )
+    }
+
+    /// Whether a prompt of this kind can be the REASON a turn runs.
+    ///
+    /// A spoken aside cannot, and is the only kind that cannot. It reports
+    /// what the talker said out loud, so it starts nothing (ADR 0149) and only
+    /// rides a round that was running anyway. Two paths ask this: one decides
+    /// whether a finished answer reopens, the other whether an orphan is
+    /// re-submitted.
+    pub(crate) fn can_carry_a_turn(&self) -> bool {
+        !matches!(self, Self::SpokenAside)
     }
 }
 
@@ -711,6 +723,11 @@ pub struct LucidosEngine {
     /// auto-trait-check for Send.
     pub(crate) apply_all_drive_tx:
         tokio::sync::mpsc::UnboundedSender<apply_all_driver::ApplyAllDriveMsg>,
+    /// Threads carrying a *standing apply*: the owner's instruction to apply a
+    /// change once the thread settles (ADR 0168 clause 5). The in-memory half
+    /// of `standing_applies`, so the bus subscriber filters on a lock rather
+    /// than a query. See `engine::standing_apply`.
+    pub(crate) standing_applies: Arc<standing_apply::ArmedThreads>,
     /// Weak self-reference for spawning background tasks that need Arc<Self>
     self_arc: std::sync::OnceLock<std::sync::Weak<LucidosEngine>>,
     /// EventBus — single emission point for all domain events.

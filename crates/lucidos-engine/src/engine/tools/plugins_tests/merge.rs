@@ -454,6 +454,124 @@ async fn unmodified_file_is_plainly_replaced() {
     let _ = std::fs::remove_dir_all(&ws);
 }
 
+/// The repro: the user edits files, publishes those edits upstream, then
+/// updates back onto their own work. Every path they sent is byte-identical to
+/// what the new version ships, so only the one they held back is a decision.
+/// The panel counts what this plan holds, so an extra row is an extra question
+/// about a file nothing can happen to.
+#[tokio::test]
+async fn a_file_already_equal_to_the_new_version_is_not_a_local_change() {
+    let ws = fresh_workspace();
+    let bus = MockEventBus::new();
+    let files: &[(&str, &[u8])] = &[
+        ("knowhow/notes.md", NOTES.as_bytes()),
+        ("apps/demo/index.html", b"<h1>v1</h1>\n"),
+    ];
+    install_first(&ws, &bus, files).await;
+
+    // Published upstream: their edit IS v2's content.
+    let published = notes_with_user_section(NOTES);
+    write_data(&ws, "knowhow/notes.md", &published);
+    // Held back: still only theirs.
+    write_data(&ws, "apps/demo/index.html", "<h1>mine</h1>\n");
+    let base = baseline(&bus, &["knowhow/notes.md", "apps/demo/index.html"]);
+
+    let root = stage(
+        &ws,
+        "2.0.0-preview",
+        MANIFEST_V2,
+        &[
+            ("knowhow/notes.md", published.as_bytes()),
+            ("apps/demo/index.html", b"<h1>v2</h1>\n"),
+        ],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = super::plan_local_changes(&ws, &base, &planned);
+
+    let listed: Vec<String> = plan
+        .preview_json()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["apps/demo/index.html".to_string()],
+        "only the file that really differs from upstream is a decision"
+    );
+
+    // And clearing the keep control acts on that one file alone: the published
+    // edit is not "discarded", so nothing is copied aside for it.
+    let outcome = update(
+        &ws,
+        &bus,
+        MANIFEST_V2,
+        &[
+            ("knowhow/notes.md", published.as_bytes()),
+            ("apps/demo/index.html", b"<h1>v2</h1>\n"),
+        ],
+        &base,
+        false,
+    )
+    .await;
+    assert_eq!(outcome.replaced, vec!["apps/demo/index.html".to_string()]);
+    assert!(outcome.merged.is_empty() && outcome.conflicted.is_empty());
+    assert_eq!(
+        outcome.saved_paths,
+        vec![
+            "artifacts/plugin-local-changes/demo/v2.0.0/apps/demo/index.html".to_string(),
+            "artifacts/plugin-local-changes/demo/v2.0.0/apps/demo/index.html.patch".to_string(),
+            "artifacts/plugin-local-changes/demo/v2.0.0/README.md".to_string(),
+        ],
+        "a file already equal to upstream has nothing to save aside"
+    );
+    assert_eq!(
+        read_data(&ws, "knowhow/notes.md"),
+        published,
+        "and it lands as the new version ships it, which is what it already was"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// A path the panel says nothing about is still watched. The user edited it
+/// once, so they can edit it again while the panel sits open, and that edit is
+/// real work. Silent in the list must not mean unguarded at confirm.
+#[tokio::test]
+async fn a_file_dropped_for_matching_upstream_is_still_drift_checked() {
+    let ws = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(&ws, &bus, &[("knowhow/notes.md", NOTES.as_bytes())]).await;
+    let published = notes_with_user_section(NOTES);
+    write_data(&ws, "knowhow/notes.md", &published);
+    let base = baseline(&bus, &["knowhow/notes.md"]);
+
+    let root = stage(
+        &ws,
+        "v2",
+        MANIFEST_V2,
+        &[("knowhow/notes.md", published.as_bytes())],
+    );
+    let (_, planned) = validate_tree(&root).unwrap();
+    let plan = super::plan_local_changes(&ws, &base, &planned);
+    assert!(
+        plan.preview_json().as_array().unwrap().is_empty(),
+        "nothing to decide, so nothing to list"
+    );
+    assert!(
+        plan.detect_drift(&ws).is_none(),
+        "clean right after staging"
+    );
+
+    write_data(&ws, "knowhow/notes.md", "something else entirely\n");
+    assert_eq!(
+        plan.detect_drift(&ws).as_deref(),
+        Some("knowhow/notes.md"),
+        "an edit inside the staging window must still stop the confirm"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
 /// The panel's keep control switched off: clean upstream everywhere, but the
 /// discarded edit is still preserved rather than deleted.
 #[tokio::test]
@@ -858,6 +976,36 @@ async fn nothing_to_propose_without_a_real_local_edit() {
     assert!(
         super::local_patch(&ws, &base).is_none(),
         "a trigger projection diff describes the serializer, not the user"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+/// A path reaches `modified_paths` on a mode change alone, and identical
+/// content has no diff. The proposal must then offer nothing, rather than a
+/// patch header with no hunks under it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mode_only_change_proposes_no_patch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ws = fresh_workspace();
+    let bus = MockEventBus::new();
+    install_first(&ws, &bus, &[("scripts/run.sh", NOTES.as_bytes())]).await;
+    let base = baseline(&bus, &["scripts/run.sh"]);
+
+    std::fs::set_permissions(
+        data_path(&ws, "scripts/run.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(
+        super::modification_status_for(&ws, &base.commit, &base.files).modified,
+        "test premise: a chmod alone already reads as modified"
+    );
+
+    assert!(
+        super::local_patch(&ws, &base).is_none(),
+        "unchanged content has nothing to propose"
     );
     let _ = std::fs::remove_dir_all(&ws);
 }

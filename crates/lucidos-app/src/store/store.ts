@@ -1521,6 +1521,25 @@ export const applyingNowThreadIds = signal<Map<string, 'requesting' | 'applying'
  *  background, including a multi-minute wait while it hardens an unhardened
  *  member. Without this the button reads as dead the whole time. */
 export const applyAllInProgress = signal(false);
+/** Threads carrying a *standing apply*: the owner's instruction to apply their
+ *  change once the thread settles (ADR 0168 clause 5).
+ *
+ *  Keyed by thread rather than by change, because a sweep arms a thread that has
+ *  proposed nothing yet. Seeded from `GET /api/v1/changes` so a reload keeps the
+ *  armed state, and kept live by the StandingApplyArmed / StandingApplyDropped
+ *  SSE events. */
+export const standingApplyThreadIds = signal<Set<string>>(new Set());
+/** Coding-agent threads still working, so an Apply All sweep has something to
+ *  arm. Served by `GET /api/v1/changes`, because the panel cannot derive it:
+ *  `threadMap` holds only the loaded window. */
+export const workingThreadCount = signal(0);
+/** Threads whose arm or disarm request is in flight, so a second tap can't fire
+ *  a duplicate. */
+export const armingStandingApplyThreadIds = signal<Set<string>>(new Set());
+/** The workspace-scope disarm is in flight, so a second tap can't fire a
+ *  duplicate. Read by the handler to drop that tap, never to draw the control
+ *  disabled: ADR 0168 keeps the explaining tooltip reachable. */
+export const disarmingAllStandingApply = signal(false);
 /** Thread IDs where archive is in progress (prevents duplicate API calls). */
 export const archivingThreadIds = signal<Set<string>>(new Set());
 /** Thread IDs whose change discard is in progress: hides Apply, shows "Discard...". */

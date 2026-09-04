@@ -77,7 +77,13 @@ test.describe('Queued chat messages', () => {
           const at = document.elementFromPoint(cx + dx, cy + dy);
           return !!at && (at === btn || btn.contains(at));
         };
-        const reach = 2.25 * root / 2;
+        // The overlay is taller than it is wide, so each axis has its own
+        // reach. Read them off the pseudo-element rather than restating the
+        // rule: this test asks where a thumb lands, and the source scan in
+        // styles/__tests__/trash-icon-optical-size.test.ts owns the values.
+        const overlay = getComputedStyle(btn, '::before');
+        const reachX = parseFloat(overlay.width) / 2;
+        const reachY = parseFloat(overlay.height) / 2;
         const stamp = btn.closest('.initiator-header')!
           .querySelector('.initiator-timestamp') as HTMLElement;
         const stampBox = stamp.getBoundingClientRect();
@@ -95,17 +101,27 @@ test.describe('Queued chat messages', () => {
           // rather than the header around it.
           fieldHeight: btn.closest('.exchange-status-label')!.getBoundingClientRect().height,
           lineHeight: parseFloat(line) * root,
-          insideTarget: [hits(-(reach - 2), 0), hits(reach - 2, 0), hits(0, -(reach - 2)), hits(0, reach - 2)],
-          pastTarget: [hits(-(reach + 3), 0), hits(reach + 3, 0)],
+          targetHeight: parseFloat(overlay.height),
+          fullTarget: 2.25 * root,
+          insideTarget: [hits(-(reachX - 2), 0), hits(reachX - 2, 0), hits(0, -(reachY - 2)), hits(0, reachY - 2)],
+          // Both axes stop where the overlay says they do. These probes read
+          // the same box, so they cannot catch a target that grew back over
+          // the words: `labelClearance` below is what does that.
+          pastTarget: [hits(0, -(reachY + 3)), hits(0, reachY + 3), hits(-(reachX + 3), 0), hits(reachX + 3, 0)],
           stampIsOwnTarget: atStampEdge === stamp || stamp.contains(atStampEdge),
-          labelClearance: (cx - reach) - labelRight,
+          labelClearance: (cx - reachX) - labelRight,
         };
       });
 
-      // A thumb landing anywhere in the 2.25rem target still hits the trash,
-      // which is what the box used to guarantee and the overlay now does.
-      expect(measured.insideTarget, 'the tap target no longer covers 2.25rem').toEqual([true, true, true, true]);
-      expect(measured.pastTarget, 'the tap target reaches past 2.25rem').toEqual([false, false]);
+      // A thumb landing anywhere in the target still hits the trash, which is
+      // what the box used to guarantee and the overlay now does.
+      expect(measured.insideTarget, 'the tap target no longer covers its own box').toEqual([true, true, true, true]);
+      expect(measured.pastTarget, 'the tap target reaches past its own box')
+        .toEqual([false, false, false, false]);
+      // And it spends its whole reach on the axis that has room. Half a pixel
+      // of slack, for the sub-pixel rounding a scaled root can leave.
+      expect(measured.targetHeight, 'the target gave up height it had room for')
+        .toBeCloseTo(measured.fullTarget, 0);
       // And it takes no space in the line it interrupts. The reported defect
       // was the button holding this field at 2.25rem, nearly twice the row
       // unit, with the extra showing as air around the glyph.
@@ -113,11 +129,10 @@ test.describe('Queued chat messages', () => {
         Math.abs(measured.fieldHeight - measured.lineHeight),
         `status field ${measured.fieldHeight}px against a row unit of ${measured.lineHeight}px`,
       ).toBeLessThan(1.5);
-      // The overlay reaches past the glyph, so both neighbours have to keep
-      // their own ground. The timestamp is a button of its own, and the label
-      // is what the clickable header folds the turn on. The label side is the
-      // thinner of the two and the only one nothing else would catch: the
-      // 0.375rem gap against a reach the chip and the glyph size both feed.
+      // Both neighbours keep their own ground. The timestamp is a button of
+      // its own. The label is inert text, so an overlay over it would turn a
+      // tap on a status word into a delete. The label side is the thinner of
+      // the two and the only one nothing else would catch.
       expect(measured.stampIsOwnTarget, 'the trash overlay swallowed the timestamp button').toBe(true);
       expect(
         measured.labelClearance,

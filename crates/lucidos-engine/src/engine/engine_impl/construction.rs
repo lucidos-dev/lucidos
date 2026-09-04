@@ -1370,6 +1370,7 @@ impl LucidosEngine {
                 APPLY_ALL_DRIVE_RX.with(|cell| cell.borrow_mut().replace(rx));
                 tx
             },
+            standing_applies: Arc::new(crate::engine::standing_apply::ArmedThreads::default()),
             self_arc: std::sync::OnceLock::new(),
             trigger_configs,
             trigger_groups: Arc::new(std::sync::RwLock::new(HashMap::new())),

@@ -13,17 +13,39 @@
 //! The request carries a bearer this cycle minted. It is refused like any wrong
 //! token, and `api::webhooks::stamp_refused` recognises it and leaves the
 //! hook's refusal stamp alone.
+//!
+//! A family that failed everywhere gets a second reading before the probe
+//! blames the ingress. A host that cannot open the funnel port to anything is
+//! describing its own network, not the far side.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use crate::core::webhook_ingress::{classify_status, AddressProbe, Family, Stage};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+use crate::core::webhook_ingress::{
+    classify_status, nothing_answered, AddressProbe, Family, Stage,
+};
 
 /// How long one request gets, connect and read together.
 ///
 /// The scheduler runs this every 15 minutes, so a slow answer costs nothing.
 /// A wedged relay must still give up long before the next cycle.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long one egress dial gets.
+///
+/// Well under `PROBE_TIMEOUT`, because this asks only whether a handshake
+/// starts. A filtered port stays silent, and waiting on silence buys nothing.
+const EGRESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The port the egress check compares the funnel port against.
+///
+/// A funnel already on 443 has nothing to compare against, so the question is
+/// not asked there. That costs nothing: 443 is the port a network almost never
+/// filters, so the reading this check exists to correct does not arise on it.
+const REFERENCE_PORT: u16 = 443;
 
 /// Longest `detail` line a payload carries. A TLS stack can hand back a
 /// paragraph, and this is read on a settings row.
@@ -94,9 +116,11 @@ pub async fn probe_all(
     routes: LocalRoutes,
 ) -> Vec<AddressProbe> {
     let mut results = Vec::with_capacity(addresses.len());
+    let mut dialled = Vec::with_capacity(addresses.len());
     for address in addresses {
         let address = normalize(*address);
         let family = family_of(&address);
+        dialled.push(address);
         if routes.covers(family) {
             results.push(probe_one(target, address, family).await);
         } else {
@@ -109,7 +133,109 @@ pub async fn probe_all(
             });
         }
     }
+    explain_local_egress(target.port, &dialled, &mut results).await;
     results
+}
+
+/// Ask whether this host could send at all, for a family that failed everywhere.
+///
+/// Only a failure is worth explaining, so the healthy path never dials. One
+/// answer of any kind already proves the port leaves this machine, and
+/// `nothing_answered` is the gate that says so.
+async fn explain_local_egress(port: u16, dialled: &[IpAddr], results: &mut [AddressProbe]) {
+    for family in Family::BOTH {
+        if !nothing_answered(results, family) {
+            continue;
+        }
+        let of_family: Vec<IpAddr> = dialled
+            .iter()
+            .copied()
+            .filter(|address| family_of(address) == family)
+            .collect();
+        if port_egress(port, &of_family).await == PortEgress::Blocked {
+            blame_local_egress(results, family, port);
+        }
+    }
+}
+
+/// Blame this host for a family whose every request stayed in the building.
+fn blame_local_egress(results: &mut [AddressProbe], family: Family, port: u16) {
+    for probe in results.iter_mut().filter(|probe| probe.family == family) {
+        probe.stage = Stage::LocalEgressBlocked;
+        probe.detail = Some(format!("this host cannot reach port {port} on any address"));
+    }
+}
+
+/// Whether this host can open a port to anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortEgress {
+    /// Something answered on the port, so it leaves this machine.
+    Open,
+    /// Nothing answered on the port, and something answered on the reference
+    /// port. The network under this host filters the port.
+    Blocked,
+    /// Neither port answered, so the addresses are out of reach. That is not a
+    /// fact about this host, so nothing here excuses the ingress.
+    Unknown,
+}
+
+/// Can this host open the funnel port to any of these addresses?
+///
+/// A dial can only ever prove that a port WORKS. A completed handshake and a
+/// refusal both mean a packet left and an answer came back. Silence says
+/// nothing on its own, because a target that serves nothing on a port is silent
+/// too. The reference port supplies the missing half: an address that answers
+/// on 443 and stays silent on the funnel port is reachable, and the port is not.
+///
+/// `docs/adr/0172-a-blocked-port-is-not-a-dead-ingress.md` rejects dialling an
+/// unrelated public host on the funnel port, and carries the measurements that
+/// rule it out. It also names the one fault this reading cannot tell apart.
+async fn port_egress(port: u16, addresses: &[IpAddr]) -> PortEgress {
+    // The reference leg is asked only when the funnel port stayed silent, so a
+    // working port costs one round rather than two.
+    let on_port = any_answers(addresses, port).await;
+    let on_reference =
+        !on_port && port != REFERENCE_PORT && any_answers(addresses, REFERENCE_PORT).await;
+    read_egress(on_port, on_reference)
+}
+
+/// What the two legs add up to.
+///
+/// `Blocked` needs both of them: silence on the funnel port, and an answer on
+/// the reference port from the same addresses. A relay that is merely down is
+/// silent on both, which is why it reads `Unknown` rather than blaming anybody.
+fn read_egress(on_port: bool, on_reference: bool) -> PortEgress {
+    match (on_port, on_reference) {
+        (true, _) => PortEgress::Open,
+        (false, true) => PortEgress::Blocked,
+        (false, false) => PortEgress::Unknown,
+    }
+}
+
+/// Did any of these addresses answer on this port?
+///
+/// Stops at the first one that does, so a working port costs one dial.
+async fn any_answers(addresses: &[IpAddr], port: u16) -> bool {
+    for address in addresses {
+        if answers_on(*address, port).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Did this address answer on this port?
+///
+/// A completed handshake and a refusal both count. Each proves a packet left
+/// and an answer came back, which is the whole question. The socket is dropped
+/// at once, because nothing is ever sent on it.
+async fn answers_on(address: IpAddr, port: u16) -> bool {
+    let target = SocketAddr::new(address, port);
+    match timeout(EGRESS_PROBE_TIMEOUT, TcpStream::connect(target)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+        Err(_) => false,
+    }
 }
 
 /// One request to one address.

@@ -109,6 +109,87 @@ impl LucidosEngine {
         });
     }
 
+    /// One Apply All press, engine side.
+    ///
+    /// Filters the pending list exactly as the button's rule says, then arms
+    /// the sweep when the owner asked. It seeds a batch and applies its first
+    /// member synchronously, so the caller has a real result. The driver takes
+    /// the rest.
+    ///
+    /// Both surfaces call this: the HTTP handler and the agent's
+    /// `apply_as_they_settle`. Neither owns the rule, which is what stops the
+    /// tool quietly becoming a second Apply All with no batch behind it.
+    pub(crate) async fn run_apply_all(
+        self: &std::sync::Arc<Self>,
+        actor: Option<MessageOrigin>,
+        keep_going: bool,
+    ) -> Result<ApplyAllOutcome, sqlx::Error> {
+        let all_pending = self.changes().list_pending().await?;
+        let total_pending = all_pending.len();
+        // Exclude changes whose thread has not settled: mid-turn, or parked and
+        // due to wake (ADR 0106). This path calls `apply_change` directly, which
+        // bypasses the per-change `guard_change_action` gate. Without it we
+        // would merge a branch the coding agent is still committing on, racing
+        // the session's next proposal (real thread 76b4ee76).
+        //
+        // "Keep going as the rest settle" is what the sweep answers those
+        // dropped changes with: not applied now, applied when their thread
+        // lands.
+        let live_filtered =
+            crate::core::changes::drop_unsettled_thread_changes(self.pool(), all_pending).await?;
+        let unsettled = total_pending - live_filtered.len();
+        // Also drop changes with no files left. The per-change endpoint 409s
+        // those, and this path would otherwise do what the button refuses:
+        // merge no-op commits, possibly spending a harden run on an empty diff.
+        let pending = crate::core::changes::drop_empty_changes(live_filtered);
+        let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();
+
+        // Arm BEFORE the first apply. That apply is awaited here and can spend
+        // minutes hardening, and an instruction the owner gave must not wait on
+        // it.
+        let armed = if keep_going {
+            self.sweep_standing_applies(Some(Uuid::new_v4()), actor.clone(), &change_ids)
+                .await
+        } else {
+            0
+        };
+
+        let Some(first) = pending.first() else {
+            return Ok(ApplyAllOutcome::NothingToApply {
+                total_pending,
+                unsettled,
+                armed,
+            });
+        };
+        let batch_id = self
+            .start_apply_all_batch(change_ids.clone(), actor.clone())
+            .await;
+        let first_result = self.apply_change(first.id, actor).await;
+        // Some apply_change outcomes emit no per-change terminator to notify the
+        // driver: `Noop` (already applied), `Conflict` (CC handles it later via
+        // emit_change_applied/_failed), and several early-Err paths
+        // (change-not-found, status-mismatch). Notify explicitly for the cases
+        // that would otherwise leave the batch stalled on the first change
+        // forever. The driver's record_* methods are first-write-wins, so
+        // over-notification is safe.
+        match &first_result {
+            Ok(r) if matches!(r.status, crate::engine::ApplyStatus::Noop) => {
+                self.notify_apply_all(ApplyAllDriveMsg::Applied(first.id));
+            }
+            Err(e) => {
+                self.notify_apply_all(ApplyAllDriveMsg::Failed(first.id, e.to_string()));
+            }
+            _ => {}
+        }
+        Ok(ApplyAllOutcome::Started {
+            batch_id,
+            batch_size: change_ids.len(),
+            armed,
+            first_branch: first.branch_name.clone(),
+            first_result: first_result.map_err(|e| e.to_string()),
+        })
+    }
+
     /// Seed a new Apply All batch. Emits the durable `ApplyAllBatchStarted`
     /// event (recoverable on restart) and adds the live batch to the
     /// in-memory registry. Returns the batch_id so the HTTP handler can
@@ -504,6 +585,25 @@ impl LucidosEngine {
             }
         }
     }
+}
+
+/// What one Apply All press did, for the surface that made it.
+pub(crate) enum ApplyAllOutcome {
+    /// A batch started, and its first member has already been applied.
+    Started {
+        batch_id: Uuid,
+        batch_size: usize,
+        armed: usize,
+        first_branch: String,
+        first_result: Result<crate::engine::ApplyResult, String>,
+    },
+    /// Nothing could be applied right now. The two counts are what lets the
+    /// caller name the real reason rather than one blanket refusal.
+    NothingToApply {
+        total_pending: usize,
+        unsettled: usize,
+        armed: usize,
+    },
 }
 
 /// What `advance_apply_all_batch` decided to do once it released the

@@ -168,6 +168,24 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
     groups
 }
 
+/// Whether a drained injection set is worth reopening a finished answer for.
+///
+/// The final-answer path is the last chance to ingest a follow-up that landed
+/// mid-call. Taking it costs a whole extra round, so a set carrying no
+/// follow-up must not buy one.
+///
+/// A set of spoken asides alone carries no follow-up, per
+/// [`InjectedPromptKind::can_carry_a_turn`]. `drain_turn_orphans` drops one a
+/// moment later for the same reason, so the two windows agree rather than a
+/// race deciding.
+///
+/// Mixed with a real follow-up the set still reopens, and the aside rides
+/// along in the appended message. That is the case
+/// `TurnStarter::overheard` exists for.
+pub(crate) fn injections_reopen_a_finished_answer(prompts: &[InjectedPrompt]) -> bool {
+    prompts.iter().any(|p| p.kind.can_carry_a_turn())
+}
+
 /// Where a framed injection is being delivered — the half of the framing the
 /// prompt itself can't carry.
 ///

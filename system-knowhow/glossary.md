@@ -688,6 +688,17 @@ A per-*thread*, *Lucidos Agent*-maintained list of *todo items* the agent is wor
 ### Top-thread
 A spawn with `relation: "top"` (the CLI default for `lucidos spawn-thread`). Has no parent and no callback wiring, so it appears in the main thread list as an independent top-level thread. The *spawning thread* is **not** resumed when it finishes. It still records WHO launched it: the route popover on its first message names the spawning thread and links to it. "No parent" is about the callback, not about provenance.
 
+**No parent means the workspace, and two top-threads are siblings.** The workspace is the root every top-thread sits directly under (ADR 0168 clause 1). It is a container and never a place work runs, so nothing holds a turn there and nothing can be delegated to it. Neither sibling has standing over the other: a top-thread reaches its own descendants on its own authority, and anything wider is the *workspace owner*'s button.
+
+### Standing instruction
+What lets a *thread* press one of the *workspace owner*'s buttons while the owner is not watching. A thread acts inside its own subtree on its own authority; anything wider needs this. Two shapes qualify and no third.
+
+**A turn the owner opened.** They spoke into the thread from one of their own devices, and their words in that turn are the press. A turn the engine re-opened after a restart is not one, so a resumed thread carries none until the owner speaks again.
+
+**A *trigger* firing the owner authorized.** The same decision, made in advance: they wrote the trigger, or switched it on. A trigger an agent wrote and fired carries nothing, or any thread could hand itself the owner's authority.
+
+Nothing is inherited. A thread you spawn opens its own turn, so it carries none of yours. See `system-knowhow/orchestrating-sub-threads.md` for what this permits and refuses.
+
 <!--gloss-trigger-start-->
 ### Trigger
 A workspace configuration that fires either on a schedule (`run.cron`) or on one of its *event subscriptions* (`on`). The `run` is one of two shapes:
@@ -760,15 +771,21 @@ A session starts from the **call toggle** in the prompt input, a handset beside 
 
 **A call runs on a chat thread the Lucidos Agent holds, and nowhere else.** Moving the destination to a coding agent while a call is up therefore ends it, and says so. A *coding-agent thread* offers no call at all: the handset is absent there, and the engine refuses one placed any other way.
 
-While a call is up, the handset turns red, and that is the whole of it on screen. There is no separate panel to watch: what each of you says lands in the thread itself, as it is said. Speaking over the assistant stops it mid-word, as it would on the phone.
+While a call is up, the handset turns red, and there is no separate panel to watch. What each of you says lands in the thread itself, as it is said. Your own bubble appears the moment you start speaking, and pulses until your words arrive in it. Speaking over the assistant stops it mid-word, as it would on the phone.
 
 **Experimental, and off until you turn it on.** The switch is **Settings → Models → Voice**. The same place holds the two models a call uses, the voice it speaks in, and what it loads before it starts. One model does the talking, and the other turns your speech into text. A call that cannot find a talker says so and offers a button straight there.
 
-**Speaking wakes the thread.** Each finished sentence lands as a message and starts an ordinary turn, the same one typing would. So a spoken question costs a full turn, and a short call can cost several.
+**Speaking wakes the thread**, unless Lucidos answers you itself. A sentence it hands on lands as a message and starts an ordinary turn, the same one typing would. One it answers from what it already knows starts nothing, and is written down all the same.
+
+**You can answer out loud what Lucidos is waiting on.** A question it asked, or a permission it needs, is read to you on the call, and saying which one you want settles it. That writes the same thing the buttons on screen write. The two widest "Always allow" choices stay on screen only, so a permission by voice is allow once, allow for this conversation, or no. While something is waiting, a new request is not started: Lucidos is stuck inside the question, and says so.
+
+**Saying you are done ends the call.** "That's all, thanks" rings off after the goodbye, and work already running keeps running.
 
 **The audio is thrown away, the words are not.** Nothing is recorded. The thread keeps what you said, what the assistant answered, and what was actually said out loud. It also keeps when the session opened and closed, and what the call spent. Read the conversation back afterwards like any other.
 
-**The transcript says which of it was spoken.** A message you spoke is marked "Spoken", so a conversation you half spoke and half typed reads back correctly. What was said out loud appears in a "Said aloud" bubble inside the turn, marked as cut off if you talked over it.
+**The transcript says which of it was spoken.** A message you spoke carries a small handset above it, so a conversation you half spoke and half typed reads back correctly. The bubble itself is the one a typed message gets. A message wears that mark whether the assistant answered you straight away or had to go and look. An answer you speak to a question it asked is written as the answer itself, on the card.
+
+**What the assistant said out loud is a bubble inside the turn**, under the same handset. It is marked as cut off if you talked over it. It sits beside the written answer rather than instead of it, the two being different things.
 
 **What you hear is not what you read.** The written answer is for reading, and can carry tables, code and links. So the spoken reply is what that answer *means*, in a sentence or two. A long answer is spoken as the short version plus an offer of the detail. The full text is waiting in the thread either way.
 
@@ -918,6 +935,19 @@ One packaged failure is reported differently from the rest, and it is worth know
 
 ### Apply All
 The user-clicked action that triggers an *Apply* on every pending *change* in one batch. UI button label: **Apply All** (sibling to per-row *Apply* / Discard on the changes panel). The batch skips exactly what a per-row *Apply* refuses — changes whose thread is still working, and changes with no file changes left — so the bulk path can't do what the button won't. Discard All skips neither. Engine emits `ApplyAllBatchStarted` with the full change-id list + actor, then advances the batch as each member's `ChangeApplied` / `ChangeApplyFailed` event lands, and emits `ApplyAllBatchCompleted` with `applied: Vec<Uuid>` + `failed: Vec<ApplyFailure>` when every member has resolved. Member status is first-write-wins — one failure does not abandon the rest of the batch. Each member individually goes through the same *hardening* and restart-derivation rules as a single *Apply*. Persisted under aggregate `apply_all_batch`, `aggregate_id` = `batch_id` (UUID). While the batch runs, a sticky toast with a spinner shows progress and offers **Cancel** (`POST /api/v1/changes/apply-all/cancel`): the engine stops advancing to further members, interrupts the in-flight *hardening*/merge session, and marks the remaining members `failed` with "Apply All canceled" so the batch resolves and `ApplyAllBatchCompleted` still fires. Already-applied members stay applied; the rest return to pending (best-effort for an in-progress merge that already landed). A single *Apply* that woke a *hardening* or merge session can likewise be canceled from its *coding-agent thread* (the thread's Cancel button).
+
+**The checkbox beside it is the sweep.** *Keep going as the rest settle* adds a *standing apply* to every thread still working. Each one then applies as it lands, rather than waiting for you. With nothing appliable now, arming IS the action and the button reads **Apply as they settle**. The batch toast's **Cancel** takes the whole sweep back with it.
+
+### Standing apply
+The owner's instruction to *Apply* a *change* once its thread finishes. Pressed while the thread is still working, carried out by the engine later (ADR 0168 clause 5). It is what the Apply button becomes on a thread that has not settled: a control that cannot act is replaced by the one that can, so nothing on either surface renders disabled.
+
+Two forms. **Apply as it settles** arms one change, from the thread's own prompt row or its row in the Changes panel. **Apply as they settle**, the *Apply All* checkbox, arms every thread still working. Both read the same rule and both are one-shot.
+
+It always ends. The change applies the moment the thread finishes. A thread that parks or fails never settles by itself. The instruction is then dropped and reported, rather than left waiting. It acts only on the change it was armed for, so a second change the thread proposes afterwards is untouched.
+
+Cancel it from the same control you armed it with. Every control is a toggle, and they all show one state. In the **Changes panel** a change's row reads **✓ Applying as it settles** once armed. The bulk control above it reads **✓ Applying as they settle**, and cancels every standing apply here. On the **thread's own prompt row** it is a flag icon, filled once armed; its tooltip says the same thing.
+
+Cancelling stops what has not started. A change already merging or hardening finishes, and nothing already applied is undone. Stopping a running *Apply All* is its own Cancel, on the "Applying changes" notice.
 
 ### Cancel (Stop)
 The user-clicked **Stop** action on a working *coding-agent thread*. Behaves like pressing **Esc** in the *Claude Code* CLI: it *interrupts* the current turn but keeps the session resumable — the same `cc_session_id` and branch are preserved, so the next message continues the *same* conversation (a `--resume`) with full context. It is NOT a kill and NOT a fresh start. Emits `ResponseCanceled` (the visible "Canceled" chip) + `CodingAgentIdled` (the resume anchor). Distinct from *Apply* / Discard / Archive, which terminate the turn via their own lifecycle event. Routed through `interrupt_agent` (`POST /api/v1/claude-code/stop`, default `StopReason::UserStop`); a bounded fallback hard-stops only if the agent fails to honor the interrupt. Source: `crates/lucidos-engine/src/engine/claude_code/control.rs`, `agent_session/lifecycle.rs` (`SessionEndAction::KeepCanceledBranch`).

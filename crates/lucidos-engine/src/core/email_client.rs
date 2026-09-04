@@ -111,7 +111,10 @@ impl EmailClient {
         uid_list.reverse(); // newest first
 
         if uid_list.is_empty() {
-            session.logout().await?;
+            // Best-effort teardown: a `?` would discard a successful read
+            // when the server drops the connection instead of replying to
+            // LOGOUT (rust.md cleanup).
+            let _ = session.logout().await;
             return Ok(Vec::new());
         }
 
@@ -197,7 +200,10 @@ impl EmailClient {
             });
         }
 
-        session.logout().await?;
+        // Best-effort teardown: a `?` would discard the successful read above
+        // when the server drops the connection instead of replying to LOGOUT
+        // (rust.md cleanup).
+        let _ = session.logout().await;
 
         // Sort by UID descending (newest first)
         summaries.sort_by(|a, b| b.uid.cmp(&a.uid));
@@ -278,7 +284,10 @@ impl EmailClient {
         // Extract attachment metadata
         let attachments = extract_attachment_info(&parsed);
 
-        session.logout().await?;
+        // Best-effort teardown: a `?` would discard the successful read above
+        // when the server drops the connection instead of replying to LOGOUT
+        // (rust.md cleanup).
+        let _ = session.logout().await;
 
         Ok(EmailMessage {
             uid,
@@ -358,7 +367,10 @@ impl EmailClient {
 
         let data = part.contents().to_vec();
 
-        session.logout().await?;
+        // Best-effort teardown: a `?` would discard the successful read above
+        // when the server drops the connection instead of replying to LOGOUT
+        // (rust.md cleanup).
+        let _ = session.logout().await;
 
         Ok((filename, mime_type, data))
     }

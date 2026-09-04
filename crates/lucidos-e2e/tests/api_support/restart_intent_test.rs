@@ -1,4 +1,7 @@
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, register_device};
+
+/// The device both accepted-shaped calls name.
+const DEVICE: &str = "e2e-restart-intent-device";
 
 /// `POST /api/v1/internal/restart-intent` is how the workspace gateway tells an
 /// engine that a human asked for the teardown it is about to signal, so the
@@ -12,10 +15,15 @@ use crate::support::{base_url, http_client};
 async fn restart_intent_requires_a_device_and_refuses_a_proxied_caller() {
     let client = http_client();
     let url = format!("{}/api/v1/internal/restart-intent", base_url());
+    // The device the two calls below name. Registered, or the gate reads the
+    // header as a claim nobody backs and answers 401 before the route runs.
+    register_device(DEVICE).await;
 
-    // No device to name. `user_actor_resolved` would fall back to an `Api`
-    // actor, which is not the switch fingerprint: it would resume nothing while
-    // replacing the honest System attribution. Absent attribution stays absent.
+    // Nothing at all to name. `api::mutating_gate` answers first now, so this
+    // is the general refusal rather than the route's own. Either way absent
+    // attribution stays absent: it is never stashed as an `Api` actor, which
+    // is not the switch fingerprint and would resume nothing while replacing
+    // the honest System attribution.
     let no_device = client
         .post(&url)
         .send()
@@ -23,8 +31,8 @@ async fn restart_intent_requires_a_device_and_refuses_a_proxied_caller() {
         .expect("request to /api/v1/internal/restart-intent failed");
     assert_eq!(
         no_device.status(),
-        400,
-        "a caller with no device id must be refused, not stashed as an Api actor"
+        401,
+        "a caller with no identity must be refused, not stashed as an Api actor"
     );
 
     // Arrived through the gateway proxy, i.e. from a browser. The gateway
@@ -35,7 +43,7 @@ async fn restart_intent_requires_a_device_and_refuses_a_proxied_caller() {
     let proxied = client
         .post(&url)
         .header("x-forwarded-prefix", "/e2e-test/")
-        .header("x-lucidos-device-id", "e2e-restart-intent-device")
+        .header("x-lucidos-device-id", DEVICE)
         .send()
         .await
         .expect("request to /api/v1/internal/restart-intent failed");
@@ -50,7 +58,7 @@ async fn restart_intent_requires_a_device_and_refuses_a_proxied_caller() {
     // disposable workspace it changes nothing any later test observes.
     let accepted = client
         .post(&url)
-        .header("x-lucidos-device-id", "e2e-restart-intent-device")
+        .header("x-lucidos-device-id", DEVICE)
         .send()
         .await
         .expect("request to /api/v1/internal/restart-intent failed");

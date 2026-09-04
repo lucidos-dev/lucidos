@@ -52,8 +52,14 @@ const TALKER_MODELS = [
  *
  *  The second and last model in the voice loop. Nothing translates and nothing
  *  summarises: the language is a rule in the talker's own instructions, and the
- *  agent's answer reaches it as written. */
-const TRANSCRIBER_MODELS = [
+ *  agent's answer reaches it as written.
+ *
+ *  Live transcription leads, because it is the one built for a microphone: it
+ *  streams the transcript as the caller speaks. The rest transcribe a turn once
+ *  it is committed. Exported so a test can read the order. */
+export const TRANSCRIBER_MODELS = [
+  { value: 'gpt-live-transcribe', label: 'GPT live transcribe' },
+  { value: 'gpt-transcribe', label: 'GPT transcribe' },
   { value: 'gpt-4o-mini-transcribe', label: 'GPT-4o mini transcribe' },
   { value: 'gpt-4o-transcribe', label: 'GPT-4o transcribe' },
   { value: 'whisper-1', label: 'Whisper' },

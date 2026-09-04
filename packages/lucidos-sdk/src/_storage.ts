@@ -44,6 +44,20 @@ export function wsLocalGet(key: string): string | null {
   }
 }
 
+/** The storage key the parent app mints this workspace's device id under. */
+const DEVICE_ID_KEY = 'lucidos-device-id';
+
+/**
+ * The device id the parent app minted for this workspace, or null.
+ *
+ * Two readers, which is why it sits here rather than in either of them.
+ * `preferences` scopes its read by it, and `_fetch` sends it on every request
+ * so the engine can attribute what an app changed.
+ */
+export function wsDeviceId(): string | null {
+  return wsLocalGet(DEVICE_ID_KEY);
+}
+
 /** Remove a per-workspace localStorage value (namespaced). Best-effort: used by
  *  the boot script's `?style-reset` escape hatch, which must work even when the
  *  UI it is rescuing does not. */

@@ -11,7 +11,7 @@ export type DisplaySection = 'saved' | 'current' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';
 export const THREAD_STATUSES: readonly ThreadStatus[] = ['idle', 'running', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const;
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
-export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';
+export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
 export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';
 
 export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
@@ -193,6 +193,9 @@ export function availableThreadActions(
     } else if (storedSection === 'inbox' && !descendantsBlockArchive) {
       actions.push('archive');
     }
+  }
+  if (threadType === 'claude_code' && (status === 'running' || status === 'paused')) {
+    actions.push('apply_when_settled');
   }
   actions.push(isSaved ? 'unsave' : 'save');
   return actions;

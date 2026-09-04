@@ -936,7 +936,7 @@ mod tests {
             .unwrap();
         backdate_last_seen(&pool, "old-off", 45).await;
 
-        // Right on the cutoff (29 days) → excluded
+        // One day short of the 30-day cutoff (29 days) → excluded
         DeviceStore::register(&pool, &bus, "almost-on", Some("UA"), None)
             .await
             .unwrap();

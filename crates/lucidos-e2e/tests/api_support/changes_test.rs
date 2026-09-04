@@ -1,5 +1,5 @@
 use crate::support::{
-    base_url, db_url, git, git_in, http_client, seed_cc_thread_summary, workspace_path,
+    base_url, db_url, git, git_in, seed_cc_thread_summary, user_client, workspace_path,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -48,7 +48,7 @@ async fn seed_change_for_test(
 /// must emit it before any further work, ahead of `ChangeApplyFailed`.
 #[tokio::test]
 async fn apply_unhardened_change_emits_missing_hardening_detected() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -151,7 +151,7 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
 /// but opts out of the seed's default marker via `planned: false`.
 #[tokio::test]
 async fn apply_unplanned_change_is_blocked() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -240,7 +240,7 @@ async fn apply_unplanned_change_is_blocked() {
 /// `planned-state` wire contract the cc-plan-gate hook depends on.
 #[tokio::test]
 async fn plan_marker_proposed_then_approved_round_trip() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -332,7 +332,7 @@ async fn plan_marker_proposed_then_approved_round_trip() {
 /// retry unchanged.
 #[tokio::test]
 async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bound() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -432,7 +432,7 @@ async fn bounded_security_fix_satisfies_the_gate_and_refuses_an_unenforceable_bo
 /// causing the second apply to fail with "uncommitted changes".
 #[tokio::test]
 async fn sequential_apply_two_changes_succeeds() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -704,7 +704,7 @@ async fn sequential_apply_two_changes_succeeds() {
 /// (never Archive) in this state.
 #[tokio::test]
 async fn archive_with_pending_change_is_rejected_409() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 
@@ -788,7 +788,7 @@ async fn archive_with_pending_change_is_rejected_409() {
 /// not a 500 or a silent success — the endpoint reports there's nothing running.
 #[tokio::test]
 async fn cancel_apply_all_with_no_batch_returns_bad_request() {
-    let client = http_client();
+    let client = user_client().await;
     let url = format!("{}/api/v1/changes/apply-all/cancel", base_url());
     let resp = client
         .post(&url)
@@ -819,7 +819,7 @@ async fn cancel_apply_all_with_no_batch_returns_bad_request() {
 /// user's behalf.
 #[tokio::test]
 async fn apply_change_with_no_files_is_rejected_409() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap();
 

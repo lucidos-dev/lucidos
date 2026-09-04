@@ -62,6 +62,13 @@ impl SessionEndReason {
 pub enum VoiceSessionEndReason {
     /// The caller hung up. The ordinary ending.
     Hangup,
+    /// The caller said the conversation was over, and the talker rang off for
+    /// them. Told apart from [`Self::Hangup`] for the reason
+    /// [`Self::Disconnected`] already is: the two read alike to the user and
+    /// differently in the log.
+    ///
+    /// It ends the call and never the work. A turn in flight keeps running.
+    AgentHangup,
     /// The socket died without a goodbye: the network dropped, or the page
     /// closed. Indistinguishable from a hangup to the user, and worth telling
     /// apart in the log.

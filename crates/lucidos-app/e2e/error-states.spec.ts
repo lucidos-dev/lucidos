@@ -1,6 +1,6 @@
 import { test, expect } from './fixtures';
 import { randomUUID } from 'crypto';
-import { assertHealthy, navigateToApp } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp } from './helpers';
 import { psql } from './db-helpers';
 
 test.describe('Error display states', () => {
@@ -10,7 +10,7 @@ test.describe('Error display states', () => {
 
   test('malformed chat stream request shows error response', async ({ page }) => {
     // Send a request with missing required fields
-    const resp = await page.request.post('/api/v1/chat/stream', {
+    const resp = await apiRequest(page).post('/api/v1/chat/stream', {
       headers: { 'content-type': 'application/json' },
       data: JSON.stringify({ text: '' }),
       failOnStatusCode: false,
@@ -20,7 +20,7 @@ test.describe('Error display states', () => {
   });
 
   test('chat stream with invalid thread_id returns error', async ({ page }) => {
-    const resp = await page.request.post('/api/v1/chat/stream', {
+    const resp = await apiRequest(page).post('/api/v1/chat/stream', {
       headers: { 'content-type': 'application/json' },
       data: JSON.stringify({ text: 'hello', thread_id: 'not-a-valid-uuid' }),
       failOnStatusCode: false,
@@ -37,7 +37,7 @@ test.describe('Error display states', () => {
   });
 
   test('changes API with invalid change ID returns error', async ({ page }) => {
-    const resp = await page.request.post('/api/v1/changes/not-a-uuid/apply', {
+    const resp = await apiRequest(page).post('/api/v1/changes/not-a-uuid/apply', {
       failOnStatusCode: false,
     });
     expect(resp.status()).toBeGreaterThanOrEqual(400);

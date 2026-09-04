@@ -227,6 +227,33 @@ pub fn http_client() -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+/// Put `device_id` in the `devices` table, so a header naming it is evidence.
+///
+/// `api::actor::require_user_actor` suppresses an id that names no row, so an
+/// unregistered id is a header rather than an identity and the request is
+/// refused. A test that sends its OWN id (rather than taking [`user_client`])
+/// registers it here first. `POST /devices/register` is the one bootstrap the
+/// mutating gate exempts, so the bare client is the right caller for it.
+///
+/// An upsert, so calling it repeatedly is free and emits no second
+/// `DeviceRegistered`.
+pub async fn register_device(device_id: &str) {
+    let resp = http_client()
+        .post(format!("{}/api/v1/devices/register", base_url()))
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "user_agent": "lucidos-e2e/1",
+        }))
+        .send()
+        .await
+        .expect("device registration request failed");
+    assert!(
+        resp.status().is_success(),
+        "device registration returned {}",
+        resp.status()
+    );
+}
+
 /// Device id this suite registers to stand in for the user's own client.
 /// Stable across tests: registration is an upsert, and the `DeviceRegistered`
 /// event only fires on the genuine first insert.
@@ -253,20 +280,7 @@ pub const E2E_DEVICE_ID: &str = "e2e-api-client";
 /// single indexed upsert against a local engine, which is not the cost worth
 /// optimising here.
 pub async fn user_client() -> reqwest::Client {
-    let resp = http_client()
-        .post(format!("{}/api/v1/devices/register", base_url()))
-        .json(&serde_json::json!({
-            "device_id": E2E_DEVICE_ID,
-            "user_agent": "lucidos-e2e/1",
-        }))
-        .send()
-        .await
-        .expect("device registration request failed");
-    assert!(
-        resp.status().is_success(),
-        "device registration returned {}",
-        resp.status()
-    );
+    register_device(E2E_DEVICE_ID).await;
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "x-lucidos-device-id",

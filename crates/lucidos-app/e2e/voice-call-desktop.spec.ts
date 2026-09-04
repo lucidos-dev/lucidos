@@ -21,7 +21,7 @@
  * the two mobile projects, one of which is WebKit.
  */
 import { test, expect } from '@playwright/test';
-import { gotoWithRetry, setVoiceEnabled, waitForVisibleInput } from './helpers';
+import { apiRequest, gotoWithRetry, setVoiceEnabled, waitForVisibleInput } from './helpers';
 
 // A fake capture device, so `getUserMedia` resolves with no hardware and no
 // consent prompt. Both flags are needed: one supplies the device, the other
@@ -41,7 +41,7 @@ async function setOpenAiProvider(
   page: import('@playwright/test').Page,
   on: boolean,
 ): Promise<void> {
-  const res = await page.request.put(`/api/v1/preferences?key=${OPENAI_SWITCH_KEY}`, {
+  const res = await apiRequest(page).put(`/api/v1/preferences?key=${OPENAI_SWITCH_KEY}`, {
     data: { value: String(on) },
   });
   expect(res.ok()).toBeTruthy();

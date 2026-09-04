@@ -13,6 +13,11 @@
 //! the thread's own agent through a [`TurnStarter`]. What that agent produces
 //! comes back over the EventBus, so the loop selects over three things: the
 //! caller, the talker, and the thread.
+//!
+//! **What the thread is waiting on goes through a third seam.** A card the
+//! caller can settle is read and resolved by a [`DecisionResolver`], never by
+//! this file reaching into the engine. That is also what refuses a delegation
+//! while the doer is parked inside a card of its own.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -22,14 +27,14 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 use uuid::Uuid;
 
+use super::decision::{DecisionKind, DecisionResolver, OpenDecision, Resolution};
 use super::doer::TurnStarter;
 use super::provider::{SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 use super::wire::{ClientControl, ServerFrame};
 use super::{build, language, resident};
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
 use crate::engine::thread_events::{
-    AgentParticipant, CancelCause, EventMeta, MessageOrigin, QuestionOption, ThreadEvent,
-    VoiceSessionEndReason,
+    AgentParticipant, CancelCause, EventMeta, MessageOrigin, ThreadEvent, VoiceSessionEndReason,
 };
 use crate::engine::{AuxCapture, ContextPurpose, LucidosEngine};
 use crate::llm::tool_names;
@@ -63,14 +68,16 @@ const UNFINISHED: &str =
 const NOT_TAKEN: &str = "[ANSWER] That could not be started on this conversation. \
                          Tell the caller so, and say they can type it instead.";
 
-/// What the talker is told once the caller has answered.
+/// What the talker is told once something waiting has been settled.
 ///
-/// Appended rather than spoken. The caller answered it themselves, on screen,
-/// so saying it back is news to nobody. What it prevents is the talker
-/// offering the same question again from a question note it still holds.
-const QUESTION_SETTLED: &str = "\
-[ANSWERED] The caller has answered that question on screen. It is settled, so \
-do not put it to them again.";
+/// Appended rather than spoken. Whoever settled it already knows: the caller
+/// either said so out loud or pressed it on screen. What it prevents is the
+/// talker offering the same card again from a note it still holds.
+///
+/// It names neither route, because the engine sees one event either way and
+/// must state no fact it was not given (ADR 0149).
+const DECISION_SETTLED: &str = "\
+[SETTLED] That is settled now, so do not put it to them again.";
 
 /// What the talker is told when its `delegate` call landed.
 ///
@@ -78,6 +85,45 @@ do not put it to them again.";
 /// talker already told the caller it is on it, and a second promise here is
 /// one more thing that can turn out false.
 const DELEGATION_TAKEN: &str = "Taken. The answer will arrive separately.";
+
+/// What the talker is told when a delegation could not start anything.
+///
+/// It states a FACT rather than a policy: the doer is blocked inside the very
+/// card that is waiting, so there is no turn to start. The answer is what frees
+/// it, which is why the note points back at the card.
+const DELEGATION_PARKED: &str = "\
+Not started. Lucidos is waiting on the caller's answer to what is already open, \
+so nothing new can run until they settle it. Put that back to them, and answer \
+it with what they say.";
+
+/// What the talker is told when its `answer` call settled the card.
+const ANSWER_TAKEN: &str = "Answered. That is settled now.";
+
+/// What the talker is told when its `hang_up` call landed.
+///
+/// The goodbye is still being spoken when this goes over, so the talker really
+/// does read it. It says nothing about timing, because the line closes when
+/// that turn ends rather than now.
+const HANGUP_TAKEN: &str = "Ending the call now.";
+
+/// What the talker is told when a held answer never got the caller's words.
+///
+/// Two ways there: a second `answer` displaces the first, or the utterance
+/// after it carried nothing. Owed either way, per [`Call::acknowledge`].
+const NEVER_HEARD: &str = "\
+That one was dropped: the caller's own words never came through for it. Ask \
+them again if it still matters.";
+
+/// What the talker is told when an answer spent the words its ask was waiting
+/// for.
+///
+/// Appended, because the ask's own acknowledgement went out when it was made
+/// and a tool call is answered once. Its reason follows, so the talker can
+/// offer the caller the thing that did not run.
+const ASK_LOST_ITS_WORDS: &str = "\
+[NOT STARTED] The caller's words settled what was waiting, so the request \
+below never started. Nothing is running for it. Offer it to them again if they \
+still want it.";
 
 /// Above this many characters, an answer is offered rather than delivered.
 ///
@@ -109,35 +155,36 @@ fn answer_to_say(text: &str) -> String {
     format!("{}\n\n{}", opening, text)
 }
 
-/// Hand the talker a question the doer parked on, as something to ask.
+/// Hand the talker something the thread is waiting on, as something to put to
+/// the caller.
 ///
-/// Spoken rather than appended, because the turn behind it is waiting on a
+/// Spoken rather than appended, because the turn behind it is parked on a
 /// person. Nothing else is coming, so a talker that stays quiet leaves the
 /// caller waiting for an answer that never arrives.
 ///
-/// It says where the answer goes. No utterance routes back to
-/// `UserQuestionAnswered` yet, so a talker taking a spoken answer would be
-/// promising something no code keeps.
-fn question_to_ask(question: &str, options: &[QuestionOption], multi_select: bool) -> String {
-    let choices = super::choices_for(options, multi_select);
-    // Two openings, because a question with no options has no choices to
-    // read. Told to read them anyway, the talker either invents a set or
-    // stumbles over the gap, and both land on the caller.
-    let read_them = if choices.is_empty() {
-        ""
-    } else {
-        ", and read the choices"
+/// It says where the answer goes, and that is now HERE. The caller settles it
+/// out loud, and the talker hands back the id of the choice they picked.
+fn decision_to_ask(decision: &OpenDecision) -> String {
+    // Exhaustive, so a fourth kind has to decide what the caller hears rather
+    // than inheriting the permission wording by default.
+    let opening = match decision.kind {
+        DecisionKind::Question => "[QUESTION] The work is waiting on the caller's answer.",
+        DecisionKind::CommandPermission
+        | DecisionKind::McpPermission
+        | DecisionKind::CodingAgentPermission => {
+            "[PERMISSION] Lucidos needs the caller's say-so before it can carry on."
+        }
     };
-    // The question itself is NEVER cut, unlike everything else the talker
-    // reads. A truncated question is a different question, and the talker is
-    // about to state it as the one being asked.
+    // The prompt itself is NEVER cut, unlike everything else the talker reads.
+    // A truncated question is a different question, and the talker is about to
+    // state it as the one being asked.
     format!(
-        "[QUESTION] The work is waiting on the caller's answer. Put this to \
-         them out loud, in your own words{}. They answer on screen, so never \
-         tell them you have recorded what they say.\n\n{}\n\n{}",
-        read_them,
-        question.trim(),
-        choices,
+        "{} Put this to them out loud, in your own words, and read them the \
+         choices. They answer by saying which one they want, and you hand its \
+         id back. Never say an id out loud.\n\n{}\n\n{}",
+        opening,
+        decision.prompt,
+        super::choices_for(&decision.choices),
     )
 }
 
@@ -182,6 +229,7 @@ pub async fn run_call(
     provider: &dyn VoiceProvider,
     transport: &mut dyn CallTransport,
     doer: &dyn TurnStarter,
+    decisions: &dyn DecisionResolver,
     opening: SessionOpening,
     subject: CallSubject,
 ) -> Option<VoiceSessionEndReason> {
@@ -234,6 +282,7 @@ pub async fn run_call(
         bus: bus.clone(),
         provider,
         doer,
+        decisions,
         capture: AuxCapture::new(bus, subject.thread_id, ContextPurpose::Voice),
         subject: subject.clone(),
         thread,
@@ -243,6 +292,8 @@ pub async fn run_call(
         waiting_to_be_said: VecDeque::new(),
         pending_utterance: None,
         pending_delegation: None,
+        pending_answer: None,
+        hanging_up: false,
         delegated_this_turn: false,
     };
     let reason = call.drive(&mut *session, transport).await;
@@ -300,6 +351,8 @@ struct Call<'a> {
     bus: EventBus,
     provider: &'a dyn VoiceProvider,
     doer: &'a dyn TurnStarter,
+    /// What this call can do about what is waiting on its own thread.
+    decisions: &'a dyn DecisionResolver,
     capture: AuxCapture,
     subject: CallSubject,
     thread: Receiver<EmittedEvent>,
@@ -331,9 +384,29 @@ struct Call<'a> {
     /// this would drop the caller's real question into a row that starts
     /// nothing. That is the failure the whole tool exists to end.
     pending_delegation: Option<String>,
+    /// An `answer` call whose choice sends the caller's own words, waiting for
+    /// the transcript to catch up.
+    ///
+    /// The same race the ask has, held the same way. Only the one choice that
+    /// carries a transcript can end up here: every other choice names
+    /// everything it needs, so it settles the moment it arrives.
+    pending_answer: Option<PendingAnswer>,
+    /// The talker called `hang_up`, and the goodbye is still being spoken.
+    ///
+    /// The call ends at that turn's end rather than on the tool call. So the
+    /// caller hears the whole of it and the thread keeps the row. Cleared by a
+    /// barge-in: a caller talking over the goodbye was not done.
+    hanging_up: bool,
     /// The talker already asked once in the turn it is speaking now. Cleared
     /// when that turn ends, so the next one may ask again.
     delegated_this_turn: bool,
+}
+
+/// An answer waiting on the caller's words, and the tool call that owes an
+/// acknowledgement for it.
+struct PendingAnswer {
+    tool_call_id: String,
+    choice_id: String,
 }
 
 impl Call<'_> {
@@ -422,8 +495,18 @@ impl Call<'_> {
                 // real words then arriving with no ask left to claim them.
                 if !transcript.trim().is_empty() {
                     self.pending_utterance = Some(transcript.clone());
-                    self.settle_the_pending_utterance(session).await;
                 }
+                // The answer first: it is the one thing that can SPEND the
+                // transcript. A delegation pairing with words already sent as
+                // an answer would run that answer as a turn of its own.
+                //
+                // Outside the guard above, so a wordless turn settles a held
+                // answer too. It settles it by giving up, which is the point:
+                // an answer held past the utterance it was made for would
+                // eventually settle a card with a sentence about something
+                // else.
+                self.settle_the_pending_answer(session).await;
+                self.settle_the_pending_utterance(session).await;
                 ServerFrame::UserTurnEnded { transcript }
             }
             VoiceEvent::TalkerTranscript { text } => {
@@ -431,12 +514,28 @@ impl Call<'_> {
                 ServerFrame::TalkerTranscript { text }
             }
             VoiceEvent::DelegationRequested {
-                delegation_id,
+                tool_call_id,
                 reason,
             } => {
-                self.delegated(session, &delegation_id, reason).await;
+                self.delegated(session, &tool_call_id, reason).await;
                 // No frame. The caller hears one answer, and which model
                 // produced it is nothing they can act on.
+                return None;
+            }
+            VoiceEvent::AnswerRequested {
+                tool_call_id,
+                choice_id,
+            } => {
+                self.answer(session, tool_call_id, choice_id, false).await;
+                return None;
+            }
+            VoiceEvent::HangupRequested { tool_call_id } => {
+                self.acknowledge(session, &tool_call_id, HANGUP_TAKEN).await;
+                // Held, NOT acted on. A tool call lands while the talker is
+                // still speaking, which is what makes delegation free and what
+                // would cut the goodbye off mid-word here. The turn's end is
+                // where the line closes.
+                self.hanging_up = true;
                 return None;
             }
             VoiceEvent::TalkerTurnEnded { transcript, usage } => {
@@ -459,11 +558,26 @@ impl Call<'_> {
                 // The next turn may ask again, and must be able to.
                 self.delegated_this_turn = false;
                 self.talker_has_the_floor = false;
+                // The goodbye is said and written down, so the line can close.
+                // The caller heard all of it, which is the whole reason the
+                // hangup waited for this.
+                if self.hanging_up {
+                    log!("[Voice] The caller said they were done, so the talker rang off");
+                    let _ = transport.send_frame(ServerFrame::TalkerTurnEnded).await;
+                    return Some(VoiceSessionEndReason::AgentHangup);
+                }
                 self.say_what_is_waiting(session).await;
                 ServerFrame::TalkerTurnEnded
             }
             VoiceEvent::Interrupted => {
                 self.interrupted = true;
+                // The caller talked over the goodbye, so they were not done.
+                // Their intent is the only thing that ends a call (ADR 0170),
+                // and taking the floor back is them saying otherwise.
+                if self.hanging_up {
+                    log!("[Voice] The caller cut in over the goodbye, so the call stays up");
+                    self.hanging_up = false;
+                }
                 ServerFrame::Interrupted
             }
             VoiceEvent::Failed { message } => {
@@ -484,11 +598,13 @@ impl Call<'_> {
     /// doing?" truthfully without narrating every step unasked. An answer is
     /// spoken, because it is the thing the caller is waiting for.
     ///
-    /// A QUESTION is spoken for the same reason, and it is the stronger case:
-    /// the turn behind it is parked on a person, so no answer follows it at
-    /// all. Its resolution is appended, the caller having answered on screen.
+    /// Anything WAITING on the caller is spoken for the same reason, and it is
+    /// the stronger case: the turn behind it is parked on a person, so no
+    /// answer follows it at all. Four surfaces qualify, and each gets its own
+    /// arm: a question card, and a permission card in each of its three lanes.
+    /// Their resolutions share one arm, because settled is settled.
     ///
-    /// Spoken, not read: see [`answer_to_say`] and [`question_to_ask`].
+    /// Spoken, not read: see [`answer_to_say`] and [`decision_to_ask`].
     async fn on_thread_event(&mut self, emitted: EmittedEvent, session: &mut dyn VoiceSession) {
         let BusEvent::Thread {
             thread_id, event, ..
@@ -512,16 +628,62 @@ impl Call<'_> {
                 self.append(session, &note).await;
             }
             ThreadEvent::UserQuestionAsked {
+                tool_use_id,
                 question,
                 options,
                 multi_select,
                 ..
             } => {
-                let ask = question_to_ask(question, options, *multi_select);
-                self.say(session, ask).await;
+                let open = OpenDecision::question(tool_use_id, question, options, *multi_select);
+                self.ask(session, open).await;
             }
-            ThreadEvent::UserQuestionAnswered { .. } => {
-                self.append(session, QUESTION_SETTLED).await;
+            ThreadEvent::CommandPermissionRequested {
+                request_id,
+                tool_name,
+                command,
+                summary,
+                ..
+            } => {
+                let open =
+                    OpenDecision::command_permission(request_id, tool_name, command, summary);
+                self.ask(session, open).await;
+            }
+            ThreadEvent::McpPermissionRequested {
+                request_id,
+                server_id,
+                server_name,
+                tool_name,
+                arguments_summary,
+                ..
+            } => {
+                let open = OpenDecision::mcp_permission(
+                    request_id,
+                    server_id,
+                    server_name,
+                    tool_name,
+                    arguments_summary,
+                );
+                self.ask(session, open).await;
+            }
+            ThreadEvent::CodingAgentPermissionRequest {
+                request_id,
+                tool_name,
+                input,
+                summary,
+                ..
+            } => {
+                let open =
+                    OpenDecision::coding_agent_permission(request_id, tool_name, input, summary);
+                self.ask(session, open).await;
+            }
+            // Settled, whichever way and by whichever surface. Appended rather
+            // than spoken: the caller either said it or pressed it, so saying
+            // it back is news to nobody.
+            ThreadEvent::UserQuestionAnswered { .. }
+            | ThreadEvent::CommandPermissionResolved { .. }
+            | ThreadEvent::McpPermissionResolved { .. }
+            | ThreadEvent::CodingAgentPermissionResolved { .. } => {
+                self.append(session, DECISION_SETTLED).await;
             }
             ThreadEvent::ResponseGenerated { text, .. } if !text.trim().is_empty() => {
                 let answer = answer_to_say(text.trim());
@@ -548,9 +710,15 @@ impl Call<'_> {
 
     /// The talker asked for the doer.
     ///
-    /// The acknowledgement is owed whatever happens next. An unresolved call
-    /// leaves a dangling item in the talker's history, and it reads that as
-    /// work it never heard back about.
+    /// **Refused while this thread's doer is parked**, and at no other time.
+    /// The doer is blocked inside the very card that is waiting, so there is no
+    /// turn to start. The utterance is not paired and the doer is not woken, so
+    /// what the caller said is still written down on the next flush.
+    ///
+    /// Read-then-act, like `doer_for` on the typed path: a card landing between
+    /// the read and the pairing is not caught. Closing that would mean holding
+    /// a lock across the wake, and the loser is one superseded card rather than
+    /// a wrong action.
     ///
     /// **One ask per talker turn, and the rest are acknowledged only.** A model
     /// that calls a tool twice in one response is asking about one utterance,
@@ -563,21 +731,21 @@ impl Call<'_> {
     async fn delegated(
         &mut self,
         session: &mut dyn VoiceSession,
-        delegation_id: &str,
+        tool_call_id: &str,
         reason: String,
     ) {
-        // Owed whatever happens next, duplicate or not. An unresolved call
-        // leaves a dangling item in the talker's history, and it reads that as
-        // work it never heard back about.
-        if let Err(e) = session
-            .resolve_delegation(delegation_id, DELEGATION_TAKEN)
-            .await
-        {
+        if self.decisions.doer_is_parked(self.subject.thread_id).await {
             log!(
-                "[Voice] The talker would not take the acknowledgement: {}",
-                e
+                "[Voice] Not delegating {:?}: this thread's doer is parked on a card",
+                reason
             );
+            self.acknowledge(session, tool_call_id, DELEGATION_PARKED)
+                .await;
+            return;
         }
+        // Owed whatever happens next, duplicate or not.
+        self.acknowledge(session, tool_call_id, DELEGATION_TAKEN)
+            .await;
         if self.delegated_this_turn {
             log!(
                 "[Voice] The talker asked twice in one turn, ignoring: {}",
@@ -589,6 +757,110 @@ impl Call<'_> {
         self.delegated_this_turn = true;
         self.pending_delegation = Some(reason);
         self.settle_the_pending_utterance(session).await;
+    }
+
+    /// The talker answered something waiting on the caller.
+    ///
+    /// The choice id came from the engine, and the engine looks it up again
+    /// before acting. One it never issued, and one whose card has since
+    /// settled, are both refused with a note saying so, never guessed at.
+    ///
+    /// `retry` marks the second and last attempt at a held answer. A first
+    /// attempt with no words waits for them; a retry with none gives up.
+    async fn answer(
+        &mut self,
+        session: &mut dyn VoiceSession,
+        tool_call_id: String,
+        choice_id: String,
+        retry: bool,
+    ) {
+        // The caller's own words as held, for the one choice that sends them.
+        // A paraphrase would be a different answer (ADR 0149).
+        let spoken = self.pending_utterance.clone().unwrap_or_default();
+        let outcome = self
+            .decisions
+            .resolve(
+                self.subject.thread_id,
+                &choice_id,
+                &spoken,
+                self.subject.actor.clone(),
+            )
+            .await;
+        match outcome {
+            Resolution::Settled => self.acknowledge(session, &tool_call_id, ANSWER_TAKEN).await,
+            Resolution::SettledWithTheirWords => {
+                // Spent. Those words ARE the answer's row, exactly as a typed
+                // answer is, so holding them on would write the same sentence
+                // down a second time.
+                self.pending_utterance = None;
+                // An ask still waiting for those same words is now waiting for
+                // nothing. Left sticky it pairs with a LATER utterance. That
+                // wakes the doer on words asking for something else, under a
+                // reason taken from the sentence just spent.
+                //
+                // Its "Taken." went out when it was made, and a tool call is
+                // answered once. So the correction is appended instead, which
+                // is what lets the talker tell the caller.
+                if let Some(stale) = self.pending_delegation.take() {
+                    log!("[Voice] The answer spent the words an ask was waiting for");
+                    let note = format!("{}\n\n{}", ASK_LOST_ITS_WORDS, stale);
+                    self.append(session, &note).await;
+                }
+                self.acknowledge(session, &tool_call_id, ANSWER_TAKEN).await;
+            }
+            Resolution::NeedsTheirWords if !retry => {
+                // Nothing is acknowledged yet: the call is held, and settles on
+                // the next thing the caller says, whatever it is.
+                let held = PendingAnswer {
+                    tool_call_id,
+                    choice_id,
+                };
+                if let Some(displaced) = self.pending_answer.replace(held) {
+                    self.acknowledge(session, &displaced.tool_call_id, NEVER_HEARD)
+                        .await;
+                }
+            }
+            // A retry that STILL has no words. Held again it would sit until
+            // some later, unrelated sentence settled the card with it, and a
+            // card cannot be unsettled. Dropped and said so instead.
+            Resolution::NeedsTheirWords => {
+                self.acknowledge(session, &tool_call_id, NEVER_HEARD).await;
+            }
+            Resolution::Refused(why) => self.acknowledge(session, &tool_call_id, &why).await,
+        }
+    }
+
+    /// Settle a held answer against the next thing the caller said.
+    ///
+    /// **Once, whatever that turn carried.** The held call is bounded to the
+    /// utterance following it, which is the one the talker was answering for.
+    /// Anything later is a different sentence, and settling a card with it is
+    /// not something the caller can undo.
+    async fn settle_the_pending_answer(&mut self, session: &mut dyn VoiceSession) {
+        let Some(held) = self.pending_answer.take() else {
+            return;
+        };
+        self.answer(session, held.tool_call_id, held.choice_id, true)
+            .await;
+    }
+
+    /// Tell the talker one of its tool calls landed.
+    ///
+    /// Owed for every tool and every outcome. An unresolved call leaves a
+    /// dangling item in the talker's history, and it reads that as work it
+    /// never heard back about.
+    async fn acknowledge(&self, session: &mut dyn VoiceSession, tool_call_id: &str, note: &str) {
+        if let Err(e) = session.resolve_tool_call(tool_call_id, note).await {
+            log!(
+                "[Voice] The talker would not take the acknowledgement: {}",
+                e
+            );
+        }
+    }
+
+    /// Put an open decision to the caller, out loud.
+    async fn ask(&mut self, session: &mut dyn VoiceSession, decision: OpenDecision) {
+        self.say(session, decision_to_ask(&decision)).await;
     }
 
     /// Pair a held utterance with a held ask, and send both on.

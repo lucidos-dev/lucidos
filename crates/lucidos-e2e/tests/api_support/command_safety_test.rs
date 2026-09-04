@@ -16,7 +16,7 @@
 //! checkpoint from the event store directly. The third turns the guard on for
 //! its own duration and puts it back.
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
 /// Ensure a timezone preference exists so `create_trigger` doesn't have to fall
@@ -140,7 +140,7 @@ async fn poll_trigger_grant(
 /// side-effect grant set.
 #[tokio::test]
 async fn trigger_side_effect_grant_round_trips() {
-    let client = http_client();
+    let client = user_client().await;
     set_timezone_utc(&client).await;
     let name = unique_marker("e2e-grant");
 
@@ -167,7 +167,7 @@ async fn trigger_side_effect_grant_round_trips() {
 /// the scheduler.
 #[tokio::test]
 async fn trigger_create_rejects_unknown_side_effect_category() {
-    let client = http_client();
+    let client = user_client().await;
     set_timezone_utc(&client).await;
 
     let body = json!({
@@ -193,7 +193,7 @@ async fn trigger_create_rejects_unknown_side_effect_category() {
 /// update either.
 #[tokio::test]
 async fn trigger_update_rejects_unknown_side_effect_category() {
-    let client = http_client();
+    let client = user_client().await;
     set_timezone_utc(&client).await;
     let name = unique_marker("e2e-bad-update");
 
@@ -224,7 +224,7 @@ async fn trigger_update_rejects_unknown_side_effect_category() {
 /// discard/revert endpoints).
 #[tokio::test]
 async fn command_checkpoint_undo_unknown_id_returns_error() {
-    let client = http_client();
+    let client = user_client().await;
     let unknown_id = uuid::Uuid::new_v4().to_string();
 
     let resp = client
@@ -255,7 +255,7 @@ async fn command_checkpoint_undo_unknown_id_returns_error() {
 /// id as a valid no-op.
 #[tokio::test]
 async fn command_checkpoint_undo_missing_id_is_rejected() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = client
         .post(format!("{}/api/v1/command-checkpoint/undo", base_url()))
         .json(&json!({}))
@@ -276,7 +276,7 @@ async fn command_checkpoint_undo_missing_id_is_rejected() {
 /// this parse exists to stop.
 #[tokio::test]
 async fn command_checkpoint_diff_rejects_a_non_uuid_id() {
-    let client = http_client();
+    let client = user_client().await;
     for id in ["../../heads/main", "not-a-uuid", ""] {
         let resp = client
             .get(format!("{}/api/v1/command-checkpoint/diff", base_url()))
@@ -297,7 +297,7 @@ async fn command_checkpoint_diff_rejects_a_non_uuid_id() {
 /// different claim from "there is no such checkpoint".
 #[tokio::test]
 async fn command_checkpoint_diff_unknown_id_is_not_found() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = client
         .get(format!("{}/api/v1/command-checkpoint/diff", base_url()))
         .query(&[("checkpoint_id", uuid::Uuid::new_v4().to_string())])

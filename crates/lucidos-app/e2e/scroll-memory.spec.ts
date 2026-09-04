@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, navigateToApp, waitForEventStream } from './helpers';
 
 // Regression: ResizeObserver alone doesn't fire when only the scroll
 // container's INNER content (not its own box) grows, which is the typical
@@ -55,7 +55,7 @@ test.describe('scroll position restore', () => {
     // SSE, and the page routes it through `handleNavigationRequest` into
     // `openSettingsSubview`. That helper reveals the content pane on mobile
     // too, so this covers both layouts without driving either one's chrome.
-    const res = await page.request.post('/api/v1/ui/navigate', {
+    const res = await apiRequest(page).post('/api/v1/ui/navigate', {
       headers: { 'content-type': 'application/json' },
       data: { target: 'settings', params: { settings_view: SUBVIEW } },
     });

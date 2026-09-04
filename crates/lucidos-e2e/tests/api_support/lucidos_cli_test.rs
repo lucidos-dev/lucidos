@@ -353,7 +353,7 @@ fn notify_rejects_empty_title_at_engine() {
 /// directly because the CLI does its own trim-check before posting.
 #[tokio::test]
 async fn notify_endpoint_rejects_whitespace_only_title() {
-    let client = crate::support::http_client();
+    let client = crate::support::user_client().await;
     let url = format!("{}/api/v1/notifications", crate::support::base_url());
     let resp = client
         .post(&url)

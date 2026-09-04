@@ -7,7 +7,7 @@
 //! (`decide_push_allowed`, `PresenceTracker`); these tests cover the
 //! wiring: HTTP → EventBus emit → SSE broadcast → push_log writer.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{base_url, db_url, http_client, register_device, unique_marker, user_client};
 use futures::StreamExt;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -56,16 +56,14 @@ async fn reset_presence_state() {
 async fn register_test_subscription(suffix: &str) -> String {
     let device_id = format!("presence-test-{}", suffix);
 
-    let resp = http_client()
-        .post(format!("{}/api/v1/devices/register", base_url()))
-        .json(&serde_json::json!({ "device_id": device_id, "user_agent": "presence-e2e/1" }))
-        .send()
-        .await
-        .expect("register request");
-    assert_eq!(resp.status(), 200, "device registration should succeed");
+    register_device(&device_id).await;
 
+    // Registered above, so from here the device speaks for itself: the header
+    // is what `api::mutating_gate` reads to record who is acting. Its own id
+    // rather than `user_client`'s, since these calls ARE this device acting.
     let resp = http_client()
         .put(format!("{}/api/v1/devices/{}/push", base_url(), device_id))
+        .header("x-lucidos-device-id", &device_id)
         .json(&serde_json::json!({ "push_enabled": true }))
         .send()
         .await
@@ -75,6 +73,7 @@ async fn register_test_subscription(suffix: &str) -> String {
     let endpoint = format!("https://test.invalid/{}", device_id);
     let resp = http_client()
         .post(format!("{}/api/v1/push/subscribe", base_url()))
+        .header("x-lucidos-device-id", &device_id)
         .json(&serde_json::json!({
             "endpoint": endpoint,
             "p256dh": "BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -89,7 +88,8 @@ async fn register_test_subscription(suffix: &str) -> String {
 }
 
 async fn create_notification(title: &str, message: &str) -> String {
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!("{}/api/v1/notifications", base_url()))
         .json(&serde_json::json!({
             "title": title,
@@ -320,9 +320,14 @@ async fn s3_notification_with_visible_device_emits_presence_check_sse() {
 
     // Mark a device visible so candidates() is non-empty → fan-out runs
     // the PresenceCheck protocol.
+    // Registered, unlike the sibling test's, which comes back from
+    // `register_test_subscription` already in the table. An id naming no device
+    // is a header rather than identity, so the post would be refused.
     let device_id = format!("presence-visible-{}", suffix);
+    register_device(&device_id).await;
     let resp = http_client()
         .post(format!("{}/api/v1/device-presence", base_url()))
+        .header("x-lucidos-device-id", &device_id)
         .json(&serde_json::json!({ "device_id": device_id, "visible": true }))
         .send()
         .await
@@ -390,6 +395,7 @@ async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
     // Mark the same device visible so it's the lone PresenceCheck candidate.
     let resp = http_client()
         .post(format!("{}/api/v1/device-presence", base_url()))
+        .header("x-lucidos-device-id", &device_id)
         .json(&serde_json::json!({ "device_id": device_id, "visible": true }))
         .send()
         .await
@@ -597,7 +603,8 @@ async fn s4_push_allowed_emits_native_push_requested_sse_with_no_web_subscriptio
 /// The list endpoint is the only place the persisted `tap` is observable over
 /// HTTP, which is what the derived-default tests below need to see.
 async fn create_and_read_back(body: serde_json::Value) -> serde_json::Value {
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!("{}/api/v1/notifications", base_url()))
         .json(&body)
         .send()

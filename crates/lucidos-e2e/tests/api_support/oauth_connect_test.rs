@@ -8,13 +8,13 @@
 //! got "Missing auth_url in OAuth credentials" on the next press: an error one
 //! screen away from its cause, with no way forward.
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::{json, Value};
 
 /// The registry the Connect form autofills from.
 #[tokio::test]
 async fn known_providers_are_served_with_the_redirect_uri_to_register() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     let body: Value = client
@@ -56,7 +56,7 @@ async fn known_providers_are_served_with_the_redirect_uri_to_register() {
 /// knows, so the user enters only a Client ID.
 #[tokio::test]
 async fn connecting_a_known_provider_with_no_client_prefills_its_endpoints() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     let known = first_known_provider(&client, &api).await;
@@ -90,7 +90,7 @@ async fn connecting_a_known_provider_with_no_client_prefills_its_endpoints() {
 /// prefilled, targeted at the row it must repair.
 #[tokio::test]
 async fn an_endpointless_client_reopens_the_form_instead_of_failing_later() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     let known = first_known_provider(&client, &api).await;

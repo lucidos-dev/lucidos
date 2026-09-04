@@ -58,6 +58,6 @@ describe('a call captions itself nowhere', () => {
   it('keeps the call state announceable, which is the one thing a panel did', () => {
     const source = read('CallToggle.tsx');
     expect(source).toContain('role="status"');
-    expect(source).toContain('callStatusLabel(phase)');
+    expect(source).toContain('callStatusLabel(call)');
   });
 });

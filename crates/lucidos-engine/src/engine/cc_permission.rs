@@ -31,6 +31,7 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     ActorMode, EngineReason, EventMeta, MessageOrigin, ThreadDirection, ThreadEvent,
 };
+use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
 use crate::triggers::TriggerConfig;
 
@@ -1270,21 +1271,17 @@ async fn record_unattended_denial(
             "[CCPermission] CodingAgentPermissionRequest (unattended deny)",
         )
         .await;
-    event_bus
-        .emit_or_log(
-            BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::CodingAgentPermissionResolved {
-                    request_id,
-                    allowed: false,
-                    reason: Some(reason.to_string()),
-                    persist_scope: None,
-                },
-                meta,
-            },
-            "[CCPermission] CodingAgentPermissionResolved (unattended deny)",
-        )
-        .await;
+    emit_coding_agent_permission_resolved(
+        event_bus,
+        thread_id,
+        request_id,
+        false,
+        Some(reason.to_string()),
+        None,
+        meta,
+        "[CCPermission] CodingAgentPermissionResolved (unattended deny)",
+    )
+    .await;
 }
 
 /// Map the broadcast `recv` result for a pending permission into the outcome
@@ -1314,6 +1311,128 @@ fn outcome_from_permission_recv(
             reason: Some(RESTART_INTERRUPT_REASON.to_string()),
         },
     }
+}
+
+/// Record a granted "Always allow" by scope, for the coding-agent lane.
+/// `Session` goes into the in-memory per-thread allow set; `Narrow` / `Broad`
+/// into `<workspace>/.lucidos/cc-allowed-tools`. A scope yielding no derivable
+/// pattern records nothing (e.g. `Edit` at `Broad`, per
+/// `BROAD_ALLOW_INEFFECTIVE`).
+///
+/// Both storages bind the CURRENT session. CC reads the file at its next spawn,
+/// but the engine's own gate reads it on every prompt. That is what makes an
+/// "Always allow" click take effect where it was clicked (ADR 0125).
+///
+/// Sibling of `command_permission::record_command_allow_grant` and
+/// `mcp_permission::record_mcp_allow_grant`, one per lane.
+pub fn record_coding_agent_allow_grant(
+    engine: &LucidosEngine,
+    entry: &PermissionEntry,
+    scope: crate::engine::claude_code::AllowScope,
+) {
+    use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+    let Some(pattern) = derive_allow_pattern(&entry.tool_name, &entry.input, scope) else {
+        return;
+    };
+    match scope {
+        AllowScope::Session => {
+            let mut pending = engine.pending_cc_permission.lock().unwrap();
+            pending.allow_session(entry.thread_id, pattern);
+        }
+        AllowScope::Narrow | AllowScope::Broad => {
+            if let Err(e) = crate::core::grants::append(
+                &engine.grants_dir(),
+                crate::core::grants::GrantFile::CodingAgentTools,
+                &pattern,
+            ) {
+                crate::log!(
+                    "[CCPermission] Failed to persist allow pattern {:?}: {}",
+                    pattern,
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// Emit a `CodingAgentPermissionResolved` via the bus. Sibling of
+/// `command_permission::emit_command_permission_resolved`, and the one place
+/// this lane builds the variant: the answer path, the unattended deny, and both
+/// dangling-card sweeps all come through here.
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_coding_agent_permission_resolved(
+    event_bus: &EventBus,
+    thread_id: Uuid,
+    request_id: String,
+    allowed: bool,
+    reason: Option<String>,
+    persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    meta: EventMeta,
+    log_context: &str,
+) {
+    event_bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::CodingAgentPermissionResolved {
+                    request_id,
+                    allowed,
+                    reason,
+                    persist_scope,
+                },
+                meta,
+            },
+            log_context,
+        )
+        .await;
+}
+
+/// Answer one coding-agent permission card, whoever answered it.
+///
+/// This lane's half of the contract `command_permission::resolve_command_permission`
+/// documents: the single in-process path, three effects in order, and `false`
+/// for a request id nothing is waiting on. The blocked waiter here is the
+/// agent's own subprocess handler rather than an in-process loop.
+pub async fn resolve_coding_agent_permission(
+    engine: &LucidosEngine,
+    request_id: String,
+    allowed: bool,
+    persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    actor: Option<MessageOrigin>,
+    log_context: &str,
+) -> bool {
+    let entry = {
+        let mut pending = engine.pending_cc_permission.lock().unwrap();
+        pending.take(&request_id)
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    // Wake the blocked handler, and every deduped waiter on the same broadcast.
+    let _ = entry.tx.send(allowed);
+
+    let reason = if allowed {
+        None
+    } else {
+        Some(DENIAL_REASON.to_string())
+    };
+    // A scope on a denial grants nothing: the click said no.
+    let persist_scope = persist_scope.filter(|_| allowed);
+    if let Some(scope) = persist_scope {
+        record_coding_agent_allow_grant(engine, &entry, scope);
+    }
+    emit_coding_agent_permission_resolved(
+        &engine.event_bus,
+        entry.thread_id,
+        request_id,
+        allowed,
+        reason,
+        persist_scope,
+        EventMeta::with_actor(actor),
+        log_context,
+    )
+    .await;
+    true
 }
 
 /// Resolve every unresolved `CodingAgentPermissionRequest` on `thread_id` as
@@ -1428,21 +1547,17 @@ async fn resolve_pending_permissions_with_reason(
                 let _ = entry.tx.send(false);
             }
         }
-        event_bus
-            .emit_or_log(
-                BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::CodingAgentPermissionResolved {
-                        request_id,
-                        allowed: false,
-                        reason: Some(reason.to_string()),
-                        persist_scope: None,
-                    },
-                    meta: EventMeta::with_actor(actor.clone()),
-                },
-                log_label,
-            )
-            .await;
+        emit_coding_agent_permission_resolved(
+            event_bus,
+            thread_id,
+            request_id,
+            false,
+            Some(reason.to_string()),
+            None,
+            EventMeta::with_actor(actor.clone()),
+            log_label,
+        )
+        .await;
     }
 }
 

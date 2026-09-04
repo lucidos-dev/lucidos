@@ -1,5 +1,8 @@
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement, clickHeaderAction, headerActionOffered } from './helpers';
+import {
+  apiRequest, assertHealthy, clickHeaderAction, clickVisibleElement, headerActionOffered,
+  navigateToApp, openFilesPanel,
+} from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';
 import { writeFileSync } from 'fs';
@@ -7,7 +10,7 @@ import { resolve } from 'path';
 
 /** Register the e2e workspace as a repository via API. */
 async function registerRepo(page: Page, name: string): Promise<string> {
-  const resp = await page.request.post('/api/v1/repositories', {
+  const resp = await apiRequest(page).post('/api/v1/repositories', {
     data: { name, path: WORKSPACE, description: 'e2e test repo' },
   });
   expect(resp.ok()).toBeTruthy();
@@ -17,7 +20,7 @@ async function registerRepo(page: Page, name: string): Promise<string> {
 
 /** Remove a repository via API. */
 async function removeRepo(page: Page, id: string): Promise<void> {
-  await page.request.delete(`/api/v1/repositories/${id}`);
+  await apiRequest(page).delete(`/api/v1/repositories/${id}`);
 }
 
 test.describe('Repo File Explorer', () => {

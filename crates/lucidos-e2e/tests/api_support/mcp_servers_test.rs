@@ -11,7 +11,7 @@
 //! a command and args and spawns a process. So these tests exercise the
 //! unknown-id lane plus the read surfaces.
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
 /// An id no server holds. Every verb below has to say "not found" rather than
@@ -22,7 +22,7 @@ fn missing_id() -> String {
 
 #[tokio::test]
 async fn delete_on_an_unknown_server_is_404() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = missing_id();
 
@@ -48,7 +48,7 @@ async fn delete_on_an_unknown_server_is_404() {
 
 #[tokio::test]
 async fn start_and_stop_on_an_unknown_server_are_404() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = missing_id();
 
@@ -65,7 +65,7 @@ async fn start_and_stop_on_an_unknown_server_are_404() {
 
 #[tokio::test]
 async fn setting_disabled_tools_on_an_unknown_server_is_404() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = missing_id();
 
@@ -82,7 +82,7 @@ async fn setting_disabled_tools_on_an_unknown_server_is_404() {
 /// figure is engine-computed, and the model's window comes with it.
 #[tokio::test]
 async fn listing_servers_carries_totals_and_the_resolved_window() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     let resp = client
@@ -143,7 +143,7 @@ async fn listing_servers_carries_totals_and_the_resolved_window() {
 /// route the file was editable only by hand on the host.
 #[tokio::test]
 async fn mcp_allowed_tools_round_trips_over_http() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let url = format!("{}/api/v1/mcp-allowed-tools", api);
 

@@ -19,6 +19,40 @@ import type { ThreadAggregate, ThreadState } from './thread-meta';
  *  frame. A synthetic seq never enters the cache. The fast path appends to the
  *  cached fold; the fallback folds an augmented COPY of the events map. */
 export function computeExchanges(thread: ThreadState): Exchange[] {
+  return withLiveUtterance(thread, foldedExchanges(thread));
+}
+
+/**
+ * Draw the caller's utterance under everything, while they are still saying it.
+ *
+ * Appended HERE, past every path through the fold, and that is the whole of its
+ * safety. The fold never sees it. So it cannot be re-anchored, cannot become a
+ * wall a re-anchor stops at, and cannot take a step off a running turn. The
+ * engine will write the real row soon, and this one goes then.
+ *
+ * `MAX_SAFE_INTEGER` puts it under a pending typed message too, which is right:
+ * the caller is speaking now, and that message was sent before.
+ */
+function withLiveUtterance(thread: ThreadState, exchanges: Exchange[]): Exchange[] {
+  const live = thread.liveUtterance;
+  if (!live) return exchanges;
+  const userEvent = {
+    type: 'MessageReceived' as const,
+    text: '',
+    _eventId: live.eventId,
+    _displayCreated: live.created,
+    _liveUtterance: true as const,
+    channel: thread.meta.channel,
+  } as StoredEvent;
+  return [...exchanges, { userEvent, userSeq: Number.MAX_SAFE_INTEGER, steps: [] }];
+}
+
+/** True for the synthetic row above, and for nothing the engine ever wrote. */
+export function isLiveUtteranceRow(event: { _liveUtterance?: true }): boolean {
+  return event._liveUtterance === true;
+}
+
+function foldedExchanges(thread: ThreadState): Exchange[] {
   if (thread.pendingUserMessages.length === 0) {
     return filterRemovedQueuedExchanges(groupIntoExchangesCached(thread.events), thread.events);
   }
@@ -88,6 +122,12 @@ function removedQueuedMessageIds(events: Map<number, StoredEvent>): Set<string> 
   return removed;
 }
 
+/** Drop the exchanges of messages the reader retracted.
+ *
+ *  The test is `isWaitingTypedMessage`, the same one that OFFERED the retract
+ *  (`queuedMessagesFromExchanges`). Steplessness is a different question. A
+ *  message a delegation marker had folded into would be offered and then
+ *  survive the removal, rendering as a turn with a red Aborted badge. */
 function filterRemovedQueuedExchanges(
   exchanges: Exchange[],
   events: Map<number, StoredEvent>,
@@ -96,7 +136,7 @@ function filterRemovedQueuedExchanges(
   if (removed.size === 0) return exchanges;
   return exchanges.filter(ex => {
     const id = ex.userEvent._eventId;
-    return !(ex.userEvent.type === 'MessageReceived' && ex.steps.length === 0 && id && removed.has(id));
+    return !(isWaitingTypedMessage(ex) && id && removed.has(id));
   });
 }
 
@@ -126,6 +166,10 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'CredentialRequested',
   'McpConsentRequested',
   'ChildThreadCompleted',
+  // A caller's utterance the talker answered alone. A reader sorts a
+  // transcript by who is talking. Which turn was running underneath comes
+  // second, so the caller opens a boundary either way.
+  'SpokenMessageReceived',
 ]);
 
 /** Whether this event opens a new exchange. Takes the EVENT, not its type,
@@ -351,14 +395,42 @@ function requestEventIdOf(event: { type: string }): string | undefined {
   return (event as { request_event_id?: string }).request_event_id;
 }
 
-/** A turn of a call: what Lucidos said out loud, or what the caller said when
- *  the talker answered it alone.
+/** The caller speaking, in either of the two events one utterance can be.
  *
- *  Neither is an exchange boundary in the ordinary case. A spoken turn lands
- *  inside whatever turn was running when it was said, which is where it
- *  happened. This names them for the one case where there is no such turn. */
-export function isSpokenTurn(event: { type: string }): boolean {
-  return event.type === 'SpokenReplyGenerated' || event.type === 'SpokenMessageReceived';
+ *  The talker fielding an utterance itself writes a `SpokenMessageReceived`.
+ *  Delegating it writes a `MessageReceived` carrying `voice_session_id`. That
+ *  field is the only thing marking a message as spoken, ADR 0148 adding no
+ *  channel and no source value for voice.
+ *
+ *  **One predicate, because the reader cannot tell the two apart.** Both draw
+ *  the same bubble and both open a boundary, so anything reasoning about "the
+ *  caller said something here" has to see both. Splitting the question in two
+ *  is how the re-anchor guard came to protect only half of a call. */
+export function isCallerUtterance(event: { type: string; voice_session_id?: string }): boolean {
+  if (event.type === 'SpokenMessageReceived') return true;
+  return event.type === 'MessageReceived' && !!event.voice_session_id;
+}
+
+/** True when this exchange draws a stretch of a call and holds no turn.
+ *
+ *  A spoken boundary starts nothing, so it owns nothing: not the events a
+ *  running turn routes chronologically, not the live stream, not a place in the
+ *  queue. Both the fold and the active-turn search step over it.
+ *
+ *  A DELEGATED utterance is deliberately not one of these. That one is a turn. */
+export function exchangeHoldsNoTurn(exchange: Exchange): boolean {
+  if (isLiveUtteranceRow(exchange.userEvent)) return true;
+  const type = exchange.userEvent.type;
+  return type === 'SpokenMessageReceived' || type === 'SpokenReplyGenerated';
+}
+
+/** A boundary opened by something said on a call, in either direction.
+ *
+ *  The caller's two, plus a greeting. A greeting opens a boundary only where
+ *  there was no exchange to land in. A reader asking "is this exchange a
+ *  stretch of a call" wants it either way. */
+export function isCallBoundary(event: { type: string; voice_session_id?: string }): boolean {
+  return event.type === 'SpokenReplyGenerated' || isCallerUtterance(event);
 }
 
 /** Read `tool_use_id` from a CodingAgentTool* event payload. Empty string in
@@ -522,6 +594,96 @@ function newFoldState(): GroupFoldState {
     resolvedReqIds: new Set(),
     abortReqIds: new Set(),
   };
+}
+
+/** What a call leaves in the transcript with no turn behind it, and so belongs
+ *  at the BOTTOM rather than in whatever turn is running.
+ *
+ *  Speech reads back in the order it was said, and a caller's utterance takes
+ *  no turn, so it is the bottom without being `current`. These rows are the
+ *  answer to it and the session marks around that answer.
+ *
+ *  `WorkDelegated` is deliberately absent. It precedes the `MessageReceived`
+ *  that becomes the new bottom anyway, and it draws nothing wherever it lands. */
+const CALL_ROW_TYPES: ReadonlySet<string> = new Set([
+  'SpokenReplyGenerated',
+  'VoiceSessionStarted',
+  'VoiceSessionEnded',
+]);
+
+/** Everything a call can leave in an exchange without a turn behind it.
+ *
+ *  The spoken reply is what a reader sees. The session pair and the delegation
+ *  marker draw nothing, yet they still fold in as steps. A set naming only the
+ *  visible one would answer `false` for most real calls.
+ *
+ *  A delegation is in the set deliberately. It sits beside a `MessageReceived`,
+ *  which is a boundary, so that turn opens an exchange of its own. The marker
+ *  left here reports no work landing HERE.
+ *
+ *  The caller's own utterance is NOT here, and cannot be: it is an exchange
+ *  start type, so the fold gives it a boundary and never a step. */
+export const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
+  'SpokenReplyGenerated',
+  'VoiceSessionStarted',
+  'VoiceSessionEnded',
+  'WorkDelegated',
+]);
+
+/** A user message the agentic loop has not picked up yet, in EITHER direction.
+ *
+ *  **Judged by whether a TURN has landed here, not by whether the exchange is
+ *  stepless.** A call files rows of its own into whatever is open. So a stall
+ *  the talker spoke, or a delegation it made, leaves a step behind without the
+ *  loop having touched the message. Read as ingested, the message takes the
+ *  running turn's live stream and badge, and loses its own place in the queue.
+ *
+ *  An optimistic one carries `_displayCreated` and no `created`, a persisted
+ *  queued one carries `created`. Both wait until a `UserPromptInjected` lands
+ *  and is absorbed. */
+export function isUningestedMessage(exchange: Exchange): boolean {
+  if (exchange.userEvent.type !== 'MessageReceived') return false;
+  // A live utterance is no message at all yet. Nothing was sent, so nobody
+  // waits on the loop to take it. Counted as awaiting, it would take the
+  // running turn's stream the moment a caller drew breath.
+  if (isLiveUtteranceRow(exchange.userEvent)) return false;
+  return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
+}
+
+/** The narrower half: a message the reader may RETRACT.
+ *
+ *  A DELEGATED utterance is uningested in the same window and is NOT one of
+ *  these. It is speech, and nothing offers to unsay something.
+ *  `voice_session_id` is what tells them apart. */
+export function isWaitingTypedMessage(exchange: Exchange): boolean {
+  if (!isUningestedMessage(exchange)) return false;
+  return !(exchange.userEvent as { voice_session_id?: string }).voice_session_id;
+}
+
+/** The newest exchange a call row may be filed in, or null.
+ *
+ *  Read off the array rather than tracked. "The bottom" is a fact about the
+ *  array, and a pointer would need clearing everywhere one can appear. Those
+ *  places do not all open a boundary: an absorb re-anchors a message by moving
+ *  it, and an abort, a cancel and a user stop each push a panel and return
+ *  early. A pointer missed every one of them.
+ *
+ *  Two kinds are stepped over, both because a row filed there is a row nobody
+ *  can read. A message still WAITING has had nothing happen in it, and a step
+ *  there takes it out of the queue, beyond Stop's reach. A user's Stop-waiting
+ *  panel draws no body at all.
+ *
+ *  Null means nowhere can hold the row. A reply then opens a boundary of its
+ *  own, the greeting arm in `foldEvent`, and a session mark is dropped.
+ *  Deliberately NOT `current`, which is routinely the waiting message. */
+function callRowTarget(exchanges: Exchange[]): Exchange | null {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const exchange = exchanges[i];
+    if (isWaitingTypedMessage(exchange)) continue;
+    if (isUserStoppedWait(exchange.userEvent)) continue;
+    return exchange;
+  }
+  return null;
 }
 
 export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {
@@ -706,21 +868,55 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
   return state;
 }
 
-/** Re-anchor `exchange` to the end of the timeline, the position it should
- *  occupy now that the agent has engaged with it. Used by the two paths where
- *  an exchange was created earlier than it was engaged with: the mid-flight
- *  `UserPromptInjected` absorb and `reanchorResolvedDivider`. No-op when it is
- *  already last, the common case for both.
+/** Re-anchor `exchange` to the position it should occupy now that the agent has
+ *  engaged with it: as far down as it can go WITHOUT crossing something the
+ *  caller said.
+ *
+ *  The end of the timeline when nothing was said after it, which is the common
+ *  case for both callers. Otherwise just above the first utterance that
+ *  followed. Used by the two paths where an exchange was created earlier than
+ *  it was engaged with: the mid-flight `UserPromptInjected` absorb and
+ *  `reanchorResolvedDivider`. No-op when it is already there.
+ *
+ *  All-or-nothing was wrong both ways. Moving to the end regardless prints the
+ *  caller's own words out of the order they were said. Refusing to move at all
+ *  leaves the exchange above a card it was engaged with AFTER, which is the
+ *  whole reason a re-anchor exists. One utterance in the way should not cost
+ *  the move against every other boundary.
  *
  *  Position is not part of an Exchange's own state, so callers relying on
  *  position-derived props need no `touched` bump. The render pass recomputes
  *  `isLast` / `hasPriorActive` / `priorModel` / `priorEffort` per exchange and
  *  `chatExchangePropsEqual` compares each, so a reorder re-renders on its own. */
-function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
-  const idx = exchanges.indexOf(exchange);
-  if (idx === -1 || idx === exchanges.length - 1) return;
-  exchanges.splice(idx, 1);
-  exchanges.push(exchange);
+function reanchorBelowSpeech(exchanges: Exchange[], exchange: Exchange): void {
+  const from = exchanges.indexOf(exchange);
+  if (from === -1) return;
+  let wall = exchanges.length;
+  for (let i = from + 1; i < exchanges.length; i++) {
+    if (isCallerUtterance(exchanges[i].userEvent)) {
+      wall = i;
+      break;
+    }
+  }
+  // `wall - 1` is where it lands once the splice closes the gap it left.
+  const to = wall - 1;
+  if (to <= from) return;
+  exchanges.splice(from, 1);
+  exchanges.splice(to, 0, exchange);
+}
+
+/** Did the caller speak after `exchange` opened? The one thing a re-anchor may
+ *  not cross, see `reanchorResolvedDivider`.
+ *
+ *  Both halves of an utterance count (`isCallerUtterance`). The reader sees the
+ *  same bubble either way, so moving a card below a delegated one reorders
+ *  speech just as visibly. */
+function callerSpokeAfter(exchanges: Exchange[], exchange: Exchange): boolean {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (exchanges[i] === exchange) return false;
+    if (isCallerUtterance(exchanges[i].userEvent)) return true;
+  }
+  return false;
 }
 
 /** A divider just received its resolution (answer / permission grant). A
@@ -732,15 +928,29 @@ function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
  *  the thread is a stepless card frozen on 'Requesting', as if stuck.
  *
  *  So re-anchor the divider to its RESOLUTION point: move it to the end and
- *  make it `current`. Same move and reason as the mid-flight
- *  `UserPromptInjected` absorb above.
+ *  make it `current`. Same move as the mid-flight `UserPromptInjected` absorb
+ *  above, for a different reason: that one follows the message the loop just
+ *  picked up, this one follows the card the reader just answered.
  *
  *  Gated on the divider being a `reqIdRedirect` target, which is exactly the
  *  in-process chat dividers whose continuation routes back here by request id.
  *  A CC `CodingAgentPermissionRequest` is never a redirect target, CC events
  *  not being request-id routed. Its continuation flows through `current` to the
  *  intervening boundary, so moving the card would strand it. No-op with no
- *  boundary between, the divider being already last and already `current`. */
+ *  boundary between, the divider being already last and already `current`.
+ *
+ *  **A caller's utterance stops the move outright**, both halves of it. The
+ *  intervening boundary this was written for is a sub-thread finishing, which
+ *  nobody said out loud. An utterance is speech, and so is what the card holds:
+ *  every spoken line must read back in the order it was said. Moving the card
+ *  below a later utterance reorders its own spoken rows. Handing it `current`
+ *  sends the NEXT reply there too, rows early. The continuation still finds the
+ *  card, routing by request id rather than by position, so what is given up is
+ *  where it renders.
+ *
+ *  The hold costs the card nothing else, because an utterance never took
+ *  `current` in the first place: the boundary branch hands it back. So the
+ *  card keeps the continuation that routes chronologically too. */
 function reanchorResolvedDivider(
   state: GroupFoldState,
   divider: Exchange,
@@ -754,7 +964,8 @@ function reanchorResolvedDivider(
     }
   }
   if (!ownsContinuation) return current;
-  moveExchangeToEnd(state.exchanges, divider);
+  reanchorBelowSpeech(state.exchanges, divider);
+  if (callerSpokeAfter(state.exchanges, divider)) return current;
   // The resolved divider is the live turn again (see `Exchange.continuationMoved`).
   divider.continuationMoved = false;
   return divider;
@@ -862,6 +1073,9 @@ function foldEvent(
     if (NON_EXCHANGE_METADATA_EVENTS.has(event.type)) return;
     if (isAuxiliaryCapture(event)) return;
 
+    // Walked once, and only for a row a call leaves behind. Every other event
+    // short-circuits on the set membership and pays nothing.
+    const callTarget = CALL_ROW_TYPES.has(event.type) ? callRowTarget(exchanges) : null;
     const reqId = shouldRouteByRequestId(event) ? requestEventIdOf(event) : undefined;
     // Remember the active chat turn's req_id (see `lastChatTurnReqId`) so the
     // divider redirect bootstrap below targets it directly, rather than
@@ -994,7 +1208,17 @@ function foldEvent(
       // engages with the message now, so its panel and reply belong BELOW those
       // boundaries. Re-anchor to the ingestion point by moving it to the end.
       // No-op when it is already last, the common case.
-      moveExchangeToEnd(exchanges, absorbTarget);
+      //
+      // **A caller's utterance holds this move**, as it holds the divider's
+      // (`reanchorResolvedDivider`). What waited here was SAID, and so is what
+      // the talker stalled with while it waited, which `callRowTarget` files
+      // right here. Moving it below a later utterance prints both after words
+      // the caller said afterwards, and no audio is kept to correct that.
+      //
+      // Only the MOVE is held. The exchange still takes `current`, so the
+      // turn's own bookkeeping keeps landing on it. What the call leaves
+      // behind never reaches `current`, going to the bottom by name instead.
+      reanchorBelowSpeech(exchanges, absorbTarget);
       absorbTarget.steps.push({ seq, event });
       touched?.add(absorbTarget);
       // It owns the turn again, so a handoff recorded while it sat in the queue
@@ -1029,6 +1253,24 @@ function foldEvent(
       // there is no continuation to redirect and no handoff to record.
       if (isUserStoppedWait(event)) {
         current = previousCurrent;
+        return;
+      }
+      // **A caller's utterance takes no ownership of the turn either**, and for
+      // the same reason: the talker answered it alone, so it started nothing.
+      // The doer keeps working on whatever it was asked before, and its
+      // `TodoListWritten`, its background-bash pair and its `EventWaitStarted`
+      // route chronologically. Folded in here they would report a crashed turn
+      // under the caller's words, and take the real turn's park row with them.
+      //
+      // What DOES belong here is the reply, and the session rows around it.
+      // Those find it as the BOTTOM of the transcript rather than as `current`,
+      // through `callRowTarget`.
+      if (event.type === 'SpokenMessageReceived') {
+        // Handed back only when there is a TURN to hand it to. A call nobody
+        // delegated from has none, and the utterances are then all there is:
+        // `current` stays on this one, so nothing that lands next falls off the
+        // end of the fold, and the newest utterance is where it goes.
+        if (previousCurrent && !exchangeHoldsNoTurn(previousCurrent)) current = previousCurrent;
         return;
       }
       // Register divider exchanges so their resolution can route back here by
@@ -1154,7 +1396,7 @@ function foldEvent(
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
       touched?.add(current);
-    } else if (isSpokenTurn(event) && !current) {
+    } else if (event.type === 'SpokenReplyGenerated' && !callTarget) {
       // A call opens with a greeting, and it is said before anything has
       // started a turn. So there is no exchange for the row to land in, and
       // the `current` fallthrough below drops it silently. No audio is kept,
@@ -1164,9 +1406,34 @@ function foldEvent(
       // Promoted to a boundary of its own, as the legacy prompt above is. It
       // takes NO steps: the words are in the event, and its initiator panel
       // draws them. Anything landing after it belongs to it as usual.
-      current = { userEvent: event, userSeq: seq, steps: [] };
-      exchanges.push(current);
-      touched?.add(current);
+      //
+      // Gated on there being nowhere to put it, which covers more than an
+      // empty thread. A message the loop has not picked up yet is the other
+      // way a transcript holds nothing a reply may go in.
+      //
+      // It takes `current` only when nothing else holds it. A turn that has
+      // started but not yet emitted a step is one of those nowheres, and the
+      // reply must not take its ownership: whatever that turn routes
+      // chronologically would then land under a greeting.
+      //
+      // The caller's own utterance never reaches here. It is a boundary
+      // wherever it lands, so the branch above has already taken it.
+      const greeting: Exchange = { userEvent: event, userSeq: seq, steps: [] };
+      exchanges.push(greeting);
+      touched?.add(greeting);
+      if (!current) current = greeting;
+    } else if (CALL_ROW_TYPES.has(event.type)) {
+      // A call row goes where the call is, and `callTarget` is the only place
+      // that can hold one. Never `current`, which is routinely a message still
+      // waiting to be picked up.
+      //
+      // With nowhere at all, the row is dropped. Only a session mark reaches
+      // that: a reply took the boundary above, and a mark draws nothing, so
+      // there is nothing to lose and nowhere to lose it from.
+      if (callTarget) {
+        callTarget.steps.push({ seq, event });
+        touched?.add(callTarget);
+      }
     } else if (owner) {
       owner.steps.push({ seq, event });
       touched?.add(owner);
@@ -1259,6 +1526,26 @@ export function handleEvent(
     // Must stay in sync with update_thread_projection() in event_bus.rs.
     // Tick-only write — does not mark metaChanged (see `applyAggregateToMeta`).
     if (created && updatesLastActivity(event.type)) thread.meta.updatedAt = created;
+    // The caller's words landed, so the row promising them has done its job.
+    // Here rather than on the call's own clock: the engine holds a transcript
+    // across the talker's decision, so `user_turn_ended` can precede this row
+    // by a second or more. Dropping it there would reopen the silence.
+    //
+    // Matched by COUNT rather than taken on sight. The engine holds one
+    // utterance at a time. So a caller who barges in can have a SECOND row up
+    // before the first one's words arrive. Clearing whatever is there would
+    // erase the row for the sentence they are still saying.
+    //
+    // Words land in the order they were said, so the tally is enough and no
+    // id is needed. An utterance the gate never heard still counts, which
+    // only ever makes the next clear more eager.
+    if (isCallerUtterance(event)) {
+      const settled = (thread.settledUtterances ?? 0) + 1;
+      thread.settledUtterances = settled;
+      if (thread.liveUtterance && thread.liveUtterance.count <= settled) {
+        thread.liveUtterance = null;
+      }
+    }
     // A real MessageReceived from the backend removes the matching optimistic
     // pending message by event_id.
     if ((event.type === 'MessageReceived' || event.type === 'UserPromptInjected') && thread.pendingUserMessages.length > 0) {

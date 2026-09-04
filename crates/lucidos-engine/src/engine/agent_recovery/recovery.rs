@@ -1187,11 +1187,16 @@ fn unanswered_question_predicate_sql(id_expr: &str) -> String {
 
 /// A question a thread is parked on, as a reader of it needs it.
 ///
-/// The event carries resume plumbing beside these three: a `tool_use_id`, a
-/// Claude Code session id, a worktree path. None of that means anything to
-/// somebody being asked the question, so none of it is here.
+/// The event carries resume plumbing beside these four: a Claude Code session
+/// id and a worktree path. Neither means anything to somebody being asked the
+/// question, so neither is here.
+///
+/// `tool_use_id` is here because it is what ANSWERS the question:
+/// `agent_question::answer_pending_question` takes it, and a reader that could
+/// read a question aloud but not settle it would be half a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenQuestion {
+    pub tool_use_id: String,
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub multi_select: bool,
@@ -1209,7 +1214,9 @@ pub(crate) struct OpenQuestion {
 /// one the reader is looking at.
 ///
 /// A read error, a missing question or a blank one all yield `None`. A call
-/// that opens knowing less beats a call that does not open.
+/// that opens knowing less beats a call that does not open. A question with no
+/// `tool_use_id` yields `None` too: nothing can answer it, here or anywhere
+/// else, so reading it aloud would only offer the caller a dead end.
 pub(crate) async fn newest_open_question(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -1239,12 +1246,17 @@ pub(crate) async fn newest_open_question(
     if question.is_empty() {
         return None;
     }
+    let tool_use_id = payload.get("tool_use_id")?.as_str()?.trim();
+    if tool_use_id.is_empty() {
+        return None;
+    }
     let options = payload
         .get("options")
         .cloned()
         .and_then(|v| serde_json::from_value::<Vec<QuestionOption>>(v).ok())
         .unwrap_or_default();
     Some(OpenQuestion {
+        tool_use_id: tool_use_id.to_string(),
         question: question.to_string(),
         options,
         multi_select: payload
@@ -1387,10 +1399,13 @@ pub(crate) const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborte
      AND payload->'actor'->>'kind' = 'device' \
      AND payload->>'cause' = 'engine_shutdown'";
 
-/// SQL list of the events that begin (or restart) a thread's turn. Reach for
-/// [`after_latest_thread_start_sql`] rather than this constant: the list is only
-/// ever useful inside that one predicate.
-const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
+/// SQL list of the events that begin (or restart) a thread's turn.
+///
+/// Two questions read it, and they must not answer differently about which turn
+/// is current. The recovery gates ask through [`after_latest_thread_start_sql`],
+/// which is the form to reach for here. `api::standing_instruction` asks who
+/// opened that turn, and selects the newest row of this set directly.
+pub(crate) const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
     'OrphanRecoveryStarted'";
 

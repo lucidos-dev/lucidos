@@ -32,12 +32,7 @@
  *     unit level (chat-link-click.test.ts END-TO-END test) instead.
  */
 import { test, expect, Page } from './fixtures';
-import {
-  assertHealthy,
-  navigateToApp,
-  isMobileViewport,
-  waitForEventStream,
-} from './helpers';
+import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
 import { clearNotifications } from './db-helpers';
 
 async function expectMobileView(
@@ -88,7 +83,7 @@ test.describe('Mobile pane-swipe — every navigation source reveals the content
       await waitForEventStream(page);
       await expectMobileView(page, 'thread');
 
-      const res = await page.request.post('/api/v1/ui/navigate', {
+      const res = await apiRequest(page).post('/api/v1/ui/navigate', {
         headers: { 'content-type': 'application/json' },
         data: { target },
       });
@@ -108,7 +103,7 @@ test.describe('Mobile pane-swipe — every navigation source reveals the content
     await navigateToApp(page);
     await expectMobileView(page, 'thread');
 
-    const postRes = await page.request.post('/api/v1/notifications', {
+    const postRes = await apiRequest(page).post('/api/v1/notifications', {
       headers: { 'content-type': 'application/json' },
       data: {
         title: 'Go to apps',

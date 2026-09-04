@@ -4,37 +4,9 @@ use super::*;
 use crate::core::grants::{self, GrantFile};
 use crate::core::mcp_servers::validate_server_id;
 use crate::core::{McpServer, McpServerStore};
-use crate::engine::cc_permission::{PermissionEntry, DENIAL_REASON};
-use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
-use crate::engine::event_bus::BusEvent;
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::cc_permission::resolve_coding_agent_permission;
+use crate::engine::claude_code::AllowScope;
 use crate::mcp::{McpCostTotals, McpStartOutcome, McpStopOutcome};
-
-/// Dispatch an "Always allow" grant to the right storage. `Narrow` / `Broad`
-/// append to `<workspace>/.lucidos/cc-allowed-tools`; `Session` records into the
-/// per-thread in-memory allow set. Returns silently for tools whose scope yields
-/// no derivable pattern (e.g. `Edit` with `Broad` — `BROAD_ALLOW_INEFFECTIVE`).
-///
-/// Both storages bind the CURRENT session. CC reads the file at its next spawn,
-/// but the engine's own gate reads it on every prompt. That is what makes an
-/// "Always allow" click take effect where it was clicked (ADR 0125).
-fn record_allow_grant(state: &AppState, entry: &PermissionEntry, scope: AllowScope) {
-    let Some(pattern) = derive_allow_pattern(&entry.tool_name, &entry.input, scope) else {
-        return;
-    };
-    match scope {
-        AllowScope::Session => {
-            let mut pending = state.engine.pending_cc_permission.lock().unwrap();
-            pending.allow_session(entry.thread_id, pattern);
-        }
-        AllowScope::Narrow | AllowScope::Broad => {
-            let dir = state.engine.grants_dir();
-            if let Err(e) = grants::append(&dir, GrantFile::CodingAgentTools, &pattern) {
-                crate::log!("[MCP] Failed to persist allow pattern {:?}: {}", pattern, e);
-            }
-        }
-    }
-}
 
 #[derive(Deserialize)]
 pub(super) struct McpConsentResponse {
@@ -64,54 +36,31 @@ pub(super) struct McpConsentResponse {
 ///
 /// The chat MCP permission lane has its own endpoint
 /// (`/api/v1/mcp-permission/consent`); this one is coding-agent-only.
+///
+/// Thin: resolving one is `cc_permission::resolve_coding_agent_permission`,
+/// which a spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_mcp_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<McpConsentResponse>,
 ) -> impl IntoResponse {
-    let cc_entry = {
-        let mut pending = state.engine.pending_cc_permission.lock().unwrap();
-        pending.take(&body.request_id)
-    };
-    let Some(entry) = cc_entry else {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let answered = resolve_coding_agent_permission(
+        &state.engine,
+        body.request_id,
+        body.allowed,
+        body.persist_scope,
+        actor,
+        "[MCP] CodingAgentPermissionResolved",
+    )
+    .await;
+    if !answered {
         return (
             StatusCode::NOT_FOUND,
             "No pending consent request with that ID",
         )
             .into_response();
-    };
-    let _ = entry.tx.send(body.allowed);
-    let reason = if body.allowed {
-        None
-    } else {
-        Some(DENIAL_REASON.to_string())
-    };
-    let persist_scope = if body.allowed {
-        body.persist_scope
-    } else {
-        None
-    };
-    if let Some(scope) = persist_scope {
-        record_allow_grant(&state, &entry, scope);
     }
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    state
-        .engine
-        .event_bus
-        .emit_or_log(
-            BusEvent::Thread {
-                thread_id: entry.thread_id,
-                event: ThreadEvent::CodingAgentPermissionResolved {
-                    request_id: body.request_id,
-                    allowed: body.allowed,
-                    reason,
-                    persist_scope,
-                },
-                meta: EventMeta::with_actor(actor),
-            },
-            "[MCP] CodingAgentPermissionResolved",
-        )
-        .await;
     StatusCode::OK.into_response()
 }
 
@@ -286,9 +235,8 @@ pub(super) async fn remove_mcp_server(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     // The store emits `McpServerRemoved` from inside its write path, so the
-    // device actor is resolved up front and passed down rather than going
-    // through `emit_user_system`.
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // device actor is resolved up front and passed down.
+    let actor = Some(super::actor::require_user_actor(&headers, &state.pool, None).await?);
     let removed = state
         .engine
         .mcp_manager

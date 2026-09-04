@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use sqlx::PgPool;
 use tokio::sync::Notify;
 
-use super::{answer_to_say, question_to_ask, OFFER_THE_DETAIL_ABOVE_CHARS};
+use super::{answer_to_say, decision_to_ask, OFFER_THE_DETAIL_ABOVE_CHARS};
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, CancelCause, MessageOrigin, QuestionOption, ThreadEvent,
@@ -16,12 +16,85 @@ use crate::engine::thread_events::{
 use crate::engine::ApiUsage;
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use crate::voice::call::{run_call, CallSubject, CallTransport, CallerFrame};
+use crate::voice::decision::{DecisionResolver, OpenDecision, Resolution};
 use crate::voice::doer::TurnStarter;
 use crate::voice::mock::MockVoiceProvider;
 use crate::voice::provider::{AudioFormat, SessionOpening, VoiceEvent};
 use crate::voice::wire::{ClientControl, ServerFrame};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A thread with nothing waiting on the caller, and a resolver that records
+/// what it was asked to settle.
+///
+/// The default is what most cases need: a free doer, so a delegation goes
+/// through. `parked` and `answers` are set by the cases that are about the
+/// other side.
+#[derive(Default)]
+struct NoDecisions {
+    /// What `doer_is_parked` answers.
+    parked: bool,
+    /// What `resolve` answers, in order. Exhausted, it settles.
+    answers: Mutex<std::collections::VecDeque<Resolution>>,
+    /// Every `(choice_id, spoken)` it was asked to settle, oldest first.
+    asked: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl NoDecisions {
+    /// A thread whose doer is parked on something waiting on the caller.
+    fn parked() -> Self {
+        Self {
+            parked: true,
+            ..Self::default()
+        }
+    }
+
+    /// A resolver answering each `resolve` from this script, in order.
+    fn answering(script: Vec<Resolution>) -> Self {
+        Self {
+            answers: Mutex::new(script.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
+    fn asked(&self) -> Arc<Mutex<Vec<(String, String)>>> {
+        Arc::clone(&self.asked)
+    }
+}
+
+/// The default resolver, shared: nothing waiting, and every answer settles.
+///
+/// Most cases are about something else entirely and only need a free doer, so
+/// they pass this inline. A case asserting what was ASKED builds its own.
+fn free_doer() -> &'static NoDecisions {
+    static FREE: std::sync::OnceLock<NoDecisions> = std::sync::OnceLock::new();
+    FREE.get_or_init(NoDecisions::default)
+}
+
+#[async_trait::async_trait]
+impl DecisionResolver for NoDecisions {
+    async fn resolve(
+        &self,
+        _thread_id: uuid::Uuid,
+        choice_id: &str,
+        spoken: &str,
+        _actor: Option<MessageOrigin>,
+    ) -> Resolution {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((choice_id.to_string(), spoken.to_string()));
+        self.answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Resolution::Settled)
+    }
+
+    async fn doer_is_parked(&self, _thread_id: uuid::Uuid) -> bool {
+        self.parked
+    }
+}
 
 /// A doer that records what it was asked to start, and starts nothing.
 ///
@@ -90,7 +163,7 @@ impl TurnStarter for RecordingTurns {
 /// The talker asking for the doer, with a reason.
 fn asks_for_the_doer(reason: &str) -> VoiceEvent {
     VoiceEvent::DelegationRequested {
-        delegation_id: "call_1".to_string(),
+        tool_call_id: "call_1".to_string(),
         reason: reason.to_string(),
     }
 }
@@ -342,6 +415,31 @@ async fn a_chat_thread(pool: &PgPool) -> uuid::Uuid {
     thread_id
 }
 
+/// A coding-agent thread, the only kind its permission lane fires on.
+async fn a_coding_agent_thread(bus: &EventBus) -> uuid::Uuid {
+    let thread_id = uuid::Uuid::new_v4();
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::SessionStarted {
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            session_id: "sid-test".to_string(),
+            branch: "claude-code/test".to_string(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+        },
+        meta: crate::engine::thread_events::EventMeta {
+            channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+            ..crate::engine::thread_events::EventMeta::NONE
+        },
+    })
+    .await
+    .expect("SessionStarted emit")
+    .expect("SessionStarted persisted");
+    thread_id
+}
+
 /// The ordinary shape of a call: one start, one end, and a hangup reason.
 #[tokio::test]
 async fn a_hangup_pairs_the_start_with_one_end() {
@@ -358,6 +456,7 @@ async fn a_hangup_pairs_the_start_with_one_end() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -395,6 +494,7 @@ async fn a_dropped_socket_still_closes_the_pair() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -444,6 +544,7 @@ async fn a_whole_call_leaves_the_thread_a_chat_thread() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -489,6 +590,7 @@ async fn a_spoken_reply_records_what_it_spent() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -528,6 +630,7 @@ async fn a_talker_that_never_answers_leaves_no_trace() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -571,6 +674,7 @@ async fn talker_audio_reaches_the_caller_and_no_event() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -646,6 +750,7 @@ async fn a_talker_that_drops_the_call_ends_it_as_a_failure() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -688,6 +793,7 @@ async fn a_caller_who_stops_receiving_is_not_a_provider_failure() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -797,6 +903,7 @@ async fn a_call_that_hears(
         &provider,
         &mut caller,
         &turns,
+        free_doer(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -1007,6 +1114,7 @@ async fn a_refused_utterance_is_written_down_and_said_out_loud() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, session_id),
         ),
@@ -1210,12 +1318,13 @@ async fn every_ask_is_acknowledged() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
     .await;
 
-    let resolved = log.lock().unwrap().resolved_delegations.clone();
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
     assert_eq!(resolved.len(), 1, "{:?}", resolved);
     assert_eq!(resolved[0].0, "call_1");
 
@@ -1263,6 +1372,7 @@ async fn a_call_that_drops_mid_utterance_loses_nothing() {
             &provider,
             &mut caller,
             &RecordingTurns::default(),
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         )
@@ -1400,6 +1510,7 @@ async fn the_doers_answer_is_spoken_and_progress_is_not() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1512,6 +1623,7 @@ async fn a_question_is_put_to_the_caller_out_loud() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1549,8 +1661,13 @@ async fn a_question_is_put_to_the_caller_out_loud() {
         assert!(spoken.contains("Chunks 25-33"), "{}", spoken);
         assert!(spoken.contains("Leave it for tonight"), "{}", spoken);
         assert!(
-            spoken.contains("answer on screen"),
-            "the talker was not told where the answer goes: {}",
+            !spoken.to_lowercase().contains("on screen"),
+            "the talker was still sending the caller to the screen: {}",
+            spoken
+        );
+        assert!(
+            spoken.contains("question:toolu_q0#opt0"),
+            "the talker was given no id to hand back: {}",
             spoken
         );
         // The only tool whose progress note is suppressed. It is the tool the
@@ -1565,8 +1682,8 @@ async fn a_question_is_put_to_the_caller_out_loud() {
     teardown_test_db(&db_name).await;
 }
 
-/// The caller answers on screen, so the talker is told rather than asked to
-/// say it. What that prevents is the question being offered a second time.
+/// Whoever settled it already knows, so the talker is told rather than asked
+/// to say it. What that prevents is the card being offered a second time.
 #[tokio::test]
 async fn an_answered_question_is_appended_and_never_asked_again() {
     let (pool, db_name) = setup_test_db().await;
@@ -1585,6 +1702,7 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1613,7 +1731,7 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
                     .unwrap()
                     .history
                     .iter()
-                    .any(|h| h.starts_with("[ANSWERED]"))
+                    .any(|h| h.starts_with("[SETTLED]"))
             })
             .await;
             hang_up.notify_one();
@@ -1633,27 +1751,262 @@ async fn an_answered_question_is_appended_and_never_asked_again() {
     teardown_test_db(&db_name).await;
 }
 
-/// A question with one option and no description still reads as a choice, and
-/// a multi-select one says so. Pure, so neither needs a call behind it.
+/// A permission card in each of the three lanes, put to the caller out loud.
+///
+/// Spoken for the same reason a question is: the agent is blocked inside the
+/// card, so no answer follows it. Before this the caller heard nothing at all,
+/// and a delegated utterance silently resolved the card as denied.
+#[tokio::test]
+async fn a_permission_card_is_put_to_the_caller_out_loud_in_every_lane() {
+    // The coding-agent lane fires only on a coding-agent thread: the lifecycle
+    // validator refuses its event anywhere else. A call is refused on one at
+    // admission (ADR 0165), so voice meets it after a destination flip mid-call.
+    let lanes = [
+        (
+            "command",
+            false,
+            ThreadEvent::CommandPermissionRequested {
+                request_id: "req-cmd".to_string(),
+                tool_use_id: "toolu_b0".to_string(),
+                tool_name: "run_bash".to_string(),
+                command: "gh release delete v1".to_string(),
+                summary: "Deletes a published release.".to_string(),
+            },
+            "Deletes a published release.",
+            "command:req-cmd#allow-once",
+        ),
+        (
+            "mcp",
+            false,
+            ThreadEvent::McpPermissionRequested {
+                request_id: "req-mcp".to_string(),
+                tool_use_id: "toolu_m0".to_string(),
+                server_id: "example-server".to_string(),
+                server_name: "Example Server".to_string(),
+                tool_name: "post_message".to_string(),
+                arguments_summary: "{\"channel\":\"general\"}".to_string(),
+            },
+            "Example Server",
+            "mcp:req-mcp#allow-once",
+        ),
+        (
+            "coding agent",
+            true,
+            ThreadEvent::CodingAgentPermissionRequest {
+                request_id: "req-agent".to_string(),
+                tool_use_id: "toolu_c0".to_string(),
+                tool_name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "git push" }),
+                summary: "Bash git push".to_string(),
+            },
+            "Bash git push",
+            "agent:req-agent#allow-once",
+        ),
+    ];
+
+    for (lane, on_a_coding_agent_thread, card, expected, first_choice) in lanes {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = if on_a_coding_agent_thread {
+            a_coding_agent_thread(&bus).await
+        } else {
+            a_chat_thread(&pool).await
+        };
+
+        let provider = MockVoiceProvider::new(vec![]);
+        let log = provider.log();
+        let turns = RecordingTurns::default();
+        let hang_up = Arc::new(Notify::new());
+        let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+
+        tokio::join!(
+            run_call(
+                &bus,
+                &provider,
+                &mut caller,
+                &turns,
+                free_doer(),
+                opening(),
+                subject(thread_id, uuid::Uuid::new_v4()),
+            ),
+            async {
+                until("the session to open", || {
+                    log.lock().unwrap().openings.len() == 1
+                })
+                .await;
+                if !on_a_coding_agent_thread {
+                    a_turn_starts(&bus, thread_id).await;
+                }
+                seed_thread_event(&bus, thread_id, card).await;
+                until("the card to be handed to the talker", || {
+                    log.lock()
+                        .unwrap()
+                        .asked_to_speak
+                        .iter()
+                        .any(|s| s.starts_with("[PERMISSION]"))
+                })
+                .await;
+                hang_up.notify_one();
+            }
+        );
+
+        let spoken = log
+            .lock()
+            .unwrap()
+            .asked_to_speak
+            .iter()
+            .find(|s| s.starts_with("[PERMISSION]"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(spoken.contains(expected), "{}: {}", lane, spoken);
+        assert!(spoken.contains(first_choice), "{}: {}", lane, spoken);
+        // Decision 7: both Always-allow scopes stay on screen.
+        assert!(
+            !spoken.to_lowercase().contains("always allow"),
+            "{}: {}",
+            lane,
+            spoken
+        );
+
+        teardown_test_db(&db_name).await;
+    }
+}
+
+/// A card resolved on screen mid-call tells the talker it is settled, so it
+/// stops offering a spent card. Appended, never spoken.
+#[tokio::test]
+async fn a_permission_settled_mid_call_is_appended_and_never_asked_again() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![]);
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let hang_up = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&hang_up));
+
+    tokio::join!(
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &turns,
+            free_doer(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        ),
+        async {
+            until("the session to open", || {
+                log.lock().unwrap().openings.len() == 1
+            })
+            .await;
+            a_turn_starts(&bus, thread_id).await;
+            seed_thread_event(
+                &bus,
+                thread_id,
+                ThreadEvent::CommandPermissionRequested {
+                    request_id: "req-cmd".to_string(),
+                    tool_use_id: "toolu_b0".to_string(),
+                    tool_name: "run_bash".to_string(),
+                    command: "gh release delete v1".to_string(),
+                    summary: "Deletes a published release.".to_string(),
+                },
+            )
+            .await;
+            until("the card to be handed to the talker", || {
+                log.lock().unwrap().asked_to_speak.len() == 1
+            })
+            .await;
+            seed_thread_event(
+                &bus,
+                thread_id,
+                ThreadEvent::CommandPermissionResolved {
+                    request_id: "req-cmd".to_string(),
+                    allowed: true,
+                    reason: None,
+                    persist_scope: None,
+                },
+            )
+            .await;
+            until("the resolution to reach the talker", || {
+                log.lock()
+                    .unwrap()
+                    .history
+                    .iter()
+                    .any(|h| h.starts_with("[SETTLED]"))
+            })
+            .await;
+            hang_up.notify_one();
+        }
+    );
+
+    assert_eq!(
+        log.lock().unwrap().asked_to_speak.len(),
+        1,
+        "the resolution was said out loud"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A question with one option reads it out with the id that settles it, and a
+/// free-text one still offers the caller's own words. Pure, so neither needs a
+/// call behind it.
 #[test]
-fn the_choices_are_read_out_however_they_were_written() {
+fn the_choices_are_read_out_with_the_ids_that_settle_them() {
     let one = [QuestionOption {
         id: "opt-0".to_string(),
         label: "Ship it".to_string(),
         description: None,
     }];
-    let single = question_to_ask("Ready?", &one, false);
-    assert!(single.contains("\n- Ship it"), "{}", single);
-    assert!(!single.contains("more than one"), "{}", single);
+    let single = decision_to_ask(&OpenDecision::question("toolu_q0", "Ready?", &one, false));
+    assert!(
+        single.contains("- Ship it [question:toolu_q0#opt0]"),
+        "{}",
+        single
+    );
 
-    let many = question_to_ask("Which ones?", &one, true);
-    assert!(many.contains("more than one"), "{}", many);
-
-    // No choices at all is a free-text question, and it carries no heading it
-    // cannot fill.
-    let free = question_to_ask("What should I call it?", &[], false);
-    assert!(!free.contains("choices"), "{}", free);
+    let free = decision_to_ask(&OpenDecision::question(
+        "toolu_q1",
+        "What should I call it?",
+        &[],
+        false,
+    ));
     assert!(free.contains("What should I call it?"), "{}", free);
+    assert!(free.contains("[question:toolu_q1#said]"), "{}", free);
+}
+
+/// Both surfaces stopped sending the caller to the screen. This is the note
+/// handed over mid-call; `sections` covers the resident block.
+#[test]
+fn the_note_says_the_caller_answers_out_loud_and_never_on_screen() {
+    let decision = OpenDecision::question("toolu_q0", "Ready?", &[], false);
+    let note = decision_to_ask(&decision);
+    assert!(!note.to_lowercase().contains("on screen"), "{}", note);
+    assert!(note.contains("hand its id back"), "{}", note);
+    assert!(note.contains("Never say an id out loud"), "{}", note);
+}
+
+/// A permission card reads as a request for permission, not as a question the
+/// agent asked.
+#[test]
+fn a_permission_note_asks_for_a_say_so() {
+    let note = decision_to_ask(&OpenDecision::mcp_permission(
+        "req-1",
+        "example-server",
+        "Example Server",
+        "post_message",
+        "{\"channel\":\"general\"}",
+    ));
+    assert!(note.starts_with("[PERMISSION]"), "{}", note);
+    assert!(note.contains("Example Server"), "{}", note);
+    assert!(
+        note.contains("- Allow once [mcp:req-1#allow-once]"),
+        "{}",
+        note
+    );
+    assert!(note.contains("- Deny [mcp:req-1#deny]"), "{}", note);
 }
 
 /// Two replies at once is the failure a listener cannot recover from. An
@@ -1677,6 +2030,7 @@ async fn the_talker_is_not_asked_to_speak_over_itself() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1786,6 +2140,7 @@ async fn a_spoken_reply_is_written_down_under_the_talkers_name() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, session_id),
     )
@@ -1830,6 +2185,7 @@ async fn an_interrupted_reply_says_so() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -1867,6 +2223,7 @@ async fn a_reply_with_no_words_is_not_written_down() {
         &provider,
         &mut caller,
         &RecordingTurns::default(),
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -1946,6 +2303,7 @@ async fn a_stopped_turn_tells_the_caller_it_is_not_coming() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -1997,6 +2355,7 @@ async fn a_turn_superseded_by_the_next_utterance_says_nothing() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2111,6 +2470,7 @@ async fn the_talkers_own_words_are_offered_to_a_running_round() {
         &provider,
         &mut caller,
         &turns,
+        free_doer(),
         opening(),
         subject(thread_id, uuid::Uuid::new_v4()),
     )
@@ -2143,6 +2503,7 @@ async fn an_answer_the_talker_relayed_is_not_offered_back() {
             &provider,
             &mut caller,
             &turns,
+            free_doer(),
             opening(),
             subject(thread_id, uuid::Uuid::new_v4()),
         ),
@@ -2192,6 +2553,545 @@ async fn an_answer_the_talker_relayed_is_not_offered_back() {
         vec!["Anything else?".to_string()],
         "the relayed answer was offered back to the round that wrote it"
     );
+
+    teardown_test_db(&db_name).await;
+}
+
+// ---------------------------------------------------------------------------
+// Answering, and the refusal
+// ---------------------------------------------------------------------------
+
+/// The talker answering a choice id, as the seam sees it.
+fn answers_with(choice_id: &str) -> VoiceEvent {
+    VoiceEvent::AnswerRequested {
+        tool_call_id: "call_a".to_string(),
+        choice_id: choice_id.to_string(),
+    }
+}
+
+/// One call, driven over a script with a resolver of the test's choosing.
+///
+/// The sibling of `a_call_that_hears`, for the cases that are about what the
+/// call does with a decision rather than about what it writes down.
+async fn a_call_deciding(
+    pool: &PgPool,
+    bus: &EventBus,
+    decisions: &NoDecisions,
+    script: Vec<VoiceEvent>,
+) -> (Arc<Mutex<crate::voice::mock::MockLog>>, Vec<String>) {
+    let thread_id = a_chat_thread(pool).await;
+    // Counted, not guessed. A tool call reaches the caller as no frame at all.
+    // So the deliveries are the utterance, the reply, and the opening frame
+    // every call sends. Ringing off too early ends the call before the tool
+    // call is even read.
+    let deliveries = 1 + script
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                VoiceEvent::UserTurnEnded { .. } | VoiceEvent::TalkerTurnEnded { .. }
+            )
+        })
+        .count();
+    let provider = MockVoiceProvider::new(script);
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(deliveries);
+
+    run_call(
+        bus,
+        &provider,
+        &mut caller,
+        &turns,
+        decisions,
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let woken = turns.woken().lock().unwrap().clone();
+    (log, woken)
+}
+
+/// The whole route, end to end with no socket: the caller says which one, the
+/// talker hands back the id, and the engine settles it.
+#[tokio::test]
+async fn a_spoken_answer_settles_the_card_and_the_talker_is_told() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let decisions = NoDecisions::default();
+    let asked = decisions.asked();
+    let (log, _) = a_call_deciding(
+        &pool,
+        &bus,
+        &decisions,
+        vec![
+            the_caller_says("the first one"),
+            answers_with("question:toolu_q0#opt0"),
+            the_talker_says("Done."),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        asked.lock().unwrap().clone(),
+        vec![(
+            "question:toolu_q0#opt0".to_string(),
+            "the first one".to_string()
+        )]
+    );
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert_eq!(resolved[0].0, "call_a");
+    assert!(resolved[0].1.contains("Answered"), "{:?}", resolved);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// An id the engine did not issue is refused with a note saying so, never
+/// guessed at. The refusal still resolves the tool call, so nothing dangles.
+#[tokio::test]
+async fn an_id_the_engine_did_not_issue_is_refused_out_loud() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let refusal = crate::voice::decision::NOT_WAITING.to_string();
+    let decisions = NoDecisions::answering(vec![Resolution::Refused(refusal.clone())]);
+    let (log, _) = a_call_deciding(
+        &pool,
+        &bus,
+        &decisions,
+        vec![
+            the_caller_says("allow it"),
+            answers_with("something the talker made up"),
+            the_talker_says("Let me check that."),
+        ],
+    )
+    .await;
+
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert_eq!(resolved[0].1, refusal);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The "something else" choice sends the caller's transcript, word for word.
+/// A paraphrase would be a different answer (ADR 0149).
+#[tokio::test]
+async fn their_own_words_reach_the_card_exactly_as_they_said_them() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let decisions = NoDecisions::answering(vec![Resolution::SettledWithTheirWords]);
+    let asked = decisions.asked();
+    let (_, woken) = a_call_deciding(
+        &pool,
+        &bus,
+        &decisions,
+        vec![
+            the_caller_says("neither, do the second half only"),
+            answers_with("question:toolu_q0#said"),
+            the_talker_says("Right."),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        asked.lock().unwrap().clone(),
+        vec![(
+            "question:toolu_q0#said".to_string(),
+            "neither, do the second half only".to_string()
+        )]
+    );
+    // No turn: an answer is not a request, and the words were spent on it.
+    assert!(woken.is_empty(), "{:?}", woken);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Words spent on an answer are not written down a second time. Typing one
+/// writes the answer's row and nothing else, and speaking one matches.
+#[tokio::test]
+async fn words_spent_on_an_answer_are_not_also_written_down_as_speech() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let decisions = NoDecisions::answering(vec![Resolution::SettledWithTheirWords]);
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("neither, do the second half only"),
+        answers_with("question:toolu_q0#said"),
+        the_talker_says("Right."),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        &decisions,
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let events = thread_events(&pool, thread_id).await;
+    assert!(
+        !voice_kinds(&events).contains(&"SpokenMessageReceived".to_string()),
+        "{:?}",
+        voice_kinds(&events)
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// An answer that needs the caller's words, made before the transcript landed.
+///
+/// The same race the ask has: the tool call and the transcript come from two
+/// models on one socket. Held, and settled by the `UserTurnEnded` that follows.
+#[tokio::test]
+async fn an_answer_waiting_on_their_words_settles_when_the_words_arrive() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let decisions = NoDecisions::answering(vec![
+        Resolution::NeedsTheirWords,
+        Resolution::SettledWithTheirWords,
+    ]);
+    let asked = decisions.asked();
+    let (log, _) = a_call_deciding(
+        &pool,
+        &bus,
+        &decisions,
+        vec![
+            // The call first, then the words. That order is the bug this
+            // handles, and a fixed script really does deliver it.
+            answers_with("question:toolu_q0#said"),
+            the_caller_says("do the second half only"),
+            the_talker_says("Right."),
+        ],
+    )
+    .await;
+
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "{:?}", asked);
+    assert_eq!(asked[0].1, "", "the first try had no words yet");
+    assert_eq!(asked[1].1, "do the second half only");
+
+    // One acknowledgement, and only once it actually settled. The held call
+    // must not be answered twice.
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert!(resolved[0].1.contains("Answered"), "{:?}", resolved);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A delegation is refused exactly while this thread's doer is parked. The
+/// refusal states a fact: the doer is blocked inside the card that is waiting.
+#[tokio::test]
+async fn a_delegation_is_refused_while_the_doer_is_parked() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("book me a table for eight"),
+        asks_for_the_doer("they want a booking"),
+        the_talker_says("I need the other answer first."),
+    ]);
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        &NoDecisions::parked(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    // Nothing was started, and no ask was recorded beside a turn that never ran.
+    assert!(turns.woken().lock().unwrap().is_empty());
+    let events = thread_events(&pool, thread_id).await;
+    let kinds = voice_kinds(&events);
+    assert!(!kinds.contains(&"WorkDelegated".to_string()), "{:?}", kinds);
+
+    // The utterance is still written down, exactly once.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| *k == "SpokenMessageReceived")
+            .count(),
+        1,
+        "{:?}",
+        kinds
+    );
+
+    // And the talker was told why, rather than left holding a dangling call.
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert!(resolved[0].1.contains("Not started"), "{:?}", resolved);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The other side of the refusal: a free doer takes the delegation as before.
+#[tokio::test]
+async fn a_delegation_goes_through_when_nothing_is_waiting() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("book me a table for eight"),
+        asks_for_the_doer("they want a booking"),
+        the_talker_says("On it."),
+    ]);
+    let log = provider.log();
+    let turns = RecordingTurns::default();
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(3);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(
+        *turns.woken().lock().unwrap(),
+        vec!["book me a table for eight".to_string()]
+    );
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert!(resolved[0].1.contains("Taken"), "{:?}", resolved);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The caller said they were done, so the talker rang off for them.
+///
+/// **The tool call comes BEFORE the goodbye's turn end**, which is the real
+/// wire order: a tool call lands while the talker is still speaking. So the
+/// call must survive it and close on the turn's end instead. Scripted the other
+/// way round, this test would pass over a hangup that cuts the goodbye off.
+#[tokio::test]
+async fn the_talker_can_ring_off_when_the_caller_says_they_are_done() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("that's all, thanks"),
+        VoiceEvent::HangupRequested {
+            tool_call_id: "call_h".to_string(),
+        },
+        the_talker_says("Speak soon."),
+    ]);
+    let log = provider.log();
+    // Never rings off itself: the talker's own call is what ends this one.
+    let mut caller = ScriptedCaller::new(vec![]);
+
+    let reason = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        opening(),
+        subject(thread_id, session_id),
+    )
+    .await;
+
+    assert_eq!(reason, Some(VoiceSessionEndReason::AgentHangup));
+
+    // Acknowledged, so nothing dangles in the talker's history.
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert_eq!(resolved[0].0, "call_h");
+
+    let events = thread_events(&pool, thread_id).await;
+    let kinds: Vec<&str> = events.iter().map(|(kind, _)| kind.as_str()).collect();
+    // The goodbye was said in full and written down. Ending on the tool call
+    // would have cut it off mid-word and lost the row.
+    assert!(
+        kinds.contains(&"SpokenReplyGenerated"),
+        "the goodbye was never recorded: {:?}",
+        kinds
+    );
+    // The pair is one start and one end, exactly as a caller hangup writes.
+    let session_rows: Vec<&&str> = kinds
+        .iter()
+        .filter(|kind| kind.starts_with("VoiceSession"))
+        .collect();
+    assert_eq!(
+        session_rows,
+        vec![&"VoiceSessionStarted", &"VoiceSessionEnded"],
+        "{:?}",
+        kinds
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A caller who talks over the goodbye was not done, so the call stays up.
+///
+/// Their intent is the only thing that ends a call (ADR 0170), and taking the
+/// floor back says otherwise.
+#[tokio::test]
+async fn a_caller_who_cuts_in_over_the_goodbye_keeps_the_call() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("that's all, thanks"),
+        VoiceEvent::HangupRequested {
+            tool_call_id: "call_h".to_string(),
+        },
+        VoiceEvent::Interrupted,
+        the_talker_says("Speak s"),
+        the_caller_says("actually, one more thing"),
+        the_talker_says("Go on."),
+    ]);
+    // Rings off itself, since the talker's own call was withdrawn: the opening
+    // frame, two utterances and two replies.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(6);
+
+    let reason = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert_eq!(
+        reason,
+        Some(VoiceSessionEndReason::Hangup),
+        "the withdrawn hangup ended the call anyway"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// Words spent on an answer cannot later pair with a waiting ask.
+///
+/// Both tool calls can land before the transcript, and the answer takes the
+/// words. An ask left sticky would then grab the NEXT utterance and wake the
+/// doer on words asking for something else, under a stale reason.
+#[tokio::test]
+async fn an_ask_waiting_on_words_an_answer_spent_never_pairs_with_a_later_one() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let decisions = NoDecisions::answering(vec![
+        Resolution::NeedsTheirWords,
+        Resolution::SettledWithTheirWords,
+    ]);
+    let provider = MockVoiceProvider::new(vec![
+        // Both calls first, then the words they were both waiting for.
+        answers_with("question:toolu_q0#said"),
+        asks_for_the_doer("they want the second half"),
+        the_caller_says("neither, do the second half only"),
+        the_talker_says("Right."),
+        // A later, unrelated utterance. Nothing may pair with it.
+        the_caller_says("what time is it"),
+        the_talker_says("Just gone eleven."),
+    ]);
+    let turns = RecordingTurns::default();
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(5);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        &decisions,
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    assert!(
+        turns.woken().lock().unwrap().is_empty(),
+        "a stale ask woke the doer: {:?}",
+        turns.woken().lock().unwrap()
+    );
+    let kinds = voice_kinds(&thread_events(&pool, thread_id).await);
+    assert!(!kinds.contains(&"WorkDelegated".to_string()), "{:?}", kinds);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A held answer is bounded to the utterance it was made for.
+///
+/// The talker answers with the choice that sends the caller's words, and the
+/// transcript that follows carries none. Held on, it would settle the card with
+/// some later sentence about something else, and a card cannot be unsettled.
+#[tokio::test]
+async fn a_held_answer_gives_up_rather_than_claiming_a_later_sentence() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let decisions = NoDecisions::answering(vec![
+        Resolution::NeedsTheirWords,
+        Resolution::NeedsTheirWords,
+    ]);
+    let asked = decisions.asked();
+    let provider = MockVoiceProvider::new(vec![
+        answers_with("question:toolu_q0#said"),
+        // Nothing came through for it: a wordless turn.
+        the_caller_says("   "),
+        the_talker_says("Sorry, I missed that."),
+        // A later, unrelated sentence. It must not settle the card.
+        the_caller_says("what time is it"),
+        the_talker_says("Just gone eleven."),
+    ]);
+    let log = provider.log();
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(5);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        &decisions,
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    // Two tries and no more: the call, then the utterance it was made for.
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "{:?}", asked);
+    assert!(
+        asked.iter().all(|(_, spoken)| spoken.is_empty()),
+        "{:?}",
+        asked
+    );
+
+    // And it was answered rather than left dangling in the talker's history.
+    let resolved = log.lock().unwrap().resolved_tool_calls.clone();
+    assert_eq!(resolved.len(), 1, "{:?}", resolved);
+    assert!(resolved[0].1.contains("dropped"), "{:?}", resolved);
 
     teardown_test_db(&db_name).await;
 }

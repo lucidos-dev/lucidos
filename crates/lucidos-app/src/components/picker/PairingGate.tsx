@@ -148,7 +148,7 @@ function DesktopPairing({ onPaired }: { onPaired: () => void }) {
   // on the workspace, and the user never learns there was a gate.
   const showBusy = useDelayedFlag(auto === 'running');
 
-  // Only the busy card below. Everything after a failed self-pair is somebody
+  // Only the busy screen below. Everything after a failed self-pair is somebody
   // else's screen, and uncovers itself.
   useUncoverOnPaint(auto === 'running' && showBusy);
 
@@ -176,7 +176,7 @@ function DesktopPairing({ onPaired }: { onPaired: () => void }) {
     if (!showBusy) return null;
     return (
       <div class="pairing-gate">
-        <div class="pairing-card">
+        <div class="pairing-column">
           <h1 class="pairing-title">Pairing this Mac…</h1>
           <p class="pairing-lede">Lucidos is letting this window in.</p>
         </div>
@@ -297,7 +297,7 @@ function InstallFirst({ onPairHere }: { onPairHere: () => void }) {
 
   return (
     <div class="pairing-gate">
-      <div class="pairing-card">
+      <div class="pairing-column">
         <h1 class="pairing-title">Install Lucidos first</h1>
         <p class="pairing-lede">
           Your phone treats the app on your home screen as its own device, separate from this
@@ -558,14 +558,14 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     // could only re-redeem a code this already spent.
   }, []);
 
-  // Nothing to ask for yet, and nothing worth drawing under the delay. The card
-  // appears only when the redeem is slow enough that a held splash would read
-  // as a stall.
+  // Nothing to ask for yet, and nothing worth drawing under the delay. The
+  // screen appears only when the redeem is slow enough that a held splash would
+  // read as a stall.
   if (autoPair === 'running') {
     if (!showAutoPair) return null;
     return (
       <div class="pairing-gate">
-        <div class="pairing-card">
+        <div class="pairing-column">
           <h1 class="pairing-title">Pairing this device…</h1>
           <p class="pairing-lede">Lucidos is letting this app in, with the code it launched with.</p>
         </div>
@@ -573,14 +573,14 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     );
   }
 
-  // The scanner replaces the card's contents rather than floating over them.
+  // The scanner replaces the column's contents rather than floating over them.
   // `<Overlay>` is not reachable here: `OverlayLayer` mounts inside `App`, and
-  // this screen renders instead of it. Cancel lives out here, so the card is
-  // never a blank box while the scanner's chunk is still loading.
+  // this screen renders instead of it. Cancel lives out here, so the screen is
+  // never blank while the scanner's chunk is still loading.
   if (scanning) {
     return (
       <div class="pairing-gate">
-        <div class="pairing-card">
+        <div class="pairing-column">
           <h1 class="pairing-title">Scan the QR</h1>
           <p class="pairing-lede">
             Point the camera at the QR under Settings → Access on the machine running Lucidos.
@@ -602,7 +602,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
 
   return (
     <div class="pairing-gate">
-      <form class="pairing-card" onSubmit={submit}>
+      <form class="pairing-column" onSubmit={submit}>
         <h1 class="pairing-title">Pair this device</h1>
         <p class="pairing-lede">
           {scanned

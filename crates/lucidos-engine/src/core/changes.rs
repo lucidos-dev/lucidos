@@ -46,6 +46,20 @@ pub struct Change {
     #[sqlx(default)]
     #[serde(default)]
     pub thread_unsettled: bool,
+    /// `true` when the originating thread is still WORKING, so a *standing
+    /// apply* has a settle to wait for.
+    ///
+    /// The half of `thread_unsettled` that can be acted on. A thread parked on
+    /// a question, an event wait or a sub-thread is unsettled too, and arming
+    /// it drops on the first look (`engine::standing_apply`). The panel needs
+    /// the two apart, or it offers a control that ends the moment it is
+    /// pressed.
+    ///
+    /// NOT a DB column: populated by `enrich_thread_unsettled` at serialize
+    /// time, and `false` for a direct DB load.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub thread_working: bool,
 }
 
 /// One thread's contribution to the current restart-required toast: the
@@ -155,28 +169,30 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Set `thread_unsettled` on each pending Change by batch-loading thread state.
-/// Applied changes are left alone (their thread state no longer gates Apply).
-/// Single batch query, no N+1 — the serialize-time companion to
-/// `enrich_thread_titles`.
+/// Set `thread_unsettled` and `thread_working` on each pending Change by
+/// batch-loading thread state. Applied changes are left alone (their thread
+/// state no longer gates Apply). Two batch queries, no N+1: the serialize-time
+/// companion to `enrich_thread_titles`.
 pub async fn enrich_thread_unsettled(
     pool: &PgPool,
     changes: &mut [Change],
 ) -> Result<(), sqlx::Error> {
-    let unsettled = unsettled_thread_ids(
-        pool,
+    let pending_ids = || {
         changes
             .iter()
             .filter(|c| c.status == "pending")
-            .filter_map(|c| c.thread_id),
-    )
-    .await?;
+            .filter_map(|c| c.thread_id)
+    };
+    let unsettled = unsettled_thread_ids(pool, pending_ids()).await?;
     if unsettled.is_empty() {
         return Ok(());
     }
+    let working = crate::engine::standing_apply::working_thread_ids(pool, pending_ids()).await?;
     for change in changes.iter_mut() {
         if let Some(tid) = change.thread_id {
-            change.thread_unsettled = change.status == "pending" && unsettled.contains(&tid);
+            let pending = change.status == "pending";
+            change.thread_unsettled = pending && unsettled.contains(&tid);
+            change.thread_working = pending && working.contains(&tid);
         }
     }
     Ok(())
@@ -272,6 +288,7 @@ mod tests {
             commits: vec![],
             incomplete: false,
             thread_unsettled: false,
+            thread_working: false,
         }
     }
 

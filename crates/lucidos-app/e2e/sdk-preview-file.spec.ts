@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { WORKSPACE, git } from './db-helpers';
-import { gotoWithRetry, ensureMobileView, clickHeaderAction } from './helpers';
+import { apiRequest, clickHeaderAction, ensureMobileView, gotoWithRetry } from './helpers';
 
 const APP_ID = 'e2e-sdk-preview-test';
 const APP_DIR = resolve(WORKSPACE, 'data/apps', APP_ID);
@@ -398,7 +398,7 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
     });
 
     test.beforeEach(async ({ page }) => {
-      const resp = await page.request.post('/api/v1/repositories', {
+      const resp = await apiRequest(page).post('/api/v1/repositories', {
         data: { name: `e2e-preview-ref-${suffix}`, path: WORKSPACE, description: 'e2e test repo' },
       });
       expect(resp.ok()).toBeTruthy();
@@ -406,7 +406,7 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
     });
 
     test.afterEach(async ({ page }) => {
-      if (repoId) await page.request.delete(`/api/v1/repositories/${repoId}`);
+      if (repoId) await apiRequest(page).delete(`/api/v1/repositories/${repoId}`);
     });
 
     // The bug this form fixes, shown from the other side: without a ref the

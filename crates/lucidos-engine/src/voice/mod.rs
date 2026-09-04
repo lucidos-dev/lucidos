@@ -5,13 +5,15 @@
 //! owns the seam both sit behind, and nothing above it names a provider.
 //!
 //! **Talker and DOER are the two halves.** The doer holds every tool and the
-//! talker holds one, so what splits them is capability. That one tool is the
-//! whole of the talker's reach, and it only delegates.
+//! talker holds three, so what splits them is capability rather than count.
+//! Those three are the whole of the talker's reach: it asks for work, it
+//! answers what is waiting on the user, and it hangs up (ADR 0170).
 //!
 //! The plan is `docs/plans/2026-08-29-a-voice-session-opens-behind-one-seam.md`.
 
 pub mod build;
 pub mod call;
+pub mod decision;
 pub mod doer;
 pub mod language;
 pub mod provider;
@@ -29,11 +31,10 @@ pub mod mock;
 #[path = "purity_tests.rs"]
 mod purity_tests;
 
+use decision::DecisionChoice;
 pub use language::SpokenLanguage;
 pub use provider::{AudioFormat, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 pub use sections::{ResidentSection, SECTIONS};
-
-use crate::engine::thread_events::QuestionOption;
 
 /// A preference's value when set to something non-blank.
 ///
@@ -79,37 +80,27 @@ pub(super) fn clip(text: &str, max: usize) -> String {
     format!("{}…", &flat[..end])
 }
 
-/// The choices on a question, as lines the talker reads out.
+/// The choices on an open decision, as lines the talker reads out.
 ///
-/// Empty when the question offers none, which is a free-text question. Its
-/// callers each say so their own way, because a heading promising choices
-/// there is one the talker either invents or stumbles over.
+/// Each line carries the id the engine issued for that choice, because handing
+/// one back is the whole of how the talker settles anything. The id is for the
+/// tool and never for the caller's ear: the two surfaces below say so, and so
+/// does the tool's own description.
 ///
-/// Shared by the two places a question reaches the talker: the *resident
+/// Never empty. A decision with no choice is one nothing can settle, and
+/// `voice::decision` refuses to build one.
+///
+/// Shared by the two places a decision reaches the talker: the *resident
 /// block* a call opens with, and the note handed over when one lands mid-call.
-/// One wording, so the caller hears the same question whichever route it took.
-pub(super) fn choices_for(options: &[QuestionOption], multi_select: bool) -> String {
-    if options.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from(if multi_select {
-        "The choices, and more than one may be picked:\n"
-    } else {
-        "The choices:\n"
-    });
-    for option in options {
-        let description = option
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty());
-        match description {
-            Some(detail) => out.push_str(&format!(
-                "- {}: {}\n",
-                option.label,
-                clip(detail, READ_ALOUD_CHARS)
-            )),
-            None => out.push_str(&format!("- {}\n", option.label)),
+/// One wording, so the caller hears the same thing whichever route it took.
+pub(super) fn choices_for(choices: &[DecisionChoice]) -> String {
+    let mut out = String::from("The choices, with the id to hand back for each:\n");
+    for choice in choices {
+        match choice.description.as_deref() {
+            Some(detail) => {
+                out.push_str(&format!("- {} [{}]: {}\n", choice.label, choice.id, detail))
+            }
+            None => out.push_str(&format!("- {} [{}]\n", choice.label, choice.id)),
         }
     }
     out
@@ -121,9 +112,9 @@ pub(super) fn choices_for(options: &[QuestionOption], multi_select: bool) -> Str
 /// keeping free of anything per-session. Five rules:
 ///
 /// - It speaks as Lucidos, in the first person. The user meets one entity.
-/// - It does nothing itself. Its one tool delegates, and that is the only way
-///   anything gets looked up or done (ADR 0149, and the ADR superseding its
-///   tool-less clause).
+/// - It does nothing itself. Its tools ask, answer and hang up. Calling one is
+///   the only way anything gets looked up or done (ADR 0149, and ADR 0170,
+///   which supersedes its tool-less clause).
 /// - It may stall truthfully, because work really is running on its behalf.
 /// - It may not state a fact it did not receive. A confident first-person
 ///   claim is a fabrication rather than a paraphrase.
@@ -141,12 +132,15 @@ numbers, dates and names the way a person would say them aloud.
 
 You look nothing up and do nothing yourself. What you know is in this \
 conversation and in the context block you were opened with. For everything \
-else you have one tool, and calling it is the only way anything is found out \
-or done.
+else you have tools, and calling one is the only way anything is found out or \
+done.
 
-Reach for it early. Call it the moment you hear something that block does not \
-answer. Call it for anything the user wants done. Speak in the same turn: tell \
-them you are on it, then stop and wait.
+Reach for them early. Ask for work the moment you hear something that block \
+does not answer, and for anything the user wants done. Speak in the same turn: \
+tell them you are on it, then stop and wait.
+
+When something is waiting on the user, they can settle it by saying so. Put it \
+to them out loud, and hand back the choice they pick.
 
 Never state a fact you were not given. If you do not have the answer, say so, \
 and say that you are getting it. Work really is running for you, so it is \
@@ -157,11 +151,25 @@ It was written to be read, and it can carry headings, tables, code and links, \
 none of which can be spoken. The user has the full text in front of them, so \
 your job is to tell them what it says.";
 
-/// The talker's one tool. Named here, so no caller can pass a second.
+/// The talker's tools. Named here, so nothing above the seam can add a fourth.
+///
+/// Three, and each is on the harmless side of ADR 0149's line: one starts an
+/// ordinary doer turn, one settles a card the caller can already see, and one
+/// ends the call. None mutates the workspace, and none reaches a capability the
+/// doer does not already gate (ADR 0170).
 pub const DELEGATE_TOOL: &str = "delegate";
+pub const ANSWER_TOOL: &str = "answer";
+pub const HANGUP_TOOL: &str = "hang_up";
 
-/// The one argument it takes: the talker's own words for what is wanted.
+/// The one argument `delegate` takes: the talker's own words for what is
+/// wanted.
 pub const DELEGATE_REASON_ARG: &str = "reason";
+
+/// The one argument `answer` takes: a choice id the ENGINE issued.
+///
+/// Never a label and never a spoken word. That is the whole reason no matching
+/// is needed, and why the workspace's language cannot break it.
+pub const ANSWER_CHOICE_ARG: &str = "choice";
 
 /// What the talker is told the tool is for.
 ///
@@ -188,6 +196,37 @@ wait. What comes back arrives later, as something for you to pass on.
 Never say this tool's name out loud, and never suggest anything but you is \
 involved.";
 
+/// What the talker is told the answering tool is for.
+///
+/// Every choice it can pick was issued by the engine and read to it. So the
+/// instruction is to hand one back, never to compose one: an id it invents
+/// answers nothing, and the engine says so rather than guessing.
+pub const ANSWER_TOOL_DESCRIPTION: &str = "\
+Use this to answer something the user is being asked. What is open is in the \
+context block, and each choice there carries an id.
+Hand back the id of the choice they picked, exactly as it is written. Never \
+read an id out loud, and never make one up.
+When what they said fits none of the choices, use the one that sends their own \
+words. That is also how they pick more than one.
+Only call this once they have actually chosen. Somebody thinking out loud has \
+not answered yet, so wait for them.
+Never say this tool's name out loud, and never suggest anything but you is \
+involved.";
+
+/// What the talker is told the hangup tool is for.
+///
+/// Four rules, and the first is the load-bearing one: the caller's own words
+/// trigger it. A talker that ends a call on its own judgment hangs up on
+/// somebody who was thinking.
+pub const HANGUP_TOOL_DESCRIPTION: &str = "\
+Use this when the user says the conversation is over: goodbye, that is all, \
+thanks that is everything. It ends the call.
+Say goodbye first, in the same turn, and call this after. It closes the line, \
+so anything you say afterwards is something they never hear.
+Only their words end a call. Silence does not, because somebody who stops \
+talking is thinking. Never call this because you have run out of things to say.
+Work in flight keeps going. This ends the call and never the work.";
+
 /// What this workspace's talker is told, language included.
 ///
 /// The language belongs here rather than in the resident block. That block is
@@ -209,8 +248,10 @@ pub fn instructions_for(language: Option<&SpokenLanguage>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::decision::OpenDecision;
     use super::mock::MockVoiceProvider;
     use super::*;
+    use crate::engine::thread_events::QuestionOption;
     use crate::engine::ApiUsage;
 
     fn opening() -> SessionOpening {
@@ -332,43 +373,39 @@ mod tests {
         ]
     }
 
-    /// One wording, so a question reads the same whether it reached the talker
+    /// One wording, so a decision reads the same whether it reached the talker
     /// in the opening block or as a note mid-call.
     #[test]
     fn the_choices_carry_a_description_when_there_is_one() {
-        let block = choices_for(&options(), false);
+        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false);
+        let block = choices_for(&decision.choices);
         assert!(
-            block.contains("- Run the tail now: Chunks 25-33\n"),
+            block.contains("- Run the tail now [question:toolu_q0#opt0]: Chunks 25-33\n"),
             "{}",
             block
         );
-        assert!(block.contains("- Leave it\n"), "{}", block);
-        assert!(!block.contains("more than one"), "{}", block);
+        assert!(
+            block.contains("- Leave it [question:toolu_q0#opt1]\n"),
+            "{}",
+            block
+        );
     }
 
+    /// Handing an id back is the whole of how the talker settles anything, so
+    /// every line carries one.
     #[test]
-    fn a_multi_select_question_says_more_than_one_may_be_picked() {
-        assert!(choices_for(&options(), true).contains("more than one"));
-    }
-
-    /// A free-text question has none, and gets no heading promising any. Each
-    /// caller then words its own opening around an empty block.
-    #[test]
-    fn a_question_with_no_options_yields_nothing_at_all() {
-        assert_eq!(choices_for(&[], false), "");
-        assert_eq!(choices_for(&[], true), "");
-    }
-
-    /// An option description has no length contract, and the talker reads it
-    /// aloud. Same cut as a recalled turn.
-    #[test]
-    fn a_long_description_is_cut_like_everything_else_read_aloud() {
-        let long = vec![QuestionOption {
-            id: "opt-0".to_string(),
-            label: "Go".to_string(),
-            description: Some("x".repeat(READ_ALOUD_CHARS * 2)),
-        }];
-        assert!(choices_for(&long, false).contains('…'));
+    fn every_choice_reads_out_with_the_id_that_settles_it() {
+        let decision = OpenDecision::question("toolu_q0", "Now?", &options(), false);
+        let block = choices_for(&decision.choices);
+        assert!(block.contains("id to hand back"), "{}", block);
+        for choice in &decision.choices {
+            assert!(
+                block.contains(&choice.id),
+                "{} missing from {}",
+                choice.id,
+                block
+            );
+        }
     }
 
     #[test]
@@ -377,14 +414,60 @@ mod tests {
         assert!(TALKER_INSTRUCTIONS.contains("Never state a fact you were not given"));
     }
 
-    /// It is told the tool is the only way anything happens, and to reach for
-    /// it early. Under-calling is the expensive mistake: nothing corrects a
-    /// stale resident block once the doer stops running every turn.
+    /// It is told a tool call is the only way anything happens, and to reach
+    /// for one early. Under-calling is the expensive mistake: nothing corrects
+    /// a stale resident block once the doer stops running every turn.
     #[test]
-    fn the_talker_is_told_its_one_tool_is_the_only_way_anything_happens() {
-        assert!(TALKER_INSTRUCTIONS.contains("you have one tool"));
+    fn the_talker_is_told_a_tool_is_the_only_way_anything_happens() {
+        assert!(TALKER_INSTRUCTIONS.contains("you have tools"));
         assert!(TALKER_INSTRUCTIONS.contains("the only way anything is found out"));
-        assert!(TALKER_INSTRUCTIONS.contains("Reach for it early"));
+        assert!(TALKER_INSTRUCTIONS.contains("Reach for them early"));
+    }
+
+    /// It is told the caller can settle what is waiting by saying so. The two
+    /// surfaces that read a card out say the same, and the code now keeps it.
+    #[test]
+    fn the_talker_is_told_the_caller_can_settle_things_out_loud() {
+        assert!(TALKER_INSTRUCTIONS.contains("they can settle it by saying so"));
+        assert!(TALKER_INSTRUCTIONS.contains("hand back the choice they pick"));
+    }
+
+    /// Three tools, each named once. A fourth cannot arrive from above the
+    /// seam, so this is the whole of the talker's reach (ADR 0170).
+    #[test]
+    fn the_talker_holds_three_tools_and_each_says_what_it_is_for() {
+        let named = [
+            (DELEGATE_TOOL, DELEGATE_TOOL_DESCRIPTION),
+            (ANSWER_TOOL, ANSWER_TOOL_DESCRIPTION),
+            (HANGUP_TOOL, HANGUP_TOOL_DESCRIPTION),
+        ];
+        let mut names: Vec<&str> = named.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 3, "two tools share a name");
+        for (name, description) in named {
+            assert!(!name.is_empty());
+            assert!(description.len() > 100, "{} is barely described", name);
+        }
+    }
+
+    /// The answering tool hands back an id, never a word the caller said. That
+    /// is the whole reason no matching is needed, in any language.
+    #[test]
+    fn the_answering_tool_is_told_to_hand_back_an_id_and_never_invent_one() {
+        assert!(ANSWER_TOOL_DESCRIPTION.contains("Hand back the id"));
+        assert!(ANSWER_TOOL_DESCRIPTION.contains("Never read an id out loud"));
+        assert!(ANSWER_TOOL_DESCRIPTION.contains("never make one up"));
+    }
+
+    /// The caller's intent ends a call, never the talker's judgment, and never
+    /// silence. Saying goodbye cancels nothing that is running.
+    #[test]
+    fn the_hangup_tool_is_triggered_by_the_caller_and_ends_no_work() {
+        assert!(HANGUP_TOOL_DESCRIPTION.contains("Only their words end a call"));
+        assert!(HANGUP_TOOL_DESCRIPTION.contains("Silence does not"));
+        assert!(HANGUP_TOOL_DESCRIPTION.contains("never the work"));
+        assert!(HANGUP_TOOL_DESCRIPTION.contains("Say goodbye first"));
     }
 
     /// The talker cannot see whether a turn is running, so nothing it reads
@@ -396,7 +479,11 @@ mod tests {
     #[test]
     fn the_talker_is_never_asked_about_the_doers_state() {
         let assembled = instructions_for(SpokenLanguage::resolve("Norwegian").as_ref());
-        let whole = format!("{} {}", assembled, DELEGATE_TOOL_DESCRIPTION).to_lowercase();
+        let whole = format!(
+            "{} {} {} {}",
+            assembled, DELEGATE_TOOL_DESCRIPTION, ANSWER_TOOL_DESCRIPTION, HANGUP_TOOL_DESCRIPTION
+        )
+        .to_lowercase();
         for phrase in [
             "idle",
             "busy",

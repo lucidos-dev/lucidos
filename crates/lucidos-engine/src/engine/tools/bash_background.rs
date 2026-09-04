@@ -2153,20 +2153,22 @@ mod tests {
         // re-polled hundreds of times (172 calls in one release thread,
         // 51 of them 2 s apart). The wait must now hold its full budget
         // and hand back everything that accumulated in one go.
-        // The child emits every ~20 ms, not every ~100 ms. That is what makes
-        // this test answer about the CODE and not about the host. The
-        // line-count assertion below counts what the child produced inside a
-        // fixed 700 ms window. At a 100 ms cadence a loaded machine delivered
-        // two lines and failed a wait that had behaved perfectly.
+        // The child emits its first three lines AT ONCE, then keeps going at
+        // ~20 ms. That is what makes this test answer about the CODE and not
+        // about the host. The line-count assertion below used to count what a
+        // timed loop managed to produce inside a fixed 700 ms window, so it
+        // measured OS scheduling: a loaded machine delivered one line and
+        // failed a wait that had behaved perfectly. Twice, at two cadences.
         //
-        // The faster cadence strengthens the primary assertion too: the first
-        // chunk lands sooner, so a wait that woke on it cuts short more
-        // visibly. 100 lines at 20 ms is 2 s of work against a 700 ms wait, so
-        // the task is still running when the wait returns.
+        // An up-front burst also strengthens the primary assertion. The first
+        // chunk lands immediately, so a wait that woke on it cuts short as
+        // visibly as it can. The tail keeps output arriving, which is the
+        // scenario, and outlasts the wait so the task is still running.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
             .spawn(
-                "for i in $(seq 1 100); do echo line$i; sleep 0.02; done",
+                "echo line1; echo line2; echo line3; \
+                 for i in $(seq 4 100); do sleep 0.02; echo line$i; done",
                 30,
                 std::path::Path::new("/tmp"),
                 &[],
@@ -2174,6 +2176,18 @@ mod tests {
             )
             .await
             .expect("spawn");
+
+        // The window opens once the child is actually emitting, per
+        // `wait_for_stdout`'s own note. Starting it at `spawn` measured the
+        // HOST's fork-and-exec latency inside a 700 ms budget: under the full
+        // suite that regularly ate the whole window and drained zero lines,
+        // while the module alone and the test alone both passed. Peeking does
+        // not consume, so the drain below still sees `line1`.
+        assert!(
+            reg.wait_for_stdout(&task_id, "line1", Duration::from_secs(10))
+                .await,
+            "the child never emitted its first line"
+        );
 
         let start = std::time::Instant::now();
         let snap = reg
@@ -2396,20 +2410,19 @@ mod tests {
             .await
             .expect("spawn");
 
+        // A budget far past anything the host can account for, so "woke on
+        // the finish" and "the machine was busy" cannot be confused. At a 3 s
+        // budget the assertion below was really measuring fork-and-exec plus
+        // child reaping, and the full suite tipped it over.
+        const BUDGET: Duration = Duration::from_secs(30);
         let reg_a = reg.clone();
         let task_a = task_id.clone();
-        let h_a = tokio::spawn(async move {
-            reg_a
-                .read_output_in_memory_wait(&task_a, Duration::from_secs(3))
-                .await
-        });
+        let h_a =
+            tokio::spawn(async move { reg_a.read_output_in_memory_wait(&task_a, BUDGET).await });
         let reg_b = reg.clone();
         let task_b = task_id.clone();
-        let h_b = tokio::spawn(async move {
-            reg_b
-                .read_output_in_memory_wait(&task_b, Duration::from_secs(3))
-                .await
-        });
+        let h_b =
+            tokio::spawn(async move { reg_b.read_output_in_memory_wait(&task_b, BUDGET).await });
 
         let started = std::time::Instant::now();
         let (snap_a, snap_b) = tokio::join!(h_a, h_b);
@@ -2417,11 +2430,11 @@ mod tests {
         let snap_a = snap_a.unwrap().expect("waiter A returned None");
         let snap_b = snap_b.unwrap().expect("waiter B returned None");
 
-        // BOTH return on the finish, not just whichever won a single
-        // permit. The task ends at ~0.3 s against a 3 s budget, so a
-        // stranded waiter shows up as an elapsed near the full ceiling.
+        // BOTH return on the finish, not just whichever won a single permit.
+        // The task ends at ~0.3 s, so a stranded waiter sits out the whole
+        // budget and lands an order of magnitude past this ceiling.
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < BUDGET / 3,
             "both waiters must wake on finish, not sit out the budget (took {:?})",
             elapsed
         );

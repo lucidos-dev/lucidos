@@ -1,19 +1,13 @@
 import { test, expect, Page } from './fixtures';
 import {
-  assertHealthy,
-  ensureOnThreadPane,
-  waitForVisibleInput,
-  openFilesPanel,
-  waitForVisibleElement,
-  clickVisibleElement,
-  clickHeaderAction,
-  gotoWithRetry,
+  apiRequest, assertHealthy, clickHeaderAction, clickVisibleElement, ensureOnThreadPane,
+  gotoWithRetry, openFilesPanel, waitForVisibleElement, waitForVisibleInput,
 } from './helpers';
 
 /** Create a markdown data file via the API. Returns the relative data path. */
 async function createMdFile(page: Page, name: string, content: string): Promise<string> {
   const path = `artifacts/${name}`;
-  const resp = await page.request.put(`/api/v1/data/${path}`, {
+  const resp = await apiRequest(page).put(`/api/v1/data/${path}`, {
     headers: { 'Content-Type': 'text/plain' },
     data: content,
   });
@@ -28,7 +22,7 @@ async function readMdFile(page: Page, path: string): Promise<string> {
 }
 
 async function deleteMdFile(page: Page, path: string): Promise<void> {
-  await page.request.delete(`/api/v1/data/${path}`);
+  await apiRequest(page).delete(`/api/v1/data/${path}`);
 }
 
 test.describe('File preview inline editing', () => {

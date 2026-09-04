@@ -59,6 +59,11 @@ pub(super) async fn write_grant_file(
     file: GrantFile,
     contents: &str,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Before the write. A grant file widens what an agent may run without a
+    // permission card, so an unidentified caller must not reach it at all.
+    let actor = crate::api::actor::require_user_actor(headers, &state.pool, None)
+        .await
+        .map_err(|e| (e.status, e.message))?;
     grants::write_raw(&state.engine.grants_dir(), file, contents).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -69,15 +74,15 @@ pub(super) async fn write_grant_file(
     state
         .engine
         .event_bus
-        .emit_user_system(
-            headers,
-            &state.pool,
+        .emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::PermissionGrantsChanged {
+                    grant_file: file,
+                    patterns,
+                    actor: Some(actor),
+                },
+            ),
             "[Settings] PermissionGrantsChanged",
-            |actor| crate::engine::event_bus::SystemEvent::PermissionGrantsChanged {
-                grant_file: file,
-                patterns,
-                actor,
-            },
         )
         .await;
     Ok(StatusCode::NO_CONTENT)
@@ -195,10 +200,12 @@ pub(super) async fn create_credential(
         Err(reason) => return ApiResult::err(reason),
     };
     // `upsert` emits `Credential{Created,Updated}` itself, so this handler
-    // resolves the device actor up front instead of going through
-    // `emit_user_system`. The emit is not the caller's to make (see
-    // `CredentialStore`'s type doc).
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // resolves the device actor up front and passes it down. The emit is not
+    // the caller's to make (see `CredentialStore`'s type doc).
+    let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
+        Ok(a) => Some(a),
+        Err(e) => return ApiResult::err(e.message),
+    };
     match CredentialStore::upsert(
         &state.pool,
         &state.engine.event_bus,
@@ -1530,6 +1537,16 @@ pub(super) async fn send_email_confirmed(
 ) -> Json<serde_json::Value> {
     use crate::core::email::{EmailClient, EmailStore};
 
+    // Before the send, which leaves the machine and cannot be recalled. This
+    // route answers 200 with `success: false`, so the refusal wears that shape
+    // rather than a status the caller's own error path would not read.
+    let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
+        Ok(a) => a,
+        Err(e) => {
+            return Json(serde_json::json!({ "success": false, "error": e.message }));
+        }
+    };
+
     let to: Vec<String> = body["to"]
         .as_array()
         .map(|a| {
@@ -1660,17 +1677,20 @@ pub(super) async fn send_email_confirmed(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Email] EmailSent", |actor| {
-                    crate::engine::event_bus::SystemEvent::EmailSent {
-                        account: account.name.clone(),
-                        to: to.clone(),
-                        cc: cc.clone(),
-                        bcc: bcc.clone(),
-                        subject: subject.to_string(),
-                        attachment_count,
-                        actor,
-                    }
-                })
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::EmailSent {
+                            account: account.name.clone(),
+                            to: to.clone(),
+                            cc: cc.clone(),
+                            bcc: bcc.clone(),
+                            subject: subject.to_string(),
+                            attachment_count,
+                            actor: Some(actor),
+                        },
+                    ),
+                    "[Email] EmailSent",
+                )
                 .await;
             Json(serde_json::json!({ "success": true }))
         }

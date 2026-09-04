@@ -93,6 +93,11 @@ pub(super) async fn get_credential_value(
         log!("[Credentials] refused a credential-value read from an app document");
         return Err(forbidden(SUBJECT_LABEL));
     }
+    // Before the redeem, which is one-shot: a caller refused after it would
+    // have spent its token on a request that never saw the credential.
+    let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None)
+        .await
+        .map_err(|e| (e.status, e.message))?;
     let presented = query.token.as_deref().unwrap_or_default();
     if !state
         .reveal_tokens
@@ -106,15 +111,15 @@ pub(super) async fn get_credential_value(
             state
                 .engine
                 .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::CredentialRevealed {
+                            service_name: cred.service_name.clone(),
+                            auth_type: cred.auth_type.to_string(),
+                            actor: Some(actor),
+                        },
+                    ),
                     "[Credentials] CredentialRevealed",
-                    |actor| crate::engine::event_bus::SystemEvent::CredentialRevealed {
-                        service_name: cred.service_name.clone(),
-                        auth_type: cred.auth_type.to_string(),
-                        actor,
-                    },
                 )
                 .await;
             Ok(Json(serde_json::json!({

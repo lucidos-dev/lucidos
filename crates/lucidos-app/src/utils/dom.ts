@@ -59,7 +59,7 @@ export function getRemPx(): number {
 /** The viewport clamps live in `@lucidos/geometry`, because the shared tooltip
  *  runs in an app iframe and needs them too. Re-exported here so the host's own
  *  callers keep one import site, and there is still one definition. */
-export { clampWithin, clampToViewportX } from '@lucidos/geometry';
+export { clampWithin } from '@lucidos/geometry';
 
 /** Resize a textarea to fit its content. Setting height to 'auto' first lets
  *  scrollHeight shrink when text is removed; without it the textarea would

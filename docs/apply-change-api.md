@@ -23,13 +23,19 @@ POST /api/v1/changes/{change_id}/apply
 
 ## Response shape
 
-Always JSON. `200 OK` on accepted requests (including `noop`, `hardening`,
-`conflict`); `400 Bad Request` when the engine could not even consider
-the change (missing change, invalid status, etc.); `409 Conflict` when the
-owning thread's current state doesn't offer Apply (the server-side mirror of
-the UI gate — e.g. the thread is mid-turn / Running). An idempotent re-apply
-of an already-applied change is NOT gated: it falls through to the engine and
-returns `200` with `status: "noop"`.
+Always JSON, with four statuses.
+
+- `200 OK` on accepted requests, including `noop`, `hardening` and `conflict`.
+- `400 Bad Request` when the engine could not even consider the change (missing
+  change, invalid status, and so on).
+- `403 Forbidden` when the caller is a thread with no authority over the
+  change's own thread (ADR 0168).
+- `409 Conflict` when the owning thread's current state does not offer Apply.
+  That is the server-side mirror of the UI gate, for a thread mid-turn or
+  Running.
+
+An idempotent re-apply of an already-applied change is NOT gated: it falls
+through to the engine and returns `200` with `status: "noop"`.
 
 ```ts
 type ApplyStatus = 'applied' | 'noop' | 'hardening' | 'conflict';
@@ -189,6 +195,7 @@ worked example.
 |---|---|
 | `400` `{"error":"Change not found"}` | Wrong `change_id`, or change was discarded |
 | `400` `{"error":"Change is already applied"}` | Stale UUID — the engine treats this as an error, not idempotent. The idempotent-applied path returns `200` with `status: "noop"`. |
+| `403` `{"error":"Thread … is out of your reach, so you cannot apply a change from it…"}` | The caller presents a *thread-bound origin token* and the change belongs outside its own subtree. Applying it is the *workspace owner*'s, so the caller needs their *standing instruction*: a turn they opened, or a trigger firing they authorized. A caller with no token is unaffected. |
 | `409` `{"error":"This change can't be applied in the thread's current state"}` | The owning thread doesn't currently offer Apply (e.g. mid-turn / Running). Mirrors the UI gate. Re-applying an *already-applied* change is exempt — that returns `200 noop`. |
 | `200` `{"status":"noop", "commits_applied":0, ...}` | Branch existed but had no commits, or the change was already applied via another path |
 | `200` `{"status":"hardening", ...}` | The change wasn't hardened. The recovery session will auto-apply when done. |

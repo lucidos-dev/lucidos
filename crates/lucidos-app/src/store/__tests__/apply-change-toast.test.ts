@@ -144,7 +144,7 @@ describe('applySingleChange feedback', () => {
   });
 
   it('cancelApplyAllBatch swaps the toast to "Canceling..." and calls the cancel API', async () => {
-    mockedCancelApplyAll.mockResolvedValue({ canceled_batches: 1 });
+    mockedCancelApplyAll.mockResolvedValue({ canceled_batches: 1, disarmed: 0 });
 
     await cancelApplyAllBatch();
 

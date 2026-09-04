@@ -240,12 +240,18 @@ export function renderExchanges(
     lastEffort = exchangeReasoningEffort(ex) ?? lastEffort;
   };
 
+  // **Queued follow-ups are NOT windowed.** They render at the bottom of the
+  // transcript, whatever their index. Gating them on that index hides a
+  // message the reader is still waiting on. A call is what makes the two
+  // disagree: every utterance said after they typed is an exchange, so enough
+  // of them push the index above the window floor. There are only ever a
+  // handful, each stepless, so drawing them all costs nothing.
   const renderQueued = (): void => {
     if (queuedCount === 0) return;
     if (queuedCount === 1) {
       const i = queuedOrder[0];
       const ex = exchanges[i];
-      if (i >= renderFromIndex) nodes.push(renderOne(ex, i));
+      nodes.push(renderOne(ex, i));
       advance(ex);
       return;
     }
@@ -253,12 +259,9 @@ export function renderExchanges(
     const queuedNodes: VNode[] = [];
     for (const j of queuedOrder) {
       const ex = exchanges[j];
-      if (j >= renderFromIndex) queuedNodes.push(renderOne(ex, j));
+      queuedNodes.push(renderOne(ex, j));
       advance(ex);
     }
-    // Queued followups ride the active turn at the tail, so they're virtually
-    // always in-window; bail if windowing happened to exclude them all.
-    if (queuedNodes.length === 0) return;
     nodes.push(
       <details
         class="queued-message-group"
@@ -281,6 +284,26 @@ export function renderExchanges(
     );
   };
 
+  // The queued group rides the BOTTOM of the transcript, which is where the
+  // reader left their unsent messages. On a typed thread that IS the active
+  // turn, since everything after it is queued by construction. On a call it is
+  // not: a caller can speak after typing, and those utterances belong below the
+  // turn and above the messages still waiting. So anchor on the last exchange
+  // that is not itself queued, which the active one never is.
+  let queuedAnchor = activeIdx;
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (!queuedRun.queuedIndices.has(i)) {
+      queuedAnchor = i;
+      break;
+    }
+  }
+
+  // The window floor is NOT widened to reach the active turn, however far up a
+  // call has pushed it. The edge is seeded once and only ever moves up
+  // (`threadWindow.ts`). Deriving it from the active index would let it fall
+  // back down the moment a turn ended, unmounting turns the reader had already
+  // been shown. Reaching an out-of-view live turn means moving the STORED edge,
+  // which is that module's own mechanism.
   for (let i = 0; i < exchanges.length;) {
     if (queuedRun.queuedIndices.has(i)) {
       i++;
@@ -291,7 +314,7 @@ export function renderExchanges(
     if (i >= renderFromIndex) nodes.push(renderOne(ex, i));
     advance(ex);
 
-    if (i === activeIdx) {
+    if (i === queuedAnchor) {
       renderQueued();
     }
 

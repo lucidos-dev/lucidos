@@ -18,13 +18,13 @@
  * in the desktop PanelNav header group, and right-click is a desktop affordance.
  */
 import { test, expect } from './fixtures';
-import { assertHealthy, navigateToApp, waitForEventStream, clickVisibleElement } from './helpers';
+import { apiRequest, assertHealthy, clickVisibleElement, navigateToApp, waitForEventStream } from './helpers';
 
 const CONTENT_TITLE = '.pane-header-content-title';
 const HISTORY_OPTION = '.nav-history-menu .dropdown-option';
 
 async function navigateMenu(page: import('@playwright/test').Page, target: string): Promise<void> {
-  const res = await page.request.post('/api/v1/ui/navigate', {
+  const res = await apiRequest(page).post('/api/v1/ui/navigate', {
     headers: { 'content-type': 'application/json' },
     data: { target },
   });

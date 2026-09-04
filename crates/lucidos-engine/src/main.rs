@@ -887,6 +887,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.set_self_arc(&shared_engine);
     shared_engine.start_parent_callback_listener();
     shared_engine.start_apply_all_driver();
+    shared_engine.start_standing_apply_resolver();
     // The slot boots empty and the model is installed live once it lands, so
     // boot never waits on a multi-hundred-MB download.
     shared_engine.spawn_embedder_load();
@@ -1159,6 +1160,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Without it the registry comes back empty, no batch matches the eventual
     // terminal event, and the frontend's "Applying changes" toast never clears.
     shared_engine.recover_apply_all_batches().await;
+
+    // Re-take every standing apply's verdict against current state. A thread
+    // that settled while the engine was down gets its apply now, and one that
+    // failed gets its report. Same ordering rule as the batch recovery above.
+    shared_engine.recover_standing_applies().await;
 
     lucidos_engine::engine::memory_consumer::spawn(shared_engine.clone());
 

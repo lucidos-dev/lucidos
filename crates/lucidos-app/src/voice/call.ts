@@ -2,25 +2,53 @@
  * The one impure file: it drives a call's devices and owns none of its rules.
  *
  * `callState.ts` decides what happens. This carries the decisions out. It holds
- * the socket, the open audio device and the barge-in gate, and hands every
- * arriving frame back to the reducer.
+ * the socket, the open audio device, the speech gate and the one timer a call
+ * runs, and hands every arriving frame back to the reducer.
  *
  * The devices arrive as ports, so a test drives a whole call with fakes and no
  * `AudioContext` anywhere.
  */
 import {
-  BARGE_IN_IDLE,
-  type BargeInSettings,
-  type BargeInState,
+  SPEECH_GATE_SHUT,
+  type SpeechGateSettings,
+  type SpeechGateState,
   frameEnergy,
-  stepBargeIn,
-} from './bargeIn';
-import { CALL_IDLE, type CallEffect, type CallInput, type CallState, isLive, stepCall } from './callState';
+  stepSpeechGate,
+} from './speechGate';
+import {
+  CALL_IDLE,
+  type CallEffect,
+  type CallInput,
+  type CallState,
+  type CallerUtterance,
+  LANDING_BOUND_MS,
+  WORDS_BOUND_MS,
+  isLive,
+  stepCall,
+} from './callState';
 import { parseServerFrame } from './frames';
 import { floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, CallSocket } from './ports';
 import { CALL_REFUSED, NO_ROUTE_FOR_A_CALL, setupRefusal } from './refusals';
 import { errorDetail } from '../utils/errorDetail';
+
+/**
+ * How long this utterance may wait before its row is withdrawn, or `null`.
+ *
+ * `none` has nothing to withdraw and `live` is bounded by the caller, so
+ * neither waits on a clock. The other two are both waits, on different things.
+ */
+function utteranceBound(at: CallerUtterance): number | null {
+  switch (at) {
+    case 'landing':
+      return LANDING_BOUND_MS;
+    case 'transcribed':
+      return WORDS_BOUND_MS;
+    case 'none':
+    case 'live':
+      return null;
+  }
+}
 
 export interface CallRunner {
   /** Wake the audio device. Call this synchronously inside the press. */
@@ -47,14 +75,24 @@ export interface CallRunnerOptions {
    * `null`, means the system default.
    */
   microphone?: () => string | null;
-  bargeIn?: BargeInSettings;
+  speechGate?: SpeechGateSettings;
 }
 
 export function createCallRunner(options: CallRunnerOptions): CallRunner {
   let state: CallState = CALL_IDLE;
   let socket: CallSocket | null = null;
   let audio: AudioDevice | null = null;
-  let gate: BargeInState = BARGE_IN_IDLE;
+  let gate: SpeechGateState = SPEECH_GATE_SHUT;
+  /**
+   * The bound running on an utterance whose words have not landed, and which
+   * utterance it belongs to.
+   *
+   * Armed once per state an utterance reaches, never per input. Every delta of
+   * the talker's reply is an input. Re-arming on each would push the bound out
+   * for as long as the talker kept speaking.
+   */
+  let held: { count: number; at: CallerUtterance } | null = null;
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
   /** True once the handshake succeeded. A close before it is a refusal. */
   let handshook = false;
   /**
@@ -70,7 +108,39 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     const step = stepCall(state, next);
     state = step.state;
     options.onState(state);
+    holdTheUtterance();
     for (const effect of step.effects) perform(effect);
+  }
+
+  /**
+   * Keep the bound on the current utterance in step with the reducer.
+   *
+   * The reducer says which wait an utterance is in, and each wait has its own
+   * duration. This is the clock behind that, and nothing else here knows the
+   * time.
+   */
+  function holdTheUtterance(): void {
+    const at = state.utterance;
+    const bound = utteranceBound(at);
+    if (bound === null) {
+      dropTheHold();
+      return;
+    }
+    if (held && held.count === state.utteranceCount && held.at === at) return;
+    dropTheHold();
+    held = { count: state.utteranceCount, at };
+    const mine = generation;
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      held = null;
+      if (mine === generation) input({ kind: 'utterance-timeout' });
+    }, bound);
+  }
+
+  function dropTheHold(): void {
+    if (holdTimer !== null) clearTimeout(holdTimer);
+    holdTimer = null;
+    held = null;
   }
 
   function perform(effect: CallEffect): void {
@@ -82,8 +152,14 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
         socket?.sendText(JSON.stringify(effect.control));
         return;
       case 'stop-playback':
+        // The gate is deliberately left alone. It measures the CALLER's voice,
+        // and the caller is mid-word: this effect fires on the barge-in they
+        // just made. Resetting it here would shut the gate under them and read
+        // the rest of the same sentence as a second utterance.
         audio?.stopPlayback();
-        gate = BARGE_IN_IDLE;
+        return;
+      case 'forget-speech':
+        gate = SPEECH_GATE_SHUT;
         return;
       case 'teardown':
         teardown();
@@ -170,22 +246,23 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
     options.onProblem(carried ? CALL_REFUSED : NO_ROUTE_FOR_A_CALL);
   }
 
-  /** One captured frame: send it, and ask whether it cut the talker off. */
+  /** One captured frame: send it, and say whether the caller's voice moved.
+   *
+   *  Only an EDGE reaches the reducer. Twenty-five frames a second arrive, and
+   *  what any reader wants from them is the moment speech starts and the moment
+   *  it stops. */
   function captured(samples: Float32Array): void {
     if (!isLive(state.phase)) return;
     socket?.sendAudio(floatToPcm16(samples));
-    const step = stepBargeIn(
-      gate,
-      { rms: frameEnergy(samples), talkerSpeaking: state.phase === 'speaking' },
-      options.bargeIn,
-    );
-    gate = step.state;
-    if (step.fire) input({ kind: 'barge-in' });
+    const wasOpen = gate.open;
+    gate = stepSpeechGate(gate, frameEnergy(samples), options.speechGate);
+    if (gate.open !== wasOpen) input({ kind: 'speech', open: gate.open });
   }
 
   function teardown(): void {
     generation++;
-    gate = BARGE_IN_IDLE;
+    dropTheHold();
+    gate = SPEECH_GATE_SHUT;
     handshook = false;
     socket?.close();
     socket = null;

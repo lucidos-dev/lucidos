@@ -9,6 +9,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use crate::api::AppState;
 use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
 
@@ -79,6 +80,22 @@ pub(in crate::api) async fn answer_thread_question(
             })),
         ));
     }
+    // An answer is the user's own, so it is the owner's button wherever it
+    // lands outside the caller's subtree (ADR 0168 clause 4). Before the answer
+    // is recorded, so a refusal leaves the card live and answerable.
+    refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        ThreadReachVerb::AnswerQuestion,
+    )
+    .await
+    .map_err(|e| {
+        (
+            e.status_code(),
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     use crate::engine::agent_question::{answer_pending_question, AnswerResult};
     match answer_pending_question(
@@ -337,6 +354,17 @@ pub(in crate::api) async fn continue_thread(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    // Restarting another thread's turn is nobody's answer to anything, which is
+    // why ADR 0168 puts it on clause 4. Before the emit, so a refusal starts no
+    // turn.
+    refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        ThreadReachVerb::Continue,
+    )
+    .await
+    .map_err(|e| (e.status_code(), e.to_string()))?;
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     // Decide which dispatch path to take based on the thread's recorded type.

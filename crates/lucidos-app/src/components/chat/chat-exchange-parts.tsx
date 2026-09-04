@@ -11,6 +11,7 @@ import { BlobImage } from '../shared/BlobImage';
 import type { EventSubscription, EventWaitCancelCause, Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
+import { HEARING_YOU } from '../../voice/callState';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { formatShortDate, formatShortTime, isSameDayInUserTz } from '../../utils/formatTime';
@@ -811,7 +812,15 @@ const NAMED_STEP_OUTCOMES: ReadonlySet<StepOutcome> = new Set<StepOutcome>([
  *  two buttons rather than one button: a `<button>` may not contain another
  *  interactive element. The main target opens what the step DID, and the
  *  context counter opens what the model was SENT. */
-export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
+export function InlineStep(
+  { event, rowRef }: {
+    event: Extract<ResponseEvent, { type: 'step' }>;
+    /** Handed this row's own element, so a caller can watch where it sits.
+     *  `ChatExchange` gives it to the live row alone, which is how the
+     *  "Working" label learns whether the live shimmer is on screen. */
+    rowRef?: (el: HTMLDivElement | null) => void;
+  },
+) {
   const { label, icon, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
   const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
@@ -850,6 +859,7 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
 
   return (
     <div
+      ref={rowRef}
       class={`inline-step ${className}`}
       data-role="inline-step"
       /* A row the user can't read at a glance needs naming, and the tooltip
@@ -953,22 +963,30 @@ const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
  *  the one place in the header a fact about the message can go.
  *
  *  It names the ACT, never a second speaker. The user meets one Lucidos, and
- *  the split behind a call is internal (ADR 0149). */
+ *  the split behind a call is internal (ADR 0149).
+ *
+ *  **The icon is the whole mark.** It says what the word said, and it says it
+ *  in a header that already reads as the reader's own. The word is kept for a
+ *  screen reader, which has no icon to read. */
 export function SpokenChip() {
   return (
     <span class="spoken-chip" data-role="spoken-chip">
       <CallIcon />
-      {'Spoken'}
+      <span class="visually-hidden">{'Spoken'}</span>
     </span>
   );
 }
 
 /** What Lucidos said out loud, one row per talker turn.
  *
- *  It sits inside the doer's turn, which is where it happened, but it is
- *  NOT the doer's words. The written answer above is what the reader reads;
- *  this is the short spoken version the caller heard. So it wears a label of
- *  its own rather than blending into the response body (ADR 0150).
+ *  It sits inside the exchange that was open, which is where it happened, but
+ *  it is NOT the written answer. That answer is what the reader reads; this is
+ *  the short spoken version the caller heard. So it keeps a raised surface and
+ *  a mark of its own rather than blending into the response body (ADR 0150).
+ *
+ *  The mark is the call icon alone. The header above the row already names the
+ *  speaker, so a word here would say it twice. A screen reader has no icon to
+ *  read and keeps the words.
  *
  *  Plain text, never markdown. This is a transcript of speech, and there was
  *  no formatting to lose.
@@ -980,7 +998,7 @@ export function SpokenReply({ event }: { event: Extract<ResponseEvent, { type: '
     <div class="spoken-reply" data-role="spoken-reply">
       <span class="spoken-reply-who">
         <CallIcon />
-        {'Said aloud'}
+        <span class="visually-hidden">{'Said aloud'}</span>
       </span>
       <span class="spoken-reply-text">
         {event.text}
@@ -991,24 +1009,26 @@ export function SpokenReply({ event }: { event: Extract<ResponseEvent, { type: '
   );
 }
 
-/** What the caller said out loud, when the talker answered it alone.
+/** What a caller's bubble holds while they are still speaking.
  *
- *  Its twin above is what Lucidos said back, and the two share a row shape so
- *  a call reads as the conversation it was. They differ in label and in tint.
- *  The tint is the accent a spoken user bubble carries, so a caller's words
- *  look the same wherever they land.
+ *  No words, and none are possible: the client is never sent a partial, so
+ *  there is nothing to caption. Three bars in the slot the words will fill, so
+ *  the swap to the real text moves nothing around it.
  *
- *  An utterance the talker delegated is not this: it opens a turn as a
- *  `MessageReceived` and gets a bubble of its own. */
-export function SpokenMessage({ event }: { event: Extract<ResponseEvent, { type: 'spoken_message' }> }) {
+ *  The hidden phrase is the same one the call toggle's status region speaks, so
+ *  a screen reader hears one thing said one way. Without it the bubble reads as
+ *  empty, an icon being nothing to read out.
+ *
+ *  It says "hearing", never "recording": Lucidos keeps no audio, and this is
+ *  the one surface where a caller would believe the other word. */
+export function LiveUtteranceBody() {
   return (
-    <div class="spoken-message" data-role="spoken-message">
-      <span class="spoken-message-who">
-        <CallIcon />
-        {'You said'}
-      </span>
-      <span class="spoken-message-text">{event.text}</span>
-    </div>
+    <span class="live-utterance" data-role="live-utterance">
+      <span class="live-utterance-bar" />
+      <span class="live-utterance-bar" />
+      <span class="live-utterance-bar" />
+      <span class="visually-hidden">{HEARING_YOU}</span>
+    </span>
   );
 }
 

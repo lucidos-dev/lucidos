@@ -26,7 +26,7 @@ import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, Glo
 import { BlobImage } from '../shared/BlobImage';
 import { codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { PromptRowControls } from './PromptRowControls';
-import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
+import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, getStandingApplyControl, type BannerState } from './WaitingBanner';
 import { composeHasContent, resolveComposerText, composerTextDisagreementToast, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, recoverableAnswerDraft, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
@@ -1132,9 +1132,13 @@ export function PromptInput() {
   // standalone Diff button fills that gap, so a branch with commits always
   // shows a Diff whatever the coding agent's run-state. It is the only liftable
   // slot while composing.
+  //
+  // The primary slot is no longer empty there. A still-working thread carries
+  // the standing apply, so the row offers the change action that CAN act rather
+  // than nothing at all (ADR 0168).
   const slots = bannerState
     ? getBannerSlots(bannerState)
-    : { liftable: getStandaloneCcDiffButton(), primary: null };
+    : { liftable: getStandaloneCcDiffButton(), primary: getStandingApplyControl() };
   const stacked = !fitsInOneRow;
   const sendButton = morphMode !== 'hidden' ? (
     <button

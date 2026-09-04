@@ -442,10 +442,13 @@ pub(super) async fn create_trigger(
         Err(e) => return ApiResult::err(e),
     }
 
-    // Through the trigger write chokepoint, not `emit_user_system`: the
-    // registry must hold the new trigger before this 200 lands, or the
-    // client's next `GET /api/v1/triggers` can miss what it just created.
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // Through the trigger write chokepoint: the registry must hold the new
+    // trigger before this 200 lands, or the client's next
+    // `GET /api/v1/triggers` can miss what it just created.
+    let actor = match crate::api::actor::require_user_actor(&headers, &state.pool, None).await {
+        Ok(a) => Some(a),
+        Err(e) => return ApiResult::err(e.message),
+    };
     state
         .engine
         .emit_trigger_write_or_log(

@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp } from './helpers';
 import {
   psql, git, WORKSPACE, cleanupCCThread, cleanupFileFromMain,
 } from './db-helpers';
@@ -82,7 +82,7 @@ async function seedChangeProposed(page: Page, opts: {
   file: string;
   description: string;
 }): Promise<void> {
-  const resp = await page.request.post('/api/v1/internal/seed-change-for-test', {
+  const resp = await apiRequest(page).post('/api/v1/internal/seed-change-for-test', {
     data: {
       change_id: opts.changeId,
       thread_id: opts.threadId,
@@ -184,7 +184,7 @@ test.describe('WaitingBanner Diff button reacts to coding_agent_has_diff', () =>
       await expect.poll(() => diffVisible(page), { timeout: 10_000 }).toBe(true);
 
       // Apply via the real API → ChangeApplied → projection clears coding_agent_has_diff.
-      const applyResp = await page.request.post(`/api/v1/changes/${changeId}/apply`);
+      const applyResp = await apiRequest(page).post(`/api/v1/changes/${changeId}/apply`);
       expect(applyResp.ok(), `apply failed: ${applyResp.status()} ${await applyResp.text()}`).toBeTruthy();
       appliedToMain = true;
 

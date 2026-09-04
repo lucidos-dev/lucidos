@@ -144,6 +144,14 @@ pub const TABLES: &[TableRule] = &[
         },
     },
     TableRule {
+        table: "standing_applies",
+        owners: &["engine/standing_apply.rs"],
+        announcement: Announcement::Announced {
+            events: &["StandingApplyArmed", "StandingApplyDropped"],
+            exempt: &[],
+        },
+    },
+    TableRule {
         table: "browser_logins",
         owners: &["runtime/browser/mod.rs"],
         announcement: Announcement::Silent {

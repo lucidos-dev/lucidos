@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openTriggersPanel } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, openTriggersPanel } from './helpers';
 
 /** The trigger group heading's two glyphs read at the same size.
  *
@@ -34,7 +34,7 @@ test.describe('Trigger group heading glyphs share one optical size', () => {
       const res = await page.request.get('/api/v1/trigger-groups');
       const body = await res.json();
       for (const g of (body.groups ?? []) as Array<{ id: string; name: string }>) {
-        if (g.name?.startsWith(PREFIX)) await page.request.delete(`/api/v1/trigger-groups?id=${g.id}`);
+        if (g.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/trigger-groups?id=${g.id}`);
       }
     } catch {
       /* best-effort cleanup */
@@ -44,7 +44,7 @@ test.describe('Trigger group heading glyphs share one optical size', () => {
   test('the trash lands the pencil\'s ink height, at the pencil\'s stroke weight', async ({ page }) => {
     await assertHealthy(page);
     const groupName = `${PREFIX}-${Date.now()}`;
-    const created = await page.request.post('/api/v1/trigger-groups', { data: { name: groupName } });
+    const created = await apiRequest(page).post('/api/v1/trigger-groups', { data: { name: groupName } });
     expect(created.ok(), 'failed to create the group over the API').toBe(true);
 
     await navigateToApp(page);

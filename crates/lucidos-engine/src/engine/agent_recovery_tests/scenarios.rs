@@ -1011,15 +1011,15 @@ fn a_device_id_header_alone_produces_the_switch_fingerprints_actor() {
          in-workspace switch, or the picker keeps settling turns at 'failed'"
     );
 
-    // The negative half, and the reason the restart-intent handler refuses a
-    // caller with no device: `user_actor` still returns an actor (an `Api` one),
-    // and stashing THAT would promise nothing while overwriting the honest
-    // System attribution with an API caller.
-    let no_device = crate::api::actor::user_actor(&axum::http::HeaderMap::new(), None, None)
-        .expect("an actor is produced even with no device");
+    // The negative half. A caller with no device produces no actor at all
+    // (ADR 0169), where it used to produce an `Api { mode: Human }` one. So
+    // there is nothing left to stash, and nothing that could overwrite the
+    // honest System attribution.
+    let no_device = crate::api::actor::user_actor(&axum::http::HeaderMap::new(), None, None);
+    assert_eq!(no_device, None, "an unidentified caller is nobody");
     assert!(
-        !AbortCause::EngineShutdown.promises_auto_resume(Some(&no_device)),
-        "an Api actor is not the fingerprint, so it must never reach the stash"
+        !AbortCause::EngineShutdown.promises_auto_resume(no_device.as_ref()),
+        "no actor is not the fingerprint, so it must never reach the stash"
     );
 }
 

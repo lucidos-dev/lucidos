@@ -148,7 +148,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
 }
 
 #[tokio::test]
-async fn emit_user_system_resolves_actor_and_emits_system_event() {
+async fn a_required_user_actor_reaches_the_persisted_system_event() {
     use crate::api::actor::HEADER_DEVICE_ID;
     use crate::core::DeviceStore;
     use crate::engine::thread_events::MessageOrigin;
@@ -178,13 +178,17 @@ async fn emit_user_system_resolves_actor_and_emits_system_event() {
     // branch, which serializes the whole `#[serde(tag = "type", content =
     // "data")]` shape — so `payload` is `{"type": "DataFileWritten",
     // "data": {"path": …, "actor": {…}}}` and the actor round-trips.
-    bus.emit_user_system(&headers, &pool, "[Test] DataFileWritten", |actor| {
-        SystemEvent::DataFileWritten {
+    let actor = crate::api::actor::require_user_actor(&headers, &pool, None)
+        .await
+        .expect("a registered device identifies itself");
+    bus.emit_or_log(
+        BusEvent::System(SystemEvent::DataFileWritten {
             path: "artifacts/fixture.txt".into(),
             commit: None,
-            actor,
-        }
-    })
+            actor: Some(actor),
+        }),
+        "[Test] DataFileWritten",
+    )
     .await;
 
     // Find the emitted event in the events table.

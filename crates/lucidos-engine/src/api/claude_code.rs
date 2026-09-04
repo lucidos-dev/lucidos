@@ -24,6 +24,21 @@ impl StopQuery {
     }
 }
 
+/// Which clause-4 verb this route is, for the authority gate. One route, three
+/// verbs: the query params pick which button was pressed, and the caller reads
+/// a refusal naming the one it tried.
+fn stop_verb(
+    reason: crate::engine::claude_code::StopReason,
+) -> super::thread_reach::ThreadReachVerb {
+    use super::thread_reach::ThreadReachVerb;
+    use crate::engine::claude_code::StopReason;
+    match reason {
+        StopReason::Apply => ThreadReachVerb::Apply,
+        StopReason::Discard => ThreadReachVerb::Discard,
+        _ => ThreadReachVerb::Cancel,
+    }
+}
+
 /// `POST /api/v1/claude-code/stop` — stop a running Claude Code session.
 ///
 /// Three modes via query params:
@@ -44,8 +59,18 @@ pub(super) async fn claude_code_stop(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<StopQuery>,
-) -> Result<Json<super::CancelResponse>, StatusCode> {
+) -> Result<Json<super::CancelResponse>, ApiError> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
+    // Before the question card is cancel-stamped and before any hard stop, so
+    // a refusal leaves the turn exactly as it found it. Apply and Discard reach
+    // this route too, and each is gated as itself.
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        thread_id,
+        stop_verb(query.reason()),
+    )
+    .await?;
     // Stamp the user actor so any ChangeApplied / ChangeApplyFailed emitted by
     // the stale-session fallback (stop?apply=true on a thread whose CC
     // already exited) carries the device that clicked the button instead of
@@ -106,7 +131,7 @@ pub(super) async fn claude_code_stop(
             })),
             Err(e) => {
                 crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
-                Err(StatusCode::NOT_FOUND)
+                Err(StatusCode::NOT_FOUND.into())
             }
         },
         // Apply / Discard: the terminator is `ChangeApplied` / `ChangeDiscarded`,
@@ -115,7 +140,7 @@ pub(super) async fn claude_code_stop(
             Ok(()) => Ok(Json(super::CancelResponse { canceled: true })),
             Err(e) => {
                 crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
-                Err(StatusCode::NOT_FOUND)
+                Err(StatusCode::NOT_FOUND.into())
             }
         },
     }
@@ -156,15 +181,24 @@ pub(super) async fn claude_code_apply_now(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ApplyNowQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let thread_id = uuid::Uuid::parse_str(&query.thread_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Apply by another route, so it takes the same gate. Before the merge, so a
+    // refusal lands nothing on main.
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_id),
+        super::thread_reach::ThreadReachVerb::Apply,
+    )
+    .await?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match state.engine.apply_now(thread_id, actor).await {
         Ok(_) => Ok(Json(serde_json::json!({ "status": "applying" }))),
         Err(e) => {
             let msg = e.to_string();
             crate::log!("[API] apply_now failed for {}: {}", thread_id, msg);
-            Err(apply_now_error_status(&msg))
+            Err(apply_now_error_status(&msg).into())
         }
     }
 }
@@ -333,6 +367,16 @@ pub(super) async fn claude_code_discard(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let thread_uuid = uuid::Uuid::parse_str(&body.thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
+    // Discard by another route, so it takes the same gate. Before the branch
+    // and worktree go.
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_uuid),
+        super::thread_reach::ThreadReachVerb::Discard,
+    )
+    .await
+    .map_err(|e| (e.status_code(), e.to_string()))?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
@@ -346,8 +390,16 @@ pub(super) async fn claude_code_interrupt(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<InterruptQuery>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<StatusCode, ApiError> {
     let thread_id = super::parse_optional_uuid(query.thread_id.as_deref())?;
+    // Cancel by another route, so it takes the same gate.
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        thread_id,
+        super::thread_reach::ThreadReachVerb::Cancel,
+    )
+    .await?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     // No question card is cancel-stamped on this route, so a `running` row it
     // settles is one this request did not write.
@@ -363,7 +415,7 @@ pub(super) async fn claude_code_interrupt(
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             crate::log!("[API] interrupt_agent failed: {}", e);
-            Err(StatusCode::NOT_FOUND)
+            Err(StatusCode::NOT_FOUND.into())
         }
     }
 }

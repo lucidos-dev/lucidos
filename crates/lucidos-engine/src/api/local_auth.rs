@@ -39,10 +39,26 @@
 //! frontend fallback. `/api/v1/health` is the single exemption, because the
 //! gateway health-probes it before it can prove anything.
 
+//! # The same token also answers a second question, on every bind
+//!
+//! [`is_local_process`] asks whether a caller is a process on this machine, for
+//! ATTRIBUTION rather than for the door. `api::actor` reads it to stamp the
+//! engine's own build-watch and release scripts, which hold no thread-bound
+//! origin token and are not a person (ADR 0169).
+//!
+//! It answers on a loopback bind too, where [`EngineAuth::is_required`] is
+//! false and nothing is refused. The door and the name are separate questions,
+//! which is the split this module's header opens with.
+//!
+//! **The answer names a machine, never a person.** So it can never be the
+//! evidence ADR 0168's clause 4 asks for. Two scripts presenting the token are
+//! one identity in the log, and that is accepted.
+
 use crate::net_config::BindChoice;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lucidos_local_token as local_token;
+use std::sync::OnceLock;
 
 /// What a presented credential authorizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,19 +90,27 @@ impl EngineAuth {
     /// logged at boot rather than discovered one 401 at a time. It is not
     /// fatal: refusing every caller is the safe end of the trade, and
     /// `/api/v1/health` still answers so a supervisor can see the process.
+    ///
+    /// The local token is minted here when the file is absent. See
+    /// [`local_token_for_this_engine`].
     pub fn resolve(choice: &BindChoice) -> Self {
         let required = auth_required(choice);
         let auth = EngineAuth {
             required,
-            local: local_token::read_named(local_token::LOCAL_TOKEN_FILE),
+            local: local_token_for_this_engine(),
             webhook: local_token::read_named(local_token::WEBHOOK_TOKEN_FILE),
         };
+        // One file read serves both questions. Publishing here rather than
+        // reading again keeps the door and the attribution answer from ever
+        // disagreeing about what the token is.
+        publish_local_token(auth.local.clone());
         if required {
             let scope = crate::net_config::bind_scope_label(choice);
             if auth.local.is_none() && auth.webhook.is_none() {
                 crate::log!(
                     "[API] bound to {scope} with no credential on disk, so every call is \
-                     refused. Start a gateway to mint one, or bind loopback."
+                     refused. The mint above says why it could not write one; bind \
+                     loopback until it can."
                 );
             } else {
                 crate::log!("[API] bound to {scope}, so callers must present a credential");
@@ -118,6 +142,33 @@ impl EngineAuth {
     /// Does this engine check credentials at all?
     pub fn is_required(&self) -> bool {
         self.required
+    }
+}
+
+/// The machine-local token, minting it when no gateway has.
+///
+/// The gateway mints before it spawns any engine, so a fronted engine finds
+/// that value and this writes nothing. A bare single-engine run has no gateway
+/// to mint for it, and until this existed it had no token file at all.
+///
+/// That gap was not academic. The engine's own build-watch reaches
+/// `POST /api/v1/events/emit` through the CLI, holding no thread-bound origin
+/// token, so the machine-local token is the only identity it can present. With
+/// no file, `api::mutating_gate` would refuse the engine's own rebuild.
+///
+/// A mint that fails is logged and treated as absent, which is exactly the
+/// posture the caller had before. It is never fatal: on the loopback bind that
+/// ships everywhere, nothing is refused for want of it.
+fn local_token_for_this_engine() -> Option<String> {
+    match local_token::ensure_named(local_token::LOCAL_TOKEN_FILE) {
+        Ok(token) => Some(token),
+        Err(e) => {
+            crate::log!(
+                "[API] could not read or mint the machine-local token ({e}), so no caller \
+                 can prove it is a local process"
+            );
+            None
+        }
     }
 }
 
@@ -169,6 +220,52 @@ pub fn presented_scope(headers: &HeaderMap, auth: &EngineAuth) -> Option<EngineS
         }
     }
     None
+}
+
+/// The machine-local token, published by [`EngineAuth::resolve`] at startup.
+///
+/// `None` before the router is built, and `Some(None)` on a machine with no
+/// gateway to mint one. Both mean the same thing to [`is_local_process`]: no
+/// caller can prove it is a local process, so none is attributed as one.
+static LOCAL_TOKEN: OnceLock<Option<String>> = OnceLock::new();
+
+/// Publish the token for [`is_local_process`]. First writer wins, matching the
+/// production invariant that one engine startup builds one router.
+fn publish_local_token(token: Option<String>) {
+    let _ = LOCAL_TOKEN.set(token);
+}
+
+/// Is this caller a process on this machine, running as this user?
+///
+/// Attribution only. See the module note: it is asked on every bind, including
+/// the loopback one where nothing is refused, and it names a machine rather
+/// than a person.
+pub fn is_local_process(headers: &HeaderMap) -> bool {
+    carries_local_token(headers, LOCAL_TOKEN.get().and_then(Option::as_deref))
+}
+
+/// The pure half of [`is_local_process`], so the comparison is testable without
+/// the process-wide token.
+///
+/// No expected token means nobody qualifies. That is the fail-closed direction:
+/// an absent secret must not make every caller local.
+fn carries_local_token(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    expected.is_some_and(|want| {
+        presented(headers, local_token::HEADER_LOCAL_TOKEN)
+            .is_some_and(|got| local_token::ct_eq(got, want))
+    })
+}
+
+/// Publish a known token so a test can drive [`is_local_process`]. Idempotent,
+/// and every caller installs the same value, so parallel tests agree.
+///
+/// No unit test builds a router, so nothing else writes [`LOCAL_TOKEN`] in the
+/// test binary.
+#[cfg(test)]
+pub fn publish_test_local_token() -> &'static str {
+    const TEST_TOKEN: &str = "test-machine-local-token";
+    publish_local_token(Some(TEST_TOKEN.to_string()));
+    TEST_TOKEN
 }
 
 /// A header read as a trimmed, non-empty value.
@@ -325,6 +422,39 @@ mod tests {
     fn a_dot_segment_never_reaches_the_exemption() {
         assert!(!is_public_path("/data/../api/v1/health"));
         assert!(!is_public_path("/api/v1/./health"));
+    }
+
+    /// The attribution half, which the bind does not decide. Reading a mode
+    /// 0600 file is the thing a remote caller cannot do.
+    #[test]
+    fn the_local_token_names_a_local_process() {
+        let h = hm(&[(local_token::HEADER_LOCAL_TOKEN, "local-secret")]);
+        assert!(carries_local_token(&h, Some("local-secret")));
+        assert!(!carries_local_token(&h, Some("other-secret")));
+    }
+
+    /// Fail closed on both halves of the pair. A machine with no gateway has
+    /// no token, and a caller that sends nothing proves nothing. Neither may
+    /// read as local: that would attribute every stranger to this machine.
+    #[test]
+    fn nobody_is_local_without_both_a_secret_and_a_header() {
+        let with = hm(&[(local_token::HEADER_LOCAL_TOKEN, "local-secret")]);
+        let without = hm(&[]);
+        assert!(!carries_local_token(&with, None));
+        assert!(!carries_local_token(&without, Some("local-secret")));
+        assert!(!carries_local_token(&without, None));
+        // An empty header is an absent one, per `presented`.
+        let blank = hm(&[(local_token::HEADER_LOCAL_TOKEN, "   ")]);
+        assert!(!carries_local_token(&blank, Some("local-secret")));
+    }
+
+    /// The webhook token reaches one route and names no local process. Its
+    /// holder is whatever `tailscale funnel` exposed, so reading it as local
+    /// would hand the open internet the engine's own identity.
+    #[test]
+    fn the_webhook_token_never_names_a_local_process() {
+        let h = hm(&[(local_token::HEADER_WEBHOOK_TOKEN, "hook-secret")]);
+        assert!(!carries_local_token(&h, Some("hook-secret")));
     }
 
     #[test]

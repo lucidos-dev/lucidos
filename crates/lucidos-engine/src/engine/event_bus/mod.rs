@@ -678,45 +678,6 @@ impl EventBus {
         }
     }
 
-    /// Resolve the user actor from request headers + the `devices` table, hand
-    /// it to `build`, wrap the result in `BusEvent::System`, and emit through
-    /// `emit_or_log` — the canonical helper for mutating HTTP handlers that:
-    ///
-    /// - take `&HeaderMap` from axum,
-    /// - have a `&PgPool` in scope,
-    /// - need to stamp a same-workspace device/api actor (no body-supplied
-    ///   device-id override, no cross-workspace `caller`), and
-    /// - want fire-and-forget emit with a per-call-site log prefix.
-    ///
-    /// Equivalent to (and replaces) the hand-rolled five-line dance:
-    ///
-    /// ```ignore
-    /// let actor = actor::user_actor_resolved(&headers, &pool, None).await;
-    /// if let Err(e) = bus.emit(BusEvent::System(SystemEvent::X { /* fields */, actor })).await {
-    ///     log!("[Module] Failed to emit X: {}", e);
-    /// }
-    /// ```
-    ///
-    /// `ctx` carries the per-module log prefix (e.g. `"[Apps] AppDeleted"`)
-    /// so `[EventBus] [Apps] AppDeleted emit failed: …` remains greppable by
-    /// module.
-    ///
-    /// For per-device handlers (body-supplied device id), cross-workspace
-    /// callers, Thread events, or handlers that need the `EmitResult` back,
-    /// call `user_actor_resolved` + `emit` / `emit_or_log` directly.
-    pub async fn emit_user_system<F>(
-        &self,
-        headers: &axum::http::HeaderMap,
-        pool: &sqlx::PgPool,
-        ctx: &str,
-        build: F,
-    ) where
-        F: FnOnce(Option<crate::engine::thread_events::MessageOrigin>) -> SystemEvent,
-    {
-        let actor = crate::api::actor::user_actor_resolved(headers, pool, None).await;
-        self.emit_or_log(BusEvent::System(build(actor)), ctx).await;
-    }
-
     /// Single entry point for all events.
     /// Persistence is determined by the event's `is_persisted()` method.
     pub async fn emit(

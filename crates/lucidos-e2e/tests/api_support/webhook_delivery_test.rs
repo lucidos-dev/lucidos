@@ -5,7 +5,7 @@
 //! the wiring between them, over real HTTP. A claim taken in the wrong order,
 //! or a header dropped on the floor, shows up here and nowhere else.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -72,7 +72,7 @@ async fn events_of_type(event_type: &str) -> i64 {
 /// The whole point: a sender resending one delivery fires the event once.
 #[tokio::test]
 async fn a_resend_inside_the_window_emits_nothing_and_reports_the_first_event() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let name = unique_marker("e2e-hook-dedupe");
     let event_type = "E2eDedupedDeliveryArrived";
@@ -115,7 +115,7 @@ async fn a_resend_inside_the_window_emits_nothing_and_reports_the_first_event() 
 /// A different delivery id is a different delivery, however alike the bodies.
 #[tokio::test]
 async fn a_new_delivery_id_still_emits_even_with_an_identical_body() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let name = unique_marker("e2e-hook-distinct");
     let event_type = "E2eDistinctDeliveryArrived";
@@ -141,7 +141,7 @@ async fn a_new_delivery_id_still_emits_even_with_an_identical_body() {
 /// what makes a sender's retry rate answerable.
 #[tokio::test]
 async fn a_hook_without_dedupe_emits_on_every_arrival() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let name = unique_marker("e2e-hook-plain");
     let event_type = "E2ePlainDeliveryArrived";
@@ -164,7 +164,7 @@ async fn a_hook_without_dedupe_emits_on_every_arrival() {
 /// `payload`, the allow-listed headers under `headers`, and no secret anywhere.
 #[tokio::test]
 async fn a_delivery_becomes_summary_headers_and_payload() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let name = unique_marker("e2e-hook-shape");
     let event_type = "E2eShapedDeliveryArrived";
@@ -215,7 +215,7 @@ async fn a_delivery_becomes_summary_headers_and_payload() {
 /// authenticate learns nothing about which delivery ids this hook has seen.
 #[tokio::test]
 async fn an_unauthenticated_resend_is_refused_rather_than_called_a_duplicate() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let name = unique_marker("e2e-hook-authfirst");
     let event_type = "E2eAuthFirstDeliveryArrived";
@@ -244,7 +244,7 @@ async fn an_unauthenticated_resend_is_refused_rather_than_called_a_duplicate() {
 /// later from a sender's failed retries.
 #[tokio::test]
 async fn a_secret_bearing_header_is_refused_at_create() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     for extra in [

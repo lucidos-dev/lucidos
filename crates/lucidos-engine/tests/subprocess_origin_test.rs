@@ -141,33 +141,26 @@ fn subprocess_token_beats_device_id_header() {
     );
 }
 
-/// A regular external `curl` without the subprocess token resolves the way
-/// it always has — `Api { mode: Human }`. The detection mechanism only
-/// fires when the per-engine token matches; bare external API clients are
-/// untouched. (Critical for back-compat with non-subprocess HTTP callers.)
+/// A regular external `curl` without the subprocess token identifies NOBODY.
+///
+/// The point here is still that the detection mechanism must not poison a
+/// non-subprocess path: this caller is resolved by the ordinary rules, not by
+/// anything the token machinery did. What those rules now answer is `None`
+/// (ADR 0169). A caller presenting no credential has said nothing about
+/// itself, and the `Api { mode: Human }` this used to expect was the inversion
+/// that ADR removed. `require_user_actor` turns the `None` into a refusal for
+/// any handler that must know who is acting.
 #[test]
-fn external_curl_without_token_resolves_to_human_api_as_before() {
+fn external_curl_without_token_identifies_nobody() {
     token_for(None);
     let h = headers(&[("user-agent", "curl/8.7.1")]);
 
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
 
-    match origin {
-        Some(MessageOrigin::Api {
-            mode,
-            source_thread_id,
-            ..
-        }) => {
-            assert_eq!(
-                mode,
-                ActorMode::Human,
-                "external curl without the subprocess token MUST stay Human \
-                 — the detection mechanism must not poison non-subprocess paths"
-            );
-            assert_eq!(source_thread_id, None);
-        }
-        other => panic!("expected Api {{ mode: Human }}, got {:?}", other),
-    }
+    assert_eq!(
+        origin, None,
+        "external curl presents no credential, so it names no actor"
+    );
 }
 
 /// Forged token (the engine secret rotates per startup; an attacker outside
@@ -200,20 +193,15 @@ fn a_subprocess_cannot_stamp_a_thread_its_token_was_not_minted_for() {
 
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
-    match origin {
-        Some(MessageOrigin::Api {
-            mode,
-            source_thread_id,
-            ..
-        }) => {
-            assert_eq!(mode, ActorMode::Human, "a forger is an external caller");
-            assert_eq!(
-                source_thread_id, None,
-                "no thread may be stamped from a token that does not cover it"
-            );
-        }
-        other => panic!("expected Api {{ mode: Human }}, got {:?}", other),
-    }
+    // The forger falls through to the external-caller path, which under ADR
+    // 0169 identifies nobody. That is a stronger answer than the
+    // `Api { mode: Human }` this once expected, and it settles the same
+    // question. A token covering one thread stamps no other, and here there
+    // is no actor at all to carry a thread id.
+    assert_eq!(
+        origin, None,
+        "a forger is an external caller, and an external caller names nobody"
+    );
 }
 
 /// JSON round-trip on the new `source_thread_id` field. Persisted event

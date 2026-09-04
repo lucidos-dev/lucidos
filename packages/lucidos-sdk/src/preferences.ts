@@ -1,6 +1,6 @@
 import { request, requestVoid } from './_fetch';
 import { assertString } from './_validate';
-import { wsLocalGet } from './_storage';
+import { wsDeviceId } from './_storage';
 
 export type Preferences = Record<string, string>;
 
@@ -11,13 +11,11 @@ export type Preferences = Record<string, string>;
  * `theme` is missing and the iframe defaults to dark.
  *
  * The device id is PER-WORKSPACE (`ws:<slug>:lucidos-device-id`), so read it
- * through `wsLocalGet` (the parent's prototype override doesn't reach this
- * realm) — see `_storage.ts`.
+ * through `_storage.ts` (the parent's prototype override doesn't reach this
+ * realm).
  */
-const DEVICE_ID_KEY = 'lucidos-device-id';
-
 function parentDeviceId(): string | undefined {
-  return wsLocalGet(DEVICE_ID_KEY) ?? undefined;
+  return wsDeviceId() ?? undefined;
 }
 
 export const preferences = {

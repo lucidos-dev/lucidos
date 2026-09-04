@@ -5,7 +5,7 @@
 //! nothing but documented routes. The point of the test is that the last step
 //! refuses, and that nothing ran.
 
-use crate::support::{base_url, http_client, workspace_path};
+use crate::support::{base_url, http_client, user_client, workspace_path};
 
 /// A file the script would create if it ever executed. Its absence is the
 /// assertion that matters: a 502 with the script having already run would be
@@ -25,9 +25,13 @@ fn planted_script(marker: &std::path::Path) -> String {
     )
 }
 
+/// A data write is a mutation, so it needs a caller the engine can name
+/// (ADR 0169). The bare client is kept below for the proxy call, which is what
+/// this file is actually about refusing.
 async fn put_data(path: &str, body: String) -> u16 {
     let url = format!("{}/api/v1/data/{}", base_url(), path);
-    http_client()
+    user_client()
+        .await
         .put(&url)
         .header("Content-Type", "text/plain")
         .body(body)
@@ -40,7 +44,7 @@ async fn put_data(path: &str, body: String) -> u16 {
 
 async fn delete_data(path: &str) {
     let url = format!("{}/api/v1/data/{}", base_url(), path);
-    let _ = http_client().delete(&url).send().await;
+    let _ = user_client().await.delete(&url).send().await;
 }
 
 /// The chain, and the edit that must not re-bless a script, in one test.
@@ -113,7 +117,8 @@ async fn the_write_then_execute_chain_is_refused() {
     // The e2e client is not a browser, so it may approve. That is the CLI's
     // path, standing in for the user having blessed this script.
     let approve = format!("{}/api/v1/handshake-scripts/approve", base_url());
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&approve)
         .json(&serde_json::json!({ "path": edited_rel }))
         .send()
@@ -127,7 +132,8 @@ async fn the_write_then_execute_chain_is_refused() {
     );
 
     let edit = format!("{}/api/v1/data/edit", base_url());
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&edit)
         .json(&serde_json::json!({
             "path": edited_rel,
@@ -189,7 +195,11 @@ async fn handshake_script_state_is_readable() {
 #[tokio::test]
 async fn approving_is_refused_to_a_browser() {
     let url = format!("{}/api/v1/handshake-scripts/approve", base_url());
-    let resp = http_client()
+    // A registered device, because a real browser carries one and the identity
+    // gate answers before this route does. Without it the 403 under test is
+    // never reached: the reply is a 401 about the missing credential.
+    let resp = user_client()
+        .await
         .post(&url)
         .header("sec-fetch-site", "same-origin")
         .header("sec-fetch-mode", "cors")

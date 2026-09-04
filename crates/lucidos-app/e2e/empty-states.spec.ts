@@ -1,5 +1,7 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, newThread, openThreadDrawer, waitForVisibleInput } from './helpers';
+import {
+  apiRequest, assertHealthy, navigateToApp, newThread, openThreadDrawer, waitForVisibleInput,
+} from './helpers';
 
 test.describe('Empty and error states', () => {
   test.beforeEach(async ({ page }) => {
@@ -43,7 +45,7 @@ test.describe('Empty and error states', () => {
   });
 
   test('malformed chat request returns error', async ({ page }) => {
-    const response = await page.request.post('/api/v1/chat/stream', {
+    const response = await apiRequest(page).post('/api/v1/chat/stream', {
       headers: { 'content-type': 'application/json' },
       data: '{invalid json}',
       failOnStatusCode: false,

@@ -69,6 +69,8 @@ async fn resolve(
             body.id
         )));
     }
+    // Before the resolve, which walks the workspace past the notice.
+    let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None).await?;
     let moved = release_notices::resolve(&state.pool, notices, &running, &body.id)
         .await
         .map_err(ApiError::db)?;
@@ -76,14 +78,12 @@ async fn resolve(
         state
             .engine
             .event_bus
-            .emit_user_system(
-                &headers,
-                &state.pool,
-                "[ReleaseNotices] ReleaseNoticeResolved",
-                |actor| SystemEvent::ReleaseNoticeResolved {
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(SystemEvent::ReleaseNoticeResolved {
                     notice_id: body.id.clone(),
-                    actor,
-                },
+                    actor: Some(actor),
+                }),
+                "[ReleaseNotices] ReleaseNoticeResolved",
             )
             .await;
     }

@@ -4,5 +4,5 @@
 # before building and deploying. Nothing in CI reads it: the docs deploy runs on
 # the maintainer's machine, never from public CI (docs/adr/0031).
 # Pinned for reproducible builds; bump deliberately.
-mkdocs-material==9.7.6
+mkdocs-material==9.7.7
 mkdocs-include-markdown-plugin==7.3.0

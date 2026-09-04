@@ -1,5 +1,5 @@
 /**
- * The pairing gate scrolls itself, and its card starts at the top when it is
+ * The pairing gate scrolls itself, and its column starts at the top when it is
  * too tall to fit.
  *
  * `mobile.css` sets `html { overflow: hidden }` under 768px, so a phone
@@ -10,7 +10,7 @@
  * Two declarations make the box scroll and neither works alone. `overflow-y`
  * scrolls nothing on an auto-height box, and a viewport-sized box without it
  * clips. So both are asserted, along with the absence of the cross-axis
- * centring that would strand the card's first lines above the scroll origin.
+ * centring that would strand the column's first lines above the scroll origin.
  *
  * A source scan rather than a browser test: no emulator reproduces the phone
  * rule that causes it, for the same reason
@@ -47,10 +47,23 @@ describe('pairing gate scroll ownership', () => {
     expect(settled('pairing-gate', 'inset')).toBe('0');
   });
 
-  it('centres the card by auto margins, never by the gate', () => {
-    expect(settled('pairing-card', 'margin')).toBe('auto');
-    // `align-items: center` overflows an over-tall card above the scroll
+  it('centres the column by auto margins, never by the gate', () => {
+    expect(settled('pairing-column', 'margin')).toBe('auto');
+    // `align-items: center` overflows an over-tall column above the scroll
     // origin, which no drag can reach.
-    expect(settled('pairing-gate', 'align-items'), 'this strands the card top').toBeUndefined();
+    expect(settled('pairing-gate', 'align-items'), 'this strands the column top').toBeUndefined();
+  });
+
+  // The page is `viewport-fit=cover` under a translucent status bar, and this
+  // screen renders instead of the shell, so no other rule insets it. A flat
+  // gutter puts the title under the clock and the Pair button under the home
+  // indicator.
+  it('clears the safe area on every side', () => {
+    const padding = settled('pairing-gate', 'padding') ?? '';
+    for (const side of ['top', 'right', 'bottom', 'left']) {
+      expect(padding, `the ${side} gutter ignores the safe area`).toContain(
+        `env(safe-area-inset-${side}`,
+      );
+    }
   });
 });

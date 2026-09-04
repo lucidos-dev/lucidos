@@ -44,6 +44,10 @@ mod capture_unit_tests;
 mod injection_coalescing_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/spoken_aside.rs"]
+mod spoken_aside_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_unit_tests/question_reask.rs"]
 mod question_reask_unit_tests;
 

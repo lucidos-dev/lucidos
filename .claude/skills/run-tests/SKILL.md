@@ -87,7 +87,7 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`10 ignored` in the lib run and `1 ignored` in the doctest run**,
+Expect **`10 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
 no `#[ignore]` at all.) The ten are three different things: **six
@@ -169,10 +169,10 @@ cargo test -p lucidos-engine --lib voice::realtime -- --ignored --nocapture
 |---|---|
 | `a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
 
-**The 1 doctest** is a ```` ```ignore ```` fenced example in
-`crates/lucidos-engine/src/engine/event_bus/mod.rs` — illustrative usage,
-not a compilable snippet. It is the crate's only doctest, so the doc run
-reports `0 passed; 1 ignored`.
+**No doctests.** The crate has none, so the doc run reports `0 passed; 0
+failed; 0 ignored`. It once carried a single ```` ```ignore ```` fenced
+example in `crates/lucidos-engine/src/engine/event_bus/mod.rs`, since
+removed. If a doctest returns, update this line and the count above.
 
 If a future change introduces a *new* `#[ignore]`, it must come with
 either (a) a sibling non-ignored verification test, or (b) a script

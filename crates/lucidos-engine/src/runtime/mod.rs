@@ -378,8 +378,9 @@ fn version_probe_target(status: &AgentBinaryStatus) -> Option<&str> {
     status.path.as_deref()
 }
 
-/// Most either pipe of a `--version` probe may contribute. The answer is one
-/// short line, so anything past this is a binary that is not the CLI we asked.
+/// The most bytes either pipe of a `--version` probe may contribute. The answer
+/// is one short line, so anything past this is a binary that is not the CLI we
+/// asked for.
 ///
 /// The cap is what bounds the probe in MEMORY, and the timeout alone does not:
 /// `Command::output` reads each pipe to EOF, so a binary that streams would

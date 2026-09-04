@@ -15,7 +15,7 @@
  * click never exercised the failing path.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, isMobileViewport, navigateToApp, waitForEventStream } from './helpers';
 
 const UI_SCALE_BUTTON = '[data-search-anchor="appearance:ui-scale"] .settings-option';
 
@@ -24,7 +24,7 @@ async function openScalePanel(page: Page): Promise<void> {
   await navigateToApp(page);
   await waitForEventStream(page);
 
-  const res = await page.request.post('/api/v1/ui/navigate', {
+  const res = await apiRequest(page).post('/api/v1/ui/navigate', {
     headers: { 'content-type': 'application/json' },
     data: { target: 'settings', params: { settings_view: 'appearance' } },
   });

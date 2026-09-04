@@ -1,25 +1,31 @@
 /* What a call leaves in the transcript.
  *
- * Three marks, answering three different questions. The chip on a user bubble
- * says the message was spoken. The two bubbles inside a turn are the call
- * itself: what Lucidos said out loud, which is never the written answer beside
- * it, and what the caller said when the talker fielded it alone.
+ * One mark and one row. The mark on a user bubble says the message was spoken.
+ * The row inside a turn is what Lucidos said out loud, which is never the
+ * written answer beside it.
  *
- * A live call paints nothing else. The call toggle says a call is up, and the
- * words land here as they are spoken. That toggle's on-state lives with the
- * prompt row's other toggle paints in input-messages.css, which is that row's
- * one registry of on-state shapes. */
+ * The caller's own words are NOT here. They draw the ordinary user bubble, in
+ * the ordinary user colour, wherever they land: input-messages.css owns that
+ * surface, and a call adds nothing to it but the mark.
+ *
+ * The mark is the call icon alone on both sides. It says what a word would say,
+ * and each side keeps the word for a screen reader.
+ *
+ * One thing a live call does paint: the pulse a caller's bubble holds while
+ * they are still speaking. The bubble itself is still the ordinary one, and
+ * this is only what sits in it until the words arrive.
+ *
+ * Nothing else. The call toggle says a call is up, and the words land here as
+ * they are spoken. That toggle's on-state lives with the prompt row's other
+ * toggle paints in input-messages.css, which is that row's one registry of
+ * on-state shapes. */
 
-/* The chip rides `.initiator-meta`, the bubble header's right-hand cluster,
+/* The mark rides `.initiator-meta`, the bubble header's right-hand cluster,
    next to the timestamp and the optional "Queued" mark. Muted, because it
    qualifies the message rather than competing with it. */
 .spoken-chip {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
-    font-size: var(--font-size-2xs);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
     color: var(--text-muted);
 }
 
@@ -28,21 +34,11 @@
     height: 0.75rem;
 }
 
-/* A spoken bubble takes a surface of its own, so a mixed transcript can be
-   read at a glance without stopping at each header. Quiet on purpose: it is
-   the same message either way, and the chip carries the fact. */
-.initiator-panel-bubble.initiator-panel-spoken .user-bubble {
-    background: color-mix(in srgb, var(--accent-notable) 14%, var(--bg-tertiary));
-}
-
-/* The row, in both directions. It shares the response body's left inset so it
-   sits on the same column as the prose it is interleaved with.
-
-   Both sides keep that one column rather than mirroring, because these rows
-   are interleaved with a left-aligned response body. A right-hand side would
-   read as a second conversation running beside the turn. */
-.spoken-reply,
-.spoken-message {
+/* The row. It shares the response body's left inset so it sits on the same
+   column as the prose it is interleaved with, and it stays on that column
+   rather than mirroring: a right-hand side would read as a second conversation
+   running beside the turn. */
+.spoken-reply {
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
@@ -51,20 +47,14 @@
     font-size: var(--font-size-sm);
 }
 
-.spoken-reply-who,
-.spoken-message-who {
+.spoken-reply-who {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
     flex-shrink: 0;
-    font-size: var(--font-size-2xs);
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
     color: var(--text-muted);
 }
 
-.spoken-reply-who svg,
-.spoken-message-who svg {
+.spoken-reply-who svg {
     width: 0.75rem;
     height: 0.75rem;
 }
@@ -76,8 +66,7 @@
  * transcript in the dark theme and a step darker in the light one, and that is
  * the whole tint. A spoken reply is not a message the reader sent, so it must
  * stay well under the accent a user bubble carries. */
-.spoken-reply-text,
-.spoken-message-text {
+.spoken-reply-text {
     flex: 0 1 auto;
     min-width: 0;
     padding: 0.25rem 0.625rem;
@@ -85,14 +74,6 @@
     border-radius: 0.75rem;
     color: var(--text-primary);
     overflow-wrap: break-word;
-}
-
-/* The caller's own words take the tint a spoken user bubble takes, so what
-   they said looks the same whether it opened a turn or the talker fielded it
-   alone. It is the one thing telling the two sides of a call apart at a
-   glance, the label being the same size and colour on both. */
-.spoken-message-text {
-    background: color-mix(in srgb, var(--accent-notable) 14%, var(--bg-tertiary));
 }
 
 /* The caller cut in, so the text stops mid-thought. Says so rather than
@@ -103,4 +84,63 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
     color: var(--text-muted);
+}
+
+/* The pulse a caller's bubble holds while they are still speaking.
+ *
+ * Sized to one short line of text, so the bubble it sits in is the size the
+ * words will make it and the swap moves nothing around it. It hugs its bars
+ * rather than filling the row: a wide empty bubble would read as a long
+ * message nobody can see yet.
+ *
+ * `currentColor`, so it takes the user bubble's own text colour and stays
+ * legible at whatever contrast that surface has in either theme. */
+.live-utterance {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.1875rem;
+    height: 1.0625rem;
+}
+
+.live-utterance-bar {
+    width: 0.1875rem;
+    height: 0.375rem;
+    border-radius: 0.09375rem;
+    background: currentColor;
+    opacity: 0.75;
+    animation: live-utterance-pulse 1s ease-in-out infinite;
+}
+
+/* Offset so the three read as one moving thing rather than three blinking
+   ones. A third of the cycle each, which is what puts a peak somewhere in the
+   row at any moment. */
+.live-utterance-bar:nth-child(2) {
+    animation-delay: 0.16s;
+}
+
+.live-utterance-bar:nth-child(3) {
+    animation-delay: 0.32s;
+}
+
+/* Indefinite, so it carries a literal duration and no `--duration-*` token: it
+   is an activity indicator rather than a transition, and does not ride the
+   animation-speed scale. See .claude/rules/frontend-css.md. */
+@keyframes live-utterance-pulse {
+    0%, 100% {
+        transform: scaleY(1);
+    }
+
+    50% {
+        transform: scaleY(2.2);
+    }
+}
+
+/* Still says the same thing, and says it without moving. The bars stay at the
+   height the animation would give them mid-rise, so the row reads as a mark
+   rather than as a paused animation. */
+@media (prefers-reduced-motion: reduce) {
+    .live-utterance-bar {
+        animation: none;
+        transform: scaleY(1.6);
+    }
 }

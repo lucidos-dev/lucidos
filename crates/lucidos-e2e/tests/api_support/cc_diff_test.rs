@@ -1,6 +1,6 @@
 use crate::support::{
-    base_url, db_url, git, git_in, http_client, register_repo, seed_app_cc_thread_summary,
-    unique_marker, workspace_path,
+    base_url, db_url, git, git_in, register_repo, seed_app_cc_thread_summary, unique_marker,
+    user_client, workspace_path,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use uuid::Uuid;
 /// `branch`.
 #[tokio::test]
 async fn cc_diff_falls_back_to_branch_when_worktree_missing() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -136,7 +136,7 @@ fn deterministic_worktree(thread_id: Uuid) -> std::path::PathBuf {
 /// worktree is at its deterministic path throughout.
 #[tokio::test]
 async fn cc_diff_finds_the_first_turn_worktree_of_an_app_thread() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");

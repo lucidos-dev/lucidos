@@ -6,10 +6,10 @@
  * lit long after the call is gone. No test with a real `AudioContext` could run
  * here at all.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
-import { BARGE_IN_DEFAULTS } from './bargeIn';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { SPEECH_GATE_DEFAULTS } from './speechGate';
 import { type CallRunner, createCallRunner } from './call';
-import type { CallState } from './callState';
+import { LANDING_BOUND_MS, WORDS_BOUND_MS, type CallState } from './callState';
 import { CAPTURE_FRAME_SAMPLES, floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, SocketHandlers } from './ports';
 import {
@@ -36,6 +36,10 @@ interface Harness {
   askedFor: (string | null)[];
   /** Push captured microphone frames at the runner. */
   capture(rms: number, frames?: number): void;
+  /** Speak loudly enough to open the gate, for a whole run by default. */
+  speak(frames?: number): void;
+  /** Go quiet for long enough to shut it, for a whole run by default. */
+  hush(frames?: number): void;
   /** How many times a woken audio device was handed back untaken. */
   releases(): number;
   /** Resolve a deferred `openAudio`, when one was armed. */
@@ -169,6 +173,12 @@ function harness(opts: { microphone?: string; note?: string } = {}): Harness {
       const samples = new Float32Array(CAPTURE_FRAME_SAMPLES).fill(rms);
       for (let i = 0; i < frames; i++) onFrame?.(samples);
     },
+    speak(frames = SPEECH_GATE_DEFAULTS.framesToOpen) {
+      this.capture(SPEECH_GATE_DEFAULTS.threshold * 2, frames);
+    },
+    hush(frames = SPEECH_GATE_DEFAULTS.framesToClose) {
+      this.capture(SPEECH_GATE_DEFAULTS.threshold / 2, frames);
+    },
     releases: () => releases,
     armSlowAudio() {
       slow = true;
@@ -300,7 +310,7 @@ describe('barge-in', () => {
   it('cuts the talker off after a run of loud frames', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
-    h.capture(0.5, BARGE_IN_DEFAULTS.framesToFire);
+    h.speak();
     expect(h.socket().controls()).toEqual(['barge_in']);
     expect(h.device().stops).toBeGreaterThan(0);
     expect(h.last().phase).toBe('listening');
@@ -308,15 +318,173 @@ describe('barge-in', () => {
 
   it('stays quiet while the talker is not speaking', async () => {
     const h = await liveCall();
-    h.capture(0.5, BARGE_IN_DEFAULTS.framesToFire * 3);
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen * 3);
     expect(h.socket().controls()).toEqual([]);
   });
 
   it('stays quiet when the caller is quiet', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'one moment' });
-    h.capture(0.001, BARGE_IN_DEFAULTS.framesToFire * 3);
+    h.hush(SPEECH_GATE_DEFAULTS.framesToOpen * 3);
     expect(h.socket().controls()).toEqual([]);
+  });
+
+  /** Stopping playback must not shut the gate. The caller is mid-word, and the
+   *  rest of that word is one utterance, not a second one. */
+  it('leaves the gate open across the cut it makes', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'one moment' });
+    h.speak();
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
+    expect(h.last().utteranceCount).toBe(1);
+  });
+
+  /** The caller never stopped, so the gate was already open when the talker
+   *  started. Only an EDGE reaches the reducer. Without measuring afresh at
+   *  the flip there is no edge left to make. The caller could then not cut in
+   *  without first shutting up for a third of a second. */
+  it('cuts in for a caller who never stopped talking', async () => {
+    const h = await liveCall();
+    h.speak();
+    expect(h.last().utterance).toBe('live');
+    h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
+    expect(h.socket().controls()).toEqual(['barge_in']);
+    expect(h.last().phase).toBe('listening');
+  });
+
+  /** Every delta of the reply arrives as one of these. Measuring afresh on
+   *  each would shut the gate under a caller who IS cutting in. */
+  it('measures afresh only on the first delta of a reply', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'here ' });
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
+    h.socket().say({ type: 'talker_transcript', text: 'is the answer' });
+    h.speak(1);
+    expect(h.socket().controls()).toEqual(['barge_in']);
+  });
+});
+
+/**
+ * The caller's own voice, as the transcript reads it.
+ *
+ * The row it draws is the only sign a caller has that anything heard them
+ * start. So what matters is that it appears on speech, and never outlives it.
+ */
+describe('a live utterance', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('opens after the run, and not before it', async () => {
+    const h = await liveCall();
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
+    expect(h.last().utterance).toBe('none');
+    h.speak(1);
+    expect(h.last().utterance).toBe('live');
+  });
+
+  it('waits on the provider once the caller stops', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    expect(h.last().utterance).toBe('landing');
+  });
+
+  it('is withdrawn when the words never come', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    vi.advanceTimersByTime(LANDING_BOUND_MS);
+    expect(h.last().utterance).toBe('none');
+  });
+
+  /** Every delta of the talker's reply is an input. A bound re-armed by each
+   *  would outlive the answer it is waiting behind. */
+  it('is withdrawn on time however much else the call is doing', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    vi.advanceTimersByTime(LANDING_BOUND_MS / 2);
+    h.socket().say({ type: 'talker_transcript', text: 'one ' });
+    h.socket().say({ type: 'talker_transcript', text: 'moment' });
+    vi.advanceTimersByTime(LANDING_BOUND_MS / 2);
+    expect(h.last().utterance).toBe('none');
+  });
+
+  it('gets the longer bound once the engine has the words', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    h.socket().say({ type: 'user_turn_ended', transcript: 'what is on today' });
+    vi.advanceTimersByTime(LANDING_BOUND_MS);
+    expect(h.last().utterance).toBe('transcribed');
+    vi.advanceTimersByTime(WORDS_BOUND_MS);
+    expect(h.last().utterance).toBe('none');
+  });
+
+  it('runs no clock while the caller is still talking', async () => {
+    const h = await liveCall();
+    h.speak();
+    vi.advanceTimersByTime(LANDING_BOUND_MS + WORDS_BOUND_MS);
+    expect(h.last().utterance).toBe('live');
+  });
+
+  it('leaves nothing running once the call is gone', async () => {
+    const h = await liveCall();
+    h.speak();
+    h.hush();
+    h.socket().handlers.onClose();
+    expect(h.last().utterance).toBe('none');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+/**
+ * The talker's tail.
+ *
+ * `talker_turn_ended` says the provider finished generating, and the speaker
+ * can still be playing what it generated. So the floor flips to the caller with
+ * audio in the air. Echo cancellation and the run-of-frames rule are what cover
+ * it. That is the same pair keeping such audio from firing a barge-in while the
+ * talker holds the floor.
+ */
+describe('audio still leaving the speaker as the floor flips', () => {
+  it('draws no utterance from echo the gate never hears', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
+    h.hush(20);
+    h.socket().say({ type: 'talker_turn_ended' });
+    h.hush(20);
+    expect(h.last().utterance).toBe('none');
+    expect(h.socket().controls()).toEqual([]);
+  });
+
+  it('carries no part-built run across the flip', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
+    h.socket().say({ type: 'talker_turn_ended' });
+    h.speak(1);
+    expect(h.last().utterance).toBe('none');
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen - 1);
+    expect(h.last().utterance).toBe('live');
+  });
+
+  /** The caller cut in, and the engine reports the turn over a moment later.
+   *  They are still mid-sentence, so that is one utterance and one row. */
+  it('keeps an open gate open, so a barge-in stays one utterance', async () => {
+    const h = await liveCall();
+    h.socket().say({ type: 'talker_transcript', text: 'here is the answer' });
+    h.speak();
+    h.socket().say({ type: 'talker_turn_ended' });
+    h.speak(SPEECH_GATE_DEFAULTS.framesToOpen);
+    expect(h.last().utteranceCount).toBe(1);
+    expect(h.last().utterance).toBe('live');
   });
 });
 
@@ -507,7 +675,7 @@ describe('the frames a call sends', () => {
   it('are only the two the engine will read', async () => {
     const h = await liveCall();
     h.socket().say({ type: 'talker_transcript', text: 'hm' });
-    h.capture(0.5, BARGE_IN_DEFAULTS.framesToFire);
+    h.speak();
     h.runner.press(THREAD);
     expect(new Set(h.socket().controls())).toEqual(new Set(['barge_in', 'hang_up']));
   });

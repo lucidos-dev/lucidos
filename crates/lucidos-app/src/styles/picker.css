@@ -1167,30 +1167,42 @@
    `html { overflow: hidden }` under 768px, to hold the composer still when the
    iOS keyboard opens, so a phone document does not scroll at all. A gate
    leaning on document scroll is therefore simply clipped, and the install
-   recipe is the tallest thing it draws. */
+   recipe is the tallest thing it draws.
+
+   The gutter clears the safe area, which the gate has to do for itself. The
+   page is `viewport-fit=cover` under a translucent status bar, so an installed
+   app draws under the clock at the top and the home indicator at the bottom.
+   Nothing else insets this screen: it renders instead of the shell. */
 .pairing-gate {
   position: fixed;
   inset: 0;
   display: flex;
   overflow-y: auto;
-  padding: 1.5rem;
+  padding: calc(1.5rem + env(safe-area-inset-top, 0px))
+    calc(1.5rem + env(safe-area-inset-right, 0px)) calc(1.5rem + env(safe-area-inset-bottom, 0px))
+    calc(1.5rem + env(safe-area-inset-left, 0px));
 }
 
-.pairing-card {
+/* A column on the page, not a card. Nothing shares this screen, so a border
+   round the only thing on it separates the content from nothing at all, and on
+   a phone it costs a gutter's width of the line length the steps need. The
+   gate's own padding is the gutter now.
+
+   Every field and control below wears a fill a step up from the page rather
+   than a step down, since the card no longer sits behind them to hold that
+   contrast. */
+.pairing-column {
   width: 100%;
   max-width: 24rem;
   /* Centred by auto margins rather than by the gate's `align-items`, which
-     would put the top of an over-tall card above the scroll origin, where
+     would put the top of an over-tall column above the scroll origin, where
      nothing can reach it. Auto margins collapse to zero with no free space, so
-     the card starts at the top edge instead and every line stays reachable. */
+     the column starts at the top edge instead and every line stays
+     reachable. */
   margin: auto;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  padding: 1.75rem;
-  border: 1px solid var(--border-color);
-  border-radius: 0.75rem;
-  background: var(--bg-secondary);
 }
 
 .pairing-title {
@@ -1222,7 +1234,7 @@
   margin-bottom: 0.5rem;
   border: 1px solid var(--border-color);
   border-radius: 0.5rem;
-  background: var(--bg-primary);
+  background: var(--bg-secondary);
   color: var(--text-primary);
   /* 1rem, so iOS Safari does not zoom the page when the field takes focus. */
   font-size: var(--font-size-xl);
@@ -1290,7 +1302,7 @@
   height: min(3rem, 18cqi);
   border: 1px solid var(--border-color);
   border-radius: 0.5rem;
-  background: var(--bg-primary);
+  background: var(--bg-secondary);
   color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: min(var(--font-size-3xl), 8cqi);
@@ -1421,7 +1433,7 @@
   aspect-ratio: 1;
   margin-bottom: 0.75rem;
   border-radius: 0.5rem;
-  background: var(--bg-primary);
+  background: var(--bg-secondary);
   object-fit: cover;
 }
 
@@ -1429,7 +1441,7 @@
   padding: 0.5rem 0.875rem;
   border: 1px solid var(--border-color);
   border-radius: 0.5rem;
-  background: var(--bg-primary);
+  background: var(--bg-secondary);
   color: var(--text-primary);
   font-size: var(--font-size-md);
   font-weight: 500;

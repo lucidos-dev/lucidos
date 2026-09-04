@@ -1,9 +1,9 @@
-import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, armingStandingApplyThreadIds, disarmingAllStandingApply, workingThreadCount, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineRestartNewVersion, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
 import type { RestartGroup } from '../store';
-import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, restartEngine, ApiError, isTransportError } from '../../api/client';
+import { applyChange as apiApply, discardChange as apiDiscard, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, armStandingApply as apiArmStandingApply, disarmStandingApply as apiDisarmStandingApply, disarmAllStandingApplies as apiDisarmAllStandingApplies, restartEngine, ApiError, isTransportError } from '../../api/client';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
 import { isNewerVersion } from '../../utils/version';
@@ -432,6 +432,11 @@ export function refreshChangesState(): void {
       // while the batch is still running. The effects.ts edge-guard shows/hides
       // the toast off this signal.
       applyAllInProgress.value = state.apply_all_in_progress ?? false;
+      // Same rehydration for the standing applies: the StandingApply* SSE
+      // events are not replayed, so a reload would otherwise draw an armed
+      // thread as unarmed and offer to arm it again.
+      standingApplyThreadIds.value = new Set(state.standing_apply_thread_ids ?? []);
+      workingThreadCount.value = state.working_thread_count ?? 0;
       // Same rehydration for the per-thread Apply Now state: its optimistic
       // spinner toast + WaitingBanner "Apply..." clear only on the live
       // ChangeApplied/ChangeApplyFailed SSE event, so a missed event (iOS PWA
@@ -492,8 +497,12 @@ export async function discardSingleChange(id: string): Promise<void> {
   }
 }
 
-/** Apply all changes. */
-export async function applyAllChanges(): Promise<void> {
+/** Apply all changes.
+ *
+ *  With `keepGoing`, the call also arms a standing apply on every thread still
+ *  working, so each one applies as it lands. With nothing pending that IS the
+ *  action, and the button reads "Apply as they settle". */
+export async function applyAllChanges(keepGoing = false): Promise<void> {
   // Optimistic busy state: the batch applies the first change synchronously and
   // drives the rest in the background — including a multi-minute pause while it
   // hardens an unhardened member — so reflect "in progress" the instant the
@@ -513,7 +522,15 @@ export async function applyAllChanges(): Promise<void> {
     // after the conflict is fixed and the batch applies (the bug this avoids).
     // The bulk button stays "Applying..." via applyAllInProgress until
     // ApplyAllBatchCompleted (SSE) clears it.
-    await apiApplyAll();
+    const result = await apiApplyAll(keepGoing);
+    // The arm-only call starts no batch, so nothing will clear the optimistic
+    // busy flag. Report what it armed and release the button here. An absent
+    // `batch_size` reads as "a batch started", which leaves the flag to the
+    // SSE completion rather than releasing a button that is still working.
+    if (result.batch_size === 0) {
+      applyAllInProgress.value = false;
+      showToast(result.message, 'info', { autoDismissMs: TOAST_AUTO_DISMISS_MS });
+    }
   } catch (e) {
     // No batch was started — drop the optimistic busy state so the button
     // doesn't stay stuck on "Applying...".
@@ -546,6 +563,77 @@ export async function discardAllChanges(): Promise<void> {
     }
   } catch (e) {
     showToast(errorDetail(e) || 'Failed to discard changes', 'error');
+  }
+}
+
+/** The `reason` the engine reports when the owner takes a standing apply back,
+ *  by hand or by cancelling the sweep that armed it.
+ *
+ *  A drop the ENGINE decided is news and gets a toast. A cancel is the owner's
+ *  own click, so it gets none. Mirrors `DISARMED_BY_OWNER` in
+ *  `crates/lucidos-engine/src/engine/standing_apply.rs`, and
+ *  `standing-apply-canceled-reason.test.ts` fails if the two drift. */
+export const STANDING_APPLY_CANCELED = 'Canceled.';
+
+/** Arm a standing apply on a thread: its change applies once the thread
+ *  settles, and drops with a report if the thread parks or fails.
+ *
+ *  Pass `changeId` when the thread already has a pending change, so the arm is
+ *  bound to that one and cannot reach a later proposal. */
+export async function armStandingApply(threadId: string, changeId?: string): Promise<void> {
+  if (armingStandingApplyThreadIds.value.has(threadId)) return;
+  armingStandingApplyThreadIds.value = new Set([...armingStandingApplyThreadIds.value, threadId]);
+  try {
+    await apiArmStandingApply(threadId, changeId);
+  } catch (e) {
+    showToast(
+      changeToastMessage('Failed to arm the standing apply', threadId, errorDetail(e)),
+      'error',
+    );
+  } finally {
+    const next = new Set(armingStandingApplyThreadIds.value);
+    next.delete(threadId);
+    armingStandingApplyThreadIds.value = next;
+  }
+}
+
+/** Take a standing apply back. */
+export async function disarmStandingApply(threadId: string): Promise<void> {
+  if (armingStandingApplyThreadIds.value.has(threadId)) return;
+  armingStandingApplyThreadIds.value = new Set([...armingStandingApplyThreadIds.value, threadId]);
+  try {
+    await apiDisarmStandingApply(threadId);
+  } catch (e) {
+    showToast(
+      changeToastMessage('Failed to cancel the standing apply', threadId, errorDetail(e)),
+      'error',
+    );
+  } finally {
+    const next = new Set(armingStandingApplyThreadIds.value);
+    next.delete(threadId);
+    armingStandingApplyThreadIds.value = next;
+  }
+}
+
+/** Take every standing apply in the workspace back: the Changes panel's own
+ *  off, pressed by the "Apply as they settle" toggle once it is armed.
+ *
+ *  Each dropped arm arrives back as its own `StandingApplyDropped`, so the
+ *  prompt-row icon un-fills with no refetch. The engine reports the cancel
+ *  reason, which those handlers deliberately leave silent: the owner clicked
+ *  it, and the control already changed face. */
+export async function disarmAllStandingApplies(): Promise<void> {
+  if (disarmingAllStandingApply.value) return;
+  disarmingAllStandingApply.value = true;
+  try {
+    await apiDisarmAllStandingApplies();
+  } catch (e) {
+    showToast(
+      `Failed to cancel the standing applies: ${errorDetail(e)}`,
+      'error',
+    );
+  } finally {
+    disarmingAllStandingApply.value = false;
   }
 }
 

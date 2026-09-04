@@ -9,7 +9,9 @@
 //!   3. Blocks until POST /api/v1/mcp/consent resolves the entry, then emits
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
-use crate::support::{base_url, db_url, http_client, seed_cc_thread_summary, workspace_path};
+use crate::support::{
+    base_url, db_url, register_device, seed_cc_thread_summary, user_client, workspace_path,
+};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::LazyLock;
@@ -64,7 +66,7 @@ async fn empty_cc_allowed_tools(client: &reqwest::Client) -> CcAllowlistRestore 
 
 #[tokio::test]
 async fn permission_prompt_rejects_invalid_thread_id() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = client
         .post(format!("{}/api/v1/internal/permission-prompt", base_url()))
         .json(&json!({
@@ -81,7 +83,7 @@ async fn permission_prompt_rejects_invalid_thread_id() {
 
 #[tokio::test]
 async fn permission_prompt_resolves_when_consent_posted() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -153,7 +155,7 @@ async fn permission_prompt_resolves_when_consent_posted() {
 ///   - exactly ONE `CodingAgentPermissionResolved` is persisted
 #[tokio::test]
 async fn permission_prompt_deduplicates_concurrent_identical_requests() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -259,7 +261,7 @@ async fn permission_prompt_deduplicates_concurrent_identical_requests() {
 #[tokio::test]
 async fn permission_prompt_persists_narrow_skill_pattern() {
     let _lock = lock_cc_allowed_tools().await;
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -318,7 +320,7 @@ async fn permission_prompt_persists_narrow_skill_pattern() {
 #[tokio::test]
 async fn permission_prompt_persists_broad_bash_pattern() {
     let _lock = lock_cc_allowed_tools().await;
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -359,7 +361,7 @@ async fn permission_prompt_persists_broad_bash_pattern() {
 #[tokio::test]
 async fn permission_prompt_narrow_grant_binds_the_same_session() {
     let _lock = lock_cc_allowed_tools().await;
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -443,7 +445,7 @@ async fn permission_prompt_narrow_grant_binds_the_same_session() {
 #[tokio::test]
 async fn permission_prompt_broad_persist_for_edit_does_not_write_file() {
     let _lock = lock_cc_allowed_tools().await;
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -483,7 +485,7 @@ async fn permission_prompt_broad_persist_for_edit_does_not_write_file() {
 #[tokio::test]
 async fn permission_prompt_without_persist_scope_does_not_write_file() {
     let _lock = lock_cc_allowed_tools().await;
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -617,7 +619,7 @@ async fn restore_cc_allowed_tools(client: &reqwest::Client, contents: &str) {
 /// list editor. Mirrors the `cc-allowed-tools` settings API.
 #[tokio::test]
 async fn agent_allowed_commands_settings_roundtrip() {
-    let client = http_client();
+    let client = user_client().await;
     // Snapshot, write a known body with a unique sentinel, read it back, restore.
     let snapshot = read_agent_allowed_commands(&client).await;
     let sentinel = format!("Bash(e2e-{}:*)", Uuid::new_v4().simple());
@@ -771,12 +773,16 @@ async fn wait_for_permission_request(
 /// missed, which is the failure this covers.
 #[tokio::test]
 async fn every_allowlist_put_records_the_resulting_grants() {
-    let client = http_client();
+    let client = user_client().await;
     let _lock = lock_cc_allowed_tools().await;
     let pool = PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to database");
+    // A unique device per run, so concurrent runs cannot read each other's row.
+    // It has to be REGISTERED: widening a grant is gated, and an id naming no
+    // device is a header rather than identity (ADR 0169).
     let device = format!("e2e-grants-{}", Uuid::new_v4().simple());
+    register_device(&device).await;
 
     for (route, grant_file, header, sentinel_pattern) in [
         (
@@ -854,7 +860,10 @@ async fn every_allowlist_put_records_the_resulting_grants() {
 /// answers rather than 500ing.
 #[tokio::test]
 async fn auto_approve_on_an_unknown_server_still_answers() {
-    let client = http_client();
+    let client = user_client().await;
+    // The per-request header wins over the client's default. So this id needs
+    // registering in its own right, or the gate refuses before the toggle runs.
+    register_device("e2e-auto-approve").await;
     let resp = client
         .put(format!("{}/api/v1/mcp/auto-approve", base_url()))
         .header("x-lucidos-device-id", "e2e-auto-approve")

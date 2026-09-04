@@ -26,7 +26,7 @@
  * nav drawer — both layout-stable on desktop.
  */
 import { test, expect } from './fixtures';
-import { assertHealthy, navigateToApp, clickVisibleElement, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, clickVisibleElement, navigateToApp, waitForEventStream } from './helpers';
 
 /** The Provider row in BackupSection. It renders unconditionally — independent
  *  of whether the backup provider list has loaded — so it's a stable "the Backup
@@ -45,7 +45,7 @@ test.describe('navigate_ui → Settings > Backup', () => {
 
     // Emit NavigationRequested via the engine → it fans out over SSE → the
     // page's thread-sync handler routes it through handleNavigationRequest.
-    const res = await page.request.post('/api/v1/ui/navigate', {
+    const res = await apiRequest(page).post('/api/v1/ui/navigate', {
       headers: { 'content-type': 'application/json' },
       data: { target: 'settings', params: { settings_view: 'backup' } },
     });

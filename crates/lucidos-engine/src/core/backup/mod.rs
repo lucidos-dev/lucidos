@@ -107,7 +107,8 @@ pub async fn get_retention_count(pool: &PgPool) -> Result<usize, BoxError> {
         .unwrap_or(DEFAULT_BACKUP_RETENTION))
 }
 
-/// Static registry of all backup providers: (id, name, oauth_provider, required_scopes, constructor).
+/// Static registry of all backup providers: (id, name, oauth_provider,
+/// required_scopes, grant_scopes, constructor).
 const PROVIDERS: &[BackupProviderEntry] = &[
     (
         "google_drive",

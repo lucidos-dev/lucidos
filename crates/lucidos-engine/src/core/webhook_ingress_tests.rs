@@ -103,6 +103,87 @@ fn a_family_this_host_cannot_reach_is_not_probed_rather_than_degraded() {
 }
 
 #[test]
+fn a_port_this_host_cannot_open_is_not_probed_rather_than_degraded() {
+    // A network that filters the funnel port is a fact about this machine. The
+    // engine declared an outage over one twice, for a webhook that GitHub was
+    // pinging successfully at the same moment.
+    let addresses = vec![
+        probe("203.0.113.7", Family::Ipv4, Stage::LocalEgressBlocked),
+        probe("203.0.113.8", Family::Ipv4, Stage::LocalEgressBlocked),
+        probe("2001:db8::1", Family::Ipv6, Stage::Healthy),
+    ];
+    let families = judge(&addresses);
+
+    let v4 = verdict_of(&families, Family::Ipv4);
+    assert_eq!(v4.verdict, Verdict::NotProbed);
+    assert_eq!(v4.total, 0);
+    assert!(degraded_families(&families).is_empty());
+}
+
+#[test]
+fn one_family_blocked_locally_does_not_hide_the_other_one_failing() {
+    // Both readings in one payload. IPv6 is a real outage, and the IPv4 line is
+    // this machine saying it could not measure. A reader must see the two apart.
+    let addresses = vec![
+        probe("203.0.113.7", Family::Ipv4, Stage::LocalEgressBlocked),
+        probe("2001:db8::1", Family::Ipv6, Stage::IngressUnreachable),
+    ];
+    let families = judge(&addresses);
+
+    assert_eq!(degraded_families(&families), vec![Family::Ipv6]);
+    assert_eq!(
+        verdict_of(&families, Family::Ipv4).verdict,
+        Verdict::NotProbed
+    );
+}
+
+#[test]
+fn only_the_two_local_stages_measure_nothing() {
+    // `judge` filters on this, so a third local stage cannot be added and then
+    // forgotten on the way into the verdict.
+    assert!(!Stage::LocalStackUnavailable.measured_the_ingress());
+    assert!(!Stage::LocalEgressBlocked.measured_the_ingress());
+    for stage in [
+        Stage::Healthy,
+        Stage::IngressUnreachable,
+        Stage::BackendUnreachable,
+        Stage::RouteMissing,
+        Stage::UnexpectedResponder,
+    ] {
+        assert!(stage.measured_the_ingress(), "{stage:?}");
+    }
+}
+
+#[test]
+fn a_family_that_answered_anywhere_is_never_blamed_on_this_host() {
+    // The gate in front of the egress check. A 502 proves the port carried a
+    // request, so the timeout beside it is the ingress and stays degraded.
+    let mixed = vec![
+        probe("203.0.113.7", Family::Ipv4, Stage::IngressUnreachable),
+        probe("203.0.113.8", Family::Ipv4, Stage::BackendUnreachable),
+    ];
+    assert!(!nothing_answered(&mixed, Family::Ipv4));
+    assert_eq!(degraded_families(&judge(&mixed)), vec![Family::Ipv4]);
+
+    let all_dead = vec![
+        probe("203.0.113.7", Family::Ipv4, Stage::IngressUnreachable),
+        probe("203.0.113.8", Family::Ipv4, Stage::IngressUnreachable),
+    ];
+    assert!(nothing_answered(&all_dead, Family::Ipv4));
+
+    // A family with nothing to explain is never asked about. That covers one
+    // nobody sent to, and one this host has no route for.
+    assert!(!nothing_answered(&all_dead, Family::Ipv6));
+    assert!(!nothing_answered(&[], Family::Ipv4));
+    let no_route = vec![probe(
+        "2001:db8::1",
+        Family::Ipv6,
+        Stage::LocalStackUnavailable,
+    )];
+    assert!(!nothing_answered(&no_route, Family::Ipv6));
+}
+
+#[test]
 fn both_families_are_always_reported() {
     // The payload must let a reader tell "healthy" from "never asked".
     let families = judge(&[probe("203.0.113.7", Family::Ipv4, Stage::Healthy)]);
@@ -175,6 +256,7 @@ fn every_wire_name_is_kebab_case() {
         (Stage::RouteMissing, "route-missing"),
         (Stage::UnexpectedResponder, "unexpected-responder"),
         (Stage::LocalStackUnavailable, "local-stack-unavailable"),
+        (Stage::LocalEgressBlocked, "local-egress-blocked"),
     ] {
         assert_eq!(serde_json::to_value(stage).unwrap(), name);
     }

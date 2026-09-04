@@ -13,35 +13,24 @@
  *
  *  No audio is kept, so a dropped spoken turn is gone rather than merely
  *  unrendered. That is what makes each of the three a real loss.
+ *
+ *  ORDER is asserted as tightly as completeness, and the same replay is what
+ *  catches a reorder. A caller's utterance is a boundary now, so the divider's
+ *  re-anchor has later exchanges to jump over. See
+ *  `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
  */
 import { describe, it, expect } from 'vitest';
+import { ev, heard, put, said } from './call-fixtures';
 import {
+  changePanelHasContinuation,
   dividerBodyIsSuppressed,
   exchangeResponseEvents,
   groupIntoExchanges,
   questionDividerResolution,
   type StoredEvent,
-  type ThreadEvent,
 } from '../thread-events';
 
 const MSG = 'msg-1';
-
-/** The two `StoredEvent` fields the fold routes by, spelled out so an event
- *  literal can carry them: the engine stamps both onto the wire payload. */
-type Recorded = ThreadEvent & { _eventId?: string; request_event_id?: string };
-
-function ev(seq: number, e: Recorded): readonly [number, StoredEvent] {
-  const created = `2026-08-30T04:50:${String(seq).padStart(2, '0')}Z`;
-  return [seq, { ...e, created } as StoredEvent] as const;
-}
-
-function said(seq: number, text: string): readonly [number, StoredEvent] {
-  return ev(seq, { type: 'SpokenReplyGenerated', session_id: 'sess-1', text, interrupted: false });
-}
-
-function heard(seq: number, text: string): readonly [number, StoredEvent] {
-  return ev(seq, { type: 'SpokenMessageReceived', session_id: 'sess-1', text });
-}
 
 /** The whole call, in the order the engine wrote it. */
 function theCall(): Map<number, StoredEvent> {
@@ -106,17 +95,80 @@ describe('a call reads back whole', () => {
     const exchanges = groupIntoExchanges(theCall());
     const drawn: string[] = [];
     for (const exchange of exchanges) {
-      // A spoken turn with no turn to land in becomes its own boundary, and
-      // its initiator panel draws the words. Every other one is a step.
+      // A caller's utterance always opens a boundary, and a greeting opens one
+      // when there is no turn to land in. Both draw their words in the
+      // initiator panel. Every reply Lucidos gave is a step.
       const starter = exchange.userEvent as { type: string; text?: string };
       if (starter.type === 'SpokenReplyGenerated' || starter.type === 'SpokenMessageReceived') {
         drawn.push(starter.text ?? '');
       }
       for (const e of exchangeResponseEvents(exchange)) {
-        if (e.type === 'spoken_reply' || e.type === 'spoken_message') drawn.push(e.text);
+        if (e.type === 'spoken_reply') drawn.push(e.text);
       }
     }
     expect(drawn).toEqual(SPOKEN);
+  });
+
+  it('opens a boundary for every caller utterance, delegated or not', () => {
+    const exchanges = groupIntoExchanges(theCall());
+    const asked = exchanges
+      .map(e => e.userEvent as { type: string; text?: string })
+      .filter(e => e.type === 'MessageReceived' || e.type === 'SpokenMessageReceived')
+      .map(e => e.text ?? '');
+    expect(asked).toEqual([
+      "What's going on in the codebase today?",
+      'What happened?',
+      'Anything that needs me?',
+    ]);
+  });
+
+  /** The divider owns the turn's continuation, so a resolution normally moves
+   *  it to the end of the timeline. It may not move past what the caller said
+   *  in the meantime: the card holds spoken rows of its own, and they were said
+   *  first. Moving it would print them after two later utterances. */
+  it('leaves the resolved divider above the utterances that followed it', () => {
+    const types = groupIntoExchanges(theCall()).map(e => e.userEvent.type);
+    expect(types).toEqual([
+      'SpokenReplyGenerated',
+      'MessageReceived',
+      'UserQuestionAsked',
+      'SpokenMessageReceived',
+      'SpokenMessageReceived',
+    ]);
+  });
+
+  /** The same guard, over the OTHER half of an utterance. A caller's words are
+   *  a `MessageReceived` when the talker delegated them. The reader sees the
+   *  same bubble either way, so the card may not move below one of those
+   *  either. Same call, with the two talker-only utterances delegated. */
+  it('holds the divider above a DELEGATED utterance too', () => {
+    const events = theCall();
+    events.delete(12);
+    events.delete(14);
+    put(events, 12, {
+      type: 'MessageReceived',
+      text: 'What happened?',
+      mode: 'human',
+      channel: 'chat',
+      voice_session_id: 'sess-2',
+      _eventId: 'msg-2',
+    });
+    put(events, 14, {
+      type: 'MessageReceived',
+      text: 'Anything that needs me?',
+      mode: 'human',
+      channel: 'chat',
+      voice_session_id: 'sess-2',
+      _eventId: 'msg-3',
+    });
+    const types = groupIntoExchanges(events).map(e => e.userEvent.type);
+    expect(types).toEqual([
+      'SpokenReplyGenerated',
+      'MessageReceived',
+      'UserQuestionAsked',
+      'MessageReceived',
+      'MessageReceived',
+    ]);
   });
 
   it('opens a boundary for the greeting, which precedes every turn', () => {
@@ -133,6 +185,35 @@ describe('a call reads back whole', () => {
     expect(questionDividerResolution(divider)).toBe('canceled');
     // And five spoken rows sat in that body, so it renders anyway.
     expect(dividerBodyIsSuppressed(divider, exchangeResponseEvents(divider))).toBe(false);
+  });
+
+  /** The other panel that suppresses its own body. A change banner is a
+   *  boundary, so a greeting said while one sat at the bottom folds in here.
+   *  Suppressed, the line is gone rather than hidden: no audio is kept. */
+  it('keeps a change banner drawing a call that landed under it', () => {
+    for (const banner of ['ChangeApplied', 'ChangeApplyFailed'] as const) {
+      const events = new Map([
+        ev(1, { type: 'MessageReceived', text: 'apply it', mode: 'human', _eventId: MSG }),
+        ev(2, { type: 'ResponseGenerated', text: 'done', request_event_id: MSG }),
+        ev(3, { type: banner, change_id: 'ch-1' }),
+        ev(4, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
+        said(5, 'Hi there. How can I help?'),
+      ]);
+      const panel = groupIntoExchanges(events).find(e => e.userEvent.type === banner);
+      if (!panel) throw new Error(`${banner} opened no panel`);
+      expect(panel.steps.map(s => s.event.type)).toContain('SpokenReplyGenerated');
+      expect(changePanelHasContinuation(panel)).toBe(true);
+    }
+  });
+
+  it('still hides a change banner with nothing under it', () => {
+    const events = new Map([
+      ev(1, { type: 'MessageReceived', text: 'apply it', mode: 'human', _eventId: MSG }),
+      ev(2, { type: 'ResponseGenerated', text: 'done', request_event_id: MSG }),
+      ev(3, { type: 'ChangeApplied', change_id: 'ch-1' }),
+    ]);
+    const panel = groupIntoExchanges(events).find(e => e.userEvent.type === 'ChangeApplied')!;
+    expect(changePanelHasContinuation(panel)).toBe(false);
   });
 
   it('still hides a typed thread canceled divider, which has nothing to draw', () => {

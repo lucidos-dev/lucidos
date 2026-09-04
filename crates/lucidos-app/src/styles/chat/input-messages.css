@@ -259,16 +259,34 @@
     transform: translateY(0.375rem);
 }
 
-/* The prompt row's two TOGGLES in their on-state: the follow toggle (riding the
- * live edge) and the WIP app preview. Both already carried `.active` and
- * `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
+/* An icon in the RIGHT-hand group (today only the standing apply) has to undo
+ * both halves of the rule above, because that group is laid out the other way
+ * round: it centres its own children rather than sitting them on the row's
+ * flex-end, and it is only as tall as a 1.5rem `.action-btn` beside a 1.625rem
+ * send button.
+ *
+ * So the transform would push the glyph below its neighbours instead of level
+ * with them. And the 2.25rem tap target would become the group's height, which
+ * lifts the send button 5px the moment a standing apply appears and drops it
+ * again when it goes. The negative block margins hand that box back the
+ * 0.375rem it takes at each end, so the target overhangs the group instead of
+ * setting its height, and the glyph lands where the pill it replaced sat.
+ *
+ * Same specificity as the rule above, so this must stay after it. */
+.prompt-actions-right .icon-btn.header-icon {
+    transform: none;
+    margin-block: -0.375rem;
+}
+
+/* The prompt row's TOGGLES in their on-state. Each already carried `.active`
+ * and `aria-pressed`, and `.active` styled nothing at all, so the WIP toggle
  * announced its state to a screen reader and to nobody else.
  *
  * They take DIFFERENT on-state paints, so each is selected by its own
  * `data-role` rather than by a shared `.active` (which would have to be a
  * negation to tell them apart, and would read as a rule about the follow toggle
- * while styling the other one). A third toggle in this row therefore has to opt
- * into one of the two shapes below; it inherits neither by accident.
+ * while styling the other one). A new toggle in this row therefore has to opt
+ * into one of the shapes below; it inherits none of them by accident.
  *
  * WIP PREVIEW: framed, the same paint as `.icon-btn.filter-active`
  * (host-components.css). Not a blanket `.icon-btn.active`, which would also
@@ -336,6 +354,16 @@
     }
 }
 
+/* STANDING APPLY: the follow toggle's shape again, accent only and no frame,
+ * but GREEN. Arming one is an Apply the owner presses early, and every other
+ * Apply in the app is `--accent-green` (`.action-btn-confirm`), so the colour
+ * says which action is waiting rather than only that a mode is on. No frame,
+ * because it stays armed for the rest of the thread's life. The flag's own
+ * fill carries the state too, so the two states differ in shape as well. */
+.prompt-actions-row .icon-btn.header-icon.active[data-role="standing-apply"] {
+    color: var(--accent-green);
+}
+
 .prompt-actions-right {
     display: flex;
     align-items: center;
@@ -375,10 +403,34 @@
 .changes-bulk-actions {
     display: flex;
     /* Right-aligned, on the same --space-lg gutter the .list-row change rows
-       below use, so the buttons' right edge lines up with the rows' content. */
+       below use, so the buttons' right edge lines up with the rows' content.
+       Wraps so the "Keep going as the rest settle" label keeps its own line on
+       a narrow pane instead of squeezing the buttons. */
     justify-content: flex-end;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 0.5rem;
     padding: var(--space-sm) var(--space-lg);
+}
+
+/* The sweep checkbox beside Apply All. It reads as a modifier on the button it
+   sits next to, so it takes the muted text colour rather than a control's. */
+.changes-keep-going {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.changes-keep-going input {
+    cursor: pointer;
+    /* An unsized checkbox renders at the UA default, which is a px constant and
+       therefore ignores the ui-scale every rem beside it rides. */
+    width: 0.875rem;
+    height: 0.875rem;
+    margin: 0;
 }
 
 .change-description {

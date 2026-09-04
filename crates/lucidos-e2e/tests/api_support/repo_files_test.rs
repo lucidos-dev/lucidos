@@ -1,4 +1,4 @@
-use crate::support::{base_url, git, git_in, http_client, register_repo, workspace_path};
+use crate::support::{base_url, git, git_in, register_repo, user_client, workspace_path};
 use uuid::Uuid;
 
 /// Register the e2e workspace as a test repository, returning its ID.
@@ -8,7 +8,7 @@ async fn register_test_repo(client: &reqwest::Client) -> String {
 
 #[tokio::test]
 async fn list_repo_files_returns_file_list() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -33,7 +33,7 @@ async fn list_repo_files_returns_file_list() {
 
 #[tokio::test]
 async fn list_repo_files_with_ref() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -52,7 +52,7 @@ async fn list_repo_files_with_ref() {
 
 #[tokio::test]
 async fn list_repo_files_rejects_invalid_ref() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -84,7 +84,7 @@ async fn list_repo_files_rejects_invalid_ref() {
 
 #[tokio::test]
 async fn get_repo_file_content() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -103,7 +103,7 @@ async fn get_repo_file_content() {
 
 #[tokio::test]
 async fn get_repo_file_rejects_path_traversal() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -120,7 +120,7 @@ async fn get_repo_file_rejects_path_traversal() {
 
 #[tokio::test]
 async fn get_repo_file_rejects_invalid_ref() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -137,7 +137,7 @@ async fn get_repo_file_rejects_invalid_ref() {
 
 #[tokio::test]
 async fn get_repo_file_not_found() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
@@ -154,7 +154,7 @@ async fn get_repo_file_not_found() {
 
 #[tokio::test]
 async fn get_repo_diff_with_branch() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
     let ws = workspace_path();
 
@@ -255,7 +255,7 @@ fn cleanup_utf8_branch(branch: &str, wt_dir: &std::path::Path) {
 /// row shows the raw `diff --git ...` header instead of the filename.
 #[tokio::test]
 async fn list_repo_files_returns_raw_utf8_paths() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
     let (branch, file, wt_dir) = create_utf8_branch("files");
 
@@ -297,7 +297,7 @@ async fn list_repo_files_returns_raw_utf8_paths() {
 
 #[tokio::test]
 async fn get_repo_diff_returns_raw_utf8_paths() {
-    let client = http_client();
+    let client = user_client().await;
     let repo_id = register_test_repo(&client).await;
     let (branch, file, wt_dir) = create_utf8_branch("diff");
 
@@ -340,7 +340,7 @@ async fn get_repo_diff_returns_raw_utf8_paths() {
 
 #[tokio::test]
 async fn repo_not_found_returns_404() {
-    let client = http_client();
+    let client = user_client().await;
     let fake_id = Uuid::new_v4();
 
     let resp = client

@@ -360,6 +360,63 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
     }
 }
 
+/// Answer one command-guard permission card, whoever answered it.
+///
+/// **The single in-process path.** The consent endpoint and a spoken answer
+/// both land here. So a card answered by voice is indistinguishable in the
+/// event log from one answered on screen, bar its actor. Parity is structural
+/// rather than something a test has to keep true.
+///
+/// Three effects, in order: fan the answer to the blocked agentic loop, record
+/// any grant the scope asks for, emit the paired resolution.
+///
+/// `false` means no pending request carried that id, so nothing was answered.
+/// It is already resolved (superseded, orphan-recovered, canceled) or was never
+/// issued. The endpoint renders that as a 404.
+pub async fn resolve_command_permission(
+    engine: &LucidosEngine,
+    request_id: String,
+    allowed: bool,
+    persist_scope: Option<AllowScope>,
+    actor: Option<MessageOrigin>,
+    log_context: &str,
+) -> bool {
+    let entry = {
+        let mut pending = engine.pending_command_permission.lock().unwrap();
+        pending.take(&request_id)
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    // Wake the blocked loop, and every deduped waiter on the same broadcast.
+    let _ = entry.tx.send(allowed);
+
+    let reason = if allowed {
+        None
+    } else {
+        Some(DENIAL_REASON.to_string())
+    };
+    // A scope on a denial grants nothing: the click said no.
+    let persist_scope = persist_scope.filter(|_| allowed);
+    if let Some(scope) = persist_scope {
+        let command =
+            command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
+        record_command_allow_grant(engine, entry.thread_id, &entry.tool_name, command, scope);
+    }
+    emit_command_permission_resolved(
+        &engine.event_bus,
+        entry.thread_id,
+        request_id,
+        allowed,
+        reason,
+        persist_scope,
+        EventMeta::with_actor(actor),
+        log_context,
+    )
+    .await;
+    true
+}
+
 /// Emit a `CommandPermissionResolved` via the bus. Shared by the consent
 /// endpoint, the superseded sweep, the orphan-recovery sweep, and the cancel
 /// branch of the in-process block.

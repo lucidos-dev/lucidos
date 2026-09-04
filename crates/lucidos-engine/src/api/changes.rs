@@ -1,8 +1,57 @@
-use super::actor::user_actor_resolved;
+use super::actor::require_user_actor;
+use super::thread_reach::{refuse_without_authority, ThreadReachVerb};
 use super::*;
-use crate::engine::apply_all_driver::ApplyAllDriveMsg;
+use crate::engine::apply_all_driver::ApplyAllOutcome;
+use crate::engine::standing_apply::{DisarmScope, StandingApply, DISARMED_BY_OWNER};
 use crate::engine::{ApplyResult, ApplyStatus};
 use axum::http::HeaderMap;
+
+/// Refuse a change verb this caller has no authority for (ADR 0168 clause 4).
+///
+/// The change's own thread is the target: applying a change acts on the thread
+/// that proposed it, so a parent applying its child's work stays in-subtree.
+///
+/// A change id naming nothing falls through. The engine's own "Change not
+/// found" is the honest answer, and a gate here would leak whether the id
+/// exists. A change naming no thread sits in nobody's subtree, so it takes the
+/// owner's standing instruction.
+async fn refuse_change_verb(
+    state: &AppState,
+    headers: &HeaderMap,
+    change_id: Uuid,
+    verb: ThreadReachVerb,
+) -> Result<(), ApiError> {
+    let row: Option<Option<Uuid>> =
+        sqlx::query_scalar("SELECT thread_id FROM changes WHERE id = $1")
+            .bind(change_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::db)?;
+    let Some(thread_id) = row else {
+        return Ok(());
+    };
+    Ok(refuse_without_authority(&state.pool, headers, thread_id, verb).await?)
+}
+
+/// The same gate for a batch, whose target is every change it will touch.
+///
+/// A thread caller passes only when every member sits in its own subtree, which
+/// is clause 3 applied member by member. The first member outside it needs the
+/// owner's standing instruction, exactly as a single change would.
+///
+/// Gated on the FILTERED list, the one the batch actually applies, so the
+/// authority question covers what happens rather than what was proposed.
+async fn refuse_batch_change_verb(
+    state: &AppState,
+    headers: &HeaderMap,
+    batch: &[crate::core::changes::Change],
+    verb: ThreadReachVerb,
+) -> Result<(), ApiError> {
+    for change in batch {
+        refuse_without_authority(&state.pool, headers, change.thread_id, verb).await?;
+    }
+    Ok(())
+}
 
 pub(super) async fn broadcast_changes(state: &AppState) {
     let proj = state.engine.changes();
@@ -93,19 +142,21 @@ pub(super) async fn list_changes(
     // cross-reload truth for the "Applying changes…" toast — the driving
     // `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
     // events aren't replayed. Joined with the other reads — independent query.
-    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r) = tokio::join!(
+    let (pending_r, applied_r, client_update_r, restart_groups_r, apply_all_r, working_r) = tokio::join!(
         proj.list_pending(),
         proj.list_recently_applied(limit + 1, before_ts),
         proj.client_update_since(state.started_at),
         proj.restart_groups_since(state.started_at),
         sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM apply_all_batches)")
             .fetch_one(pool),
+        crate::engine::standing_apply::count_sweep_candidates(pool),
     );
     let mut pending = pending_r.map_err(ApiError::db)?;
     let mut applied = applied_r.map_err(ApiError::db)?;
     let client_update = client_update_r.map_err(ApiError::db)?;
     let mut restart_groups = restart_groups_r.map_err(ApiError::db)?;
     let apply_all_in_progress = apply_all_r.map_err(ApiError::db)?;
+    let working_thread_count = working_r.map_err(ApiError::db)?;
     let has_more_applied = applied.len() as i64 > limit;
     if has_more_applied {
         applied.truncate(limit as usize);
@@ -136,6 +187,14 @@ pub(super) async fn list_changes(
         "client_update_available": client_update,
         "has_more_applied": has_more_applied,
         "apply_all_in_progress": apply_all_in_progress,
+        // Threads carrying a standing apply. Keyed by THREAD, not by change: a
+        // sweep arms a thread that has proposed nothing yet, and the prompt row
+        // still has to render its armed state.
+        "standing_apply_thread_ids": state.engine.armed_standing_apply_threads(),
+        // Coding-agent threads still working, so a sweep has something to arm.
+        // The panel offers "Apply as they settle" off this, and cannot derive
+        // it: its thread map holds only the loaded window.
+        "working_thread_count": working_thread_count,
     })))
 }
 
@@ -171,7 +230,7 @@ pub(super) async fn revert_change(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
     match state.engine.revert_change(id, actor).await {
         Ok(message) => {
             broadcast_changes(&state).await;
@@ -247,7 +306,8 @@ pub(super) async fn apply_change(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<ApplyResult>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Apply).await?;
     guard_change_action(
         &state,
         id,
@@ -273,7 +333,8 @@ pub(super) async fn discard_change(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Discard).await?;
     guard_change_action(
         &state,
         id,
@@ -290,6 +351,167 @@ pub(super) async fn discard_change(
     }
 }
 
+/// Body of `POST /api/v1/standing-applies`.
+#[derive(serde::Deserialize)]
+pub(super) struct ArmStandingApplyBody {
+    thread_id: Uuid,
+    /// The change to apply. Omit it for a thread that has proposed nothing yet,
+    /// and the arm takes whatever it proposes.
+    #[serde(default)]
+    change_id: Option<Uuid>,
+}
+
+/// POST /api/v1/standing-applies: arm a standing apply for one thread.
+///
+/// The owner's instruction to apply once the thread settles (ADR 0168 clause
+/// 5). Re-arming a thread replaces its previous arm.
+pub(super) async fn arm_standing_apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ArmStandingApplyBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Arming an apply on a thread IS applying it, one settle later, so it takes
+    // the gate the immediate apply takes. The `apply_when_settled` LLM tool is
+    // the other way to this same act, and asks the same rule.
+    refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(body.thread_id),
+        ThreadReachVerb::Apply,
+    )
+    .await?;
+    // A change named here must be this thread's own pending one. Binding an
+    // arm to somebody else's change would apply work the owner never saw on
+    // this thread's settle.
+    if let Some(change_id) = body.change_id {
+        let row: Option<(Option<Uuid>, String)> =
+            sqlx::query_as("SELECT thread_id, status FROM changes WHERE id = $1")
+                .bind(change_id)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(ApiError::db)?;
+        match row {
+            None => return Err(ApiError::not_found("Change not found")),
+            Some((thread_id, _)) if thread_id != Some(body.thread_id) => {
+                return Err(ApiError::bad_request(
+                    "That change belongs to a different thread",
+                ))
+            }
+            Some((_, status)) if status != "pending" => {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "That change has already been applied or discarded",
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    state
+        .engine
+        .arm_standing_apply(StandingApply {
+            thread_id: body.thread_id,
+            change_id: body.change_id,
+            batch_id: None,
+            actor,
+        })
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    broadcast_changes(&state).await;
+    Ok(Json(serde_json::json!({
+        "message": "Will apply when the thread settles.",
+    })))
+}
+
+/// DELETE /api/v1/standing-applies/:thread_id: take the instruction back.
+pub(super) async fn disarm_standing_apply(
+    State(state): State<AppState>,
+    Path(thread_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Taking an apply back acts on the same thread's apply, so it asks the gate
+    // the arm asks. A caller that could not have armed here may not cancel here.
+    refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_id),
+        ThreadReachVerb::Apply,
+    )
+    .await?;
+    let dropped = state
+        .engine
+        .drop_standing_apply(thread_id, DISARMED_BY_OWNER, actor)
+        .await;
+    if !dropped {
+        return Err(ApiError::not_found("No standing apply on that thread"));
+    }
+    broadcast_changes(&state).await;
+    Ok(Json(
+        serde_json::json!({ "message": "Standing apply canceled." }),
+    ))
+}
+
+/// DELETE /api/v1/standing-applies: take back every standing apply here.
+///
+/// The workspace-scope off, which the Changes panel's "Apply as they settle"
+/// toggle presses. It drops a single arm as readily as a swept one. That panel
+/// draws ONE armed state for the workspace, so its off has to mean the same.
+///
+/// Nothing armed answers 0 rather than 404. This is an off switch, and the
+/// owner pressing it on an already-off state got what they asked for. The
+/// per-thread route keeps its 404: naming a thread is a claim about that
+/// thread.
+///
+/// It stops no Apply All batch. Cancelling one is
+/// `POST /api/v1/changes/apply-all/cancel`, which also takes the sweep's arms.
+pub(super) async fn disarm_all_standing_applies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Workspace scope, so no subtree contains it. Same reasoning as Apply All.
+    refuse_without_authority(&state.pool, &headers, None, ThreadReachVerb::Apply).await?;
+    let disarmed = state
+        .engine
+        .drop_standing_applies(DisarmScope::All, DISARMED_BY_OWNER, actor)
+        .await;
+    broadcast_changes(&state).await;
+    Ok(Json(serde_json::json!({ "disarmed": disarmed })))
+}
+
+/// Query for `POST /api/v1/changes/apply-all`.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct ApplyAllQuery {
+    /// "Keep going as the rest settle": arm every thread still working, so its
+    /// change applies when it lands.
+    #[serde(default)]
+    keep_going: bool,
+}
+
+/// What Apply All says when nothing could be applied now and the checkbox was
+/// off. Pure, so each refusal names the real reason rather than one blanket
+/// message.
+pub(super) fn empty_apply_all_refusal(total_pending: usize, unsettled: usize) -> &'static str {
+    if total_pending == 0 {
+        "No pending changes"
+    } else if unsettled == total_pending {
+        "All pending changes belong to threads that are still working or waiting for something. \
+         Turn on \"Keep going as the rest settle\", or wait for them to finish."
+    } else {
+        "All pending changes that could be applied have no file changes left. Discard them instead."
+    }
+}
+
+/// What "Apply as they settle" says once it has armed. Pure.
+pub(super) fn apply_as_they_settle_message(armed: usize) -> String {
+    match armed {
+        0 => "Nothing is working right now, so there is nothing to apply as it settles.".into(),
+        1 => "Will apply 1 thread's change as it settles.".into(),
+        n => format!("Will apply {n} threads' changes as they settle."),
+    }
+}
+
 /// POST /api/v1/changes/apply-all — apply all pending changes
 ///
 /// Emits durable `ApplyAllBatchStarted` with every pending change ID, applies
@@ -300,82 +522,67 @@ pub(super) async fn discard_change(
 /// window — until every member resolves and `ApplyAllBatchCompleted` lands.
 pub(super) async fn apply_all_changes(
     State(state): State<AppState>,
+    Query(query): Query<ApplyAllQuery>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
-    let all_pending = state
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Apply All aims at the workspace rather than at one thread, and with the
+    // checkbox on it arms threads that have proposed nothing yet. No subtree
+    // contains that, so clause 3 cannot cover it and a thread caller needs the
+    // owner's standing instruction. Before the batch record and the first
+    // merge, so a refusal leaves neither.
+    refuse_without_authority(&state.pool, &headers, None, ThreadReachVerb::Apply).await?;
+    // The rule lives on the engine, so the agent's `apply_as_they_settle` runs
+    // the same press this button does.
+    let outcome = state
         .engine
-        .changes()
-        .list_pending()
+        .run_apply_all(actor, query.keep_going)
         .await
         .map_err(ApiError::db)?;
-    if all_pending.is_empty() {
-        return Err(ApiError::bad_request("No pending changes"));
-    }
-    // Exclude changes whose thread has not settled: mid-turn, or parked and due
-    // to wake (ADR 0106). Apply All calls `engine.apply_change` directly, which
-    // bypasses the per-change `guard_change_action` gate. Without this it would
-    // merge a branch the coding agent is still committing on, racing the
-    // session's next proposal (real thread 76b4ee76).
-    let live_filtered =
-        crate::core::changes::drop_unsettled_thread_changes(&state.pool, all_pending)
-            .await
-            .map_err(ApiError::db)?;
-    if live_filtered.is_empty() {
-        return Err(ApiError::bad_request(
-            "All pending changes belong to threads that are still working or waiting for something. Wait for them to finish, then apply.",
-        ));
-    }
-    // Also drop changes with no files left. The per-change endpoint 409s those
-    // (`guard_change_action`), and Apply All calls `engine.apply_change`
-    // directly — without this filter the bulk path would do what the button
-    // refuses, merging no-op commits and possibly spending a harden run on an
-    // empty diff.
-    let pending = crate::core::changes::drop_empty_changes(live_filtered);
-    if pending.is_empty() {
-        return Err(ApiError::bad_request(
-            "All pending changes have no file changes left — discard them instead.",
-        ));
-    }
-    let change_ids: Vec<Uuid> = pending.iter().map(|c| c.id).collect();
-    let batch_id = state
-        .engine
-        .start_apply_all_batch(change_ids.clone(), actor.clone())
-        .await;
-    // Apply the first change synchronously so the HTTP response carries
-    // an immediate result. The driver task takes over from here —
-    // subsequent ChangeApplied/Failed events feed it via the channel
-    // and it spawns the next apply.
-    let first = &pending[0];
-    let first_result = state.engine.apply_change(first.id, actor.clone()).await;
-    // Some apply_change outcomes don't emit a per-change terminator that
-    // would notify the driver: `Noop` (already applied), `Conflict` (CC
-    // handles it later via emit_change_applied/_failed), and several
-    // early-Err paths (change-not-found, status-mismatch). Notify
-    // explicitly for the cases that would otherwise leave the batch
-    // stalled on the first change forever. The driver's record_*
-    // methods are first-write-wins so over-notification is safe.
-    match &first_result {
-        Ok(r) if matches!(r.status, ApplyStatus::Noop) => {
-            state
-                .engine
-                .notify_apply_all(ApplyAllDriveMsg::Applied(first.id));
+
+    let (total_pending, unsettled, armed) = match &outcome {
+        ApplyAllOutcome::NothingToApply {
+            total_pending,
+            unsettled,
+            armed,
+        } => (*total_pending, *unsettled, *armed),
+        ApplyAllOutcome::Started { .. } => (0, 0, 0),
+    };
+    if let ApplyAllOutcome::NothingToApply { .. } = outcome {
+        // With the checkbox on, the sweep IS the action: "Apply as they settle".
+        if !query.keep_going {
+            return Err(ApiError::bad_request(empty_apply_all_refusal(
+                total_pending,
+                unsettled,
+            )));
         }
-        Err(e) => {
-            state
-                .engine
-                .notify_apply_all(ApplyAllDriveMsg::Failed(first.id, e.to_string()));
-        }
-        _ => {}
+        broadcast_changes(&state).await;
+        return Ok(Json(serde_json::json!({
+            "batch_size": 0,
+            "armed": armed,
+            "message": apply_as_they_settle_message(armed),
+        })));
     }
+    let ApplyAllOutcome::Started {
+        batch_id,
+        batch_size,
+        armed,
+        first_branch,
+        first_result,
+    } = outcome
+    else {
+        unreachable!("the NothingToApply arm returned above")
+    };
+
     broadcast_changes(&state).await;
-    let remaining = change_ids.len().saturating_sub(1);
+    let remaining = batch_size.saturating_sub(1);
     match first_result {
         Ok(result) => {
             let mut resp = serde_json::to_value(&result)
                 .expect("ApplyResult contains only Serialize-safe primitives");
             resp["batch_id"] = serde_json::Value::String(batch_id.to_string());
-            resp["batch_size"] = serde_json::Value::Number(change_ids.len().into());
+            resp["batch_size"] = serde_json::Value::Number(batch_size.into());
+            resp["armed"] = serde_json::Value::Number(armed.into());
             resp["message"] = serde_json::Value::String(match result.status {
                 ApplyStatus::Conflict => format!(
                     "Started Apply All — first change hit a conflict, recovery is running. \
@@ -393,10 +600,11 @@ pub(super) async fn apply_all_changes(
         }
         Err(e) => Ok(Json(serde_json::json!({
             "batch_id": batch_id.to_string(),
-            "batch_size": change_ids.len(),
+            "batch_size": batch_size,
+            "armed": armed,
             "applied": 0,
             "failed": 1,
-            "error": format!("{}: {}", first.branch_name, e),
+            "error": format!("{}: {}", first_branch, e),
             "message": format!(
                 "Started Apply All — first change errored ({}), continuing with the remaining {}.",
                 e,
@@ -413,17 +621,28 @@ pub(super) async fn apply_all_changes(
 /// members stay applied; the in-flight apply aborts back to pending (best-effort
 /// for an in-progress merge); queued members stay pending. See
 /// `cancel_apply_all_batches` for the full semantics.
+///
+/// It also takes back every arm a sweep set. Cancel means "stop applying", and
+/// leaving the sweep running would keep applying for hours afterwards. A single
+/// arm the owner set on one change is not part of the sweep and survives.
 pub(super) async fn cancel_apply_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
-    let canceled = state.engine.cancel_apply_all_batches(actor).await;
-    if canceled == 0 {
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    let canceled = state.engine.cancel_apply_all_batches(actor.clone()).await;
+    let disarmed = state
+        .engine
+        .drop_standing_applies(DisarmScope::Sweep, DISARMED_BY_OWNER, actor)
+        .await;
+    if canceled == 0 && disarmed == 0 {
         return Err(ApiError::bad_request("No Apply All batch is running"));
     }
     broadcast_changes(&state).await;
-    Ok(Json(serde_json::json!({ "canceled_batches": canceled })))
+    Ok(Json(serde_json::json!({
+        "canceled_batches": canceled,
+        "disarmed": disarmed,
+    })))
 }
 
 /// GET /api/v1/changes/:id — get a single change by ID
@@ -487,7 +706,7 @@ pub(super) async fn discard_all_changes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = user_actor_resolved(&headers, &state.pool, None).await;
+    let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
     let all_pending = state
         .engine
         .changes()
@@ -508,6 +727,8 @@ pub(super) async fn discard_all_changes(
             "All pending changes belong to threads that are still working or waiting for something. Wait for them to finish, then discard.",
         ));
     }
+    // Before the first discard, so a refusal deletes no branch and no worktree.
+    refuse_batch_change_verb(&state, &headers, &pending, ThreadReachVerb::Discard).await?;
     let mut discarded = 0;
     let mut failed = 0;
     let mut errors = Vec::new();
@@ -538,8 +759,20 @@ pub(super) async fn discard_all_changes(
 /// Routes for the `/changes*` URL surface. The diff/file routes register
 /// here even though their handlers live in `api::repositories` — grouped by
 /// path, not handler location.
+///
+/// `/standing-applies` joins them: it is a change action, and one row per
+/// armed thread is the resource it acts on. The collection takes a DELETE of
+/// its own, which is the workspace-scope off.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/standing-applies",
+            post(arm_standing_apply).delete(disarm_all_standing_applies),
+        )
+        .route(
+            "/standing-applies/:thread_id",
+            axum::routing::delete(disarm_standing_apply),
+        )
         .route("/changes", get(list_changes))
         .route("/changes/applied", get(list_applied_changes))
         .route("/changes/apply-all", post(apply_all_changes))

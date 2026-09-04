@@ -234,19 +234,48 @@ merge_rc() {
 }
 
 # Run a browser project. For mobile-webkit, split the run into two ordered
-# phases — navigation/UI specs (no Claude Code subprocess spawns) FIRST, then the
-# CC-subprocess-spawning specs. This shrinks the contention window behind the
-# mobile-webkit nav-wedge's RESIDUAL variant (a WebContent cold-start/document-load
-# stall under heavy host load — see docs/e2e-test-decisions.md). The wedge's
-# PRIMARY variant (WebKit macOS system-proxy/PAC discovery on the first navigation
-# of each fresh context) is fixed at the source by the explicit `proxy` on the
-# mobile-webkit project in playwright.config.ts. Keeping nav-sensitive specs out of
-# the CC-spawn window is recovery-frequency reduction for the residual variant, not
-# a cure, and is harmless to keep. CC specs are auto-detected by helper usage
-# (pickComposeDestination — the compose destination picker is the entry point
-# for spawning a coding-agent thread) so newly added specs classify themselves;
-# if the set can't be split we fall back to a single run. Other projects always
-# run in one pass.
+# phases: the specs that SPAWN a coding-agent thread FIRST, then everything else.
+# Other projects run in one pass.
+#
+# "Everything else" is the nav phase, and it is NOT free of Claude Code
+# subprocesses. coding-agent-question.spec.ts lands there and makes the engine
+# dispatch a real Continue (`--resume`), which keeps working for about 45s after
+# the spec ends. The partition detects a SPAWN through the compose destination
+# picker, which is the expensive thing, not every subprocess the engine starts.
+#
+# WHY THE CHEAP HALF GOES FIRST. The two halves cost wildly different amounts.
+# Nav grew the compressor 12.64 GB in one nightly; the whole CC phase costs about
+# 1 GB. With the expensive half first, the memory guard kept ending the run at the
+# phase boundary, so those 10 cheap specs repeatedly got no WebKit verdict at all,
+# and it got worse with every spec added to nav. Cheap half first means the ten
+# always report, and a shortfall lands in nav instead. That is the half where a
+# partial chunk range is cheap to carry over and already has discharge tooling.
+#
+# Expect that shortfall on a warm host, by design rather than by accident. Nav's
+# 12.64 GB on top of a CC phase and a 2 to 3 GB starting compressor lands at or
+# above the 16 GB backstop in host_memory_guard.sh. A cold start clears it. A warm
+# one loses the tail of nav, which is exactly the half chosen to carry the loss.
+#
+# WHAT THE SPLIT BUYS mostly survives the reversal, and the part that does not is
+# priced. Keeping the two sets in separate invocations is what shrinks the
+# contention window behind the mobile-webkit nav-wedge's RESIDUAL variant (a
+# WebContent cold-start stall under heavy host load, see
+# docs/e2e-test-decisions.md), and that holds whichever phase runs first. The
+# wedge's PRIMARY variant (WebKit macOS system-proxy/PAC discovery on the first
+# navigation of each fresh context) is fixed at the source by the explicit
+# `proxy` on the mobile-webkit project in playwright.config.ts.
+#
+# What DID change direction is that nav now runs downstream of the CC-spawn
+# window rather than ahead of it. That cost is accepted: the split was only ever
+# recovery-frequency reduction rather than a cure, and nav keeps its real
+# defences, which are the context preflight in e2e/fixtures.ts, gotoWithRetry and
+# retries:1. The documented drafts.spec.ts:65 window is NOT evidence against the
+# reversal, because both its leak source and its victim are nav specs.
+#
+# CC specs are auto-detected by helper usage (pickComposeDestination, the compose
+# destination picker being the entry point for spawning a coding-agent thread), so
+# newly added specs classify themselves. If the set cannot be split we fall back
+# to a single run.
 # Run a list of spec files through CMD in fresh-process chunks of CHUNK_SIZE files
 # each. Each `npx playwright test` invocation launches a fresh browser, so
 # WebKit's per-context WebContent memory accumulation RESETS between chunks —
@@ -280,7 +309,7 @@ run_specs_chunked() {
         echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
         # Anchor each filename, because Playwright reads a positional argument as
         # an unanchored regex over the file path. A bare basename therefore drags
-        # in every sibling containing it, across the nav/CC phase boundary
+        # in every sibling containing it, across the CC/nav phase boundary
         # included. See playwright_file_filter in scripts/lib/e2e.sh.
         local filters=() spec
         for spec in "${chunk[@]}"; do
@@ -351,32 +380,34 @@ _run_browser_project_body() {
                 nav_specs+=("$base")
             fi
         done
-        if [ "${#nav_specs[@]}" -gt 0 ] && [ "${#cc_specs[@]}" -gt 0 ]; then
-            # Nav specs first (quiet engine), then CC-subprocess specs — each phase
-            # sharded into fresh-process chunks so WebKit memory can't accumulate
-            # across the whole suite into the cold-start-stall zone.
-            local nav_rc=0 cc_rc=0
-            echo "── mobile-webkit phase 1/2: ${#nav_specs[@]} navigation specs (sharded) ──"
-            run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
-            # The nav/CC boundary, which the chunk loop deliberately leaves to
+        if [ "${#cc_specs[@]}" -gt 0 ] && [ "${#nav_specs[@]}" -gt 0 ]; then
+            # CC-subprocess specs first (the cheap half), then nav specs. Each
+            # phase is sharded into fresh-process chunks so WebKit memory cannot
+            # accumulate across the whole suite into the cold-start-stall zone.
+            local cc_rc=0 nav_rc=0
+            echo "── mobile-webkit phase 1/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
+            run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
+            # The CC/nav boundary, which the chunk loop deliberately leaves to
             # its caller. Phase 2 is what follows, so there is real work to stop.
             if [ -z "$MEMORY_STOPPED" ] \
-                && ! check_host_memory_at_boundary "$project phase 1/2 (nav)"; then
+                && ! check_host_memory_at_boundary "$project phase 1/2 (CC)"; then
                 MEMORY_STOPPED="$project"
-                nav_rc="$(merge_rc "$nav_rc" "$HOST_MEMORY_STOP_EXIT")"
+                cc_rc="$(merge_rc "$cc_rc" "$HOST_MEMORY_STOP_EXIT")"
             fi
             if [ -n "$MEMORY_STOPPED" ]; then
-                # Phase 2 is the heavier half. Starting it on a host already over
-                # the ceiling is exactly what the ceiling exists to prevent.
+                # Phase 2 is the heavier half, and it is last ON PURPOSE: this is
+                # where we chose a shortfall to land. Nav carries over as a
+                # partial chunk range, so what is lost here is the recoverable
+                # half rather than ten specs that have gone unverified for weeks.
                 echo "── mobile-webkit phase 2/2 SKIPPED: stopped on host memory ──"
-                return "$nav_rc"
+                return "$cc_rc"
             fi
-            echo "── mobile-webkit phase 2/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
-            run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
-            # A CC-phase stop must not overwrite a failing nav phase (see
+            echo "── mobile-webkit phase 2/2: ${#nav_specs[@]} navigation specs (sharded) ──"
+            run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
+            # A nav-phase stop must not overwrite a failing CC phase (see
             # merge_rc), which plain last-wins aggregation would do.
-            rc="$(merge_rc "$rc" "$nav_rc")"
             rc="$(merge_rc "$rc" "$cc_rc")"
+            rc="$(merge_rc "$rc" "$nav_rc")"
             return "$rc"
         fi
     fi

@@ -7,12 +7,12 @@
 //! gateway control plane, not this endpoint. The test resets to `loopback` at the
 //! end so the e2e workspace is left at the safe default.
 
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, user_client};
 use serde_json::{json, Value};
 
 #[tokio::test]
 async fn network_config_roundtrips_and_rejects_garbage() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     // GET has the expected shape.

@@ -29,7 +29,15 @@ pub(crate) mod local_auth;
 mod mcp;
 mod mcp_permission;
 mod memory;
+pub(crate) mod mutating_gate;
 mod notifications;
+
+/// Where every `/api/v1` route is mounted, as one value.
+///
+/// `create_router` nests on it and `mutating_gate` strips it off a
+/// `MatchedPath`, which reports the FULL path a nest resolved to. Two copies
+/// would let a prefix change refuse every exempt route instead.
+pub(crate) const API_V1_PREFIX: &str = "/api/v1";
 mod plugins;
 mod presence;
 pub mod presence_pong;
@@ -56,6 +64,7 @@ mod search;
 pub(crate) mod secret_reveal;
 mod settings;
 pub mod sse_connections;
+pub(crate) mod standing_instruction;
 pub(crate) mod target_workspace;
 mod thread_queue;
 pub(crate) mod thread_reach;
@@ -1261,6 +1270,16 @@ pub fn create_router(
         // `compression_predicate` extends it to leave media alone, which is what
         // keeps `Accept-Ranges` on a data-file response.
         .layer(CompressionLayer::new().compress_when(compression_predicate()))
+        // Refuse a mutating request carrying no identity (401). Layered here
+        // for the same reason the workspace check below is: a write nobody can
+        // be attributed to is a hazard on every mutating endpoint, and a
+        // per-handler check is one the next endpoint can forget. It reads the
+        // MATCHED route, so it must sit inside the nest where routing happened.
+        // See `api::mutating_gate`, and ADR 0169 for the rule.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mutating_gate::enforce_caller_identified,
+        ))
         // Refuse a request that named a DIFFERENT workspace than this engine
         // serves (409). Layered here rather than per-handler because a
         // mis-aimed write is a hazard on every mutating endpoint, and a
@@ -1293,7 +1312,7 @@ pub fn create_router(
     };
 
     let router = Router::new()
-        .nest("/api/v1", api_routes)
+        .nest(API_V1_PREFIX, api_routes)
         .nest("/app", apps::ui_router().with_state(app_ui_state))
         .nest_service("/data", serve_data);
 

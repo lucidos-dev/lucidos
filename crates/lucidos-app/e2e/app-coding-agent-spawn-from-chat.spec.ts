@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp } from './helpers';
 import { createIframeAppFixture } from './db-helpers';
 
 test.describe('App coding-agent thread — compose destination picker', () => {
@@ -26,7 +26,7 @@ test.describe('App coding-agent thread — compose destination picker', () => {
       // preference, which survives across test runs in the e2e workspace —
       // pin it so a stray Codex pick (manual debugging, a future spec) can't
       // poison the 'Claude Code' assertion below.
-      const prefReset = await page.request.put('/api/v1/preferences?key=coding_agent_default', {
+      const prefReset = await apiRequest(page).put('/api/v1/preferences?key=coding_agent_default', {
         data: { value: 'claude-code' },
       });
       expect(prefReset.ok()).toBeTruthy();

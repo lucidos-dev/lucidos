@@ -69,6 +69,7 @@ fn generate_cross_validation_fixture() -> String {
                                             Action::DiscardDraft => "discard_draft",
                                             Action::Discard => "discard",
                                             Action::Apply => "apply",
+                                            Action::ApplyWhenSettled => "apply_when_settled",
                                             Action::Archive => "archive",
                                             Action::Save => "save",
                                             Action::Unsave => "unsave",
@@ -159,7 +160,7 @@ fn generate_typescript() -> String {
         status_literals.join(", ")
     ));
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
-    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';\n");
+    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n");
     out.push_str("export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';\n\n");
 
     // LEGAL_SECTIONS
@@ -250,6 +251,11 @@ fn generate_typescript() -> String {
     out.push_str("    } else if (storedSection === 'inbox' && !descendantsBlockArchive) {\n");
     out.push_str("      actions.push('archive');\n");
     out.push_str("    }\n");
+    out.push_str("  }\n");
+    out.push_str(
+        "  if (threadType === 'claude_code' && (status === 'running' || status === 'paused')) {\n",
+    );
+    out.push_str("    actions.push('apply_when_settled');\n");
     out.push_str("  }\n");
     out.push_str("  actions.push(isSaved ? 'unsave' : 'save');\n");
     out.push_str("  return actions;\n");

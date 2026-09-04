@@ -1782,7 +1782,7 @@ impl LucidosEngine {
         // the next round reads it from history.
         let orphans: Vec<_> = orphans
             .into_iter()
-            .filter(|p| !matches!(p.kind, crate::engine::InjectedPromptKind::SpokenAside))
+            .filter(|p| p.kind.can_carry_a_turn())
             .collect();
         if !orphans.is_empty() {
             log!(

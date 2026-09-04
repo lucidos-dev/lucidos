@@ -1056,6 +1056,38 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         failed: Vec<crate::engine::apply_all_batches::ApplyFailure>,
     },
+    /// The owner armed a *standing apply*: this thread's change is to be
+    /// applied once the thread settles (ADR 0168 clause 5). Re-arming the same
+    /// thread emits again, because the arm it replaces may have named a
+    /// different change.
+    StandingApplyArmed {
+        thread_id: Uuid,
+        /// The change the arm is bound to. `None` means the thread was still
+        /// working with nothing proposed, so the arm takes whatever it
+        /// proposes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change_id: Option<Uuid>,
+        /// The Apply All sweep that armed this thread, when a sweep did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A standing apply ended without applying, and this is its report. A
+    /// thread that parks or fails never settles by itself, so the arm is
+    /// dropped rather than left waiting. Also covers the owner disarming it
+    /// and the armed change disappearing.
+    StandingApplyDropped {
+        thread_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<Uuid>,
+        /// Why it ended, written for the owner to read in the morning.
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// Bash supervisor (`scripts/lib/engine_supervisor.sh`) wrapped an
     /// engine instance that died with a non-graceful exit code (anything
     /// other than 0 / 130 / 138) and is spawning its replacement. The
@@ -1330,6 +1362,8 @@ impl SystemEvent {
         "DataFileEdited",
         "ApplyAllBatchStarted",
         "ApplyAllBatchCompleted",
+        "StandingApplyArmed",
+        "StandingApplyDropped",
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
@@ -1465,6 +1499,8 @@ impl SystemEvent {
             Self::DataFileEdited { .. } => "DataFileEdited",
             Self::ApplyAllBatchStarted { .. } => "ApplyAllBatchStarted",
             Self::ApplyAllBatchCompleted { .. } => "ApplyAllBatchCompleted",
+            Self::StandingApplyArmed { .. } => "StandingApplyArmed",
+            Self::StandingApplyDropped { .. } => "StandingApplyDropped",
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
@@ -1598,6 +1634,8 @@ impl SystemEvent {
         "DataFileEdited",
         "ApplyAllBatchStarted",
         "ApplyAllBatchCompleted",
+        "StandingApplyArmed",
+        "StandingApplyDropped",
         "EngineSupervisorRespawned",
         "EmailSent",
         "ProxyModulesReloaded",
@@ -1712,6 +1750,11 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { .. } | Self::ApplyAllBatchCompleted { .. } => {
                 "apply_all_batch"
             }
+            // A standing apply is armed for ONE thread, and that thread is what
+            // a reader follows. The sweep that armed it is a field, not the
+            // aggregate: cancelling a sweep drops many arms, each of which
+            // reports on its own thread.
+            Self::StandingApplyArmed { .. } | Self::StandingApplyDropped { .. } => "standing_apply",
             Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
@@ -1834,6 +1877,8 @@ impl SystemEvent {
             | Self::HandshakeScriptInjectsBound { path, .. } => path.clone(),
             Self::ApplyAllBatchStarted { batch_id, .. }
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
+            Self::StandingApplyArmed { thread_id, .. }
+            | Self::StandingApplyDropped { thread_id, .. } => thread_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
             // The preview is engine-level, but WHICH thread's worktree it shows
             // is its identity: one preview per thread, one slot at a time.
@@ -1853,7 +1898,7 @@ impl SystemEvent {
             // TriggerExecuted is engine-driven and carries no actor field, so
             // its raw payload is the wire shape. The CRUD variants below DO
             // carry an `actor` (stamped by the HTTP handlers via
-            // `emit_user_system`); they must merge it in so the persisted row
+            // `require_user_actor`); they must merge it in so the persisted row
             // and SSE frame attribute the change — same contract as the
             // TriggerGroup* variants.
             Self::TriggerExecuted { payload, .. } => payload.clone(),

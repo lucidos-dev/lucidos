@@ -21,6 +21,7 @@
 
 import { API } from '../../api/client';
 import { getDeviceId } from './devices';
+import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { isPageActive } from '../../utils/pageActive';
 import { startNativeWindowActiveTracking } from '../../utils/nativeWindow';
 
@@ -34,7 +35,11 @@ let cleanupFns: Array<() => void> = [];
 function postDevicePresence(visible: boolean): void {
   fetch(ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    // The header as well as the body id. This emits `DeviceVisible`, so it is
+    // a mutation `api::mutating_gate` refuses without one (ADR 0169). The body
+    // id names the SUBJECT of the event; the header says who is calling, and
+    // the engine reads only the header.
+    headers: { 'Content-Type': 'application/json', ...deviceIdHeader() },
     body: JSON.stringify({
       device_id: getDeviceId(),
       visible,

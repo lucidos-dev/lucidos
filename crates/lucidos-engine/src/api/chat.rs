@@ -780,6 +780,26 @@ pub(super) async fn chat_submit(
         }
     }
 
+    // A create with no parent is a TOP-thread, which sits directly under the
+    // workspace root. The root is not a thread and gets no row, so no place in
+    // the tree reaches it: only the owner's standing instruction does (ADR 0168
+    // clauses 1 and 4).
+    //
+    // Outside the `caller_workspace` guard above, deliberately. `lucidos
+    // spawn-thread --relation top` sends that field even for THIS workspace, so
+    // a gate inside it would miss every same-workspace top-thread spawn. A call
+    // from another workspace's engine holds no token this engine minted, so it
+    // is unaffected and keeps vouching for its own human.
+    if !thread_exists && parent_thread_id.is_none() {
+        crate::api::thread_reach::refuse_without_authority(
+            &state.pool,
+            &headers,
+            None,
+            crate::api::thread_reach::ThreadReachVerb::CreateTopThread,
+        )
+        .await?;
+    }
+
     let engine_clone = state.engine.clone();
     let message = request.message.clone();
     let model = request.model.clone();
@@ -1453,15 +1473,15 @@ pub(super) async fn cancel_chat(
     let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
     // Before the question card is cancel-stamped, so a refusal writes nothing.
     // A thread-bound caller with no `thread_id` is refused rather than reread
-    // as "cancel yourself": the unscoped form stops the whole workspace.
-    crate::api::thread_reach::refuse_out_of_reach(
+    // as "cancel yourself": the unscoped form stops the whole workspace, so it
+    // takes the owner's standing instruction like any other root-wide act.
+    crate::api::thread_reach::refuse_without_authority(
         &state.pool,
         &headers,
         thread_id,
         crate::api::thread_reach::ThreadReachVerb::Cancel,
     )
-    .await
-    .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
+    .await?;
     // Resolve the actor once and reuse it for the question-card resolution, the
     // cancel-thread call, and the settle fallback. It stamps
     // `ResponseCanceled.actor` / `ResponseAborted.actor`, so the timeline

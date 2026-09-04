@@ -1195,6 +1195,8 @@ impl LucidosEngine {
                 // Preserve the draft assistant text in history, append the
                 // coalesced injection as one user message, and continue so the
                 // agent answers the queued updates in this same turn.
+                // A spoken aside alone is not a follow-up and buys no round:
+                // `injections_reopen_a_finished_answer` says why.
                 // Whether the drafted answer is already in `messages` as
                 // assistant context. Read by the wake check below, which must
                 // not push it a second time: an injection group that drops
@@ -1212,7 +1214,7 @@ impl LucidosEngine {
                 );
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
-                if !injected_prompts.is_empty() {
+                if injections_reopen_a_finished_answer(&injected_prompts) {
                     if let Some(answer) = response
                         .content
                         .as_deref()
@@ -1247,6 +1249,12 @@ impl LucidosEngine {
                         }
                         continue;
                     }
+                } else if !injected_prompts.is_empty() {
+                    log!(
+                        "[AgenticLoop] thread={} {} spoken aside(s) landed on a finished answer, not reopening it",
+                        thread_id,
+                        injected_prompts.len()
+                    );
                 }
 
                 // A reply carrying ONLY the working understanding is

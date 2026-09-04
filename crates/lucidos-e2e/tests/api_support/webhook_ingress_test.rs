@@ -4,7 +4,7 @@
 //! The scheduler's unit tests judge a probe. This is the route that turns the
 //! newest declaration into the outage bar, over real HTTP.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -66,7 +66,7 @@ async fn seed_event(
 /// reading the other's seed.
 #[tokio::test]
 async fn the_ingress_route_reports_a_standing_outage_and_drops_it_on_recovery() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let pool = PgPool::connect(&db_url()).await.expect("connect");
 

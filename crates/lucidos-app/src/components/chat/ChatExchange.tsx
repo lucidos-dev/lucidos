@@ -1,12 +1,12 @@
 import type { ComponentChildren } from 'preact';
 import type { Signal } from '@preact/signals';
 import { memo } from 'preact/compat';
-import { useEffect, useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLiveUtteranceRow, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -16,16 +16,17 @@ import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody } from './PermissionCard';
 import { ChildCompletionRow } from './ChildCompletionRow';
-import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, hasVisibleLiveStep, drawsResponseRow } from '../../store/event-rendering';
+import { hidesEarlierProse, getCollapsedVisibleEvents, splitEventSections, liveStepIndex, drawsResponseRow } from '../../store/event-rendering';
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated, type ExchangeStatus } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenMessage, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setThreadLive } from './scrollState';
+import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
 // Without these, every dependent useMemo invalidates on every render while
@@ -136,6 +137,18 @@ interface Props {
   matchedEventType?: string;
   matchedEventId?: string;
   matchedPayloadJson?: string;
+}
+
+/** Which boundaries the reader owns, and so draw the right-aligned bubble.
+ *
+ *  Two events, one act. A caller's utterance is a `SpokenMessageReceived` when
+ *  the talker answered it alone and a `MessageReceived` when it delegated. The
+ *  reader said the same thing either way, so both read the same way.
+ *
+ *  Exported for the test that pins that, since the bubble decision itself lives
+ *  inside a component with no jsdom to mount it in. */
+export function isUserBubbleEvent(userEvent: { type: string }): boolean {
+  return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived';
 }
 
 /** Does this exchange mean the AGENT IS RUNNING on the thread being shown? The
@@ -521,11 +534,33 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     });
   }, [visibleEvents]);
 
-  // Exactly one running-text shimmer at a time. When an in-progress step is
-  // visible, its own shimmer is the live affordance and the "Working" label
-  // below drops to a plain static one. Otherwise the label shimmers as the sole
-  // affordance: steps hidden, this exchange collapsed, or no pending step.
-  const liveStepOnScreen = hasVisibleLiveStep(showSteps, isCollapsed, visibleEvents);
+  // Exactly one running-text shimmer at a time, and it has to be one the reader
+  // can SEE. While the live step row is on screen its shimmer is the affordance,
+  // so the "Working" label drops to a plain static one. Otherwise the label
+  // shimmers as the sole affordance.
+  //
+  // Two halves, because drawn and seen are different questions. `liveStepIndex`
+  // answers the first from data alone: steps hidden, this exchange collapsed, or
+  // no pending step. The hook answers the second, and it is the half that used
+  // to be missing. A coding-agent turn always carries a live row, derived by
+  // `needsLiveThinkingRow` for every gap between calls. So a tall turn read
+  // "Working" over finished checks, with its only shimmer far below the fold.
+  //
+  // No row element means no shimmer to defer to, so the label takes it. That is
+  // the safe direction: the failure this fixes is a label that stayed plain.
+
+  // `useState`, so the setter IS the ref callback: a stable identity, which is
+  // what stops Preact re-running the ref on every render of a live turn.
+  const [liveStepRow, setLiveStepRow] = useState<HTMLElement | null>(null);
+  const liveRowIndex = liveStepIndex(showSteps, isCollapsed, visibleEvents);
+  // Gated on the index because the ref does NOT clear itself when a row stops
+  // being the live one. Preact clears a ref only on unmount, or when a
+  // DIFFERENT ref replaces it on the same element. So a row that settles IN
+  // PLACE leaves the state pointing at itself: held on a permission card, or
+  // killed with the turn. Gating here is what tears the observer down.
+  const markedRow = liveRowIndex >= 0 ? liveStepRow : null;
+  const rowOnScreen = useOnScreenInTranscript(markedRow);
+  const liveStepOnScreen = markedRow !== null && rowOnScreen;
 
   // Memoize linkified HTML — linkifyPaths builds 15+ regex batches per call when
   // the workspace has many artifacts. Without memoization, every re-render of
@@ -567,7 +602,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // predicate is event-type based, NOT label-based. A user-driven control turn
   // keeps the chip slot, rendered iconless with the action AS the label (see
   // `actionInitiator`). Question dividers keep their agent chip.
-  const isUserMessageBubble = exchange.userEvent.type === 'MessageReceived' && initiator.variant === 'user';
+  const isUserMessageBubble = isUserBubbleEvent(exchange.userEvent) && initiator.variant === 'user';
   // Both of those are exempt from the fold, on report. A change turn's body is
   // a summary, a description and a file list; a user message is the reader's
   // own text. The control cost a row of chrome to fold a few short lines.
@@ -582,6 +617,9 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
   const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
+  // The caller is mid-sentence, so nothing is in flight behind this bubble and
+  // no panel belongs under it. It draws the bubble and stops there.
+  const isLiveUtterance = isLiveUtteranceRow(exchange.userEvent);
   // The trash button lives INSIDE the status label, an existing `display: flex`
   // row, rather than in a separate wrapper. "Queued" and the trash then stay on
   // one line using only CSS that already ships.
@@ -638,7 +676,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // boundaries it takes no continuation exception: the header line IS the whole
   // turn, and a response panel would be a status badge over an empty body.
   const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveUtterance && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -671,14 +709,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       }
       // `evt.type === 'step'` is `isStepMechanics` spelled inline, for the type
       // narrowing `InlineStep` needs. It is the ONLY row the toggle hides.
-      if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} />;
+      //
+      // The live row is marked so the header label can read where it sits.
+      // MOVING the mark is safe in either direction. Preact clears the old ref
+      // during the diff and applies the new one after it. So a clear can never
+      // land on top of a set. Losing the mark entirely is the case Preact does
+      // not handle, and the reader above gates on the index for exactly that.
+      if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} rowRef={k === liveRowIndex ? setLiveStepRow : undefined} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
       if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
       // Ungated, like the event row below. It is what the caller HEARD, no
       // audio is kept, and the written answer beside it is a different thing:
       // the talker says what an answer means rather than reading it out.
       if (evt.type === 'spoken_reply') return <SpokenReply key={`sr${k}`} event={evt} />;
-      if (evt.type === 'spoken_message') return <SpokenMessage key={`sm${k}`} event={evt} />;
       // Ungated, like every other marker. The park is the transcript's only
       // record that the thread subscribed to something. The clock indicator
       // holds the LIVE half and drops the wait as it resolves. A toggle
@@ -1107,6 +1150,12 @@ export function describeInitiator(
   matched?: { eventType?: string; eventId?: string; payloadJson?: string },
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
+  // Ahead of the switch, because the row wears a `MessageReceived` and would
+  // otherwise take that arm and draw an empty bubble. The caller is speaking
+  // and no words exist yet, so the bubble holds a pulse where they will go.
+  if (isLiveUtteranceRow(ev)) {
+    return youInitiator({ details: <LiveUtteranceBody />, status: <SpokenChip /> });
+  }
   const summary = initiatorSummary(ev);
   switch (ev.type) {
     case 'TriggerStarted':
@@ -1225,17 +1274,16 @@ export function describeInitiator(
       }
       // A spoken message says so. The composer stays live during a call (ADR
       // 0148), so the transcript interleaves speech and typing and the reader
-      // otherwise cannot tell which they did. The chip carries the fact; the
-      // accent gives the bubble a surface of its own.
+      // otherwise cannot tell which they did. The mark carries that one fact,
+      // and the bubble under it is the one a typed message gets.
       if (ev.voice_session_id) {
-        return youInitiator({ details, status: <SpokenChip />, accent: 'spoken' });
+        return youInitiator({ details, status: <SpokenChip /> });
       }
       return youInitiator({ details });
     }
-    // The two spoken turns, reached ONLY when one opened a boundary of its
-    // own: a call greeting said before anything started a turn
-    // (`isSpokenTurn` in `exchange-grouping`). Inside a turn they are steps
-    // and render through `exchangeResponseEvents` instead.
+    // A call greeting, said before anything had started a turn, so it opened a
+    // boundary of its own (`exchange-grouping`). Every other spoken reply is a
+    // step and renders through `exchangeResponseEvents` instead.
     case 'SpokenReplyGenerated':
       return {
         variant: 'lucidos',
@@ -1248,12 +1296,18 @@ export function describeInitiator(
         ),
       };
     case 'SpokenMessageReceived':
-      // The caller's own words, so the same chip and accent a spoken
-      // `MessageReceived` wears. What differs is that this one started no turn.
+      // The caller's own words, as the ordinary user bubble. One act, one
+      // shape: this is the same utterance a delegated one is, and which model
+      // fielded it is not the reader's distinction. `userMessageHtml` carries
+      // the words, so both arms render through one path.
+      //
+      // A wordless utterance draws no bubble, the same guard the arm above
+      // takes. Nothing carries images: the caller is speaking.
       return youInitiator({
-        details: <SpokenMessage event={{ type: 'spoken_message', text: ev.text }} />,
+        details: userMessageHtml
+          ? <UserMessageBody html={userMessageHtml} imageHashes={[]} />
+          : undefined,
         status: <SpokenChip />,
-        accent: 'spoken',
       });
     case 'ChildThreadCompleted':
       // The EventBus fan-in path raises this on the parent when a child thread

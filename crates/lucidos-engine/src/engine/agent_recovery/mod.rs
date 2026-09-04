@@ -20,7 +20,7 @@ pub use helpers::*;
 // key on one definition.
 pub(crate) use recovery::{
     newest_open_question, preserve_question_park_at_shutdown, thread_has_unanswered_question,
-    unanswered_question_exists_sql, OpenQuestion,
+    unanswered_question_exists_sql,
 };
 // "Does a boundary already cover this turn?", in its two strengths. The
 // recovery pass asks the window-only form before emitting its own boundary; a
@@ -57,6 +57,11 @@ pub(crate) use recovery::{
 #[cfg(test)]
 pub(crate) use recovery::branch_awaits_recovery;
 pub(crate) use recovery::{switch_abort_unsuperseded_sql, SWITCH_TEARDOWN_ABORT_SQL};
+// Which events begin a turn, shared with `api::standing_instruction`. The
+// recovery gates ask which turn an abort belongs to, and the standing
+// instruction asks who opened that turn. One list, so "the current turn" cannot
+// come to mean two things.
+pub(crate) use recovery::THREAD_START_EVENTS_SQL;
 // The boot floor that withdraws a resume promise this boot could not keep, so a
 // switch-interrupted thread never sits paused with no Continue button. `main.rs`
 // reaches it through `LucidosEngine::settle_unresumed_switch_threads`; the free

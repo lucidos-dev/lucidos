@@ -1,13 +1,7 @@
 import { test, expect, Page } from './fixtures';
 import {
-  navigateToApp,
-  sendMessage,
-  waitForResponse,
-  uniqueMessage,
-  openThreadDrawer,
-  ensureOnThreadPane,
-  assertHealthy,
-  waitForVisibleInput,
+  apiRequest, assertHealthy, ensureOnThreadPane, navigateToApp, openThreadDrawer, sendMessage,
+  uniqueMessage, waitForResponse, waitForVisibleInput,
 } from './helpers';
 
 test.describe('Section-aware Save/Archive buttons', () => {
@@ -66,7 +60,7 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    const archResp = await page.request.post('/api/v1/threads/archive', {
+    const archResp = await apiRequest(page).post('/api/v1/threads/archive', {
       data: { thread_id: threadId },
     });
     expect(archResp.ok()).toBeTruthy();
@@ -99,7 +93,7 @@ test.describe('Section-aware Save/Archive buttons', () => {
     await waitForResponse(page);
     const threadId = await getFocusedThreadId(page);
 
-    const saveResp = await page.request.post('/api/v1/threads/save', {
+    const saveResp = await apiRequest(page).post('/api/v1/threads/save', {
       data: { thread_id: threadId },
     });
     expect(saveResp.ok()).toBeTruthy();

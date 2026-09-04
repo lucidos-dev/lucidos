@@ -16,7 +16,7 @@
 //! without an engine restart. A drop guard restores the original key (or its
 //! absence) so the test is hermetic even on panic.
 
-use crate::support::{base_url, db_url, http_client, workspace_path};
+use crate::support::{base_url, db_url, user_client, workspace_path};
 use sqlx::PgPool;
 use std::path::PathBuf;
 
@@ -89,7 +89,7 @@ async fn key_token(client: &reqwest::Client, api: &str) -> String {
 async fn backup_key_reveal_is_read_only_and_generate_never_overwrites() {
     let _lock = crate::support::backup_key_lock().lock().await;
     let _guard = KeyFileGuard::capture();
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let key_url = format!("{}/api/v1/backup/key", api);
     let exists_url = format!("{}/api/v1/backup/key/exists", api);

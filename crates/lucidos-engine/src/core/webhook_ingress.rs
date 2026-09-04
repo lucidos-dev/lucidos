@@ -44,6 +44,23 @@ pub enum Stage {
     /// This host has no route for the family, so nothing was sent. Not a
     /// verdict about the ingress, and never reported as degraded.
     LocalStackUnavailable,
+    /// This host has a route, and still cannot open the funnel port to
+    /// anything. A filtered network, not a dead ingress, and never degraded.
+    LocalEgressBlocked,
+}
+
+impl Stage {
+    /// Did this reading measure the ingress at all?
+    ///
+    /// Two stages answer no, and both name a fault on this side of the wire.
+    /// A request that never left the machine says nothing about what it was
+    /// aimed at. Every other stage rests on an answer that came back.
+    pub fn measured_the_ingress(self) -> bool {
+        !matches!(
+            self,
+            Stage::LocalStackUnavailable | Stage::LocalEgressBlocked
+        )
+    }
 }
 
 /// What one family's addresses add up to.
@@ -95,11 +112,21 @@ pub fn classify_status(status: u16) -> Stage {
     }
 }
 
+/// Did every address of this family fail before anything answered?
+///
+/// The question a local fault has to pass before it can be blamed. One answer
+/// of any kind proves this host reaches the port. The failures beside it then
+/// belong to the ingress, not to the network under this machine.
+pub fn nothing_answered(addresses: &[AddressProbe], family: Family) -> bool {
+    let mut of_family = addresses.iter().filter(|a| a.family == family).peekable();
+    of_family.peek().is_some() && of_family.all(|a| a.stage == Stage::IngressUnreachable)
+}
+
 /// Judge each family from the per-address results.
 ///
 /// A family with no probed address is `not-probed`, never degraded. That covers
-/// a host with no IPv6 egress, which would otherwise report a permanent outage
-/// of an ingress that is fine.
+/// a host with no IPv6 egress, and a host whose network filters the funnel
+/// port. Either would otherwise report a permanent outage of a live ingress.
 ///
 /// This is the ONLY producer of a family verdict, deliberately. Every verdict
 /// therefore rests on at least one attempted request, so `degraded` can never
@@ -110,7 +137,7 @@ pub fn judge(addresses: &[AddressProbe]) -> Vec<FamilyVerdict> {
         .map(|family| {
             let probed: Vec<&AddressProbe> = addresses
                 .iter()
-                .filter(|a| a.family == *family && a.stage != Stage::LocalStackUnavailable)
+                .filter(|a| a.family == *family && a.stage.measured_the_ingress())
                 .collect();
             let healthy = probed.iter().filter(|a| a.stage == Stage::Healthy).count();
             let verdict = if probed.is_empty() {

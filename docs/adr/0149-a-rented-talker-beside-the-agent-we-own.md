@@ -1,13 +1,14 @@
 # 0149: The talker is rented and tool-less; the doer is the standard Lucidos Agent, unmodified
 
-- **Status**: Accepted, with the tool-less clause superseded by ADR 0164
+- **Status**: Accepted, with the tool-less clause superseded by ADR 0164 and then ADR 0170
 - **Date**: 2026-08-28
 
-**What changed.** The talker now holds exactly one tool, `delegate`, and it
-decides whether an utterance needs the doer. Read every "tool-less" and "empty
-tool list" below as one delegation tool. The guarantee is untouched: that tool
-mutates nothing, so a talker that gets something wrong still only says a wrong
-sentence. ADR 0164 has the reasoning, and it closes the last consequence here.
+**What changed.** The talker now holds three tools: `delegate`, one that answers
+what is waiting on the caller, and one that hangs up. Read every "tool-less" and
+"empty tool list" below as that set. The guarantee is untouched, because it was
+never about the count: none of the three mutates anything, so a talker that gets
+something wrong still only says a wrong sentence. ADR 0164 has the reasoning for
+the first, and closes the last consequence here. ADR 0170 has it for the rest.
 
 ## Context
 

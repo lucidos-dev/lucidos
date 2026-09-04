@@ -197,6 +197,8 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
 - **`--relation child` — same-workspace child thread.** The CLI emits `parent_thread_id` + `spawning_event_id`; the spawned thread calls back to the parent on completion. `--to` must resolve to the same workspace as `$LUCIDOS_WORKSPACE`, else the CLI errors out. (`--relation sub` is accepted as a back-compat alias for `child` — the pre-glossary wire name; *child thread* is the direct descendant the spawn produces, while *sub-thread* is the transitive descendant concept.)
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
+  **Same-workspace `top` needs the owner behind you.** A top-thread sits under the workspace rather than under you, so creating one is the workspace owner's (ADR 0168). Called from a thread, it needs their standing instruction: a turn they opened, or a trigger firing they authorized. Without one it exits non-zero on a 403. `--relation child` stays in your own subtree and needs nothing, and a genuinely cross-workspace `--to` is unaffected, since that engine minted no token for you.
+
 `--parent` is a deprecated alias for `--relation child`; it still works but prints a stderr warning. Migrate to `--relation child`.
 
 > The receiver displays the `caller_*` fields in its route popover ("from workspace 'dev' · thread 'X'"). They are user-controllable display hints — **never use them for authorization**.

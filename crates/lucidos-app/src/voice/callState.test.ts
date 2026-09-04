@@ -6,6 +6,7 @@ import {
   type CallInput,
   type CallPhase,
   type CallState,
+  HEARING_YOU,
   callStatusLabel,
   isLive,
   isOnCall,
@@ -27,7 +28,13 @@ function drive(inputs: CallInput[], from: CallState = CALL_IDLE) {
 }
 
 const PRESS: CallInput = { kind: 'toggle', threadId: THREAD };
+/** The local gate opening and shutting on the caller's own voice. */
+const SPOKE: CallInput = { kind: 'speech', open: true };
+const HUSHED: CallInput = { kind: 'speech', open: false };
+const TIMED_OUT: CallInput = { kind: 'utterance-timeout' };
 const frame = (f: ServerFrame): CallInput => ({ kind: 'frame', frame: f });
+/** The engine reporting the caller's finished words. */
+const HEARD: CallInput = frame({ type: 'user_turn_ended', transcript: 'what is on today' });
 const STARTED = frame({
   type: 'session_started',
   audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' },
@@ -224,21 +231,142 @@ describe('who has the floor', () => {
 
 describe('barge-in', () => {
   it('stops playback and tells the engine, while the talker is speaking', () => {
-    const { state, effects } = drive([{ kind: 'barge-in' }], talking());
+    const { state, effects } = drive([SPOKE], talking());
     expect(state.phase).toBe('listening');
     expect(sent(effects)).toEqual(['barge_in']);
     expect(has(effects, 'stop-playback')).toBe(true);
   });
 
-  it('says nothing when the talker is not speaking', () => {
-    expect(drive([{ kind: 'barge-in' }], live()).effects).toEqual([]);
-    expect(drive([{ kind: 'barge-in' }]).effects).toEqual([]);
+  /** The gate opens once per utterance, so the reducer cannot be asked twice
+   *  for the same one. The floor it just handed back is the second guard. */
+  it('cuts the talker off once, however long the caller keeps talking', () => {
+    const { effects } = drive([SPOKE, HUSHED, SPOKE], talking());
+    expect(sent(effects)).toEqual(['barge_in']);
+  });
+
+  it('says nothing when nobody is on a call', () => {
+    expect(drive([SPOKE]).effects).toEqual([]);
   });
 
   it('stops playback when the engine confirms the cut', () => {
     const { state, effects } = drive([frame({ type: 'interrupted' })], talking());
     expect(state.phase).toBe('listening');
     expect(has(effects, 'stop-playback')).toBe(true);
+  });
+});
+
+describe('the caller speaking', () => {
+  it('opens an utterance on their own floor, and interrupts nothing', () => {
+    const { state, effects } = drive([SPOKE], live());
+    expect(state.utterance).toBe('live');
+    expect(state.utteranceCount).toBe(1);
+    expect(effects).toEqual([]);
+  });
+
+  /** The barge-in hands the floor straight back, so the caller is using it
+   *  before anything reads the state. Waiting would cost the row 120 ms the
+   *  gate has already spent. */
+  it('opens one over the talker too, in the same step as the barge-in', () => {
+    expect(drive([SPOKE], talking()).state.utterance).toBe('live');
+  });
+
+  it('waits on the provider once they stop', () => {
+    expect(drive([SPOKE, HUSHED], live()).state.utterance).toBe('landing');
+  });
+
+  /** The gate shuts on 320 ms of quiet and a provider endpoints on longer. A
+   *  breath mid-sentence is still inside the turn the engine will report.
+   *  Counted as a second, its row would wait on words that never come. */
+  it('reads a pause as one utterance, not two', () => {
+    const { state } = drive([SPOKE, HUSHED, SPOKE], live());
+    expect(state.utterance).toBe('live');
+    expect(state.utteranceCount).toBe(1);
+  });
+
+  it('counts a turn the provider ended as a new one', () => {
+    const { state } = drive([SPOKE, HUSHED, HEARD, SPOKE], live());
+    expect(state.utterance).toBe('live');
+    expect(state.utteranceCount).toBe(2);
+  });
+
+  it('ignores a gate edge on a call that is not live', () => {
+    expect(drive([SPOKE]).state.utterance).toBe('none');
+    expect(drive([SPOKE], drive([PRESS]).state).state.utterance).toBe('none');
+  });
+
+  /** The talker answering PROVES the provider ended that turn and read it. It
+   *  also shuts the gate, and a row left `live` behind a shut gate could never
+   *  be retracted: the falling edge that retracts it is spent. */
+  it('hands the utterance to the words when the talker takes the floor', () => {
+    const speaking = drive([SPOKE], live()).state;
+    const { state, effects } = drive([frame({ type: 'talker_transcript', text: 'well' })], speaking);
+    expect(state.phase).toBe('speaking');
+    expect(state.utterance).toBe('transcribed');
+    expect(has(effects, 'forget-speech')).toBe(true);
+  });
+});
+
+describe('an utterance that never becomes words', () => {
+  /** `call.rs` refuses to hold a wordless transcript, so an empty one is the
+   *  engine saying the provider heard nothing worth writing down. */
+  it('goes at once when the engine reports an empty transcript', () => {
+    const { state } = drive(
+      [SPOKE, HUSHED, frame({ type: 'user_turn_ended', transcript: '   ' })],
+      live(),
+    );
+    expect(state.utterance).toBe('none');
+  });
+
+  it('goes when the bound runs out with nothing said', () => {
+    const { state } = drive([SPOKE, HUSHED, TIMED_OUT], live());
+    expect(state.utterance).toBe('none');
+  });
+
+  it('goes when the words are confirmed and the row never arrives', () => {
+    const { state } = drive([SPOKE, HUSHED, HEARD, TIMED_OUT], live());
+    expect(state.utterance).toBe('none');
+  });
+
+  it('goes with the call, whichever way the call ends', () => {
+    const speaking = drive([SPOKE], live()).state;
+    expect(drive([PRESS], speaking).state.utterance).toBe('none');
+    expect(drive([{ kind: 'leave' }], speaking).state.utterance).toBe('none');
+    expect(drive([{ kind: 'socket-closed' }], speaking).state.utterance).toBe('none');
+    expect(drive([{ kind: 'failed', message: 'gone' }], speaking).state.utterance).toBe('none');
+  });
+
+  it('cannot be timed out while the caller is still talking', () => {
+    const speaking = drive([SPOKE], live()).state;
+    expect(drive([TIMED_OUT], speaking).state.utterance).toBe('live');
+  });
+});
+
+describe('an utterance the engine has words for', () => {
+  it('waits on the talker deciding what to do with them', () => {
+    const { state } = drive([SPOKE, HUSHED, HEARD], live());
+    expect(state.utterance).toBe('transcribed');
+  });
+
+  /** The gate can miss an utterance said too quietly to clear it. Nothing was
+   *  drawn for that one, so there is nothing to keep on screen. */
+  it('starts nothing when the gate never heard the caller at all', () => {
+    expect(drive([HEARD], live()).state.utterance).toBe('none');
+  });
+
+  /** A provider can endpoint mid-breath, so this lands while the caller is
+   *  audibly still going. Withdrawing their bubble then is the one thing this
+   *  row must never do, whatever the provider made of the noise. */
+  it('withdraws no bubble while the caller is still speaking', () => {
+    const talking = drive([SPOKE], live()).state;
+    const { state } = drive([frame({ type: 'user_turn_ended', transcript: '' })], talking);
+    expect(state.utterance).toBe('live');
+  });
+
+  /** Words are a different matter: the turn is over and a row is coming, so
+   *  whatever they say next is a turn of its own. */
+  it('ends the turn on words, even mid-breath', () => {
+    const talking = drive([SPOKE], live()).state;
+    expect(drive([HEARD], talking).state.utterance).toBe('transcribed');
   });
 });
 
@@ -254,9 +382,21 @@ describe('reading a phase', () => {
   });
 
   it('labels every phase, and says nothing when there is no call', () => {
-    expect(callStatusLabel('idle')).toBe('');
+    expect(callStatusLabel(CALL_IDLE)).toBe('');
     for (const phase of phases.filter(isOnCall)) {
-      expect(callStatusLabel(phase)).not.toBe('');
+      expect(callStatusLabel({ ...CALL_IDLE, phase })).not.toBe('');
     }
+  });
+
+  it('says the caller is being heard while they speak', () => {
+    expect(callStatusLabel(drive([SPOKE], live()).state)).toBe(HEARING_YOU);
+  });
+
+  /** Once they stop, the call is back to plain listening. Announcing each wait
+   *  separately would speak three times per utterance. */
+  it('goes back to the phase once they stop', () => {
+    const waiting = drive([SPOKE, HUSHED], live()).state;
+    expect(callStatusLabel(waiting)).toBe(callStatusLabel(live()));
+    expect(callStatusLabel(drive([HEARD], waiting).state)).toBe(callStatusLabel(live()));
   });
 });

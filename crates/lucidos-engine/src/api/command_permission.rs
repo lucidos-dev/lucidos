@@ -7,11 +7,7 @@
 
 use super::*;
 use crate::engine::claude_code::AllowScope;
-use crate::engine::command_guard;
-use crate::engine::command_permission::{
-    emit_command_permission_resolved, record_command_allow_grant, DENIAL_REASON,
-};
-use crate::engine::thread_events::EventMeta;
+use crate::engine::command_permission::resolve_command_permission;
 
 #[derive(Deserialize)]
 pub(super) struct CommandConsentRequest {
@@ -30,61 +26,32 @@ pub(super) struct CommandConsentRequest {
 /// permission card. Mirrors the MCP consent endpoint, but the waiter is the
 /// in-process agentic loop (via the entry's broadcast) rather than an MCP HTTP
 /// handler, so there is no legacy oneshot fallback.
+///
+/// Thin: resolving one is `command_permission::resolve_command_permission`,
+/// which a spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_command_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CommandConsentRequest>,
 ) -> impl IntoResponse {
-    let entry = {
-        let mut pending = state.engine.pending_command_permission.lock().unwrap();
-        pending.take(&body.request_id)
-    };
-    let Some(entry) = entry else {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let answered = resolve_command_permission(
+        &state.engine,
+        body.request_id,
+        body.allowed,
+        body.persist_scope,
+        actor,
+        "[CommandPermission] CommandPermissionResolved",
+    )
+    .await;
+    if !answered {
         // Already resolved (superseded / orphan-recovery / canceled) or unknown.
         return (
             StatusCode::NOT_FOUND,
             "No pending command permission with that ID",
         )
             .into_response();
-    };
-
-    // Wake the blocked loop (and any deduped waiters on the same broadcast).
-    let _ = entry.tx.send(body.allowed);
-
-    let reason = if body.allowed {
-        None
-    } else {
-        Some(DENIAL_REASON.to_string())
-    };
-    let persist_scope = if body.allowed {
-        body.persist_scope
-    } else {
-        None
-    };
-    if let Some(scope) = persist_scope {
-        let command =
-            command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
-        record_command_allow_grant(
-            &state.engine,
-            entry.thread_id,
-            &entry.tool_name,
-            command,
-            scope,
-        );
     }
-
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    emit_command_permission_resolved(
-        &state.engine.event_bus,
-        entry.thread_id,
-        body.request_id,
-        body.allowed,
-        reason,
-        persist_scope,
-        EventMeta::with_actor(actor),
-        "[CommandPermission] CommandPermissionResolved",
-    )
-    .await;
     StatusCode::OK.into_response()
 }
 

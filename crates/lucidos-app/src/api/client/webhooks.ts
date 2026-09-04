@@ -103,7 +103,12 @@ export type WebhookIngressStage =
   | 'backend-unreachable'
   | 'route-missing'
   | 'unexpected-responder'
-  | 'local-stack-unavailable';
+  | 'local-stack-unavailable'
+  /** The two local stages say the engine could not measure, never that the
+   *  ingress is down. A family reading either of them comes out `not-probed`,
+   *  so no outage is declared over it and no bar is drawn. They reach a reader
+   *  only beside a family that DID fail. */
+  | 'local-egress-blocked';
 
 /** What one address answered when the outage was declared. */
 export interface WebhookIngressAddress {

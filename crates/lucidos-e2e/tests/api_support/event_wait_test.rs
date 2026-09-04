@@ -152,7 +152,8 @@ async fn subscribe_a_thread(pool: &sqlx::PgPool, event_type: &str, label: &str) 
 
 /// Emit a workspace domain event, the same way an app or a script would.
 async fn emit_domain_event(event_type: &str, summary: &str) {
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!("{}/api/v1/events/emit", base_url()))
         .json(&serde_json::json!({
             "event_type": event_type,
@@ -290,7 +291,8 @@ async fn an_unrelated_event_leaves_a_subscribed_thread_subscribed() {
         .as_str()
         .expect("wait_id")
         .to_string();
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/threads/{}/event-waits/{}/cancel",
             base_url(),
@@ -336,7 +338,8 @@ async fn the_reload_snapshot_carries_the_event_wait_payloads() {
         .as_str()
         .expect("wait_id")
         .to_string();
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/threads/{}/event-waits/{}/cancel",
             base_url(),
@@ -432,7 +435,8 @@ async fn a_wait_can_be_registered_over_http() {
     await_event_row(&pool, thread_id, "ResponseGenerated", 25).await;
 
     let url = format!("{}/api/v1/threads/{}/event-waits", base_url(), thread_id);
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&url)
         .json(&serde_json::json!({
             "on": [{ "event_type": event_type }],
@@ -462,7 +466,8 @@ async fn a_wait_can_be_registered_over_http() {
 
     // A refusal reaches the caller as its own words, with a 400. Re-registering
     // the identical subscription is the cheapest one to provoke.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&url)
         .json(&serde_json::json!({
             "on": [{ "event_type": event_type }],
@@ -482,7 +487,8 @@ async fn a_wait_can_be_registered_over_http() {
     // An unknown thread is a 404, not a wait armed against nothing. This is the
     // one caller that can get the id wrong: the LLM tool's comes from
     // `execute_tool`, while a CLI caller passes `$LUCIDOS_THREAD_ID`.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/threads/{}/event-waits",
             base_url(),
@@ -541,7 +547,8 @@ async fn a_registration_reports_a_match_that_landed_before_it() {
     // watermark the registration is about to record.
     emit_domain_event(&event_type, "landed while the caller was still working").await;
 
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/threads/{}/event-waits",
             base_url(),
@@ -611,7 +618,8 @@ async fn stopping_a_turn_leaves_the_thread_s_subscriptions_watching() {
     // Stop with nothing running. The server has no turn to end, so it honestly
     // reports it did nothing, and the subscription is untouched. Before the
     // fix this cancelled the wait AND reported `canceled: true` for it.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/chat/cancel?thread_id={}",
             base_url(),
@@ -647,7 +655,8 @@ async fn stopping_a_turn_leaves_the_thread_s_subscriptions_watching() {
         .expect("follow-up request failed");
     assert_eq!(resp.status(), 200);
 
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!(
             "{}/api/v1/chat/cancel?thread_id={}",
             base_url(),
@@ -737,7 +746,8 @@ async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
         serde_json::json!({}),
         serde_json::json!({ "wait_id": wait_id, "all": true }),
     ] {
-        let resp = http_client()
+        let resp = user_client()
+            .await
             .post(&cancel_url)
             .json(&body)
             .send()
@@ -749,7 +759,8 @@ async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
     // A `wait_id` that is not live on THIS thread is refused, not obeyed. Both
     // verbs are scoped to the calling thread and take no thread argument, so
     // this is the only shape a cross-thread attempt can take.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&cancel_url)
         .json(&serde_json::json!({ "wait_id": Uuid::new_v4() }))
         .send()
@@ -763,7 +774,8 @@ async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
     );
 
     // The real stand-down.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&cancel_url)
         .json(&serde_json::json!({ "wait_id": wait_id }))
         .send()
@@ -834,7 +846,8 @@ async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
     // the mock subscribes once per turn, and this is the same route a coding
     // agent's `lucidos await-event` calls.
     let register_url = format!("{}/api/v1/threads/{}/event-waits", base_url(), thread_id);
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&register_url)
         .json(&serde_json::json!({
             "on": [{ "event_type": unrelated }],
@@ -859,7 +872,8 @@ async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
         serde_json::json!({ "on": answered, "all": true }),
         serde_json::json!({ "on": answered, "wait_id": Uuid::new_v4() }),
     ] {
-        let resp = http_client()
+        let resp = user_client()
+            .await
             .post(&cancel_url)
             .json(&body)
             .send()
@@ -872,7 +886,8 @@ async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
     // success. This is the e2e lock's ordinary path, where the refusal is
     // discarded; for an agent it is the news that a watch it believed in is
     // not there.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&cancel_url)
         .json(&serde_json::json!({ "on": "E2eNobodyWatchesThis" }))
         .send()
@@ -885,7 +900,8 @@ async fn an_agent_can_stand_down_by_event_type_without_touching_the_rest() {
         "a refused cancel stops nothing"
     );
 
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(&cancel_url)
         .json(&serde_json::json!({ "on": answered }))
         .send()

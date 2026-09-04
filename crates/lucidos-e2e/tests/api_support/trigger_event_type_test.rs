@@ -18,7 +18,7 @@
 //! * every name `GET /events/types` offers survives the validator, so the
 //!   refusals point somewhere that actually answers them
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -104,7 +104,7 @@ async fn delete_trigger(client: &reqwest::Client, id: &str) {
 /// emits `CredentialCreated` when a credential modal resolves.
 #[tokio::test]
 async fn create_refuses_a_misspelled_engine_event_and_names_the_near_match() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-misspelled");
     let result = post_trigger(
         &client,
@@ -135,7 +135,7 @@ async fn create_refuses_a_misspelled_engine_event_and_names_the_near_match() {
 /// subscription with them.
 #[tokio::test]
 async fn create_refuses_a_retired_event_name() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-retired");
     let result = post_trigger(&client, &name, json!([{ "event_type": "ClaudeCodeIdled" }])).await;
 
@@ -156,7 +156,7 @@ async fn create_refuses_a_retired_event_name() {
 /// the terminator to subscribe to instead.
 #[tokio::test]
 async fn create_refuses_a_transient_frame_and_names_its_terminator() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-transient");
     let result = post_trigger(&client, &name, json!([{ "event_type": "BackupProgress" }])).await;
 
@@ -178,7 +178,7 @@ async fn create_refuses_a_transient_frame_and_names_its_terminator() {
 /// caller's OWN event name is still catchable.
 #[tokio::test]
 async fn create_accepts_an_unseen_domain_event_and_warns() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-warn");
     let event_type = never_emitted_name("NeverEmitted");
     let result = post_trigger(&client, &name, json!([{ "event_type": event_type }])).await;
@@ -208,7 +208,7 @@ async fn create_accepts_an_unseen_domain_event_and_warns() {
 /// than the caller asked for.
 #[tokio::test]
 async fn create_checks_every_entry_in_the_on_array() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-second-entry");
     let result = post_trigger(
         &client,
@@ -239,7 +239,7 @@ async fn create_checks_every_entry_in_the_on_array() {
 /// subscription.
 #[tokio::test]
 async fn update_refuses_a_dead_name_and_warns_on_an_unseen_one() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-event-type-update");
     let armed = never_emitted_name("UpdateArmed");
     let created = post_trigger(&client, &name, json!([{ "event_type": armed }])).await;
@@ -305,7 +305,7 @@ async fn update_refuses_a_dead_name_and_warns_on_an_unseen_one() {
 /// fire on the suite's own traffic.
 #[tokio::test]
 async fn every_name_the_catalog_offers_survives_the_validator() {
-    let client = http_client();
+    let client = user_client().await;
     let types: Vec<String> = client
         .get(format!("{}/api/v1/events/types", base_url()))
         .send()

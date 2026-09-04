@@ -35,7 +35,8 @@ fn change_proposed_keeps_cc_in_inbox_if_already_in_inbox() {
 
 #[test]
 fn cc_running_shows_no_close_actions() {
-    // Live thread: no close actions; only the Save retention toggle appends.
+    // Live thread: no close actions. What appends is the standing apply, which
+    // is the offer that replaces the withheld Apply, plus the Save toggle.
     let actions = available_thread_actions(
         ThreadType::CodingAgent,
         ThreadStatus::Running,
@@ -47,7 +48,7 @@ fn cc_running_shows_no_close_actions() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Save]);
+    assert_eq!(actions, vec![Action::ApplyWhenSettled, Action::Save]);
 }
 
 // ── UserQuestionAsked / UserQuestionAnswered tests ──

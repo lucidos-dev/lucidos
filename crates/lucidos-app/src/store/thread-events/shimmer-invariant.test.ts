@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Exchange } from './exchange';
 import { exchangeResponseEvents, exchangeStatus } from './exchange-render';
 import { statusLabel } from '../exchange-status';
-import { hasVisibleLiveStep } from '../event-rendering';
+import { rendersLiveStep } from '../event-rendering';
 
 const TS = '2026-06-17T12:00:00Z';
 
@@ -26,21 +26,35 @@ let seq = 1;
 const ev = (event: Record<string, unknown>) => ({ seq: ++seq, event: { created: TS, ...event } as any });
 
 /** Mirror of the ChatExchange render decision for the in-thread status label
- *  and the inline step shimmer, given an exchange + the steps-expanded toggle +
- *  whether the response panel is collapsed (which hides the steps body). */
-function shimmerState(exchange: Exchange, showSteps: boolean, collapsed = false, streamingBuffer = '') {
+ *  and the inline step shimmer.
+ *
+ *  Takes the exchange, the steps-expanded toggle, and whether the response panel
+ *  is collapsed (which hides the steps body). Then `rowInBand`, which stands for
+ *  the whole DOM half of the component's answer: a row was marked, it handed up
+ *  its element, and `useOnScreenInTranscript` says that element is in the band.
+ *  It is where scroll position enters. A rendered row far below the fold is
+ *  drawn and NOT seen, and the label owes the reader the shimmer there. */
+function shimmerState(
+  exchange: Exchange,
+  showSteps: boolean,
+  collapsed = false,
+  streamingBuffer = '',
+  rowInBand = true,
+) {
   const events = exchangeResponseEvents(exchange, true, false);
   const status = exchangeStatus(exchange, streamingBuffer, true, false, false, false, false);
   const hasSteps = events.some(e => e.type === 'step');
   const { className } = statusLabel(status, hasSteps);
-  const liveStepOnScreen = hasVisibleLiveStep(showSteps, collapsed, events);
+  const liveStepOnScreen = rendersLiveStep(showSteps, collapsed, events) && rowInBand;
   return {
     status,
     statusClass: className,
     labelShimmers: className === 'working' && !liveStepOnScreen,
     // A step shimmer is on screen iff steps are expanded, the panel isn't
-    // collapsed (collapse hides the steps body), AND a pending step renders.
-    stepShimmers: showSteps && !collapsed && events.some(e => e.type === 'step' && e.outcome === 'pending'),
+    // collapsed (collapse hides the steps body), a pending step renders, AND
+    // that row is inside the transcript's visible band.
+    stepShimmers: showSteps && !collapsed && rowInBand
+      && events.some(e => e.type === 'step' && e.outcome === 'pending'),
   };
 }
 
@@ -68,20 +82,23 @@ describe('exactly-one-shimmer invariant while working', () => {
   ];
 
   for (const showSteps of [true, false]) {
-    for (const { name, steps } of scenarios) {
-      it(`${name} (steps ${showSteps ? 'expanded' : 'collapsed'}) shows at least one shimmer`, () => {
-        const s = shimmerState(chatExchange(steps), showSteps);
-        if (s.statusClass === 'working') {
-          expect(s.labelShimmers || s.stepShimmers).toBe(true);
-        }
-      });
+    for (const rowInBand of [true, false]) {
+      for (const { name, steps } of scenarios) {
+        const where = `steps ${showSteps ? 'expanded' : 'collapsed'}, row ${rowInBand ? 'in band' : 'below the fold'}`;
+        it(`${name} (${where}) shows at least one shimmer`, () => {
+          const s = shimmerState(chatExchange(steps), showSteps, false, '', rowInBand);
+          if (s.statusClass === 'working') {
+            expect(s.labelShimmers || s.stepShimmers).toBe(true);
+          }
+        });
+      }
     }
   }
 
   // A collapsed response panel hides the steps body, so a pending step's shimmer
   // is NOT on screen — the "Working" header must carry the shimmer instead, even
   // with steps globally expanded and a pending step in the data. (Regression:
-  // hasVisibleLiveStep ignored the collapse and suppressed the label shimmer,
+  // rendersLiveStep ignored the collapse and suppressed the label shimmer,
   // leaving the working turn with no shimmer at all.)
   // The gap a coding-agent turn used to have: between a `CodingAgentToolResult`
   // and the next `CodingAgentToolCalled` nothing was pending, so the transcript
@@ -104,6 +121,17 @@ describe('exactly-one-shimmer invariant while working', () => {
     expect(s.labelShimmers).toBe(false);
   });
 
+  // Drawn is not seen. A coding-agent turn always carries a live row. So a turn
+  // taller than the pane hid its only shimmer below the fold, leaving "Working"
+  // plain over a column of finished checks. That is the same complaint the
+  // derived row answered for the data gap, arriving the other way round.
+  it('coding-agent gap with its live row below the fold shimmers the label', () => {
+    const s = shimmerState(ccGap, /*showSteps*/ true, /*collapsed*/ false, '', /*rowInBand*/ false);
+    expect(s.statusClass).toBe('working');
+    expect(s.stepShimmers).toBe(false);
+    expect(s.labelShimmers).toBe(true);
+  });
+
   it('coding-agent gap with steps hidden shimmers the label alone', () => {
     const s = shimmerState(ccGap, /*showSteps*/ false);
     expect(s.statusClass).toBe('working');
@@ -124,7 +152,7 @@ describe('exactly-one-shimmer invariant while working', () => {
     held.blockedStepSeqs = new Set(held.steps.map(s => s.seq));
     const events = exchangeResponseEvents(held, true, false);
     expect(events.filter(e => e.type === 'step' && e.outcome === 'blocked')).toHaveLength(1);
-    expect(hasVisibleLiveStep(true, false, events)).toBe(false);
+    expect(rendersLiveStep(true, false, events)).toBe(false);
     // And no derived Thinking row was added beside it: the held row IS the
     // turn's current row (`needsLiveThinkingRow`'s `anyLive`).
     expect(events.filter(e => e.type === 'step' && e.description === 'Thinking')).toHaveLength(0);

@@ -12,7 +12,7 @@
 //! and assert on the response + the events the EventBus writes. Real CC sub-
 //! thread spawn would force an LLM round-trip we don't need to exercise.
 
-use crate::support::{base_url, count_events_of_type, db_url, http_client};
+use crate::support::{base_url, count_events_of_type, db_url, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -103,7 +103,7 @@ async fn seed_session_started(pool: &sqlx::PgPool, thread_id: Uuid, branch: &str
 /// Cascade success: parent + idle CC sub-thread both get `ThreadArchived`.
 #[tokio::test]
 async fn archive_cascade_archives_idle_descendants() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -189,7 +189,7 @@ async fn archive_cascade_archives_idle_descendants() {
 /// 'archived' flip stands and the button disappears.
 #[tokio::test]
 async fn archive_already_archived_thread_is_idempotent() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -240,7 +240,7 @@ async fn archive_already_archived_thread_is_idempotent() {
 /// 409 `descendants_blocking`. NO `ThreadArchived` event lands.
 #[tokio::test]
 async fn archive_rejects_when_descendant_running() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -314,7 +314,7 @@ async fn archive_rejects_when_descendant_running() {
 /// blocks the parent's archive with 409 `descendants_blocking`.
 #[tokio::test]
 async fn archive_rejects_when_descendant_has_pending_changes() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -402,7 +402,7 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
 /// async worktree-cleanup worker GCs the worktree on its own schedule.
 #[tokio::test]
 async fn archive_does_not_settle_stale_cc_sessions() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");

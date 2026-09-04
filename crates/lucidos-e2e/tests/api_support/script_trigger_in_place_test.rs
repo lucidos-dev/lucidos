@@ -11,7 +11,7 @@
 //! the 2026-07-29 `notary-verdict-watch` trigger read a default instead of the
 //! user's recorded DMG approval, withheld a release publish, and said so.
 
-use crate::support::{base_url, http_client, unique_marker, workspace_path};
+use crate::support::{base_url, unique_marker, user_client, workspace_path};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -111,7 +111,7 @@ async fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
 
 #[tokio::test]
 async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let slug = unique_marker("inplace-probe");
     let name = format!("In-place probe {}", slug);

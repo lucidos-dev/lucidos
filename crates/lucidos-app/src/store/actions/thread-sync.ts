@@ -2,7 +2,7 @@ import { API } from '../../api/client';
 import type { Change } from '../../api/client';
 import { eventStreamTargets, openEventStream, type EventStreamTargets } from '@lucidos/event-stream';
 import { getEventStream, setEventStream } from './event-stream';
-import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
 import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, appSourceEpoch, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -19,7 +19,7 @@ import {
   handleNativePushDismiss,
   type NativePushDismissRequestedPayload,
 } from './native-push';
-import { addRestartGroup } from './chat-changes';
+import { addRestartGroup, STANDING_APPLY_CANCELED } from './chat-changes';
 import {
   handleFrontendUpdateDeferred,
   handleFrontendUpdateStranded,
@@ -1079,6 +1079,38 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
         if (next.size !== applyingChangeIds.value.size) applyingChangeIds.value = next;
       }
       applyAllInProgress.value = false;
+      break;
+    }
+
+    case 'StandingApplyArmed': {
+      // The owner armed a standing apply, possibly on another device. Every
+      // change surface reads this set to render the armed face.
+      const threadId = data.thread_id as string | undefined;
+      if (threadId) {
+        standingApplyThreadIds.value = new Set([...standingApplyThreadIds.value, threadId]);
+      }
+      break;
+    }
+
+    case 'StandingApplyDropped': {
+      // The arm ended. It fired, the owner took it back, or the thread parked
+      // or failed. The last case is the one that owes a report, and `reason` is
+      // written for the owner to read.
+      const threadId = data.thread_id as string | undefined;
+      if (threadId && standingApplyThreadIds.value.has(threadId)) {
+        const next = new Set(standingApplyThreadIds.value);
+        next.delete(threadId);
+        standingApplyThreadIds.value = next;
+      }
+      const reason = typeof data.reason === 'string' ? data.reason : '';
+      // A cancel is the owner's own click, and the control already changed
+      // face. Only a drop the engine decided is news.
+      if (threadId && reason && reason !== STANDING_APPLY_CANCELED) {
+        showToast(changeToastMessage('Standing apply dropped', threadId, reason), 'warning', {
+          key: `standing-apply-${threadId}`,
+          onClick: () => focusThread(threadId),
+        });
+      }
       break;
     }
 

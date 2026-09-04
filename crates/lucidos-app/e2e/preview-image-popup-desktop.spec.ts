@@ -25,13 +25,8 @@
  */
 import { test, expect, type Page } from './fixtures';
 import {
-  assertHealthy,
-  ensureOnThreadPane,
-  waitForVisibleInput,
-  openFilesPanel,
-  waitForVisibleElement,
-  clickVisibleElement,
-  gotoWithRetry,
+  apiRequest, assertHealthy, clickVisibleElement, ensureOnThreadPane, gotoWithRetry,
+  openFilesPanel, waitForVisibleElement, waitForVisibleInput,
 } from './helpers';
 
 test.use({ viewport: { width: 1280, height: 800 } });
@@ -90,7 +85,7 @@ test.describe('a previewed image opens full size', () => {
     smallName = `e2e-preview-image-small-${stamp}.svg`;
     paths = [`artifacts/${tallName}`, `artifacts/${smallName}`];
     for (const [path, body] of [[paths[0], TALL_IMAGE], [paths[1], SMALL_IMAGE]] as const) {
-      const resp = await page.request.put(`/api/v1/data/${path}`, {
+      const resp = await apiRequest(page).put(`/api/v1/data/${path}`, {
         headers: { 'Content-Type': 'image/svg+xml' },
         data: body,
       });
@@ -107,7 +102,7 @@ test.describe('a previewed image opens full size', () => {
   });
 
   test.afterEach(async ({ page }) => {
-    for (const path of paths) await page.request.delete(`/api/v1/data/${path}`);
+    for (const path of paths) await apiRequest(page).delete(`/api/v1/data/${path}`);
     paths = [];
   });
 

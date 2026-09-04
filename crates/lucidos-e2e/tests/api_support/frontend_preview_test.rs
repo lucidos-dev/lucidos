@@ -8,7 +8,7 @@
 //! whole job is to be disposable. The refusal path IS the security-relevant
 //! half, and it is exercised for real here.
 
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, user_client};
 
 fn url(suffix: &str) -> String {
     format!("{}/api/v1/frontend-preview{}", base_url(), suffix)
@@ -41,7 +41,8 @@ async fn a_thread_with_no_worktree_is_refused_by_name() {
     // The `start` body is the one place an id from outside becomes a directory
     // the engine will run a process in. A thread that never had a worktree must
     // be refused, and the refusal must name the path so the caller can act.
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(url("/start"))
         .json(&serde_json::json!({ "thread_id": "00000000-0000-4000-8000-000000000000" }))
         .send()
@@ -62,7 +63,8 @@ async fn a_malformed_thread_id_never_reaches_the_worktree_resolver() {
     // Rejected by deserialization, before any path is built from it. The status
     // distinguishes the two: 422 is "this is not a thread id", 400 is "this
     // thread has no worktree".
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(url("/start"))
         .json(&serde_json::json!({ "thread_id": "../../../etc" }))
         .send()
@@ -80,7 +82,8 @@ async fn a_malformed_thread_id_never_reaches_the_worktree_resolver() {
 async fn stopping_a_preview_that_is_not_running_is_a_no_op() {
     // Idempotent on purpose: the UI shows a Stop button driven by SSE state
     // that can lag a stop from another device, and a second stop must not error.
-    let body: serde_json::Value = http_client()
+    let body: serde_json::Value = user_client()
+        .await
         .post(url("/stop"))
         .json(&serde_json::json!({}))
         .send()

@@ -5,11 +5,11 @@
 //! talks to those two traits. So swapping `Realtime` for `Cascaded` changes no
 //! socket payload and no event shape (ADR 0149).
 //!
-//! **There is still no tool field here, on purpose.** The talker holds exactly
-//! one tool, `delegate`, and it is named by this module rather than passed in.
-//! A list nobody can append to beats a list every caller must remember not to
-//! grow. ADR 0149 made the talker tool-less, and the ADR superseding that
-//! clause keeps its guarantee: the one tool mutates nothing.
+//! **There is still no tool field here, on purpose.** The talker's three tools
+//! are named by `voice/mod.rs` rather than passed in. A list nobody can append
+//! to beats a list every caller must remember not to grow. ADR 0149 made the
+//! talker tool-less, and ADR 0170 keeps its guarantee while widening the set:
+//! none of the three mutates anything.
 
 use async_trait::async_trait;
 
@@ -91,12 +91,28 @@ pub enum VoiceEvent {
     /// means "the caller needs the doer" and never "wake it". Deciding between
     /// starting a turn and joining one is the engine's business.
     DelegationRequested {
-        /// The provider's handle for this call, opaque above the seam. It goes
-        /// back on [`VoiceSession::resolve_delegation`] and nowhere else.
-        delegation_id: String,
+        /// The provider's handle for this tool call, opaque above the seam. It
+        /// goes back on [`VoiceSession::resolve_tool_call`] and nowhere else.
+        tool_call_id: String,
         /// The talker's own few words on what the caller wants.
         reason: String,
     },
+    /// The talker called `answer`: the caller picked one of the choices.
+    ///
+    /// Arrives during the turn, like a delegation, and for the same reason.
+    AnswerRequested {
+        tool_call_id: String,
+        /// A choice id the ENGINE issued, handed back exactly as it was given.
+        /// Nothing here checks it: the engine looks it up against what is
+        /// still open, and refuses one it did not issue.
+        choice_id: String,
+    },
+    /// The talker called `hang_up`: the caller said the conversation is over.
+    ///
+    /// It ends the CALL and never the work. A doer turn in flight keeps
+    /// running and the thread carries on, exactly as when the caller rings off
+    /// on the button.
+    HangupRequested { tool_call_id: String },
     /// The talker finished a reply, and reported what it spent.
     TalkerTurnEnded { transcript: String, usage: ApiUsage },
     /// The talker stopped mid-utterance because the caller spoke over it.
@@ -146,16 +162,16 @@ pub trait VoiceSession: Send {
     /// a second reply, and this makes no such check: `call.rs` owns the floor.
     async fn speak(&mut self, note: &str) -> Result<(), BoxError>;
 
-    /// Tell the talker its `delegate` call landed.
+    /// Tell the talker one of its tool calls landed.
     ///
-    /// An unresolved call leaves a dangling item in the session's history, and
-    /// the talker reads that as work it never got an answer about. So this is
-    /// owed even when the delegation went nowhere.
+    /// One member for every tool, rather than a near-identical one each. An
+    /// unresolved call leaves a dangling item in the session's history, and
+    /// the talker reads that as work it never heard back about. So this is
+    /// owed even when the call went nowhere, and `note` is what says so.
     ///
     /// It asks for no reply. The talker already spoke in the turn that made
-    /// the call, and the real answer arrives later on [`Self::speak`].
-    async fn resolve_delegation(&mut self, delegation_id: &str, note: &str)
-        -> Result<(), BoxError>;
+    /// the call, and anything that comes back arrives later on [`Self::speak`].
+    async fn resolve_tool_call(&mut self, tool_call_id: &str, note: &str) -> Result<(), BoxError>;
 
     /// The next thing the talker produced, or `None` once the session is over.
     async fn next(&mut self) -> Option<VoiceEvent>;

@@ -13,9 +13,9 @@
 //! destination flipped mid-call moves the thread's row while the socket is
 //! already open.
 //!
-//! **Not every utterance comes here.** The talker decides, with its one tool,
-//! and one it answers alone is written down by `call.rs` instead. So this is
-//! the delegated half only.
+//! **Not every utterance comes here.** The talker decides, with its `delegate`
+//! tool, and one it answers alone is written down by `call.rs` instead. So this
+//! is the delegated half only.
 //!
 //! **A seam, so the call loop stays drivable without an engine.** `call.rs`
 //! talks to a [`TurnStarter`], the same way it talks to a `CallTransport`. The

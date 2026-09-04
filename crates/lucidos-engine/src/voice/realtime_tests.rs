@@ -19,6 +19,16 @@ fn speaking(preference: &str) -> SessionOpening {
     }
 }
 
+/// One named transcriber, told one language. The pair the language key branches
+/// on, so both halves have to vary together.
+fn transcribing(model: &str, preference: &str) -> SessionOpening {
+    SessionOpening {
+        transcriber: model.to_string(),
+        language: crate::voice::SpokenLanguage::resolve(preference),
+        ..opening()
+    }
+}
+
 fn transcription_of(opening: &SessionOpening) -> serde_json::Value {
     session_update(opening)["session"]["audio"]["input"]["transcription"].clone()
 }
@@ -65,39 +75,117 @@ fn an_unresolved_language_leaves_the_transcriber_alone() {
     assert_eq!(transcription_of(&speaking("Klingon")), untouched);
 }
 
-/// The structural guarantee, checked on the wire. One tool, and it delegates.
-/// A second entry here is a talker that can act, which is the thing ADR 0149
-/// exists to prevent.
+/// The live model spells the same pin as an array. A singular `language` here
+/// is a field it does not read, so the call would go back to guessing.
 #[test]
-fn the_talker_is_opened_with_one_tool_and_it_delegates() {
+fn the_live_transcriber_takes_its_language_as_an_array() {
+    let config = transcription_of(&transcribing(LIVE_TRANSCRIBE_MODEL, "Norwegian"));
+    assert_eq!(config["languages"], serde_json::json!(["no"]));
+    assert_eq!(config.get("language"), None, "{}", config);
+}
+
+/// Every other model keeps the singular key, unchanged. The provider refuses a
+/// payload holding both, so neither branch may write the other one's key.
+#[test]
+fn every_other_transcriber_keeps_the_singular_language() {
+    for model in [
+        "gpt-transcribe",
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-transcribe",
+        "whisper-1",
+    ] {
+        let config = transcription_of(&transcribing(model, "Norwegian"));
+        assert_eq!(config["language"], "no", "{}", model);
+        assert_eq!(config.get("languages"), None, "{}", model);
+    }
+}
+
+/// An unset Locale and a name nobody can map both pin nothing, whichever model
+/// transcribes. An empty array would be a language set the provider cannot
+/// satisfy, which is worse than letting it guess.
+#[test]
+fn an_unresolved_language_writes_neither_key_whichever_model_transcribes() {
+    for model in [LIVE_TRANSCRIBE_MODEL, "gpt-4o-mini-transcribe"] {
+        for preference in ["", "Klingon"] {
+            let config = transcription_of(&transcribing(model, preference));
+            assert_eq!(config.get("language"), None, "{} {}", model, preference);
+            assert_eq!(config.get("languages"), None, "{} {}", model, preference);
+        }
+    }
+}
+
+/// The structural guarantee, checked on the wire. Three tools: one asks for
+/// work, one answers what is waiting, one hangs up. A fourth entry here is a
+/// talker that can act, which is the thing ADR 0149 exists to prevent.
+#[test]
+fn the_talker_is_opened_with_its_three_tools_and_no_more() {
     let payload = session_update(&opening());
     let tools = payload["session"]["tools"]
         .as_array()
         .expect("a tool list")
         .clone();
-    assert_eq!(tools.len(), 1, "{:?}", tools);
-    assert_eq!(tools[0]["name"], crate::voice::DELEGATE_TOOL);
-    assert_eq!(tools[0]["type"], "function");
-}
-
-/// One required argument, so a delegation cannot land without saying why. An
-/// optional one is an empty `WorkDelegated` row waiting to happen.
-#[test]
-fn the_tool_takes_one_required_reason() {
-    let payload = session_update(&opening());
-    let parameters = payload["session"]["tools"][0]["parameters"].clone();
+    let named: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("a name"))
+        .collect();
     assert_eq!(
-        parameters["required"],
-        serde_json::json!([crate::voice::DELEGATE_REASON_ARG])
+        named,
+        vec![
+            crate::voice::DELEGATE_TOOL,
+            crate::voice::ANSWER_TOOL,
+            crate::voice::HANGUP_TOOL,
+        ]
     );
-    let properties = parameters["properties"].as_object().expect("properties");
-    assert_eq!(properties.len(), 1, "{:?}", properties);
+    for tool in &tools {
+        assert_eq!(tool["type"], "function");
+    }
 }
 
-/// The talker decides, so the provider must be free to call it. `required`
-/// would make every turn a delegation, which is the bug this replaced.
+/// One required argument each, so neither call can land saying nothing. An
+/// optional reason is an empty `WorkDelegated` row waiting to happen, and an
+/// optional choice is an answer that settles nothing.
+///
+/// The property is checked BY NAME against `required`, not just counted. Under
+/// `additionalProperties: false` a schema whose one property is named something
+/// else than the one required leaves the model nothing valid to send.
 #[test]
-fn the_talker_chooses_whether_to_delegate() {
+fn the_asking_and_answering_tools_each_take_one_required_argument() {
+    let payload = session_update(&opening());
+    for (index, arg) in [
+        (0, crate::voice::DELEGATE_REASON_ARG),
+        (1, crate::voice::ANSWER_CHOICE_ARG),
+    ] {
+        let parameters = payload["session"]["tools"][index]["parameters"].clone();
+        assert_eq!(parameters["required"], serde_json::json!([arg]));
+        let properties = parameters["properties"].as_object().expect("properties");
+        assert_eq!(properties.len(), 1, "{:?}", properties);
+        assert!(
+            properties.contains_key(arg),
+            "the one property is not {:?}: {:?}",
+            arg,
+            properties
+        );
+        assert_eq!(properties[arg]["type"], "string");
+    }
+}
+
+/// Hanging up carries nothing to record beyond the fact of it, and an argument
+/// a model must invent is one it will.
+#[test]
+fn the_hangup_tool_takes_nothing() {
+    let parameters = session_update(&opening())["session"]["tools"][2]["parameters"].clone();
+    assert_eq!(parameters["required"], serde_json::json!([]));
+    assert!(parameters["properties"]
+        .as_object()
+        .expect("properties")
+        .is_empty());
+}
+
+/// The talker decides, so the provider must be free to call any of them.
+/// `required` would make every turn a tool call, which is the bug that
+/// delegation replaced.
+#[test]
+fn the_talker_chooses_whether_to_call_anything() {
     assert_eq!(session_update(&opening())["session"]["tool_choice"], "auto");
 }
 
@@ -114,8 +202,44 @@ fn a_finished_tool_call_delegates_before_the_turn_ends() {
     assert_eq!(
         map_event(&frame),
         vec![VoiceEvent::DelegationRequested {
-            delegation_id: "call_abc".to_string(),
+            tool_call_id: "call_abc".to_string(),
             reason: "they want this week's calendar".to_string(),
+        }]
+    );
+}
+
+/// An answer carries the choice id through untouched. Nothing here reads it:
+/// the engine looks it up against what is still open.
+#[test]
+fn an_answer_carries_the_choice_the_talker_handed_back() {
+    let frame = serde_json::json!({
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_abc",
+        "name": "answer",
+        "arguments": "{\"choice\":\"command:req-1#allow-once\"}"
+    });
+    assert_eq!(
+        map_event(&frame),
+        vec![VoiceEvent::AnswerRequested {
+            tool_call_id: "call_abc".to_string(),
+            choice_id: "command:req-1#allow-once".to_string(),
+        }]
+    );
+}
+
+/// A hangup carries only its own id, and that is the whole of it.
+#[test]
+fn a_hangup_carries_nothing_but_its_id() {
+    let frame = serde_json::json!({
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_abc",
+        "name": "hang_up",
+        "arguments": "{}"
+    });
+    assert_eq!(
+        map_event(&frame),
+        vec![VoiceEvent::HangupRequested {
+            tool_call_id: "call_abc".to_string(),
         }]
     );
 }
@@ -128,6 +252,7 @@ fn a_delegation_with_no_reason_still_goes_through() {
         let frame = serde_json::json!({
             "type": "response.function_call_arguments.done",
             "call_id": "call_abc",
+            "name": "delegate",
             "arguments": arguments
         });
         match map_event(&frame).as_slice() {
@@ -139,8 +264,23 @@ fn a_delegation_with_no_reason_still_goes_through() {
     }
 }
 
-/// A function call naming something else is a second tool appearing, and the
-/// design says there is none. It is dropped rather than delegated.
+/// An answer naming no choice is dropped, not guessed at. The whole design is
+/// that the engine never picks, and an id it invented would be a pick.
+#[test]
+fn an_answer_with_no_choice_settles_nothing() {
+    for arguments in ["{}", "{\"choice\":\"  \"}", "not json"] {
+        let frame = serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_abc",
+            "name": "answer",
+            "arguments": arguments
+        });
+        assert!(map_event(&frame).is_empty(), "{}", arguments);
+    }
+}
+
+/// A function call naming something else is a fourth tool appearing, and the
+/// design says there are three. It is dropped rather than routed.
 #[test]
 fn a_call_to_a_tool_the_talker_does_not_hold_is_ignored() {
     let frame = serde_json::json!({
@@ -152,12 +292,13 @@ fn a_call_to_a_tool_the_talker_does_not_hold_is_ignored() {
     assert!(map_event(&frame).is_empty());
 }
 
-/// A delegation with no id cannot be resolved, so it is dropped rather than
-/// left dangling in the talker's history.
+/// A call with no id cannot be resolved, so it is dropped rather than left
+/// dangling in the talker's history.
 #[test]
-fn a_delegation_with_no_id_is_dropped() {
+fn a_tool_call_with_no_id_is_dropped() {
     let frame = serde_json::json!({
         "type": "response.function_call_arguments.done",
+        "name": "delegate",
         "arguments": "{\"reason\":\"x\"}"
     });
     assert!(map_event(&frame).is_empty());
@@ -535,4 +676,54 @@ async fn a_real_session_accepts_the_opening_payload() {
         }
     }
     session.close().await;
+}
+
+/// A call with no `name` is routed by its argument rather than dropped.
+///
+/// The code this replaced treated a missing name as a delegation, because
+/// dropping the frame loses the caller's question outright. Three tools end
+/// that assumption, so the two carrying a distinguishing required argument are
+/// recovered from it instead.
+#[test]
+fn an_unnamed_call_is_recovered_from_the_argument_it_carries() {
+    let delegating = serde_json::json!({
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_abc",
+        "arguments": "{\"reason\":\"they want this week's calendar\"}"
+    });
+    assert_eq!(
+        map_event(&delegating),
+        vec![VoiceEvent::DelegationRequested {
+            tool_call_id: "call_abc".to_string(),
+            reason: "they want this week's calendar".to_string(),
+        }]
+    );
+
+    let answering = serde_json::json!({
+        "type": "response.function_call_arguments.done",
+        "call_id": "call_abc",
+        "arguments": "{\"choice\":\"command:req-1#deny\"}"
+    });
+    assert_eq!(
+        map_event(&answering),
+        vec![VoiceEvent::AnswerRequested {
+            tool_call_id: "call_abc".to_string(),
+            choice_id: "command:req-1#deny".to_string(),
+        }]
+    );
+}
+
+/// Hanging up is NOT recovered from an unnamed call. It takes no argument, so
+/// an empty or unreadable payload looks exactly like one. Guessing there would
+/// end a call the caller never asked to end.
+#[test]
+fn an_unnamed_call_with_nothing_readable_is_dropped_rather_than_read_as_a_hangup() {
+    for arguments in ["{}", "not json", "{\"something\":\"else\"}"] {
+        let frame = serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_abc",
+            "arguments": arguments
+        });
+        assert!(map_event(&frame).is_empty(), "{}", arguments);
+    }
 }

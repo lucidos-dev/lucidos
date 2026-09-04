@@ -792,11 +792,16 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
 
 // ── a parked thread's change is not resolvable ── the thread wakes on its
 // delivery and commits on to the same branch. Apply would merge work still
-// being produced. Both waiting causes gate it, and what is left is exactly
-// what a Running thread offers.
+// being produced. Both waiting causes gate it, and neither leaves a close
+// action behind.
 
 /// The headline case: a coding-agent thread that proposed a change and then
 /// parked on an event wait. This is the `e2e-lock-wait` shape.
+///
+/// A Running thread differs by one offer, and the difference is deliberate.
+/// ADR 0168 gives a working thread the standing apply, which a parked one
+/// cannot carry: `engine::standing_apply` resolves a parked thread at once, so
+/// arming it would drop on the first look.
 #[test]
 fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
     let parked = available_thread_actions(
@@ -824,8 +829,9 @@ fn a_parked_cc_thread_with_a_change_offers_only_the_save_toggle() {
         false,
     );
     assert_eq!(
-        parked, running,
-        "a parked thread must offer exactly what a Running one offers"
+        running,
+        vec![Action::ApplyWhenSettled, Action::Save],
+        "a Running thread offers no close action either, plus the standing apply"
     );
 }
 

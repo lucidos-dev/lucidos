@@ -141,6 +141,15 @@ pub const SEARCH_THREADS: &str = "search_threads";
 pub const CHANGES: &str = "changes";
 pub const LIST_CHANGES: &str = "list_changes";
 pub const APPLY_CHANGE: &str = "apply_change";
+/// Arm a *standing apply* on one change: it applies when its thread settles,
+/// and drops with a report if the thread parks or fails (ADR 0168 clause 5).
+pub const APPLY_WHEN_SETTLED: &str = "apply_when_settled";
+/// Arm the sweep: apply everything pending that has settled, and keep going as
+/// the threads still working land theirs.
+pub const APPLY_AS_THEY_SETTLE: &str = "apply_as_they_settle";
+/// Take a *standing apply* back: one thread's, or every one in the workspace.
+/// The off for both arms above (philosophy rule 2: prompt-first).
+pub const CANCEL_STANDING_APPLY: &str = "cancel_standing_apply";
 
 // Thread Queue (background admission-control policy + live queue) — grouped
 // `thread_queue` tool (list/update_policy) from the capability parity manifest;

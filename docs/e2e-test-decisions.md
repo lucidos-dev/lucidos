@@ -208,11 +208,13 @@ and lossless.
 - The whole-test `retries: 1` stays — a fresh context is what actually clears
   variant 2 (it also absorbs unrelated Chromium context-init flakes).
 - The WebKit RSS reaper (below) stays as the host-memory safety net.
-- `scripts/e2e-browser.sh` still phase-splits nav/CC specs, which shrinks
-  variant 2's contention window and is harmless to keep. It no longer runs
-  `mobile-webkit` FIRST. See "mobile-webkit runs last, and alone" below: the
-  memory cost outranks the ordering, and the ordering bought less than it
-  looked like it did.
+- `scripts/e2e-browser.sh` still phase-splits CC/nav specs, which shrinks
+  variant 2's contention window and is harmless to keep. The split is what buys
+  that, and the phases stay disjoint whichever runs first, so the *order* is
+  decided on memory instead. Two orderings changed here and they are separate
+  things. Among PROJECTS, `mobile-webkit` no longer runs first (see
+  "mobile-webkit runs last, and alone"). Inside the project, the CC phase now
+  runs first (see "Inside the project, the cheap half goes first").
 
 *Spotlight is NOT a usable lever, despite intuition.* The `.metadata_never_index`
 marker is **deprecated and a no-op on macOS 26** (verified 2026-06: a file inside
@@ -353,7 +355,7 @@ asserts the restored prompt's `data-thread-id` matches the thread it typed into
 landing instead of masquerading as data loss.
 
 Why it looked webkit-only: mobile-webkit is the only project that splits its run into
-a nav phase and a CC phase and shards each into fresh-browser chunks. That split
+a CC phase and a nav phase and shards each into fresh-browser chunks. That split
 removes the four CC-destination spec files (14 tests) that otherwise sit between
 `coding-agent-question.spec.ts` and `drafts.spec.ts`, so on webkit `drafts:65` runs
 ~40s after the leaked Continue spawn — inside its window. chromium and mobile run one
@@ -472,12 +474,29 @@ that, and a delta budget fails the same way.
 
 So the stop condition is **swap in use**, over `LUCIDOS_E2E_SWAP_MAX_GB` (1 GB).
 macOS compresses before it swaps, so swap is the point where compression stopped
-keeping up and the run began costing the host.
+keeping up and the run began costing the host. That is the primary guard, and the
+stop message now says which of the two fired, in those words.
 
-The compressor survives as a runaway backstop, now a share of RAM
-(`LUCIDOS_E2E_COMPRESSOR_MAX_PCT`, 50). A fixed 12 GB is 75% of a 16 GB Mac and
-25% of a 48 GB one. It could not mean the same thing on both.
-`LUCIDOS_E2E_COMPRESSOR_MAX_GB` still sets an absolute backstop when given.
+The compressor survives as a **runaway backstop**, and it resolves to the **lower**
+of two ceilings. Both are ceilings, so the tighter one is the only one worth
+applying.
+
+- A **share of RAM** (`LUCIDOS_E2E_COMPRESSOR_MAX_PCT`, 50) keeps a small host
+  honest. A fixed 12 GB is 75% of a 16 GB Mac and 25% of a 48 GB one. It could
+  not mean the same thing on both.
+- An **absolute 16 GB cap** (`HOST_MEMORY_COMPRESSOR_CAP_GB`) keeps a large host
+  honest, and that half was missing. Half of 48 GB is 24 GB, which no run here
+  has come near, so on this machine the share alone could never fire. 17.41 GB is
+  the compressor reading that hard-froze this host on 2026-07-26, so 16 leaves a
+  real margin under a number already paid for.
+- `LUCIDOS_E2E_COMPRESSOR_MAX_GB` replaces **both** when set, above the cap as
+  well as below it. An operator who names a number means that number.
+
+**Nothing else sets a ceiling, and nothing else should.** `e2e-browser.sh` sets
+none and the umbrella sets none, so an unset run gets the checked-in default of
+16. Exporting a different one from a caller is how a run comes to stop at a
+number nobody chose: for months the operative default was the 24 GB share, the
+instruction said 14, and a third place still documented 12.
 
 **This host has swap; it has simply never needed it.** `vm.swapusage` reporting
 `total = 0.00M` was read as swap being off. Nothing disables it: macOS grows
@@ -492,7 +511,11 @@ it went wrong, and the old guard ignored it.
   of compressor with no swap on a 48 GB host must run on. It also covers swap
   stopping the run, the backstop scaling with RAM, and both knobs. Finally,
   garbage knobs falling back, failing open on an unreadable host, and the
-  `vm.swapusage` unit parse.
+  `vm.swapusage` unit parse. The 16 GB cap and the stop wording add their own:
+  - 48 GB resolves to 16.00, and 16 GB still resolves to 8.00.
+  - An explicit ceiling above the cap is honored rather than clamped.
+  - 14.98 GB, where the 2026-08-31 nightly stopped, now runs on.
+  - The distress stop and the backstop stop cannot read alike.
 
 **The compressor does not drain between projects.** It fell 0.55 GB at WebKit
 teardown and then stayed within 0.7 GB of its high-water mark for three more
@@ -523,6 +546,52 @@ CC-subprocess churn. That reasoning is weaker than it looks. The wedge it
 targeted is fixed at the source, by the explicit `proxy` on the mobile-webkit
 project. The projects run sequentially, so the churn was never concurrent with
 it. And the phase split inside the project remains the real mitigation.
+
+### Inside the project, the cheap half goes first
+
+`mobile-webkit` runs in two phases: the 10 CC-subprocess specs (the ones calling
+`pickComposeDestination`), then the 99 navigation specs. Both shard through
+`run_specs_chunked`, and the guard checks the boundary between them.
+
+**The order is decided by cost, and the costs are lopsided.** One nightly grew
+the compressor 12.64 GB from a 2.34 GB start across the navigation phase. The
+whole CC phase costs about 1 GB. With the expensive half first, the guard kept
+ending the run at the phase boundary. So the 10 cheap specs got no WebKit verdict
+at all, run after run, and it got worse with every spec added to nav.
+
+The cheap half now runs first and always reports, and a shortfall lands in nav
+instead. That is the half where a partial chunk range is cheap to carry over, and
+it already has discharge tooling. **Phase 2 is the heavier half on purpose**: the
+comment in `e2e-browser.sh` says so, because "don't start the heavy half on a
+loaded host" is the opposite reading and it is wrong here.
+
+**Most of what the split buys is order-independent.** Keeping the two sets in
+separate invocations shrinks the residual nav-wedge's contention window. That
+holds whichever phase runs first (see the nav-wedge section above).
+
+One thing did change direction: nav now runs downstream of the CC-spawn window
+rather than ahead of it. That cost is accepted. The split was recovery-frequency
+reduction rather than a cure, and nav keeps its real defences: the context
+preflight in `e2e/fixtures.ts`, `gotoWithRetry`, and `retries: 1`.
+
+**The `drafts:65` window above is not evidence against the reversal.** Both ends
+of it are nav specs: neither `coding-agent-question.spec.ts` nor
+`drafts.spec.ts` calls `pickComposeDestination`. They sit ~40s apart because the
+split removes the CC files that sat between them alphabetically. That is a
+property of the split rather than of the order.
+
+- **Test.** `scripts/lib/e2e_browser_phases_test.sh` (run directly, no harness).
+  `e2e-browser.sh` is a script rather than a library, so the suite lifts
+  `merge_rc`, `run_specs_chunked` and `_run_browser_project_body` out with `sed`
+  and drives them against stubs. That idiom is already used by
+  `build_dmg_test.sh` and `install_test.sh`. A lift that finds nothing is a hard
+  failure, so a rename cannot leave the suite silently testing nothing.
+- It pins the order twice over: the emitted phase labels, and which chunk the run
+  actually executes first. It also pins the boundary check between the phases and
+  a stop there skipping phase 2. Then a red CC phase outranking a later memory
+  stop, and the desktop-spec exclusion. The last case runs the **shipped** spec
+  inventory, so an edit that puts the order back fails here rather than in a
+  nightly.
 
 ### One verdict per project, however many invocations it took
 

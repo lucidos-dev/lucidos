@@ -290,7 +290,7 @@ pub(in crate::api) async fn archive_thread(
     })?;
     // Before the transaction, so a refusal writes nothing at all: no locked
     // family, no cleared pending change, no cancel-stamped question card.
-    crate::api::thread_reach::refuse_out_of_reach(
+    crate::api::thread_reach::refuse_without_authority(
         &state.pool,
         &headers,
         Some(thread_uuid),

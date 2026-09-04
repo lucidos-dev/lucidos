@@ -7,10 +7,7 @@
 
 use super::*;
 use crate::engine::claude_code::AllowScope;
-use crate::engine::mcp_permission::{
-    emit_mcp_permission_resolved, record_mcp_allow_grant, DENIAL_REASON,
-};
-use crate::engine::thread_events::EventMeta;
+use crate::engine::mcp_permission::resolve_mcp_permission;
 
 #[derive(Deserialize)]
 pub(super) struct McpPermissionConsentRequest {
@@ -29,60 +26,32 @@ pub(super) struct McpPermissionConsentRequest {
 /// POST /api/v1/mcp-permission/consent — resolve a chat MCP permission card.
 /// Mirrors the command-guard consent endpoint; the waiter is the in-process
 /// agentic loop (via the entry's broadcast).
+///
+/// Thin: resolving one is `mcp_permission::resolve_mcp_permission`, which a
+/// spoken answer reaches too. This adds the actor and the wire shape.
 pub(super) async fn submit_mcp_permission_consent(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<McpPermissionConsentRequest>,
 ) -> impl IntoResponse {
-    let entry = {
-        let mut pending = state.engine.pending_mcp_permission.lock().unwrap();
-        pending.take(&body.request_id)
-    };
-    let Some(entry) = entry else {
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let answered = resolve_mcp_permission(
+        &state.engine,
+        body.request_id,
+        body.allowed,
+        body.persist_scope,
+        actor,
+        "[McpPermission] McpPermissionResolved",
+    )
+    .await;
+    if !answered {
         // Already resolved (superseded / orphan-recovery / canceled) or unknown.
         return (
             StatusCode::NOT_FOUND,
             "No pending MCP permission with that ID",
         )
             .into_response();
-    };
-
-    // Wake the blocked loop (and any deduped waiters on the same broadcast).
-    let _ = entry.tx.send(body.allowed);
-
-    let reason = if body.allowed {
-        None
-    } else {
-        Some(DENIAL_REASON.to_string())
-    };
-    let persist_scope = if body.allowed {
-        body.persist_scope
-    } else {
-        None
-    };
-    if let Some(scope) = persist_scope {
-        // `entry.tool_name` is the namespaced `mcp__<server>__<tool>` — recover
-        // (server_id, tool) to derive the stored pattern. A malformed name (no
-        // valid parse) records nothing.
-        if let Some((server_id, tool)) =
-            crate::mcp::McpManager::parse_mcp_tool_name(&entry.tool_name)
-        {
-            record_mcp_allow_grant(&state.engine, entry.thread_id, &server_id, &tool, scope);
-        }
     }
-
-    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    emit_mcp_permission_resolved(
-        &state.engine.event_bus,
-        entry.thread_id,
-        body.request_id,
-        body.allowed,
-        reason,
-        persist_scope,
-        EventMeta::with_actor(actor),
-        "[McpPermission] McpPermissionResolved",
-    )
-    .await;
     StatusCode::OK.into_response()
 }
 

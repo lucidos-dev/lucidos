@@ -3,7 +3,9 @@
 - **Status**: Accepted; the resolver fallback below is **revised by
   [ADR 0158](0158-webhook-ingress-verdict-needs-a-measurement.md)**. The walk
   now falls through an answer naming no record, and only a probe that was
-  actually sent can degrade a family. Everything else here still holds.
+  actually sent can degrade a family. The stage table is **extended by
+  [ADR 0172](0172-a-blocked-port-is-not-a-dead-ingress.md)** with a seventh
+  value. Everything else here still holds.
 - **Date**: 2026-08-27
 
 ## Context
@@ -79,6 +81,7 @@ The failure stage is the diagnosis, so the classification is the product:
 | 404 | `route-missing` | wrong slug or hook id |
 | anything else, 200 included | `unexpected-responder` | not Lucidos answering |
 | no local route for the family | `local-stack-unavailable` | not judged |
+| a route, and the port filtered outbound | `local-egress-blocked` | not judged |
 
 The three backend codes are one stage because the gateway produces all three.
 `hook_socket.rs` answers 502 when the engine hop fails, 503 when its
@@ -183,7 +186,7 @@ both measured from the degraded event it closes.
 Field rules, so nothing has to be guessed:
 
 - `verdict` is `healthy`, `degraded` or `not-probed`.
-- `stage` is one of the six values in the table above, kebab-case.
+- `stage` is one of the values in the table above, kebab-case.
 - `status` is the HTTP status when one arrived, and `null` when none did.
 - `detail` is a short human string, present only on a failure.
 - `families` always lists both families, including a `not-probed` one.

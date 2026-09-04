@@ -20,8 +20,16 @@
 //!    thread/event id from the request body)
 //! 3. `device_id` present     → `Device` (label looked up by caller from the
 //!    `devices` table)
-//! 4. else                    → `Api { mode: Human }` (external API client;
-//!    carries `User-Agent`)
+//! 4. **Machine-local token** (`X-Lucidos-Local-Token` verifies against the
+//!    mode 0600 file the gateway minted) → `Api { mode: Engine }`, the engine's
+//!    own machinery. The build-watch and the release scripts reach the engine
+//!    this way: they belong to no thread, so they hold no origin token, and
+//!    they are not a person either. See ADR 0169.
+//! 5. else                    → `None`. A caller presenting no credential has
+//!    said nothing about itself, and there is no honest actor to build. It is
+//!    NOT the user: stamping one made dropping a credential buy more than
+//!    presenting it. [`require_user_actor`] turns this into a refusal at any
+//!    handler that must know who is acting. See ADR 0169.
 //!
 //! Mode = `Agent` or `Engine`:
 //! - With `caller` set → `Workspace` (cross-workspace agent/engine call)
@@ -483,12 +491,24 @@ pub fn build_message_origin(
                     label: device_label
                         .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, id)),
                 })
-            } else {
+            } else if super::local_auth::is_local_process(headers) {
+                // A device wins above, because it names a person and this names
+                // a machine. The order is load-bearing rather than theoretical:
+                // the gateway injects BOTH on every request it proxies, its own
+                // token to prove the hop and the device it authenticated. Read
+                // the other way round, every action from a phone would be
+                // recorded as the engine's own machinery.
                 Some(MessageOrigin::Api {
                     user_agent,
-                    mode: ActorMode::Human,
+                    mode: ActorMode::Engine,
                     source_thread_id: None,
                 })
+            } else {
+                // Nobody. Not the user: a caller presenting no credential has
+                // said nothing about itself, and naming it human is the
+                // inversion ADR 0169 removes. `require_user_actor` turns this
+                // into a refusal for a handler that must know who is acting.
+                None
             }
         }
         ActorMode::Agent | ActorMode::Engine => {
@@ -555,6 +575,109 @@ pub async fn user_actor_resolved(
         None => None,
     };
     user_actor(headers, device_id_override, device_label)
+}
+
+/// What a caller is told when it presented no identity at all.
+///
+/// It names the four credentials rather than the one this route wanted,
+/// because the caller does not know which class the engine put it in. Each is
+/// something the right caller already holds, so the message is a route back
+/// rather than a wall.
+pub const UNIDENTIFIED_CALLER: &str =
+    "This request carries no identity, so the engine cannot record who is acting. \
+     Present one of four credentials: the thread-bound origin token a Lucidos-spawned \
+     subprocess is given, the machine-local token in ~/.lucidos/local-token, an \
+     x-lucidos-device-id header for a registered device, or a caller_workspace body \
+     field for a call from another workspace.";
+
+/// Is this device id evidence, or a header somebody typed?
+///
+/// [`user_actor_resolved`] stamps ANY non-empty id as a `Device` actor, falling
+/// back to a `device-<short>` label. That is right for attribution and wrong
+/// for a gate, and `display_name` cannot tell the two apart: its `None` means
+/// absent OR a database error.
+///
+/// A database error counts as registered. This sits on the user's own action
+/// path, so failing closed would refuse real work on a blip. Same trade and
+/// same probe as the chat path's device gate, which is why `is_registered`
+/// returns the error instead of swallowing it.
+async fn device_is_evidence(pool: &PgPool, device_id: &str) -> bool {
+    match crate::core::DeviceStore::is_registered(pool, device_id).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            crate::log!(
+                "[Actor] device lookup for '{}' failed ({}); treating it as registered so a \
+                 database blip cannot refuse real work",
+                device_id,
+                e
+            );
+            true
+        }
+    }
+}
+
+/// [`user_actor_resolved`], refusing rather than returning nobody.
+///
+/// The one gate every mutating handler asks. A second spelling of it is how
+/// four routes drifted apart before ADR 0169, so callers take this and never
+/// re-derive the check.
+///
+/// **A device id must name a registered device.** Attribution accepts any id
+/// and a gate cannot, or the evidence ADR 0168 clause 4 asks for would be one
+/// header anyone can type. An id that names nothing is suppressed rather than
+/// refused outright, so the caller falls through to its other credentials.
+///
+/// 401 rather than 403: the caller may retry with a credential, and nothing
+/// here says its identity would be insufficient. That is a later question, and
+/// ADR 0168 clause 4 owns it.
+pub(crate) async fn require_user_actor(
+    headers: &axum::http::HeaderMap,
+    pool: &PgPool,
+    device_id_override: Option<&str>,
+) -> Result<MessageOrigin, super::error::ApiError> {
+    // Blank-filter EACH source before falling back, never the winner
+    // afterwards, or a blank override swallows a real header. Same order and
+    // same rule as `require_human_mode_is_attributed`.
+    let claimed = device_id_override
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| header_str(headers, HEADER_DEVICE_ID).filter(|v| !v.trim().is_empty()));
+    let device_id = match claimed.as_deref() {
+        Some(id) if device_is_evidence(pool, id).await => Some(id),
+        _ => None,
+    };
+    let device_label = match device_id {
+        Some(id) => crate::core::DeviceStore::display_name(pool, id).await,
+        None => None,
+    };
+    build_message_origin(
+        headers,
+        ActorMode::Human,
+        device_id,
+        device_label,
+        None,
+        None,
+        None,
+        None,
+    )
+    .ok_or_else(|| {
+        super::error::ApiError::new(axum::http::StatusCode::UNAUTHORIZED, UNIDENTIFIED_CALLER)
+    })
+}
+
+/// [`require_user_actor`], shaped for a handler that returns a bare `Response`.
+///
+/// The same refusal, rendered rather than propagated. A handler that has not
+/// adopted `ApiError` still gates BEFORE it mutates. Leaving the check to its
+/// emit would run it after the write had landed.
+pub(crate) async fn require_user_actor_response(
+    headers: &axum::http::HeaderMap,
+    pool: &PgPool,
+) -> Result<MessageOrigin, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+    require_user_actor(headers, pool, None)
+        .await
+        .map_err(|e| e.into_response())
 }
 
 fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {

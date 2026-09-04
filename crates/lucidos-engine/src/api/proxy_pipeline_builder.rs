@@ -29,6 +29,9 @@ pub struct PipelineBuildContext<'a> {
     pub workspace_path: Arc<PathBuf>,
     pub token_cache: Arc<ProxyTokenCache>,
     pub proxy_name: &'a str,
+    /// The entry's outbound host. A `script_handshake` layer folds it into its
+    /// token-cache key so a minted token cannot travel to a rewritten host.
+    pub base_url: &'a str,
     pub proxy_modules: &'a HashMap<String, Arc<CompiledModule>>,
     pub wasm_engine: Arc<Engine>,
 }
@@ -110,6 +113,7 @@ pub async fn build_pipeline(
                     ctx.proxy_name.to_string(),
                     credential.clone(),
                     script.clone(),
+                    ctx.base_url.to_string(),
                     oauth_providers.clone(),
                     ctx.pool.clone(),
                     ctx.workspace_path.clone(),

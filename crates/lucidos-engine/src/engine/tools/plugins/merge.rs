@@ -28,8 +28,9 @@ use super::registry::{modification_status_for, PluginBaseline};
 const MAX_MERGE_BYTES: usize = 1024 * 1024;
 
 /// What the confirm will do with one shipped path the user has locally edited.
-/// A path the user has NOT edited never becomes a [`LocalChange`] at all: it is
-/// overwritten exactly as it always was.
+/// A path the user has NOT edited never becomes a [`LocalChange`] at all, and
+/// neither does one whose copy already equals the staged version. Both are
+/// overwritten exactly as they always were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalChangeOutcome {
     /// Upstream's edits and the user's combined cleanly. The merged content
@@ -99,6 +100,12 @@ pub(crate) struct LocalChange {
 #[derive(Default)]
 pub(crate) struct MergePlan {
     pub(crate) changes: Vec<LocalChange>,
+    /// Edited paths whose copy already equalled the staged version, with the
+    /// hash that made them equal. No decision, so the panel never lists them
+    /// and the confirm never resolves them. Still watched for drift: the user
+    /// edits these files, and one edited inside the staging window is real
+    /// work the confirm would otherwise overwrite unseen.
+    unchanged: Vec<(String, git2::Oid)>,
 }
 
 impl MergePlan {
@@ -122,12 +129,18 @@ impl MergePlan {
     /// time. A mismatch means the file changed after the panel was reviewed.
     /// The confirm then refuses, rather than writing a merge computed against
     /// content that is gone. Returns the first drifted path.
+    ///
+    /// Over every edited path, listed or not. A path dropped for already
+    /// matching upstream is silent in the panel, never in here.
     pub(crate) fn detect_drift(&self, workspace_path: &Path) -> Option<String> {
         let data_dir = workspace_path.join(DATA_DIR);
-        self.changes.iter().find_map(|c| {
-            let now = hash_on_disk(&data_dir.join(&c.data_relative));
-            (now != c.ours_oid).then(|| c.data_relative.clone())
-        })
+        self.changes
+            .iter()
+            .map(|c| (&c.data_relative, c.ours_oid))
+            .chain(self.unchanged.iter().map(|(path, oid)| (path, Some(*oid))))
+            .find_map(|(path, staged)| {
+                (hash_on_disk(&data_dir.join(path)) != staged).then(|| path.clone())
+            })
     }
 
     /// Resolve the plan against the user's keep-or-replace choice.
@@ -341,6 +354,11 @@ pub(crate) fn local_patch(workspace_path: &Path, baseline: &PluginBaseline) -> O
 /// has edited. `baseline` is the version they are on; `planned` is what the
 /// staged version ships.
 ///
+/// Two questions per path, not one. "Did this change since the install
+/// commit?" makes it a candidate; "is ours already theirs?" drops it again. A
+/// user who published their own edit upstream meets the second on every file
+/// they sent.
+///
 /// Best-effort by construction: an unopenable repo, an unresolvable commit or
 /// an unreadable file all yield an empty plan, which is exactly today's
 /// behaviour (replace everything). A merge improves on overwriting. It is never
@@ -369,20 +387,39 @@ pub(crate) fn plan_local_changes(
 
     let data_dir = workspace_path.join(DATA_DIR);
     let mut changes = Vec::new();
+    let mut unchanged = Vec::new();
     for pf in planned {
         if !modified.contains(pf.data_relative.as_str()) {
             continue;
+        }
+        let live = data_dir.join(&pf.data_relative);
+        let ours_oid = hash_on_disk(&live);
+        // The user's copy already IS what the new version ships, which is what
+        // publishing your own edit upstream leaves behind. The merge writes
+        // these bytes whichever way it goes, so there is nothing to decide. A
+        // row for it inflates the count and hands the keep control a file it
+        // cannot affect.
+        //
+        // Compared by content hash, never by the buffers below. `read_mergeable`
+        // yields `None` for every oversized file, so two DIFFERENT ones would
+        // read as equal. That would drop a real edit in silence.
+        //
+        // It keeps its drift key. The panel going quiet about a path must not
+        // stop the confirm seeing an edit that lands after it.
+        if let Some(ours) = ours_oid {
+            if Some(ours) == hash_on_disk(&pf.source) {
+                unchanged.push((pf.data_relative.clone(), ours));
+                continue;
+            }
         }
         let base = tree
             .get_path(Path::new(&format!("data/{}", pf.data_relative)))
             .ok()
             .and_then(|entry| repo.find_blob(entry.id()).ok())
             .map(|blob| blob.content().to_vec());
-        let live = data_dir.join(&pf.data_relative);
         let ours = read_mergeable(&live);
         let theirs = read_mergeable(&pf.source);
 
-        let ours_oid = hash_on_disk(&live);
         let (outcome, merged) = classify(
             &repo,
             pf,
@@ -402,7 +439,7 @@ pub(crate) fn plan_local_changes(
             ours_oid,
         });
     }
-    MergePlan { changes }
+    MergePlan { changes, unchanged }
 }
 
 /// Decide one path's outcome, and produce the merged bytes when it merges.

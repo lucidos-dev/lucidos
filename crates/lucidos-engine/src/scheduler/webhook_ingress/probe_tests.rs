@@ -24,6 +24,17 @@ fn ip(s: &str) -> IpAddr {
     s.parse().expect("test address parses")
 }
 
+/// One reading, as `probe_one` would have written it.
+fn reading(address: &str, family: Family, stage: Stage) -> AddressProbe {
+    AddressProbe {
+        address: address.to_string(),
+        family,
+        stage,
+        status: (stage == Stage::Healthy).then_some(401),
+        detail: (stage == Stage::IngressUnreachable).then(|| "timed out".to_string()),
+    }
+}
+
 #[tokio::test]
 async fn a_family_this_host_cannot_reach_is_never_sent_to() {
     // No IPv6 egress is an ordinary machine, not an outage. Sending anyway
@@ -90,6 +101,49 @@ fn the_route_lookup_names_a_documentation_address() {
     // Port 9 is discard, so even a stray packet lands nowhere.
     assert_eq!(v4.port(), 9);
     assert_eq!(v6.port(), 9);
+}
+
+#[test]
+fn blocked_needs_an_answer_on_the_reference_port() {
+    // Silence on the funnel port is not evidence on its own. A relay that is
+    // merely down is silent on both legs, and blaming this host for that would
+    // trade one false reading for another.
+    assert_eq!(read_egress(false, true), PortEgress::Blocked);
+    assert_eq!(read_egress(false, false), PortEgress::Unknown);
+    // An answer on the funnel port ends the question, whatever 443 said.
+    assert_eq!(read_egress(true, false), PortEgress::Open);
+    assert_eq!(read_egress(true, true), PortEgress::Open);
+}
+
+#[test]
+fn the_egress_dial_gives_up_long_before_the_request_does() {
+    // It asks only whether a handshake starts, and a filtered port is silent.
+    // A dial as patient as the request would cost a cycle three more timeouts.
+    assert!(EGRESS_PROBE_TIMEOUT < PROBE_TIMEOUT);
+}
+
+#[test]
+fn a_blocked_family_stops_blaming_the_ingress() {
+    // The false alarm this exists to stop: three relays timing out on a network
+    // that filters the port, for a hook the sender was reaching.
+    let mut results = vec![
+        reading("203.0.113.7", Family::Ipv4, Stage::IngressUnreachable),
+        reading("203.0.113.8", Family::Ipv4, Stage::IngressUnreachable),
+        reading("2001:db8::1", Family::Ipv6, Stage::Healthy),
+    ];
+    blame_local_egress(&mut results, Family::Ipv4, 8443);
+
+    for result in &results[..2] {
+        assert_eq!(result.stage, Stage::LocalEgressBlocked);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("this host cannot reach port 8443 on any address")
+        );
+    }
+    // The other family is untouched, and the verdict follows the readings.
+    assert_eq!(results[2].stage, Stage::Healthy);
+    let families = crate::core::webhook_ingress::judge(&results);
+    assert!(crate::core::webhook_ingress::degraded_families(&families).is_empty());
 }
 
 #[test]

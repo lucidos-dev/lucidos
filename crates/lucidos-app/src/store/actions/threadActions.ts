@@ -15,12 +15,13 @@
  *    the focused thread's actions.
  */
 
-import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds } from '../store';
+import { threadMap, focusedThreadId, changes, showConfirm, effectiveThreadStatus, applyingNowThreadIds, discardingCCThreadIds, archivingThreadIds, standingApplyThreadIds } from '../store';
 import { getCodingAgentWaitingInfo } from '../thread-events';
 import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
 import { endClaudeCodeAndApply, handleDiscardCCChanges } from './chat-claude-code';
+import { armStandingApply, disarmStandingApply } from './chat-changes';
 import { discardCompose, updateCompose } from './compose';
 import { topOverlay, dismissTopOverlay } from '../overlayStack';
 
@@ -120,6 +121,11 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
       return [a];
     });
   }
+  // The standing apply is an Apply the owner presses early, so it goes wherever
+  // Apply goes. An external repo has no Apply to arm.
+  if (isExternalRepo) {
+    kinds = kinds.filter((a) => a !== 'apply_when_settled');
+  }
 
   // A composing draft only exists in the frontend (no persisted thread), and
   // `isExcludedFromSections` keeps it out of every drawer section — including
@@ -137,13 +143,29 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
     (pendingChange?.requires_restart || ccInfo?.requiresRestart || false);
   const incomplete = pendingChange?.incomplete ?? false;
 
-  return kinds.map((kind) => tagAction(kind, threadId, { requiresRestart, incomplete }));
+  // The standing apply is armed against the thread's CURRENT change where it
+  // has one, so it cannot reach a change proposed after the owner pressed.
+  const armed = standingApplyThreadIds.value.has(threadId);
+
+  return kinds.map((kind) =>
+    tagAction(kind, threadId, {
+      requiresRestart,
+      incomplete,
+      armed,
+      pendingChangeId: pendingChange?.id,
+    }),
+  );
 }
 
 function tagAction(
   kind: Action,
   threadId: string,
-  opts: { requiresRestart: boolean; incomplete: boolean },
+  opts: {
+    requiresRestart: boolean;
+    incomplete: boolean;
+    armed: boolean;
+    pendingChangeId?: string;
+  },
 ): TaggedAction {
   switch (kind) {
     case 'discard_draft':
@@ -188,6 +210,22 @@ function tagAction(
           if (opts.incomplete && !(await showConfirm(APPLY_INCOMPLETE_CONFIRM, 'Apply'))) return;
           void endClaudeCodeAndApply(threadId);
         },
+      };
+    case 'apply_when_settled':
+      return {
+        kind,
+        category: 'primary',
+        // A checked state that toggles off on click, the shape `unsave` already
+        // uses. Never a disabled Apply: ADR 0168 replaces a control that cannot
+        // act with the one that can.
+        label: opts.armed ? '✓ Applying as it settles' : 'Apply as it settles',
+        tooltip: opts.armed
+          ? 'Armed. The change applies when this thread finishes, and drops with a report if the thread parks or fails. Click to cancel.'
+          : 'The thread is still working. Apply its change the moment it finishes.',
+        invoke: () =>
+          opts.armed
+            ? void disarmStandingApply(threadId)
+            : void armStandingApply(threadId, opts.pendingChangeId),
       };
     case 'archive':
       return {

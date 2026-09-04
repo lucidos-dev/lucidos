@@ -733,6 +733,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_credential_in_a_second_cookie_field_never_meets_the_pairing_screen() {
+        // The report this came from. HTTP/2 may split one jar across several
+        // `cookie` fields, and `enforce` read only the first. A paired iPhone
+        // met the pairing screen with its row still in the store. The refusal
+        // log stayed silent too, having counted no credential at all.
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let state = state_with_device(dir.path(), Some(&now));
+
+        let own = own_device_cookie(&state);
+        let response = get(
+            &state,
+            "/dev/",
+            &[
+                ("cookie", "theme=dark"),
+                ("cookie", &own),
+                ("sec-fetch-mode", "navigate"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::IM_A_TEAPOT,
+            "the teapot is the handler, so `enforce` let this device through"
+        );
+        assert!(
+            response
+                .headers()
+                .get(crate::server::PAIRING_SHELL_HEADER)
+                .is_none(),
+            "a device the store holds must never be asked to pair again"
+        );
+    }
+
+    #[tokio::test]
     async fn two_gateways_on_one_host_do_not_share_a_cookie_name() {
         // Measured before this split: pairing the second gateway took the first
         // from 200 to 401, because a cookie is scoped to the host and ignores

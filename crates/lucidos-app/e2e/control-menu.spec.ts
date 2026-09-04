@@ -1,10 +1,8 @@
 import { test, expect, Page } from './fixtures';
 import {
-  navigateToApp, assertHealthy, pickComposeDestination, newThread,
-  waitForVisibleInput, ensureOnThreadPane, blurActiveElement,
-  clickVisibleElement, getHeaderTop,
-  sendMessage, uniqueMessage, waitForActionPanel,
-  pickDropdownOption,
+  apiRequest, assertHealthy, blurActiveElement, clickVisibleElement, ensureOnThreadPane,
+  getHeaderTop, navigateToApp, newThread, pickComposeDestination, pickDropdownOption,
+  sendMessage, uniqueMessage, waitForActionPanel, waitForVisibleInput,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -53,7 +51,7 @@ test.describe('Coding-agent control menu', () => {
   test.beforeEach(async ({ page }) => {
     clearAllThreads();
     await assertHealthy(page);
-    const prefReset = await page.request.put('/api/v1/preferences?key=coding_agent_default', {
+    const prefReset = await apiRequest(page).put('/api/v1/preferences?key=coding_agent_default', {
       data: { value: 'claude-code' },
     });
     expect(prefReset.ok()).toBeTruthy();
@@ -162,7 +160,7 @@ test.describe('Coding-agent control menu', () => {
     expect(sentBody?.folder).toBeUndefined();
     expect(sentBody?.repo_id).toBeUndefined();
     if (!chatRequestFulfilled && typeof sentBody?.thread_id === 'string') {
-      await page.request.post(`/api/v1/claude-code/stop?thread_id=${encodeURIComponent(sentBody.thread_id)}`);
+      await apiRequest(page).post(`/api/v1/claude-code/stop?thread_id=${encodeURIComponent(sentBody.thread_id)}`);
     }
   });
 

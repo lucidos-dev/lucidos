@@ -355,6 +355,13 @@ pub(super) async fn write_data(
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
 
+    // Before the write, not before the emit. A refusal after the bytes reach
+    // disk would be a mutation nobody is recorded as making.
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
     let am = match make_artifact_manager(&state.workspace_path) {
         Ok(am) => am,
         Err(resp) => return *resp,
@@ -432,15 +439,15 @@ pub(super) async fn write_data(
     state
         .engine
         .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
+        .emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::DataFileWritten {
+                    path: path.clone(),
+                    commit: commit_opt,
+                    actor: Some(actor),
+                },
+            ),
             "[DataApi] DataFileWritten",
-            |actor| crate::engine::event_bus::SystemEvent::DataFileWritten {
-                path: path.clone(),
-                commit: commit_opt,
-                actor,
-            },
         )
         .await;
     response
@@ -455,6 +462,12 @@ pub(super) async fn delete_data(
     if let Err((code, msg)) = validate_data_path_mutate(&path) {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
+
+    // Before the delete, for the reason `write_data` gives above.
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     let am = match make_artifact_manager(&state.workspace_path) {
         Ok(am) => am,
@@ -512,15 +525,15 @@ pub(super) async fn delete_data(
     state
         .engine
         .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
+        .emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::DataFileDeleted {
+                    path: path.clone(),
+                    commit: commit_opt,
+                    actor: Some(actor),
+                },
+            ),
             "[DataApi] DataFileDeleted",
-            |actor| crate::engine::event_bus::SystemEvent::DataFileDeleted {
-                path: path.clone(),
-                commit: commit_opt,
-                actor,
-            },
         )
         .await;
     response
@@ -559,6 +572,12 @@ pub(super) async fn edit_data(
         )
             .into_response();
     }
+
+    // Before the first operation is applied, for the reason `write_data` gives.
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
 
     for (i, op) in body.operations.iter().enumerate() {
         let has_json = op.json_path.is_some() && op.json_value.is_some();
@@ -620,13 +639,16 @@ pub(super) async fn edit_data(
         state
             .engine
             .event_bus
-            .emit_user_system(&headers, &state.pool, "[DataApi] DataFileEdited", |actor| {
-                crate::engine::event_bus::SystemEvent::DataFileEdited {
-                    path: body.path.clone(),
-                    operations_count: completed,
-                    actor,
-                }
-            })
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::System(
+                    crate::engine::event_bus::SystemEvent::DataFileEdited {
+                        path: body.path.clone(),
+                        operations_count: completed,
+                        actor: Some(actor),
+                    },
+                ),
+                "[DataApi] DataFileEdited",
+            )
             .await;
     }
 

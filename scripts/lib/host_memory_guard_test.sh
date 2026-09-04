@@ -133,7 +133,9 @@ test_swap_wins_when_both_are_over() {
 test_backstop_scales_with_ram() {
     echo "test: the same compressor reading stops a 16 GB host and not a 48 GB one"
     # A fixed 12 GB ceiling meant 75% of one machine and 25% of the other, which is
-    # why it could not be calibrated. As a share of RAM it means the same thing.
+    # why it could not be calibrated. The share is what keeps a SMALL host honest,
+    # and 13 GB is the reading that separates the two. The 16 GB cap is the other
+    # half of the resolution and never binds at this reading.
     local rc
     reset_state
     HOST_COMPRESSOR_GB_OVERRIDE=13.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
@@ -152,6 +154,42 @@ test_backstop_scales_with_ram() {
     assert_eq "0" "$rc" "13 GB compressed on a 48 GB host runs on"
 }
 
+# The other half of the same rule, and the half that was missing. A share alone
+# put this 48 GB host's backstop at 24.00 GB, which no run has ever reached, so
+# the only ceiling in force was whatever the caller exported.
+test_the_cap_bites_before_the_share_on_a_large_host() {
+    echo "test: on a 48 GB host the 16 GB cap is the backstop, not the 24 GB share"
+    local rc got
+    reset_state
+    got="$(HOST_PHYSMEM_GB_OVERRIDE=48 _host_mem_compressor_ceiling_gb)"
+    assert_eq "16.00" "$got" "48 GB resolves to the cap, not half of RAM"
+
+    got="$(HOST_PHYSMEM_GB_OVERRIDE=16 _host_mem_compressor_ceiling_gb)"
+    assert_eq "8.00" "$got" "16 GB still resolves to the share, which is lower"
+
+    HOST_COMPRESSOR_GB_OVERRIDE=20.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 22/33" >"$OUT/cap.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "20 GB compressed on a 48 GB host now stops"
+    assert_says "$OUT/cap.out" "over the 16.00 GB backstop" "the cap is the number it names"
+}
+
+# 14.98 GB is where the 2026-08-31 nightly stopped, on the ceiling its spawn
+# intent exported. The checked-in default must not stop there once nobody sets
+# one, or the phase reversal buys nothing.
+test_the_reading_that_stopped_the_nightly_now_runs_on() {
+    echo "test: 14.98 GB with no exported ceiling runs on"
+    local rc
+    reset_state
+    HOST_COMPRESSOR_GB_OVERRIDE=14.98 HOST_SWAP_USED_GB_OVERRIDE=0.25 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "mobile-webkit phase 1/2 (CC)" >"$OUT/nightly.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the boundary that ended the nightly no longer stops"
+    assert_silent_about "$OUT/nightly.out" "STOP" "no stop was announced"
+}
+
 test_explicit_absolute_ceiling_overrides_the_share() {
     echo "test: LUCIDOS_E2E_COMPRESSOR_MAX_GB overrides the RAM share"
     local rc
@@ -162,10 +200,18 @@ test_explicit_absolute_ceiling_overrides_the_share() {
     rc=$?
     assert_eq "1" "$rc" "an explicit lower ceiling still stops the run"
     assert_says "$OUT/abs.out" "over the 9 GB backstop" "the explicit value is the one applied"
+
+    # It replaces BOTH defaults, not just the share. An operator who names a
+    # number above the cap means that number, and silently capping it back to 16
+    # would make an exported ceiling a lie.
+    local got
+    got="$(HOST_PHYSMEM_GB_OVERRIDE=48 LUCIDOS_E2E_COMPRESSOR_MAX_GB=20 \
+        _host_mem_compressor_ceiling_gb)"
+    assert_eq "20" "$got" "an explicit ceiling above the cap is honored, not clamped"
 }
 
 test_percent_knob_is_honored() {
-    echo "test: LUCIDOS_E2E_COMPRESSOR_MAX_PCT moves the backstop"
+    echo "test: LUCIDOS_E2E_COMPRESSOR_MAX_PCT moves the backstop below the cap"
     local rc
     reset_state
     HOST_COMPRESSOR_GB_OVERRIDE=20.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
@@ -174,6 +220,24 @@ test_percent_knob_is_honored() {
     rc=$?
     assert_eq "1" "$rc" "25% of 48 GB stops a 20 GB compressor"
     assert_says "$OUT/pct.out" "over the 12.00 GB backstop" "the backstop is a quarter of RAM"
+}
+
+# The knob moves the SHARE, and the lower of share and cap still wins. So above
+# the cap it is a no-op, which the knobs comment now says in words. Without this
+# case the whole clamped region is untested and an operator setting 75 could
+# quietly get 16 with nothing to point at.
+test_the_percent_knob_cannot_raise_the_backstop_past_the_cap() {
+    echo "test: a percentage above the cap is clamped, not honored"
+    local got
+    reset_state
+    got="$(HOST_PHYSMEM_GB_OVERRIDE=48 LUCIDOS_E2E_COMPRESSOR_MAX_PCT=75 \
+        _host_mem_compressor_ceiling_gb)"
+    assert_eq "16.00" "$got" "75% of 48 GB is clamped to the cap, not 36.00"
+
+    # The escape is naming a number in GB, which the knobs comment points at.
+    got="$(HOST_PHYSMEM_GB_OVERRIDE=48 LUCIDOS_E2E_COMPRESSOR_MAX_PCT=75 \
+        LUCIDOS_E2E_COMPRESSOR_MAX_GB=36 _host_mem_compressor_ceiling_gb)"
+    assert_eq "36" "$got" "an absolute ceiling is the way past the cap"
 }
 
 # ── Test 4: a garbage knob must never stop the suite ────────────────────────
@@ -305,7 +369,67 @@ test_start_records_the_baseline_and_states_the_thresholds() {
         report_host_memory_start >"$OUT/start.out" 2>&1
     assert_eq "4.39" "$HOST_MEMORY_BASELINE_GB" "the baseline was recorded"
     assert_says "$OUT/start.out" "browser phase start: compressor 4.39 GB, swap 0.00 GB" "the start line states both readings"
-    assert_says "$OUT/start.out" "stops at: swap over 1 GB, or compressor over 24.00 GB." "the thresholds are stated up front"
+    assert_says "$OUT/start.out" \
+        "stops at: swap over 1 GB (distress), or compressor over 16.00 GB (backstop)." \
+        "the thresholds are stated up front, and labelled"
+}
+
+# ── Test 7b: the two stops must not read alike ──────────────────────────
+# This pair is the whole point of the wording. A reader at 06:30 decides from
+# these lines whether the Mac was in trouble, and "Swap is still clear, so this
+# is the runaway backstop" was too easy to skim past.
+test_the_swap_stop_calls_itself_measured_distress() {
+    echo "test: the swap stop says the host is in trouble, in plain words"
+    reset_state
+    HOST_COMPRESSOR_GB_OVERRIDE=9.00 HOST_SWAP_USED_GB_OVERRIDE=2.40 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 12/33" >"$OUT/distress.out" 2>&1
+    assert_says "$OUT/distress.out" "MEASURED DISTRESS" "the swap stop names itself as distress"
+    assert_says "$OUT/distress.out" "the host is in" "it says the host is in trouble"
+    assert_silent_about "$OUT/distress.out" "BACKSTOP" "it does not also claim to be the backstop"
+    case "$MEMORY_STOP_DETAIL" in
+        *"measured distress"*) pass "the final-verdict detail carries the classification" ;;
+        *) fail "detail did not classify the stop: '$MEMORY_STOP_DETAIL'" ;;
+    esac
+}
+
+test_the_compressor_stop_says_the_host_was_never_in_trouble() {
+    echo "test: the backstop stop quotes the swap reading that proves it"
+    reset_state
+    HOST_COMPRESSOR_GB_OVERRIDE=16.40 HOST_SWAP_USED_GB_OVERRIDE=0.25 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 30/33" >"$OUT/runaway.out" 2>&1
+    assert_says "$OUT/runaway.out" "RUNAWAY BACKSTOP, NOT distress" "the stop names itself as the backstop"
+    assert_says "$OUT/runaway.out" "Swap is still clear at" "it states the swap reading, not just the word clear"
+    assert_says "$OUT/runaway.out" "0.25 GB, under its 1 GB limit" "the reading and the limit it cleared are both named"
+    assert_silent_about "$OUT/runaway.out" "MEASURED DISTRESS" "it does not also claim distress"
+    case "$MEMORY_STOP_DETAIL" in
+        *"not in distress"*) pass "the final-verdict detail carries the classification" ;;
+        *) fail "detail did not classify the stop: '$MEMORY_STOP_DETAIL'" ;;
+    esac
+}
+
+# "Not distress" is a claim about SWAP, so it cannot be made when swap was not
+# read. The compressor comes from vm_stat and swap from sysctl, so one can fail
+# alone, and the boundary only skips the check when BOTH are unreadable.
+test_the_backstop_stop_does_not_clear_a_host_it_could_not_read() {
+    echo "test: with swap unreadable the backstop stop refuses to say the host was fine"
+    local rc
+    reset_state
+    # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+    sysctl() { return 1; }
+    HOST_COMPRESSOR_GB_OVERRIDE=20.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 18/33" >"$OUT/blindswap.out" 2>&1
+    rc=$?
+    unset -f sysctl
+    assert_eq "1" "$rc" "the backstop still stops the run"
+    assert_says "$OUT/blindswap.out" "swap was UNREADABLE" "it says the swap reading is missing"
+    assert_silent_about "$OUT/blindswap.out" "Swap is still clear" "it does not claim swap was clear"
+    assert_silent_about "$OUT/blindswap.out" "never in" "it does not claim the host was never in trouble"
+    case "$MEMORY_STOP_DETAIL" in
+        *"could not be ruled out"*) pass "the final-verdict detail withholds the all-clear" ;;
+        *) fail "detail claimed more than it knew: '$MEMORY_STOP_DETAIL'" ;;
+    esac
 }
 
 test_stop_report_is_silent_on_a_run_that_finished() {
@@ -359,8 +483,11 @@ test_swap_over_the_limit_stops
 test_swap_at_the_limit_does_not_stop
 test_swap_wins_when_both_are_over
 test_backstop_scales_with_ram
+test_the_cap_bites_before_the_share_on_a_large_host
+test_the_reading_that_stopped_the_nightly_now_runs_on
 test_explicit_absolute_ceiling_overrides_the_share
 test_percent_knob_is_honored
+test_the_percent_knob_cannot_raise_the_backstop_past_the_cap
 test_garbage_knobs_fall_back_to_defaults
 test_garbage_swap_knob_does_not_stop_a_host_with_some_swap
 test_negative_percent_cannot_stop_everything
@@ -369,6 +496,9 @@ test_unreadable_ram_drops_the_backstop_but_keeps_swap
 test_swap_units_are_read_off_the_value
 test_compressor_uses_the_reported_page_size
 test_start_records_the_baseline_and_states_the_thresholds
+test_the_swap_stop_calls_itself_measured_distress
+test_the_compressor_stop_says_the_host_was_never_in_trouble
+test_the_backstop_stop_does_not_clear_a_host_it_could_not_read
 test_stop_report_is_silent_on_a_run_that_finished
 test_stop_report_states_what_this_run_itself_cost
 test_stop_report_does_not_advise_raising_the_ceiling

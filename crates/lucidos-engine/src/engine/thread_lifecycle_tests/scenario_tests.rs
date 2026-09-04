@@ -150,15 +150,19 @@ fn all_scenarios_pass() {
                     false, // is_saved: scenarios assert the close set only
                 );
                 // Scenarios assert the CLOSE set (archive/apply/discard) — the
-                // Save/Unsave toggle and DiscardDraft layer postdate these
-                // fixtures, so filter them out of the comparison.
+                // Save/Unsave toggle, the DiscardDraft layer and the standing
+                // apply all postdate these fixtures, so filter them out of the
+                // comparison.
                 let action_strs: Vec<String> = actions
                     .iter()
                     .filter_map(|a| match a {
                         Action::Archive => Some("archive".to_string()),
                         Action::Apply => Some("apply".to_string()),
                         Action::Discard => Some("discard".to_string()),
-                        Action::Save | Action::Unsave | Action::DiscardDraft => None,
+                        Action::ApplyWhenSettled
+                        | Action::Save
+                        | Action::Unsave
+                        | Action::DiscardDraft => None,
                     })
                     .collect();
                 assert_eq!(

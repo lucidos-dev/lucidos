@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { VoiceSection } from '../VoiceSection';
+import { VoiceSection, TRANSCRIBER_MODELS } from '../VoiceSection';
 import { preferences } from '../../../store/store';
 import {
   DEFAULT_VOICE_TALKER_MODEL,
@@ -70,6 +70,30 @@ describe('the Voice settings section', () => {
     const rendered = render({ voice_enabled: 'true' });
     expect(rendered).toContain(`model="${DEFAULT_VOICE_TRANSCRIBER_MODEL}"`);
     expect(rendered).toContain(`value="${DEFAULT_VOICE_TALKER_VOICE}"`);
+  });
+
+  /** The list is read rather than rendered: `vnodeToText` keeps scalar props,
+   *  so the array never reaches the string above.
+   *
+   *  Live transcription leads because it is the one built for a microphone. The
+   *  engine branches on that same id to send `languages` instead of `language`.
+   *  A typo here offers a row the call cannot pin a language for. */
+  it('offers live transcription first, without dropping the older models', () => {
+    const ids = TRANSCRIBER_MODELS.map((m) => m.value);
+    expect(ids[0]).toBe('gpt-live-transcribe');
+    expect(ids).toContain('gpt-transcribe');
+    expect(ids).toEqual(
+      expect.arrayContaining(['gpt-4o-mini-transcribe', 'gpt-4o-transcribe', 'whisper-1']),
+    );
+  });
+
+  /** The list stays curated, which the user asked for explicitly. Free text
+   *  belongs to the Spoken voice row, whose names the provider owns. */
+  it('keeps the transcriber row a closed list and the spoken voice free', () => {
+    const rendered = render({ voice_enabled: 'true' });
+    expect(rendered).toContain('models:voice-transcriber');
+    expect(rendered.match(/freeText="true"/g)).toHaveLength(1);
+    expect(rendered).toMatch(/models:voice-talker-voice[\s\S]*freeText="true"/);
   });
 
   /** A toggle per section, rather than a field of comma-separated ids. The

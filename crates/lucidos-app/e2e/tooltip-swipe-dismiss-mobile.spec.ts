@@ -15,12 +15,8 @@
  */
 import { test, expect, Page } from './fixtures';
 import {
-  assertHealthy,
-  clickVisibleElement,
-  ensureMobileView,
-  isMobileViewport,
-  navigateToApp,
-  waitForVisibleElement,
+  apiRequest, assertHealthy, clickVisibleElement, ensureMobileView, isMobileViewport,
+  navigateToApp, waitForVisibleElement,
 } from './helpers';
 import { clearNotifications } from './db-helpers';
 
@@ -67,7 +63,7 @@ test.describe('Mobile tooltip dismiss on swipe', () => {
   });
 
   test('tap-revealed content-title tooltip hides when the user swipes away', async ({ page }) => {
-    const res = await page.request.post('/api/v1/notifications', {
+    const res = await apiRequest(page).post('/api/v1/notifications', {
       headers: { 'content-type': 'application/json' },
       data: { title: LONG_TITLE, message: 'pipeline body' },
     });

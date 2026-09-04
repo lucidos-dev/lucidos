@@ -1113,7 +1113,18 @@ mod tests {
     /// a user the type did not exist. The list is now rendered from `AuthType`,
     /// and one line says what a `secret` is for. Knowhow cannot carry it: the
     /// enum is what the model picks from when it writes the argument.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 116_763;
+    /// Raised by 446 to a measured 117,209 for the two *standing apply*
+    /// actions on the `changes` tool. ADR 0168 puts the standing apply on both
+    /// change surfaces. Philosophy rule 2 then requires it through the prompt
+    /// too. Knowhow cannot carry it: the action enum is what the model picks
+    /// from when it writes the argument.
+    ///
+    /// Raised by 161 to a measured 117,370 for `cancel_standing_apply`, the off
+    /// for those two arms. The prompt could arm and never disarm, which is
+    /// philosophy rule 2 half-kept. One action covers both scopes, so the cost
+    /// is a single entry. Knowhow cannot carry it: the action enum is what the
+    /// model picks from when it writes the argument.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 117_370;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///

@@ -357,28 +357,14 @@ export type ResponseEvent =
        *
        *  It sits INSIDE the doer's turn but is not the doer's words.
        *  The talker says what an answer means; the written answer beside it is
-       *  what the reader reads. The row wears its own speaker label so the two
-       *  are never confused (ADR 0150).
+       *  what the reader reads. So the row keeps a raised surface and a call
+       *  mark of its own, and the two are never confused (ADR 0150).
        *
        *  `interrupted` is set when the caller talked over it, so the text is
        *  what was said before they cut in rather than the whole reply. */
       type: 'spoken_reply';
       text: string;
       interrupted: boolean;
-    }
-  | {
-      /** What the CALLER said during a *voice session*, when the talker
-       *  answered it alone (`SpokenMessageReceived`).
-       *
-       *  An utterance the talker delegated becomes a `MessageReceived` and
-       *  opens its own turn, wearing the spoken chip. One it handled itself
-       *  starts nothing, so this row is the only place it appears.
-       *
-       *  A **transcript marker** for the same reason `spoken_reply` is: no
-       *  audio is kept, so hiding it behind the steps control would put half a
-       *  conversation nowhere. */
-      type: 'spoken_message';
-      text: string;
     }
   | {
       /** The model ended its turn cleanly but produced no text (a benign empty

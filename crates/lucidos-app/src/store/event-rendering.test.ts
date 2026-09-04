@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { drawsResponseRow, hasVisibleLiveStep } from './event-rendering';
+import { drawsResponseRow, liveStepIndex, rendersLiveStep } from './event-rendering';
 import type { ResponseEvent, StepOutcome } from './types';
 
 const step = (outcome: StepOutcome): ResponseEvent => ({
@@ -9,38 +9,62 @@ const step = (outcome: StepOutcome): ResponseEvent => ({
 });
 const text = (md: string): ResponseEvent => ({ type: 'text', md });
 
-describe('hasVisibleLiveStep', () => {
-  it('is true when steps are expanded, panel not collapsed, and a pending step is visible', () => {
-    expect(hasVisibleLiveStep(true, false, [text('hi'), step('pending')])).toBe(true);
+describe('rendersLiveStep', () => {
+  it('is true when steps are expanded, panel not collapsed, and a pending step is drawn', () => {
+    expect(rendersLiveStep(true, false, [text('hi'), step('pending')])).toBe(true);
   });
 
   it('is false when steps are hidden, even if a pending step exists', () => {
-    // The "Show steps" collapsed-toggle state: the live step is not on screen,
-    // so the "Working" label must carry the shimmer instead.
-    expect(hasVisibleLiveStep(false, false, [text('hi'), step('pending')])).toBe(false);
+    // The "Show steps" collapsed-toggle state: the live step draws no row, so
+    // the "Working" label must carry the shimmer instead.
+    expect(rendersLiveStep(false, false, [text('hi'), step('pending')])).toBe(false);
   });
 
   it('is false when the response panel is collapsed, even with a pending step', () => {
     // Collapse hides the whole steps body (only the header status shows), so the
-    // pending step's shimmer is off screen — the label must carry it instead.
-    expect(hasVisibleLiveStep(true, true, [text('hi'), step('pending')])).toBe(false);
+    // pending step draws no shimmer and the label must carry it instead.
+    expect(rendersLiveStep(true, true, [text('hi'), step('pending')])).toBe(false);
   });
 
   it('is false when steps are expanded but every visible step has resolved', () => {
-    expect(hasVisibleLiveStep(true, false, [step('success'), step('error'), text('done')])).toBe(false);
+    expect(rendersLiveStep(true, false, [step('success'), step('error'), text('done')])).toBe(false);
   });
 
   it('is false for an unfinished step: the turn died, nothing is running', () => {
     // A step killed mid-call is TERMINAL, not live. If it counted as a live
     // step it would suppress the "Working"/status shimmer on a dead turn and
     // (via `.running-shimmer`) animate a row nothing is working on.
-    expect(hasVisibleLiveStep(true, false, [step('unfinished')])).toBe(false);
-    expect(hasVisibleLiveStep(true, false, [step('success'), step('unfinished')])).toBe(false);
+    expect(rendersLiveStep(true, false, [step('unfinished')])).toBe(false);
+    expect(rendersLiveStep(true, false, [step('success'), step('unfinished')])).toBe(false);
   });
 
   it('is false when there are no step events at all', () => {
-    expect(hasVisibleLiveStep(true, false, [text('just text')])).toBe(false);
-    expect(hasVisibleLiveStep(true, false, [])).toBe(false);
+    expect(rendersLiveStep(true, false, [text('just text')])).toBe(false);
+    expect(rendersLiveStep(true, false, [])).toBe(false);
+  });
+});
+
+/** The index `ChatExchange` marks a row by, so the header label can read where
+ *  that row sits. It has to agree with `rendersLiveStep` on what a live row is,
+ *  and it has to name the FIRST one. */
+describe('liveStepIndex', () => {
+  it('is the position of the pending row in the drawn list', () => {
+    expect(liveStepIndex(true, false, [text('hi'), step('success'), step('pending')])).toBe(2);
+  });
+
+  it('names the FIRST pending row when parallel calls leave several', () => {
+    // The "Working" label sits above every row, so the first pending row is the
+    // first one the reader meets coming down from it. Naming the last would let
+    // the label shimmer over a visible row above it.
+    expect(liveStepIndex(true, false, [step('pending'), step('pending')])).toBe(0);
+  });
+
+  it('is -1 wherever no row is drawn, matching rendersLiveStep', () => {
+    const pending = [text('hi'), step('pending')];
+    expect(liveStepIndex(false, false, pending)).toBe(-1);
+    expect(liveStepIndex(true, true, pending)).toBe(-1);
+    expect(liveStepIndex(true, false, [step('success'), step('blocked')])).toBe(-1);
+    expect(liveStepIndex(true, false, [])).toBe(-1);
   });
 });
 

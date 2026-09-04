@@ -1,4 +1,62 @@
-import { Page, expect, Locator } from '@playwright/test';
+import { Page, APIResponse, expect, Locator } from '@playwright/test';
+import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
+
+/** Where the app keeps this browser's device id (`utils/deviceIdHeader.ts`). */
+const DEVICE_ID_KEY = 'lucidos-device-id';
+
+/** The device id this page registered at boot, or null before it navigates. */
+async function pageDeviceId(page: Page): Promise<string | null> {
+  try {
+    return await page.evaluate((key) => localStorage.getItem(key), DEVICE_ID_KEY);
+  } catch {
+    // No document yet (a spec that calls the API before its first goto), so
+    // there is no id to borrow.
+    return null;
+  }
+}
+
+/** `page.request`, identifying itself the way the page does.
+ *
+ *  `page.request` shares the browser context's cookies but NOT its
+ *  `localStorage`, so it carries no `x-lucidos-device-id` and
+ *  `api::mutating_gate` refuses every mutation it makes (ADR 0169). The
+ *  harness is a legitimate external client, so it presents a credential rather
+ *  than the gate being narrowed.
+ *
+ *  It borrows the PAGE's own id. A call the harness makes is then attributed to
+ *  the device the test is driving, and device-scoped preferences stay per-test.
+ *  Before the first navigation there is no id to borrow, so it registers one.
+ *
+ *  Shape-preserving on purpose: `apiRequest(page).put(url, opts)` takes exactly
+ *  what `page.request.put(url, opts)` took, and a caller's own `headers` win.
+ */
+export function apiRequest(page: Page) {
+  type Opts = Parameters<Page['request']['post']>[1];
+  const withDevice = async (opts: Opts): Promise<Opts> => {
+    let id = await pageDeviceId(page);
+    if (!id) {
+      await registerHarnessDevice(page.request);
+      id = HARNESS_DEVICE_ID;
+    } else {
+      // The page has the id in localStorage, but the app registers it
+      // server-side fire-and-forget, so it may not be in `devices` yet. Make
+      // sure it is before a mutating call borrows it, or the gate 401s it
+      // (ADR 0169). See ensurePageDeviceRegistered.
+      await ensurePageDeviceRegistered(page.request, id);
+    }
+    return { ...opts, headers: { 'x-lucidos-device-id': id, ...opts?.headers } };
+  };
+  return {
+    post: async (url: string, opts?: Opts): Promise<APIResponse> =>
+      page.request.post(url, await withDevice(opts)),
+    put: async (url: string, opts?: Opts): Promise<APIResponse> =>
+      page.request.put(url, await withDevice(opts)),
+    delete: async (url: string, opts?: Opts): Promise<APIResponse> =>
+      page.request.delete(url, await withDevice(opts)),
+    patch: async (url: string, opts?: Opts): Promise<APIResponse> =>
+      page.request.patch(url, await withDevice(opts)),
+  };
+}
 
 /** CSS selector for the body of a rendered user message (initiator panel).
  *  Centralized so a UI rename only requires changing this one constant. */
@@ -609,7 +667,7 @@ export async function getHeaderTop(page: Page): Promise<number> {
  *  button and the header then shifted the form, so the mouseup landed on the
  *  wrapper. No click reached the button, and the form never submitted. */
 export async function disableMobileHeaderSticky(page: Page): Promise<void> {
-  const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
+  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'false' },
   });
   expect(res.ok()).toBeTruthy();
@@ -622,7 +680,7 @@ export async function disableMobileHeaderSticky(page: Page): Promise<void> {
  *  this in its beforeEach BEFORE navigating, so it boots pinned whatever the
  *  order. Pairs with `disableMobileHeaderSticky`. */
 export async function enableMobileHeaderSticky(page: Page): Promise<void> {
-  const res = await page.request.put('/api/v1/preferences?key=mobile_header_sticky', {
+  const res = await apiRequest(page).put('/api/v1/preferences?key=mobile_header_sticky', {
     data: { value: 'true' },
   });
   expect(res.ok()).toBeTruthy();
@@ -639,7 +697,7 @@ export async function enableMobileHeaderSticky(page: Page): Promise<void> {
  *  `afterAll`. Never assume the previous spec's value: a spec that needs voice
  *  off sets it off, so it passes alone and in any order. */
 export async function setVoiceEnabled(page: Page, on: boolean): Promise<void> {
-  const res = await page.request.put('/api/v1/preferences?key=voice_enabled', {
+  const res = await apiRequest(page).put('/api/v1/preferences?key=voice_enabled', {
     data: { value: String(on) },
   });
   expect(res.ok()).toBeTruthy();

@@ -12,9 +12,9 @@ use std::pin::Pin;
 
 use chrono::Utc;
 
+use super::decision::{open_on, DecisionKind, OpenDecision};
 use super::{choices_for, clip, read_pref, READ_ALOUD_CHARS};
 use crate::core::store::build_session_messages;
-use crate::engine::agent_recovery::{newest_open_question, OpenQuestion};
 use crate::engine::LucidosEngine;
 use crate::scheduler::NotificationStore;
 
@@ -107,15 +107,16 @@ fn who_and_where(engine: &LucidosEngine, _thread_id: uuid::Uuid) -> SectionFutur
     })
 }
 
-/// This thread's title, its recent turns, and any question it is parked on.
+/// This thread's title, its recent turns, and anything it is waiting on.
 ///
 /// Voice joins a conversation that already exists, so without this the talker
 /// answers "what were we saying" with nothing.
 ///
-/// The question is here rather than in a section of its own, for two reasons.
-/// It is part of this conversation, and a section nobody has enabled cannot be
-/// read: a workspace that already wrote `voice_resident_sections` gets exactly
-/// what that row lists, so a new id would reach the readers who need it least.
+/// What is waiting is here rather than in a section of its own, for two
+/// reasons. It is part of this conversation, and a section nobody has enabled
+/// cannot be read: a workspace that already wrote `voice_resident_sections`
+/// gets exactly what that row lists, so a new id would reach the readers who
+/// need it least.
 fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'_> {
     Box::pin(async move {
         let store = engine.event_store();
@@ -125,7 +126,7 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
         let (title, events, open) = tokio::join!(
             store.get_thread_title(thread_id),
             store.get_recent_thread_events(thread_id, THREAD_EVENT_WINDOW),
-            newest_open_question(engine.pool(), thread_id),
+            open_on(engine.pool(), thread_id),
         );
 
         let mut out = String::new();
@@ -152,33 +153,46 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
             ));
         }
 
-        if let Some(open) = open {
-            out.push_str(&open_question_block(&open));
+        for decision in &open {
+            out.push_str(&open_decision_block(decision));
         }
         Ok(out)
     })
 }
 
-/// A question the thread is parked on, written as something the talker knows.
+/// Something the thread is waiting on, written as what the talker KNOWS.
 ///
-/// Stated as fact, not as an instruction. The block is what the talker KNOWS,
-/// and where an answer goes is a fact about this workspace rather than a rule
-/// it follows. That an utterance cannot settle it is the same kind of fact,
-/// and saying it is what stops the talker promising to record one.
+/// Stated as fact, not as an instruction. The block is knowledge, and where an
+/// answer goes is a fact about this workspace rather than a rule it follows.
+/// That the caller can settle it out loud is a fact of the same kind. Saying it
+/// is what stops the talker sending them to the screen.
 ///
-/// The turn fold above cannot carry this. A question is not a message, so
-/// `build_session_messages` has no arm for it and never will: the agent
-/// already reads its own `ask_user_question` call and result.
-fn open_question_block(open: &OpenQuestion) -> String {
-    // The question itself is never cut, unlike the turns above it. A
-    // truncated question is a different question, and the talker is about to
-    // state it as the one being asked.
+/// The turn fold above cannot carry this. A card is not a message, so
+/// `build_session_messages` has no arm for one and never will: the agent
+/// already reads its own tool call and result.
+fn open_decision_block(decision: &OpenDecision) -> String {
+    // Exhaustive, so a fourth kind has to decide what the caller hears rather
+    // than inheriting the permission wording by default.
+    let (waiting, label) = match decision.kind {
+        DecisionKind::Question => ("Lucidos asked this and it is still unanswered", "Question"),
+        DecisionKind::CommandPermission
+        | DecisionKind::McpPermission
+        | DecisionKind::CodingAgentPermission => (
+            "Lucidos needs their say-so before it can carry on",
+            "Asking",
+        ),
+    };
+    // The prompt itself is never cut, unlike the turns above it. A truncated
+    // question is a different question, and the talker is about to state it as
+    // the one being asked.
     format!(
-        "\nWaiting on them: Lucidos asked this and it is still unanswered. It \
-         is answered on screen, so nothing said aloud settles it.\n\
-         Question: {}\n{}",
-        open.question.trim(),
-        choices_for(&open.options, open.multi_select),
+        "\nWaiting on them: {}. They can settle it out loud, by picking one of \
+         the choices below.\n\
+         {}: {}\n{}",
+        waiting,
+        label,
+        decision.prompt,
+        choices_for(&decision.choices),
     )
 }
 
@@ -372,10 +386,11 @@ mod tests {
         assert_eq!(list_line("Apps", &[]), "Apps: none\n");
     }
 
-    fn parked_on(multi_select: bool) -> OpenQuestion {
-        OpenQuestion {
-            question: "The mobile-webkit tail has no verdict. Do something now?".to_string(),
-            options: vec![
+    fn parked_on(multi_select: bool) -> OpenDecision {
+        OpenDecision::question(
+            "toolu_q0",
+            "The mobile-webkit tail has no verdict. Do something now?",
+            &[
                 QuestionOption {
                     id: "opt-0".to_string(),
                     label: "Run the tail now".to_string(),
@@ -388,50 +403,68 @@ mod tests {
                 },
             ],
             multi_select,
-        }
+        )
     }
 
     /// The talker answered "anything that needs me?" with no, over a question
     /// asked seventeen seconds earlier. The block now carries it in full.
     #[test]
     fn an_open_question_reaches_the_block_with_its_choices() {
-        let block = open_question_block(&parked_on(false));
+        let block = open_decision_block(&parked_on(false));
         assert!(block.contains("no verdict"), "{}", block);
         assert!(
-            block.contains("- Run the tail now: Chunks 25-33"),
+            block.contains("- Run the tail now [question:toolu_q0#opt0]: Chunks 25-33"),
             "{}",
             block
         );
-        assert!(block.contains("- Leave it for tonight\n"), "{}", block);
-        assert!(!block.contains("more than one"), "{}", block);
+        assert!(
+            block.contains("- Leave it for tonight [question:toolu_q0#opt1]\n"),
+            "{}",
+            block
+        );
     }
 
     /// Stated as fact, because the block is what the talker KNOWS. Where the
-    /// answer goes is a fact about this workspace. That an utterance settles
-    /// nothing is the fact stopping the talker promising to record one.
+    /// answer goes is a fact about this workspace, and it is no longer the
+    /// screen: the caller settles it out loud.
     #[test]
-    fn the_block_says_an_utterance_cannot_answer_it() {
-        let block = open_question_block(&parked_on(false));
-        assert!(block.contains("answered on screen"), "{}", block);
-        assert!(block.contains("nothing said aloud settles it"), "{}", block);
+    fn the_block_says_the_caller_can_settle_it_out_loud() {
+        let block = open_decision_block(&parked_on(false));
+        assert!(block.contains("settle it out loud"), "{}", block);
+        assert!(!block.to_lowercase().contains("on screen"), "{}", block);
     }
 
+    /// A permission card reads as one, rather than as a question Lucidos asked.
     #[test]
-    fn a_multi_select_question_says_more_than_one_may_be_picked() {
-        assert!(open_question_block(&parked_on(true)).contains("more than one"));
+    fn a_permission_card_reads_as_a_request_for_a_say_so() {
+        let block = open_decision_block(&OpenDecision::command_permission(
+            "req-1",
+            "run_bash",
+            "gh release delete v1",
+            "Deletes a published release.",
+        ));
+        assert!(block.contains("their say-so"), "{}", block);
+        assert!(block.contains("gh release delete v1"), "{}", block);
+        assert!(
+            block.contains("- Allow once [command:req-1#allow-once]"),
+            "{}",
+            block
+        );
+        assert!(block.contains("- Deny [command:req-1#deny]"), "{}", block);
     }
 
-    /// A free-text question carries no choices, so the block promises none.
+    /// A free-text question still carries the one choice that answers it: the
+    /// caller's own words. Nothing else can settle it.
     #[test]
-    fn a_question_with_no_choices_offers_none() {
-        let open = OpenQuestion {
-            question: "What should I call it?".to_string(),
-            options: vec![],
-            multi_select: false,
-        };
-        let block = open_question_block(&open);
+    fn a_question_with_no_options_still_offers_their_own_words() {
+        let block = open_decision_block(&OpenDecision::question(
+            "toolu_q1",
+            "What should I call it?",
+            &[],
+            false,
+        ));
         assert!(block.contains("What should I call it?"), "{}", block);
-        assert!(!block.contains("Choices"), "{}", block);
+        assert!(block.contains("[question:toolu_q1#said]"), "{}", block);
     }
 
     #[test]

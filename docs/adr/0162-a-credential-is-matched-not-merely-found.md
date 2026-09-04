@@ -25,10 +25,14 @@ conceded it: "Moving a data dir renames the cookie and asks its devices to pair
 again."
 
 Both were found while diagnosing a paired iPhone that met the pairing screen.
-Neither turned out to be the cause of that incident, which was the phone's own
-storage container dropping a cookie. Both are real, and both produce the same
-symptom the report opened with: the server lists the device, and the device is
-refused.
+Both are real, and both produce the same symptom the report opened with: the
+server lists the device, and the device is refused.
+
+> **Correction, ADR 0171.** This entry went on to name the phone's storage
+> container as that incident's cause. It was not. The gateway read only the
+> first `cookie` header field, and HTTP/2 clients split a jar across several.
+> The decisions below all stand. The cause attribution does not, and 0171
+> carries the evidence.
 
 ## Decision
 

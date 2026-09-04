@@ -3,7 +3,7 @@
 //! HTTP — unique-name, unknown-id rejection, delete-when-empty, and the
 //! denormalized `member_count` projection.
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
 async fn create_group(
@@ -45,7 +45,7 @@ async fn list_groups(client: &reqwest::Client) -> serde_json::Value {
 
 #[tokio::test]
 async fn create_list_delete_round_trips() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("e2e-group");
     let group = create_group(&client, &name, None).await;
     let group_id = group["id"].as_str().unwrap().to_string();
@@ -66,7 +66,7 @@ async fn create_list_delete_round_trips() {
 
 #[tokio::test]
 async fn create_rejects_duplicate_name_case_insensitive() {
-    let client = http_client();
+    let client = user_client().await;
     let name = unique_marker("dup-group");
     let group = create_group(&client, &name, None).await;
     let group_id = group["id"].as_str().unwrap().to_string();
@@ -95,7 +95,7 @@ async fn create_rejects_duplicate_name_case_insensitive() {
 /// unique-name invariant the rest of the system assumes.
 #[tokio::test]
 async fn concurrent_creates_with_same_name_yield_one_group() {
-    let client = http_client();
+    let client = user_client().await;
     // Append a uuid so two concurrent test-runner invocations (or rapid
     // re-runs landing on the same millisecond) can't share the marker and
     // poison each other's win/conflict counts.
@@ -163,7 +163,7 @@ async fn concurrent_creates_with_same_name_yield_one_group() {
 
 #[tokio::test]
 async fn unknown_group_id_on_trigger_create_is_rejected() {
-    let client = http_client();
+    let client = user_client().await;
     // Make sure timezone is set so create_trigger doesn't reject for that reason.
     let _ = client
         .put(format!("{}/api/v1/preferences", base_url()))
@@ -197,7 +197,7 @@ async fn unknown_group_id_on_trigger_create_is_rejected() {
 
 #[tokio::test]
 async fn delete_blocks_when_non_empty_and_returns_members() {
-    let client = http_client();
+    let client = user_client().await;
     let _ = client
         .put(format!("{}/api/v1/preferences", base_url()))
         .json(&json!({ "key": "timezone", "value": "UTC" }))
@@ -336,7 +336,7 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
 
 #[tokio::test]
 async fn reorder_endpoint_updates_panel_order() {
-    let client = http_client();
+    let client = user_client().await;
     let a = create_group(&client, &unique_marker("reorder-a"), Some(100)).await;
     let b = create_group(&client, &unique_marker("reorder-b"), Some(200)).await;
     let a_id = a["id"].as_str().unwrap().to_string();

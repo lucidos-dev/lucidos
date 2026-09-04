@@ -334,6 +334,28 @@ describe('incremental grouping ≡ full grouping', () => {
     expect(after.revision ?? 0).toBeGreaterThan(beforeRevision);
   });
 
+  // A call is the sequence with the most fold state per event: a boundary that
+  // hands `current` back, rows routed to the bottom rather than to `current`,
+  // and a re-anchor held by an utterance. Each of those reads state the resumed
+  // fold has to carry, so this is the shape most able to drift between the two
+  // paths. See `docs/plans/2026-08-31-a-call-reads-as-one-conversation.md`.
+  it('a call stays equivalent through every spoken turn', () => {
+    replay([
+      { seq: 1, event: { type: 'VoiceSessionStarted', session_id: 's1' } as ThreadEvent },
+      { seq: 2, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Hi there.', interrupted: false } as ThreadEvent },
+      { seq: 3, event: { type: 'WorkDelegated', session_id: 's1', reason: 'Check it.' } as ThreadEvent },
+      { seq: 4, event: { type: 'MessageReceived', text: 'how long?', voice_session_id: 's1' } as ThreadEvent },
+      { seq: 5, event: { type: 'ToolCalled', name: 'run_bash', args: {} } as ThreadEvent },
+      { seq: 6, event: { type: 'SpokenMessageReceived', session_id: 's1', text: 'Still there?' } as ThreadEvent },
+      { seq: 7, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Working on it.', interrupted: false } as ThreadEvent },
+      { seq: 8, event: { type: 'TodoListWritten', items: [] } as ThreadEvent },
+      { seq: 9, event: { type: 'SpokenMessageReceived', session_id: 's1', text: 'Any idea?' } as ThreadEvent },
+      { seq: 10, event: { type: 'ResponseGenerated', text: 'ten minutes' } as ThreadEvent },
+      { seq: 11, event: { type: 'SpokenReplyGenerated', session_id: 's1', text: 'Ten minutes.', interrupted: false } as ThreadEvent },
+      { seq: 12, event: { type: 'VoiceSessionEnded', session_id: 's1', reason: 'hangup', duration_secs: 30 } as ThreadEvent },
+    ]);
+  });
+
   it('a long streaming turn stays equivalent at every token', () => {
     const events: Array<{ seq: number; event: ThreadEvent }> = [
       { seq: 1, event: { type: 'MessageReceived', text: 'stream a lot' } as ThreadEvent },

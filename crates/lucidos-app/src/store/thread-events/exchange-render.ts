@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { isSpokenTurn, toolUseIdOf } from './exchange-grouping';
+import { VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -864,9 +864,12 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // An exchange boundary in groupIntoExchanges, never a step.
         break;
       case 'SpokenReplyGenerated': {
-        // What the caller actually heard. It lands inside the doer's turn
-        // because that is when it was said: the talker stalls truthfully while
-        // the turn runs, then says what the answer means once it lands.
+        // What the caller actually heard. It lands inside the exchange that was
+        // open because that is when it was said: the talker stalls truthfully
+        // while a turn runs, then says what the answer means once it lands.
+        //
+        // The caller's own words are NOT a row here. They open an exchange and
+        // draw the ordinary user bubble, so a caller reads the same either way.
         //
         // No audio is kept, so this row is the whole record of a spoken turn.
         // It is a marker rather than a step, and renders ungated.
@@ -877,18 +880,6 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
           text: e.text,
           interrupted: e.interrupted === true,
         });
-        break;
-      }
-      case 'SpokenMessageReceived': {
-        // What the caller said when the talker answered it alone. It started
-        // no turn, so unlike a delegated utterance it becomes no
-        // `MessageReceived` and has no bubble of its own anywhere.
-        //
-        // Without this row half of a call is missing from the thread: every
-        // question the caller asked and the talker fielded itself.
-        const e = event as { text: string };
-        if (!hasVisibleText(e.text)) break;
-        events.push({ type: 'spoken_message', text: e.text });
         break;
       }
       case 'CommandCheckpointed': {
@@ -1129,9 +1120,12 @@ export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
   return events.some(e => e.type !== 'text' || isMeaningfulText(e));
 }
 
-/** True when this body carries something said out loud, in either direction. */
+/** True when this body carries something Lucidos said out loud.
+ *
+ *  The caller's own words are not looked for. They open an exchange of their
+ *  own, so a body never holds one. */
 function hasSpokenRow(events: ResponseEvent[]): boolean {
-  return events.some(e => e.type === 'spoken_reply' || e.type === 'spoken_message');
+  return events.some(e => e.type === 'spoken_reply');
 }
 
 /** True when a question divider draws its header and nothing else.
@@ -1227,8 +1221,11 @@ export function questionDividerResolution(
 }
 
 /** Change-lifecycle banner exchanges whose body may carry a post-boundary CC
- *  continuation. Excludes `ChangeApplyFailed` — its initiator renders the error
- *  and the change stays pending, so it has no "continued work" body. */
+ *  continuation. Excludes `ChangeApplyFailed`: its initiator renders the error
+ *  and the change stays pending, so it has no "continued work" body.
+ *
+ *  The exclusion is about WORK. A spoken row is not work, and every banner can
+ *  acquire one, so `changePanelHasContinuation` asks about that separately. */
 const CHANGE_CONTINUATION_PANELS: ReadonlySet<string> = new Set([
   'ChangeApplied',
   'ChangeDiscarded',
@@ -1243,8 +1240,15 @@ const CHANGE_CONTINUATION_PANELS: ReadonlySet<string> = new Set([
  *  The banner normally suppresses its response body (`showResponsePanel` in
  *  ChatExchange). When this is true the body must render, or the continued
  *  work is invisible between two "Change applied" rows. Idle and snapshot-only
- *  steps do not count: only output `exchangeResponseEvents` would render. */
+ *  steps do not count: only output `exchangeResponseEvents` would render.
+ *
+ *  **A spoken row counts on EVERY banner**, the failed one included. A banner
+ *  is a boundary, so a call greeting said while one sat at the bottom folds in
+ *  here. No audio is kept, so suppressing the body is the difference between
+ *  the line being hidden and being gone. Same carve-out, same reason, as
+ *  `dividerBodyIsSuppressed`. */
 export function changePanelHasContinuation(exchange: Exchange): boolean {
+  if (exchange.steps.some(({ event }) => event.type === 'SpokenReplyGenerated')) return true;
   if (!CHANGE_CONTINUATION_PANELS.has(exchange.userEvent.type)) return false;
   return exchange.steps.some(({ event }) =>
     event.type === 'CodingAgentTextStreamed'
@@ -1385,23 +1389,6 @@ export function abortTookEngineDown(ev: ThreadEvent): boolean {
   return ev.type === 'ResponseAborted' && isEngineDownAbort(ev.cause);
 }
 
-/** Everything a call can leave in an exchange without a turn behind it.
- *
- *  The two spoken rows are what a reader sees. The session pair and the
- *  delegation marker draw nothing, yet they still fold in as steps. A set
- *  naming only the visible two would answer `false` for most real calls.
- *
- *  A delegation is in the set deliberately. It sits beside a `MessageReceived`,
- *  which is a boundary, so that turn opens an exchange of its own. The marker
- *  left here reports no work landing HERE. */
-const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
-  'SpokenMessageReceived',
-  'SpokenReplyGenerated',
-  'VoiceSessionStarted',
-  'VoiceSessionEnded',
-  'WorkDelegated',
-]);
-
 /** True when this exchange is a stretch of a call and holds no turn at all.
  *
  *  A call is not a turn (ADR 0148), so such an exchange never gets a
@@ -1409,13 +1396,35 @@ const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
  *  looks exactly like a crash, which is what stamped "Aborted" on every
  *  finished call.
  *
- *  Both halves are required. The boundary must be a spoken turn, so an ordinary
- *  turn that merely OVERLAPPED a call is untouched. And every step must be a
- *  voice row, so a delegation landing here later takes the exchange back to the
- *  ordinary machinery. */
+ *  Both halves are required. The boundary must be part of a call, so an
+ *  ordinary turn that merely OVERLAPPED one is untouched. And every step must
+ *  be a voice row, so the doer's first tool call takes the exchange back to the
+ *  ordinary machinery.
+ *
+ *  A DELEGATED utterance qualifies while its doer sleeps, which is the whole of
+ *  the wait this arm exists to show. It is a `MessageReceived` rather than a
+ *  spoken turn, and `voice_session_id` is what says it was said rather than
+ *  typed (`isCallerUtterance`). */
 function isCallOnly(exchange: Exchange): boolean {
-  if (!isSpokenTurn(exchange.userEvent)) return false;
+  if (!isCallBoundary(exchange.userEvent)) return false;
   return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
+}
+
+/** True when this stretch of a call has been answered, so nothing is pending.
+ *
+ *  A caller's utterance the talker fielded itself is answered by the reply it
+ *  spoke: no doer was asked, so nothing else is coming. A greeting is its own
+ *  whole exchange and is answered by construction.
+ *
+ *  **A DELEGATED utterance is never answered by speech.** The talker stalls
+ *  while the doer works, routinely before the doer has even woken. Counting
+ *  that stall would settle the exact wait this arm exists to show. The answer
+ *  there is the doer's, and the doer's first step takes the exchange out of
+ *  `isCallOnly` entirely. */
+function callAnswered(exchange: Exchange): boolean {
+  if (exchange.userEvent.type === 'MessageReceived') return false;
+  if (exchange.userEvent.type === 'SpokenReplyGenerated') return true;
+  return exchange.steps.some(s => s.event.type === 'SpokenReplyGenerated');
 }
 
 /** True when the call this exchange holds has rung off.
@@ -1597,15 +1606,6 @@ export function isPendingFollowup(exchange: Exchange): boolean {
   return ev.type === 'MessageReceived' && !ev.created && !!ev._displayCreated;
 }
 
-/** A chat user message that has been accepted by the UI/server but not yet
- *  ingested by the agentic loop. Optimistic messages have `_displayCreated`
- *  and no `created`; persisted queued messages have `created`. Both stay
- *  stepless until `UserPromptInjected` lands and is absorbed into the
- *  exchange. */
-function isUningestedChatMessage(exchange: Exchange): boolean {
-  return exchange.userEvent.type === 'MessageReceived' && exchange.steps.length === 0;
-}
-
 function exchangeHasTerminalStep(exchange: Exchange): boolean {
   return exchange.steps.some(({ event }) =>
     event.type === 'ResponseGenerated'
@@ -1654,27 +1654,51 @@ export interface QueuedFollowupRun {
  *  rather than as one contiguous trailing run. Coding agents are excluded:
  *  their follow-ups go straight to subprocess stdin, and only chat uses the
  *  agentic-loop queue. */
+/** The bottom exchange that could own a turn, stepping over a *live utterance*.
+ *
+ *  That row is the caller mid-sentence and holds nothing: no stream, no badge,
+ *  no `last` role. Every fallback here means "whatever is at the bottom", and
+ *  the row is at the bottom by construction while somebody is speaking. */
+function lastTurnBearingIndex(exchanges: Exchange[]): number {
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (!isLiveUtteranceRow(exchanges[i].userEvent)) return i;
+  }
+  return -1;
+}
+
 export function queuedFollowupRun(
   exchanges: Exchange[],
   threadBusy: boolean,
   threadIsCC = false,
 ): QueuedFollowupRun {
   const empty: QueuedFollowupRun = {
-    activeIndex: exchanges.length - 1,
+    activeIndex: lastTurnBearingIndex(exchanges),
     queuedOrder: [],
     queuedIndices: new Set(),
   };
   if (!threadBusy || threadIsCC || exchanges.length === 0) return empty;
 
+  // The QUEUE is what the reader may retract, so a delegated utterance is not
+  // a candidate: it is speech, and nothing offers to unsay it.
+  // Two lists, because they answer different questions. `awaiting` is every
+  // message the loop has still to take, and the oldest of those is what the
+  // reader is waiting on. `candidates` is the retractable subset.
+  const awaiting: number[] = [];
   const candidates: number[] = [];
   for (let i = 0; i < exchanges.length; i++) {
-    if (isUningestedChatMessage(exchanges[i])) candidates.push(i);
+    if (!isUningestedMessage(exchanges[i])) continue;
+    awaiting.push(i);
+    if (isWaitingTypedMessage(exchanges[i])) candidates.push(i);
   }
-  if (candidates.length === 0) return empty;
 
   let activeIndex = -1;
   for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (isUningestedChatMessage(exchanges[i])) continue;
+    // The WALK asks a wider question, so it takes a wider predicate. What
+    // decides the live turn is whether the loop has TAKEN the message, and a
+    // delegated utterance awaiting its injection has not been taken. Read as
+    // the active one, it steals the running turn's stream and badge.
+    if (isUningestedMessage(exchanges[i])) continue;
+    if (exchangeHoldsNoTurn(exchanges[i])) continue;
     // Only the MOST RECENT settled or in-flight turn can own queued
     // follow-ups, so stop at the first non-uningested exchange. If it can be
     // queued behind, the follow-up queues behind it. If it is terminal, the
@@ -1687,7 +1711,18 @@ export function queuedFollowupRun(
     if (canQueueBehind(exchanges[i])) activeIndex = i;
     break;
   }
-  if (activeIndex === -1) activeIndex = candidates[0];
+  // Nothing beneath owns a turn. The reader is then waiting on the oldest
+  // message the loop has still to take, which is the next one. `awaiting`
+  // rather than `candidates`: a DELEGATED utterance is not retractable and so
+  // is not a candidate, but it is exactly what a caller is waiting on. Picked
+  // by `candidates` alone it could never be active, and the live stream went to
+  // whatever the caller said last instead.
+  //
+  // With nothing awaiting either, the literal last exchange is active. That is
+  // a call with no doer turn under it at all.
+  if (activeIndex === -1) {
+    activeIndex = awaiting.length > 0 ? awaiting[0] : lastTurnBearingIndex(exchanges);
+  }
 
   const queuedOrder = candidates.filter(i => i !== activeIndex);
   if (queuedOrder.length === 0) {
@@ -2008,6 +2043,39 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // (`isExchangeStartEvent`), so it should hold no steps. If a future routing
   // path lands a real terminal in it, that terminal reports itself.
   if (isUserStoppedWait(exchange.userEvent)) return 'done';
+  // A stretch of a call, holding no turn at all. The stale detector below has
+  // nothing to have caught: it reads a transcript with no terminator as a
+  // crash, and every finished call rendered "Aborted" until this arm.
+  //
+  // The LIVE one settles on either of two facts. The caller has heard back, so
+  // nothing is pending. Or the call rang off, which ends the wait however it
+  // ends. Neither holds while the caller waits, and that wait is the stretch
+  // the transcript used to say nothing about at all.
+  //
+  // Any OTHER one is settled. `isLast` is the ACTIVE exchange rather than the
+  // final one, so this also takes an utterance under a live turn or an open
+  // question card. Both are honest: the affordance for that wait is on the turn
+  // or on the card, and a shimmer here would be a second one. What it must
+  // never do is spin. An utterance the talker never answered, with more said
+  // after it, would otherwise never settle.
+  //
+  // High in the chain deliberately, above the queued, interrupted and non-last
+  // arms. A call is not a turn (ADR 0148), so none of those verdicts is about
+  // it. The terminal arms above stay above: a real terminator lands only in an
+  // exchange this no longer matches.
+  if (threadIdle && isCallOnly(exchange)) {
+    if (!isLast) return 'done';
+    if (callAnswered(exchange)) return 'done';
+    if (!callHasEnded(exchange)) return 'streaming';
+    // Ringing off settles the CALL, and for a talker-only utterance that is
+    // the same thing: no doer was asked, so nothing else was coming.
+    //
+    // A DELEGATED one is not settled by it. Its answer is the doer's and
+    // outlives the call, so a hangup says nothing about whether the turn ran.
+    // Falling through hands it to the ordinary machinery, which reports a turn
+    // that produced nothing as the crash it is.
+    if (exchange.userEvent.type !== 'MessageReceived') return 'done';
+  }
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // Agent idle. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';
@@ -2088,22 +2156,6 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // branch above bypasses. It must not read as a crash, which is why `isStale`
   // excludes it outright rather than relying on this line's position.
   if (isAbsorbedUpiPlaceholder) return 'done';
-
-  // A call the talker answered alone, which holds no turn at all. So the
-  // stale detector below has nothing to have caught: it reads a transcript
-  // with no terminator as a crash, and every finished call rendered "Aborted"
-  // until this arm.
-  //
-  // A call still up is NOT terminal, and the thread cannot say so: voice never
-  // moves `status`, so `threadIdle` is true for the whole of a talker-only
-  // call. The session's own end is the signal, and one always lands, so
-  // nothing can spin here forever.
-  //
-  // `threadIdle` still guards the arm, to keep it off a doer turn running
-  // elsewhere on the thread.
-  if (threadIdle && isCallOnly(exchange)) {
-    return callHasEnded(exchange) ? 'done' : 'streaming';
-  }
 
   if (isStale) return 'aborted';
 

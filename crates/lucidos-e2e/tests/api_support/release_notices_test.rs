@@ -1,7 +1,7 @@
 //! `/api/v1/release-notices`: what this workspace still owes the reader, and
 //! the answer that settles one.
 
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, user_client};
 use serde_json::Value;
 
 fn list_url() -> String {
@@ -69,7 +69,8 @@ async fn the_list_serves_both_surfaces_from_one_shape() {
 /// than a silent no-op. The cursor must never move to a name nothing defines.
 #[tokio::test]
 async fn resolving_an_unknown_notice_is_refused() {
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!("{}/resolve", list_url()))
         .json(&serde_json::json!({ "id": "no-such-release-notice" }))
         .send()
@@ -96,7 +97,10 @@ async fn answering_a_settled_notice_changes_nothing() {
         return;
     };
 
-    let resp = http_client()
+    // Resolving walks the workspace past the notice, so the caller has to be
+    // one the engine can name (ADR 0169). Reading the list needs nobody.
+    let resp = user_client()
+        .await
         .post(format!("{}/resolve", list_url()))
         .json(&serde_json::json!({ "id": settled }))
         .send()
@@ -132,7 +136,8 @@ async fn answering_the_owed_notice_settles_it() {
         return;
     };
 
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .post(format!("{}/resolve", list_url()))
         .json(&serde_json::json!({ "id": owed }))
         .send()

@@ -8,7 +8,7 @@
 //! HTTP surface has to carry the value in both directions and has to keep the
 //! absent-vs-explicit-null distinction that lets a caller clear it.
 
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, unique_marker, user_client};
 use serde_json::json;
 
 /// Fetch one model from `GET /models`, or `None` if absent.
@@ -41,7 +41,7 @@ async fn delete_model(client: &reqwest::Client, api: &str, id: &str) {
 /// read it back, change it, and clear it with an explicit `null`.
 #[tokio::test]
 async fn context_window_round_trips_over_http() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = unique_marker("e2e-model");
 
@@ -137,7 +137,7 @@ async fn context_window_round_trips_over_http() {
 /// refactor could nest or drop the field without any Rust test noticing.
 #[tokio::test]
 async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     for (id, expected) in [
@@ -188,7 +188,7 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
 /// cannot know, and a wrong answer would fail their turns.
 #[tokio::test]
 async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = unique_marker("e2e-model-local");
 
@@ -220,7 +220,7 @@ async fn a_new_local_model_is_offered_only_the_universally_safe_tiers() {
 /// separately.
 #[tokio::test]
 async fn seeded_grok_models_report_xai_and_their_declared_windows() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     for (id, window, enabled) in [
@@ -245,7 +245,7 @@ async fn seeded_grok_models_report_xai_and_their_declared_windows() {
 /// always did, which is what this asserts at the HTTP surface.
 #[tokio::test]
 async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let prefixed = "x-ai/grok-4.6";
 
@@ -290,7 +290,7 @@ async fn a_bare_xai_grok_and_an_openrouter_grok_coexist() {
 /// a value that parses in Rust can still be refused at the API.
 #[tokio::test]
 async fn the_keyless_provider_is_accepted_at_the_models_api() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = unique_marker("e2e-free-model");
 
@@ -328,7 +328,7 @@ async fn the_keyless_provider_is_accepted_at_the_models_api() {
 /// window from the id. This is the back-compat path every existing row takes.
 #[tokio::test]
 async fn omitted_context_window_is_null() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let id = unique_marker("e2e-model-nowin");
 
@@ -355,7 +355,7 @@ async fn omitted_context_window_is_null() {
 /// This asserts the seeds survive all the way to the HTTP surface.
 #[tokio::test]
 async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     // Every group below mirrors one decision in the two seeding migrations
@@ -467,7 +467,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
 /// shared by every test within a run.
 #[tokio::test]
 async fn builtin_accepts_context_window_but_keeps_its_identity() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     // A seeded builtin that no other test asserts on, so these edits can't race
     // one. Identity is read from the row rather than hardcoded, so a future
@@ -553,7 +553,7 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
 /// an enormous one.
 #[tokio::test]
 async fn non_positive_context_window_is_rejected() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
 
     for bad in [0, -1] {

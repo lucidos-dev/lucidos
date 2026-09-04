@@ -46,6 +46,9 @@ use lucidos_local_token::{read as local_token, HEADER_LOCAL_TOKEN};
 ///   than served.
 /// - the local token, when this machine has a gateway that minted one. It is
 ///   what proves the caller is local, since a loopback peer address does not.
+///   The engine reads it twice: as the door's credential on a wide bind, and as
+///   the identity of a caller holding no origin token (ADR 0169). That second
+///   reading is what attributes the background rebuild's build slot.
 ///
 /// A subcommand that deliberately targets ANOTHER workspace (`lucidos
 /// spawn-thread --to`) sets the assertion itself on the request builder, which
@@ -132,8 +135,8 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 /// For a caller whose request is incidental to its real job, where a hung
 /// engine must cost seconds rather than half a minute. `build-slot` announces
 /// contention this way while a build waits. It exists so that caller does not
-/// hand-roll a third builder and drop the two default headers with it: an
-/// unattributed call is stamped `Api { mode: Human }` (ADR 0050), and one with
+/// hand-roll a third builder and drop the three default headers with it: a call
+/// carrying no credential at all cannot say who it is (ADR 0169), and one with
 /// no workspace assertion is served by whichever engine holds the port.
 pub(crate) fn client_with_timeout(
     timeout: std::time::Duration,
@@ -502,10 +505,10 @@ mod tests {
         assert_eq!(headers.len(), 1, "no second origin header may be sent");
     }
 
-    /// Env var unset means no header. Terminal users running `lucidos ...` by
-    /// hand (no subprocess context) get the honest path: the engine has no
-    /// evidence of who they are, so it stamps `Api { mode: Human }` and the UI
-    /// renders "API caller".
+    /// Env var unset means no origin header. A terminal user running `lucidos`
+    /// by hand still sends the local token, where the machine has one. The
+    /// engine reads that as its own machinery, never as the owner: a
+    /// machine-local token names a machine (ADR 0169).
     #[test]
     fn default_headers_from_env_yields_empty_when_env_unset() {
         let headers = headers_from(None, None, None);

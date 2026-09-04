@@ -1,6 +1,10 @@
 import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
-import { assertHealthy, clickThreadRow, clickVisibleElement, ensureMobileView, expectPushSent, navigateToApp, openThreadDrawer, waitForVisibleInput, waitForVisibleElement, waitForExchangeCount, gotoWithRetry } from './helpers';
+import {
+  apiRequest, assertHealthy, clickThreadRow, clickVisibleElement, ensureMobileView,
+  expectPushSent, gotoWithRetry, navigateToApp, openThreadDrawer, waitForExchangeCount,
+  waitForVisibleElement, waitForVisibleInput,
+} from './helpers';
 import { clearNotifications, psql } from './db-helpers';
 
 /** Send a notification through the script-facing endpoint that powers the
@@ -20,7 +24,7 @@ async function postNotification(
     tap?: unknown;
   },
 ): Promise<void> {
-  const res = await page.request.post('/api/v1/notifications', {
+  const res = await apiRequest(page).post('/api/v1/notifications', {
     headers: { 'content-type': 'application/json' },
     data: body,
   });
@@ -486,7 +490,7 @@ test.describe('Declarative Web Push payload', () => {
     psql(`DELETE FROM device_presence`);
     expect(baseURL, 'Playwright baseURL is needed to seed the subscription scope').toBeTruthy();
     const scopeUrl = new URL('/', baseURL!).toString();
-    const subRes = await page.request.post('/api/v1/push/subscribe', {
+    const subRes = await apiRequest(page).post('/api/v1/push/subscribe', {
       headers: { 'content-type': 'application/json' },
       data: {
         endpoint: `https://push.test/synthetic/${Date.now()}`,
@@ -505,7 +509,7 @@ test.describe('Declarative Web Push payload', () => {
     const fakeThreadId = '00000000-0000-4000-8000-000000000001';
     const fakeEventId = '00000000-0000-4000-8000-000000000002';
 
-    const res = await page.request.post('/api/v1/notifications', {
+    const res = await apiRequest(page).post('/api/v1/notifications', {
       headers: { 'content-type': 'application/json' },
       data: {
         title: 'Claude is asking',

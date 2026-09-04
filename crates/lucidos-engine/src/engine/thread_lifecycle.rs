@@ -233,6 +233,11 @@ pub enum Action {
     DiscardDraft,
     Discard,
     Apply,
+    /// Arm a *standing apply*: the change applies once the thread settles (ADR
+    /// 0168 clause 5). Offered exactly where `Apply` is withheld because the
+    /// thread is still working, so a control that cannot act is replaced by the
+    /// one that can. Serializes as `"apply_when_settled"`.
+    ApplyWhenSettled,
     Archive,
     /// Retention toggle — present for any focused thread (mutually exclusive
     /// with `Unsave`). Not part of the close cascade.
@@ -1071,6 +1076,15 @@ pub fn available_thread_actions(
         } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
             actions.push(Action::Archive);
         }
+    }
+    // The standing apply, offered while the thread is still working. Running
+    // and Paused are the two states a standing apply can wait through: every
+    // other resting state resolves it at once, so offering it there would arm
+    // something that drops on its first look. See `engine::standing_apply`.
+    if thread_type == ThreadType::CodingAgent
+        && (status == ThreadStatus::Running || status == ThreadStatus::Paused)
+    {
+        actions.push(Action::ApplyWhenSettled);
     }
     // Retention toggle — available in any run state, exactly one of the pair.
     if is_saved {

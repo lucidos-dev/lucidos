@@ -149,6 +149,8 @@ will erode, so it is stated flatly rather than smoothed over.
 | A payload states a fact rather than an order | **Convention.** Nothing inspects payloads. The parent is the check. |
 | A child does not act on an imperative payload | **Convention.** Prompt-level, and this ADR plus `system-knowhow/orchestrating-sub-threads.md` are that prompt. |
 | A child cannot archive or cancel a sibling, or its own parent | **Enforced** since the amendment below. Was not enforced at all when this ADR was accepted. |
+| A thread cannot Apply, Discard, answer a question card, restart a turn or create a top-thread outside its own subtree | **Enforced** since ADR 0168, in `api::thread_reach`. It carries the workspace owner's standing instruction, or it is refused. Per verb, so every route reaching one takes the gate. |
+| A standing instruction covers the act the owner asked for | **Convention.** The engine confirms the owner opened the turn, never that they asked for this particular act. ADR 0168 names the gap. |
 
 **The destructive verbs are ungated, and that is a defect rather than a
 decision.** (Was true when this ADR was accepted. Fixed by the amendment below,
@@ -201,7 +203,9 @@ Four details worth having in the record:
   `POST /api/v1/chat/cancel`
   with no `thread_id` stops every thread in the workspace, which is the user's
   global Stop. A thread-bound caller asking for it is told to name a thread,
-  rather than being quietly narrowed to itself.
+  rather than being quietly narrowed to itself. ADR 0168 keeps that refusal and
+  adds the one way past it: the global Stop is the owner's button, so a caller
+  carrying their standing instruction may press it.
 - **One residual, and it belongs to the whole surface.** `/api/v1` carries no
   authentication (`docs/glossary.md` § unattributed caller, ADR 0050). So a
   subprocess that DROPS its origin token reads as an ordinary local caller and

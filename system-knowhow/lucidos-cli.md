@@ -362,6 +362,8 @@ Start a new *thread* in another (or this same) workspace: a *chat thread* by def
 
 `--relation top` (the default) starts an independent thread that does not report back; `--relation child` is a same-workspace parent-with-callback spawn (the calling thread auto-resumes when the child finishes).
 
+A top-thread sits directly under the workspace rather than under you, so creating one is the *workspace owner*'s to do (ADR 0168). Called from a thread, `--relation top` needs their standing instruction: a turn they opened, or a trigger firing they authorized. Without one it exits non-zero on a 403 whose body names the same two shapes. `--relation child` stays inside your own subtree and needs nothing.
+
 **Coding-agent backend:**
 
 - `--cc` — legacy shortcut for a Claude Code coding-agent thread.
@@ -1002,6 +1004,12 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 
 > **In-thread agent:** the chat Lucidos Agent has the equivalent `apply_change` LLM tool. It calls the same engine apply pipeline **in-process** and stamps the apply as the agent (linked back to the applying thread), so the route popover never mislabels it as "You". Use `apply_change` from a chat / trigger thread; use this CLI from a `script:`-typed trigger or a bash / Python subprocess (which can't call the in-process tool and would otherwise have to forward the subprocess-origin headers by hand).
 
+> **Applying work that has not finished:** the agent also has two *standing apply* actions. `apply_when_settled` takes one thread's change, applied the moment that thread finishes. `apply_as_they_settle` takes everything pending that has settled, plus every thread still working as each one lands. Both arm the same instruction the Apply control arms from the UI. Both drop with a report if a thread parks or fails. LLM-only, with no CLI form.
+
+> **Taking one back:** `cancel_standing_apply` is the off for both. With a `thread_id` it cancels that thread's instruction. Without one it cancels every standing apply in the workspace, which is what the Changes panel's own off does. It stops future applies only: a change already merging or hardening keeps going, and nothing already applied is reverted. Cancelling a running Apply All batch is a different action.
+
+> **All four ask the same authority question the CLI does.** Applying a change from your own subtree needs nothing. Anything wider is the *workspace owner*'s, and the tool returns the refusal above rather than applying. `apply_as_they_settle` is always wider, since the sweep reaches every thread in the workspace, and so is a `cancel_standing_apply` naming no thread.
+
 The response carries:
 
 | Field | Meaning |
@@ -1016,6 +1024,8 @@ The response carries:
 The CLI prints the JSON verbatim on stdout. Exit non-zero on transport / 4xx with the engine's error body on stderr — match `--fail` semantics from `lucidos proxy`.
 
 Two 409s are refusals rather than errors, and both name the resolution: the change's thread is still working (wait for it to idle), or the change has **no file changes left** (`file_count` is 0 — its branch's commits cancelled out, so there is nothing to merge; discard it with the Discard button instead). A script driving a build → apply pipeline should treat a zero-`file_count` entry in `lucidos changes list` as "nothing to apply", not as a change to retry.
+
+A 403 is the third refusal, and it is about authority rather than state. Applying a change acts on the thread that proposed it, so a change from your own subtree needs nothing. A change from anywhere else is the *workspace owner*'s to apply, and you may do it only while carrying their standing instruction: a turn they opened, or a trigger firing they authorized. Discard answers the same way. The body names both shapes, so read it rather than retrying.
 
 #### Why the CLI and not hand-rolled urllib / curl
 

@@ -21,24 +21,43 @@ export function isMeaningfulText(e: ResponseEvent): boolean {
   return e.type === 'text' && hasVisibleText(e.md);
 }
 
-/** True when an in-progress step is actually rendered on screen — steps are
- *  expanded, the response panel is NOT collapsed, AND the visible set holds a
- *  pending step (`outcome === 'pending'`, the one that carries the
- *  `.running-shimmer` "live" affordance). Only `'pending'` counts, and the
- *  question is what SHIMMERS rather than what is terminal. `'unfinished'` is
- *  terminal and does not. `'blocked'` is not terminal and still does not: a
- *  call held on a permission card is waiting for the reader, so animating it
- *  would claim the machine is busy.
+/** True when an in-progress step row is DRAWN: steps are expanded, the response
+ *  panel is not collapsed, and the visible set holds a pending step
+ *  (`outcome === 'pending'`, the one carrying the `.running-shimmer` "live"
+ *  affordance). Only `'pending'` counts, and the question is what SHIMMERS
+ *  rather than what is terminal. `'unfinished'` is terminal and does not.
+ *  `'blocked'` is not terminal and still does not: a call held on a permission
+ *  card is waiting for the reader, so animating it would claim the machine is
+ *  busy.
  *
- *  Drives the "exactly one running-text shimmer at a time" rule: when a live
- *  step is on screen its own shimmer is the live signal, so the status label
- *  ("Working") stays plain; otherwise the label itself shimmers as the sole
- *  affordance. The `collapsed` guard is load-bearing — a collapsed panel hides
- *  the steps body entirely (only the header status shows), so a pending step in
- *  the data is NOT on screen; without this, the label shimmer was suppressed
- *  while the step shimmer was hidden, leaving a working turn with no shimmer. */
-export function hasVisibleLiveStep(showSteps: boolean, collapsed: boolean, visibleEvents: ResponseEvent[]): boolean {
-  return showSteps && !collapsed && visibleEvents.some(e => e.type === 'step' && e.outcome === 'pending');
+ *  Half of the "exactly one running-text shimmer at a time" rule. Drawn is not
+ *  the same as seen, so `ChatExchange` narrows this with
+ *  `useOnScreenInTranscript` over the row's own element before it drops the
+ *  "Working" label's shimmer. Answering the drawn half from data alone is what
+ *  keeps this module pure.
+ *
+ *  The `collapsed` guard is load-bearing. A collapsed panel hides the steps body
+ *  entirely, so a pending step in the data draws nothing. Without it the label
+ *  shimmer was suppressed while the step shimmer was hidden, leaving a working
+ *  turn with no shimmer at all. */
+export function rendersLiveStep(showSteps: boolean, collapsed: boolean, visibleEvents: ResponseEvent[]): boolean {
+  return liveStepIndex(showSteps, collapsed, visibleEvents) >= 0;
+}
+
+/** Where the FIRST such row sits in `visibleEvents`, or -1 for none.
+ *
+ *  `rendersLiveStep` is this question asked as a yes or no, so the two cannot
+ *  disagree about what a live row is. `ChatExchange` needs the index as well:
+ *  it marks that one row, and only that one, to report where it sits on screen.
+ *
+ *  First rather than last, and the reason is where the label sits. Parallel
+ *  calls each push a pending row of their own, and the "Working" label is above
+ *  all of them. A reader who can see the label can see the first row too. A row
+ *  below the first is below the fold whenever the first one is. Either way the
+ *  first row is the one whose visibility decides. */
+export function liveStepIndex(showSteps: boolean, collapsed: boolean, visibleEvents: ResponseEvent[]): number {
+  if (!showSteps || collapsed) return -1;
+  return visibleEvents.findIndex(e => e.type === 'step' && e.outcome === 'pending');
 }
 
 /** True when a rendered row is step **mechanics**: one line of the tool-by-tool
@@ -100,7 +119,6 @@ export function drawsResponseRow(event: ResponseEvent, showSteps: boolean): bool
     case 'checkpoint':
     case 'event_wait':
     case 'spoken_reply':
-    case 'spoken_message':
     case 'empty':
       return true;
     // Drawn somewhere else, or not at all. A question and a permission are

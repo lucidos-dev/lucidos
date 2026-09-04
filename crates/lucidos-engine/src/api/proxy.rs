@@ -1280,21 +1280,26 @@ pub(super) async fn proxy_modules_reload(
     if !browser_proxy_request_allowed(&headers) {
         return forbidden_cross_origin_proxy_response();
     }
+    // Before the swap: a reload replaces every compiled signer module.
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     match reload_proxy_modules_into(&state.engine, &state.workspace_path).await {
         Ok(names) => {
             let count = names.len();
             state
                 .engine
                 .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
+                .emit_or_log(
+                    crate::engine::event_bus::BusEvent::System(
+                        crate::engine::event_bus::SystemEvent::ProxyModulesReloaded {
+                            count,
+                            names: names.clone(),
+                            actor: Some(actor),
+                        },
+                    ),
                     "[Proxy] ProxyModulesReloaded",
-                    |actor| crate::engine::event_bus::SystemEvent::ProxyModulesReloaded {
-                        count,
-                        names: names.clone(),
-                        actor,
-                    },
                 )
                 .await;
             Json(serde_json::json!({"loaded": names})).into_response()
@@ -1546,6 +1551,7 @@ async fn build_pipeline_layers(
         workspace_path: Arc::new(engine.workspace_path().to_path_buf()),
         token_cache: engine.proxy_token_cache_arc(),
         proxy_name: name,
+        base_url: &config.base_url,
         proxy_modules: &modules_snapshot,
         wasm_engine: engine.wasm_engine().clone(),
     };

@@ -1,5 +1,5 @@
 import { test, expect, Page, Locator } from './fixtures';
-import { navigateToApp, assertHealthy, addTriggerCard, openTriggersPanel } from './helpers';
+import { addTriggerCard, apiRequest, assertHealthy, navigateToApp, openTriggersPanel } from './helpers';
 
 /** The trigger form's "Allowed side-effects" round-trip (ADR 0002, Phase 5).
  *  Ticking a couple of side-effect checkboxes, saving, then reloading and
@@ -50,7 +50,7 @@ test.describe('Trigger form — Allowed side-effects', () => {
     triggerName = `e2e-side-effects-${Date.now()}`;
     // create_trigger reads the timezone preference; set it so the create path
     // never has to fall back to its UTC default mid-test.
-    await page.request.put('/api/v1/preferences?key=timezone', { data: { value: 'UTC' } });
+    await apiRequest(page).put('/api/v1/preferences?key=timezone', { data: { value: 'UTC' } });
   });
 
   test.afterEach(async ({ page }) => {
@@ -60,7 +60,7 @@ test.describe('Trigger form — Allowed side-effects', () => {
       const res = await page.request.get('/api/v1/triggers');
       const body = await res.json();
       const mine = (body.triggers ?? []).find((t: { name: string; id: string }) => t.name === triggerName);
-      if (mine) await page.request.delete(`/api/v1/triggers?id=${mine.id}`);
+      if (mine) await apiRequest(page).delete(`/api/v1/triggers?id=${mine.id}`);
     } catch {
       /* best-effort cleanup */
     }

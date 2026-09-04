@@ -50,7 +50,7 @@ minted.
 
 | Caller | Identity it presents |
 |---|---|
-| The engine's own build-watch and release scripts | the machine-local token `api::local_auth` already mints |
+| The engine's own build-watch and release scripts | the machine-local token `api::local_auth` mints or reads at boot |
 | A thread's subprocess | the *thread-bound origin token* it already carries |
 | A browser on the loopback port | the *device attribution* it already holds |
 | A client through the *workspace gateway* | the paired device the gateway already injects |
@@ -108,6 +108,25 @@ convention.
 
 **What changes elsewhere.**
 
+- **The refusal is one layer, not one check per handler.**
+  `api::mutating_gate` refuses any mutating method under `/api/v1` whose caller
+  presents nothing, matching on the route rather than the URI. Same argument as
+  `api::target_workspace`: a per-handler check is one the next endpoint can
+  forget, and that is how four routes drifted apart before ADR 0083.
+- **Four classes are exempt**, each a route a legitimate caller cannot identify
+  itself on. Identity in the body (`/chat/stream`,
+  `/threads/:thread_id/follow-up`). The device bootstrap (`/devices/register`,
+  `/devices/hand-over`). Third-party ingress (`/webhooks/:id/deliver`, the three
+  `/proxy/:name` routes). A worker caller (`/internal/client-log`,
+  `/internal/client-logs`, `/presence-pong`, `/notification/read`): a service
+  worker and the SSE worker have no `localStorage`, so no device id. A caller
+  that COULD hold a credential and does not is a caller to fix, so
+  `/device-presence` was taught the header rather than exempted.
+- **The engine mints the machine-local token when no gateway will.** Only the
+  gateway minted it, so a bare single-engine run had no file, and the row above
+  naming that token was false there. The engine's own build-watch reaches
+  `POST /api/v1/events/emit` holding no thread-bound token, so the gate would
+  have refused its rebuild.
 - `user_actor_resolved` loses its fallback, and every caller of it inherits the
   refusal.
 - `docs/glossary.md` § *unattributed caller* loses the carve-out sentence naming

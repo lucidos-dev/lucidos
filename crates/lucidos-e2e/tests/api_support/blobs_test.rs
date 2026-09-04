@@ -7,7 +7,7 @@
 //! See `docs/plans/2026-05-07-image-blob-store-design.md`.
 
 use crate::support::{
-    base_url, db_url, encoded_jpeg, http_client, png_bytes, sha256_hex, workspace_path,
+    base_url, db_url, encoded_jpeg, png_bytes, sha256_hex, user_client, workspace_path,
 };
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
@@ -67,7 +67,7 @@ fn png_form() -> Form {
 
 #[tokio::test]
 async fn post_blob_returns_hash_and_writes_file() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let bytes = png_bytes();
     let expected_hash = sha256_hex(&bytes);
@@ -101,7 +101,7 @@ async fn post_blob_returns_hash_and_writes_file() {
 
 #[tokio::test]
 async fn post_blob_idempotent_on_same_bytes() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
 
     let r1 = client
@@ -135,7 +135,7 @@ async fn post_blob_idempotent_on_same_bytes() {
 
 #[tokio::test]
 async fn post_blob_rejects_non_image_with_unsupported_mime() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
 
     let form = Form::new().part(
@@ -162,7 +162,7 @@ async fn post_blob_rejects_non_image_with_unsupported_mime() {
 /// leaves the caller to guess, which is what the paste bug did to the user.
 #[tokio::test]
 async fn post_blob_names_the_uploaded_format_in_its_415() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
 
     // A little-endian TIFF header. The declared mime is a lie the server
@@ -199,7 +199,7 @@ async fn post_blob_names_the_uploaded_format_in_its_415() {
 /// An empty upload is its own verdict, not "we could not recognize this".
 #[tokio::test]
 async fn post_blob_calls_an_empty_upload_empty() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
 
     let form = Form::new().part(
@@ -227,7 +227,7 @@ async fn post_blob_calls_an_empty_upload_empty() {
 
 #[tokio::test]
 async fn post_blob_rejects_missing_thread() {
-    let client = http_client();
+    let client = user_client().await;
     let bogus = Uuid::new_v4();
     let resp = client
         .post(blobs_url(&bogus))
@@ -244,7 +244,7 @@ async fn post_blob_rejects_missing_thread() {
 
 #[tokio::test]
 async fn post_blob_rejects_discarded_thread() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     // Discard it.
     let del = client
@@ -269,7 +269,7 @@ async fn post_blob_rejects_discarded_thread() {
 
 #[tokio::test]
 async fn post_blob_emits_image_uploaded_event() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -299,7 +299,7 @@ async fn post_blob_emits_image_uploaded_event() {
 
 #[tokio::test]
 async fn get_blob_returns_bytes_with_mime_after_upload() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let bytes = png_bytes();
 
@@ -334,7 +334,7 @@ async fn get_blob_returns_bytes_with_mime_after_upload() {
 
 #[tokio::test]
 async fn get_blob_sets_immutable_cache_header() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let upload = client
         .post(blobs_url(&thread_id))
@@ -366,7 +366,7 @@ async fn get_blob_sets_immutable_cache_header() {
 
 #[tokio::test]
 async fn get_blob_returns_404_for_unknown_hash() {
-    let client = http_client();
+    let client = user_client().await;
     // Valid-shaped hash but unused.
     let bogus = "0".repeat(64);
     let resp = client
@@ -379,7 +379,7 @@ async fn get_blob_returns_404_for_unknown_hash() {
 
 #[tokio::test]
 async fn get_blob_returns_404_for_malformed_hash() {
-    let client = http_client();
+    let client = user_client().await;
     // Path traversal attempt + short string — must not 200.
     let resp = client
         .get(blob_url("..%2F..%2Fetc%2Fpasswd"))
@@ -397,7 +397,7 @@ async fn get_blob_returns_404_for_malformed_hash() {
 
 #[tokio::test]
 async fn get_blob_preview_downscales_large_image_to_jpeg() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     // 4000 long edge — exceeds the 2048-px preview cap, so the endpoint
     // must serve a downscaled JPEG instead of the original.
@@ -446,7 +446,7 @@ async fn get_blob_preview_downscales_large_image_to_jpeg() {
 
 #[tokio::test]
 async fn get_blob_preview_serves_original_when_image_within_cap() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     // 800×600 is well under the 2048-px cap — endpoint must serve the
     // original bytes (and the original PNG mime, in this case).
@@ -484,7 +484,7 @@ async fn get_blob_preview_serves_original_when_image_within_cap() {
 
 #[tokio::test]
 async fn get_blob_preview_returns_404_for_unknown_hash() {
-    let client = http_client();
+    let client = user_client().await;
     let bogus = "0".repeat(64);
     let resp = client
         .get(blob_preview_url(&bogus))
@@ -496,7 +496,7 @@ async fn get_blob_preview_returns_404_for_unknown_hash() {
 
 #[tokio::test]
 async fn get_blob_preview_sets_immutable_cache_header() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let upload = client
         .post(blobs_url(&thread_id))
@@ -534,7 +534,7 @@ async fn get_blob_preview_sets_immutable_cache_header() {
 /// always hits the warm cache.
 #[tokio::test]
 async fn post_blob_pregenerates_preview_in_background_for_large_image() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let bytes = encoded_jpeg(4000, 3000);
 
@@ -582,7 +582,7 @@ async fn post_blob_pregenerates_preview_in_background_for_large_image() {
 /// decode + resize.
 #[tokio::test]
 async fn post_blob_returns_quickly_even_when_pregeneration_is_slow() {
-    let client = http_client();
+    let client = user_client().await;
     let thread_id = create_thread(&client, "lucidos").await;
     let bytes = encoded_jpeg(4000, 3000);
 

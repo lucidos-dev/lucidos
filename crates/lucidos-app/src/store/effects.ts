@@ -5,6 +5,7 @@ import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
 import { onNotificationDetailClosed } from './actions/notifications';
 import { installSeenTargetWatch } from './actions/notification-visit';
+import { installLiveUtteranceRow } from './liveUtterance';
 import { syncWorkspaceAppBadge } from './actions/app-badge';
 import { pushNativeWindowTitle } from '../utils/windowTitle';
 
@@ -276,3 +277,8 @@ effect(() => {
 // rules they feed rather than spread across this file. See
 // actions/notification-visit.ts and system-knowhow/notifications.md §4.
 installSeenTargetWatch();
+
+// The caller's bubble appears as they start speaking, rather than when the
+// words finally land. Its own module for the same reason as the watch above:
+// the rule belongs beside the call it reads. See store/liveUtterance.ts.
+installLiveUtteranceRow();

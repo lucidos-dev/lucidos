@@ -3,9 +3,9 @@
 //! The first implementation behind the seam (the parent plan's decision 5). It
 //! speaks OpenAI's Realtime API, and nothing above `provider.rs` knows that.
 //!
-//! **Opened with exactly one tool.** [`SessionOpening`] still has no tool
-//! field: the single `delegate` entry is built here from the words in
-//! `voice/mod.rs`, so no caller can add a second.
+//! **Opened with exactly three tools.** [`SessionOpening`] still has no tool
+//! field: the set is built here from the words in `voice/mod.rs`, so nothing
+//! above the seam can add a fourth (ADR 0170).
 //!
 //! **End of turn is semantic.** `semantic_vad` asks the model whether the
 //! caller finished a thought. A silence timer cannot tell a pause from a full
@@ -20,7 +20,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::provider::{SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
-use super::{DELEGATE_REASON_ARG, DELEGATE_TOOL, DELEGATE_TOOL_DESCRIPTION};
+use super::{
+    ANSWER_CHOICE_ARG, ANSWER_TOOL, ANSWER_TOOL_DESCRIPTION, DELEGATE_REASON_ARG, DELEGATE_TOOL,
+    DELEGATE_TOOL_DESCRIPTION, HANGUP_TOOL, HANGUP_TOOL_DESCRIPTION,
+};
 use crate::engine::{ApiUsage, ModalityUsage};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -35,6 +38,12 @@ const REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
 /// the catalog default is what fills it. This is the last resort under both, so
 /// an empty opening still transcribes rather than opening a mute call.
 const TRANSCRIBE_MODEL: &str = "gpt-4o-mini-transcribe";
+
+/// The one transcriber that spells its language pin as an array.
+///
+/// A constant, because `transcription()` branches on this id and the picker in
+/// `VoiceSection.tsx` offers it. That function says what the branch does.
+const LIVE_TRANSCRIBE_MODEL: &str = "gpt-live-transcribe";
 
 /// How many talker events may queue before the reader waits.
 ///
@@ -141,16 +150,12 @@ impl VoiceSession for RealtimeSession {
         Ok(())
     }
 
-    async fn resolve_delegation(
-        &mut self,
-        delegation_id: &str,
-        note: &str,
-    ) -> Result<(), BoxError> {
+    async fn resolve_tool_call(&mut self, tool_call_id: &str, note: &str) -> Result<(), BoxError> {
         let frame = json!({
             "type": "conversation.item.create",
             "item": {
                 "type": "function_call_output",
-                "call_id": delegation_id,
+                "call_id": tool_call_id,
                 "output": note,
             }
         });
@@ -176,7 +181,7 @@ impl VoiceSession for RealtimeSession {
     }
 }
 
-/// The opening payload: who the talker is, what audio it speaks, one tool.
+/// The opening payload: who the talker is, what audio it speaks, its tools.
 pub fn session_update(opening: &SessionOpening) -> Value {
     json!({
         "type": "session.update",
@@ -184,7 +189,7 @@ pub fn session_update(opening: &SessionOpening) -> Value {
             "type": "realtime",
             "instructions": opening.instructions,
             "output_modalities": ["audio"],
-            "tools": [delegate_tool()],
+            "tools": tools(),
             "tool_choice": "auto",
             "audio": {
                 "input": {
@@ -208,25 +213,56 @@ pub fn session_update(opening: &SessionOpening) -> Value {
     })
 }
 
-/// The one tool the talker holds, as this provider spells a function.
+/// The tools the talker holds, as this provider spells a function.
 ///
-/// One required argument and nothing optional. A model that can leave the
-/// reason out will, and an empty reason is a row that says a wake happened
-/// without saying why.
-fn delegate_tool() -> Value {
+/// Built here from the names in `voice/mod.rs`, so nothing above the seam can
+/// add a fourth.
+fn tools() -> Vec<Value> {
+    vec![
+        // One required argument and nothing optional. A model that can leave
+        // the reason out will, and an empty reason is a row that says a wake
+        // happened without saying why.
+        function(
+            DELEGATE_TOOL,
+            DELEGATE_TOOL_DESCRIPTION,
+            Some((
+                DELEGATE_REASON_ARG,
+                "A few words on what the user asked for.",
+            )),
+        ),
+        // Required for the same reason, and it is the whole of the call: an
+        // answer with no choice names nothing.
+        function(
+            ANSWER_TOOL,
+            ANSWER_TOOL_DESCRIPTION,
+            Some((
+                ANSWER_CHOICE_ARG,
+                "The id of the choice the user picked, copied exactly.",
+            )),
+        ),
+        // No argument at all. Ending the call carries nothing to record beyond
+        // the fact of it, and an argument a model must invent is one it will.
+        function(HANGUP_TOOL, HANGUP_TOOL_DESCRIPTION, None),
+    ]
+}
+
+/// One tool, with at most one required string argument.
+fn function(name: &str, description: &str, argument: Option<(&str, &str)>) -> Value {
+    let (properties, required) = match argument {
+        Some((arg, detail)) => (
+            json!({ arg: { "type": "string", "description": detail } }),
+            json!([arg]),
+        ),
+        None => (json!({}), json!([])),
+    };
     json!({
         "type": "function",
-        "name": DELEGATE_TOOL,
-        "description": DELEGATE_TOOL_DESCRIPTION,
+        "name": name,
+        "description": description,
         "parameters": {
             "type": "object",
-            "properties": {
-                DELEGATE_REASON_ARG: {
-                    "type": "string",
-                    "description": "A few words on what the user asked for.",
-                }
-            },
-            "required": [DELEGATE_REASON_ARG],
+            "properties": properties,
+            "required": required,
             "additionalProperties": false,
         },
     })
@@ -234,10 +270,15 @@ fn delegate_tool() -> Value {
 
 /// How the caller's audio is turned into text.
 ///
-/// The `language` key is added only when one resolved. Left off, the model
+/// A language key is added only when one resolved. Left off, the model
 /// re-guesses per utterance, which is how a Bokmål phrase came back as
 /// Nynorsk. The plan is
 /// `docs/plans/2026-08-29-a-call-speaks-one-language-and-gives-one-answer.md`.
+///
+/// **Which key carries it depends on the model.** [`LIVE_TRANSCRIBE_MODEL`]
+/// reads `languages`, an array of codes. Every other model reads the singular
+/// `language`. The provider refuses a payload holding both, so this writes
+/// exactly one of them. An unresolved language still writes neither.
 fn transcription(opening: &SessionOpening) -> Value {
     let model = match opening.transcriber.trim() {
         "" => TRANSCRIBE_MODEL,
@@ -245,7 +286,11 @@ fn transcription(opening: &SessionOpening) -> Value {
     };
     let mut config = json!({ "model": model });
     if let Some(code) = opening.language.as_ref().and_then(|l| l.code.as_deref()) {
-        config["language"] = json!(code);
+        if model == LIVE_TRANSCRIBE_MODEL {
+            config["languages"] = json!([code]);
+        } else {
+            config["language"] = json!(code);
+        }
     }
     config
 }
@@ -292,7 +337,7 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
                 None => vec![],
             }
         }
-        "response.function_call_arguments.done" => delegation(value),
+        "response.function_call_arguments.done" => tool_call(value),
         "response.done" => done_events(value),
         "error" => vec![VoiceEvent::Failed {
             message: value
@@ -305,52 +350,90 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
     }
 }
 
-/// One finished `delegate` call, as the seam's own event.
+/// One finished tool call, as the seam's own event.
 ///
 /// Read from `response.function_call_arguments.done` rather than from
 /// `response.done`, because that frame lands while the talker is still
 /// speaking. Waiting for the response to finish would cost a full spoken reply
 /// of latency on every real question.
 ///
-/// **A missing `name` still delegates.** One tool is declared, so nothing else
-/// can arrive here, and dropping the frame would lose the caller's question
-/// outright. A name that names something else is dropped, since that is a
-/// second tool appearing and the whole design says there is none.
-fn delegation(value: &Value) -> Vec<VoiceEvent> {
-    let named = value.get("name").and_then(Value::as_str);
-    if named.is_some_and(|name| name != DELEGATE_TOOL) {
-        log!(
-            "[Voice] The talker called {:?}, which it does not hold",
-            named
-        );
-        return vec![];
-    }
-    let Some(delegation_id) = value.get("call_id").and_then(Value::as_str) else {
-        log!("[Voice] A delegation arrived with no id, so it cannot be resolved");
+/// **An unnamed call is routed by its ARGUMENT, not dropped.** With one tool a
+/// missing `name` could simply be assumed, and the code this replaced said so:
+/// dropping the frame would lose the caller's question outright. Three tools
+/// end the assumption, but not the risk it guarded. So the two tools with a
+/// distinguishing required argument are recovered from it instead.
+///
+/// A name naming none of the three is dropped for the older reason: that is a
+/// fourth tool appearing, and the design says there is none.
+fn tool_call(value: &Value) -> Vec<VoiceEvent> {
+    let Some(tool_call_id) = value.get("call_id").and_then(Value::as_str) else {
+        log!("[Voice] A tool call arrived with no id, so it cannot be resolved");
         return vec![];
     };
-    vec![VoiceEvent::DelegationRequested {
-        delegation_id: delegation_id.to_string(),
-        reason: delegation_reason(value),
-    }]
+    let tool_call_id = tool_call_id.to_string();
+    let Some(name) = value.get("name").and_then(Value::as_str) else {
+        return unnamed_tool_call(value, tool_call_id);
+    };
+    match name {
+        DELEGATE_TOOL => vec![VoiceEvent::DelegationRequested {
+            tool_call_id,
+            reason: argument(value, DELEGATE_REASON_ARG)
+                .unwrap_or_else(|| "the talker gave no reason".to_string()),
+        }],
+        // A choice the talker left out is not one the engine can guess at, and
+        // the whole design says it never guesses. Dropped, so the call is
+        // acknowledged by nothing and the talker asks the caller again.
+        ANSWER_TOOL => match argument(value, ANSWER_CHOICE_ARG) {
+            Some(choice_id) => vec![VoiceEvent::AnswerRequested {
+                tool_call_id,
+                choice_id,
+            }],
+            None => {
+                log!("[Voice] An answer arrived naming no choice, so it settles nothing");
+                vec![]
+            }
+        },
+        HANGUP_TOOL => vec![VoiceEvent::HangupRequested { tool_call_id }],
+        _ => {
+            log!(
+                "[Voice] The talker called {:?}, which it does not hold",
+                name
+            );
+            vec![]
+        }
+    }
 }
 
-/// The talker's stated reason, or a stand-in when it gave none.
+/// Which tool a call with no `name` was, read off its arguments.
 ///
-/// The argument is required, so an absent one is the model misbehaving. The
-/// delegation still goes through: a wake with a vague reason beats a caller
-/// whose question never runs.
-fn delegation_reason(value: &Value) -> String {
-    let arguments = value.get("arguments").and_then(Value::as_str).unwrap_or("");
-    serde_json::from_str::<Value>(arguments)
-        .ok()
-        .as_ref()
-        .and_then(|parsed| parsed.get(DELEGATE_REASON_ARG))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-        .unwrap_or("the talker gave no reason")
-        .to_string()
+/// Only the two carrying a distinguishing required argument are recoverable,
+/// and each is recovered by the presence of its own. Hanging up is NOT: it
+/// takes no argument, so an empty or unreadable payload looks exactly like one.
+/// Guessing there would end a call the caller never asked to end.
+fn unnamed_tool_call(value: &Value, tool_call_id: String) -> Vec<VoiceEvent> {
+    if let Some(reason) = argument(value, DELEGATE_REASON_ARG) {
+        return vec![VoiceEvent::DelegationRequested {
+            tool_call_id,
+            reason,
+        }];
+    }
+    if let Some(choice_id) = argument(value, ANSWER_CHOICE_ARG) {
+        return vec![VoiceEvent::AnswerRequested {
+            tool_call_id,
+            choice_id,
+        }];
+    }
+    log!("[Voice] A tool call arrived unnamed and unreadable, so it cannot be routed");
+    vec![]
+}
+
+/// One string argument off a finished call, trimmed. `None` when the model
+/// left it out, sent something that is not a string, or sent only spaces.
+fn argument(value: &Value, key: &str) -> Option<String> {
+    let arguments = value.get("arguments").and_then(Value::as_str)?;
+    let parsed = serde_json::from_str::<Value>(arguments).ok()?;
+    let text = parsed.get(key)?.as_str()?.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// What one finished response means.

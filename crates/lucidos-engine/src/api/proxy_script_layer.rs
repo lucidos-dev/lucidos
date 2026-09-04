@@ -93,6 +93,9 @@ pub struct ScriptHandshakeLayer {
     /// script obtains its secret by other means).
     credential: Option<String>,
     script_rel_path: String,
+    /// The host the minted token is for. Part of the cache key, so a token
+    /// cannot be served for a request the config has repointed at another host.
+    base_url: String,
     oauth_providers: Vec<String>,
     pool: PgPool,
     workspace_path: Arc<PathBuf>,
@@ -110,6 +113,7 @@ impl ScriptHandshakeLayer {
         proxy_name: String,
         credential: Option<String>,
         script_rel_path: String,
+        base_url: String,
         oauth_providers: Vec<String>,
         pool: PgPool,
         workspace_path: Arc<PathBuf>,
@@ -121,12 +125,39 @@ impl ScriptHandshakeLayer {
             proxy_name,
             credential,
             script_rel_path,
+            base_url,
             oauth_providers,
             pool,
             workspace_path,
             token_cache,
             oauth_lookup,
         }
+    }
+
+    /// Cache key for this layer's minted token.
+    ///
+    /// A minted token is decided by the script that mints it, the secrets fed to
+    /// it, and the host it is minted for. Keying by proxy name alone let an
+    /// `apis.json` rewrite replay the token to an attacker host. The cache hit
+    /// skipped the runner's hash check, so a new base_url and unrecorded script
+    /// served the old token. The key now carries every input that decides the
+    /// token: script, injected secrets, and host. A rewrite of any of them misses
+    /// the cache, so the runner runs again. The field separator and the record
+    /// separator cannot appear in a URL host, so the host stays an unambiguous
+    /// suffix.
+    fn cache_key(&self) -> String {
+        use crate::core::handshake_approvals::injected_secrets;
+        let injects = injected_secrets(
+            self.credential.as_deref(),
+            self.oauth_providers.iter().map(String::as_str),
+        )
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\u{1e}");
+        format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.proxy_name, self.namespace, self.script_rel_path, injects, self.base_url
+        )
     }
 
     /// Resolve the headers for this request: cache hit → reuse; miss →
@@ -138,7 +169,7 @@ impl ScriptHandshakeLayer {
     ) -> Result<(Vec<(HeaderName, HeaderValue)>, bool), (StatusCode, String)> {
         let (token, was_hit) = self
             .token_cache
-            .get_or_refresh(&self.proxy_name, || self.run_script())
+            .get_or_refresh(&self.cache_key(), || self.run_script())
             .await?;
         Ok((token.headers, was_hit))
     }
@@ -224,7 +255,7 @@ impl AuthLayer for ScriptHandshakeLayer {
     }
 
     async fn invalidate_cache(&self) {
-        self.token_cache.invalidate(&self.proxy_name).await;
+        self.token_cache.invalidate(&self.cache_key()).await;
     }
 
     async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
@@ -358,6 +389,7 @@ mod tests {
             "proxy".into(),
             Some("cred".into()),
             "scripts/x.sh".into(),
+            "https://upstream.example".into(),
             oauth_providers,
             lazy_pool(),
             Arc::new(PathBuf::from("/ws")),
@@ -390,9 +422,10 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_sets_cache_was_hit_and_returns_cached_headers() {
         let cache = Arc::new(ProxyTokenCache::new());
+        let layer = layer_no_oauth(cache.clone());
         cache
             .insert(
-                "proxy",
+                &layer.cache_key(),
                 vec![(
                     HeaderName::from_static("authorization"),
                     HeaderValue::from_static("Bearer cached-token"),
@@ -400,8 +433,6 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await;
-
-        let layer = layer_no_oauth(cache.clone());
 
         let body = Bytes::new();
         let prior = HashMap::new();
@@ -432,15 +463,15 @@ mod tests {
         // (and the upstream would 401 with no diagnostic). Surface as 502
         // instead so the operator sees an actionable error.
         let cache = Arc::new(ProxyTokenCache::new());
+        let layer = layer_no_oauth(cache.clone());
         let raw = HeaderValue::from_bytes(b"\xff non-ascii").unwrap();
         cache
             .insert(
-                "proxy",
+                &layer.cache_key(),
                 vec![(HeaderName::from_static("authorization"), raw)],
                 Duration::from_secs(60),
             )
             .await;
-        let layer = layer_no_oauth(cache);
         let body = Bytes::new();
         let prior = HashMap::new();
         let input = input_for(&body, "https://x", &prior);
@@ -455,9 +486,11 @@ mod tests {
     #[tokio::test]
     async fn invalidate_cache_removes_cached_entry() {
         let cache = Arc::new(ProxyTokenCache::new());
+        let layer = layer_no_oauth(cache.clone());
+        let key = layer.cache_key();
         cache
             .insert(
-                "proxy",
+                &key,
                 vec![(
                     HeaderName::from_static("authorization"),
                     HeaderValue::from_static("Bearer cached-token"),
@@ -466,11 +499,113 @@ mod tests {
             )
             .await;
 
-        let layer = layer_no_oauth(cache.clone());
-
-        assert!(cache.get("proxy").await.is_some(), "precondition: cached");
+        assert!(cache.get(&key).await.is_some(), "precondition: cached");
         layer.invalidate_cache().await;
-        assert!(cache.get("proxy").await.is_none(), "should be invalidated");
+        assert!(cache.get(&key).await.is_none(), "should be invalidated");
+    }
+
+    /// A minted token is bound to the host it was minted for. An `apis.json`
+    /// rewrite that repoints the same entry at another host must miss the warm
+    /// cache, never replay the token. Keying by proxy name alone leaked it. The
+    /// cache hit skipped the runner's hash check. A rewritten base_url plus an
+    /// unrecorded script then handed a token minted for the legit host to the
+    /// attacker. This test fails if the base_url leaves the cache key.
+    #[tokio::test]
+    async fn a_rewritten_base_url_cannot_replay_a_cached_token_to_another_host() {
+        let cache = Arc::new(ProxyTokenCache::new());
+
+        let legit = ScriptHandshakeLayer::new(
+            "script_handshake".into(),
+            "comfort".into(),
+            None,
+            "scripts/auth/comfort.py".into(),
+            "https://accsmart.panasonic.test".into(),
+            Vec::new(),
+            lazy_pool(),
+            Arc::new(PathBuf::from("/ws")),
+            cache.clone(),
+            Arc::new(PanicLookup),
+        );
+        // Warm the cache exactly as a legitimate first call would.
+        cache
+            .insert(
+                &legit.cache_key(),
+                vec![(
+                    HeaderName::from_static("authorization"),
+                    HeaderValue::from_static("Bearer minted-for-panasonic"),
+                )],
+                Duration::from_secs(600),
+            )
+            .await;
+
+        // The app rewrites apis.json: same entry name (the old cache key), the
+        // attacker's host, and an unrecorded script.
+        let attacker = ScriptHandshakeLayer::new(
+            "script_handshake".into(),
+            "comfort".into(),
+            None,
+            "scripts/auth/unrecorded.py".into(),
+            "https://attacker.test".into(),
+            Vec::new(),
+            lazy_pool(),
+            Arc::new(PathBuf::from("/ws")),
+            cache.clone(),
+            Arc::new(PanicLookup),
+        );
+
+        assert_ne!(
+            legit.cache_key(),
+            attacker.cache_key(),
+            "a different base_url must produce a different cache key"
+        );
+        assert!(
+            cache.get(&attacker.cache_key()).await.is_none(),
+            "the token minted for the legit host must not be reachable off it"
+        );
+        // The legit host still serves its cached token, a hit with no script run.
+        let body = Bytes::new();
+        let prior = HashMap::new();
+        let input = input_for(&body, "https://accsmart.panasonic.test/x", &prior);
+        let m = legit.apply(&input).await.unwrap();
+        assert!(m.cache_was_hit, "the legit host keeps its cache hit");
+        assert_eq!(m.add_headers[0].1, "Bearer minted-for-panasonic");
+    }
+
+    /// The injected secrets decide the minted token, so changing the credential
+    /// (or the OAuth providers) must change the cache key. Otherwise a config
+    /// that swaps the injected account keeps serving the token minted for the old
+    /// one until it expires.
+    #[tokio::test]
+    async fn changing_the_injected_credential_changes_the_cache_key() {
+        let cache = Arc::new(ProxyTokenCache::new());
+        let make = |credential: Option<&str>, oauth: Vec<String>| {
+            ScriptHandshakeLayer::new(
+                "script_handshake".into(),
+                "svc".into(),
+                credential.map(str::to_string),
+                "scripts/auth/login.py".into(),
+                "https://api.example.test".into(),
+                oauth,
+                lazy_pool(),
+                Arc::new(PathBuf::from("/ws")),
+                cache.clone(),
+                Arc::new(PanicLookup),
+            )
+        };
+        let with_a = make(Some("cred-a"), Vec::new());
+        let with_b = make(Some("cred-b"), Vec::new());
+        let with_oauth = make(Some("cred-a"), vec!["google".into()]);
+
+        assert_ne!(
+            with_a.cache_key(),
+            with_b.cache_key(),
+            "a different injected credential must change the cache key"
+        );
+        assert_ne!(
+            with_a.cache_key(),
+            with_oauth.cache_key(),
+            "a different OAuth provider set must change the cache key"
+        );
     }
 
     #[tokio::test]
@@ -533,6 +668,7 @@ print(json.dumps({
                 "proxy".into(),
                 Some("testsvc".into()),
                 "scripts/auth/echo.py".into(),
+                "https://example.test".into(),
                 Vec::new(),
                 pool.clone(),
                 Arc::new(tmp.path().to_path_buf()),
@@ -611,6 +747,7 @@ print(json.dumps({
             "proxy".into(),
             None,
             "scripts/auth/echo.py".into(),
+            "https://example.test".into(),
             Vec::new(),
             lazy_pool(),
             Arc::new(tmp.path().to_path_buf()),

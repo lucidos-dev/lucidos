@@ -6,7 +6,7 @@
 //! is the permanent back-compat shape, so a script written before the scope
 //! became a set keeps working, and this is what proves it.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -14,7 +14,7 @@ use sqlx::PgPool;
 /// omitting `auth_value` keeps the stored secret.
 #[tokio::test]
 async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let service = unique_marker("e2e-cred");
 
@@ -102,7 +102,7 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
 /// This is the regression an email-account edit surfaced.
 #[tokio::test]
 async fn update_email_credential_syncs_email_accounts_row() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
 
@@ -276,7 +276,7 @@ async fn delete_credential(client: &reqwest::Client, api: &str, id: &str) {
 /// the user typed it.
 #[tokio::test]
 async fn a_credential_carries_and_edits_a_set_of_base_urls() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let service = unique_marker("e2e-scope");
 
@@ -370,7 +370,7 @@ async fn a_credential_carries_and_edits_a_set_of_base_urls() {
 /// and has to be written down.
 #[tokio::test]
 async fn creating_a_credential_without_a_scope_field_is_refused() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let service = unique_marker("e2e-noscope");
 
@@ -427,7 +427,7 @@ async fn creating_a_credential_without_a_scope_field_is_refused() {
 /// exists to prevent.
 #[tokio::test]
 async fn a_credential_value_needs_a_token_and_a_non_app_origin() {
-    let client = http_client();
+    let client = user_client().await;
     let api = base_url();
     let service = unique_marker("e2e-reveal");
 

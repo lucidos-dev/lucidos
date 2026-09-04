@@ -433,6 +433,7 @@ export type TriggerInvocation =
  *  Full reasoning is on the Rust variant. */
 export type VoiceSessionEndReason =
   | 'hangup'
+  | 'agent_hangup'
   | 'disconnected'
   | 'provider_failed'
   | 'engine_shutdown';

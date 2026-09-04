@@ -76,9 +76,13 @@ pub async fn add_repository(
     let root_commit_sha = crate::engine::git_ops::root_commit_sha(path).await;
 
     // `register` emits `RepositoryAdded` itself, so this handler resolves the
-    // device actor up front instead of going through `emit_user_system`. The
-    // emit is not the caller's to make (see `RepositoryStore`'s type doc).
-    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    // device actor up front and passes it down. The emit is not the caller's
+    // to make (see `RepositoryStore`'s type doc).
+    let actor = Some(
+        crate::api::actor::require_user_actor(&headers, &state.pool, None)
+            .await
+            .map_err(|e| (e.status, e.message))?,
+    );
     let repo = RepositoryStore::register(
         &state.pool,
         &state.engine.event_bus,

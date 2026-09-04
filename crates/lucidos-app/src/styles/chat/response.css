@@ -1292,8 +1292,7 @@
     gap: 0.25rem;
 }
 
-/* The recipe the voice-call rows use for a "who said this" mark
-   (`.spoken-message-who`), which is the same job this does. */
+/* A small muted "who said this" mark, over the answer it labels. */
 .question-freetext-label {
     font-size: var(--font-size-2xs);
     color: var(--text-muted);

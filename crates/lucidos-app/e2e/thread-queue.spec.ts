@@ -1,5 +1,5 @@
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 
 /** Thread Queue panel end-to-end: hold all background admission via the
  *  capacity policy (`max_concurrent_total: 0`), fire an event trigger so a
@@ -18,7 +18,7 @@ const TRIGGER_NAME = 'E2E thread-queue probe';
  *  Same SSE-delivered path as settings-backup-navigation-desktop.spec.ts. */
 async function openThreadQueuePanel(page: Page): Promise<void> {
   await waitForEventStream(page);
-  const res = await page.request.post('/api/v1/ui/navigate', {
+  const res = await apiRequest(page).post('/api/v1/ui/navigate', {
     headers: { 'content-type': 'application/json' },
     data: { target: 'thread-queue' },
   });
@@ -32,7 +32,7 @@ async function openThreadQueuePanel(page: Page): Promise<void> {
 /** Restore the default capacity policy. `CapacityPolicy` is
  *  `#[serde(default)]`, so an empty body resets every field. */
 async function restoreDefaultPolicy(page: Page): Promise<void> {
-  const resp = await page.request.put('/api/v1/thread-queue/policy', { data: {} });
+  const resp = await apiRequest(page).put('/api/v1/thread-queue/policy', { data: {} });
   expect(resp.ok()).toBeTruthy();
 }
 
@@ -43,7 +43,7 @@ async function deleteProbeTrigger(page: Page): Promise<void> {
   const body = (await list.json()) as { triggers: Array<{ id: string; name: string }> };
   for (const t of body.triggers ?? []) {
     if (t.name === TRIGGER_NAME) {
-      await page.request.delete(`/api/v1/triggers?id=${encodeURIComponent(t.id)}`);
+      await apiRequest(page).delete(`/api/v1/triggers?id=${encodeURIComponent(t.id)}`);
     }
   }
 }
@@ -68,13 +68,13 @@ test.describe('thread queue panel', () => {
     await waitForEventStream(page);
 
     // Hold ALL background admission so the fire queues instead of running.
-    const policyResp = await page.request.put('/api/v1/thread-queue/policy', {
+    const policyResp = await apiRequest(page).put('/api/v1/thread-queue/policy', {
       data: { max_concurrent_total: 0 },
     });
     expect(policyResp.ok()).toBeTruthy();
 
     // A real event trigger — its fire is what lands in the queue.
-    const createResp = await page.request.post('/api/v1/triggers', {
+    const createResp = await apiRequest(page).post('/api/v1/triggers', {
       data: {
         name: TRIGGER_NAME,
         run: { type: 'intent', intent: 'Say hello.' },
@@ -85,7 +85,7 @@ test.describe('thread queue panel', () => {
     expect(createResp.ok()).toBeTruthy();
 
     // Fire the matching domain event.
-    const emitResp = await page.request.post('/api/v1/events/emit', {
+    const emitResp = await apiRequest(page).post('/api/v1/events/emit', {
       data: { event_type: PROBE_EVENT, payload: { probe: true } },
     });
     expect(emitResp.ok()).toBeTruthy();

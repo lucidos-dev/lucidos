@@ -1163,6 +1163,51 @@ const CHANGES_OPS: &[Operation] = &[
         cli: None,
         sdk: None,
     },
+    Operation {
+        action: "apply_when_settled",
+        summary: "Apply one thread's change the moment it finishes. Drops with a report if the thread parks or fails. ONLY when the user asked. (requires: thread_id)",
+        method: Method::Post,
+        path: "/standing-applies",
+        args: &[],
+        cli_name: "apply-when-settled",
+        sdk_name: "applyWhenSettled",
+        mutating: true,
+        llm_alias: Some("apply_when_settled"),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Thread whose change to apply once it settles."},"change_id":{"type":"string","description":"Bind to this change. Omit when nothing is proposed yet."}}"#),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "apply_as_they_settle",
+        summary: "Apply every settled pending change, then keep going as the working threads land theirs. ONLY when the user asked.",
+        method: Method::Post,
+        path: "/changes/apply-all?keep_going=true",
+        args: &[],
+        cli_name: "apply-as-they-settle",
+        sdk_name: "applyAsTheySettle",
+        mutating: true,
+        llm_alias: Some("apply_as_they_settle"),
+        llm_schema: Some("{}"),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "cancel_standing_apply",
+        summary: "Take back a standing apply. With thread_id, that thread's. Without, every one here. Stops future applies only.",
+        method: Method::Delete,
+        path: "/standing-applies",
+        args: &[],
+        cli_name: "cancel-standing-apply",
+        sdk_name: "cancelStandingApply",
+        mutating: true,
+        llm_alias: Some("cancel_standing_apply"),
+        llm_schema: Some(r#"{"thread_id":{"type":"string","description":"Cancel this thread's standing apply. Omit to cancel every one in the workspace."}}"#),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
 ];
 
 const CHANGES_DOMAIN: Domain = Domain {
@@ -3071,7 +3116,16 @@ mod tests {
 
         // changes — grouped LLM tool only (hand-written CLI stays).
         let changes = domains().iter().find(|d| d.name == "changes").unwrap();
-        assert_eq!(changes.actions(), vec!["list", "apply"]);
+        assert_eq!(
+            changes.actions(),
+            vec![
+                "list",
+                "apply",
+                "apply_when_settled",
+                "apply_as_they_settle",
+                "cancel_standing_apply"
+            ]
+        );
         assert!(changes.llm && !changes.cli && !changes.sdk);
         assert_eq!(domain_for_tool("apply_change").unwrap().name, "changes");
     }

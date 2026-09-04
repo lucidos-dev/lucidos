@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.35.0 — 2026-09-04
+
+### Added
+
+- Answer a waiting question out loud during a call. Speaking the choice settles the card on screen, and a permission card can be answered the same way instead of passing in silence. Saying goodbye ends the call and leaves the work running.
+- Arm Apply before a coding agent has finished. The prompt row and the Changes panel carry a standing apply: press it while a thread is still working and the change lands the moment that thread settles. Apply All gains the same, as one toggle that also turns the whole workspace off again.
+- Pick the live transcription model for calls. **gpt-live-transcribe** leads the list in Settings > Models, built for a live microphone.
+
+### Changed
+
+- Your bubble appears as you start speaking, with three pulsing bars, and fills in as the words arrive.
+- A call reads back as one conversation. Every utterance draws the ordinary user bubble with a call icon, whichever model fielded it, and an answer still on its way draws its response panel straight away instead of leaving the transcript quiet.
+- The pairing screen is a column on the page rather than a card, which gives the install steps the full line length on a phone.
+- A control that cannot act is replaced by the one that can, so no button is drawn faded with its tooltip out of reach.
+
+### Fixed
+
+- A paired iPhone stays paired. A browser may split its cookies across several header fields over HTTP/2, and the gateway read only the first, so the same phone was let in on one request and handed the pairing screen on the next.
+- Reading email works when the server hangs up on the way out. A successful read is kept even if the IMAP LOGOUT that follows it never gets a reply.
+- A handshake token minted for one host is never sent to another. It is now bound to the script, the host and the accounts it was minted with, so repointing a proxy entry cannot replay a live credential somewhere else.
+- **Working** shimmers even when the live step row is below the fold, so a tall coding-agent turn no longer reads as finished.
+- A spoken aside no longer reopens a finished answer, which used to produce a whole second reply seconds after the first.
+- A spoken reply lands under the thing it answers, wherever the bottom of the transcript moved to.
+- The plugin update panel counts a real decision. A file whose content already matches the new version is no longer listed as your local change.
+- The webhook ingress bar tells a blocked local port apart from a dead ingress, and names the families this host could not send for.
+- A caller with no credential is refused rather than recorded as you, and every mutating request under the API is held to the same rule in one place.
 ## v0.34.1 — 2026-08-31
 
 ### Changed

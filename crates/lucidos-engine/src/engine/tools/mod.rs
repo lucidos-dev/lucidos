@@ -31,6 +31,7 @@ mod web;
 pub(crate) use capabilities::TurnCapabilities;
 
 use super::LucidosEngine;
+use crate::api::thread_reach::ThreadReachVerb;
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::llm::tool_names as tn;
@@ -109,6 +110,59 @@ pub(crate) fn agent_tool_actor(
         spawning_event_id: None,
         mode: crate::engine::thread_events::ActorMode::Agent,
         direction: crate::engine::thread_events::ThreadDirection::Parent,
+    }
+}
+
+/// The clause-4 gate, rendered for a tool's `Result<String, String>`.
+///
+/// Three LLM tools press Apply in-process, so each asks the same rule the HTTP
+/// routes ask. A verb gated on the route somebody remembered and forgotten on
+/// its second is the failure both ADR 0083 and ADR 0168 diagnose.
+///
+/// The refusal text comes from `api::thread_reach`, so a tool and a route tell
+/// an agent the same thing.
+impl LucidosEngine {
+    async fn refuse_tool_without_authority(
+        &self,
+        caller_thread_id: uuid::Uuid,
+        target: Option<uuid::Uuid>,
+        verb: ThreadReachVerb,
+    ) -> Result<(), String> {
+        crate::api::thread_reach::refuse_thread_without_authority(
+            self.pool(),
+            caller_thread_id,
+            target,
+            verb,
+        )
+        .await
+        .map_err(|e| format!("Error: {e}"))
+    }
+
+    /// What the gate should aim at for a change id, or `None` to skip it.
+    ///
+    /// A change id naming nothing skips the gate, so the engine answers "Change
+    /// not found" as it does on the HTTP route. Gating it would make a tool and
+    /// a route disagree, and would leak whether the id exists.
+    ///
+    /// Everything else aims: at the proposing thread when there is one, and at
+    /// the workspace when the change names none. That second case is the
+    /// fail-closed answer, since no subtree contains a threadless change.
+    async fn change_target(&self, change_id: uuid::Uuid) -> Option<Option<uuid::Uuid>> {
+        match sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+            "SELECT thread_id FROM changes WHERE id = $1",
+        )
+        .bind(change_id)
+        .fetch_optional(self.pool())
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                log!("[Tools] Could not read the thread of change {change_id}: {e}");
+                // A probe that could not run must not wave the act past, so aim
+                // at the workspace and let the standing instruction decide.
+                Some(None)
+            }
+        }
     }
 }
 
@@ -251,6 +305,9 @@ impl LucidosEngine {
             tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
             tn::LIST_CHANGES => self.execute_list_changes().await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
+            tn::APPLY_WHEN_SETTLED => self.execute_apply_when_settled(args, thread_id).await,
+            tn::APPLY_AS_THEY_SETTLE => self.execute_apply_as_they_settle(thread_id).await,
+            tn::CANCEL_STANDING_APPLY => self.execute_cancel_standing_apply(args, thread_id).await,
             tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
             tn::UPDATE_THREAD_QUEUE_POLICY => {
                 self.execute_update_thread_queue_policy(args, thread_id)
@@ -918,7 +975,14 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        let change_id = parse_apply_change_id(args)?;
+        let change_id = parse_required_uuid(args, "change_id")?;
+        // Applying acts on the thread that proposed the change, so a parent
+        // applying its child's work stays in-subtree and needs nobody. A change
+        // from anywhere else is the owner's button (ADR 0168 clause 4).
+        if let Some(target) = self.change_target(change_id).await {
+            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+                .await?;
+        }
         // The agent in THIS thread drove the apply, so the `ChangeApplied`
         // event (emitted on the *proposing* thread's timeline) deep-links back
         // here. `direction: Parent` fits the dominant flow: a chat thread
@@ -934,6 +998,120 @@ impl LucidosEngine {
                 .map_err(|e| format!("Error: failed to serialise apply result: {}", e)),
             Err(e) => Err(format!("Error: failed to apply change: {}", e)),
         }
+    }
+
+    /// LLM tool: arm a *standing apply* on one thread, so its change applies
+    /// once the thread settles. The prompt-side twin of the Apply control's
+    /// "Apply as it settles" face, calling the same engine state (ADR 0168
+    /// clause 5, philosophy rule 2).
+    async fn execute_apply_when_settled(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let target = parse_required_uuid(args, "thread_id")?;
+        let change_id = parse_optional_uuid(args, "change_id")?;
+        // Arming an apply on a thread IS applying it, one settle later, so it
+        // takes the same gate the immediate apply does.
+        self.refuse_tool_without_authority(thread_id, Some(target), ThreadReachVerb::Apply)
+            .await?;
+        let actor = agent_tool_actor(thread_id);
+        let engine = self.clone_arc();
+        engine
+            .arm_standing_apply(crate::engine::standing_apply::StandingApply {
+                thread_id: target,
+                change_id,
+                batch_id: None,
+                actor: Some(actor),
+            })
+            .await
+            .map_err(|e| format!("Error: failed to arm the standing apply: {e}"))?;
+        serde_json::to_string(&serde_json::json!({
+            "armed_thread_id": target,
+            "change_id": change_id,
+        }))
+        .map_err(|e| format!("Error: failed to serialise the arm: {e}"))
+    }
+
+    /// LLM tool: the sweep. Apply everything pending that has settled, then
+    /// keep going as the threads still working land theirs.
+    ///
+    /// Runs the engine's own Apply All press, so this is the button's rule
+    /// rather than a second copy of it: same filters, same durable batch, same
+    /// driver taking the remainder. Only the first member is applied inline, so
+    /// the turn does not sit through a multi-minute harden.
+    async fn execute_apply_as_they_settle(&self, thread_id: uuid::Uuid) -> ToolOutcome {
+        // The sweep is Apply at workspace scope, so no subtree contains it and
+        // it is the owner's button (ADR 0168 clause 4).
+        self.refuse_tool_without_authority(thread_id, None, ThreadReachVerb::Apply)
+            .await?;
+        let actor = agent_tool_actor(thread_id);
+        let engine = self.clone_arc();
+        let outcome = engine
+            .run_apply_all(Some(actor), true)
+            .await
+            .map_err(|e| format!("Error: failed to start Apply All: {e}"))?;
+        let body = match outcome {
+            crate::engine::apply_all_driver::ApplyAllOutcome::NothingToApply { armed, .. } => {
+                serde_json::json!({ "batch_size": 0, "armed": armed })
+            }
+            crate::engine::apply_all_driver::ApplyAllOutcome::Started {
+                batch_id,
+                batch_size,
+                armed,
+                first_branch,
+                first_result,
+            } => serde_json::json!({
+                "batch_id": batch_id,
+                "batch_size": batch_size,
+                "armed": armed,
+                "first_branch": first_branch,
+                "first_status": first_result.as_ref().map(|r| r.status).ok(),
+                "first_error": first_result.err(),
+            }),
+        };
+        engine.broadcast_changes_updated().await;
+        serde_json::to_string(&body)
+            .map_err(|e| format!("Error: failed to serialise the sweep result: {e}"))
+    }
+
+    /// LLM tool: take a *standing apply* back. The off for the two arms above,
+    /// so the prompt can undo what it armed (philosophy rule 2).
+    ///
+    /// `thread_id` names one thread. Omitted, it cancels every arm here, which
+    /// is what the Changes panel's own off does.
+    ///
+    /// It asks the gate the arm asks. Taking an apply back acts on the same
+    /// thread's apply, so a caller that could not have armed here may not
+    /// cancel here. The workspace-wide form aims past every subtree, exactly as
+    /// the sweep does.
+    ///
+    /// Nothing armed is not an error. The caller asked for the instruction to
+    /// be gone, and it is.
+    async fn execute_cancel_standing_apply(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let target = parse_optional_uuid(args, "thread_id")?;
+        self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+            .await?;
+        let actor = Some(agent_tool_actor(thread_id));
+        let reason = crate::engine::standing_apply::DISARMED_BY_OWNER;
+        let canceled = match target {
+            Some(target) => usize::from(self.drop_standing_apply(target, reason, actor).await),
+            None => {
+                self.drop_standing_applies(
+                    crate::engine::standing_apply::DisarmScope::All,
+                    reason,
+                    actor,
+                )
+                .await
+            }
+        };
+        self.broadcast_changes_updated().await;
+        serde_json::to_string(&serde_json::json!({ "canceled": canceled }))
+            .map_err(|e| format!("Error: failed to serialise the cancel: {e}"))
     }
 
     /// LLM tool: list the Thread Queue plus the active capacity policy. Shares
@@ -1087,17 +1265,34 @@ fn is_thread_queue_policy_field(field: &str) -> bool {
     )
 }
 
-/// Parse the required `change_id` UUID arg for the `apply_change` tool. Pure
-/// so the validation branches are unit-testable without booting an engine
-/// (same pattern as `query_events_impl`). Missing / null / empty /
+/// Parse a required UUID arg by name. Pure, so the validation branches are
+/// unit-testable without booting an engine. Missing, null, empty and
 /// whitespace-only all collapse to "required"; a non-UUID string is rejected
-/// before the heavyweight merge pipeline runs.
-pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
-    let raw = match args.get("change_id").and_then(|v| v.as_str()) {
+/// before any heavyweight work runs.
+pub(crate) fn parse_required_uuid(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<uuid::Uuid, String> {
+    let raw = match args.get(key).and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => return Err("Error: change_id is required".to_string()),
+        _ => return Err(format!("Error: {key} is required")),
     };
-    uuid::Uuid::parse_str(raw).map_err(|_| format!("Error: change_id is not a valid UUID: {}", raw))
+    uuid::Uuid::parse_str(raw).map_err(|_| format!("Error: {key} is not a valid UUID: {raw}"))
+}
+
+/// Parse an optional UUID arg by name. Absent reads as `None`. A present but
+/// unparseable value is an error rather than a silent `None`, so a mistyped id
+/// cannot quietly widen what the caller asked for.
+pub(crate) fn parse_optional_uuid(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<uuid::Uuid>, String> {
+    match args.get(key).and_then(|v| v.as_str()).map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => uuid::Uuid::parse_str(raw)
+            .map(Some)
+            .map_err(|_| format!("Error: {key} is not a valid UUID: {raw}")),
+    }
 }
 
 /// Parse an optional RFC3339 time filter (`since` / `until`) for the event

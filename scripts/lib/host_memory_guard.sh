@@ -32,14 +32,35 @@
 # the run. The pile-up recorded in the e2e_lock.sh header reached 23.5 GB
 # compressed AND 14 GB of swap; swap is the half that says it went wrong.
 #
-# The compressor is kept as a RUNAWAY BACKSTOP only, and is now a share of
-# physical memory rather than a fixed byte count. A fixed 12 GB is 75% of a 16 GB
-# Mac and 25% of a 48 GB one, so it could not mean the same thing on both.
+# The compressor is kept as a RUNAWAY BACKSTOP only, and it resolves to the LOWER
+# of two ceilings. Both are ceilings, so the tighter one is the only one worth
+# applying.
+#
+# The share of physical memory keeps a SMALL host honest. A fixed 12 GB is 75% of
+# a 16 GB Mac and 25% of a 48 GB one, so one byte count cannot mean the same thing
+# on both.
+#
+# The absolute cap keeps a LARGE host honest, and that half was missing. Half of
+# 48 GB is 24 GB, which no run here has come near, so on this machine the share
+# alone could never fire and the only ceiling in force was whatever the caller
+# happened to export. The cap is HOST_MEMORY_COMPRESSOR_CAP_GB, 16. It is not a
+# round number picked for comfort: 17.41 GB is the compressor reading that
+# hard-froze this host on 2026-07-26, so 16 leaves a real margin under a reading
+# already paid for. Raising it spends that margin.
 
 # ── knobs ───────────────────────────────────────────────────────────────
 #   LUCIDOS_E2E_SWAP_MAX_GB        swap in use that stops the run (default 1)
-#   LUCIDOS_E2E_COMPRESSOR_MAX_PCT backstop as a share of RAM (default 50)
-#   LUCIDOS_E2E_COMPRESSOR_MAX_GB  explicit absolute backstop, overrides the pct
+#   LUCIDOS_E2E_COMPRESSOR_MAX_GB  absolute backstop; when set it wins outright
+#   LUCIDOS_E2E_COMPRESSOR_MAX_PCT share of RAM (default 50), CAPPED, see below
+#
+# Unset, the backstop is the lower of HOST_MEMORY_COMPRESSOR_CAP_GB and that
+# share. An explicit LUCIDOS_E2E_COMPRESSOR_MAX_GB replaces BOTH, because an
+# operator naming a number means that number.
+#
+# The PCT knob is NOT an escape from the cap. It moves the share, and the lower
+# of the two still wins, so on a 48 GB host any value over 33 is a no-op. That is
+# deliberate: the cap is calibrated to a freeze reading rather than to a ratio, so
+# a percentage cannot argue it away. Name a number in GB to raise the ceiling.
 #
 # Test seams, honored before any real host read:
 #   HOST_COMPRESSOR_GB_OVERRIDE
@@ -51,6 +72,11 @@
 # It sits beside the host-load guard's 75 (EX_TEMPFAIL). Playwright exits 0, 1 or
 # 130, so 71 can never collide with a Playwright code.
 HOST_MEMORY_STOP_EXIT=71
+
+# The absolute half of the compressor backstop, in GB. The header says where 16
+# comes from and what raising it costs. The RAM share is the other half, and the
+# lower of the two is what a boundary is judged against.
+HOST_MEMORY_COMPRESSOR_CAP_GB=16
 
 # Set to the project name at the boundary that tripped a stop. The phase split
 # and the project loop both read it. Neither starts more work on a host we have
@@ -147,8 +173,13 @@ _host_mem_swap_ceiling_gb() {
     printf '%s' "$max"
 }
 
+# The backstop, in GB. An explicit LUCIDOS_E2E_COMPRESSOR_MAX_GB wins outright:
+# an operator who names a number means that number, cap included.
+#
 # Echoes nothing when physical memory is unreadable and no absolute override is
-# set, so the backstop is simply not applied. Swap still is.
+# set, so the backstop is simply not applied. Swap still is. The cap alone would
+# be a defensible answer there, but a guard that cannot measure the host must not
+# start inventing thresholds for it.
 _host_mem_compressor_ceiling_gb() {
     local explicit="${LUCIDOS_E2E_COMPRESSOR_MAX_GB:-}"
     if _host_mem_is_number "$explicit" && awk -v m="$explicit" 'BEGIN { exit (m + 0 > 0) ? 0 : 1 }'; then
@@ -163,7 +194,11 @@ _host_mem_compressor_ceiling_gb() {
     local phys
     phys="$(_host_mem_read_physical_gb)"
     [ -n "$phys" ] || return 0
-    awk -v p="$phys" -v q="$pct" 'BEGIN { printf "%.2f", p * q / 100 }'
+    # The lower of the share and the cap. On a 48 GB host the cap bites first, at
+    # 16.00 against a 24.00 share; on a 16 GB one the share still bites first, at
+    # 8.00. That is the whole point of taking a minimum rather than picking one.
+    awk -v p="$phys" -v q="$pct" -v cap="$HOST_MEMORY_COMPRESSOR_CAP_GB" \
+        'BEGIN { share = p * q / 100; printf "%.2f", (share < cap) ? share : cap }'
 }
 
 # True when $1 is strictly greater than $2. Float math goes through awk, never
@@ -192,25 +227,43 @@ check_host_memory_at_boundary() {
     fi
     echo "[e2e-mem] after $where: compressor ${gb:-?} GB, swap ${swap:-?} GB"
 
+    # Two stops, and they mean opposite things about the host. The wording says
+    # which one fired, because this line is what somebody reads at 06:30 to
+    # decide whether the Mac was in trouble or the run merely got greedy.
+    #
     # Swap first, because it is the condition that means the host is in trouble.
     # The compressor below only means it has been busy.
     if [ -n "$swap" ] && _host_mem_over "$swap" "$swap_max"; then
         HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
-        MEMORY_STOP_DETAIL="At $where the host had $swap GB of swap in use, over the $swap_max GB limit."
+        MEMORY_STOP_DETAIL="At $where the host had $swap GB of swap in use, over the $swap_max GB limit. That is measured distress."
         echo ""
         echo "[e2e-mem] STOP: $swap GB of swap is in use, over the $swap_max GB limit."
-        echo "[e2e-mem] Compression has stopped keeping up, so the run is now"
-        echo "[e2e-mem] costing the host. Stopping at this boundary."
+        echo "[e2e-mem] This is MEASURED DISTRESS. macOS compresses before it swaps, so"
+        echo "[e2e-mem] swap means compression stopped keeping up and the host is in"
+        echo "[e2e-mem] real trouble. The run must stop at this boundary."
         return 1
     fi
 
     if [ -n "$gb" ] && [ -n "$ceiling" ] && _host_mem_over "$gb" "$ceiling"; then
         HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
-        MEMORY_STOP_DETAIL="At $where the compressor was $gb GB, over the $ceiling GB backstop."
         echo ""
         echo "[e2e-mem] STOP: compressor $gb GB is over the $ceiling GB backstop."
-        echo "[e2e-mem] Swap is still clear, so this is the runaway backstop rather"
-        echo "[e2e-mem] than measured distress. Stopping at this boundary."
+        # "Not distress" is a claim about SWAP, so it may only be made when swap
+        # was actually read. The compressor is readable on its own (vm_stat), and
+        # a failing `sysctl vm.swapusage` leaves it empty, so this branch is
+        # reachable and the confident wording would be a lie in it.
+        if [ -n "$swap" ]; then
+            MEMORY_STOP_DETAIL="At $where the compressor was $gb GB, over the $ceiling GB backstop, with swap at $swap GB. The host was not in distress."
+            echo "[e2e-mem] This is the RUNAWAY BACKSTOP, NOT distress. Swap is still clear at"
+            echo "[e2e-mem] $swap GB, under its $swap_max GB limit, so the host was never in"
+            echo "[e2e-mem] trouble. The run is stopped for growing further than a run should"
+            echo "[e2e-mem] need to, not because the Mac was struggling."
+        else
+            MEMORY_STOP_DETAIL="At $where the compressor was $gb GB, over the $ceiling GB backstop. Swap was unreadable, so distress could not be ruled out."
+            echo "[e2e-mem] This is the RUNAWAY BACKSTOP, but swap was UNREADABLE, so distress"
+            echo "[e2e-mem] cannot be ruled out here. Read the host yourself before deciding"
+            echo "[e2e-mem] the Mac was fine."
+        fi
         return 1
     fi
     return 0
@@ -232,7 +285,7 @@ report_host_memory_start() {
     else
         echo "[e2e-mem] browser phase start: compressor $gb GB, swap ${swap:-?} GB"
     fi
-    echo "[e2e-mem] stops at: swap over $swap_max GB, or compressor over ${ceiling:-no} GB."
+    echo "[e2e-mem] stops at: swap over $swap_max GB (distress), or compressor over ${ceiling:-no} GB (backstop)."
 }
 
 # Final verdict for a run a stop cut short. finish calls it, so every exit path

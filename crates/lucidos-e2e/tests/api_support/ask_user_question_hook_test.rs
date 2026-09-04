@@ -2,7 +2,7 @@
 //! invoked by the lucidos-cli ask-user-question-hook subcommand from inside
 //! CC subprocesses. Drives the endpoint with HTTP only — no real CC needed.
 
-use crate::support::{base_url, count_events_of_type, db_url, http_client, seed_cc_thread_summary};
+use crate::support::{base_url, count_events_of_type, db_url, seed_cc_thread_summary, user_client};
 use serde_json::json;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -41,7 +41,7 @@ async fn wait_for_question_asked(pool: &PgPool, thread_id: Uuid, tool_use_id: &s
 
 #[tokio::test]
 async fn long_poll_returns_answer_when_user_responds() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_e2e_{}", thread_id.simple());
@@ -141,7 +141,7 @@ async fn long_poll_returns_answer_when_user_responds() {
 /// alone. Without it a restart would re-fire the walk and re-ask it.
 #[tokio::test]
 async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_batch_end_{}", thread_id.simple());
@@ -266,7 +266,7 @@ async fn answer_less_resolution_releases_the_parked_hook_and_ends_the_batch() {
 /// refusal has to be tested rather than assumed from the type.
 #[tokio::test]
 async fn answer_question_refuses_a_client_supplied_superseded() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let q0_id = format!("toolu_client_superseded_{}#q0", thread_id.simple());
@@ -342,7 +342,7 @@ async fn answer_question_refuses_a_client_supplied_superseded() {
 
 #[tokio::test]
 async fn multi_select_question_returns_joined_answer() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_multi_{}", thread_id.simple());
@@ -422,7 +422,7 @@ async fn multi_select_question_returns_joined_answer() {
 
 #[tokio::test]
 async fn multi_select_empty_answer_is_rejected() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_multi_empty_{}", thread_id.simple());
@@ -496,7 +496,7 @@ async fn multi_select_empty_answer_is_rejected() {
 
 #[tokio::test]
 async fn returns_immediately_when_answer_already_persisted() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
     let thread_id = Uuid::new_v4();
     let tool_use_id = format!("toolu_recovery_{}", thread_id.simple());

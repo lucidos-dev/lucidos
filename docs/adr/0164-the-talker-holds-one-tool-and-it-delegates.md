@@ -1,10 +1,17 @@
 # 0164: The talker holds one delegation tool and decides when the doer runs
 
-- **Status**: Accepted
+- **Status**: Accepted, with the one-tool clause superseded by ADR 0170
 - **Date**: 2026-08-30
 
 Supersedes the tool-less clause of ADR 0149. The rest of that ADR stands,
 including the guarantee this one keeps.
+
+**What changed.** The talker now holds three tools: `delegate`, one that answers
+what is waiting on the caller, and one that hangs up. Read "exactly one tool"
+and "one entry and stays one entry" below as that set. The guarantee is
+untouched, because it was never about the count: none of the three mutates
+anything. ADR 0170 has the reasoning, and it re-argues the rejected "two tools"
+alternative below on the case that actually arose.
 
 ## Context
 

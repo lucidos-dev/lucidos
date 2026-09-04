@@ -50,6 +50,9 @@ mod errors_test;
 #[path = "api_support/changes_test.rs"]
 mod changes_test;
 
+#[path = "api_support/standing_apply_test.rs"]
+mod standing_apply_test;
+
 #[path = "api_support/app_coding_agent_test.rs"]
 mod app_coding_agent_test;
 

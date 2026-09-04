@@ -24,7 +24,7 @@
 //! issue an HTTP request while the runtime is winding down, which this crate's
 //! `reqwest` (no `blocking` feature) cannot do without re-entering the reactor.
 
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, user_client};
 use serde_json::json;
 
 /// `(schedule, provider)` as the engine reports them, or `None` if the request
@@ -43,7 +43,8 @@ async fn read_schedule() -> Option<(Option<String>, Option<String>)> {
 }
 
 async fn put_schedule(provider: &str, schedule: &str) -> serde_json::Value {
-    let resp = http_client()
+    let resp = user_client()
+        .await
         .put(format!("{}/api/v1/backup/schedule", base_url()))
         .json(&json!({ "provider": provider, "schedule": schedule }))
         .send()

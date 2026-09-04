@@ -107,8 +107,9 @@ describe('questionDividerResolution', () => {
 });
 
 /** The suppression itself. It is `questionDividerResolution` plus one carve-out:
- *  a body carrying a spoken row is the transcript of a call, and nothing else
- *  in the app draws one. */
+ *  a body carrying what Lucidos said out loud is the transcript of a call, and
+ *  nothing else in the app draws one. The caller's own words are not looked
+ *  for, since those open an exchange of their own. */
 describe('dividerBodyIsSuppressed', () => {
   const canceled = () =>
     makeExchange(askedEvent, [
@@ -127,11 +128,6 @@ describe('dividerBodyIsSuppressed', () => {
     const events: ResponseEvent[] = [
       { type: 'spoken_reply', text: 'The codebase is clean.', interrupted: false },
     ];
-    expect(dividerBodyIsSuppressed(canceled(), events)).toBe(false);
-  });
-
-  it('keeps a body carrying what the caller said out loud', () => {
-    const events: ResponseEvent[] = [{ type: 'spoken_message', text: 'Anything for me?' }];
     expect(dividerBodyIsSuppressed(canceled(), events)).toBe(false);
   });
 

@@ -529,6 +529,8 @@ The staged install panel lists the outcome for each edited file **before** you c
 | `replaced` | Never mergeable: a trigger definition, a binary, or a file over 1 MB. Writes upstream's version, and saves yours aside. |
 | `restored` | You had deleted the file and the new version still ships it, so it comes back. Nothing is saved aside, because a deletion has no content to keep. |
 
+**A file already identical to the new version is not listed at all.** It is the common shape after you publish your own edit upstream: you update back onto your own work. Those paths are written as shipped, with no row, no count, and nothing saved aside. Only the files that still differ from the new version are a decision. The comparison is by content hash, so an oversized file is judged like any other.
+
 The panel also carries one **Keep my local changes** control, on by default. Clearing it takes a clean update: every file becomes `replaced`, and every edit is saved aside. The choice reaches the engine as `?keep_local_changes=false` on the confirm. An absent flag means keep, so a caller that never showed the control cannot silently discard a patch.
 
 **A discarded edit is never simply deleted.** Before anything is overwritten, the engine writes your version and a `.patch` of it under `data/artifacts/plugin-local-changes/<plugin-id>/v<version>/`, with a `README.md` explaining the folder. That root is git-tracked and never auto-deleted. A clean merge saves nothing, because your edit survives in the file itself.

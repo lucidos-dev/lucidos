@@ -7,7 +7,8 @@
 //! emits ChangeProposed → Apply) is covered by browser e2e.
 
 use crate::support::{
-    base_url, db_url, git, git_in, http_client, seed_app_cc_thread_summary, workspace_path,
+    base_url, db_url, git, git_in, http_client, seed_app_cc_thread_summary, user_client,
+    workspace_path,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -246,7 +247,7 @@ async fn cleanup(
 /// file changed.
 #[tokio::test]
 async fn app_coding_agent_lifecycle() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap().to_string();
     let pool = sqlx::PgPool::connect(&db_url())
@@ -285,14 +286,20 @@ async fn app_coding_agent_lifecycle() {
     // Subscribe to SSE BEFORE seeding the change so we don't miss the
     // transient `AppUiRefreshRequested` (it's not persisted to the events
     // table — see `SystemEvent::is_persisted`). The handle resolves to the
-    // matching SSE line, or None if the 10s window elapses.
+    // matching SSE line, or None once the window elapses.
+    //
+    // The window is a LIVENESS bound, never a latency assertion: what is under
+    // test is that the emit happens for this app at all. At 10s it was neither.
+    // The apply in between does real git work on the shared workspace tree,
+    // with a sibling test applying concurrently. The full suite regularly
+    // pushed it past 10s while the test passed alone.
     let app_id_for_predicate = app_id.clone();
     let sse_handle = await_sse_line(
         move |line| {
             line.contains("\"type\":\"AppUiRefreshRequested\"")
                 && line.contains(&format!("\"app_id\":\"{}\"", app_id_for_predicate))
         },
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -384,7 +391,7 @@ async fn app_coding_agent_lifecycle() {
 /// source already works; app threads reuse the same mutex).
 #[tokio::test]
 async fn app_coding_agent_concurrent_apply() {
-    let client = http_client();
+    let client = user_client().await;
     let ws = workspace_path();
     let repo_root = ws.to_str().unwrap().to_string();
     let pool = sqlx::PgPool::connect(&db_url())

@@ -30,7 +30,7 @@ use sqlx::PgPool;
 
 use crate::api::SharedEngine;
 use crate::core::webhook_ingress::{
-    decide, degraded_families, judge, AddressProbe, Decision, Family, FamilyVerdict,
+    decide, degraded_families, judge, AddressProbe, Decision, Family, FamilyVerdict, Stage,
 };
 use crate::core::webhook_probe_token;
 use crate::core::WebhookStore;
@@ -147,6 +147,16 @@ async fn run_cycle(engine: &SharedEngine, pool: &PgPool) -> Option<&'static str>
     };
     let families = judge(&addresses);
     let observed = degraded_families(&families);
+
+    let blocked = local_egress_families(&addresses);
+    if !blocked.is_empty() {
+        log!(
+            "[WebhookIngress] This host cannot send to {}:{} over {}, so it judged nothing there",
+            ingress.host,
+            ingress.port,
+            family_list(&blocked)
+        );
+    }
 
     match record_cycle(&families, declared.as_ref()) {
         Decision::Nothing => {}
@@ -467,6 +477,22 @@ fn hook_port_from(configured: Option<&str>) -> Option<u16> {
     }
 }
 
+/// The families this host could not send for, in canonical order.
+///
+/// They earn a log line because nothing else reports them. Such a family reads
+/// `not-probed`, so no event carries it and the page draws nothing. Without the
+/// line, an engine that declined to judge would look exactly like a quiet one.
+fn local_egress_families(addresses: &[AddressProbe]) -> Vec<Family> {
+    let mut out: Vec<Family> = addresses
+        .iter()
+        .filter(|a| a.stage == Stage::LocalEgressBlocked)
+        .map(|a| a.family)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The degraded families, for a log line.
 fn family_list(families: &[Family]) -> String {
     families
@@ -501,6 +527,44 @@ mod tests {
         assert_eq!(hook_port_from(Some("not a port")), None);
         assert_eq!(hook_port_from(Some("70000")), None);
         assert_eq!(hook_port_from(None), None);
+    }
+
+    #[test]
+    fn a_family_this_host_could_not_send_for_still_reaches_the_log() {
+        // The one reading nothing else reports. It emits no event and draws no
+        // bar, so a silent cycle would look identical to a healthy one.
+        let blocked = |address: &str, family| AddressProbe {
+            address: address.into(),
+            family,
+            stage: Stage::LocalEgressBlocked,
+            status: None,
+            detail: Some("this host cannot reach port 8443 on any address".into()),
+        };
+        let addresses = vec![
+            blocked("2001:db8::1", Family::Ipv6),
+            blocked("203.0.113.7", Family::Ipv4),
+            blocked("203.0.113.8", Family::Ipv4),
+        ];
+
+        // Canonical order and one entry per family, because the line names them.
+        assert_eq!(
+            local_egress_families(&addresses),
+            vec![Family::Ipv4, Family::Ipv6]
+        );
+        assert_eq!(
+            family_list(&local_egress_families(&addresses)),
+            "IPv4 and IPv6"
+        );
+
+        // A cycle that measured something says nothing about local egress.
+        let healthy = vec![AddressProbe {
+            address: "203.0.113.7".into(),
+            family: Family::Ipv4,
+            stage: Stage::Healthy,
+            status: Some(401),
+            detail: None,
+        }];
+        assert!(local_egress_families(&healthy).is_empty());
     }
 
     /// A stored payload, with the families under test.

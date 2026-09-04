@@ -134,3 +134,42 @@ describe('rawFetch deadline + caller signal', () => {
       .rejects.toMatchObject({ httpCode: 400, reason: 'unknown preference key' });
   });
 });
+
+/** Three app routes reached the engine with no identity at all, so the engine
+ *  recorded them as the owner on no evidence: Publish, Blog preview and Trigger
+ *  update. They arrive through this facade rather than the host app's own
+ *  device-stamped client, so stamping here covers every SDK caller at once.
+ *  See ADR 0169. */
+describe('device attribution', () => {
+  const DEVICE_ID_HEADER = 'x-lucidos-device-id';
+
+  /** The header the facade sent, or undefined. */
+  async function headerOn(deviceId: string | null): Promise<string | undefined> {
+    if (deviceId === null) localStorage.removeItem('lucidos-device-id');
+    else localStorage.setItem('lucidos-device-id', deviceId);
+    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await request('/triggers');
+    const init = spy.mock.calls[0][1] as RequestInit;
+    return (init.headers as Record<string, string>)[DEVICE_ID_HEADER];
+  }
+
+  afterEach(() => localStorage.removeItem('lucidos-device-id'));
+
+  it('sends the parent app\'s device id on every request', async () => {
+    expect(await headerOn('device-abcdef01')).toBe('device-abcdef01');
+  });
+
+  it('sends no header when the parent has minted no device yet', async () => {
+    expect(await headerOn(null)).toBeUndefined();
+  });
+
+  it('lets a caller-supplied header win, so an explicit device is never masked', async () => {
+    localStorage.setItem('lucidos-device-id', 'stored');
+    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
+    globalThis.fetch = spy as unknown as typeof fetch;
+    await request('/triggers', { headers: { [DEVICE_ID_HEADER]: 'explicit' } });
+    const init = spy.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>)[DEVICE_ID_HEADER]).toBe('explicit');
+  });
+});

@@ -1,9 +1,6 @@
 import { test, expect, Page, Locator } from './fixtures';
 import {
-  navigateToApp,
-  assertHealthy,
-  openTriggersPanel,
-  addTriggerCard,
+  addTriggerCard, apiRequest, assertHealthy, navigateToApp, openTriggersPanel,
   pickDropdownOption,
 } from './helpers';
 
@@ -71,7 +68,7 @@ test.describe('Trigger groups — create / delete', () => {
     await assertHealthy(page);
     // create_trigger reads the timezone preference; set it so the create path
     // never falls back to its UTC default mid-test (matches trigger-side-effects).
-    await page.request.put('/api/v1/preferences?key=timezone', { data: { value: 'UTC' } });
+    await apiRequest(page).put('/api/v1/preferences?key=timezone', { data: { value: 'UTC' } });
   });
 
   test.afterEach(async ({ page }) => {
@@ -81,12 +78,12 @@ test.describe('Trigger groups — create / delete', () => {
       const tRes = await page.request.get('/api/v1/triggers');
       const tBody = await tRes.json();
       for (const t of (tBody.triggers ?? []) as Array<{ id: string; name: string }>) {
-        if (t.name?.startsWith(PREFIX)) await page.request.delete(`/api/v1/triggers?id=${t.id}`);
+        if (t.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/triggers?id=${t.id}`);
       }
       const gRes = await page.request.get('/api/v1/trigger-groups');
       const gBody = await gRes.json();
       for (const g of (gBody.groups ?? []) as Array<{ id: string; name: string }>) {
-        if (g.name?.startsWith(PREFIX)) await page.request.delete(`/api/v1/trigger-groups?id=${g.id}`);
+        if (g.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/trigger-groups?id=${g.id}`);
       }
     } catch {
       /* best-effort cleanup */

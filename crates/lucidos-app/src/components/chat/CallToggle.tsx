@@ -20,9 +20,9 @@
  * row. `available` carries that, so one gate decides and the live-call
  * exemption below covers both reasons at once.
  *
- * It also carries the call's one `status` region, so a screen reader hears a
- * call connect and go live. Nothing draws that state: a caller watching the
- * button knows a call is on, and what is being said lands in the transcript.
+ * It also carries the call's one `status` region. A screen reader hears a call
+ * connect, hears it go live, and hears it pick the caller's voice up. It is
+ * the only announcer a call has: a second one would talk over this.
  *
  * Ringing off is the BUTTON's announcement, not the region's. Its pressed
  * state and its label both flip, where emptying a live region says nothing at
@@ -41,8 +41,8 @@ import { voiceEnabled } from '../../store/actions/preferences';
 export function CallToggle({ available = true }: { available?: boolean }) {
   // Subscribe to the preference signal.
   preferences.value;
-  const phase = voiceCall.value.phase;
-  const on = isOnCall(phase);
+  const call = voiceCall.value;
+  const on = isOnCall(call.phase);
   const openRef = useRef<OverflowMenuOpener | null>(null);
   // The hold's own paired click is swallowed by the gesture, so opening the
   // picker never also places a call. The devices are read by the menu's own
@@ -75,7 +75,7 @@ export function CallToggle({ available = true }: { available?: boolean }) {
           it. Empty while idle, so the first state a call reaches is an
           announcement rather than a change nobody heard the start of. */}
       <span class="visually-hidden" role="status" data-role="call-state">
-        {callStatusLabel(phase)}
+        {callStatusLabel(call)}
       </span>
       <MicrophonePicker openRef={openRef} />
     </>

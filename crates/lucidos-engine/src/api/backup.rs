@@ -5,6 +5,7 @@ use super::secret_reveal::{
 use super::*;
 use crate::core::backup::{self, crypto};
 use crate::core::PreferenceStore;
+use crate::engine::thread_events::MessageOrigin;
 
 /// The route that mints a backup-key reveal token, named in its own refusal.
 const KEY_MINT_ROUTE: &str = "/api/v1/backup/key/reveal-token";
@@ -161,22 +162,27 @@ pub struct BackupKeyQuery {
     pub token: Option<String>,
 }
 
-/// Refuse this request unless it may see the backup key.
+/// Refuse this request unless it may see the backup key, and say who is asking.
 ///
 /// Both key-bearing routes run it, so the two cannot drift apart. The `rule`
 /// differs by method and the reasoning is ADR 0117's: a `GET` is re-issued by
 /// the service worker on iOS and may lose its `Referer`, a `POST` is not.
-fn check_key_access(
+///
+/// The caller identifies itself BEFORE the reveal token is redeemed. A token is
+/// one-shot, so refusing after the redeem would spend it on a request that
+/// never saw the key.
+async fn check_key_access(
     state: &AppState,
     headers: &HeaderMap,
     token: Option<&str>,
     rule: RefererRule,
-) -> Result<(), ApiError> {
+) -> Result<MessageOrigin, ApiError> {
     if !reveal_request_allowed(headers, rule) {
         log!("[Backup] refused a backup-key read from an app document");
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
+    let actor = crate::api::actor::require_user_actor(headers, &state.pool, None).await?;
     if !state
         .reveal_tokens
         .redeem(token.unwrap_or_default(), RevealSubject::BackupKey)
@@ -185,19 +191,22 @@ fn check_key_access(
         let (status, message) = token_required(KEY_MINT_ROUTE);
         return Err(ApiError::new(status, message));
     }
-    Ok(())
+    Ok(actor)
 }
 
 /// Record that the key left the engine, naming the actor and never the key.
-async fn audit_key_revealed(state: &AppState, headers: &HeaderMap, minted: bool) {
+async fn audit_key_revealed(state: &AppState, actor: MessageOrigin, minted: bool) {
     state
         .engine
         .event_bus
-        .emit_user_system(
-            headers,
-            &state.pool,
+        .emit_or_log(
+            crate::engine::event_bus::BusEvent::System(
+                crate::engine::event_bus::SystemEvent::BackupKeyRevealed {
+                    minted,
+                    actor: Some(actor),
+                },
+            ),
             "[Backup] BackupKeyRevealed",
-            |actor| crate::engine::event_bus::SystemEvent::BackupKeyRevealed { minted, actor },
         )
         .await;
 }
@@ -241,11 +250,12 @@ pub async fn get_backup_key(
     headers: HeaderMap,
     Query(query): Query<BackupKeyQuery>,
 ) -> Result<Json<KeyResponse>, ApiError> {
-    check_key_access(&state, &headers, query.token.as_deref(), READ_REFERER_RULE)?;
+    let actor =
+        check_key_access(&state, &headers, query.token.as_deref(), READ_REFERER_RULE).await?;
     let key_path = backup::key_file_path(&state.workspace_path);
     match crypto::load_key_file(&key_path) {
         Ok(Some(key)) => {
-            audit_key_revealed(&state, &headers, false).await;
+            audit_key_revealed(&state, actor, false).await;
             Ok(Json(KeyResponse {
                 key: crypto::key_to_base64(&key),
                 is_new: false,
@@ -275,10 +285,11 @@ pub async fn generate_backup_key(
     headers: HeaderMap,
     Query(query): Query<BackupKeyQuery>,
 ) -> Result<Json<KeyResponse>, ApiError> {
-    check_key_access(&state, &headers, query.token.as_deref(), WRITE_REFERER_RULE)?;
+    let actor =
+        check_key_access(&state, &headers, query.token.as_deref(), WRITE_REFERER_RULE).await?;
     let (key, is_new) = crypto::ensure_key(&state.workspace_path)
         .map_err(|e| ApiError::internal(format!("Failed to generate backup key: {e}")))?;
-    audit_key_revealed(&state, &headers, is_new).await;
+    audit_key_revealed(&state, actor, is_new).await;
     Ok(Json(KeyResponse {
         key: crypto::key_to_base64(&key),
         is_new,

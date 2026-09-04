@@ -1,7 +1,5 @@
 import { test, expect } from './fixtures';
-import {
-  assertHealthy, uniqueMessage,
-} from './helpers';
+import { apiRequest, assertHealthy, uniqueMessage } from './helpers';
 import { git, psql, WORKSPACE, WORKSPACE_CANONICAL, cleanupCCThread, cleanupFileFromMain } from './db-helpers';
 import { execSync } from 'child_process';
 import { writeFileSync } from 'fs';
@@ -46,7 +44,7 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      const resp = await page.request.post(`/api/v1/changes/${change.id}/apply`);
+      const resp = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`);
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toBeTruthy();
@@ -72,7 +70,7 @@ test.describe('Apply and discard changes', () => {
     const change = createTestChange(suffix);
 
     try {
-      const resp = await page.request.post(`/api/v1/changes/${change.id}/discard`);
+      const resp = await apiRequest(page).post(`/api/v1/changes/${change.id}/discard`);
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toContain('discarded');
@@ -106,7 +104,7 @@ test.describe('Apply and discard changes', () => {
       expect(ourChange!.description).toContain(suffix);
 
       // Apply via API
-      const applyResp = await page.request.post(`/api/v1/changes/${change.id}/apply`);
+      const applyResp = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`);
       expect(applyResp.ok()).toBeTruthy();
 
       // Verify it moved to applied list
@@ -128,7 +126,7 @@ test.describe('Apply and discard changes', () => {
     const change2 = createTestChange(suffix2);
 
     try {
-      const resp = await page.request.post('/api/v1/changes/discard-all');
+      const resp = await apiRequest(page).post('/api/v1/changes/discard-all');
       expect(resp.ok()).toBeTruthy();
       const body = await resp.json();
       expect(body.message).toContain('discarded');
@@ -151,11 +149,11 @@ test.describe('Apply and discard changes', () => {
 
     try {
       // Apply first time
-      const resp1 = await page.request.post(`/api/v1/changes/${change.id}/apply`);
+      const resp1 = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`);
       expect(resp1.ok()).toBeTruthy();
 
       // Apply second time — should either succeed idempotently or return error
-      const resp2 = await page.request.post(`/api/v1/changes/${change.id}/apply`, {
+      const resp2 = await apiRequest(page).post(`/api/v1/changes/${change.id}/apply`, {
         failOnStatusCode: false,
       });
       // The API may return 200 (idempotent) or 400 (already applied) — both are valid
@@ -171,7 +169,7 @@ test.describe('Apply and discard changes', () => {
 
   test('discarding non-existent change returns error', async ({ page }) => {
     const fakeId = randomUUID();
-    const resp = await page.request.post(`/api/v1/changes/${fakeId}/discard`, {
+    const resp = await apiRequest(page).post(`/api/v1/changes/${fakeId}/discard`, {
       failOnStatusCode: false,
     });
     expect(resp.status()).toBeGreaterThanOrEqual(400);

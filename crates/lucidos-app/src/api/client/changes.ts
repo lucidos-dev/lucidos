@@ -31,6 +31,11 @@ export interface Change {
    * so the changes view disables Apply and drops it from Apply All. Defaults to
    * false (absent on non-pending changes and older payloads). */
   thread_unsettled?: boolean;
+  /** True when the originating thread is still WORKING, the half of
+   *  `thread_unsettled` a *standing apply* can act on. A thread parked on a
+   *  question, an event wait or a sub-thread is unsettled too, and arming one
+   *  drops the moment it is pressed. Defaults to false. */
+  thread_working?: boolean;
 }
 
 /** One thread's contribution to the current restart-required toast: derived
@@ -54,6 +59,14 @@ export interface ChangesState {
    *  `applyAllInProgress` signal resets on reload and the ApplyAllBatch* SSE
    *  events aren't replayed. */
   apply_all_in_progress: boolean;
+  /** Threads carrying a *standing apply*. Keyed by thread, not by change: a
+   *  sweep arms a thread that has proposed nothing yet, and its prompt row
+   *  still renders the armed state. Absent on an older payload. */
+  standing_apply_thread_ids?: string[];
+  /** Coding-agent threads still working, so a sweep has something to arm. The
+   *  Changes panel offers "Apply as they settle" off this. It cannot derive it:
+   *  `threadMap` holds only the loaded window. Absent on an older payload. */
+  working_thread_count?: number;
 }
 
 export async function fetchChanges(params?: {
@@ -112,6 +125,12 @@ export interface ApplyAllResult {
   status?: ApplyStatus;
   /** Engine-assigned batch id, present whenever a batch was started. */
   batch_id?: string;
+  /** How many changes the batch holds. Exactly `0` means no batch started, so
+   *  the call only armed: with nothing appliable now, the sweep IS the action
+   *  and nothing will arrive later to clear the optimistic busy flag. Absent on
+   *  an older payload, which reads as "a batch started" and leaves the flag to
+   *  the ApplyAllBatchCompleted event. */
+  batch_size?: number;
   /** Set when the first change stopped at a conflict — same shape as ApplyChangeResult. */
   conflict_thread_id?: string;
   /** Set when the first change needs hardening — the recovery thread that will
@@ -119,16 +138,58 @@ export interface ApplyAllResult {
   review_thread_id?: string;
   applied?: number;
   failed?: number;
+  /** How many threads the sweep armed, when "Keep going as the rest settle"
+   *  was on. */
+  armed?: number;
 }
 
-export async function applyAllChanges(): Promise<ApplyAllResult> {
-  return json(`${API}/changes/apply-all`, { method: 'POST' }, APPLY_TIMEOUT_MS);
+/** Apply every pending change whose thread has settled.
+ *
+ *  With `keepGoing`, it also arms a *standing apply* on every thread still
+ *  working, so each one applies as it lands. That is the whole action when
+ *  nothing is pending, and the button reads "Apply as they settle" there. */
+export async function applyAllChanges(keepGoing = false): Promise<ApplyAllResult> {
+  const qs = keepGoing ? '?keep_going=true' : '';
+  return json(`${API}/changes/apply-all${qs}`, { method: 'POST' }, APPLY_TIMEOUT_MS);
+}
+
+/** Arm a standing apply: the thread's change applies once it settles.
+ *
+ *  Omit `changeId` for a thread that has proposed nothing yet, and the arm
+ *  takes whatever it proposes. */
+export async function armStandingApply(
+  threadId: string,
+  changeId?: string,
+): Promise<{ message: string }> {
+  return json(`${API}/standing-applies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ thread_id: threadId, change_id: changeId ?? null }),
+  });
+}
+
+/** Take the instruction back. */
+export async function disarmStandingApply(threadId: string): Promise<{ message: string }> {
+  return json(`${API}/standing-applies/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
+}
+
+/** Take back every standing apply in the workspace: the Changes panel's own
+ *  off. It drops a single arm as readily as a swept one, because that panel
+ *  draws one armed state for the whole workspace.
+ *
+ *  Nothing armed answers `{ disarmed: 0 }` rather than an error. It stops no
+ *  running Apply All batch: `cancelApplyAllChanges` is that button. */
+export async function disarmAllStandingApplies(): Promise<{ disarmed: number }> {
+  return json(`${API}/standing-applies`, { method: 'DELETE' });
 }
 
 /** Cancel the running Apply All batch — stops the driver, interrupts the
  *  in-flight hardening/merge, and leaves not-yet-applied changes pending. The
  *  resulting ApplyAllBatchCompleted SSE clears the in-progress state. */
-export async function cancelApplyAllChanges(): Promise<{ canceled_batches: number }> {
+export async function cancelApplyAllChanges(): Promise<{
+  canceled_batches: number;
+  disarmed: number;
+}> {
   return json(`${API}/changes/apply-all/cancel`, { method: 'POST' });
 }
 

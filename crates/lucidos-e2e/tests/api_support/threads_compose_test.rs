@@ -13,7 +13,7 @@
 //!
 //! See `docs/plans/2026-05-03-threads-as-drafts-design.md`.
 
-use crate::support::{base_url, db_url, http_client};
+use crate::support::{base_url, db_url, user_client};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -72,7 +72,7 @@ fn thread_url(id: &Uuid) -> String {
 
 #[tokio::test]
 async fn post_threads_creates_composing_thread_and_persists_row() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -94,7 +94,7 @@ async fn post_threads_creates_composing_thread_and_persists_row() {
 
 #[tokio::test]
 async fn post_threads_idempotent_on_same_mode() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
     let body = json!({ "id": id, "mode": "lucidos" });
 
@@ -121,7 +121,7 @@ async fn post_threads_idempotent_on_same_mode() {
 
 #[tokio::test]
 async fn post_threads_conflict_on_different_mode() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
 
     let r1 = client
@@ -147,7 +147,7 @@ async fn post_threads_conflict_on_different_mode() {
 
 #[tokio::test]
 async fn put_compose_updates_text_images_and_mode() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -184,7 +184,7 @@ async fn put_compose_updates_text_images_and_mode() {
 /// shows as "Lucidos" in the archive section.
 #[tokio::test]
 async fn put_compose_mode_toggle_updates_source() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -230,7 +230,7 @@ async fn put_compose_mode_toggle_updates_source() {
 /// the text changes (otherwise we'd churn the drawer pill on every keystroke).
 #[tokio::test]
 async fn put_compose_text_only_preserves_source() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -258,7 +258,7 @@ async fn put_compose_text_only_preserves_source() {
 
 #[tokio::test]
 async fn put_compose_text_only_preserves_mode() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -288,7 +288,7 @@ async fn put_compose_text_only_preserves_mode() {
 /// composing list, so a reload rehydrates the draft's picks.
 #[tokio::test]
 async fn put_compose_persists_and_surfaces_selection() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -343,7 +343,7 @@ async fn put_compose_persists_and_surfaces_selection() {
 /// selection via COALESCE — otherwise every keystroke would wipe the picks.
 #[tokio::test]
 async fn put_compose_text_only_preserves_selection() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -380,7 +380,7 @@ async fn put_compose_text_only_preserves_selection() {
 
 #[tokio::test]
 async fn delete_thread_marks_discarded() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -408,7 +408,7 @@ async fn delete_thread_marks_discarded() {
 /// in-flight echoes; new design rejects at the API boundary by construction.
 #[tokio::test]
 async fn discard_then_late_put_returns_gone() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
 
     client
@@ -440,7 +440,7 @@ async fn discard_then_late_put_returns_gone() {
 
 #[tokio::test]
 async fn delete_then_delete_is_idempotent() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -466,7 +466,7 @@ async fn delete_then_delete_is_idempotent() {
 
 #[tokio::test]
 async fn delete_unknown_thread_is_idempotent_no_op() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
     let resp = client
         .delete(thread_url(&id))
@@ -487,7 +487,7 @@ async fn delete_unknown_thread_is_idempotent_no_op() {
 /// compose layer must accept the keystrokes that lead up to send.
 #[tokio::test]
 async fn put_compose_on_archived_thread_returns_no_content() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -551,7 +551,7 @@ async fn put_compose_on_archived_thread_returns_no_content() {
 /// still apply to archived threads (mode reflects history, not current intent).
 #[tokio::test]
 async fn put_compose_on_archived_rejects_mode_change() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -592,7 +592,7 @@ async fn put_compose_on_archived_rejects_mode_change() {
 
 #[tokio::test]
 async fn put_compose_unknown_thread_returns_not_found() {
-    let client = http_client();
+    let client = user_client().await;
     let id = Uuid::new_v4();
     let resp = client
         .put(compose_url(&id))
@@ -609,7 +609,7 @@ async fn put_compose_unknown_thread_returns_not_found() {
 
 #[tokio::test]
 async fn post_threads_rejects_unknown_mode() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = client
         .post(threads_url())
         .json(&json!({ "id": Uuid::new_v4(), "mode": "bogus" }))
@@ -666,7 +666,7 @@ async fn fetch_compose_epoch(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
 
 #[tokio::test]
 async fn put_compose_at_a_consumed_epoch_is_refused_and_changes_nothing() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -717,7 +717,7 @@ async fn put_compose_at_a_consumed_epoch_is_refused_and_changes_nothing() {
 
 #[tokio::test]
 async fn put_compose_at_the_current_epoch_is_applied() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -749,7 +749,7 @@ async fn consecutive_compose_puts_at_one_epoch_are_all_accepted() {
     // The keystroke path. The epoch counts SUBMISSIONS, not writes, so every
     // PUT between two submissions carries the same value and none of them may
     // fence out the next. A per-write counter would break typing outright.
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -790,7 +790,7 @@ async fn consecutive_compose_puts_at_one_epoch_are_all_accepted() {
 /// lock's 409 surfaced as a "Compose sync failed" card on an ordinary send.
 #[tokio::test]
 async fn a_stale_write_carrying_a_mode_is_refused_as_stale_not_mode_locked() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -851,7 +851,7 @@ async fn a_stale_write_carrying_a_mode_is_refused_as_stale_not_mode_locked() {
 /// is what the reordering above must not weaken.
 #[tokio::test]
 async fn a_current_write_carrying_a_mode_on_a_sent_thread_is_mode_locked() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");
@@ -890,7 +890,7 @@ async fn put_compose_without_an_epoch_is_unfenced() {
     // Permanent back-compat: a cached PWA bundle running against a newer engine
     // cannot know to send an epoch, and refusing its writes would break draft
     // sync outright for it.
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect to e2e db");

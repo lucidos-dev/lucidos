@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openTriggersPanel } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, openTriggersPanel } from './helpers';
 
 /** The trigger group heading's delete icon must be what a touch at its own outer
  *  edge actually hits.
@@ -41,7 +41,7 @@ test.describe('Trigger group actions clear the edge-swipe strip', () => {
       const res = await page.request.get('/api/v1/trigger-groups');
       const body = await res.json();
       for (const g of (body.groups ?? []) as Array<{ id: string; name: string }>) {
-        if (g.name?.startsWith(PREFIX)) await page.request.delete(`/api/v1/trigger-groups?id=${g.id}`);
+        if (g.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/trigger-groups?id=${g.id}`);
       }
     } catch {
       /* best-effort cleanup */
@@ -53,7 +53,7 @@ test.describe('Trigger group actions clear the edge-swipe strip', () => {
     // Created over HTTP so the panel simply loads it: this test is about where
     // the button IS, not about the create flow the lifecycle spec covers.
     const groupName = `${PREFIX}-${Date.now()}`;
-    const created = await page.request.post('/api/v1/trigger-groups', { data: { name: groupName } });
+    const created = await apiRequest(page).post('/api/v1/trigger-groups', { data: { name: groupName } });
     expect(created.ok(), 'failed to create the group over the API').toBe(true);
 
     await navigateToApp(page);

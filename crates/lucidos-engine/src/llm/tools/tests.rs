@@ -586,7 +586,16 @@ fn changes_grouped_tool_exposes_list_and_apply() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    assert_eq!(action_names, vec!["list", "apply"]);
+    assert_eq!(
+        action_names,
+        vec![
+            "list",
+            "apply",
+            "apply_when_settled",
+            "apply_as_they_settle",
+            "cancel_standing_apply"
+        ]
+    );
     let change_id = props
         .get("change_id")
         .expect("changes tool must expose a `change_id` property for apply");
@@ -597,7 +606,13 @@ fn changes_grouped_tool_exposes_list_and_apply() {
     );
 
     // Flat aliases still resolve to the changes domain (back-compat).
-    for alias in [tn::LIST_CHANGES, tn::APPLY_CHANGE] {
+    for alias in [
+        tn::LIST_CHANGES,
+        tn::APPLY_CHANGE,
+        tn::APPLY_WHEN_SETTLED,
+        tn::APPLY_AS_THEY_SETTLE,
+        tn::CANCEL_STANDING_APPLY,
+    ] {
         let domain = crate::capability_manifest::domain_for_tool(alias)
             .unwrap_or_else(|| panic!("alias {alias} must resolve"));
         assert_eq!(domain.name, "changes");

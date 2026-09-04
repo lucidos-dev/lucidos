@@ -1,4 +1,4 @@
-use crate::support::{base_url, http_client, unique_marker, workspace_path};
+use crate::support::{base_url, unique_marker, user_client, workspace_path};
 
 /// Write a file directly to the workspace data/artifacts/ directory (no git commit).
 /// This avoids git commit races with other test modules that also touch the repo.
@@ -37,7 +37,7 @@ async fn post_file_edit(client: &reqwest::Client, body: serde_json::Value) -> re
 /// Test both JSON and text edit modes sequentially to avoid git commit races.
 #[tokio::test]
 async fn edit_json_and_text_modes() {
-    let client = http_client();
+    let client = user_client().await;
     // Creates and then edits files in the shared working tree, both of which
     // show up in a command checkpoint's diff if they land mid-snapshot; see
     // `workspace_tree_lock`. Held for the whole test, which is short.
@@ -100,7 +100,7 @@ async fn edit_json_and_text_modes() {
 
 #[tokio::test]
 async fn edit_empty_path_returns_400() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = post_file_edit(
         &client,
         serde_json::json!({
@@ -114,7 +114,7 @@ async fn edit_empty_path_returns_400() {
 
 #[tokio::test]
 async fn edit_path_traversal_returns_400() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = post_file_edit(
         &client,
         serde_json::json!({
@@ -128,7 +128,7 @@ async fn edit_path_traversal_returns_400() {
 
 #[tokio::test]
 async fn edit_file_not_found_returns_400() {
-    let client = http_client();
+    let client = user_client().await;
     let marker = unique_marker("edit-notfound");
     let resp = post_file_edit(
         &client,
@@ -145,7 +145,7 @@ async fn edit_file_not_found_returns_400() {
 
 #[tokio::test]
 async fn edit_old_string_not_found_returns_400() {
-    let client = http_client();
+    let client = user_client().await;
     let marker = unique_marker("edit-nomatch");
     let path = format!("{}.md", marker);
 

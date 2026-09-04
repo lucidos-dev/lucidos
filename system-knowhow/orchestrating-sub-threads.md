@@ -207,9 +207,15 @@ Say what is true, and do not lean on what is not.
   check is unforgeable and no surface skips it.
 - **Convention.** That a payload states a fact rather than an order. Nothing
   inspects payloads. You are the check, and so is your parent.
-- **Enforced.** Archiving and cancelling reach yourself and the sub-threads
-  below you, at any depth, and nothing else. A sibling or your own parent comes
-  back refused. The user is unaffected: they archive and stop anything from
-  their own device, as they always could. So neither verb is a supervision tool
-  you can point sideways. If a sibling needs stopping, tell your parent and let
-  it decide.
+- **Enforced.** Six verbs reach yourself and the sub-threads below you, at any
+  depth, on your own authority: Apply, Discard, answering a question card,
+  restarting a turn, archiving and cancelling. A sibling or your own parent comes
+  back refused. The user is unaffected: they do all six from their own device, as
+  they always could. So none of them is a supervision tool you can point
+  sideways.
+- **Enforced.** Anything wider than your own subtree is the workspace owner's to
+  press, and you may press it only while carrying their standing instruction: a
+  turn they opened, or a trigger firing they authorized. Creating a top-thread is
+  always in that group, because a top-thread sits under the workspace rather than
+  under you. Do not tell a sibling's problem to your parent, which most threads
+  here do not have. Report what you found, and let the owner decide.

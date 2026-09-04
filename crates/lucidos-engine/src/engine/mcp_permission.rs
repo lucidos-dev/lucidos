@@ -298,6 +298,60 @@ pub async fn recover_orphan_mcp_permission_requests(pool: &sqlx::PgPool, event_b
     }
 }
 
+/// Answer one chat MCP permission card, whoever answered it.
+///
+/// This lane's half of the contract `command_permission::resolve_command_permission`
+/// documents: the single in-process path, three effects in order, and `false`
+/// for a request id nothing is waiting on.
+pub async fn resolve_mcp_permission(
+    engine: &LucidosEngine,
+    request_id: String,
+    allowed: bool,
+    persist_scope: Option<AllowScope>,
+    actor: Option<MessageOrigin>,
+    log_context: &str,
+) -> bool {
+    let entry = {
+        let mut pending = engine.pending_mcp_permission.lock().unwrap();
+        pending.take(&request_id)
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    // Wake the blocked loop, and every deduped waiter on the same broadcast.
+    let _ = entry.tx.send(allowed);
+
+    let reason = if allowed {
+        None
+    } else {
+        Some(DENIAL_REASON.to_string())
+    };
+    // A scope on a denial grants nothing: the click said no.
+    let persist_scope = persist_scope.filter(|_| allowed);
+    if let Some(scope) = persist_scope {
+        // `entry.tool_name` is the namespaced `mcp__<server>__<tool>`, so the
+        // stored pattern needs the pair back. A name that will not parse
+        // records nothing.
+        if let Some((server_id, tool)) =
+            crate::mcp::McpManager::parse_mcp_tool_name(&entry.tool_name)
+        {
+            record_mcp_allow_grant(engine, entry.thread_id, &server_id, &tool, scope);
+        }
+    }
+    emit_mcp_permission_resolved(
+        &engine.event_bus,
+        entry.thread_id,
+        request_id,
+        allowed,
+        reason,
+        persist_scope,
+        EventMeta::with_actor(actor),
+        log_context,
+    )
+    .await;
+    true
+}
+
 /// Emit an `McpPermissionResolved` via the bus. Shared by the consent endpoint,
 /// the superseded sweep, the orphan-recovery sweep, and the cancel branch.
 #[allow(clippy::too_many_arguments)]

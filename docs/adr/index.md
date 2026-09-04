@@ -177,3 +177,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0167: A call makes the thread real, and moves nothing a turn owns](0167-a-call-makes-the-thread-real.md)
 - [0168: A thread acts in its own subtree on its own authority; anything wider is the workspace owner's button, and a thread may press it only while carrying a standing instruction from the owner, which is a turn they opened or a trigger firing they authorized](0168-a-thread-acts-in-its-own-subtree.md)
 - [0169: Every caller to the engine identifies itself: the mode-human default dies, and four credentials that already exist cover the engine's own machinery, a thread's subprocess, a browser and a paired device](0169-every-caller-identifies-itself.md)
+- [0170: The talker holds three tools: it asks, it answers what is waiting, and it hangs up](0170-the-talker-holds-a-tool-set-and-none-of-it-acts.md)
+- [0171: A cookie header arrives in as many fields as the client likes](0171-a-cookie-header-arrives-in-as-many-fields-as-the-client-likes.md)
+- [0172: A blocked local port is not a dead webhook ingress](0172-a-blocked-port-is-not-a-dead-ingress.md)

@@ -310,7 +310,15 @@ export interface EventWaitSummary {
   expires_at: string;
 }
 
-export type StoredEvent = ThreadEvent & { created?: string; _displayCreated?: string; _eventId?: string };
+export type StoredEvent = ThreadEvent & {
+  created?: string;
+  _displayCreated?: string;
+  _eventId?: string;
+  /** Marks the one synthetic event nothing on the engine will ever write: the
+   *  caller's utterance while they are still saying it. See *live utterance*
+   *  in `docs/glossary.md`. */
+  _liveUtterance?: true;
+};
 
 /** Events that define (or redefine) a thread's channel/source. */
 export function isChannelDefiningEvent(eventType: string): boolean {

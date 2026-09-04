@@ -1806,12 +1806,15 @@ fn handshake_layer_injecting(
     credential: Option<&str>,
     oauth_providers: &[&str],
 ) -> Vec<Arc<dyn crate::api::proxy_auth_layer::AuthLayer>> {
+    // The base_url only feeds the layer's token-cache key. These tests bind a
+    // fresh empty cache and never dispatch, so its value is not exercised here.
     vec![Arc::new(
         crate::api::proxy_script_layer::ScriptHandshakeLayer::new(
             "script_handshake".into(),
             "comfort".into(),
             credential.map(str::to_string),
             script.into(),
+            "https://accsmart.panasonic.test".into(),
             oauth_providers.iter().map(|p| p.to_string()).collect(),
             unreachable_pool(),
             Arc::new(std::path::PathBuf::from("/ws")),

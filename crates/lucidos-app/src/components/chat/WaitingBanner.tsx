@@ -1,8 +1,9 @@
 import type { ComponentChildren } from 'preact';
-import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn } from '../../store/store';
+import { threadMap, focusedThreadId, applyingNowThreadIds, applyingChangeThreadIds, archivingThreadIds, discardingCCThreadIds, cancelingThreadIds, effectiveThreadStatus, isMidTurn, standingApplyThreadIds, armingStandingApplyThreadIds } from '../../store/store';
 import { resolveThreadActions, type TaggedAction } from '../../store/actions/threadActions';
 import { viewThreadCcDiff } from '../../store/actions/repositories';
 import { SplitButton, type SplitButtonMenuItem } from '../shared/SplitButton';
+import { StandingApplyIcon } from '../shared/icons';
 import { useTouchActivated } from '../../hooks/useTouchActivated';
 import { blurPromptInputIfFocused } from './promptFocus';
 
@@ -253,6 +254,73 @@ export function DiffButton({ threadId }: { threadId: string }) {
 
 function renderDiffButton(threadId: string): ComponentChildren {
   return <DiffButton key="diff" threadId={threadId} />;
+}
+
+/** The change action a still-working thread offers: arm a *standing apply*, or
+ *  cancel the one it carries (ADR 0168 clause 5).
+ *
+ *  An ICON toggle, wearing the shape the follow toggle beside it already wears
+ *  (`PromptRowControls`). As a green pill it took over half a phone's prompt
+ *  row. No label short enough to fix that still said what it does.
+ *
+ *  The word survives twice over, because the label was the only explanation a
+ *  phone had. The `aria-label` IS the action's own label, the string the
+ *  Changes panel shows as visible text. And `data-tooltip-longpress` is what
+ *  puts the tooltip within reach of a finger: the host shell reveals on a long
+ *  press only for elements carrying it, so a `data-tooltip` alone would be
+ *  desktop-only (`hooks/useTooltip.ts`).
+ *
+ *  Never disabled. A tap while the request is in flight is dropped by the
+ *  handler instead, because `.icon-btn:disabled` sets `pointer-events: none`
+ *  and takes that tooltip with it.
+ *
+ *  It does NOT blur the composer, unlike the `.action-btn` it used to be. This
+ *  arms a mode rather than closing the thread. So a reader typing a follow-up
+ *  keeps their keyboard, as the toggles beside it already leave it alone.
+ *
+ *  A component rather than a function returning JSX, because it reads signals
+ *  and `getStandingApplyControl` is called from `PromptInput`'s render. */
+export function StandingApplyButton({
+  threadId,
+  action,
+}: {
+  threadId: string;
+  action: TaggedAction;
+}) {
+  const busy = armingStandingApplyThreadIds.value.has(threadId);
+  const armed = standingApplyThreadIds.value.has(threadId);
+  return (
+    <button
+      class={`icon-btn header-icon${armed ? ' active' : ''}`}
+      data-role="standing-apply"
+      data-row-item
+      aria-pressed={armed}
+      aria-label={action.label}
+      data-tooltip={action.tooltip}
+      data-tooltip-longpress=""
+      onClick={() => {
+        if (busy) return;
+        void action.invoke();
+      }}
+    >
+      <StandingApplyIcon armed={armed} />
+    </button>
+  );
+}
+
+/** The change action for the focused thread's own prompt row, when the banner
+ *  is suppressed because the thread is still working.
+ *
+ *  That row used to lift the Diff button and nothing else, so a working
+ *  coding-agent thread offered no way to arm an apply at all. Availability
+ *  comes from the same lifecycle selector the banner reads, so the two cannot
+ *  drift on when the action exists. */
+export function getStandingApplyControl(): ComponentChildren | null {
+  const focused = focusedThreadId.value;
+  if (!focused) return null;
+  const action = resolveThreadActions(focused).find((a) => a.kind === 'apply_when_settled');
+  if (!action) return null;
+  return <StandingApplyButton key="standing-apply" threadId={focused} action={action} />;
 }
 
 /** Diff button decoupled from waitingState: appears whenever the focused

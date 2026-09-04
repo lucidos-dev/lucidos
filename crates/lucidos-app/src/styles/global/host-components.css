@@ -262,21 +262,44 @@
    around the glyph.
 
    So the box is the glyph, and an overlay carries the target instead. The
-   negative margin hands `.icon-btn`'s own chip padding back, the way
-   `.initiator-actor` does (chat/input-messages.css). Vertical only: the chip's
-   WIDTH is what separates the trash from the words, and it is the one part of
-   that separation the user can see. */
+   negative margin hands `.icon-btn`'s own chip padding back on BOTH axes, the
+   way `.initiator-actor` does (chat/input-messages.css). The chip is a hover
+   affordance, not spacing: the row an inline icon lands in declares its own
+   gaps, and a chip that also spaced would stack on top of them. */
 .icon-btn.inline-icon {
     --inline-icon-chip: 0.25rem;
     padding: var(--inline-icon-chip);
-    margin-block: calc(-1 * var(--inline-icon-chip));
+    margin: calc(-1 * var(--inline-icon-chip));
+    /* Raise the glyph onto the text's CAP BAND. A flex row centres it on the
+       line box, which sits low against the caps: a font's ascent and descent
+       are not symmetric about them. `.explainer-btn` below takes the same
+       correction from an x-height, and states its own derivation.
+
+       No one number is exact in both engines, which place the baseline
+       differently inside the line box. Against --font-size-md Fira Code,
+       Chromium wants 0.10em and WebKit 0.045em, at every UI scale. This splits
+       them, leaving under half a pixel either way. `em`, so the correction
+       tracks the text. `position` comes from the band rule above. */
+    top: -0.07em;
 }
 
-/* The overlay. Centred, so it reaches past the chip evenly and stops short of
-   both neighbours. It clears the queued message's own gaps, 0.375rem to the
-   label and 0.5rem to the timestamp, which is what keeps the trash off the
-   timestamp button beside it. Transparent and positioned, so it takes the
-   pointer without painting anything.
+/* The overlay, and it grows on ONE axis. Transparent and positioned, so it
+   takes the pointer without painting anything.
+
+   It takes its HEIGHT from the shared 2.25rem and its WIDTH from the button,
+   because only the vertical has room. A square target at this size reaches
+   past both the words an inline icon sits between. The queued trash cleared
+   its "Queued" label by a single pixel, so the row held the two words 0.89em
+   and 1.05em out to make space for a box nobody can see. That was reported as
+   too much padding, and it was all of it. Above and below sits only the turn's
+   own body, which no pointer wants, so the reach goes there and the words come
+   back in to 0.59em and 0.74em.
+
+   Sized off the button rather than a second token, since the two are one
+   claim: a target that stopped tracking the box it covers would drift off the
+   glyph on the next retune. Each neighbour keeps that side's gap less the
+   chip, so the queued trash holds 0.125rem off the label and 0.25rem off the
+   timestamp. e2e/queued-message-group.spec.ts measures both.
 
    `left`/`top` are load-bearing: the transform centres nothing on its own, and
    without them the target slides half its width off the glyph. */
@@ -285,7 +308,7 @@
     position: absolute;
     left: 50%;
     top: 50%;
-    width: var(--icon-tap-target);
+    width: 100%;
     height: var(--icon-tap-target);
     transform: translate(-50%, -50%);
 }

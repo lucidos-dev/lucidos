@@ -25,8 +25,9 @@
  * bands take three nominals off one shared 2.25rem tap target: a header band, a
  * list row's action cluster, an icon inline in text. Only the glyph moves.
  * It also pins the split as the SINGLE source of all three sizes. And it pins
- * the two shapes the target comes in. The two chrome bands take it as a box;
- * the inline one lays it over its own, a word in a line of text.
+ * the two shapes the target comes in. The two chrome bands take it as a box.
+ * The inline one lays a taller-than-wide overlay over its own box, since a
+ * word sits either side and only the vertical has room.
  */
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -200,18 +201,25 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
     }
   });
 
-  it('gives every band the full target, as a box in a strip and an overlay in text', () => {
+  it('gives the target to every band, as a box in a strip and a tall overlay in text', () => {
     // Two shapes, one number. A retune has to reach both, so both read the var
     // rather than restating it. A band that stopped reading it would ship a
     // target sized by whatever its glyph happens to be.
     expect(boxRule, 'the two chrome bands no longer share a box rule').toBeDefined();
     expect(overlayRule, 'the inline band has no tap-target overlay').toBeDefined();
-    for (const [name, rule] of [['box', boxRule!], ['overlay', overlayRule!]] as const) {
-      for (const prop of ['width', 'height']) {
-        expect(rule.props.get(prop), `the ${name} does not take its ${prop} from the target`)
-          .toBe('var(--icon-tap-target)');
-      }
+    for (const prop of ['width', 'height']) {
+      expect(boxRule!.props.get(prop), `the box does not take its ${prop} from the target`)
+        .toBe('var(--icon-tap-target)');
     }
+    // The overlay grows on ONE axis, and which one is the whole point. An
+    // inline icon has a word on each side. A square target at this size
+    // reaches past both. The row then holds the words off to make space for a
+    // box nobody can see, which was reported as too much padding. Above and
+    // below there is only the turn's body, so the reach goes there.
+    expect(overlayRule!.props.get('height'), 'the overlay does not take its height from the target')
+      .toBe('var(--icon-tap-target)');
+    expect(overlayRule!.props.get('width'), 'the overlay reaches sideways, into the words')
+      .toBe('100%');
     // The overlay only IS a tap target while it covers the glyph and takes the
     // pointer, which is what these declarations buy.
     expect(overlayRule!.props.get('content'), 'the overlay is not generated').toBe("''");
@@ -233,14 +241,34 @@ describe('the nominal glyph size is declared per band, on the shared tap target'
       expect(inlineChipRule!.props.has(prop), `the inline band sets ${prop} on its box`).toBe(false);
     }
     // The pairing IS the condition: the chip reaches past the glyph without
-    // costing the line any height, exactly as `.initiator-actor` hands its own
+    // costing the row any space, exactly as `.initiator-actor` hands its own
     // hover chip back. Expressed against one var, so neither half can move
-    // alone. Block only: the chip's width is real spacing beside the words.
+    // alone. Both axes, because the chip is a hover affordance and not
+    // spacing: the row it lands in declares gaps of its own, and a chip that
+    // also spaced would stack on top of them.
     expect(inlineChipRule!.props.get('padding'), 'the chip padding is not one named value')
       .toBe('var(--inline-icon-chip)');
-    expect(inlineChipRule!.props.get('margin-block'), 'the chip is not handed back')
+    expect(inlineChipRule!.props.get('margin'), 'the chip is not handed back on both axes')
       .toBe('calc(-1 * var(--inline-icon-chip))');
-    expect(inlineChipRule!.props.has('margin'), 'the chip is handed back on both axes').toBe(false);
+    for (const prop of ['margin-block', 'margin-inline', 'margin-top', 'margin-left']) {
+      expect(inlineChipRule!.props.has(prop), `"${prop}" splits the handback in two`).toBe(false);
+    }
+  });
+
+  it('raises the inline glyph off the line box and onto the cap band', () => {
+    // A flex row centres the glyph on the LINE box, which sits low against the
+    // caps. The correction is a relative offset, so it moves no layout, and it
+    // is in `em` because it tracks the text it aligns to. Both halves are
+    // load-bearing: `position` without `top` corrects nothing, and `top`
+    // without `position` is ignored outright.
+    expect(inlineChipRule!.props.get('top'), 'the inline glyph carries no optical rise')
+      .toMatch(/^-[\d.]+em$/);
+    expect(bandRule!.props.get('position'), 'the rise has nothing to offset against')
+      .toBe('relative');
+    // A rise is an optical nudge, not a layout move. Past a fraction of the
+    // text it stops reading as alignment and starts reading as a raised glyph.
+    const rise = Math.abs(parseFloat(inlineChipRule!.props.get('top')!));
+    expect(rise, 'the rise is large enough to read as a layout move').toBeLessThan(0.15);
   });
 
   it('starts the bands at the large step and takes one step down per band', () => {

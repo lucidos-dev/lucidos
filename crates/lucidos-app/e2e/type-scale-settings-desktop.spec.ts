@@ -18,7 +18,7 @@
  * unchecked on WebKit.
  */
 import { test, expect } from './fixtures';
-import { assertHealthy, navigateToApp, waitForEventStream } from './helpers';
+import { apiRequest, assertHealthy, navigateToApp, waitForEventStream } from './helpers';
 import { offenders, report } from './typeScaleWalk';
 
 test.use({ viewport: { width: 1280, height: 900 } });
@@ -31,7 +31,7 @@ test.describe('Type scale in Settings', () => {
   test("every visible text run in What's New is on the scale", async ({ page }) => {
     await navigateToApp(page);
     await waitForEventStream(page);
-    const res = await page.request.post('/api/v1/ui/navigate', {
+    const res = await apiRequest(page).post('/api/v1/ui/navigate', {
       headers: { 'content-type': 'application/json' },
       data: { target: 'settings', params: { settings_view: 'whats-new' } },
     });

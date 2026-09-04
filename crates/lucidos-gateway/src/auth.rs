@@ -424,14 +424,34 @@ impl PendingPairings {
 /// buries nothing under it.
 pub const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
 
+/// Is this refusal worth a line?
+///
+/// A caller carrying NO cookie at all is silent, which is a browser that has
+/// never paired. One carrying cookies but no credential is not silent. That is
+/// a browser the host knows, arriving without the one cookie that lets it in.
+/// Nobody could see that shape while the reader counted credentials alone.
+pub fn refusal_is_worth_logging(audit: CookieAudit) -> bool {
+    audit.cookies > 0
+}
+
 /// What the gateway says when it turns a device away.
 ///
 /// Pure, and built from counts and one cookie NAME. A credential in here would
 /// be a credential leaked, so nothing that could carry one is an argument.
-pub fn refusal_line(presented: usize, own_name: bool, cookie_name: &str, devices: usize) -> String {
+///
+/// `field(s)` is in the line because a jar split across several of them is what
+/// asked a paired iPhone to pair again. See [`cookie_pairs`].
+pub fn refusal_line(audit: CookieAudit, cookie_name: &str, devices: usize) -> String {
+    let CookieAudit {
+        fields,
+        cookies,
+        credentials,
+        own_name,
+    } = audit;
     format!(
-        "[Gateway] refused a device: {presented} credential cookie(s) presented, {} under this \
-         gateway's own name {cookie_name}, and none matched any of the {devices} paired device(s)",
+        "[Gateway] refused a device: {cookies} cookie(s) over {fields} cookie field(s), of which \
+         {credentials} credential(s), {} under this gateway's own name {cookie_name}, and none \
+         matched any of the {devices} paired device(s)",
         if own_name { "one" } else { "none" },
     )
 }
@@ -561,8 +581,11 @@ pub fn mint_device_id() -> std::io::Result<String> {
 }
 
 /// Write `contents` to `path` with mode 0600, never create-then-chmod.
+///
+/// Replaces what is there. The caller holds the authoritative value, unlike the
+/// token mint's exclusive create, which is racing to become it.
 fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
-    local_token::write_owner_only(path, contents)
+    local_token::write_owner_only(path, contents, local_token::Exclusive::No)
 }
 
 /// Decide what an inbound request proved.
@@ -642,24 +665,41 @@ pub fn presented_credentials<'a>(
     found
 }
 
-/// How many device-credential cookies arrived, and whether one was ours.
+/// What a refused request carried, in counts.
 ///
-/// For the refusal log. Counts and one flag, never a value: the log says which
-/// door was tried, and a credential in it would be a credential leaked.
+/// Counts and one flag, never a value: the log says which door was tried, and a
+/// credential in it would be a credential leaked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CookieAudit {
+    /// Separate `cookie` header fields. More than one means the client split
+    /// its jar, which is the shape that hid a credential from `headers.get`.
+    pub fields: usize,
+    /// Cookies of any name, across every field.
+    pub cookies: usize,
+    /// Of those, the ones in the `lucidos_device` family.
+    pub credentials: usize,
+    /// Whether one of those carried THIS gateway's own name.
+    pub own_name: bool,
+}
+
+/// What a refused request carried.
 ///
 /// Counted off the header rather than through [`presented_credentials`], so a
 /// refused request allocates nothing. Every unpaired asset request lands here.
-pub fn presented_credential_summary(headers: &HeaderMap, cookie_name: &str) -> (usize, bool) {
-    let mut presented = 0;
-    let mut own = false;
+pub fn presented_credential_summary(headers: &HeaderMap, cookie_name: &str) -> CookieAudit {
+    let mut audit = CookieAudit {
+        fields: headers.get_all(axum::http::header::COOKIE).iter().count(),
+        ..CookieAudit::default()
+    };
     for (name, _) in cookie_pairs(headers) {
+        audit.cookies += 1;
         if !is_device_cookie_name(name) {
             continue;
         }
-        presented += 1;
-        own |= name == cookie_name;
+        audit.credentials += 1;
+        audit.own_name |= name == cookie_name;
     }
-    (presented, own)
+    audit
 }
 
 /// Is `name` in the device-credential family?
@@ -681,11 +721,26 @@ fn is_device_cookie_name(name: &str) -> bool {
 /// Hand-parsed rather than pulling in a cookie crate: the gateway is the only
 /// network-facing process and its dependency list is kept short. The format is
 /// `name=value` pairs joined by `; `.
+///
+/// # EVERY `cookie` field, never just the first
+///
+/// HTTP/2 lets a client split one cookie jar across several `cookie` fields, to
+/// compress better (RFC 9113 §8.2.3). WebKit does, hyper hands each one to us
+/// separately, and a receiver is required to read them as one header. So
+/// `headers.get` here dropped every cookie after the first field, and the
+/// credential was only in that field by luck: HPACK decides the split, so the
+/// same jar arrives whole on one request and cut in two on the next.
+///
+/// That is what asked a paired iPhone to pair again, invisibly from both ends. A
+/// credential in a dropped field is one the gateway never counted, so
+/// [`presented_credential_summary`] said zero and `log_device_refusal` stayed
+/// silent. Reproduced against a running gateway: the same two cookies read as 2
+/// over HTTP/1.1 and 1 over HTTP/2.
 fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
     headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
+        .get_all(axum::http::header::COOKIE)
         .into_iter()
+        .filter_map(|v| v.to_str().ok())
         .flat_map(|raw| raw.split(';'))
         .filter_map(|pair| pair.split_once('='))
         .map(|(name, value)| (name.trim(), value.trim()))
@@ -702,6 +757,21 @@ mod tests {
             h.insert(
                 axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// One jar arriving as SEVERAL `cookie` fields, which is what HTTP/2 sends.
+    ///
+    /// Appended rather than inserted: `insert` replaces, so a helper built on it
+    /// can only ever express the single-field case.
+    fn cookie_fields(fields: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for field in fields {
+            h.append(
+                axum::http::header::COOKIE,
+                axum::http::HeaderValue::from_str(field).unwrap(),
             );
         }
         h
@@ -921,6 +991,76 @@ mod tests {
         );
     }
 
+    // ── One jar, several `cookie` fields ────────────────────────────────────
+
+    #[test]
+    fn a_credential_in_a_second_cookie_field_still_authorizes() {
+        // The bug that asked a paired iPhone to pair again. HTTP/2 may split one
+        // jar across several `cookie` fields, and reading only the first dropped
+        // whatever followed. Which field carries the credential is HPACK's
+        // choice, so the same phone was let in and turned away by turns.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let paired = paired_with("cred-abc");
+        let h = cookie_fields(&["theme=dark", &format!("{own}=cred-abc")]);
+        let (decision, matched) = authorize_with_match(&h, "secret", &paired, &own);
+        assert!(
+            matches!(decision, Authorization::Device { .. }),
+            "a credential past the first field is still one the client sent"
+        );
+        assert!(
+            !matched.expect("matched").is_renamed(),
+            "it arrived under our own name, so nothing is being migrated"
+        );
+    }
+
+    #[test]
+    fn our_own_name_is_tried_first_across_fields_too() {
+        // Ordering is a property of the jar, not of how it was cut up. Ours
+        // arrives in the LAST field here and must still be the first candidate.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let h = cookie_fields(&["lucidos_device=legacy-value", &format!("{own}=own-value")]);
+        let candidates = presented_credentials(&h, &own);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].value(), "own-value");
+        assert!(!candidates[0].is_renamed());
+    }
+
+    #[test]
+    fn the_refusal_summary_counts_every_field() {
+        // This is why the bug was silent from both ends. The count feeds the
+        // refusal log, which said nothing at all when it read zero. A dropped
+        // field therefore turned a refusal with a credential into what the log
+        // treats as a browser that has never paired.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let h = cookie_fields(&["theme=dark", &format!("{own}=cred-abc")]);
+        assert_eq!(
+            presented_credential_summary(&h, &own),
+            CookieAudit {
+                fields: 2,
+                cookies: 2,
+                credentials: 1,
+                own_name: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_refusal_carrying_cookies_but_no_credential_is_logged() {
+        // The shape nobody could see. A browser the host already knows arrives
+        // without the one cookie that lets it in. The old reader counted
+        // credentials alone, so that read as a first run and said nothing.
+        let own = device_cookie_name(Path::new("/tmp/gw-a"));
+        let known = presented_credential_summary(&headers(&[("cookie", "theme=dark")]), &own);
+        assert_eq!(known.cookies, 1);
+        assert_eq!(known.credentials, 0);
+        assert!(refusal_is_worth_logging(known));
+
+        // A browser carrying nothing at all stays silent, which is a first run.
+        let fresh = presented_credential_summary(&headers(&[]), &own);
+        assert_eq!(fresh, CookieAudit::default());
+        assert!(!refusal_is_worth_logging(fresh));
+    }
+
     #[test]
     fn only_the_device_cookie_family_is_read_as_a_credential() {
         // A near-miss name must not become a door. Each of these is a caller's
@@ -951,21 +1091,40 @@ mod tests {
             "cookie",
             &format!("theme=dark; {own}=v1; {other}=v2; lucidos_device=v3"),
         )]);
-        assert_eq!(presented_credential_summary(&h, &own), (3, true));
+        let audit = presented_credential_summary(&h, &own);
+        assert_eq!(audit.credentials, 3);
+        assert_eq!(audit.cookies, 4);
+        assert!(audit.own_name);
 
         let h = headers(&[("cookie", "theme=dark")]);
-        assert_eq!(presented_credential_summary(&h, &own), (0, false));
+        let audit = presented_credential_summary(&h, &own);
+        assert_eq!(audit.credentials, 0);
+        assert!(!audit.own_name);
     }
 
     #[test]
     fn a_refusal_line_names_the_door_and_never_a_credential() {
         // Its whole job is to answer "the store lists my phone, so why the
         // pairing screen?". Its whole constraint is to leak nothing doing it.
-        let line = refusal_line(2, true, OWN_COOKIE, 3);
+        let audit = CookieAudit {
+            fields: 2,
+            cookies: 5,
+            credentials: 2,
+            own_name: true,
+        };
+        let line = refusal_line(audit, OWN_COOKIE, 3);
         assert!(line.contains(OWN_COOKIE), "{line}");
-        assert!(line.contains('2') && line.contains('3'), "{line}");
+        assert!(line.contains("2 cookie field(s)"), "{line}");
+        assert!(line.contains("5 cookie(s)"), "{line}");
+        assert!(line.contains("2 credential(s)"), "{line}");
+        assert!(line.contains("3 paired device(s)"), "{line}");
         assert!(line.contains("one under"), "{line}");
-        assert!(refusal_line(1, false, OWN_COOKIE, 0).contains("none under"));
+
+        let none_ours = CookieAudit {
+            own_name: false,
+            ..audit
+        };
+        assert!(refusal_line(none_ours, OWN_COOKIE, 0).contains("none under"));
     }
 
     #[test]

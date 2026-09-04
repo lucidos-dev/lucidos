@@ -904,6 +904,77 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only where the quoted label matches NEITHER the module segment (after
   `module_label`'s rename table) nor the message string.
 
+- **`json!({ key_variable: value })` uses the variable's VALUE as the key, not
+  the literal identifier.** A reviewer reads `json!({ arg: {…} })` beside
+  `json!([arg])` and concludes the property is literally named `arg` while
+  `required` names `reason`. Under `additionalProperties: false` that would be a
+  schema the model cannot satisfy, so it reads as a feature-killing bug.
+
+  `serde_json`'s `json!` evaluates an object key expression rather than
+  stringifying it, so both sides get the same name. Asserted rather than argued:
+  `the_asking_and_answering_tools_each_take_one_required_argument` checks the
+  property BY NAME against `required` and reads its `type`.
+
+  Re-flag if that assertion is weakened back to a bare `properties.len() == 1`,
+  which is the shape that let the doubt stand.
+
+- **The three `resolve_*_permission` lane functions are near-identical on
+  purpose, and a shared generic would be the wrong seam.** A reviewer counts
+  three ~35-line bodies doing the same six steps over one `PermissionState`
+  type. It then proposes a generic resolver with a lane parameter, or a trait.
+
+  Each step differs by lane in a way a parameter cannot carry. The pending map
+  is a different field on the engine. The grant derivation takes a different
+  argument shape per lane: a command string, a `(server_id, tool)` pair, a tool
+  `input` JSON. The emitted event is a different `ThreadEvent` variant.
+  Collapsing them means a trait with three impls, whose bodies are the three
+  differences and whose shared part is six lines of glue. The lanes were already
+  parallel this way before voice existed, in four families at once: the emit
+  helpers, the grant recorders, the superseded sweeps and the orphan sweeps.
+
+  Re-flag if a fifth lane appears. Re-flag too if a change to the resolution
+  contract has to land in all three at once, and one of them is missed.
+
+- **`Call::delegated` checks `doer_is_parked` at the ask, not at the pairing,
+  and the residual race is accepted.** A reviewer traces a delegation whose
+  transcript is still in flight. The doer can park in that window, and
+  `settle_the_pending_utterance` then wakes it anyway.
+
+  It is a read-then-act check, deliberately the same strength as `doer_for` on
+  the typed path, and for the same reason: closing it means holding a lock
+  across `EventBus::emit` and a turn spawn. The window is the transcript's own
+  lag, and reaching it needs a PREVIOUS turn to park inside it. What it costs is
+  one superseded card, which is what every delegation did before the refusal
+  existed. Re-checking at the pairing site is worse rather than better. The
+  talker was already told "Taken.", so a silent drop there leaves it believing
+  work started.
+
+  Re-flag if the pairing site gains a way to tell the talker it changed its
+  mind, or if the wake stops going through single-flight admission.
+
+- **The webhook ingress egress check reads `local-egress-blocked` from a
+  reference-port comparison, and that ambiguity is priced in (ADR 0172).** A
+  reviewer will object that a relay answering on 443 while the funnel port stays
+  silent could be a real ingress fault. The check would then suppress the outage
+  it exists to catch. The mechanism is real, and the ADR names it as the one
+  fault this reading cannot tell apart.
+
+  It is accepted because the concrete funnel-port faults do not have that shape.
+  A listener that went away answers with a reset, and `answers_on` counts a
+  reset as an answer. The wedge ADR 0143 was built for completes the handshake
+  and dies in TLS, which is also an answer. A relay that is gone is silent on
+  443 too, which reads `Unknown` and changes nothing. A relay-side drop would
+  also have to hit all three A records the same way, where a local filter hits
+  them all by construction. The suppression is logged, so it is never silent.
+
+  A stricter off-path leg was weighed and lost: a control that serves nothing on
+  the funnel port is silent in the blocked case AND the healthy one, so it
+  changes no verdict. `8.8.8.8:8080` silent beside `1.1.1.1:8080` connecting, on
+  one network in one minute, is the measurement that settles it.
+
+  Re-flag with evidence that a Tailscale relay drops a funnel port rather than
+  resetting it, or if `answers_on` stops counting a refusal as an answer.
+
 ## Desktop client (Tauri, macOS)
 
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
@@ -2361,6 +2432,62 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag if a desktop false positive is actually observed in the log, or if
   the settle-time re-read is removed.
 
+- **`notification-visit.ts` roots its `IntersectionObserver` at the WINDOW while
+  its verdict measures the transcript's band, and that is not the latching bug
+  `useOnScreenInTranscript` warns about.** A reviewer reading the hook's comment
+  goes looking for the same shape elsewhere and finds it one file over. The two
+  really do measure different boxes: `isInViewport` reaches `isElementOnScreen`,
+  which bands on the active scroll element.
+
+  What makes it safe is that the observer is not the only notifier there. That
+  watch also resamples on navigation, on a store change, on a DOM mutation and
+  on a dwell timer. So an intersection entry it never receives is picked up by
+  the next trigger. The hook has ONE notifier, so a missed entry there is
+  permanent, which is why it roots at the verdict's own box.
+
+  Re-flag if that watch loses its other resample triggers and comes to depend on
+  the observer alone.
+
+- **The prompt row's standing apply leaves the mobile keyboard up, and that is
+  the point of it being a toggle.** A reviewer sees `StandingApplyButton` wear
+  `.icon-btn` rather than `.action-btn`, notes that
+  `installActionBtnBlurListener` matches `.closest('.action-btn')`, and reports
+  a lost keyboard dismissal. Codex flagged it as P2 the day the pill became an
+  icon.
+
+  The listener's own comment says what it is for: an action button EXITS the
+  compose state, so the keyboard raised while composing should drop with the
+  tap. Arming a standing apply exits nothing. It sets a mode the engine acts on
+  later, and the reader is usually mid-draft when they reach for it.
+
+  Its neighbours settle it. The follow toggle, the call toggle and the WIP
+  preview toggle all sit in this row, all carry `.icon-btn`, and none of them
+  blurs. Under the pill this control was the one mode-arming button that took a
+  reader's keyboard away. Re-flag only if arming comes to close the thread.
+
+- **A *live utterance* row is matched by count alone, and a transcript event
+  from a PREVIOUS call can still clear one. There is no client-side identity to
+  match on.** A reviewer traces `handleEvent`'s tally against `writeRow`'s
+  count-1 reset and points out the window: an old call's event, delayed past a
+  hangup and a redial, increments `settledUtterances` and clears the new call's
+  first row. The suggested fix is to compare the voice session.
+
+  **The client is never told the session id.** ADR 0149 keeps it dumb, and
+  `voice/frames.ts` carries no such field on any frame, so a call cannot name
+  itself. The thread EVENTS do carry one, which is what makes the suggestion
+  look reachable, and it is not: classifying the first event of a new call needs
+  the id before that event has arrived.
+
+  Timestamps are the other tempting correlation and are worse. The row's
+  `created` is the browser's clock and the event's is the engine's. A browser a
+  few seconds ahead would read every legitimate event as older than its row. No
+  row would then clear on words, and every one would sit until its bound. That
+  trades a rare lost pulse for a common stale bubble.
+
+  The window needs an SSE event delayed across a hangup, a redial, a session
+  open and 120 ms of speech. It costs one pulse vanishing a second early.
+  Re-flag only if a call gains a client-visible identity.
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
@@ -2562,6 +2689,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the CLI stops starting its walk-up at the cwd, or if something
   begins setting `LUCIDOS_WORKSPACE` to the empty string deliberately.
   (`scripts/lib/e2e_lock.sh`, `crates/lucidos-cli/src/workspace.rs`.)
+
+- **The `drafts:65` leaked-Continue window is nav-to-nav, so it says nothing
+  about which mobile-webkit phase runs first.** A reviewer reads the phase order
+  in `_run_browser_project_body` and finds the incident in
+  `docs/e2e-test-decisions.md`. They object that running the CC phase first puts
+  every navigation spec inside the documented lifetime of a leaked Continue
+  process.
+
+  Both ends of that incident are NAV specs. Neither
+  `coding-agent-question.spec.ts` (the leak) nor `drafts.spec.ts` (the victim)
+  calls `pickComposeDestination`, so both land in the navigation phase whichever
+  order runs. What the split changed there was alphabetical distance: it removes
+  the CC-destination files that used to sit between them, which brings the victim
+  ~40s closer to the leak. That is a property of the split, not of the order, and
+  reversing the order does not touch it.
+
+  The order is decided on memory. The reasoning sits in the block comment above
+  `run_specs_chunked`, and in the "cheap half goes first" section of the decision
+  doc. Re-flagging needs a leak whose SOURCE is a CC-phase spec and whose victim
+  is a nav one, with a measured window, not this incident.
 
 ## CI workflows
 

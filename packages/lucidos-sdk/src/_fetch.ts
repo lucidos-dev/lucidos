@@ -11,7 +11,13 @@
  * stamped here so individual SDK files can't drift. Files that need to build
  * a URL for the browser (e.g. `lucidos.data.url(path)`, `sse.ts`) call
  * `apiUrl(suffix)` for the same auto-prefixing.
+ *
+ * `_storage.ts` imports `getBaseUrl` from here, so the two form a cycle. It is
+ * safe: both sides export hoisted function declarations, and neither calls the
+ * other while its module is evaluating.
  */
+
+import { wsDeviceId } from './_storage';
 
 /** Derive the workspace base path (`/<slug>`) the SDK runs under, so calls to
  *  the engine's `/api/v1` surface carry the gateway prefix (ADR 0014). Two
@@ -108,12 +114,20 @@ export function restampDeadline(
   return err;
 }
 
+/** The header the engine resolves a request's actor from (`api::actor`). */
+const DEVICE_ID_HEADER = 'x-lucidos-device-id';
+
 async function rawFetch(
   path: string,
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<Response> {
   const headers: Record<string, string> = {};
+  // Every app call says which device it came from, so a publish or a trigger
+  // edit is attributed to the person who clicked it. Without it the engine has
+  // no evidence of who is calling and refuses the write (ADR 0169).
+  const deviceId = wsDeviceId();
+  if (deviceId) headers[DEVICE_ID_HEADER] = deviceId;
   if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
 
   const normalized = path.startsWith('/') ? path : `/${path}`;

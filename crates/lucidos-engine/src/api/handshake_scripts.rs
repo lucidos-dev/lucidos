@@ -119,6 +119,12 @@ pub(super) async fn approve_handshake_script(
         )
             .into_response();
     }
+    // Approving widens what a signer may run, so it is recorded before it is
+    // done rather than after.
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     let key = match approval_key(&state.workspace_path, &body.path) {
         Ok(k) => k,
         Err(e) => {
@@ -146,15 +152,15 @@ pub(super) async fn approve_handshake_script(
                 state
                     .engine
                     .event_bus
-                    .emit_user_system(
-                        &headers,
-                        &state.pool,
+                    .emit_or_log(
+                        crate::engine::event_bus::BusEvent::System(
+                            crate::engine::event_bus::SystemEvent::HandshakeScriptApproved {
+                                path: key.clone(),
+                                source: ApprovalSource::Approved,
+                                actor: Some(actor),
+                            },
+                        ),
                         "[Proxy] HandshakeScriptApproved",
-                        |actor| crate::engine::event_bus::SystemEvent::HandshakeScriptApproved {
-                            path: key.clone(),
-                            source: ApprovalSource::Approved,
-                            actor,
-                        },
                     )
                     .await;
             }

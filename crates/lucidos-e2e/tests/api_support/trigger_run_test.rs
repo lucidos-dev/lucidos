@@ -14,7 +14,7 @@
 //! 3. An event-only trigger is refused and pointed at emitting its event. A
 //!    payload-less fire is a shape it has never had.
 
-use crate::support::{base_url, http_client, unique_marker, workspace_path};
+use crate::support::{base_url, unique_marker, user_client, workspace_path};
 use serde_json::json;
 use std::time::{Duration, Instant};
 
@@ -345,7 +345,7 @@ async fn wait_for_last_run(
 
 #[tokio::test]
 async fn run_fires_a_cron_trigger_and_records_last_run() {
-    let client = http_client();
+    let client = user_client().await;
     let slug = unique_marker("run-probe");
     let name = format!("Run probe {}", slug);
     // The one test that actually fires, so the one that needs a real script on
@@ -423,7 +423,7 @@ async fn run_fires_a_cron_trigger_and_records_last_run() {
 /// would still fail here.
 #[tokio::test]
 async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
-    let client = http_client();
+    let client = user_client().await;
     let slug = unique_marker("run-terminator");
     let name = format!("Run terminator {}", slug);
     // An intent trigger, so the fire goes through the agentic loop (the path
@@ -493,7 +493,7 @@ async fn a_fired_trigger_turn_emits_exactly_one_terminator() {
 
 #[tokio::test]
 async fn run_refuses_a_paused_trigger_instead_of_silently_dropping_it() {
-    let client = http_client();
+    let client = user_client().await;
     let slug = unique_marker("run-paused");
     let name = format!("Run paused {}", slug);
     let id = create_trigger(
@@ -537,7 +537,7 @@ async fn run_refuses_a_paused_trigger_instead_of_silently_dropping_it() {
 
 #[tokio::test]
 async fn run_refuses_an_event_only_trigger_and_points_at_emitting_the_event() {
-    let client = http_client();
+    let client = user_client().await;
     let slug = unique_marker("run-eventonly");
     let name = format!("Run event-only {}", slug);
     let event_type = format!("E2eRunProbe{}", slug.replace('-', ""));
@@ -570,7 +570,7 @@ async fn run_refuses_an_event_only_trigger_and_points_at_emitting_the_event() {
 
 #[tokio::test]
 async fn run_refuses_an_unknown_trigger_id() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = run_trigger(&client, "00000000-0000-0000-0000-000000000000").await;
     assert_eq!(resp["success"], false, "unknown id must be refused: {resp}");
     assert!(

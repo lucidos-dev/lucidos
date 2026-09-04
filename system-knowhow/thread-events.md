@@ -473,18 +473,29 @@ which is what lets the boot sweep find one whose engine died mid-call.
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `VoiceSessionStarted` | A voice session opened on this thread. Carries `session_id: Uuid`, and the `actor` (from `EventMeta`) is the device that opened the socket. Exactly one session may be live per thread, so a second upgrade is refused and writes no second row. Placing a call bumps the thread's recency and nothing else. It does NOT promote a draft: connecting is not a conversation, so the first spoken word does that instead (ADR 0167). | lifecycle (rare per thread) | yes | yes |
-| `VoiceSessionEnded` | The session closed. Carries the same `session_id`, `duration_secs: u64`, and `reason`: `hangup` (the caller rang off), `disconnected` (the socket died with no goodbye), `provider_failed` (the talker could not go on), `engine_shutdown` (the engine went away under the call, or the boot sweep settled a start its process never got to end). A sweep-settled row carries `duration_secs: 0`, because the engine holding the clock is gone. | lifecycle (rare per thread) | yes | yes |
+| `VoiceSessionEnded` | The session closed. Carries the same `session_id`, `duration_secs: u64`, and `reason`: `hangup` (the caller rang off), `agent_hangup` (the caller said they were done and Lucidos rang off for them, which ends the call and never the work), `disconnected` (the socket died with no goodbye), `provider_failed` (the talker could not go on), `engine_shutdown` (the engine went away under the call, or the boot sweep settled a start its process never got to end). A sweep-settled row carries `duration_secs: 0`, because the engine holding the clock is gone. | lifecycle (rare per thread) | yes | yes |
 | `SpokenReplyGenerated` | The talker finished saying something out loud, and this is what it said. Carries `session_id: Uuid`, `text: String`, and `interrupted: bool` (the caller spoke over it, so only that much was heard). One per talker turn, whether the talker composed the words itself or was reading the agent's answer aloud: both are what the caller heard. A reply cut off before a word was said writes nothing. The `actor` names the talker as a guest agent, so the agent reading the thread sees it under its own speaker label rather than as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status and a talker turn landing mid-turn must not settle it. Like the spoken message beside it, it MAKES THE THREAD REAL (ADR 0167). That matters because the talker usually greets first. | a few per call | yes | yes |
 | `SpokenMessageReceived` | The caller said something and the talker answered it alone, from what it already knew. Carries `session_id: Uuid` and `text: String`, and the `actor` is the caller's device rather than the talker. It started no agent turn, which is exactly why it is not a `MessageReceived`: that variant is a Start event, and using it here would leave the thread claiming a turn that never runs. `Metadata`, and it moves no section. It MAKES THE THREAD REAL, as the spoken reply beside it does (ADR 0167): a draft the call was placed from becomes an ordinary thread, its stored draft is cleared, and every device is told. The caller's FIRST spoken words also become the thread's `first_message`, which is what titles a call nobody delegated from. | a few per call | yes | yes |
-| `WorkDelegated` | The talker called its one tool, asking for the agent. Carries `session_id: Uuid` and `reason: String`, the talker's own few words on what the caller wants. Never empty: a call with no reason gets a stand-in rather than being dropped. The `actor` names the talker as a guest agent, as on a spoken reply. It sits BESIDE the `MessageReceived` that started the turn, never in place of it, so it is `Metadata` and moves no section. | a few per call | yes | yes |
+| `WorkDelegated` | The talker asked for the agent, with its `delegate` tool. Carries `session_id: Uuid` and `reason: String`, the talker's own few words on what the caller wants. Never empty: a call with no reason gets a stand-in rather than being dropped. The `actor` names the talker as a guest agent, as on a spoken reply. It sits BESIDE the `MessageReceived` that started the turn, never in place of it, so it is `Metadata` and moves no section. | a few per call | yes | yes |
 
 No payload here carries audio, and audio is never persisted at all.
 
 **The talker decides whether a spoken turn needs the agent.** It holds exactly
-one tool, `delegate`, taking a short reason. What it delegates persists as a
-`MessageReceived` and starts the agent's turn through the same single-flight
-admission a typed message uses. What it answers alone persists as a
-`SpokenMessageReceived` and starts nothing.
+three tools and none of them acts (ADR 0170). `delegate` takes a short reason.
+What it delegates persists as a `MessageReceived` and starts the agent's turn
+through the same single-flight admission a typed message uses. What it answers
+alone persists as a `SpokenMessageReceived` and starts nothing.
+
+`answer` settles something waiting on the caller: a question card, or a
+permission card in any of its three lanes. It hands back a choice id the engine
+issued, so nothing matches a spoken word against a label. The resulting
+`UserQuestionAnswered` or `*PermissionResolved` is the same row the screen
+writes, bar its actor. A `delegate` is refused while one of those is open,
+because the agent is blocked inside it.
+
+`hang_up` ends the call when the caller says they are done. It ends the CALL
+and never the work, so a turn in flight keeps running. It writes
+`VoiceSessionEnded` with reason `agent_hangup`.
 
 Either way the utterance is recorded exactly once, so a call's transcript is
 the thread's transcript: the caller's words, the agent's answer where there was
