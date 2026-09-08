@@ -76,6 +76,12 @@ describe('chatModelOptions', () => {
     expect(MODELS.some((m) => m.value === 'claude-opus-5@default')).toBe(true);
   });
 
+  // The newest OpenAI builtin. A seed the fallback list misses is invisible
+  // until `/models` lands, which is exactly when a fresh page is being read.
+  it('offers GPT-6 Astra', () => {
+    expect(MODELS).toContainEqual({ value: 'gpt-6-astra', label: 'GPT-6 Astra' });
+  });
+
   it('returns only enabled models, mapped to {value,label}, when loaded', () => {
     chatModels.value = {
       status: 'loaded',
@@ -179,6 +185,10 @@ describe('lucidosModelChoices / clampEffortFor', () => {
     // Pre-load, a GPT-5.6 id still gets its full set so the picker is usable.
     const row = lucidosModelChoices('gpt-5.6-sol').find((c) => c.value === 'gpt-5.6-sol');
     expect(row?.reasoningEfforts).toContain('max');
+    // Astra too, which the heuristic missed while it keyed on `gpt-5.6` alone.
+    const astra = lucidosModelChoices('gpt-6-astra').find((c) => c.value === 'gpt-6-astra');
+    expect(astra?.reasoningEfforts).toContain('max');
+    expect(clampEffortFor('max', 'gpt-6-astra')).toBe('max');
     expect(clampEffortFor('max', 'gpt-5.4')).toBe('xhigh');
   });
 });

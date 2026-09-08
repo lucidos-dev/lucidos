@@ -257,6 +257,22 @@ pub(super) async fn claude_code_control(
             Json(serde_json::json!({ "error": "Invalid thread_id" })),
         )
     })?;
+    // Control by another route, so it takes the same gate its four siblings do.
+    // A thread-bound subprocess may drive only its own session or a
+    // descendant's, never a sibling's. Runs before the request reaches the session.
+    super::thread_reach::refuse_without_authority(
+        &state.pool,
+        &headers,
+        Some(thread_id),
+        super::thread_reach::ThreadReachVerb::Control,
+    )
+    .await
+    .map_err(|e| {
+        (
+            e.status_code(),
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine

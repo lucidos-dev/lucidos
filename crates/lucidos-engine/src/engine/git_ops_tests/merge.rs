@@ -1081,6 +1081,46 @@ async fn ensure_head_on_main_aborts_stale_rebase() {
     );
 }
 
+/// Build an `Output` with the given exit code, without running a process.
+/// `ExitStatus::from_raw` takes a wait(2) status word on unix, where the exit
+/// code lives in the high byte.
+fn abort_output(code: i32) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    }
+}
+
+/// The load-bearing arm. A timed-out `git rebase --abort` is no evidence that
+/// the rebase is stale. `.git/rebase-merge` holds the user's only route back to
+/// the pre-rebase HEAD, so only a git that RAN and refused may authorize the
+/// hand removal.
+#[test]
+fn an_unanswered_rebase_abort_never_authorizes_deleting_the_rebase_state() {
+    assert_eq!(
+        classify_rebase_abort(&Err("git rebase --abort timed out after 30s".to_string())),
+        StaleRebase::Unanswered,
+        "a timed-out abort must not read as 'no rebase in progress'"
+    );
+    assert_eq!(
+        classify_rebase_abort(&Err(
+            "git rebase --abort failed: No such file or directory".to_string()
+        )),
+        StaleRebase::Unanswered
+    );
+    // git ran and refused, so the leftovers really are residue.
+    assert_eq!(
+        classify_rebase_abort(&Ok(abort_output(128))),
+        StaleRebase::Residue
+    );
+    assert_eq!(
+        classify_rebase_abort(&Ok(abort_output(0))),
+        StaleRebase::Aborted
+    );
+}
+
 /// Regression: a Lucidos-source coding-agent spawn must branch its worktree off
 /// the local default branch (`main`), NEVER off whatever the shared repo
 /// checkout happens to have at `HEAD`. The real bug: the dev repo's one primary

@@ -16,9 +16,10 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { describeInitiator, isUserBubbleEvent } from '../ChatExchange';
+import { chatExchangePropsEqual, describeInitiator, isUserBubbleEvent } from '../ChatExchange';
 import { vnodeToText } from './vnodeToText';
 import { HEARING_YOU } from '../../../voice/callState';
+import { exchangeStatus } from '../../../store/thread-events';
 import type { Exchange, StoredEvent } from '../../../store/thread-events';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
@@ -78,6 +79,66 @@ describe('nothing is drawn under it', () => {
       .find(l => l.includes('const showResponsePanel'));
     expect(line).toBeDefined();
     expect(line).toContain('!isLiveUtterance');
+  });
+
+  /** And the exclusion lifts the moment the words are there. The engine is
+   *  then holding them while the talker decides. Something IS in flight, and
+   *  the reader is owed the shimmer under their own turn (ADR 0174). */
+  it('stops being excluded once the row carries the words', () => {
+    const line = chatExchangeSource
+      .split('\n')
+      .find(l => l.includes('const isLiveUtterance ='));
+    expect(line).toContain('!userMessage');
+  });
+});
+
+/** The same row, once the provider has ended the turn. It is the caller's own
+ *  message now, and takes the bubble a spoken message takes. */
+describe('the caller\'s words, before the engine has written them down', () => {
+  const spoken: Exchange = {
+    ...theRow,
+    userEvent: { ...theRow.userEvent, text: 'fix the blank thread' } as StoredEvent,
+  };
+
+  it('draws the words, not the pulse', () => {
+    const body = vnodeToText(describeInitiator(spoken, '<p>fix the blank thread</p>', [], 'tid').details);
+    expect(body).toContain('fix the blank thread');
+    expect(body).not.toContain('live-utterance-bar');
+  });
+
+  it('keeps the spoken mark, so it still reads as speech', () => {
+    const initiator = describeInitiator(spoken, '<p>fix the blank thread</p>', [], 'tid');
+    expect(vnodeToText(initiator.status)).toContain('Spoken');
+    expect(initiator.variant).toBe('user');
+  });
+
+  /** The waiting is real: the engine is holding the words. So the turn reads
+   *  as pending, which is the Requesting shimmer, rather than as a finished
+   *  turn with no answer. */
+  it('reads as a turn still being requested', () => {
+    expect(exchangeStatus(spoken, '', true, false, false, /* threadIdle */ true, false))
+      .toBe('pending');
+  });
+
+  it('reads the same way while the caller is still speaking', () => {
+    expect(exchangeStatus(theRow, '', true, false, false, /* threadIdle */ true, false))
+      .toBe('pending');
+  });
+
+  /** The row is `memo`d on a content fingerprint, and its identity does not
+   *  move when the words arrive: same event id, same seq, no steps, no
+   *  revision. So the fingerprint has to carry the text, or the swap is
+   *  swallowed and the pulse keeps drawing over words the reader could read.
+   *  That is the whole reported bug, arriving one layer down. */
+  it('re-renders when the pulse becomes the words', () => {
+    const props = (exchange: Exchange) => ({
+      exchange,
+      revision: 0,
+      threadId: 'tid',
+      isLast: false,
+      streamingBuffer: '',
+    } as unknown as Parameters<typeof chatExchangePropsEqual>[0]);
+    expect(chatExchangePropsEqual(props(theRow), props(spoken))).toBe(false);
   });
 });
 

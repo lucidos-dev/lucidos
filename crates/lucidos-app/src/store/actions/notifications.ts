@@ -31,6 +31,11 @@ import { nudgeDockBadge } from '../../utils/tauri';
 
 const PAGE_SIZE = 15;
 
+/** How many times `loadMoreNotifications` re-cursors when a concurrent reload
+ *  moves the list under its request. Bounded so a busy arrival stream cannot
+ *  spin: giving up leaves the list correct, just one page short. */
+const MAX_PAGE_RETRIES = 3;
+
 /** Cap for the unread-set load. Unread is naturally small, and the API clamps
  *  `limit` to 100 — so this is the most we pull in one go. A backlog larger than
  *  this renders as "99+" on the badge: accurate enough, and far past any
@@ -181,24 +186,43 @@ export async function loadNotifications(): Promise<void> {
 export async function loadMoreNotifications(): Promise<void> {
   if (notificationsLoadingMore.value || !notificationsHasMore.value) return;
 
-  const current = notifications.value;
-  if (current.status !== 'loaded' || current.data.length === 0) return;
-
-  const lastItem = current.data[current.data.length - 1];
-  const beforeTs = new Date(lastItem.created_at).getTime() / 1000;
-
   notificationsLoadingMore.value = true;
   try {
-    const data = await getNotifications({
-      limit: PAGE_SIZE,
-      before: beforeTs,
-      filter: notificationsFilter.value,
-    });
-    notifications.value = {
-      status: 'loaded',
-      data: [...current.data, ...(data.notifications || [])],
-    };
-    notificationsHasMore.value = data.has_more;
+    // Re-cursor and retry when the list moves under the request, rather than
+    // appending or dropping. `handleNotificationSSE` re-runs `loadNotifications`
+    // on every arrival, under exactly the conditions infinite scroll runs in,
+    // and that reload truncates back to one page.
+    //
+    // Both simpler answers are wrong. Writing the pre-await snapshot back
+    // reverts the reload and drops the row it brought in. Appending the page
+    // instead spans the truncation, so every row between the reloaded page and
+    // this one becomes unreachable by scrolling. Dropping the page wedges the
+    // scroll: the sentinel's observer is rebuilt only when `hasMore` changes,
+    // and it never left the viewport, so nothing re-asks.
+    for (let attempt = 0; attempt < MAX_PAGE_RETRIES; attempt++) {
+      const base = notifications.value;
+      if (base.status !== 'loaded' || base.data.length === 0) return;
+      const tail = base.data[base.data.length - 1];
+
+      const data = await getNotifications({
+        limit: PAGE_SIZE,
+        before: new Date(tail.created_at).getTime() / 1000,
+        filter: notificationsFilter.value,
+      });
+
+      const after = notifications.value;
+      if (after.status !== 'loaded') return;
+      // Moved under us: this page answers a cursor that no longer ends the
+      // list, so throw it away and ask again from the new tail.
+      if (after.data !== base.data) continue;
+
+      // Dedupe anyway: a reload can have carried some of these rows already.
+      const seen = new Set(after.data.map(n => n.id));
+      const fresh = (data.notifications || []).filter(n => !seen.has(n.id));
+      notifications.value = { status: 'loaded', data: [...after.data, ...fresh] };
+      notificationsHasMore.value = data.has_more;
+      return;
+    }
   } catch (error) {
     showToast(`Failed to load more notifications: ${errorDetail(error)}`, 'error');
   } finally {

@@ -2,8 +2,8 @@
 //! — the field that sizes the engine's context trim budget.
 //!
 //! Why this matters: the window is only inferred from the model id when the row
-//! doesn't declare one, and that fallback recognises just `claude-*` and
-//! `gpt-5*`. Every OpenRouter / xAI / Gemini / local model is treated as 200k until
+//! doesn't declare one, and that fallback recognises just `claude-*` and a
+//! `gpt-` major of 5 or newer. Every OpenRouter / xAI / Gemini / local model is treated as 200k until
 //! this field is set, which trims their context far earlier than needed. So the
 //! HTTP surface has to carry the value in both directions and has to keep the
 //! absent-vs-explicit-null distinction that lets a caller clear it.
@@ -153,9 +153,14 @@ async fn every_model_declares_the_reasoning_tiers_its_provider_supports() {
         ),
         // Gemini collapses everything above high onto high.
         ("gemini-3.5-flash", vec!["none", "low", "medium", "high"]),
-        // GPT-5.6 has a real max; earlier OpenAI families top out at xhigh.
+        // GPT-5.6 and GPT-6 Astra have a real max; earlier OpenAI families top
+        // out at xhigh.
         (
             "gpt-5.6-sol",
+            vec!["none", "low", "medium", "high", "xhigh", "max"],
+        ),
+        (
+            "gpt-6-astra",
             vec!["none", "low", "medium", "high", "xhigh", "max"],
         ),
         ("gpt-5.5", vec!["none", "low", "medium", "high", "xhigh"]),
@@ -380,15 +385,17 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         );
     }
 
-    // Declared, because the prefix map's `gpt-5` → 400k UNDERSTATES these. The
-    // OpenAI path has no context opt-in, so the model's full window applies to
-    // every request and there is nothing to under-declare for.
+    // Declared, because the prefix map's 400k guess for a `gpt-` major of 5 or
+    // newer UNDERSTATES these. The OpenAI path has no context opt-in, so the
+    // model's full window applies to every request and there is nothing to
+    // under-declare for.
     for id in [
         "gpt-5.5",
         "gpt-5.5-pro",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-6-astra",
     ] {
         let m = find_model(&client, &api, id)
             .await

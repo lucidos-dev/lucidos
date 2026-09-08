@@ -1048,6 +1048,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **`min-height: 1lh` beside a `text-box-trim` is load-bearing, not
+  redundant.** A reviewer sees a rule trim the line box and then state a
+  minimum height equal to it. They read the second as cancelling the first.
+  It does not. The trim shrinks the CONTENT box to the cap band, which is what
+  makes the glyph the thing being centred. `1lh` puts the ELEMENT's box back
+  where it was, so the trim costs no layout.
+
+  Three things ride on the box staying put, and none is visible from the rule.
+  A drawer section header stays the same height collapsed and expanded, which
+  is the jump `styles/drawer.css` documents. A `background-clip: text` shimmer
+  keeps a positioning area covering the whole glyph. A pill sized by its line
+  box keeps its pill.
+
+  Every site is `styles/badges.css` or the `@supports` block in
+  `styles/drawer.css`, and `styles/__tests__/badge-glyph-centring.test.ts`
+  pins each one. Re-flagging needs a site whose box may genuinely shrink.
+
 - **`answerThreadQuestion`'s retry can report `false` for an answer that
   landed, and that trade is deliberate.** A reviewer sees
   `mutatingFetchIdempotent` on the answer POST and observes that a transport

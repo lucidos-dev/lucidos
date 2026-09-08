@@ -5,6 +5,16 @@ import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
 import { FilePreviewPath } from '../files/FilePreviewPath';
+// The two notification views are the exception to the code-split below, because
+// `lazyComponent` renders NOTHING until its chunk lands. Every other view can
+// afford that: you reach it from the menu, already looking at the pane. You
+// reach these two from the bell in every header, and from an OS push tap. So
+// the chunk fetch sat in front of the first pixel, swallowing the inbox toolbar
+// and both skeletons. That is the reported blank panel. The pair adds under
+// 2 KB gzipped, and buys back a round-trip on the app's most latency-sensitive
+// path.
+import { NotificationsView } from '../notifications/NotificationsView';
+import { NotificationDetailInline } from '../notifications/NotificationDetailInline';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { forceWebKitRepaint } from '../../utils/webkitRepaint';
 import { onPageResume } from '../../utils/pageResume';
@@ -15,13 +25,11 @@ const PluginsView = lazyComponent(() => import('../plugins/PluginsView').then(m 
 const TriggersView = lazyComponent(() => import('../triggers/TriggersView').then(m => m.TriggersView));
 const SettingsView = lazyComponent(() => import('../settings/SettingsView').then(m => m.SettingsView));
 const ChangesView = lazyComponent(() => import('../changes/ChangesView').then(m => m.ChangesView));
-const NotificationsView = lazyComponent(() => import('../notifications/NotificationsView').then(m => m.NotificationsView));
 const FilePreviewInline = lazyComponent(() => import('../files/FilePreviewInline').then(m => m.FilePreviewInline));
 const RepoFilePreviewWithSidebar = lazyComponent(() => import('../files/RepoFilePreview').then(m => m.RepoFilePreviewWithSidebar));
 const UrlPreviewInline = lazyComponent(() => import('../files/UrlPreviewInline').then(m => m.UrlPreviewInline));
 const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => m.AppUiInline));
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
-const NotificationDetailInline = lazyComponent(() => import('../notifications/NotificationDetailInline').then(m => m.NotificationDetailInline));
 
 /** The navigation cover's CSS clear animation at 1x (`--duration-normal`). The
  *  fuse below is this scaled by the Animation speed slider plus a little slack,
@@ -203,12 +211,10 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
             never gets here). The pane was revealed on the tap, so this fills it
             with the detail's own skeleton rather than an empty panel.
 
-            Mounting the lazy component here also WARMS ITS CHUNK in parallel
-            with the fetch, where it used to start only once the overlay was set,
-            i.e. strictly after the round-trip. `lazyComponent` renders null
-            until the chunk lands, so on a genuinely cold chunk the skeleton may
-            not paint before the notification does; that is the pre-existing
-            empty-panel behaviour, minus a serial chunk load. */}
+            The skeleton paints on the tap because the component is eager, per
+            the import block at the top. Behind a lazy chunk it could not: the
+            chunk fetch and the notification fetch raced, and the loser was the
+            thing standing in for the other. */}
         {showPendingNotification && (
           <SkeletonProvider><NotificationDetailInline /></SkeletonProvider>
         )}

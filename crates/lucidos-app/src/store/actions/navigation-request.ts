@@ -286,7 +286,11 @@ export function handleNavigationRequest(nav: {
       // in its own pane and closing the app would cost the reader what they
       // were working in. Same distinction the `new-chat` branch draws.
       exitAppFullscreen();
-      focusThreadOrBootstrap(nav.id, { targetEventId: nav.event_id ?? null });
+      focusThreadOrBootstrap(nav.id, {
+        targetEventId: nav.event_id ?? null,
+        // Same as the `app` and `trigger` branches: a miss says who asked.
+        source: opts?.source,
+      });
       break;
     case 'new-app':
       // Single nav push — switchMenuItem would push (apps, no overlay) first,

@@ -34,7 +34,7 @@ import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
 import { archivingThreadIds, bootstrappingThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
 import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
-import { focusThread, focusThreadOrBootstrapResult } from './threads';
+import { focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult } from './threads';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -357,6 +357,33 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     // Not left staring at a skeleton for a thread that will never arrive.
     expect(focusedThreadId.value).toBe('was-here');
     expect(bootstrappingThreadId.value).toBeNull();
+  });
+
+  it('names the thread and the origin when the bootstrap misses', async () => {
+    // A bare "Thread not found" strips the identity, which the no-hidden-errors
+    // rule counts as a swallowed error. Most callers here are not a direct
+    // click: a sibling thread's `NavigationRequested`, a notification tap.
+    (fetchThreadById as any).mockResolvedValue(null);
+    toasts.value = [];
+
+    focusThreadOrBootstrap('ghost-1', { source: 'thread "Nightly build"' });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const message = toasts.value.map((t) => t.message).join(' ');
+    expect(message).toContain('ghost-1');
+    expect(message).toContain('requested by thread "Nightly build"');
+  });
+
+  it('names the thread even when nothing said where the navigate came from', async () => {
+    (fetchThreadById as any).mockResolvedValue(null);
+    toasts.value = [];
+
+    focusThreadOrBootstrap('ghost-2');
+    await new Promise((r) => setTimeout(r, 0));
+
+    const message = toasts.value.map((t) => t.message).join(' ');
+    expect(message).toContain('ghost-2');
+    expect(message).not.toContain('requested by');
   });
 
   it('restores the previous focus when the fetch fails', async () => {

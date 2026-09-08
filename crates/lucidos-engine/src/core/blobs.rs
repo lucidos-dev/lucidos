@@ -247,8 +247,12 @@ fn blob_path(workspace: &Path, hash: &str, ext: &str) -> PathBuf {
 /// allowlist (so the upload endpoint can reject with 415 before any
 /// disk write).
 ///
-/// The write goes to a sibling `.tmp-<hash>` path then renames into
-/// place atomically; a crash mid-write leaves no half-written blob.
+/// The write goes to a sibling `.tmp-<hash>-<nonce>` path then renames into
+/// place atomically; a crash mid-write leaves no half-written blob. The
+/// per-call nonce keeps two concurrent uploads of the same bytes off one tmp
+/// path: without it the first to rename takes the file out from under the
+/// second, whose own rename then fails with ENOENT on a successful upload.
+/// Same reasoning as `get_or_create_preview` below.
 pub fn write_blob(workspace: &Path, bytes: &[u8]) -> Result<ResolvedBlob, BlobError> {
     let mime = sniff_image_mime(bytes)
         .ok_or_else(|| BlobError::UnsupportedMime(classify_unsupported_image(bytes)))?;
@@ -260,7 +264,8 @@ pub fn write_blob(workspace: &Path, bytes: &[u8]) -> Result<ResolvedBlob, BlobEr
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_file_name(format!(".tmp-{hash}.{ext}"));
+        let nonce = uuid::Uuid::new_v4().simple();
+        let tmp = path.with_file_name(format!(".tmp-{hash}-{nonce}.{ext}"));
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)?;
     }
@@ -604,6 +609,41 @@ mod tests {
             !entries.iter().any(|n| n.starts_with(".tmp-")),
             "no .tmp-* files after idempotent write: {entries:?}"
         );
+    }
+
+    #[test]
+    fn write_blob_survives_concurrent_identical_writes() {
+        use std::sync::{Arc, Barrier};
+        // Fixed-tmp-path race: two callers write one tmp, the first rename moves
+        // it out from under the second, whose rename then fails with ENOENT. The
+        // nonce keeps each caller's tmp distinct. The barrier fires the threads
+        // together so a regressed build surfaces the ENOENT. Peak concurrency is
+        // kept small (rounds, not threads, drive the odds) so this stays a light
+        // neighbour under the parallel suite.
+        let bytes = png_bytes();
+        let hash = compute_hash(&bytes);
+        for _ in 0..25 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            let n = 6;
+            let barrier = Arc::new(Barrier::new(n));
+            let mut handles = Vec::new();
+            for _ in 0..n {
+                let path = path.clone();
+                let bytes = bytes.clone();
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    write_blob(&path, &bytes)
+                }));
+            }
+            for h in handles {
+                h.join()
+                    .unwrap()
+                    .expect("concurrent identical write must succeed");
+            }
+            assert!(resolve_blob(&path, &hash).is_some());
+        }
     }
 
     #[test]

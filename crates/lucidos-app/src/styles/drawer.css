@@ -1197,11 +1197,44 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 
 .list-section-title-collapsible > .collapse-count-badge {
     position: relative;
+    /* A hand-tuned lift, and the block below retires it wherever it can. The
+       label's caps ride above its own line box's middle, by whatever the font's
+       ascent and descent are worth, while the count sits at its pill's middle.
+       This nudge stood in for that gap, and being a constant it was right at one
+       ui-scale and one font. */
     top: -0.0625rem;
     /* Extra breathing room after the section name, on top of the flex `gap`
        (0.25rem) — sets the name-to-count spacing apart from the icon-to-name
        gap so the badge doesn't crowd the label. */
     margin-left: 0.25rem;
+}
+
+/* The label, its icon and its count on ONE cap band, derived instead of nudged.
+ *
+ * `styles/badges.css` trims the pill's line box to the cap band, so the digits
+ * now sit exactly at the pill's middle. Give the label the same trim and its
+ * caps sit exactly at the middle of ITS box, which the flex row centres on the
+ * same axis. All three then coincide at any font and any ui-scale, and the
+ * nudge above has nothing left to correct. The ICON is the third, and it was
+ * off by the same gap: 1.24px at 200% ui-scale, now 0.08px.
+ *
+ * `min-height: 1lh` is what keeps this safe. The trim shrinks the CONTENT box
+ * to the cap band; the min-height puts the element's own box back at the line
+ * box it had, so the row is the same height collapsed and expanded (see the
+ * jump this file documents above) and the shimmer still paints over the whole
+ * glyph. Measured: the count went from 0.80px above the label's caps at 200%
+ * ui-scale to 0.04px, on both engines, with every row height unchanged. */
+@supports (text-box-trim: trim-both) {
+    .drawer-section-label {
+        min-height: 1lh;
+        align-content: center;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+    }
+
+    .list-section-title-collapsible > .collapse-count-badge {
+        top: 0;
+    }
 }
 
 /* Section header icon — sits left of the label, sharing the title's flex row.

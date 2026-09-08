@@ -23,6 +23,8 @@ describe('threadFilterActive', () => {
     selectedRepoIds.value = new Set();
     selectedAppIds.value = new Set();
     threadChannelFilter.value = new Set(ALL_CHANNELS);
+    historicalTriggers.value = { status: 'not-loaded' };
+    setIncludeDeletedFilterOptions(false);
   });
 
   it('is false when every channel is on and no per-trigger / per-repo subset is set', () => {
@@ -69,6 +71,26 @@ describe('threadFilterActive', () => {
       ],
     };
     selectedTriggerIds.value = new Set();
+    expect(threadFilterActive.value).toBe(false);
+  });
+
+  it('is true when every VISIBLE trigger is picked but a deleted one is still excluded', () => {
+    // The trigger arm counted against the visible slice, which drops an
+    // unselected deleted trigger while "Include deleted" is off. Picking every
+    // row on screen therefore read as "all", so the Filter button went dark.
+    // `threadPassesChannelFilter` still hides the deleted trigger's threads on
+    // any non-empty selection, so the list WAS narrowed.
+    triggers.value = { status: 'loaded', data: [makeTrigger({ id: 'a', name: 'A' })] };
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'gone', name: 'Gone', last_activity: '2026-05-01T00:00:00Z' }],
+    };
+    selectedTriggerIds.value = new Set(['a']);
+
+    expect(threadFilterActive.value).toBe(true);
+    // Opting the deleted one back in and picking it too excludes nothing.
+    setIncludeDeletedFilterOptions(true);
+    selectedTriggerIds.value = new Set(['a', 'gone']);
     expect(threadFilterActive.value).toBe(false);
   });
 

@@ -3,7 +3,11 @@ import { checkConnection, handleResume, bounceToPickerIfStranded } from '../stor
 import { loadArtifacts, openUrl } from '../store/actions/artifacts';
 import { openFilePreviewModal, filePreviewRequestError, filePreviewBlockedReason } from '../store/actions/filePreviewModal';
 import { syncAppFullscreenHost } from '../store/appFullscreenHost';
-import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
+import {
+  loadUnreadNotifications,
+  loadNotifications,
+  refreshActiveNotificationsTab,
+} from '../store/actions/notifications';
 import { syncWorkspaceAppBadge, refreshOtherWorkspacesUnread } from '../store/actions/app-badge';
 import { loadApps } from '../store/actions/apps';
 import { loadCredentials } from '../store/actions/credentials';
@@ -134,13 +138,25 @@ export function useStartup(): void {
     // workspace on the origin. A no-op on a direct engine port. See
     // store/actions/app-badge.ts.
     void refreshOtherWorkspacesUnread();
+    // Cold-starting ON the Notifications panel: start the inbox load here, not
+    // in the preferences `.then()` below. The filter it selects is already on
+    // the signal, seeded from its localStorage cache. Waiting out that
+    // round-trip guarded against a stale filter, and cost the panel a whole
+    // round-trip of blank. The correction below buys the guard back. Only the
+    // "All" tab has anything to load: "Unread" renders the set fetched above.
+    const filterBeforePreferences = notificationsFilter.value;
+    if (activeMenuItem.value === 'notifications' && filterBeforePreferences === 'all') {
+      void loadNotifications();
+    }
     loadPreferences().then(() => {
-      // Notifications must load after preferences so the persisted filter is
-      // applied. The "Unread" tab renders `unreadNotifications` (loaded above via
-      // loadUnreadNotifications), so only the "All" tab needs the paginated
-      // browse list loaded here.
-      if (activeMenuItem.value === 'notifications' && notificationsFilter.value === 'all') {
-        loadNotifications();
+      // The served filter overrides the cached one, and that is the single case
+      // the eager load above can get wrong: the tab was switched on another
+      // device since this one last loaded. Re-source whichever tab won.
+      if (
+        activeMenuItem.value === 'notifications' &&
+        notificationsFilter.value !== filterBeforePreferences
+      ) {
+        refreshActiveNotificationsTab();
       }
       // The version-update dismissals are now GLOBAL preferences, so the update
       // surfaces skip while preferences are still loading (they can't yet know if

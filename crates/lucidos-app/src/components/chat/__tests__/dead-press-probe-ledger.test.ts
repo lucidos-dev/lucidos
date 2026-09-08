@@ -99,11 +99,30 @@ function fire(type: string, event: Record<string, unknown>) {
     .dispatchEvent({ type, ...event });
 }
 
+interface Line {
+  face: string;
+  verdict: string;
+  rowRect?: Box;
+  faceRect?: Box;
+  /** Written by the scheduled check, which has no gesture behind it. */
+  scheduled?: boolean;
+  /** Why no watchable face took a press attributed to the row. */
+  under?: string;
+  underFace?: string | null;
+  faceCount?: number;
+  watchableCount?: number;
+  /** The silence that ended at the input this line belongs to. */
+  quiet?: { ms: number; checks: number; unreachable: number } | null;
+  /** Set only on a repair line. */
+  nudged?: boolean;
+  connected?: boolean;
+}
+
 /** Every `composer-press` line written so far, newest last. */
-function lines(): Array<{ face: string; verdict: string; rowRect?: Box; faceRect?: Box }> {
+function lines(): Line[] {
   return postClientLog.mock.calls
     .filter((c) => c[0] === 'composer-press')
-    .map((c) => c[2] as { face: string; verdict: string; rowRect?: Box; faceRect?: Box });
+    .map((c) => c[2] as Line);
 }
 
 function verdicts(): string[] {
@@ -354,7 +373,11 @@ describe('the reachability question is no longer behind the row gate', () => {
       expect.stringContaining('not reachable where it is drawn'),
       'warning',
     );
-    expect(verdicts()).toEqual(['unreachable']);
+    // A repair follows the detection on this path too. The latch would
+    // otherwise strand a wedge the user found by tapping, since the scheduled
+    // check goes quiet once the face is reported.
+    expect(verdicts()).toContain('unreachable');
+    expect(verdicts()).not.toContain('missed');
   });
 
   it('stays quiet about a composer parked off-screen on another pane', () => {
@@ -385,7 +408,266 @@ describe('the reachability question is no longer behind the row gate', () => {
     fire('touchstart', touch(elsewhere, 10, 90));
     vi.advanceTimersByTime(1000);
     fire('touchstart', touch(elsewhere, 10, 90));
-    expect(verdicts()).toEqual(['unreachable']);
+    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
+    expect(verdicts()).not.toContain('missed');
+  });
+});
+
+/** The scheduled check's period, mirrored from the module. */
+const TICK = 3000;
+
+/** Let the row answer once. A healthy reading forgets both latches. They are
+ *  keyed by face NAME, so they outlive the fresh `FakeEl` each case builds. */
+function settleHealthy() {
+  atPoint = send;
+  vi.advanceTimersByTime(TICK);
+  vi.advanceTimersByTime(200);
+  postClientLog.mockClear();
+  showToast.mockClear();
+}
+
+describe('the reading that does not wait to be touched', () => {
+  // The tenth episode wrote no line at all, which proves the page took neither
+  // a touch nor a click while the composer sat dead. Every other path in the
+  // module needs one of those to arrive first.
+  //
+  // Full reconstruction:
+  // docs/plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md
+
+  it('writes a line with no event dispatched at all', () => {
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    expect(verdicts()).toContain('unreachable');
+    expect(lines()[0].scheduled).toBe(true);
+  });
+
+  it('stays quiet while no composer row is laid out', () => {
+    settleHealthy();
+    row.box = { left: 0, right: 0, top: 0, bottom: 0 };
+    atPoint = null;
+    vi.advanceTimersByTime(TICK);
+    expect(verdicts()).toEqual([]);
+  });
+
+  it('stays quiet while the document is hidden', () => {
+    settleHealthy();
+    const doc = globalThis.document as unknown as Record<string, unknown>;
+    doc.visibilityState = 'hidden';
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    doc.visibilityState = 'visible';
+    expect(verdicts()).toEqual([]);
+  });
+
+  it('writes once for a wedge that lasts, and again after one that returns', () => {
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK * 4);
+    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    expect(verdicts().filter((v) => v === 'unreachable')).toHaveLength(1);
+  });
+});
+
+describe('the repair, and whether it worked', () => {
+  /** A style object that actually stores, so the restore can be asserted. The
+   *  shared setup's stub answers the empty string for every property, which
+   *  the module reads as a shell it does not own. */
+  let props: Record<string, string>;
+  let priorStyle: unknown;
+
+  beforeEach(() => {
+    const root = (globalThis.document as unknown as { documentElement: Record<string, unknown> })
+      .documentElement;
+    priorStyle = root.style;
+    props = { '--app-height': '844px' };
+    root.style = {
+      setProperty: (k: string, v: string) => { props[k] = v; },
+      getPropertyValue: (k: string) => props[k] ?? '',
+      removeProperty: (k: string) => { delete props[k]; },
+    };
+  });
+
+  afterEach(() => {
+    const root = (globalThis.document as unknown as { documentElement: Record<string, unknown> })
+      .documentElement;
+    root.style = priorStyle;
+  });
+
+  /** Advance in steps shorter than the repair's own settle timer, stopping the
+   *  moment the check reports. The shared interval's phase drifts across cases,
+   *  so a single long advance can run the repair before the case can answer. */
+  function tickUntilUnreachable() {
+    for (let i = 0; i < 400 && !verdicts().includes('unreachable'); i++) {
+      vi.advanceTimersByTime(20);
+    }
+  }
+
+  it('says it worked when the face answers afterwards', () => {
+    settleHealthy();
+    atPoint = row;
+    tickUntilUnreachable();
+    atPoint = send;                       // the nudge took effect
+    vi.advanceTimersByTime(200);
+    expect(verdicts()).toContain('repaired');
+    expect(showToast).toHaveBeenCalledWith(
+      expect.stringContaining('stopped taking taps'),
+      'warning',
+    );
+  });
+
+  it('says it did not work when the face still will not answer', () => {
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(200);
+    expect(verdicts()).toContain('repair-failed');
+    expect(showToast).not.toHaveBeenCalledWith(
+      expect.stringContaining('stopped taking taps'),
+      'warning',
+    );
+  });
+
+  it('restores the height it nudged', () => {
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(200);
+    expect(props['--app-height']).toBe('844px');
+  });
+
+  it('never touches a healthy row', () => {
+    settleHealthy();
+    vi.advanceTimersByTime(TICK * 3);
+    expect(verdicts()).toEqual([]);
+    expect(props['--app-height']).toBe('844px');
+  });
+
+  it('spends one attempt per episode, not one per tick', () => {
+    settleHealthy();
+    atPoint = row;
+    vi.advanceTimersByTime(TICK * 5);
+    const attempts = verdicts().filter((v) => v === 'repaired' || v === 'repair-failed');
+    expect(attempts).toHaveLength(1);
+  });
+
+  it('does not call a row that re-rendered under it a failed repair', () => {
+    // The face left the document, so it answers nothing. Scoring that as a
+    // failure would poison the split the repair exists to read.
+    settleHealthy();
+    atPoint = row;
+    tickUntilUnreachable();
+    send.isConnected = false;
+    vi.advanceTimersByTime(200);
+    const judged = lines().find((l) => l.verdict === 'repair-failed');
+    expect(judged?.connected).toBe(false);
+  });
+
+  it('leaves a unit it does not own alone', () => {
+    settleHealthy();
+    props['--app-height'] = '100%';
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(200);
+    expect(props['--app-height']).toBe('100%');
+    expect(lines().find((l) => l.verdict === 'repair-failed')?.nudged).toBe(false);
+  });
+
+  it('declines to write a height the shell never set', () => {
+    settleHealthy();
+    delete props['--app-height'];
+    atPoint = row;
+    vi.advanceTimersByTime(TICK);
+    vi.advanceTimersByTime(200);
+    expect(verdicts()).toContain('repair-failed');
+    expect(props['--app-height']).toBeUndefined();
+  });
+});
+
+describe('every line brackets the silence before it', () => {
+  it('carries the gap, and what the checks saw across it', () => {
+    // The recovery input is the one event guaranteed to arrive, so it is the
+    // one moment a deaf window can be measured from.
+    settleHealthy();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    postClientLog.mockClear();
+    atPoint = row;
+    vi.advanceTimersByTime(30000);
+    atPoint = send;
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.ms).toBeGreaterThanOrEqual(30000);
+    expect(press?.quiet?.checks).toBeGreaterThan(0);
+    expect(press?.quiet?.unreachable).toBeGreaterThan(0);
+  });
+
+  it('does not let a synthetic click erase the silence its own tap ended', () => {
+    // The paired click lands about 50ms after the `touchstart`, and the press
+    // records 600ms later still. Resetting on that click handed the press
+    // which ENDED a silence a 50ms window, losing the whole reading.
+    settleHealthy();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(30000);
+    fire('touchstart', touch(send, 350, 420));
+    fire('touchend', touch(send, 350, 420));
+    fire('click', { target: send });
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'clicked');
+    expect(press?.quiet?.ms).toBeGreaterThanOrEqual(30000);
+  });
+
+  it('reports a quiet stretch the checks found healthy as exactly that', () => {
+    settleHealthy();
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    postClientLog.mockClear();
+    vi.advanceTimersByTime(30000);
+    tapSend();
+    vi.advanceTimersByTime(1000);
+    const press = lines().find((l) => l.verdict === 'dead' || l.verdict === 'clicked');
+    expect(press?.quiet?.checks).toBeGreaterThan(0);
+    expect(press?.quiet?.unreachable).toBe(0);
+  });
+});
+
+describe('a missed press says why no face took it', () => {
+  it('names an excluded action face under the finger', () => {
+    // The distinction the ledger never carried. A tap on empty row space and a
+    // tap on a dead action face used to write the same line.
+    settleHealthy();
+    send.disabled = true;
+    atPoint = send;
+    fire('touchstart', touch(row, 350, 420));
+    const [line] = lines();
+    expect(line.under).toBe('disabled-face');
+    expect(line.underFace).toBe('Send message');
+    expect(line.faceCount).toBe(1);
+    expect(line.watchableCount).toBe(0);
+  });
+
+  it('calls the invisible placeholder by its own name, not disabled', () => {
+    settleHealthy();
+    send.disabled = true;
+    send.classes = ['action-btn', 'send-cancel-morph', 'morph-placeholder'];
+    atPoint = send;
+    fire('touchstart', touch(row, 350, 420));
+    expect(lines()[0].under).toBe('placeholder-face');
+  });
+
+  it('says nothing was under a tap on empty row space', () => {
+    settleHealthy();
+    atPoint = row;
+    fire('touchstart', touch(row, 10, 420));
+    const missed = lines().find((l) => l.verdict === 'missed');
+    expect(missed?.under).toBe('nothing');
+    expect(missed?.underFace).toBeNull();
   });
 });
 

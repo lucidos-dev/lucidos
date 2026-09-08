@@ -18,31 +18,39 @@
 //!
 //! # Units
 //!
-//! Every number in this module is in **physical pixels**, in the desktop's
-//! global coordinate space: the space `Window::outer_position` and
-//! `Monitor::work_area` both speak, and the space the plugin persists and
-//! restores in. It is also the only space shared by monitors running different
-//! scale factors, so a mixed-DPI desktop needs no per-monitor conversion here.
-//! The conversion happens once, at the boundary in [`clamp_restored_geometry`],
-//! where the LOGICAL values from `tauri.conf.json` are multiplied by the
-//! window's scale factor.
+//! Every number in this module is in **logical points**, in the macOS global
+//! desktop coordinate space. macOS lays its displays out in that space and they
+//! tile without overlapping, so it is the one reading a mixed-DPI desk cannot
+//! break. It is also what `tauri.conf.json` already declares.
+//!
+//! **tao's "physical pixels" are not one space.** It derives a window's
+//! position and a monitor's position from the same point space, each multiplied
+//! by the scale factor of the object being read. A 1x display and a 2x display
+//! therefore get two different projections, and a rect from one means nothing
+//! in the other. Applying a 2x frame to a window born on a 1x display doubled
+//! its size and its offset from the origin (ADR 0173).
+//!
+//! So every physical number converts the moment it is read, through the scale
+//! factor of the thing that reported it: [`Rect::from_physical`] for a window,
+//! [`work_area_points`] for a monitor. Corrections go back out as
+//! `LogicalPosition` and `LogicalSize`, which tao passes through untouched.
 
-use tauri::{Manager, PhysicalPosition, PhysicalSize};
+use tauri::{LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize};
 
-/// Height of the strip at the top of the window that counts as the drag handle,
-/// in LOGICAL pixels: one standard macOS title bar, the same 28 the shell stamps
-/// as `--titlebar-inset`. A window whose title bar is off screen cannot be moved
+/// Height of the strip at the top of the window that counts as the drag handle:
+/// one standard macOS title bar, the same 28 the shell stamps as
+/// `--titlebar-inset`. A window whose title bar is off screen cannot be moved
 /// back with the pointer, which is the state this module exists to prevent.
-const GRAB_HEIGHT_LOGICAL: f64 = 28.0;
+const GRAB_HEIGHT_POINTS: f64 = 28.0;
 
 /// How much of that strip has to be inside one monitor's work area for the
-/// window to count as reachable, in LOGICAL pixels. The traffic-light cluster
-/// plus its clearance already claims 80px of the band (the reserve
-/// `store/paneMinimums.ts` restates as `TITLEBAR_LIGHTS_RESERVE_PX`), so 120
-/// leaves 40px of strip that is actually grabbable rather than a button.
-const GRAB_WIDTH_LOGICAL: f64 = 120.0;
+/// window to count as reachable. The traffic-light cluster plus its clearance
+/// already claims 80 points of the band (`store/paneMinimums.ts` restates that
+/// reserve as `TITLEBAR_LIGHTS_RESERVE_PX`). So 120 leaves 40 points of strip
+/// that is grabbable rather than a button.
+const GRAB_WIDTH_POINTS: f64 = 120.0;
 
-/// A window or monitor rect in physical pixels. `i64` throughout so an
+/// A window or monitor rect in logical points. `i64` throughout so an
 /// off-screen position far outside the desktop cannot underflow a subtraction
 /// or overflow an area product.
 ///
@@ -57,6 +65,36 @@ pub(crate) struct Rect {
 }
 
 impl Rect {
+    /// The point-space rect behind a tao PHYSICAL reading, given the scale
+    /// factor of whatever reported it.
+    ///
+    /// The one door a physical number comes through, so the module header's
+    /// rule holds by construction. `scale` must belong to the OBJECT that was
+    /// read: a window's own factor for a window, a monitor's own for a monitor.
+    /// Another object's is what put a remembered window off screen at twice its
+    /// size.
+    pub(crate) fn from_physical(
+        position: PhysicalPosition<i32>,
+        size: PhysicalSize<u32>,
+        scale: f64,
+    ) -> Self {
+        // Both callers refuse to convert without a scale they could read, so
+        // this is the last net rather than the first. 1.0 leaves the numbers as
+        // they came: coarse on a Retina panel, never nonsense.
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let points = |physical: f64| (physical / scale).round() as i64;
+        Self {
+            x: points(position.x as f64),
+            y: points(position.y as f64),
+            width: points(size.width as f64),
+            height: points(size.height as f64),
+        }
+    }
+
     fn right(&self) -> i64 {
         self.x + self.width
     }
@@ -78,7 +116,7 @@ impl Rect {
     }
 }
 
-/// The display layout the clamp judges a rect against, in physical pixels.
+/// The display layout the clamp judges a rect against, in logical points.
 #[derive(Debug, Clone)]
 pub(crate) struct Displays {
     /// Work area (the usable frame, menu bar and Dock excluded) of every
@@ -89,7 +127,7 @@ pub(crate) struct Displays {
     pub primary: Rect,
 }
 
-/// The floors and fallbacks the clamp applies, in physical pixels. Derived from
+/// The floors and fallbacks the clamp applies, in logical points. Derived from
 /// `tauri.conf.json` rather than restated, so the declared minimum and the
 /// minimum the clamp enforces cannot drift apart.
 #[derive(Debug, Clone, Copy)]
@@ -103,31 +141,25 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
-    /// Convert the LOGICAL config values plus this module's logical thresholds
-    /// into the physical pixels everything else here works in.
-    fn from_logical(
+    /// Round the declared config values, which are already points, into the
+    /// whole points everything here works in. No scale factor appears, which is
+    /// the point of the module speaking the space the config is written in.
+    fn from_declared(
         min_width: f64,
         min_height: f64,
         default_width: f64,
         default_height: f64,
-        scale: f64,
     ) -> Self {
-        // A non-finite or non-positive scale factor would turn every threshold
-        // into nonsense, so fall back to 1.0 and let the clamp reason in what
-        // are then logical pixels: coarser, never wrong in a harmful direction.
-        let scale = if scale.is_finite() && scale > 0.0 {
-            scale
-        } else {
-            1.0
-        };
-        let px = |logical: f64| (logical * scale).round().max(0.0) as i64;
+        // `max` returns the operand that is not NaN, so a garbage config value
+        // becomes 0: no floor rather than a nonsense one.
+        let whole = |points: f64| points.round().max(0.0) as i64;
         Self {
-            min_width: px(min_width),
-            min_height: px(min_height),
-            default_width: px(default_width),
-            default_height: px(default_height),
-            grab_width: px(GRAB_WIDTH_LOGICAL),
-            grab_height: px(GRAB_HEIGHT_LOGICAL),
+            min_width: whole(min_width),
+            min_height: whole(min_height),
+            default_width: whole(default_width),
+            default_height: whole(default_height),
+            grab_width: whole(GRAB_WIDTH_POINTS),
+            grab_height: whole(GRAB_HEIGHT_POINTS),
         }
     }
 }
@@ -298,36 +330,34 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
         return;
     };
 
-    // Scale factor of the monitor the window currently sits on. A window on the
-    // wrong monitor may report the wrong one, which only scales the thresholds;
-    // this is a coarse sanity check, not a layout.
-    let scale = window.scale_factor().unwrap_or(1.0);
     // Absent minimums mean no floor rather than a guessed one, so removing them
     // from the config can never shrink a window. `tauri_conf_declares_minimums`
     // below is what keeps them declared.
-    let policy = Policy::from_logical(
+    let policy = Policy::from_declared(
         config.min_width.unwrap_or(0.0),
         config.min_height.unwrap_or(0.0),
         config.width,
         config.height,
-        scale,
     );
 
-    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
-        eprintln!("[Tauri] Could not read the restored window geometry: skipping the clamp");
-        return;
-    };
     // `outer_position` + `inner_size` is deliberately the pair the window-state
     // plugin itself persists and restores, so the clamp reasons about the exact
     // numbers that produced the bad state. On this window the two sizes are the
     // same anyway: `titleBarStyle: "Overlay"` gives the content view the full
     // frame, so there is no title bar outside it.
-    let restored = Rect {
-        x: position.x as i64,
-        y: position.y as i64,
-        width: size.width as i64,
-        height: size.height as i64,
+    //
+    // The scale factor comes with them, and an unreadable one skips the clamp
+    // rather than falling back to 1.0. It is what converts the pair into
+    // points, so a guess here is a wrong rect, not a coarse threshold.
+    let (Ok(position), Ok(size), Ok(scale)) = (
+        window.outer_position(),
+        window.inner_size(),
+        window.scale_factor(),
+    ) else {
+        eprintln!("[Tauri] Could not read the restored window geometry: skipping the clamp");
+        return;
     };
+    let restored = Rect::from_physical(position, size, scale);
 
     let Ok(monitors) = window.available_monitors() else {
         eprintln!("[Tauri] Could not enumerate monitors: skipping the restore clamp");
@@ -343,8 +373,8 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
         return;
     };
     let displays = Displays {
-        work_areas: monitors.iter().map(work_area_rect).collect(),
-        primary: work_area_rect(&primary),
+        work_areas: monitors.iter().map(work_area_points).collect(),
+        primary: work_area_points(&primary),
     };
 
     let Some(fixed) = sanitize(restored, &displays, &policy) else {
@@ -352,7 +382,7 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
     };
     eprintln!(
         "[Tauri] Restored window geometry {}x{} at {},{} is unusable on the attached displays: \
-         correcting to {}x{} at {},{} (physical pixels)",
+         correcting to {}x{} at {},{} (logical points)",
         restored.width,
         restored.height,
         restored.x,
@@ -362,10 +392,13 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
         fixed.x,
         fixed.y
     );
-    if let Err(e) = window.set_size(PhysicalSize::new(fixed.width as u32, fixed.height as u32)) {
+    // Logical, so tao applies the numbers as they are. A physical correction
+    // would be divided by the scale factor of whatever display the window is
+    // on when the call lands. That is the defect this module now avoids.
+    if let Err(e) = window.set_size(LogicalSize::new(fixed.width as f64, fixed.height as f64)) {
         eprintln!("[Tauri] Failed to correct the restored window size: {e}");
     }
-    if let Err(e) = window.set_position(PhysicalPosition::new(fixed.x as i32, fixed.y as i32)) {
+    if let Err(e) = window.set_position(LogicalPosition::new(fixed.x as f64, fixed.y as f64)) {
         eprintln!("[Tauri] Failed to correct the restored window position: {e}");
     }
 }
@@ -373,14 +406,14 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
 /// A monitor's usable frame as a [`Rect`]. Deliberately the work area rather
 /// than the full resolution: the menu bar and the Dock are not places a title
 /// bar can be grabbed.
-fn work_area_rect(monitor: &tauri::Monitor) -> Rect {
+///
+/// Converted through THIS monitor's own scale factor, which is the one tao
+/// multiplied its work area by. A neighbour's factor would put the display
+/// somewhere it is not. The clamp would then judge every window against a
+/// desktop that does not exist.
+fn work_area_points(monitor: &tauri::Monitor) -> Rect {
     let area = monitor.work_area();
-    Rect {
-        x: area.position.x as i64,
-        y: area.position.y as i64,
-        width: area.size.width as i64,
-        height: area.size.height as i64,
-    }
+    Rect::from_physical(area.position, area.size, monitor.scale_factor())
 }
 
 #[cfg(test)]
@@ -424,14 +457,15 @@ mod tests {
         assert!(policy_config(&[], "main").is_none());
     }
 
-    /// A single 3456x2234 physical panel with a 74px menu bar, the display the
-    /// bug was reported on.
+    /// The internal Retina panel alone: 1728x1117 points behind 3456x2234
+    /// pixels, with a 37-point menu bar. The display the shipped clamp bug was
+    /// reported on.
     fn one_panel() -> Displays {
         let work_area = Rect {
             x: 0,
-            y: 74,
-            width: 3456,
-            height: 2160,
+            y: 37,
+            width: 1728,
+            height: 1080,
         };
         Displays {
             work_areas: vec![work_area],
@@ -444,7 +478,7 @@ mod tests {
     fn two_panels() -> Displays {
         let mut displays = one_panel();
         displays.work_areas.push(Rect {
-            x: 3456,
+            x: 1728,
             y: 0,
             width: 2560,
             height: 1440,
@@ -452,18 +486,145 @@ mod tests {
         displays
     }
 
-    /// `tauri.conf.json`'s 480x400 minimum and 1024x768 default at a 2x panel.
-    fn policy() -> Policy {
-        Policy::from_logical(480.0, 400.0, 1024.0, 768.0, 2.0)
+    /// The desk the placement bug was reported on: a 1x 5120x1440 ultrawide as
+    /// primary, and the 2x internal panel below and right of it.
+    ///
+    /// In points, because that is the space macOS lays displays out in. tao
+    /// reports the panel's own rect doubled, at 4050,3250, and a window on it
+    /// doubled to match. Those two agree with each other and with nothing else.
+    fn mixed_dpi_desk() -> Displays {
+        let ultrawide = Rect {
+            x: 0,
+            y: 30,
+            width: 5120,
+            height: 1410,
+        };
+        let panel = Rect {
+            x: 2025,
+            y: 1625,
+            width: 1728,
+            height: 1117,
+        };
+        Displays {
+            work_areas: vec![ultrawide, panel],
+            primary: ultrawide,
+        }
     }
+
+    /// `tauri.conf.json`'s 480x400 minimum and 1024x768 default.
+    fn policy() -> Policy {
+        Policy::from_declared(480.0, 400.0, 1024.0, 768.0)
+    }
+
+    // ── Reading a physical number back into the one space ────────────────────
+
+    // The defect, stated. One 800x600 window at 100,200 reads as every number
+    // doubled on the 2x panel and as the points themselves on the 1x
+    // ultrawide. Converted through the panel's own factor the two are one rect.
+    // Taken raw they are two, and applying one on the other display is what
+    // handed the user a doubled window off the bottom.
+    #[test]
+    fn one_window_reads_the_same_on_either_panel() {
+        let retina = Rect::from_physical(
+            PhysicalPosition::new(200, 400),
+            PhysicalSize::new(1600, 1200),
+            2.0,
+        );
+        let ultrawide = Rect::from_physical(
+            PhysicalPosition::new(100, 200),
+            PhysicalSize::new(800, 600),
+            1.0,
+        );
+        assert_eq!(retina, ultrawide);
+        assert_eq!(
+            retina,
+            Rect {
+                x: 100,
+                y: 200,
+                width: 800,
+                height: 600,
+            }
+        );
+    }
+
+    // The reported bug, at the boundary that now prevents it. A window in the
+    // middle of the Retina panel is reported by tao at 4450,3650 2048x1536,
+    // because everything about that panel is doubled. Converted, it is still on
+    // the panel, so no window born on the ultrawide can wear a doubled copy.
+    #[test]
+    fn a_frame_captured_on_the_retina_panel_stays_on_it() {
+        let captured = Rect::from_physical(
+            PhysicalPosition::new(4450, 3650),
+            PhysicalSize::new(2048, 1536),
+            2.0,
+        );
+        assert_eq!(
+            captured,
+            Rect {
+                x: 2225,
+                y: 1825,
+                width: 1024,
+                height: 768,
+            }
+        );
+        assert_eq!(sanitize(captured, &mixed_dpi_desk(), &policy()), None);
+    }
+
+    // The monitor side of the same rule, and what `mixed_dpi_desk` encodes. A
+    // display enters the clamp through its OWN scale factor. Read tao's raw
+    // 4050,3250 instead and the desk puts the panel thousands of points from
+    // where it is. Every window on it is then judged against a display that
+    // does not exist.
+    #[test]
+    fn a_monitor_enters_the_clamp_through_its_own_scale_factor() {
+        let panel = Rect::from_physical(
+            PhysicalPosition::new(4050, 3250),
+            PhysicalSize::new(3456, 2234),
+            2.0,
+        );
+        assert_eq!(
+            panel,
+            Rect {
+                x: 2025,
+                y: 1625,
+                width: 1728,
+                height: 1117,
+            }
+        );
+        assert_eq!(panel, mixed_dpi_desk().work_areas[1]);
+    }
+
+    // Last net only: both callers refuse to convert without a scale they read.
+    #[test]
+    fn a_nonsense_scale_factor_leaves_the_numbers_as_they_came() {
+        let raw = Rect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        for scale in [0.0, -2.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                Rect::from_physical(
+                    PhysicalPosition::new(10, 20),
+                    PhysicalSize::new(30, 40),
+                    scale
+                ),
+                raw,
+                "scale {scale}"
+            );
+        }
+    }
+
+    // ── What the clamp decides ───────────────────────────────────────────────
 
     #[test]
     fn a_healthy_rect_is_left_untouched() {
         let healthy = Rect {
-            x: 400,
-            y: 300,
-            width: 2048,
-            height: 1536,
+            x: 200,
+            y: 150,
+            width: 1024,
+            height: 768,
         };
         assert_eq!(sanitize(healthy, &one_panel(), &policy()), None);
     }
@@ -476,106 +637,106 @@ mod tests {
 
     #[test]
     fn a_degenerate_size_falls_back_to_the_declared_default() {
-        // 1x1 logical in the middle of the screen: only the size is wrong.
+        // 1x1 in the middle of the screen: only the size is wrong.
         let degenerate = Rect {
-            x: 1000,
-            y: 800,
-            width: 2,
-            height: 2,
+            x: 500,
+            y: 400,
+            width: 1,
+            height: 1,
         };
         let fixed = sanitize(degenerate, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.width, fixed.height), (2048, 1536));
+        assert_eq!((fixed.width, fixed.height), (1024, 768));
         // Still reachable at that position, so the position is not touched.
-        assert_eq!((fixed.x, fixed.y), (1000, 800));
+        assert_eq!((fixed.x, fixed.y), (500, 400));
     }
 
     #[test]
     fn the_reported_bug_recentres_on_the_primary() {
-        // 1x1 logical at 1727,1085 logical: the saved 3454,2170 physical, the
-        // extreme bottom-right of the panel.
+        // 1x1 at 1727,1085: the extreme bottom-right of the panel, saved as
+        // 3454,2170 in the pixels the plugin writes.
         let shipped_bug = Rect {
-            x: 3454,
-            y: 2170,
-            width: 2,
-            height: 2,
+            x: 1727,
+            y: 1085,
+            width: 1,
+            height: 1,
         };
         let fixed = sanitize(shipped_bug, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.width, fixed.height), (2048, 1536));
-        assert_eq!((fixed.x, fixed.y), (704, 386));
+        assert_eq!((fixed.width, fixed.height), (1024, 768));
+        assert_eq!((fixed.x, fixed.y), (352, 193));
     }
 
     #[test]
     fn a_window_on_an_unplugged_display_recentres_on_the_primary() {
         // Saved on the external display, which is no longer attached.
         let orphaned = Rect {
-            x: 4000,
-            y: 200,
-            width: 2048,
-            height: 1536,
+            x: 2000,
+            y: 100,
+            width: 1024,
+            height: 768,
         };
         assert_eq!(sanitize(orphaned, &two_panels(), &policy()), None);
         let fixed = sanitize(orphaned, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.width, fixed.height), (2048, 1536));
-        assert_eq!((fixed.x, fixed.y), (704, 386));
+        assert_eq!((fixed.width, fixed.height), (1024, 768));
+        assert_eq!((fixed.x, fixed.y), (352, 193));
     }
 
     #[test]
     fn a_partly_offscreen_window_is_nudged_back_rather_than_recentred() {
-        // Hanging off the right edge with only 100px of title bar left: too
-        // little to grab, but most of the window is still on screen.
+        // Hanging off the right edge with only 100 points of title bar left:
+        // too little to grab, but most of the window is still on screen.
         let hanging = Rect {
-            x: 3356,
-            y: 500,
-            width: 2048,
-            height: 1536,
+            x: 1628,
+            y: 250,
+            width: 1024,
+            height: 768,
         };
         let fixed = sanitize(hanging, &one_panel(), &policy()).expect("must be corrected");
         // Pushed just far enough left to sit inside the work area, keeping the
         // size and the vertical position the user chose.
-        assert_eq!((fixed.x, fixed.y), (1408, 500));
-        assert_eq!((fixed.width, fixed.height), (2048, 1536));
+        assert_eq!((fixed.x, fixed.y), (704, 250));
+        assert_eq!((fixed.width, fixed.height), (1024, 768));
     }
 
     #[test]
     fn a_sliver_on_the_edge_counts_as_gone_and_recentres() {
-        // Two physical pixels of a full-size window left on the panel: less than
-        // a drag handle's worth, so there is no neighbourhood left to nudge into.
+        // One point of a full-size window left on the panel: less than a drag
+        // handle's worth, so there is no neighbourhood left to nudge into.
         let sliver = Rect {
-            x: 3454,
-            y: 500,
-            width: 2048,
-            height: 1536,
+            x: 1727,
+            y: 250,
+            width: 1024,
+            height: 768,
         };
         let fixed = sanitize(sliver, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.x, fixed.y), (704, 386));
+        assert_eq!((fixed.x, fixed.y), (352, 193));
     }
 
     #[test]
     fn a_title_bar_above_the_work_area_is_nudged_down() {
         // Top edge under the menu bar: horizontally fine, vertically not.
         let under_the_menu_bar = Rect {
-            x: 400,
+            x: 200,
             y: 0,
-            width: 2048,
-            height: 1536,
+            width: 1024,
+            height: 768,
         };
         let fixed =
             sanitize(under_the_menu_bar, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.x, fixed.y), (400, 74));
+        assert_eq!((fixed.x, fixed.y), (200, 37));
     }
 
     #[test]
     fn a_window_larger_than_the_work_area_aligns_with_its_leading_edge() {
         let oversized = Rect {
-            x: -900,
-            y: -200,
-            width: 4000,
-            height: 2400,
+            x: -450,
+            y: -100,
+            width: 2000,
+            height: 1200,
         };
         let fixed = sanitize(oversized, &one_panel(), &policy()).expect("must be corrected");
-        assert_eq!((fixed.x, fixed.y), (0, 74));
+        assert_eq!((fixed.x, fixed.y), (0, 37));
         // Oversized is not degenerate, so the size the user had is kept.
-        assert_eq!((fixed.width, fixed.height), (4000, 2400));
+        assert_eq!((fixed.width, fixed.height), (2000, 1200));
     }
 
     /// The reason `clamp_restored_geometry` returns early on a fullscreen
@@ -588,8 +749,8 @@ mod tests {
         let fullscreen = Rect {
             x: 0,
             y: 0,
-            width: 3456,
-            height: 2234,
+            width: 1728,
+            height: 1117,
         };
         assert!(sanitize(fullscreen, &one_panel(), &policy()).is_some());
     }
@@ -597,10 +758,10 @@ mod tests {
     #[test]
     fn a_window_on_the_second_display_keeps_its_place() {
         let external = Rect {
-            x: 3700,
-            y: 100,
-            width: 2048,
-            height: 1200,
+            x: 1850,
+            y: 50,
+            width: 1024,
+            height: 600,
         };
         assert_eq!(sanitize(external, &two_panels(), &policy()), None);
     }
@@ -609,28 +770,28 @@ mod tests {
     fn a_correction_is_itself_healthy_so_the_clamp_cannot_loop() {
         let broken = [
             Rect {
-                x: 3454,
-                y: 2170,
-                width: 2,
-                height: 2,
+                x: 1727,
+                y: 1085,
+                width: 1,
+                height: 1,
             },
             Rect {
-                x: 4000,
-                y: 200,
-                width: 2048,
-                height: 1536,
+                x: 2000,
+                y: 100,
+                width: 1024,
+                height: 768,
             },
             Rect {
-                x: 3356,
-                y: 500,
-                width: 2048,
-                height: 1536,
+                x: 1628,
+                y: 250,
+                width: 1024,
+                height: 768,
             },
             Rect {
-                x: -900,
-                y: -200,
-                width: 4000,
-                height: 2400,
+                x: -450,
+                y: -100,
+                width: 2000,
+                height: 1200,
             },
         ];
         for rect in broken {
@@ -643,20 +804,21 @@ mod tests {
         }
     }
 
+    // The declared numbers reach the clamp unchanged, whatever panel the window
+    // is on. No scale factor multiplies them any more, which is the whole point
+    // of the module speaking the space the config is written in.
     #[test]
-    fn a_1x_display_gets_1x_thresholds() {
-        let policy = Policy::from_logical(480.0, 400.0, 1024.0, 768.0, 1.0);
+    fn the_thresholds_are_the_declared_points() {
+        let policy = policy();
         assert_eq!((policy.min_width, policy.min_height), (480, 400));
         assert_eq!((policy.default_width, policy.default_height), (1024, 768));
         assert_eq!((policy.grab_width, policy.grab_height), (120, 28));
     }
 
     #[test]
-    fn a_nonsense_scale_factor_degrades_to_1x() {
-        let policy = Policy::from_logical(480.0, 400.0, 1024.0, 768.0, 0.0);
-        assert_eq!((policy.min_width, policy.min_height), (480, 400));
-        let policy = Policy::from_logical(480.0, 400.0, 1024.0, 768.0, f64::NAN);
-        assert_eq!((policy.min_width, policy.min_height), (480, 400));
+    fn a_nonsense_config_value_leaves_no_floor_rather_than_a_wrong_one() {
+        let policy = Policy::from_declared(f64::NAN, -10.0, 1024.0, 768.0);
+        assert_eq!((policy.min_width, policy.min_height), (0, 0));
     }
 
     /// The clamp reads its floor from the config, so a config that declares no

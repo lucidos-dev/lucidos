@@ -232,7 +232,9 @@ type PressVerdict =
   | 'missed'
   | 'no-lift'
   | 'click-no-touch'
-  | 'unreachable';
+  | 'unreachable'
+  | 'repaired'
+  | 'repair-failed';
 
 /** How often the reachability question may be asked.
  *
@@ -262,6 +264,43 @@ function roundRect(rect: ProbeRect | null): ProbeRect | null {
   };
 }
 
+/** The quiet window that ended at the most recent input, and the counters
+ *  filling the one now running.
+ *
+ *  The tenth episode wrote no line at all, which proves the page took no touch
+ *  and no click while the composer sat dead. A probe that must be touched
+ *  cannot report that, so the recovery input has to carry it instead.
+ *
+ *  Every line therefore says how long the page had been silent beforehand. It
+ *  says how many scheduled checks ran in that silence, and how many found the
+ *  row unreachable. Those three read together bracket an episode. Riding on
+ *  lines that are written anyway costs no new noise. */
+interface QuietWindow {
+  ms: number;
+  checks: number;
+  unreachable: number;
+}
+
+let lastInputAt: number | null = null;
+let checksSinceInput = 0;
+let unreachableSinceInput = 0;
+let quiet: QuietWindow | null = null;
+
+/** Close the running quiet window and open a fresh one. Called for every
+ *  `touchstart` and every `click` the document sees, wherever they land. */
+function noteInput(now: number): void {
+  if (lastInputAt !== null) {
+    quiet = {
+      ms: Math.round(now - lastInputAt),
+      checks: checksSinceInput,
+      unreachable: unreachableSinceInput,
+    };
+  }
+  lastInputAt = now;
+  checksSinceInput = 0;
+  unreachableSinceInput = 0;
+}
+
 /** The engine-log breadcrumb, written for EVERY press the probe watches.
  *
  *  A toast reports to whoever is looking at the screen and keeps it. That is
@@ -283,11 +322,40 @@ function recordPress(facts: {
    *  paint-versus-hit-test offset instead of implying one. */
   rowRect?: ProbeRect | null;
   faceRect?: ProbeRect | null;
+  /** What sat under a finger no watchable face claimed, and the census behind
+   *  that answer. Only the `missed` branch fills these. */
+  under?: UnderFinger;
+  underFace?: string | null;
+  faceCount?: number;
+  watchableCount?: number;
+  /** Written with no user input behind it, by the scheduled check. */
+  scheduled?: boolean;
+  /** Whether the relayout actually ran. A `repair-failed` that never nudged
+   *  rules nothing out, unlike one that nudged and did not help. */
+  nudged?: boolean;
+  /** Whether the face was still in the document when the repair was judged.
+   *  A row that re-rendered answers nothing, and that is not a failure. */
+  connected?: boolean;
 }): void {
   postClientLog('composer-press', `${facts.face}: ${facts.verdict}`, {
     ...facts,
     movedPx: Math.round(facts.movedPx),
+    // The composer's own state. "The button is there, it just doesn't work" is
+    // a claim about this, and no line has ever carried it.
+    morph: readMorphState(),
+    quiet,
     viewport: readViewport(),
+  });
+}
+
+/** The morph button as the DOM currently holds it. */
+function readMorphState(): MorphState {
+  const el = document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
+  return morphStateOf({
+    present: !!el,
+    placeholder: !!el?.classList.contains('morph-placeholder'),
+    disabled: !!el?.disabled,
+    label: el?.getAttribute('aria-label') ?? null,
   });
 }
 
@@ -300,13 +368,65 @@ function recordPress(facts: {
 const ROW_SELECTOR = '.prompt-actions-row';
 const FACE_SELECTOR = '.action-btn';
 
-/** A face a press is entitled to activate. Two exclusions, each a press the app
- *  drops on purpose: a `morph-placeholder` is invisible and inert, holding the
- *  row's height, and a disabled face is a settling Stop or a busy Apply.
+/** Why a face cannot take a press, or that it can. Two exclusions, each a press
+ *  the app drops on purpose: a `morph-placeholder` is invisible and inert,
+ *  holding the row's height, and a disabled face is a settling Stop or a busy
+ *  Apply.
+ *
+ *  Placeholder is asked FIRST, because that mode renders disabled as well. The
+ *  more specific of the two overlapping answers is the useful one.
  *
  *  Structural rather than a DOM node so it tests without one. */
+export type FaceExclusion = 'watchable' | 'placeholder' | 'disabled';
+
+export function faceExclusion(face: { disabled: boolean; placeholder: boolean }): FaceExclusion {
+  if (face.placeholder) return 'placeholder';
+  if (face.disabled) return 'disabled';
+  return 'watchable';
+}
+
+/** A face a press is entitled to activate. */
 export function pressIsWatchable(face: { disabled: boolean; placeholder: boolean }): boolean {
-  return !face.disabled && !face.placeholder;
+  return faceExclusion(face) === 'watchable';
+}
+
+/** What sat under a finger that no watchable face claimed.
+ *
+ *  The tenth report is why this exists. Every `missed` line in the ledger
+ *  carried no face at all. So a tap on empty row space, a tap on an `.icon-btn`
+ *  and a tap on an excluded action face all read alike. Only the third is the
+ *  bug.
+ *
+ *  `actionFace` is the exclusion of an `.action-btn` whose painted box holds the
+ *  point, and null when none does. */
+export type UnderFinger = 'placeholder-face' | 'disabled-face' | 'other-button' | 'nothing';
+
+export function underFingerReason(f: {
+  actionFace: FaceExclusion | null;
+  otherButton: boolean;
+}): UnderFinger {
+  if (f.actionFace === 'placeholder') return 'placeholder-face';
+  if (f.actionFace === 'disabled') return 'disabled-face';
+  if (f.otherButton) return 'other-button';
+  return 'nothing';
+}
+
+/** The morph button's own mode, which is what "the send button" means.
+ *
+ *  Read from the DOM rather than stamped by `PromptInput`, so the component
+ *  keeps no diagnostic surface to remove when this module goes. */
+export type MorphState = 'absent' | 'placeholder' | 'disabled' | 'cancel' | 'send';
+
+export function morphStateOf(m: {
+  present: boolean;
+  placeholder: boolean;
+  disabled: boolean;
+  label: string | null;
+}): MorphState {
+  if (!m.present) return 'absent';
+  if (m.placeholder) return 'placeholder';
+  if (m.disabled) return 'disabled';
+  return m.label === 'Cancel' ? 'cancel' : 'send';
 }
 
 /** What the report calls the button. The accessible name first, since an
@@ -320,12 +440,23 @@ function nameOf(btn: HTMLButtonElement): string {
   return faceName({ ariaLabel: btn.getAttribute('aria-label'), text: btn.textContent ?? '' });
 }
 
-function watchableFaces(): HTMLButtonElement[] {
-  const faces = document.querySelectorAll<HTMLButtonElement>(`${ROW_SELECTOR} ${FACE_SELECTOR}`);
-  return Array.from(faces).filter((btn) => pressIsWatchable({
+/** Every action face in the row, excluded ones included. The census the
+ *  `missed` line needs, since the whole question there is what was skipped. */
+function allFaces(): HTMLButtonElement[] {
+  return Array.from(
+    document.querySelectorAll<HTMLButtonElement>(`${ROW_SELECTOR} ${FACE_SELECTOR}`),
+  );
+}
+
+function exclusionOf(btn: HTMLButtonElement): FaceExclusion {
+  return faceExclusion({
     disabled: btn.disabled,
     placeholder: btn.classList.contains('morph-placeholder'),
-  }));
+  });
+}
+
+function watchableFaces(): HTMLButtonElement[] {
+  return allFaces().filter((btn) => exclusionOf(btn) === 'watchable');
 }
 
 /** Can the document hit-test this point at all? `elementFromPoint` answers null
@@ -376,11 +507,16 @@ const reportedUnreachable = new Set<string>();
  *  Silent while an overlay is open: that is the one time something is MEANT to
  *  cover the row, and the app inerts the shell behind it on purpose. Silent too
  *  for a face with no box, which is a row mid-layout rather than a fault. */
-function firstUnreachableFace(
-  faces: HTMLButtonElement[],
-): { face: string; report: string; rect: ProbeRect } | null {
+interface UnreachableFace {
+  face: string;
+  el: HTMLButtonElement;
+  report: string;
+  rect: ProbeRect;
+}
+
+function firstUnreachableFace(faces: HTMLButtonElement[]): UnreachableFace | null {
   if (document.documentElement.hasAttribute('data-overlay-open')) return null;
-  let fresh: { face: string; report: string; rect: ProbeRect } | null = null;
+  let fresh: UnreachableFace | null = null;
   for (const face of faces) {
     const rect = face.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
@@ -401,12 +537,171 @@ function firstUnreachableFace(
       pointerEventsAtCentre: pointerEventsOf(at),
       viewport: readViewport(),
     });
-    if (!report) { reportedUnreachable.delete(name); continue; }
+    if (!report) {
+      // The face answers again, so the episode is over. Both latches are
+      // forgotten together, or a state that returns would go unreported and
+      // unrepaired.
+      reportedUnreachable.delete(name);
+      repairAttempted.delete(name);
+      continue;
+    }
     if (reportedUnreachable.has(name)) continue;
     reportedUnreachable.add(name);
-    fresh ??= { face: name, report, rect: roundRect(rect) as ProbeRect };
+    fresh ??= { face: name, el: face, report, rect: roundRect(rect) as ProbeRect };
   }
   return fresh;
+}
+
+/** Does the page answer with this face at its own painted centre? The bare
+ *  question `firstUnreachableFace` wraps, asked again after a repair with no
+ *  latch and no report in the way. */
+function faceAnswersAtCentre(face: HTMLButtonElement): boolean {
+  const rect = face.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  const centre = { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 };
+  if (!onScreen(centre)) return false;
+  const at = document.elementFromPoint(centre.x, centre.y);
+  return !!at && face.contains(at);
+}
+
+/** How often the row is asked whether it can still be reached.
+ *
+ *  Slow on purpose. The check costs a hit test and a style read per face, and a
+ *  wedge persists, so a faster tick buys nothing. */
+const SCHEDULED_CHECK_MS = 3000;
+
+/** How long the repair is given before the face is asked again. Past a frame,
+ *  and short enough that the answer still belongs to the nudge. */
+const REPAIR_SETTLE_MS = 50;
+
+/** Faces a repair has already been spent on, cleared the moment the face
+ *  answers again. One attempt per episode: a nudge that did not work will not
+ *  work on the next tick either. */
+const repairAttempted = new Set<string>();
+
+/** Force the shell to relayout, which is what the user's own recovery does.
+ *
+ *  Closing and reopening the keyboard rewrites the visual viewport, and the app
+ *  answers by rewriting `--app-height`. So nudging that property and putting it
+ *  straight back reproduces the effect, without touching focus, the caret or
+ *  the keyboard. Blurring the textarea would dismiss the keyboard, and iOS
+ *  refuses to reopen it outside a user gesture.
+ *
+ *  Both writes happen in one task, so nothing is painted in between and the
+ *  nudge is invisible. Reading `offsetHeight` between them is what makes each
+ *  write a real layout rather than a coalesced no-op.
+ *
+ *  False when the property is not set, which is a shell the probe does not own
+ *  and must not start writing. */
+function nudgeLayout(): boolean {
+  const root = document.documentElement;
+  const prior = root.style.getPropertyValue('--app-height');
+  // A px length, not merely something starting with a number. Writing `99px`
+  // over a `100%` would change the unit for the instant before the restore.
+  if (!/^-?[\d.]+px$/.test(prior.trim())) return false;
+  const px = Number.parseFloat(prior);
+  if (!Number.isFinite(px)) return false;
+  root.style.setProperty('--app-height', `${px - 1}px`);
+  void root.offsetHeight;
+  root.style.setProperty('--app-height', prior);
+  void root.offsetHeight;
+  // Recompute the layout viewport too. A no-op scroll, since it asks for the
+  // offset the page already holds.
+  if (typeof window.scrollTo === 'function') window.scrollTo(0, window.scrollY);
+  return true;
+}
+
+/** Repair a face the page will not answer with, then say whether it worked.
+ *
+ *  The outcome is the point. `repaired` says a stale layout was the cause and
+ *  the user has their composer back. `repair-failed` rules that out, which is
+ *  the reading ten reports have not produced.
+ *
+ *  Only `repaired` toasts. The user pressed something that did nothing, and the
+ *  message tells them it is worth pressing again. A failed repair changes
+ *  nothing they can see or act on. */
+function attemptRepair(found: UnreachableFace, scheduled: boolean): void {
+  if (repairAttempted.has(found.face)) return;
+  repairAttempted.add(found.face);
+  if (!nudgeLayout()) {
+    recordPress({
+      face: found.face,
+      verdict: 'repair-failed',
+      movedPx: 0,
+      scheduled,
+      nudged: false,
+      faceRect: found.rect,
+    });
+    return;
+  }
+  setTimeout(() => {
+    // A face the row replaced under us answers nothing, and calling that a
+    // failed repair would poison the very split this exists to read. The
+    // episode ended by re-render, so forget it and let the next check ask.
+    if (!found.el.isConnected) {
+      recordPress({
+        face: found.face,
+        verdict: 'repair-failed',
+        movedPx: 0,
+        scheduled,
+        nudged: true,
+        connected: false,
+        faceRect: found.rect,
+      });
+      reportedUnreachable.delete(found.face);
+      repairAttempted.delete(found.face);
+      return;
+    }
+    const ok = faceAnswersAtCentre(found.el);
+    recordPress({
+      face: found.face,
+      verdict: ok ? 'repaired' : 'repair-failed',
+      movedPx: 0,
+      scheduled,
+      nudged: true,
+      connected: true,
+      toasted: ok,
+      faceRect: roundRect(found.el.getBoundingClientRect()),
+    });
+    if (!ok) return;
+    // The episode is over, so let a later one report and repair itself.
+    reportedUnreachable.delete(found.face);
+    repairAttempted.delete(found.face);
+    showToast(
+      `${found.face} had stopped taking taps and has been reset. Try again.`,
+      'warning',
+    );
+  }, REPAIR_SETTLE_MS);
+}
+
+/** Ask the row whether it can be reached, with no user input behind it.
+ *
+ *  This is the one reading that does not wait to be touched. Every other path
+ *  in this module needs a `touchstart`, a lift or a click to arrive first, and
+ *  the tenth episode delivered none of them.
+ *
+ *  A row with no watchable face is skipped in silence rather than reported. An
+ *  empty composer is faceless all the time, so a line there would be noise. */
+function runScheduledCheck(): void {
+  if (!isMobile()) return;
+  if (document.visibilityState && document.visibilityState !== 'visible') return;
+  if (!watchableRow()) return;
+  const faces = watchableFaces();
+  if (faces.length === 0) return;
+  checksSinceInput += 1;
+  const unreachable = firstUnreachableFace(faces);
+  if (!unreachable) return;
+  unreachableSinceInput += 1;
+  recordPress({
+    face: unreachable.face,
+    verdict: 'unreachable',
+    movedPx: 0,
+    scheduled: true,
+    toasted: true,
+    faceRect: unreachable.rect,
+  });
+  showToast(unreachable.report, 'warning');
+  attemptRepair(unreachable, true);
 }
 
 /** This event's entry for one finger, or null when another finger moved. */
@@ -567,6 +862,7 @@ export function installDeadPressProbe(): void {
     if (previous) ruleArmedWithNoLift(previous, true);
     if (!isMobile()) return;
     lastTouchStartAt = Date.now();
+    noteInput(lastTouchStartAt);
     const touch = e.changedTouches?.[0];
     if (!touch) return;
     const row = watchableRow();
@@ -575,8 +871,12 @@ export function installDeadPressProbe(): void {
     const target = e.target as Element | null;
     const onRow = !!target && !!target.closest(ROW_SELECTOR);
     const inRow = inside(rowRect, touch.clientX, touch.clientY);
-    const faces = watchableFaces();
-    if (faces.length === 0) return;
+    // A row with no watchable face used to return here, in silence. That is a
+    // real state, and a tap into it is the user pressing something that cannot
+    // answer. The `missed` branch below records the census instead, so the line
+    // says how many faces the row held and how many were skipped.
+    const every = allFaces();
+    const faces = every.filter((btn) => exclusionOf(btn) === 'watchable');
     const pressed = faces.find((f) => !!target && (target === f || f.contains(target)));
     if (!pressed) {
       // The reachability question comes FIRST, in front of the row-attribution
@@ -601,6 +901,10 @@ export function installDeadPressProbe(): void {
             faceRect: unreachable.rect,
           });
           showToast(unreachable.report, 'warning');
+          // Repair from here too. This path latches the face, so leaving it to
+          // the scheduled check would strand a wedge the USER found first.
+          // Tapping is how they find it.
+          attemptRepair(unreachable, false);
         }
       }
       // Past that, only the composer's own row is this module's business. A
@@ -622,12 +926,24 @@ export function installDeadPressProbe(): void {
         pointerEventsAtPoint,
         viewport: readViewport(),
       }) : null;
+      // WHY no face took it. Read from the UNFILTERED row, so an excluded
+      // action face under the finger is named instead of being dropped with
+      // everything else. That distinction is what the ledger never carried.
+      const held = every.find((f) => inside(f.getBoundingClientRect(), touch.clientX, touch.clientY));
+      const under = underFingerReason({
+        actionFace: held ? exclusionOf(held) : null,
+        otherButton: !!at && at.closest('button') !== null,
+      });
       recordPress({
         face: aimedAt ? nameOf(aimedAt) : 'the row',
         verdict: 'missed',
         movedPx: 0,
         elementAtPoint,
         pointerEventsAtPoint,
+        under,
+        underFace: held ? nameOf(held) : null,
+        faceCount: every.length,
+        watchableCount: faces.length,
         rowRect: roundRect(rowRect),
         faceRect: roundRect(aimedAt?.getBoundingClientRect() ?? null),
       });
@@ -774,6 +1090,13 @@ export function installDeadPressProbe(): void {
   document.addEventListener('click', (e) => {
     const target = e.target as Element | null;
     if (!target) return;
+    // A TOUCHLESS click opens a fresh quiet window, and a paired one must not.
+    // The synthetic click lands about 50ms after its own `touchstart`, and a
+    // press records 600ms later still. So resetting here would hand the press
+    // that ENDED a silence a 50ms window, losing the reading entirely.
+    const touchBehind = lastTouchStartAt !== null
+      && Date.now() - lastTouchStartAt < TOUCH_BEHIND_CLICK_MS;
+    if (!touchBehind) noteInput(Date.now());
     // Newest first. Two taps on one face can settle at once, and the click
     // belongs to the later of them. Insertion order handed it to the older
     // press, which reversed the evidence: the tap that died read `clicked` and
@@ -789,8 +1112,6 @@ export function installDeadPressProbe(): void {
     // stopped. `isMobile` is a viewport width, so a narrow desktop window would
     // otherwise log every composer click as the very split being chased.
     if (!isMobile() || !isTouchDevice()) return;
-    const touchBehind = lastTouchStartAt !== null
-      && Date.now() - lastTouchStartAt < TOUCH_BEHIND_CLICK_MS;
     if (touchBehind) return;
     const face = watchableFaces().find((f) => target === f || f.contains(target));
     if (!face) return;
@@ -805,4 +1126,8 @@ export function installDeadPressProbe(): void {
       faceRect: roundRect(face.getBoundingClientRect()),
     });
   }, { capture: true, passive: true });
+
+  // The one reading that needs no gesture. Everything above waits to be
+  // touched, and a page that cannot be touched never reaches any of it.
+  setInterval(runScheduledCheck, SCHEDULED_CHECK_MS);
 }

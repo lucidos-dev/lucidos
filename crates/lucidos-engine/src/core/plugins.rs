@@ -255,7 +255,11 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
         if name_str == "manifest.toml" {
             continue;
         }
-        if !CONTENT_DIRS.contains(&name_str.as_ref()) || !entry.path().is_dir() {
+        // No-follow: a symlink named as a content dir would pass `is_dir()` and
+        // let the walk below escape the plugin tree. Reject any top-level entry
+        // that is not a real directory named in CONTENT_DIRS.
+        let is_real_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !CONTENT_DIRS.contains(&name_str.as_ref()) || !is_real_dir {
             return Err(ValidationError::UnexpectedTopLevelEntry(name_str.into()));
         }
     }
@@ -315,16 +319,27 @@ fn walk_into(dir: &Path, prefix: &str, out: &mut Vec<PlannedFile>) {
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str.starts_with('.') {
             continue;
         }
+        // `file_type()` reads the directory entry without following a symlink,
+        // unlike `Path::is_dir`/`is_file`. Skip symlinks so a plugin cannot plan
+        // a path outside its own tree. A git-sourced plugin ships whatever
+        // symlinks its author committed, and following one would copy an
+        // arbitrary host file into `data/` on install.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
         let next_prefix = format!("{}/{}", prefix, name_str);
-        if path.is_dir() {
+        if file_type.is_dir() {
             walk_into(&path, &next_prefix, out);
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             out.push(PlannedFile {
                 source: path,
                 data_relative: next_prefix,

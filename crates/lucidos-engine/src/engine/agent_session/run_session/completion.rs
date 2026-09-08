@@ -17,10 +17,55 @@ use crate::engine::git_ops::{
     worktree_current_branch,
 };
 use crate::engine::thread_events::EventChannel;
-use crate::engine::{LucidosEngine, ProcessResult, StopReason};
+use crate::engine::{AgentSession, LucidosEngine, ProcessResult, StopReason};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// This teardown's OWN `agent_sessions` entry, or `None` when the map holds a
+/// replacement session's.
+///
+/// The token is the run's `external_terminal_emitted`, which `run.rs` clones
+/// into the entry it inserts, so `Arc::ptr_eq` is exact. It is the identity
+/// question `SessionEntryGuard` answers with `same_channel`.
+///
+/// A replacement can be registered on this thread while this teardown runs, and
+/// this teardown is what creates one. Touching it strands a live subprocess.
+/// Removing its entry hides that subprocess from both watchdogs, and Stop then
+/// force-removes the worktree it is writing into. Reading `pending_stop` off it
+/// runs this teardown's cleanup for somebody else's Discard.
+///
+/// Liveness is NOT this question. `!is_live()` also reads true for a
+/// replacement that has exited, or that finalize's own opening stamp marked.
+fn own_session_entry<'a>(
+    sessions: &'a HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    token: &Arc<std::sync::atomic::AtomicBool>,
+) -> Option<&'a AgentSession> {
+    sessions
+        .get(&thread_id)
+        .filter(|s| Arc::ptr_eq(&s.external_terminal_emitted, token))
+}
+
+/// Drop this teardown's own entry and leave a replacement alone. See
+/// [`own_session_entry`] for why the two must be told apart.
+fn reap_own_session_entry(
+    sessions: &mut HashMap<Uuid, AgentSession>,
+    thread_id: Uuid,
+    token: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    if own_session_entry(sessions, thread_id, token).is_some() {
+        sessions.remove(&thread_id);
+        return;
+    }
+    if sessions.contains_key(&thread_id) {
+        log!(
+            "[AgentSession] Teardown for thread {} left a replacement session's entry alone",
+            thread_id
+        );
+    }
+}
 
 /// Remove the worktree of a session the user chose to **Discard**, and only
 /// then. Discard is the one session end that asks for the work to go away: the
@@ -218,7 +263,13 @@ impl LucidosEngine {
         // a dead channel (closes the process_exited race window in chat.rs fast-path).
         {
             let mut guard = self.agent_sessions.lock().await;
-            if let Some(s) = guard.get_mut(&thread_id) {
+            // Ours only. A recovery-mode spawn can have replaced this entry
+            // before finalize started. Stamping that one dead is what would let
+            // `own_session_entry` mistake it for ours and reap it.
+            if let Some(s) = guard
+                .get_mut(&thread_id)
+                .filter(|s| Arc::ptr_eq(&s.external_terminal_emitted, &external_terminal_emitted))
+            {
                 s.process_exited = true;
                 s.idle_notify.notify_waiters();
             }
@@ -337,10 +388,18 @@ impl LucidosEngine {
         // so recover_orphaned_worktrees can resume the session after restart.
         // Read discard early so we can skip unnecessary work (auto-commit,
         // hardening) when the user chose Discard.
-        let should_discard = matches!(
-            self.pending_stop_reason(thread_id).await,
-            Some(StopReason::Discard),
-        );
+        // Ours only, because this gates `remove_discarded_worktree` and a
+        // `git branch -D`. `maybe_auto_resume_after_api_error` above can have
+        // spawned a replacement onto this thread, and a Discard meant for that
+        // one would delete the worktree it is running in.
+        let should_discard = {
+            let guard = self.agent_sessions.lock().await;
+            matches!(
+                own_session_entry(&guard, thread_id, &external_terminal_emitted)
+                    .and_then(|s| s.pending_stop),
+                Some(StopReason::Discard),
+            )
+        };
 
         // Re-asked, not reused: a restart that began during the awaits above
         // must be seen HERE, because this is the branch that decides whether the
@@ -369,7 +428,7 @@ impl LucidosEngine {
                 }
             }
             let mut guard = self.agent_sessions.lock().await;
-            guard.remove(&thread_id);
+            reap_own_session_entry(&mut guard, thread_id, &external_terminal_emitted);
             log!(
                 "[Shutdown] Skipping cleanup for thread {}: session will resume after restart",
                 thread_id
@@ -914,10 +973,11 @@ impl LucidosEngine {
         let auto_apply = {
             let mut guard = self.agent_sessions.lock().await;
             let val = matches!(
-                guard.get(&thread_id).and_then(|s| s.pending_stop),
+                own_session_entry(&guard, thread_id, &external_terminal_emitted)
+                    .and_then(|s| s.pending_stop),
                 Some(StopReason::Apply),
             );
-            guard.remove(&thread_id);
+            reap_own_session_entry(&mut guard, thread_id, &external_terminal_emitted);
             val
         };
 
@@ -938,5 +998,93 @@ impl LucidosEngine {
             auto_apply,
             orphaned_injections: cc_orphans,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::AgentUserInput;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// One session, its identity token, and the receiver that keeps it live.
+    /// Bind the receiver for the test's lifetime: dropping it makes the entry a
+    /// phantom (see `AgentSession::is_live`).
+    fn session_with(
+        process_exited: bool,
+    ) -> (
+        AgentSession,
+        Arc<std::sync::atomic::AtomicBool>,
+        UnboundedReceiver<AgentUserInput>,
+    ) {
+        let (mut session, rx) = AgentSession::for_test();
+        session.process_exited = process_exited;
+        let token = session.external_terminal_emitted.clone();
+        (session, token, rx)
+    }
+
+    /// The ordinary path: the teardown gives its own entry back.
+    #[test]
+    fn the_teardown_reaps_its_own_entry() {
+        let thread_id = Uuid::new_v4();
+        let (session, token, _rx) = session_with(true);
+        let mut sessions = HashMap::from([(thread_id, session)]);
+
+        assert!(own_session_entry(&sessions, thread_id, &token).is_some());
+        reap_own_session_entry(&mut sessions, thread_id, &token);
+        assert!(
+            sessions.is_empty(),
+            "the teardown must still give its own entry back"
+        );
+    }
+
+    /// The regression, in the shape liveness could not see. A replacement
+    /// registers on this thread and is then marked exited, by its own teardown
+    /// or by finalize's opening stamp. It must still survive: removing its entry
+    /// leaves a live subprocess no watchdog can see and no Stop can reach.
+    #[test]
+    fn a_replacement_session_survives_even_when_it_reads_dead() {
+        let thread_id = Uuid::new_v4();
+        let (_outgoing, our_token, _our_rx) = session_with(true);
+        let (replacement, _their_token, _their_rx) = session_with(true);
+        let mut sessions = HashMap::from([(thread_id, replacement)]);
+
+        assert!(
+            own_session_entry(&sessions, thread_id, &our_token).is_none(),
+            "identity, not liveness: an exited replacement is still not ours"
+        );
+        reap_own_session_entry(&mut sessions, thread_id, &our_token);
+        assert!(
+            sessions.contains_key(&thread_id),
+            "the replacement's entry must survive the outgoing teardown"
+        );
+    }
+
+    /// A replacement's `pending_stop` must not reach this teardown. It gates
+    /// `remove_discarded_worktree`, so reading somebody else's Discard deletes a
+    /// worktree the replacement is running in.
+    #[test]
+    fn a_replacements_pending_stop_is_not_read_by_this_teardown() {
+        let thread_id = Uuid::new_v4();
+        let (_outgoing, our_token, _our_rx) = session_with(true);
+        // Exited, so liveness would have called it ours. Only identity does not.
+        let (mut replacement, _their_token, _their_rx) = session_with(true);
+        replacement.pending_stop = Some(StopReason::Discard);
+        let sessions = HashMap::from([(thread_id, replacement)]);
+
+        assert!(
+            own_session_entry(&sessions, thread_id, &our_token)
+                .and_then(|s| s.pending_stop)
+                .is_none(),
+            "a Discard aimed at the replacement must not reach this teardown"
+        );
+    }
+
+    #[test]
+    fn reaping_an_absent_entry_does_nothing() {
+        let (_session, token, _rx) = session_with(true);
+        let mut sessions: HashMap<Uuid, AgentSession> = HashMap::new();
+        reap_own_session_entry(&mut sessions, Uuid::new_v4(), &token);
+        assert!(sessions.is_empty());
     }
 }

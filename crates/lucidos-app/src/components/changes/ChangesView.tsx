@@ -343,10 +343,17 @@ export function ChangesView() {
                   the prompt-row flag icon already wear, so all three surfaces
                   read one state and all three can turn it off.
 
-                  The armed face is never disabled, even mid-batch: cancelling
-                  an instruction is not the batch, and a faded control takes its
-                  explaining tooltip with it (ADR 0168). A second tap while the
-                  request is in flight is dropped by the action instead. */}
+                  TWO faces, never a third. This control ARMS, so it has no
+                  progress of its own to report: a press lands on the armed
+                  face, which the `StandingApplyArmed` events bring a moment
+                  later. Apply All's "Applying..." belongs to a batch this
+                  press never starts, and wearing it flashes a narrower, faded
+                  pill on the way.
+
+                  Neither face is disabled, even mid-batch. Cancelling an
+                  instruction is not the batch, and a faded control takes its
+                  explaining tooltip with it (ADR 0168). A second press while
+                  the request is in flight is dropped by the action. */}
               {(bulk.sweepOnly || bulk.armed) && (
                 bulk.armed ? (
                   <button
@@ -361,16 +368,10 @@ export function ChangesView() {
                   <button
                     class="action-btn action-btn-confirm"
                     aria-pressed={false}
-                    disabled={applyAllInProgress.value}
-                    // An apply in flight is progress, not a blocked action, so
-                    // it takes the one disabled face here and carries NO
-                    // tooltip. `.action-btn:disabled` sets `pointer-events:
-                    // none` and would put this one out of reach, which is what
-                    // the disabled ban is about.
-                    data-tooltip={applyAllInProgress.value ? undefined : SWEEP_ONLY_TIP}
+                    data-tooltip={SWEEP_ONLY_TIP}
                     onClick={() => void applyAllChanges(true)}
                   >
-                    {applyAllInProgress.value ? 'Applying...' : 'Apply as they settle'}
+                    Apply as they settle
                   </button>
                 )
               )}

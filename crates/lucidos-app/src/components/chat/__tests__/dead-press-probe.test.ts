@@ -12,6 +12,9 @@ import {
   noLiftReport,
   faceHitTestReport,
   pressIsWatchable,
+  faceExclusion,
+  underFingerReason,
+  morphStateOf,
   faceName,
   type FaceHitTestFacts,
   type LandingFacts,
@@ -297,6 +300,14 @@ describe('pressIsWatchable: every actionable face in the row', () => {
     expect(pressIsWatchable({ ...LIVE, placeholder: true })).toBe(false);
   });
 
+  it('names the placeholder ahead of disabled, since that mode is both', () => {
+    // Placeholder mode renders `disabled` as well, so the two overlap. The
+    // specific answer is the one a report can act on.
+    expect(faceExclusion({ disabled: true, placeholder: true })).toBe('placeholder');
+    expect(faceExclusion({ disabled: true, placeholder: false })).toBe('disabled');
+    expect(faceExclusion({ disabled: false, placeholder: false })).toBe('watchable');
+  });
+
   it('ignores a disabled face, which is a settling Stop or a busy Apply', () => {
     expect(pressIsWatchable({ ...LIVE, disabled: true })).toBe(false);
   });
@@ -305,6 +316,66 @@ describe('pressIsWatchable: every actionable face in the row', () => {
 // The second output channel. A toast reports to whoever is looking at the
 // screen and keeps it, which is how five episodes produced nothing to work
 // from. The breadcrumb lands in engine.log and can be read back later.
+describe('underFingerReason: why no watchable face took the press', () => {
+  // Every `missed` line in the tenth report's ledger carried no face at all, so
+  // three different situations wrote the same line. Only one of them is a bug.
+
+  it('names an excluded action face, which is the one that matters', () => {
+    expect(underFingerReason({ actionFace: 'disabled', otherButton: false }))
+      .toBe('disabled-face');
+    expect(underFingerReason({ actionFace: 'placeholder', otherButton: false }))
+      .toBe('placeholder-face');
+  });
+
+  it('tells a control button apart from an action face', () => {
+    // The row also holds `.icon-btn` controls, which this module never watched
+    // and never should. A tap on one is ordinary use.
+    expect(underFingerReason({ actionFace: null, otherButton: true }))
+      .toBe('other-button');
+  });
+
+  it('says nothing sat there at all, for a tap on empty row space', () => {
+    expect(underFingerReason({ actionFace: null, otherButton: false }))
+      .toBe('nothing');
+  });
+
+  it('prefers the action face when a control button is under it too', () => {
+    expect(underFingerReason({ actionFace: 'disabled', otherButton: true }))
+      .toBe('disabled-face');
+  });
+
+  it('calls a watchable face nothing, since it would have claimed the press', () => {
+    expect(underFingerReason({ actionFace: 'watchable', otherButton: false }))
+      .toBe('nothing');
+  });
+});
+
+describe('morphStateOf: what "the send button" was showing', () => {
+  // "The button is there, it just doesn't work" is a claim about this, and no
+  // line has ever carried it.
+  const base = { present: true, placeholder: false, disabled: false, label: 'Send message' };
+
+  it('reads a live Send', () => {
+    expect(morphStateOf(base)).toBe('send');
+  });
+
+  it('reads a live Stop by its label, since the node is the same one', () => {
+    expect(morphStateOf({ ...base, label: 'Cancel' })).toBe('cancel');
+  });
+
+  it('reads the settling Stop as disabled rather than as a Cancel', () => {
+    expect(morphStateOf({ ...base, disabled: true, label: 'Cancel' })).toBe('disabled');
+  });
+
+  it('reads the invisible placeholder ahead of the disabled it also carries', () => {
+    expect(morphStateOf({ ...base, placeholder: true, disabled: true })).toBe('placeholder');
+  });
+
+  it('reads answer mode, where the morph is not rendered at all', () => {
+    expect(morphStateOf({ ...base, present: false })).toBe('absent');
+  });
+});
+
 describe('the breadcrumb channel', () => {
   const here: string = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(resolve(here, '../deadPressProbe.ts'), 'utf-8');
@@ -398,7 +469,17 @@ describe('the probe consumes no gesture', () => {
     // The miss this round: the probe queried `.send-cancel-morph`, and the row
     // was in answer mode, where that node is not rendered at all.
     expect(code).toContain(`'.prompt-actions-row'`);
-    expect(code).not.toContain('send-cancel-morph');
+    expect(code).toContain(`'.action-btn'`);
+    expect(code).toMatch(/querySelectorAll<HTMLButtonElement>\(\s*`\$\{ROW_SELECTOR\} \$\{FACE_SELECTOR\}`/);
+  });
+
+  it('names the morph only to read its mode, never to pick what it watches', () => {
+    // "The button is there, it just doesn't work" is a claim about the morph's
+    // own state, and no line used to carry it. Reading that one node is
+    // legitimate; building the watched SET from it is the miss above.
+    const morphLines = code.split('\n').filter((l: string) => l.includes('send-cancel-morph'));
+    expect(morphLines).toHaveLength(1);
+    expect(morphLines[0]).toContain('querySelector<HTMLButtonElement>');
   });
 
   it('reads isConnected at the lift, which is the decisive question', () => {

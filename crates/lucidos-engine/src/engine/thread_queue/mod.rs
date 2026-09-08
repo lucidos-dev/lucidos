@@ -1131,6 +1131,15 @@ impl ThreadQueue {
     /// The returned guard's drop is the BACKSTOP: it releases the gate's
     /// reservation if the task dies before reconcile cleared it (normally a
     /// no-op, since the terminal status event already reconciled the slot away).
+    ///
+    /// **The guard is built before the first `.await`, not at the end.** The
+    /// reservation lands in `user_queued` / `user_active` under the lock, and
+    /// everything after that is cancellable. An aborted caller drops this future
+    /// at `emit_changed` or at the wake. A reservation with no guard behind it
+    /// has nobody left to release it: the drainer admits the dead waiter, its
+    /// wake send fails into `let _ =`, and the slot is held for the life of the
+    /// process. Enough of those and every chat POST blocks on the pool. Owning
+    /// the reservation from the moment it exists is what releases it on cancel.
     pub async fn acquire_user_slot(
         self: &Arc<Self>,
         thread_id: Option<Uuid>,
@@ -1161,6 +1170,13 @@ impl ThreadQueue {
                 Some(rx)
             }
         };
+        // Own the reservation before the first await, so cancelling anything
+        // below releases it instead of stranding it. See the doc comment.
+        let guard = UserSlotGuard {
+            queue: self.clone(),
+            entry_id,
+            thread_id,
+        };
         // Panel: a new running (admitted) or waiting (queued) user entry.
         self.emit_changed().await;
         if let Some(rx) = wait {
@@ -1168,11 +1184,7 @@ impl ThreadQueue {
             // teardown) resolves Err — proceed; the slot dies with the process.
             let _ = rx.await;
         }
-        UserSlotGuard {
-            queue: self.clone(),
-            entry_id,
-            thread_id,
-        }
+        guard
     }
 
     /// Backstop release of the gate's reserved slot, keyed by the guard's

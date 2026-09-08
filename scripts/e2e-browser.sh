@@ -22,10 +22,16 @@
 #   ./scripts/e2e-browser.sh --no-webkit               # The cheap projects only
 #   ./scripts/e2e-browser.sh --ios                     # iOS Simulator
 #
-# mobile-webkit costs about 15 GB of macOS VM compressor and the other five
-# projects cost about 0.6 GB between them, so the two are run separately:
-# `--no-webkit` here (or on scripts/e2e.sh) for the cheap set, then `--webkit`
-# on a cold host for the expensive one. See docs/e2e-test-decisions.md.
+# Environment:
+#   LUCIDOS_E2E_WEBKIT_CHUNK    specs per fresh-browser chunk (default 3)
+#   LUCIDOS_E2E_WEBKIT_CHUNKS   run only nav chunks <first>-<last> (or <first>-)
+#
+# mobile-webkit grows the macOS VM compressor by roughly 15 GB. That is squeezed
+# idle memory host-wide rather than anything the run holds, so it is a cost to
+# the host's morning rather than a danger; see scripts/lib/host_memory_guard.sh.
+# The other five projects cost about 0.6 GB between them, so the two sets are
+# still run separately: `--no-webkit` here (or on scripts/e2e.sh) for the cheap
+# set, then `--webkit` for the expensive one. See docs/e2e-test-decisions.md.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -118,6 +124,15 @@ start_webkit_reaper
 # exit code (see report_host_load_saturation).
 start_host_load_sampler
 
+# Mid-run host-MEMORY sampler, which is what makes the boundary check peak-aware.
+# A boundary reading bounds the host at the boundary and says nothing about the
+# chunk that just ran, whose observed compressor deltas reach 1.16 GB. This loop
+# ticks throughout, and check_host_memory_at_boundary folds the worst sample
+# since the previous boundary over its own instantaneous reading. Purely
+# additive: with no sampler the boundary behaves exactly as it did before.
+# Reaped by the same stop_e2e_background_guards as the two above.
+start_host_memory_sampler
+
 if [ -n "${LUCIDOS_E2E_UMBRELLA:-}" ]; then
     trap stop_e2e_background_guards EXIT
 fi
@@ -134,6 +149,7 @@ finish() {
     stop_host_load_sampler
     report_host_load_saturation "$rc"
     report_memory_stop
+    report_webkit_chunk_range
     report_webkit_excluded "$SKIP_WEBKIT"
     rm -f "$PW_TALLY_LOG"
     exit "$rc"
@@ -220,6 +236,59 @@ set_output_dir() {
 # whichever phase or chunk it came. Stated once here because the run aggregates
 # exit codes at three levels. A stop that overwrote a failure at any of them
 # would hide a red run behind a host-memory verdict.
+# Resolve LUCIDOS_E2E_WEBKIT_CHUNKS into "<first> <last>", clamped to 1..NCHUNKS.
+# Accepts "A-B" and the open-ended "A-". Anything else, an empty value included,
+# yields the full range, because a knob nobody can parse must never be read as a
+# request to run less. A garbage value SAYS SO on stderr rather than quietly
+# widening back: silently running everything is the safe direction, and silently
+# doing it without a word is how a typo goes unnoticed for a month.
+#
+# Pure: no host reads, no globals. $1 is the raw value, $2 is the chunk count.
+webkit_chunk_range() {
+    local raw="$1" nchunks="$2" first last
+    if [ -z "$raw" ]; then
+        echo "1 $nchunks"
+        return 0
+    fi
+    case "$raw" in
+        *-*) first="${raw%%-*}"; last="${raw#*-}" ;;
+        *) first=""; last="" ;;
+    esac
+    [ -n "$last" ] || last="$nchunks"
+    case "$first" in '' | *[!0-9]*) first="" ;; esac
+    case "$last" in *[!0-9]*) last="" ;; esac
+    # A first past the END is unusable, not clamped. Clamping "9-" on a 4-chunk
+    # run to "4 4" would silently run one chunk for a range that names none, and
+    # a silent reduction is the failure this knob must not have. Widening back
+    # can only cost time.
+    if [ -z "$first" ] || [ -z "$last" ] ||
+        [ "$first" -lt 1 ] || [ "$first" -gt "$last" ] || [ "$first" -gt "$nchunks" ]; then
+        echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNKS='$raw' is not a chunk range of $nchunks, running every chunk" >&2
+        echo "1 $nchunks"
+        return 0
+    fi
+    # A last past the end IS clamped: the first is real, so the range names work
+    # that exists and simply asks for more tail than there is.
+    [ "$last" -le "$nchunks" ] || last="$nchunks"
+    # Normalise before echoing, because the caller decides "did a range narrow
+    # anything?" by comparing these as STRINGS. Unnormalised, `01-4` on a 4-chunk
+    # phase runs every chunk and still reports itself as a partial range, which
+    # inverts the one thing this knob must never get wrong. `10#` forces decimal:
+    # bash arithmetic reads a bare `08` as octal and errors.
+    echo "$((10#$first)) $((10#$last))"
+}
+
+# Set by run_specs_chunked when a range actually narrowed the nav phase, and read
+# once by finish(). A ranged run must never read as a complete project.
+WEBKIT_CHUNK_RANGE_APPLIED=""
+
+report_webkit_chunk_range() {
+    [ -n "$WEBKIT_CHUNK_RANGE_APPLIED" ] || return 0
+    echo ""
+    echo "[e2e] mobile-webkit nav ran a CHUNK RANGE ONLY: $WEBKIT_CHUNK_RANGE_APPLIED."
+    echo "[e2e] Coverage is incomplete. The chunks outside that range have no verdict."
+}
+
 merge_rc() {
     local current="$1" incoming="$2"
     if [ "$incoming" -eq 0 ]; then
@@ -252,9 +321,10 @@ merge_rc() {
 # partial chunk range is cheap to carry over and already has discharge tooling.
 #
 # Expect that shortfall on a warm host, by design rather than by accident. Nav's
-# 12.64 GB on top of a CC phase and a 2 to 3 GB starting compressor lands at or
-# above the 16 GB backstop in host_memory_guard.sh. A cold start clears it. A warm
-# one loses the tail of nav, which is exactly the half chosen to carry the loss.
+# 12.64 GB of compressor growth eats into the host's free headroom, and a warm
+# host starts with less of it, so the free-headroom floor in host_memory_guard.sh
+# stops the run sooner. A cold start clears it. A warm one loses the tail of nav,
+# which is exactly the half chosen to carry the loss.
 #
 # WHAT THE SPLIT BUYS mostly survives the reversal, and the part that does not is
 # priced. Keeping the two sets in separate invocations is what shrinks the
@@ -295,17 +365,58 @@ merge_rc() {
 # ceiling. The boundary after the last chunk is the caller's: only it knows
 # whether another phase or another project follows, and a stop with nothing
 # left to stop would report a finished run as a cut-short one.
+#
+# LUCIDOS_E2E_WEBKIT_CHUNKS narrows the loop to a chunk range, and applies to the
+# NAV phase only. Two uses, and both are why it exists. It is how a partial run
+# is validated without an unfiltered pass on a working machine, and it is how a
+# night that lost the tail of nav discharges exactly that tail the next day. The
+# CC phase is four chunks and always runs whole, so a range never costs the ten
+# specs the phase order exists to protect.
+#
+# A ranged run must never read as a complete project: every skipped chunk says so
+# on its own line, and report_webkit_chunk_range restates the range at the end.
 run_specs_chunked() {
     local project="$1"; shift
     local label="$1"; shift
     local specs=("$@")
     local total="${#specs[@]}"
+    # A chunk size that is not a positive integer HANGS this loop rather than
+    # failing: bash arithmetic reads `2-3` as -1, `nchunks` goes negative, and
+    # `start` then counts down forever. One character separates this knob from
+    # LUCIDOS_E2E_WEBKIT_CHUNKS, so that typo is a live way in.
     local size="${LUCIDOS_E2E_WEBKIT_CHUNK:-3}"
+    case "$size" in
+        '' | *[!0-9]* | 0)
+            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_CHUNK='$size' is not a positive integer, using 3" >&2
+            size=3
+            ;;
+    esac
     local rc=0 start=0 chunk_no=0 nchunks
     nchunks=$(( (total + size - 1) / size ))
+
+    # The range, resolved once. Only the nav phase honours it; the CC phase
+    # always gets 1..nchunks.
+    local first=1 last="$nchunks" range=""
+    if [ "$label" = "nav" ]; then
+        range="$(webkit_chunk_range "${LUCIDOS_E2E_WEBKIT_CHUNKS:-}" "$nchunks")"
+        first="${range%% *}"
+        last="${range##* }"
+        if [ "$first" != "1" ] || [ "$last" != "$nchunks" ]; then
+            WEBKIT_CHUNK_RANGE_APPLIED="$first-$last of $nchunks"
+            echo "── mobile-webkit $label: LIMITED to chunks $first-$last of $nchunks ──"
+        fi
+    fi
+
     while [ "$start" -lt "$total" ]; do
         chunk_no=$(( chunk_no + 1 ))
         local chunk=("${specs[@]:start:size}")
+        # Outside the range: announced, never silent. A skipped chunk that said
+        # nothing would leave a green-looking log for a project that did not run.
+        if [ "$chunk_no" -lt "$first" ] || [ "$chunk_no" -gt "$last" ]; then
+            echo "── mobile-webkit $label chunk $chunk_no/$nchunks: SKIPPED, outside chunk range $first-$last ──"
+            start=$(( start + size ))
+            continue
+        fi
         echo "── mobile-webkit $label chunk $chunk_no/$nchunks: ${#chunk[@]} specs (fresh browser) ──"
         # Anchor each filename, because Playwright reads a positional argument as
         # an unanchored regex over the file path. A bare basename therefore drags
@@ -325,8 +436,17 @@ run_specs_chunked() {
         # another project follows it. A stop needs something left to stop: with
         # mobile-webkit running last, an unconditional check here would report a
         # run that finished everything as a run that was cut short.
-        [ "$start" -lt "$total" ] || break
-        if ! check_host_memory_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
+        #
+        # `$last` as well as `$total`, so a ranged run gets no boundary after ITS
+        # last chunk either. The chunks past the range are not work this run was
+        # going to do, so stopping "before" them would report a run that did
+        # everything asked of it as one cut short.
+        #
+        # This SKIPS the check rather than leaving the loop, so the chunks after
+        # the range still reach the announcement above. Breaking here left them
+        # silent, which is the one thing a range must never be.
+        if [ "$start" -lt "$total" ] && [ "$chunk_no" -lt "$last" ] &&
+            ! check_host_memory_at_boundary "$project $label chunk $chunk_no/$nchunks"; then
             MEMORY_STOPPED="$project"
             # MEMORY_STOPPED carries the stop on its own, so merge_rc can keep a
             # failing chunk's code and neither signal hides the other.

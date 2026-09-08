@@ -34,16 +34,58 @@ pub const WINDOW_SESSION_FILE: &str = ".window-session.json";
 /// `open` is what to reopen. `geometry` is how big to make it, and it
 /// deliberately OUTLIVES a window's closing. Reopening a workspace later still
 /// lands at the size the user left it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSession {
     /// Workspace slugs that had a window, in the order to restore them. The
     /// first gets `main`.
     #[serde(default)]
     pub open: Vec<String>,
-    /// The last known frame of each workspace's window, in PHYSICAL pixels, the
-    /// units `window_restore` reasons in.
+    /// The last known frame of each workspace's window, in LOGICAL points, the
+    /// units `window_restore` reasons in. See [`FrameUnits`].
     #[serde(default)]
     pub geometry: BTreeMap<String, Rect>,
+    /// The space `geometry` is written in, so a record this build did not write
+    /// cannot be read as if it had.
+    #[serde(default = "FrameUnits::unmarked")]
+    pub units: FrameUnits,
+}
+
+impl Default for WindowSession {
+    /// Nothing to restore, and nothing that could be misread. An empty record
+    /// is in points because every record this build writes is. An unmarked
+    /// FILE is a different fact, and [`FrameUnits::unmarked`] carries that one.
+    fn default() -> Self {
+        Self {
+            open: Vec::new(),
+            geometry: BTreeMap::new(),
+            units: FrameUnits::LogicalPoints,
+        }
+    }
+}
+
+/// The coordinate space a record's frames are in.
+///
+/// A marker rather than a version number, because the only thing that ever
+/// changed is what the numbers MEAN. A record written before ADR 0173 holds
+/// physical pixels, which are not one space across monitors at different scale
+/// factors. Such a rect cannot be converted after the fact: that needs the scale
+/// factor of the display it was captured on, which the record never held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FrameUnits {
+    /// The pre-fix space, whose frames [`in_points`] drops.
+    PhysicalPixels,
+    /// Logical points in the macOS global desktop space, what every frame this
+    /// build writes means.
+    LogicalPoints,
+}
+
+impl FrameUnits {
+    /// What a record naming no space is written in. It predates ADR 0173, so
+    /// its frames are physical pixels and [`in_points`] drops them.
+    fn unmarked() -> Self {
+        Self::PhysicalPixels
+    }
 }
 
 /// One live window, as the capture sees it.
@@ -102,6 +144,10 @@ pub fn capture(previous: &WindowSession, windows: &[WindowSnapshot]) -> WindowSe
     let mut session = WindowSession {
         open: Vec::new(),
         geometry: previous.geometry.clone(),
+        // Every frame here came off a live window through
+        // `Rect::from_physical`, so the record can say so. `read` is what makes
+        // `previous` safe to merge: it drops frames in any other space.
+        units: FrameUnits::LogicalPoints,
     };
     for snapshot in ordered {
         let Some(workspace) = crate::window_target::window_workspace(&snapshot.url) else {
@@ -136,11 +182,29 @@ pub fn read(app_data: &Path) -> WindowSession {
         }
     };
     match serde_json::from_str::<WindowSession>(&raw) {
-        Ok(session) => session,
+        Ok(session) => in_points(session),
         Err(e) => {
             eprintln!("[Tauri] ignoring unreadable {}: {e}", path.display());
             WindowSession::default()
         }
+    }
+}
+
+/// Drop frames this build cannot interpret, and keep everything it can.
+///
+/// A record from before ADR 0173 holds physical pixels. Restoring one on a
+/// mixed-DPI desk puts the window at the wrong size in the wrong place, which is
+/// the whole bug. `open` is untouched, so the launch after the upgrade still
+/// reopens every workspace that had a window. Each lands at the declared default
+/// until it is moved once, and the next capture records it in points.
+fn in_points(session: WindowSession) -> WindowSession {
+    if session.units == FrameUnits::LogicalPoints {
+        return session;
+    }
+    WindowSession {
+        open: session.open,
+        geometry: BTreeMap::new(),
+        units: FrameUnits::LogicalPoints,
     }
 }
 
@@ -464,8 +528,42 @@ mod tests {
                 rect(1, 2, 1200, 800),
             )],
         );
+        // Stamped, or the read below would drop the frame it just wrote and
+        // every launch would open at the default size.
+        assert_eq!(session.units, FrameUnits::LogicalPoints);
         write(tmp.path(), &session);
         assert_eq!(read(tmp.path()), session);
+    }
+
+    // A record from before ADR 0173 holds physical pixels, which cannot be
+    // converted: that needs the scale factor of the display each frame was
+    // captured on, and the record never held it. The frames go, `open` stays,
+    // so the launch after the upgrade still reopens every workspace.
+    #[test]
+    fn a_legacy_record_keeps_its_open_set_and_drops_its_frames() {
+        let tmp = TempDir::new("legacy");
+        tmp.write_raw(
+            r#"{"open":["myws","dev"],
+                "geometry":{"myws":{"x":4050,"y":3250,"width":3456,"height":2168}}}"#,
+        );
+        let session = read(tmp.path());
+        assert_eq!(session.open, vec!["myws", "dev"]);
+        assert!(session.geometry.is_empty());
+        // In points now, vacuously, so a capture can merge it without checking.
+        assert_eq!(session.units, FrameUnits::LogicalPoints);
+    }
+
+    #[test]
+    fn a_stamped_record_keeps_its_frames() {
+        let tmp = TempDir::new("stamped");
+        tmp.write_raw(
+            r#"{"open":["myws"],"units":"logical-points",
+                "geometry":{"myws":{"x":100,"y":200,"width":800,"height":600}}}"#,
+        );
+        assert_eq!(
+            read(tmp.path()).geometry.get("myws"),
+            Some(&rect(100, 200, 800, 600))
+        );
     }
 
     // This runs on the client's boot path, so nothing here may be fatal.
@@ -537,6 +635,7 @@ mod tests {
         let session = WindowSession {
             open: vec!["myws".into()],
             geometry: BTreeMap::from([("myws".to_string(), rect(1, 2, 1200, 800))]),
+            units: FrameUnits::LogicalPoints,
         };
         for url in [
             "http://localhost:3210/dev/",
@@ -560,6 +659,7 @@ mod tests {
         let session = WindowSession {
             open: vec!["myws".into(), "dev".into()],
             geometry: BTreeMap::from([("myws".to_string(), rect(1, 2, 1200, 800))]),
+            units: FrameUnits::LogicalPoints,
         };
         assert_eq!(
             restore_plan(&session, true),
@@ -586,6 +686,7 @@ mod tests {
                 "ok".into(),
             ],
             geometry: BTreeMap::new(),
+            units: FrameUnits::LogicalPoints,
         };
         assert_eq!(restore_plan(&session, true), vec![("ok".to_string(), None)]);
     }
@@ -597,6 +698,7 @@ mod tests {
         let session = WindowSession {
             open: vec!["myws".into()],
             geometry: BTreeMap::new(),
+            units: FrameUnits::LogicalPoints,
         };
         assert!(restore_plan(&session, false).is_empty());
     }

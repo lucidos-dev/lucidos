@@ -33,7 +33,7 @@ pub struct Model {
     pub source: String,
     pub enabled: bool,
     /// Declared context window in tokens. `None` = not declared, so
-    /// `engine::context::context_window_from_prefix` decides from the id shape.
+    /// `llm::model_registry::context_window_from_prefix` decides from the id shape.
     /// Only worth setting for ids the prefix map gets wrong — every OpenRouter /
     /// xAI / Gemini / local model, which otherwise takes the 200k fallback.
     pub context_window: Option<i32>,
@@ -533,6 +533,7 @@ mod tests {
             "claude-fable-5",
             "claude-opus-5@default",
             "claude-sonnet-5",
+            "gpt-6-astra",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -780,6 +781,7 @@ mod tests {
             ("gpt-5.6-sol", 1_050_000),
             ("gpt-5.6-terra", 1_050_000),
             ("gpt-5.6-luna", 1_050_000),
+            ("gpt-6-astra", 1_050_000),
         ];
 
         for (id, window) in expected {
@@ -825,6 +827,78 @@ mod tests {
                 "{id} has no verified window — it must fall back to the prefix map"
             );
         }
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The GPT-6 Astra seed, run verbatim from the migration file.
+    ///
+    /// A workspace could already hold this id as a hand-added `user` row, so
+    /// the seed is `ON CONFLICT DO UPDATE` rather than the usual DO NOTHING.
+    /// DO NOTHING would leave that row deletable and on whatever identity it
+    /// was typed with, outside every disable-only builtin protection.
+    ///
+    /// `include_str!` rather than a copy of the statement: a test asserting a
+    /// promotion the shipped migration no longer performs proves nothing.
+    #[tokio::test]
+    async fn the_astra_seed_promotes_a_user_row_without_switching_it_on() {
+        const SEED: &str =
+            include_str!("../../migrations/20260905112728_seed_gpt_6_astra_openai_model.sql");
+        let (pool, db_name) = setup_test_db().await;
+
+        /// Put the row back in the shape a hand-added `manage_models` row has.
+        async fn as_hand_added_user_row(pool: &PgPool, enabled: bool) {
+            sqlx::query(
+                "UPDATE models SET source = 'user', label = 'astra', \
+                 provider = 'openrouter', sort_order = 99, context_window = NULL, \
+                 enabled = $1 WHERE id = 'gpt-6-astra'",
+            )
+            .bind(enabled)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        // An enabled user row is promoted, identity and all.
+        as_hand_added_user_row(&pool, true).await;
+        sqlx::query(SEED).execute(&pool).await.unwrap();
+        let m = ModelStore::get(&pool, "gpt-6-astra")
+            .await
+            .unwrap()
+            .expect("the seed must leave a row");
+        assert!(m.is_builtin(), "a user row must be promoted to builtin");
+        assert_eq!(m.label, "GPT-6 Astra");
+        assert_eq!(m.provider, "openai");
+        assert_eq!(m.sort_order, 36);
+        assert_eq!(m.context_window, Some(1_050_000));
+        assert!(m.enabled);
+
+        // A row the user switched off is promoted too, and STAYS off. Whether a
+        // model is offered is their decision, not the migration's.
+        as_hand_added_user_row(&pool, false).await;
+        sqlx::query(SEED).execute(&pool).await.unwrap();
+        let m = ModelStore::get(&pool, "gpt-6-astra")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(m.is_builtin(), "a disabled user row is still promoted");
+        assert_eq!(m.provider, "openai");
+        assert!(!m.enabled, "the promotion must not switch the row back on");
+
+        // With no row at all the seed inserts one, enabled by the column default.
+        sqlx::query("DELETE FROM models WHERE id = 'gpt-6-astra'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(SEED).execute(&pool).await.unwrap();
+        let m = ModelStore::get(&pool, "gpt-6-astra")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(m.is_builtin());
+        assert!(m.enabled, "a fresh insert lands enabled");
+        assert_eq!(m.context_window, Some(1_050_000));
 
         pool.close().await;
         teardown_test_db(&db_name).await;

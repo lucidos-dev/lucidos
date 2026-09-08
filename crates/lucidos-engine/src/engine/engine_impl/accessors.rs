@@ -402,7 +402,7 @@ impl LucidosEngine {
 
     /// Context window (tokens) for `model`: the window declared on its `models`
     /// registry row, else the id-shape guess in
-    /// [`crate::engine::context::context_window_from_prefix`].
+    /// [`crate::llm::model_registry::context_window_from_prefix`].
     ///
     /// Every context-budget and `ContextCaptured` site goes through here rather
     /// than calling the prefix map directly — the prefix map has no rule for

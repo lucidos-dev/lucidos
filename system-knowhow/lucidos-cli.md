@@ -1193,7 +1193,7 @@ $ lucidos knowhow read system-knowhow/building-an-app
 
 ### `lucidos proxy <name> [path] [-X METHOD] [-H "Hdr: val"] [-d body | --data-stdin] [-i] [--fail]`
 
-Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store, injects the configured auth header, and strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. **The credential value never reaches the script** — neither in `argv`, env vars, the request line, nor any log.
+Call a backend configured in `data/config/apis.json` through the engine. The engine resolves the credential from the workspace's credential store and injects the configured auth header. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request. It strips every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns with them, so no Lucidos credential reaches the upstream. **The credential value never reaches the script**: not in `argv`, env vars, the request line, nor any log.
 
 **This is the preferred way for scripts to call external APIs.** The previous pattern — `curl -H "Authorization: Bearer $CRED_FOO" ...` with `$CRED_FOO` injected into the script's environment — leaks the secret into process args and shell history. Configure the API in `data/config/apis.json` once, then use `lucidos proxy` everywhere.
 

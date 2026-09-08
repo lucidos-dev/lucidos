@@ -11,6 +11,7 @@
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
 use crate::core::AuthType;
+use crate::llm::model_registry::gpt_major_version;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, TokenCallback, ToolCall, ToolDefinition,
 };
@@ -132,8 +133,13 @@ pub fn resolve_bearer_key(
 }
 
 /// GPT-5+ and Codex models use the Responses API, all others use Chat Completions.
-fn uses_responses_api(model: &str) -> bool {
-    model.contains("codex") || model.starts_with("gpt-5")
+///
+/// The GPT half reads the id's major version through
+/// [`gpt_major_version`] rather than matching `gpt-5`. The literal spelling
+/// sent `gpt-6-astra` to Chat Completions, which is the wrong endpoint for it,
+/// and the same would happen to every family after it.
+pub(crate) fn uses_responses_api(model: &str) -> bool {
+    model.contains("codex") || gpt_major_version(model).is_some_and(|major| major >= 5)
 }
 
 pub struct OpenAiProvider {
@@ -668,7 +674,40 @@ mod tests {
         )
         .unwrap();
         assert!(!openrouter.should_use_responses("gpt-5.5"));
+        assert!(!openrouter.should_use_responses("gpt-6-astra"));
         assert!(!openrouter.should_use_responses("z-ai/glm-5.2"));
+    }
+
+    /// The whole GPT-5-and-newer family takes the Responses path, read off the
+    /// id's major version rather than a literal `gpt-5`.
+    ///
+    /// GPT-6 Astra is the regression: it is served through the Responses API,
+    /// and the old spelling sent it to Chat Completions. `gpt-7` stands in for
+    /// the next family, which must need no edit here.
+    #[test]
+    fn every_gpt_family_from_5_upward_takes_the_responses_path() {
+        for model in [
+            "gpt-5",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-6-astra",
+            "gpt-7-whatever",
+        ] {
+            assert!(uses_responses_api(model), "{model} must use Responses");
+        }
+        // Older families, and a codex id that qualifies on its own name.
+        for model in ["gpt-4o", "gpt-4.1", "gpt-3.5-turbo"] {
+            assert!(
+                !uses_responses_api(model),
+                "{model} must stay on Chat Completions"
+            );
+        }
+        assert!(uses_responses_api("gpt-5.3-codex"));
+        assert!(uses_responses_api("codex-mini"));
+        // A non-GPT id names no version, so it is not a Responses model.
+        for model in ["z-ai/glm-5.2", "llama3.1", "gpt-oss", "claude-opus-5"] {
+            assert!(!uses_responses_api(model), "{model}");
+        }
     }
 
     /// The `Authorization` header is omitted on an empty key (keyless local

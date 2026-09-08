@@ -162,11 +162,20 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Reading an episode.** Grep for `composer-press` in whichever log the
   engine's stdout goes to. Under `web-dev.sh -b` that is the workspace's
   `engine.log`, and for a gateway-launched engine it is
-  `~/.lucidos/gateway/gateway.log`. Check both, since the workspace file goes
-  quiet rather than missing. Each line names the face, the verdict (`served`,
+  `~/.lucidos/gateway/gateway.log`. **Check the gateway file first.** A
+  workspace `engine.log` goes quiet rather than missing, and reading a stale
+  one cost most of a session on the tenth report. `lsof -p $(cat
+  <ws>/.lucidos/engine.pid)` names the file the live engine actually writes.
+
+  Each line names the face and the verdict. The eleven are `served`,
   `swallowed`, `clicked`, `canceled`, `missed`, `dead`, `no-lift`,
-  `click-no-touch` or `unreachable`), the travel, the row and face boxes, the
-  viewport block and the `data-keyboard-active` flag.
+  `click-no-touch`, `unreachable`, `repaired` and `repair-failed`. It carries
+  the travel, the row and face boxes, the viewport block and the
+  `data-keyboard-active` flag.
+
+  Three readings joined in the tenth round. The morph's own mode, the quiet
+  window before the line, and, on a `missed`, why no watchable face took the
+  press.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
@@ -184,6 +193,25 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   typed and the characters never appeared, so no button was ever pressed. This
   probe was silent and correct, and the textarea had nothing watching it. The
   dead-keystroke probe below covers that half now.
+- **What the tenth report found: the probe waits to be touched.** The Send face
+  was visible and enabled, and the ledger holds no line for the episode. That
+  combination is a proof rather than another silence.
+
+  A visible, enabled face is watched, and a `touchstart` on it records
+  unconditionally: through the grace timer, the lift deadline, or
+  `touchcancel`. There is no fourth path. So no touch arrived, and the absent
+  `click-no-touch` says no click did either.
+
+  Every reading in the module was event-driven, which makes all of them blind
+  to that state by construction. The reachability check is the one question
+  answerable with no user input, and it only ever ran from inside the
+  `touchstart` handler. It had never fired once in 101 lines.
+
+  It now runs on an interval as well, gated on a laid-out row and a visible
+  document. Three smaller silences went with it. A faceless row no longer
+  returns without a line. A `missed` line says why no face took the press. And
+  every line carries the quiet window before it. The plan is
+  [`docs/plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md`](plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md).
 - **Status:** `active`, and back to gathering evidence rather than confirming a
   repair.
 - **Not a workaround.** It changes no behaviour and takes no gesture. Real fixes
@@ -225,6 +253,37 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** `active`
 - **Not a workaround.** Every listener is passive and consumes nothing. The
   behaviour fix ships beside it, in `resolveEmptyDraftSync`.
+
+### Composer relayout nudge, when the row stops being reachable
+
+- **Added:** 2026-09-05
+- **Lives in:** `nudgeLayout` and `attemptRepair` in
+  `crates/lucidos-app/src/components/chat/deadPressProbe.ts`, with their cases
+  in `src/components/chat/__tests__/dead-press-probe-ledger.test.ts`.
+- **Impermanent because:** It works around a WebKit fault we cannot name yet.
+  On an iOS PWA the composer stops taking taps, and the user recovers by
+  closing and reopening the keyboard. That rewrites the visual viewport, so the
+  app rewrites `--app-height` and the shell relayouts. The nudge reproduces
+  that effect, and nothing about it is a design we would choose.
+- **What it does, and what it refuses to do.** It runs only after the scheduled
+  reachability check finds a face the page will not answer with at its own
+  painted centre. It writes `--app-height` one pixel down and straight back in
+  one task, so nothing is painted in between. It changes no focus, no caret and
+  no draft. Blurring the textarea would dismiss the keyboard, and iOS refuses
+  to reopen it outside a user gesture. One attempt per episode.
+- **It is a diagnostic too, which is why it ships this early.** The re-check
+  after the nudge records `repaired` or `repair-failed`. Those two split the
+  last candidates apart: a stale layout, or a page simply not being delivered
+  events. Ten reports have produced neither reading.
+- **Removal / resolution condition:** A run of `repair-failed` with no
+  `repaired`, which rules the relayout out and points elsewhere. Or a run of
+  `repaired` long enough to justify a real fix at the layer that wedges, which
+  then replaces this. Or WebKit fixes the delivery. Then delete both functions
+  and their cases, and flip this row to `removed`.
+- **Investigation:** none, same as the two probes above. It goes with the
+  press probe if that is removed first, since it depends on that module's
+  scheduled check.
+- **Status:** `active`
 
 ### Recorded mirror-history exceptions
 
@@ -1456,6 +1515,27 @@ Feature flags / kill-switches awaiting cleanup, and back-compat shims/aliases th
 carry a **concrete** removal condition (NOT permanent back-compat — that's OUT). A
 flag belongs here the moment it lands; a shim belongs here only if you can name the
 event that retires it.
+
+### The retired-compressor-cap notice in the e2e memory guard (ADR 0175)
+
+- **Added:** 2026-09-07
+- **Lives in:** `scripts/lib/host_memory_guard.sh`, the last block of
+  `report_host_memory_start`, plus
+  `test_a_retired_cap_knob_is_named_rather_than_ignored` in
+  `host_memory_guard_test.sh`.
+- **What it is:** ADR 0175 deleted `LUCIDOS_E2E_COMPRESSOR_CAP_GB` and
+  `LUCIDOS_E2E_COMPRESSOR_CAP_PCT` outright. A caller still exporting one would
+  otherwise get no signal at all, and keep believing the run is capped. So the
+  start report names the variable and says nothing reads it.
+- **Impermanent because:** it exists only for callers written against the old
+  knob. Once none set it, the block is telling nobody anything. It is not input
+  validation: no value is accepted, rejected, or defaulted.
+- **Removal condition:** after one full nightly cycle on the new guard, confirm
+  no caller sets either variable. `grep -rn COMPRESSOR_CAP` should return only
+  this row and the ADR, and the nightly Step 5 spawn intent in the
+  `lucidos-ops/nightly-pipeline` knowhow should name neither. Then delete the
+  block and its test.
+- **Status:** active
 
 ### `self_curated_context_mode` flag (ADR 0085)
 

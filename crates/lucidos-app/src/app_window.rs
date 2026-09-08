@@ -22,7 +22,7 @@ use crate::{
     window_target,
 };
 
-/// Put a window at `frame`, in the physical pixels the record stores.
+/// Put a window at `frame`, in the logical points the record stores.
 ///
 /// Both restore paths go through here: `main` before the deferred show, and
 /// each extra window while it is still hidden. Best-effort and logged, since a
@@ -30,15 +30,19 @@ use crate::{
 /// Takes a `tauri::Window`, per ADR 0140: sizing and placing are window
 /// operations. Both callers already hold one, the restore path from a lookup
 /// and the builder path off the window it just built.
+///
+/// Logical, so tao applies the numbers as they are. It divides a PHYSICAL one
+/// by the scale factor of the display the window is on. That is not the
+/// display the frame was captured on (ADR 0173). The two calls can also
+/// straddle a display change, and only logical values survive that.
 pub(crate) fn place_window(window: &tauri::Window, frame: window_restore::Rect, what: &str) {
-    if let Err(e) = window.set_size(tauri::PhysicalSize::new(
-        frame.width as u32,
-        frame.height as u32,
+    if let Err(e) = window.set_size(tauri::LogicalSize::new(
+        frame.width as f64,
+        frame.height as f64,
     )) {
         eprintln!("[Tauri] Failed to size {what}: {e}");
     }
-    if let Err(e) =
-        window.set_position(tauri::PhysicalPosition::new(frame.x as i32, frame.y as i32))
+    if let Err(e) = window.set_position(tauri::LogicalPosition::new(frame.x as f64, frame.y as f64))
     {
         eprintln!("[Tauri] Failed to place {what}: {e}");
     }
@@ -142,8 +146,8 @@ pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// `desktop::gateway_capability` scopes IPC to), same title-bar style, same
 /// pre-paint tint and traffic-light placement.
 ///
-/// `frame` is the geometry the window's WORKSPACE was last left at, in physical
-/// pixels. Such a window is built hidden, placed, and shown once it is right, so
+/// `frame` is the geometry the window's WORKSPACE was last left at, in logical
+/// points. Such a window is built hidden, placed, and shown once it is right, so
 /// it never appears at the default size and jumps. `None` takes the declared
 /// default, centred: File > New Window, and a workspace nothing is remembered
 /// about.
@@ -186,10 +190,9 @@ fn open_app_window(
     // A restored window is built HIDDEN and shown at the end. It then appears
     // at its own frame rather than at the default and jumping.
     //
-    // The builder cannot carry the frame itself: its `inner_size` and
-    // `position` are LOGICAL pixels and the record is physical. Converting
-    // needs the scale factor of the monitor the window lands on, which no one
-    // knows before it exists.
+    // `place_window` does the placing, not the builder's own `inner_size` and
+    // `position`. One routine places every window the client owns, so `main`
+    // and a `window-<n>` cannot drift apart.
     let builder = if frame.is_some() {
         builder.visible(false)
     } else {

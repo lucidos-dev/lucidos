@@ -40,21 +40,29 @@ export function notificationsTabSource(
   return filter === 'unread' ? unread : all;
 }
 
+/** Whether the tab owes the user a skeleton. Both tabs treat 'not-loaded' as
+ *  loading, because from here the two states say the same thing: no rows yet.
+ *
+ *  The unread set never reaches 'loading' at all, since `loadUnreadNotifications`
+ *  applies in place so the bell badge cannot blink to 0 on a reload. The "All"
+ *  list does, but only once its loader claims the signal, and it sits at
+ *  'not-loaded' until then. Reading 'loading' alone left that window with no
+ *  skeleton, which is where the reported blank panel came from on a cold start.
+ *
+ *  Pure + exported so the four states are unit-testable. The caller still gates
+ *  it behind `useDelayedFlag`, so a fast load shows nothing rather than a
+ *  flash. */
+export function notificationsTabIsLoading(loadable: Loadable<Notification[]>): boolean {
+  return loadable.status === 'loading' || loadable.status === 'not-loaded';
+}
+
 export function NotificationsView() {
   const sentinelRef = useRef<HTMLDivElement>(null);
 
   const filter = notificationsFilter.value;
   const loadable = notificationsTabSource(filter, unreadNotifications.value, notifications.value);
   const items = loadedOr(loadable, []);
-  // The "All" browse list transitions through 'loading' (loadNotifications). The
-  // unread set never does — `loadUnreadNotifications` applies in place so the bell
-  // badge never blinks to 0 on a reload — so on the "Unread" tab, treat the
-  // first-load 'not-loaded' state as loading too. Delay-gated either way, so a
-  // fast load shows nothing rather than a flash; a slow first load shows the
-  // skeleton instead of a blank panel.
-  const showLoading = useDelayedFlag(
-    loadable.status === 'loading' || (filter === 'unread' && loadable.status === 'not-loaded'),
-  );
+  const showLoading = useDelayedFlag(notificationsTabIsLoading(loadable));
   // Pagination applies to the "All" browse list only — the unread set is loaded
   // whole (bounded by UNREAD_LOAD_LIMIT; a larger backlog already renders as
   // "99+" on the badge), so there is no "load more" on the "Unread" tab.

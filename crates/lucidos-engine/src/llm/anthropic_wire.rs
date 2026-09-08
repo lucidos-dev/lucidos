@@ -610,6 +610,12 @@ fn carries_output(block: &AccumulatedBlock) -> bool {
     }
 }
 
+/// Upper bound on a streamed content-block index before we treat the frame as
+/// malformed. Real messages carry a handful of blocks. This sits far above any
+/// legitimate stream and exists only to stop an untrusted host OOMing the
+/// engine with a huge index.
+const MAX_CONTENT_BLOCKS: usize = 1024;
+
 fn process_sse_data(
     data_str: &str,
     blocks: &mut Vec<AccumulatedBlock>,
@@ -622,6 +628,16 @@ fn process_sse_data(
     match event_type {
         "content_block_start" => {
             let index = data["index"].as_u64().unwrap_or(0) as usize;
+            // The index comes straight off provider JSON. A huge value would grow
+            // `blocks` to billions of empty entries and OOM the engine. Real
+            // messages carry a handful of content blocks, so anything past the cap
+            // is malformed.
+            if index >= MAX_CONTENT_BLOCKS {
+                return Err(format!(
+                    "provider streamed content_block index {index}, past the {MAX_CONTENT_BLOCKS} cap"
+                )
+                .into());
+            }
             let block = &data["content_block"];
             let block_type = block["type"].as_str().unwrap_or("");
 
@@ -1234,6 +1250,22 @@ mod tests {
         assert_eq!(meta.input_tokens, Some(u32::MAX));
         assert_eq!(meta.cache_creation_tokens, Some(u32::MAX));
         assert_eq!(meta.cache_read_tokens, Some(u32::MAX));
+    }
+
+    #[test]
+    fn process_sse_rejects_an_out_of_range_content_block_index() {
+        // A content_block_start index comes straight off provider JSON. Without
+        // the cap a huge value grows `blocks` to billions of entries and OOMs.
+        let mut blocks = Vec::new();
+        let mut meta = TurnMeta::default();
+        let event = r#"{"type":"content_block_start","index":4000000000,"content_block":{"type":"text","text":""}}"#;
+
+        let result = process_sse_data(event, &mut blocks, &mut meta, "Test");
+        assert!(
+            result.is_err(),
+            "out-of-range content_block index must error"
+        );
+        assert!(blocks.is_empty(), "must not grow the block list");
     }
 
     #[test]

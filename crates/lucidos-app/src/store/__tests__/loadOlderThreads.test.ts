@@ -336,6 +336,67 @@ describe('loadOlderThreads', () => {
     expect(fetchMock).toHaveBeenLastCalledWith('2026-05-16T22:46:00Z', 15, undefined, undefined, undefined, undefined);
   });
 
+  it('keeps a thread inserted while the page was in flight', async () => {
+    // Regression: the map was captured BEFORE the fetch and republished after
+    // it, so anything installing a fresh Map in that window was reverted. The
+    // lazy compose-draft insert is the sharp case. The row the user is typing
+    // into vanished while the focus still pointed at it.
+    const seed = loaded(makeOptimisticThreadState({
+      id: 'seed', title: 'Seed', channel: 'chat', initiator: 'user',
+      eventsLoaded: false,
+    }), '2026-01-01T00:00:00Z');
+    seed.meta.section = 'archived';
+    threadMap.value = new Map([['seed', seed]]);
+
+    let landPage!: (v: { threads: ThreadSummary[]; family_threads: never[]; has_more: boolean }) => void;
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { landPage = resolve; }));
+    const inFlight = loadOlderThreads();
+    expect(fetchMock, 'the request must be in flight for the race to exist').toHaveBeenCalledTimes(1);
+
+    // A draft is created while the page is out, installing a fresh Map exactly
+    // as `startComposeIfNeeded` does.
+    threadMap.value = new Map([
+      ...threadMap.value,
+      ['draft', makeOptimisticThreadState({
+        id: 'draft', title: '', channel: 'chat', initiator: 'user',
+        eventsLoaded: true, state: 'composing', status: 'idle',
+      })],
+    ]);
+
+    landPage({
+      threads: [{
+        thread_id: 'older',
+        title: 'Older',
+        channel: 'chat',
+        initiator: 'user',
+        created_at: '2025-12-01T00:00:00Z',
+        last_activity: '2025-12-01T00:00:00Z',
+        message_count: 1,
+        section: 'archived',
+        active_children_count: 0,
+        total_children_count: 0,
+        blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
+        status: 'idle',
+        coding_agent_has_diff: false,
+        coding_agent_proposed: false,
+        coding_agent_requires_restart: false,
+        coding_agent_is_external_repo: false,
+        coding_agent_applying: false,
+        last_revived_at: null,
+        parent_thread_id: null,
+        state: 'active',
+        compose_text: '',
+        compose_images: [],
+      }],
+      family_threads: [],
+      has_more: false,
+    });
+    await inFlight;
+
+    expect(threadMap.value.has('draft'), 'a draft created mid-fetch must survive the page landing').toBe(true);
+    expect(threadMap.value.has('older'), 'the fetched page still lands').toBe(true);
+  });
+
   it('reloadAfterFilterChange eagerly fetches matching threads when none are loaded (archived-only repo facet)', async () => {
     // Reproduces the reported bug: a repo whose threads are all archived is
     // selected as a filter. None of its threads are in the loaded window, so

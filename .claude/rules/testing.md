@@ -1,6 +1,7 @@
 ---
 paths:
   - "crates/lucidos-app/e2e/**"
+  - "crates/lucidos-app/src/**/*.rs"
   - "crates/lucidos-app/src/**/*.test.ts"
   - "crates/lucidos-engine/tests/**"
   - "crates/lucidos-e2e/tests/**"
@@ -292,6 +293,13 @@ CLI two clients are competing for.
 | Rust engine logic | `cargo test` |
 | Packaged macOS build boots | Packaged build smoke test |
 | Native Tauri (non-UI) logic | `cargo test -p lucidos-app` |
+
+**That last row is the one nothing else runs for you.** `make test` is
+`./scripts/test-engine.sh`, which tests `lucidos-engine` alone. Clippy compiles
+the client's test targets and never executes them, so a broken assertion there
+lands on `main` green. Touch a `.rs` file under `crates/lucidos-app/src/` and
+run `cargo test --locked -p lucidos-app --lib` yourself: seconds, and no
+Postgres. `/harden` Phase 4.5 carries the same row.
 
 `./scripts/e2e.sh` runs API → browser → wasm → embedder back-to-back. The
 nightly trigger calls it; nothing else runs the wasm + embedder suites

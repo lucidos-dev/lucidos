@@ -32,8 +32,8 @@
 //! - **Gemini**: `vertex::gemini::gemini_thinking_level` collapses `high`,
 //!   `xhigh` and `max` onto the same `"high"` level, so offering the top two
 //!   would show tiers that send an identical request.
-//! - **OpenAI**: GPT-5.6 (Sol / Terra / Luna) accepts a distinct `max`; earlier
-//!   families top out at `xhigh`.
+//! - **OpenAI**: GPT-5.6 (Sol / Terra / Luna) and GPT-6 Astra accept a distinct
+//!   `max`; earlier families top out at `xhigh`.
 //! - **OpenRouter / xAI / Local**: a server other than OpenAI's sits behind
 //!   these, so only the tiers universal to the OpenAI-compatible wire format
 //!   are offered. `xhigh` is OpenAI-proprietary and is never sent. xAI accepts
@@ -78,6 +78,13 @@ const LOW_HIGH_MAX: &[&str] = &["low", "high", "max"];
 /// seeded free model takes [`THROUGH_HIGH`].
 const OX_ALPHA_FREE: &str = "x-preview-f-free";
 
+/// GPT-6 Astra, which accepts the same full tier set as the GPT-5.6 family.
+///
+/// Named here rather than folded into a `gpt-6` prefix rule. A family that tops
+/// out at `xhigh` answers `max` with a 400. So which ids reach [`ALL_TIERS`]
+/// stays a per-family fact, never a guess from the id's shape.
+const GPT_6_ASTRA: &str = "gpt-6-astra";
+
 /// The tiers `model` supports when served by `provider`.
 ///
 /// The Vertex arm asks [`VertexProvider::is_claude_model`] rather than
@@ -94,7 +101,7 @@ pub fn supported_efforts(provider: ProviderKind, model: &str) -> &'static [&'sta
             }
         }
         ProviderKind::OpenAi => {
-            if model.starts_with("gpt-5.6") {
+            if model.starts_with("gpt-5.6") || model == GPT_6_ASTRA {
                 ALL_TIERS
             } else {
                 THROUGH_XHIGH
@@ -236,10 +243,19 @@ mod tests {
         }
     }
 
+    /// The two OpenAI families with a distinct `max`, and the earlier ones
+    /// without it. Astra is the regression: it was clamped to `xhigh` while the
+    /// rule read `starts_with("gpt-5.6")` alone, so it silently lost the top
+    /// tier the model actually accepts.
     #[test]
-    fn openai_offers_max_only_on_gpt_5_6() {
-        for sixer in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            assert_eq!(supported_efforts(ProviderKind::OpenAi, sixer), ALL_TIERS);
+    fn openai_offers_max_on_gpt_5_6_and_astra() {
+        for top in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", GPT_6_ASTRA] {
+            assert_eq!(supported_efforts(ProviderKind::OpenAi, top), ALL_TIERS);
+            assert_eq!(
+                clamp_effort("max", ProviderKind::OpenAi, top),
+                Some("max"),
+                "{top} must be sent max unchanged"
+            );
         }
         for earlier in ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex"] {
             assert_eq!(
@@ -269,6 +285,7 @@ mod tests {
                 // A local server is free to serve an OpenAI-shaped id; the
                 // server, not the id, decides the vocabulary.
                 "gpt-5.6-sol",
+                GPT_6_ASTRA,
             ] {
                 let tiers = supported_efforts(provider, model);
                 assert_eq!(tiers, THROUGH_HIGH, "{provider:?}/{model}");
@@ -421,6 +438,7 @@ mod tests {
             (ProviderKind::Vertex, "gemini-3.1-pro-preview"),
             (ProviderKind::Anthropic, "claude-fable-5"),
             (ProviderKind::OpenAi, "gpt-5.6-sol"),
+            (ProviderKind::OpenAi, GPT_6_ASTRA),
             (ProviderKind::OpenAi, "gpt-5.4"),
             (ProviderKind::OpenRouter, "z-ai/glm-5.2"),
             (ProviderKind::XAi, "grok-4.6"),

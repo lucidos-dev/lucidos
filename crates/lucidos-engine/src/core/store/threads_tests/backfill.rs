@@ -227,8 +227,8 @@ async fn both_backfills_compose_legacy_task_id_to_config_id() {
 /// is in neither the live `repositories` registry (once removed) nor the event
 /// log, so the filter showed the raw UUID. Their path survives in
 /// `changes.repo_root`, and the backfill scavenges its basename into
-/// `repo_names` — so the deleted repo lists as `cognos`, not a UUID, AND the
-/// projection-backed names already present are left untouched.
+/// `repo_names`, so the deleted repo lists as `example-repo`, not a UUID, AND
+/// the projection-backed names already present are left untouched.
 #[tokio::test]
 async fn backfill_repo_names_from_changes_recovers_basename() {
     let (pool, db) = setup_test_db().await;
@@ -238,14 +238,14 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
     // its path, but it's in neither `repositories` nor `repo_names`.
     let deleted_repo = Uuid::new_v4();
     let cc = insert_cc_repo_thread(&pool, &deleted_repo.to_string(), 60).await;
-    insert_change(&pool, cc, "/Users/dev/IdeaProjects/cognos").await;
+    insert_change(&pool, cc, "/Users/me/projects/example-repo").await;
 
     // A repo already named in the projection (registry / RepositoryAdded) must
     // NOT be clobbered by the path basename.
     let named_repo = Uuid::new_v4();
     insert_repo_name(&pool, named_repo, "Canonical Name").await;
     let named_cc = insert_cc_repo_thread(&pool, &named_repo.to_string(), 50).await;
-    insert_change(&pool, named_cc, "/Users/dev/projects/lowercase").await;
+    insert_change(&pool, named_cc, "/Users/me/projects/lowercase").await;
 
     // A repo with no change: nothing to scavenge — stays absent (NULL name).
     let nameless_repo = Uuid::new_v4();
@@ -262,7 +262,7 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
         .execute(&pool)
         .await
         .expect("mark app thread");
-    insert_change(&pool, app, "/Users/dev/workspaces/my-workspace").await;
+    insert_change(&pool, app, "/Users/me/workspaces/my-workspace").await;
 
     let inserted = store
         .backfill_repo_names_from_changes()
@@ -283,7 +283,7 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
 
     assert_eq!(
         name_of(&pool, deleted_repo).await.as_deref(),
-        Some("cognos"),
+        Some("example-repo"),
         "deleted pre-event repo recovers its name from changes.repo_root basename"
     );
     assert_eq!(
@@ -310,7 +310,7 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
         .iter()
         .find(|f| f.id.as_deref() == Some(deleted_repo.to_string().as_str()))
         .expect("deleted repo is a facet");
-    assert_eq!(deleted_facet.name.as_deref(), Some("cognos"));
+    assert_eq!(deleted_facet.name.as_deref(), Some("example-repo"));
 
     let second = store
         .backfill_repo_names_from_changes()

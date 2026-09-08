@@ -52,6 +52,41 @@ fn strips_host_cookie_origin_referer() {
 }
 
 #[test]
+fn strips_our_own_namespace_and_the_headers_the_gateway_owns() {
+    // The mirror of `hook_socket::forwarded_to_engine`. The gateway writes each
+    // of these on the hop reaching this handler, so on the way out it is ours
+    // rather than the caller's. A name added later inherits the strip from the
+    // prefix, which is why this is not a list of the four in use.
+    for h in [
+        "x-lucidos-local-token",
+        "x-lucidos-webhook-token",
+        "x-lucidos-agent-origin-token",
+        "x-lucidos-device-id",
+        "x-lucidos-target-workspace",
+        "X-Lucidos-Anything-Added-Later",
+        "x-forwarded-prefix",
+        "x-forwarded-host",
+    ] {
+        assert!(
+            should_strip_request_header(&name(h)),
+            "expected {h} to be stripped"
+        );
+    }
+    // The two engine credentials by their real names, so a rename OUT of the
+    // namespace cannot quietly take either off the prefix above. The same
+    // closing assertion the gateway's sibling test carries.
+    for h in [
+        lucidos_local_token::HEADER_LOCAL_TOKEN,
+        lucidos_local_token::HEADER_WEBHOOK_TOKEN,
+    ] {
+        assert!(
+            should_strip_request_header(&name(h)),
+            "expected {h} to be stripped"
+        );
+    }
+}
+
+#[test]
 fn strip_check_is_case_insensitive() {
     assert!(should_strip_request_header(&name("cookie")));
     assert!(should_strip_request_header(&name("HOST")));
@@ -801,6 +836,56 @@ async fn upstream_does_not_see_stripped_headers() {
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("origin")));
     assert!(!observed.iter().any(|n| n.eq_ignore_ascii_case("referer")));
     assert!(observed.iter().any(|n| n.eq_ignore_ascii_case("x-keep-me")));
+}
+
+#[tokio::test]
+async fn the_engines_own_trust_headers_never_reach_an_upstream() {
+    // The gateway stamps every proxied hop with `x-lucidos-local-token`, the
+    // machine's full-authority credential, plus the device it authenticated and
+    // the prefix it owns. All three arrive on the request this handler forwards.
+    //
+    // `data/config/apis.json` is writable over the API, so an app can point an
+    // auth-less entry at any host and call it. Passing our own namespace through
+    // hands that host a credential reaching every route of every workspace here,
+    // and reaching the gateway as a local process. Nor does it take an attacker:
+    // unstripped, the builtin `openai` entry hands it to the model provider on
+    // every app call.
+    let (base, slot) = spawn_recording_upstream(200, "ok").await;
+    let url = format!("{}/x", base);
+    let headers = hm(&[
+        ("x-lucidos-local-token", "full-authority-machine-token"),
+        ("x-lucidos-webhook-token", "webhook-scope-token"),
+        ("x-lucidos-agent-origin-token", "thread-bound-token"),
+        ("x-lucidos-device-id", "device-1"),
+        ("x-forwarded-prefix", "/dev/"),
+        ("x-forwarded-host", "laptop.example.ts.net"),
+        ("X-Keep-Me", "yes"),
+    ]);
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        headers,
+        Vec::new(),
+        Bytes::new(),
+        Transport::Verified,
+    )
+    .await;
+    let recorded = slot.lock().unwrap().clone().unwrap();
+    for (name, value) in &recorded.headers {
+        assert!(
+            !name.eq_ignore_ascii_case("x-forwarded-prefix")
+                && !name.eq_ignore_ascii_case("x-forwarded-host")
+                && !name.to_ascii_lowercase().starts_with("x-lucidos-"),
+            "the upstream saw {name}: {value}"
+        );
+    }
+    // An ordinary caller header still travels, so the strip is the namespace
+    // rather than a blanket refusal to forward anything.
+    assert!(recorded
+        .headers
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("x-keep-me")));
 }
 
 #[tokio::test]

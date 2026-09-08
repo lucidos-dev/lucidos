@@ -105,6 +105,24 @@ cache_read_per_mtok = 0.5
 cache_creation_per_mtok = 0.0
 
 [[model]]
+# READ THE CACHE-CREATION RATE BEFORE COPYING THIS ROW ANYWHERE.
+#
+# It is the one OpenAI row here that does not price a cache write at zero.
+# Astra bills the write at 1.25x input, the way Anthropic does, so the "OpenAI
+# caches for free" fact the `gpt-5.6-sol` row above rests on does not hold for
+# it. Copy that row as a template and every cache write is under-priced by
+# $12.50 per 1M tokens.
+#
+# All four figures come from launch coverage and are unconfirmed against a
+# billed call: the account is not entitled to Astra yet, so no run has produced
+# one. Re-check them against a real invoice before publishing a cost figure.
+id = "gpt-6-astra"
+input_per_mtok = 10.0
+output_per_mtok = 50.0
+cache_read_per_mtok = 1.0
+cache_creation_per_mtok = 12.50
+
+[[model]]
 # Never the model under test, and observed on every run all the same. The
 # fixture seeds `chat_model` alone and deletes every other preference row, so
 # title, memory and summary work resolves to the memory extractor's default.

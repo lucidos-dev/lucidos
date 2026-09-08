@@ -377,6 +377,18 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     // the placement and flexbox centres both pairs against one identical box.
     await navigateToApp(page);
 
+    // Wait for the app's own preference load to apply its ui-scale FIRST.
+    // `loadPreferences` ends in `applyUiScale`, which persists `lucidos-ui-scale`
+    // then writes `--user-ui-scale` (store/actions/preferences.ts). Until that
+    // key exists, a scale this test sets is one late write from reverting to the
+    // 16px root. That makes the assert below read "16px" and fail on the race,
+    // not the layout. Waiting for the key makes this test's set the last writer.
+    await page.waitForFunction(
+      () => localStorage.getItem('lucidos-ui-scale') !== null,
+      undefined,
+      { timeout: 10_000 },
+    );
+
     // 112.5% is the mobile stylesheet's own fallback root and a supported user
     // setting. It is also the one this reproduced at. At the 100% the suite
     // otherwise runs at, the same defect rounds to nothing, so a test taking

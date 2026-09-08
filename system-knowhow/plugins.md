@@ -59,6 +59,7 @@ Validation rules enforced at install (`core/plugins.rs::validate_tree` and `vali
 - Top-level entries are exactly `manifest.toml` plus a subset of `{apps, knowhow, triggers, scripts, auth-modules}`. No root README, no `LICENSE`, no `.git`, no `node_modules`, no `__MACOSX` (auto-injected by macOS Finder when zipping). Put per-plugin docs and license inside the plugin's own subtree if needed.
 - At least one of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/` exists with at least one file. An empty `knowhow/` directory passes the top-level check but fails as `EmptyTree`.
 - Hidden files (any path component starting with `.`) are silently skipped during the file walk -- `.DS_Store`, editor swap files, and friends do not get installed.
+- Symbolic links are never followed. A file symlink is skipped and a dir symlink is not walked. A top-level symlink named as a content dir is rejected. This keeps a plugin from reaching a file outside its own tree.
 - No archive entry uses `..` or absolute paths (`/`, `\`) -- zip-slip protection.
 
 The flat one-to-one mapping means there is no separate "install destination" question. If your file lives at `apps/foo/index.html` in the plugin, it lands at `data/apps/foo/index.html` in the workspace. Sub-trees (`triggers/foo/foo.md`, `apps/foo/sdk-prefs.js`) are preserved verbatim.

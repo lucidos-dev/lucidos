@@ -503,6 +503,10 @@ export async function discardSingleChange(id: string): Promise<void> {
  *  working, so each one applies as it lands. With nothing pending that IS the
  *  action, and the button reads "Apply as they settle". */
 export async function applyAllChanges(keepGoing = false): Promise<void> {
+  // Single flight, guarded here rather than by a `disabled` button. "Apply as
+  // they settle" presses this too and is never disabled: it arms, so it has no
+  // in-progress face to wear (ChangesView).
+  if (applyAllInProgress.value) return;
   // Optimistic busy state: the batch applies the first change synchronously and
   // drives the rest in the background — including a multi-minute pause while it
   // hardens an unhardened member — so reflect "in progress" the instant the
@@ -520,7 +524,7 @@ export async function applyAllChanges(keepGoing = false): Promise<void> {
     // change resolves; an unkeyed HTTP toast can't be reached by that resolver,
     // so it dangles forever as a stale "resolving automatically" warning even
     // after the conflict is fixed and the batch applies (the bug this avoids).
-    // The bulk button stays "Applying..." via applyAllInProgress until
+    // Apply All stays "Applying..." via applyAllInProgress until
     // ApplyAllBatchCompleted (SSE) clears it.
     const result = await apiApplyAll(keepGoing);
     // The arm-only call starts no batch, so nothing will clear the optimistic

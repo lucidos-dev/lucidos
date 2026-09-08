@@ -56,6 +56,23 @@ describe('queuedMessagesFromExchanges', () => {
     expect(queuedMessagesFromExchanges(list, true, false)).toEqual([{ id: 'q2', text: 'has id' }]);
   });
 
+  it('keeps a queued follow-up queued when an async row merely landed in it', () => {
+    // A queued message is `current` for as long as the running turn lasts, and
+    // `BackgroundBashCompleted` carries no `request_event_id`, so the fold
+    // files it there. Read as a step, the message looks ingested: it steals the
+    // running turn's badge and Stop no longer returns its text to compose,
+    // while the loop still runs it after the cancel.
+    const withAsyncRow = queued('follow up', 'q1');
+    withAsyncRow.steps = [{
+      seq: 3,
+      event: { type: 'BackgroundBashCompleted', created: TS } as SequencedEvent['event'],
+    }];
+    const list = [activeStreaming(), withAsyncRow];
+    expect(queuedMessagesFromExchanges(list, true, false)).toEqual([
+      { id: 'q1', text: 'follow up' },
+    ]);
+  });
+
   it('treats the first of several stepless messages (no active turn) as active, the rest queued', () => {
     // Mirrors "a freshly-sent first message is active (Requesting), not queued":
     // with no non-uningested turn, the earliest candidate owns the active slot.

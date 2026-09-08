@@ -342,6 +342,58 @@ fn detects_conflicts_against_data_dir() {
     let _ = fs::remove_dir_all(&empty_data);
 }
 
+// --- symlink safety ---
+
+#[cfg(unix)]
+#[test]
+fn plan_files_never_follows_a_symlink_out_of_the_tree() {
+    use std::os::unix::fs::symlink;
+    // A host secret and a host directory the plugin's symlinks would reach.
+    let outside = tmpdir("plan_symlink_outside");
+    let secret = outside.join("id_rsa");
+    fs::write(&secret, "PRIVATE KEY").unwrap();
+    let outside_dir = outside.join("etc");
+    fs::create_dir_all(&outside_dir).unwrap();
+    fs::write(outside_dir.join("passwd"), "root:x:0:0").unwrap();
+
+    let dir = tmpdir("plan_symlink");
+    write_valid_plugin(&dir);
+    // A file symlink and a dir symlink inside a content dir, both aimed outside.
+    symlink(&secret, dir.join("knowhow/leak.md")).unwrap();
+    symlink(&outside_dir, dir.join("knowhow/escape")).unwrap();
+
+    // Only the real file is planned. Neither symlink is, and the dir symlink is
+    // not walked, so nothing behind them can be copied into `data/`.
+    let planned = plan_files(&dir);
+    let paths: Vec<&str> = planned.iter().map(|p| p.data_relative.as_str()).collect();
+    assert_eq!(paths, vec!["knowhow/a.md"]);
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_tree_rejects_a_top_level_symlink_named_as_a_content_dir() {
+    use std::os::unix::fs::symlink;
+    let outside = tmpdir("validate_symlink_outside");
+    fs::write(outside.join("x.md"), "x").unwrap();
+
+    let dir = tmpdir("validate_symlink");
+    fs::write(dir.join("manifest.toml"), VALID_MANIFEST).unwrap();
+    // A symlink named `knowhow` (a content dir) pointing at a real directory
+    // outside the tree. `is_dir()` would follow and accept it; no-follow rejects.
+    symlink(&outside, dir.join("knowhow")).unwrap();
+
+    match validate_tree(&dir) {
+        Err(ValidationError::UnexpectedTopLevelEntry(name)) => assert_eq!(name, "knowhow"),
+        other => panic!("expected UnexpectedTopLevelEntry, got {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&outside);
+}
+
 // --- compare_versions ---
 
 #[test]

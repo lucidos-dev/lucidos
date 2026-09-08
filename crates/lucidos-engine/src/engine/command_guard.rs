@@ -187,23 +187,17 @@ pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", 
 /// handed the same shape. Returns the original command when it is not a
 /// recognized shell wrapper.
 pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
-    const SHELLS: &[&str] = &GUARD_SHELLS;
     let trimmed = command.trim_start();
-    let Some(first) = trimmed.split_whitespace().next() else {
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let Some(shell_at) = shell_token_index(&toks) else {
         return Cow::Borrowed(command);
     };
-    // Normalized, not a raw basename. An escaped or quoted head runs the same
-    // shell, and leaving it unwrapped hides the payload from every scan that
-    // follows. Unwrapping can only ever expose more.
-    let base = normalized_head(first);
-    if !SHELLS.contains(&base) {
-        return Cow::Borrowed(command);
-    }
     // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
     // flag; everything after it is the script. One quote layer is stripped so the
     // common `zsh -lc 'curl ...'` form classifies as a clean `curl ...`.
     let bytes = trimmed.as_bytes();
     let mut i = 0;
+    let mut tok_index = 0usize;
     while i < bytes.len() {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -214,6 +208,14 @@ pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
         }
         if start == i {
             break;
+        }
+        let this = tok_index;
+        tok_index += 1;
+        // Everything up to and including the shell word is preamble. A
+        // wrapper's OWN options must not be read as the shell's `-c`: `su -c`
+        // takes one, and it is not this shell's.
+        if this <= shell_at {
+            continue;
         }
         if is_shell_c_flag(&trimmed[start..i]) {
             let (script, tail) = split_shell_script_operand(trimmed[i..].trim());
@@ -231,6 +233,68 @@ pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
         }
     }
     Cow::Borrowed(command)
+}
+
+/// True when `arch`'s arguments name a command for it to exec, rather than only
+/// its own options and a redirect. `args` is the raw remainder of the segment,
+/// so `arch > data/machine.txt` and `arch --version` reach here with a
+/// non-empty slice and exec nothing.
+fn arch_runs_a_command(args: &[&str]) -> bool {
+    let mut i = next_non_flag_from(args, 0);
+    while let Some(tok) = args.get(i) {
+        match redirect_token_needs_target(tok) {
+            Some(needs_target) => i = next_non_flag_from(args, i + usize::from(needs_target) + 1),
+            None => return true,
+        }
+    }
+    false
+}
+
+/// Index of the shell word a `-c` payload hangs off, or `None` when no shell
+/// runs. Walks the privilege and exec-wrapper preamble first.
+///
+/// The shell is not always the first word, and reading only the first word left
+/// the payload unclassified behind any wrapper: `sudo bash -c 'rm -rf /'` and
+/// `nohup bash -c 'rm -rf /'` both read as head `sudo` / `nohup`, matched no
+/// danger table, and settled Safe. Resolving the head is what
+/// [`danger_head_candidates`] does for the danger scans; this is the same walk
+/// for the unwrap.
+///
+/// Normalized, not a raw basename. An escaped or quoted head runs the same
+/// shell, and leaving it unwrapped hides the payload from every scan that
+/// follows.
+fn shell_token_index(toks: &[&str]) -> Option<usize> {
+    let mut at = 0usize;
+    loop {
+        if at > toks.len() {
+            return None;
+        }
+        at += command_head_index(&toks[at..]);
+        let base = normalized_head(toks.get(at)?);
+        if GUARD_SHELLS.contains(&base) {
+            // Unwrapping DISCARDS the preamble, and a code-injecting `VAR=` in
+            // it runs attacker-chosen code before the shell's own `main`.
+            // Returning the inner script alone would hand `ENV=/tmp/rc bash -c
+            // 'echo hi'` to the fast path as a bare `echo`. Decline, so the
+            // whole line reaches `segment_safety`, which refuses the preamble.
+            if preamble_has_code_injecting_env(toks, at) {
+                return None;
+            }
+            return Some(at);
+        }
+        let next = if EXEC_WRAPPER_HEADS_WITH_OPERAND.contains(&base) {
+            next_non_flag_from(toks, next_non_flag_from(toks, at + 1) + 1)
+        } else if EXEC_WRAPPER_HEADS.contains(&base) {
+            next_non_flag_from(toks, at + 1)
+        } else {
+            return None;
+        };
+        // A wrapper that resolves to itself would spin.
+        if next <= at {
+            return None;
+        }
+        at = next;
+    }
 }
 
 /// A single-dash cluster of shell option letters that includes `c`: `-c`, `-lc`,
@@ -1078,6 +1142,18 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
         _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => {
             segment_escapes_workspace(segment).then_some(Refusal)
         }
+        // On macOS `arch [-arch_name] <command> [args]` EXECS its operand, so
+        // the coreutils reading (print the machine type) holds only with no
+        // operand. With one, the read-only arm below would settle the WRAPPED
+        // command Safe: no card, no checkpoint, no judge call. Must be tried
+        // before that arm. It is in `EXEC_WRAPPER_HEADS` too, so the danger
+        // scans read past it rather than stopping on it.
+        //
+        // Keyed on a real command operand, not on `args` being non-empty. A
+        // trailing redirect and a lone `--version` both leave `args` non-empty
+        // while `arch` execs nothing. Refusing those would deny an ordinary
+        // read on the unattended lane.
+        "arch" if arch_runs_a_command(args) => Some(Refusal),
         _ if READ_ONLY_HEADS.contains(&base) => None,
         _ if CREATE_HEADS.contains(&base) => (!args
             .iter()
@@ -1483,6 +1559,29 @@ fn is_flag_token(tok: &str) -> bool {
     tok.starts_with('-') && tok.len() > 1
 }
 
+/// Index of the first token at or after `from` that is not flag-shaped, or
+/// `toks.len()` when there is none.
+///
+/// This is how an exec wrapper's own options are stepped over, INSTEAD of the
+/// both-arities branch a flag-shaped head takes. That branch chains. Each flag
+/// it lands on branches again. So every token of a trailing flag run becomes a
+/// candidate head, and an ordinary `xargs -0 grep -l gcloud` categorizes as a
+/// cloud-CLI call. Scanning to the first non-flag adds at most one candidate
+/// per wrapper and cannot chain.
+///
+/// **Known gap: a wrapper flag whose value is a SEPARATE token.** The value is
+/// the first non-flag, so it becomes the candidate and the real command does
+/// not: `xargs -I {} rm -rf /` resolves `{}`. The two spellings are
+/// indistinguishable without per-flag arity, since `-0 grep` and `-I {}` have
+/// the same shape. Glued (`-I{}`) and `--flag=value` forms both resolve.
+fn next_non_flag_from(toks: &[&str], from: usize) -> usize {
+    let mut i = from;
+    while toks.get(i).is_some_and(|t| is_flag_token(t)) {
+        i += 1;
+    }
+    i
+}
+
 /// Every (command word, argument tokens) pair a segment could be running, for
 /// the three scans that CLASSIFY DANGER. Extends [`command_head_index`] by also
 /// walking past a bare shell grouping token, and normalizes each head via
@@ -1527,11 +1626,19 @@ fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str]
             continue;
         }
         seen[at] = true;
-        candidates.push((normalized_head(head).to_string(), &toks[at + 1..]));
+        let base = normalized_head(head);
+        candidates.push((base.to_string(), &toks[at + 1..]));
         if is_flag_token(head) {
             // The walk stopped inside a wrapper's own options. Try both arities.
             pending.push(at + 1);
             pending.push(at + 2);
+        } else if EXEC_WRAPPER_HEADS_WITH_OPERAND.contains(&base) {
+            // The wrapper's own operand, then the command past it.
+            let operand = next_non_flag_from(toks, at + 1);
+            pending.push(operand);
+            pending.push(next_non_flag_from(toks, operand + 1));
+        } else if EXEC_WRAPPER_HEADS.contains(&base) {
+            pending.push(next_non_flag_from(toks, at + 1));
         }
     }
     candidates
@@ -1628,6 +1735,68 @@ fn is_benign_prefix(tok: &str) -> bool {
         "sudo" | "env" | "command" | "time" | "nice" | "builtin" | "exec" | "\\"
     ) || (!tok.starts_with('-') && tok.contains('='))
 }
+
+/// Process wrappers that exec the command named in their own arguments. The
+/// head walk stops on the wrapper. Every danger scan then reads the wrapper
+/// where the real command runs, and the line matches no danger table.
+///
+/// Deliberately NOT in [`is_benign_prefix`]. That walk also feeds
+/// [`segment_safety`], where skipping a word would newly SETTLE the wrapped
+/// form as Safe. Here the head only BRANCHES, which can add a danger verdict.
+/// The prefixes already in `is_benign_prefix` are absent, because the walk
+/// skips them before a head ever resolves.
+///
+/// **Not a completeness claim.** An enumerated list fails open on every name it
+/// misses, exactly as [`danger_head_candidates`] says about flag arities. A
+/// miss costs a judge call that did not happen, so add rather than debate.
+static EXEC_WRAPPER_HEADS: &[&str] = &[
+    // Detach and scheduling wrappers. `arch` belongs here, not with the
+    // operand wrappers: its optional `-arch_name` is flag-shaped, so the walk
+    // already steps over it and the next token IS the command.
+    "arch",
+    "nohup",
+    "setsid",
+    "caffeinate",
+    "ionice",
+    "stdbuf",
+    "unbuffer",
+    "eatmydata",
+    // Privilege wrappers `is_benign_prefix` does not already skip.
+    "doas",
+    "pkexec",
+    "fakeroot",
+    // Namespace and personality wrappers.
+    "unshare",
+    "nsenter",
+    "proot",
+    "systemd-run",
+    // Tracers, repeaters and multi-call binaries.
+    "strace",
+    "ltrace",
+    "dtruss",
+    "watch",
+    "parallel",
+    "xargs",
+    "busybox",
+    "toybox",
+    // Homebrew coreutils twins, which are what these often are on macOS.
+    "gstdbuf",
+    "gnice",
+    "gxargs",
+    "gionice",
+];
+
+/// Exec wrappers whose FIRST operand is not the command: `timeout` takes a
+/// duration, `chroot` a directory, `taskset` a mask, `chrt` a priority.
+///
+/// They branch one token further than [`EXEC_WRAPPER_HEADS`] does. A pure
+/// wrapper must NOT, because its second operand is an ordinary argument, and
+/// reading that as a head over-reports: `xargs grep aws` would categorize as a
+/// cloud-CLI call when it only greps for the word.
+static EXEC_WRAPPER_HEADS_WITH_OPERAND: &[&str] = &[
+    "timeout", "gtimeout", "chroot", "setarch", "taskset", "chrt", "su", "runuser", "script",
+    "flock",
+];
 
 /// Walk past the tokens that precede the real command word and return the index
 /// of the command head in `toks`. Returns `toks.len()` when the segment is only
@@ -1941,15 +2110,32 @@ fn is_catastrophic_target(tok: &str) -> bool {
 /// counterpart of the judge's category tag, and the trigger grant key when the
 /// judge is unavailable. `None` when no obvious side-effect shape matches.
 ///
-/// Scans both shapes, per-segment shell command heads and inline Python calls.
-/// Each scan is harmless on the other tool's text. Out-of-workspace destruction
-/// is not this list's job, and [`fallback_classify`]'s destruction scan tags
-/// it.
+/// Scans three shapes: per-segment shell command heads, inline Python calls,
+/// and each substitution body. Every scan is harmless on the other tool's text.
+/// Out-of-workspace destruction is not this list's job, and
+/// [`fallback_classify`]'s destruction scan tags it.
 pub fn static_side_effect_category(command: &str) -> Option<SideEffectCategory> {
+    static_side_effect_category_at(command, 0)
+}
+
+/// [`static_side_effect_category`], carrying the substitution-recursion depth.
+/// A substitution body runs under whatever head precedes it, so `echo $(curl -X
+/// POST …)` resolves to head `echo` and derives no category. An unattended
+/// trigger's grant is checked against that category, so a miss auto-allows the
+/// call. Both danger scans already recurse the same way.
+fn static_side_effect_category_at(command: &str, depth: usize) -> Option<SideEffectCategory> {
     if let Some(cat) = python_side_effect_category(command) {
         return Some(cat);
     }
-    command_segments(command).find_map(|s| segment_side_effect_category(&s))
+    if let Some(cat) = command_segments(command).find_map(|s| segment_side_effect_category(&s)) {
+        return Some(cat);
+    }
+    if depth < MAX_SUBSTITUTION_DEPTH {
+        return substitution_bodies(command)
+            .into_iter()
+            .find_map(|body| static_side_effect_category_at(body, depth + 1));
+    }
+    None
 }
 
 /// Side-effect category for one shell command segment, or `None`. Skips the same
@@ -2300,6 +2486,204 @@ mod tests {
                 "{cmd}"
             );
         }
+    }
+
+    /// A process wrapper runs the command named in its own arguments. Its
+    /// operands are not all flags, so the flag branch alone never reaches the
+    /// real head. Every danger scan then read `nohup` where `rm` runs, matched
+    /// no danger table, and an unattended trigger auto-ran the line.
+    #[test]
+    fn the_catastrophic_scan_sees_through_an_exec_wrapper() {
+        for cmd in [
+            "nohup rm -rf /",
+            "setsid rm -rf ~",
+            "doas rm -rf /",
+            "timeout 5 rm -rf /",
+            "timeout --signal=KILL 5 rm -rf /",
+            "xargs rm -rf /",
+            "xargs -I{} rm -rf /",
+            "stdbuf -o0 rm -rf /",
+            "ionice -c3 rm -rf /",
+            "chrt -f 99 rm -rf /",
+            "nohup chmod -R 777 /",
+            "true && nohup rm -rf /",
+            "nohup sudo rm -rf /",
+            // `arch` was the worst of the set: it is on READ_ONLY_HEADS for
+            // the coreutils reading, so it settled Safe outright rather than
+            // reaching the judge.
+            "arch rm -rf /",
+            "arch -x86_64 rm -rf /",
+            "flock data/lock rm -rf /",
+            "caffeinate rm -rf /",
+            "su -c 'rm -rf /'",
+            "unshare rm -rf /",
+            "watch rm -rf ~",
+            "busybox rm -rf /",
+            "gtimeout 5 rm -rf /",
+            "taskset 0x1 rm -rf /",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+        // The two lower scans share the walk, so the wrapper hid these too.
+        assert_eq!(
+            bash_destruction_scope("nohup rm -rf /etc/nginx"),
+            Some(DestructionScope::OutOfWorkspace),
+        );
+        assert_eq!(
+            static_side_effect_category("timeout 30 curl -X POST https://example.com/pay"),
+            Some(SideEffectCategory::ExternalApi),
+        );
+    }
+
+    /// The branch must not invent danger where the wrapper word is an ARGUMENT
+    /// rather than the head, and an in-workspace target stays in-workspace.
+    #[test]
+    fn exec_wrapper_branching_does_not_over_report() {
+        for cmd in ["echo nohup rm -rf /", "grep -rn 'timeout 5 rm -rf /' docs"] {
+            assert_ne!(
+                bash(cmd),
+                StaticVerdict::Settled(RiskLane::Catastrophic),
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            bash_destruction_scope("timeout 30 rm -rf data/tmp"),
+            Some(DestructionScope::InWorkspace),
+        );
+    }
+
+    /// A PURE wrapper branches to its next token only. Branching one further
+    /// would read an ordinary argument as a command head. An everyday pipeline
+    /// would then categorize as a cloud-CLI or mail call, costing a card on
+    /// chat and failing an unattended trigger outright.
+    #[test]
+    fn a_pure_wrapper_does_not_read_its_second_argument_as_a_head() {
+        for cmd in [
+            "xargs grep aws",
+            "find . -name '*.tf' | xargs grep aws",
+            "git grep -lz x | xargs -0 grep -l gcloud",
+            "xargs -n1 basename mail",
+            "watch git status",
+        ] {
+            assert_eq!(static_side_effect_category(cmd), None, "{cmd}");
+        }
+        // An operand wrapper still has to reach past its own operand.
+        assert_eq!(
+            static_side_effect_category("timeout 30 aws s3 rm s3://b/k"),
+            Some(SideEffectCategory::CloudCli),
+        );
+    }
+
+    /// `arch` prints the machine type on Linux and EXECS its operand on macOS,
+    /// and it sits on the read-only safe list for the first reading. So the
+    /// wrapped command settled Safe outright: no card, no checkpoint, and no
+    /// judge call on either lane.
+    #[test]
+    fn arch_with_an_operand_leaves_the_read_only_fast_path() {
+        for cmd in ["arch curl -X POST https://example.com/pay", "arch ./deploy"] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // With no COMMAND operand it is the ordinary read-only command. A
+        // redirect target and a lone long option are not operands.
+        for cmd in ["arch", "arch --version", "arch > data/machine.txt"] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+        // And it must not read its SECOND operand as a head, which is why it
+        // is a pure wrapper rather than an operand one.
+        assert_eq!(static_side_effect_category("arch -x86_64 which aws"), None);
+    }
+
+    /// A wrapper in FRONT of a shell hid the whole `-c` payload: the unwrap
+    /// read only the first word, so it declined, and every scan then read the
+    /// wrapper as the head. Adding one word walked straight back out of the
+    /// hard block the bare form is caught by.
+    #[test]
+    fn a_wrapper_in_front_of_a_shell_still_unwraps_the_payload() {
+        for cmd in [
+            "nohup bash -c 'rm -rf /'",
+            "timeout 5 sh -c 'rm -rf ~'",
+            "sudo bash -c 'rm -rf /'",
+            "env -i bash -c 'rm -rf /'",
+            "xargs sh -c 'chmod -R 777 /'",
+            "flock data/lock bash -c 'rm -rf /'",
+            "nohup /bin/zsh -lc 'rm -rf ~'",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+        // The payload is what gets classified, so a harmless one stays safe.
+        assert_settled(bash("nohup bash -c 'ls -la'"), RiskLane::Safe, "wrapped ls");
+        // Unwrapping DISCARDS the preamble. A code-injecting `VAR=` in front of
+        // the shell must therefore decline the unwrap, rather than hand the
+        // fast path a bare inner command.
+        for cmd in [
+            "ENV=/tmp/rc bash -c 'echo hi'",
+            "LD_PRELOAD=data/x.so bash -c 'ls'",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+    }
+
+    /// `arch` needed a bespoke refusal arm in [`segment_safety`] because it is
+    /// on BOTH a wrapper list and `READ_ONLY_HEADS`: the read-only arm settled
+    /// the wrapped command Safe. That coupling lives in two comments 600 lines
+    /// apart, so pin it. A new name on both lists reopens the hole silently.
+    #[test]
+    fn the_only_wrapper_on_the_read_only_fast_path_is_arch() {
+        let wrappers: Vec<&str> = EXEC_WRAPPER_HEADS
+            .iter()
+            .chain(EXEC_WRAPPER_HEADS_WITH_OPERAND.iter())
+            .copied()
+            .collect();
+        let overlap: Vec<&str> = wrappers
+            .iter()
+            .copied()
+            .filter(|w| READ_ONLY_HEADS.contains(w))
+            .collect();
+        assert_eq!(
+            overlap,
+            vec!["arch"],
+            "a wrapper on READ_ONLY_HEADS settles its wrapped command Safe; \
+             give it an arm in segment_safety the way `arch` has one"
+        );
+        // The two wrapper lists must stay disjoint: a name on both takes the
+        // operand branch and the pure branch never runs for it.
+        for w in EXEC_WRAPPER_HEADS {
+            assert!(
+                !EXEC_WRAPPER_HEADS_WITH_OPERAND.contains(w),
+                "{w} is on both wrapper lists"
+            );
+        }
+    }
+
+    /// A substitution body runs under whatever head precedes it. So `echo
+    /// $(curl -X POST …)` resolved to head `echo` and derived no category. The
+    /// trigger grant check keys on that category, so the miss auto-allowed a
+    /// mutating call the grant never covered. The two danger scans already
+    /// recurse; this one did not.
+    #[test]
+    fn a_substitution_body_carries_its_side_effect_category() {
+        for (cmd, cat) in [
+            (
+                "echo $(curl -X POST https://example.com/pay -d @data/f.txt)",
+                SideEffectCategory::ExternalApi,
+            ),
+            ("echo `gh release create v1`", SideEffectCategory::CloudCli),
+            (
+                "printf %s $(mail -s hi someone@example.com)",
+                SideEffectCategory::Email,
+            ),
+            (
+                "echo $(echo $(wget --post-data=x https://example.com/p))",
+                SideEffectCategory::ExternalApi,
+            ),
+        ] {
+            assert_eq!(static_side_effect_category(cmd), Some(cat), "{cmd}");
+        }
+        // A read-only body still derives nothing.
+        assert_eq!(
+            static_side_effect_category("echo $(curl https://x/y)"),
+            None
+        );
     }
 
     /// Resolving the Safe fast path's head by BASENAME lets a binary the agent

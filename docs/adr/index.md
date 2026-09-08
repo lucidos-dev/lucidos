@@ -180,3 +180,6 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0170: The talker holds three tools: it asks, it answers what is waiting, and it hangs up](0170-the-talker-holds-a-tool-set-and-none-of-it-acts.md)
 - [0171: A cookie header arrives in as many fields as the client likes](0171-a-cookie-header-arrives-in-as-many-fields-as-the-client-likes.md)
 - [0172: A blocked local port is not a dead webhook ingress](0172-a-blocked-port-is-not-a-dead-ingress.md)
+- [0173: The client's window geometry is stored and judged in logical points, because tao's physical pixels are not one space across mixed-DPI monitors](0173-window-geometry-is-logical-points.md)
+- [0174: The client keeps the caller's finished words, so the transcript never blanks between the speaking bubble and the engine's row](0174-a-call-keeps-the-callers-last-sentence.md)
+- [0175: The browser e2e memory guard stops on kernel pressure, not the compressor](0175-e2e-memory-guard-measures-kernel-pressure.md)

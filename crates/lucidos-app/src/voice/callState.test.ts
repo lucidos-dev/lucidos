@@ -215,17 +215,66 @@ describe('who has the floor', () => {
     expect(effects).toEqual([]);
   });
 
-  it('keeps no words of its own, so nothing on screen can go stale', () => {
+  /** A reply being spoken can still be revised or cut off, so captioning one
+   *  is state that can only go stale. The caller's own FINISHED sentence is
+   *  the exception, and it is kept (ADR 0174). */
+  it('keeps no words of the talker, and the caller\'s own only once ended', () => {
     const words = ['what is on today', 'one moment'];
     const { state } = drive(
       [
+        SPOKE,
+        { kind: 'speech', open: false },
         frame({ type: 'user_turn_ended', transcript: words[0] }),
         frame({ type: 'talker_transcript', text: words[1] }),
       ],
       live(),
     );
-    expect(JSON.stringify(state)).not.toContain(words[0]);
+    expect(state.heard).toBe(words[0]);
     expect(JSON.stringify(state)).not.toContain(words[1]);
+  });
+});
+
+/** A frame carries no id and lands well after the caller stopped, so one
+ *  arriving mid-word describes something they have already finished saying.
+ *  Captioning the current bubble with it would show them an earlier sentence
+ *  inside the one they are saying. See ADR 0174. */
+describe('a frame landing mid-word captions nothing', () => {
+  /** Speaking, with the talker having taken the floor over them. */
+  const midWord = () => drive([SPOKE], live()).state;
+
+  it('withholds the caption while the caller is speaking', () => {
+    const { state } = drive(
+      [frame({ type: 'user_turn_ended', transcript: 'an earlier sentence' })],
+      midWord(),
+    );
+    expect(state.heard).toBeNull();
+  });
+
+  it('takes the caller\'s own frame once they stop', () => {
+    const { state } = drive(
+      [
+        frame({ type: 'user_turn_ended', transcript: 'an earlier sentence' }),
+        { kind: 'speech', open: false },
+        frame({ type: 'user_turn_ended', transcript: 'this one' }),
+      ],
+      midWord(),
+    );
+    expect(state.heard).toBe('this one');
+  });
+
+  /** The rule is about the caller still talking, not about the state name. A
+   *  turn the talker answered is settled, and its own frame still captions it. */
+  it('still captions a turn the talker took the floor over', () => {
+    const { state } = drive(
+      [
+        SPOKE,
+        frame({ type: 'talker_transcript', text: 'let me look' }),
+        frame({ type: 'user_turn_ended', transcript: 'what is on today' }),
+      ],
+      live(),
+    );
+    expect(state.utterance).toBe('transcribed');
+    expect(state.heard).toBe('what is on today');
   });
 });
 

@@ -23,6 +23,7 @@ export const MODELS = [
   { value: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
   { value: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
   { value: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+  { value: 'gpt-6-astra', label: 'GPT-6 Astra' },
   { value: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
   { value: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
   { value: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' },
@@ -54,9 +55,13 @@ export const REASONING_LEVELS = [
  *
  *  The heuristic is the fallback for the two cases with no registry answer: the
  *  picker rendering before `/models` lands, and a saved `chat_model` naming an
- *  id with no row. It is deliberately unchanged from when it was the only rule:
- *  - GPT-5.6 (Sol / Terra / Luna): full set — the family adds a distinct `max`
- *    reasoning tier (Sol's headline "Max reasoning effort").
+ *  id with no row. It tracks the engine's per-family answer, family by family,
+ *  so a pre-load picker offers what the request will actually honour:
+ *  - GPT-5.6 (Sol / Terra / Luna) and GPT-6 Astra: full set. Both accept a
+ *    distinct `max` reasoning tier (Sol's headline "Max reasoning effort").
+ *    Matched by name, not by a `gpt-6` prefix: the engine's
+ *    `llm::reasoning::supported_efforts` keeps the same per-family list, since
+ *    a family that tops out at `xhigh` answers `max` with a 400.
  *  - Other OpenAI: drops `max` (their top tier is `xhigh`, so `max` would be a duplicate).
  *  - Fable 5 / Opus 4.7+ (incl. Opus 5) / Sonnet 5: full set (the adaptive Anthropic family that
  *    natively supports `xhigh`). Sonnet 5 is the first Sonnet-tier model with a distinct `xhigh`;
@@ -74,7 +79,7 @@ export function availableReasoningLevels(
     if (offered.length > 0) return offered;
   }
   if (model.startsWith('gpt-')) {
-    if (model.startsWith('gpt-5.6')) return REASONING_LEVELS;
+    if (model.startsWith('gpt-5.6') || model === 'gpt-6-astra') return REASONING_LEVELS;
     return REASONING_LEVELS.filter(l => l.value !== 'max');
   }
   if (

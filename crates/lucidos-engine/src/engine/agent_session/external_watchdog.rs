@@ -411,6 +411,11 @@ impl ExternalWatchdog {
     /// A candidate that produced a fresh event since the snapshot has recovered
     /// on its own — it is left ENTIRELY alone (no cancel, no kill, no drop, no
     /// resume), so the watchdog never terminates a live, progressing session.
+    ///
+    /// A candidate whose map entry a replacement took over gets the subprocess
+    /// half only: the cancel and the suppression flag, which ride its own Arcs.
+    /// It keeps the cancel precisely because its entry is gone, so nothing else
+    /// can reach that subprocess afterwards. See [`owns_session_entry`].
     async fn recover_stuck(&self, candidates: Vec<StuckSession>) {
         let mut to_emit: Vec<StuckSession> = Vec::with_capacity(candidates.len());
         {
@@ -428,6 +433,12 @@ impl ExternalWatchdog {
                     );
                     continue;
                 }
+                // Ownership splits what follows in two, so read it here.
+                // The subprocess half is always owed: `external_terminal` and
+                // `agent_cancel` are this candidate's own handles, and killing a
+                // wedged subprocess is the whole point of the recovery. The
+                // thread half is owed only when the entry is still ours.
+                let ours = owns_session_entry(&sessions, &c);
                 // Order matters: set the suppression flag BEFORE cancelling.
                 // `agent_cancel.cancel()` can wake the driver_task / run_session
                 // teardown on another worker, and that path checks
@@ -444,12 +455,31 @@ impl ExternalWatchdog {
                 // cancel), so a conflict-resolution session hands its merge
                 // duty off instead of aborting the apply and tearing down the
                 // merge worktree under the continuation we're about to emit.
-                c.external_continuation
-                    .store(true, std::sync::atomic::Ordering::Release);
+                //
+                // That flag is the half a replacement forfeits: it promises a
+                // `ContinuationRequested` that only the `to_emit` push below
+                // sends. Setting it and then declining to emit strands the
+                // wedged session's completion in a hand-off to nothing.
+                if ours {
+                    c.external_continuation
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 c.external_terminal
                     .store(true, std::sync::atomic::Ordering::Release);
                 c.agent_cancel.cancel();
                 c.idle_notify.notify_waiters();
+                if !ours {
+                    // A recovery-mode spawn took this thread over since the
+                    // snapshot. Its entry and its turn are not ours to end, and
+                    // the wedged subprocess above is now cancelled either way.
+                    log!(
+                        "[ExternalWatchdog] thread={} was taken over by a replacement session \
+                         since the snapshot: cancelled the wedged subprocess, left the \
+                         replacement's entry and its turn alone",
+                        c.thread_id,
+                    );
+                    continue;
+                }
                 sessions.remove(&c.thread_id);
                 to_emit.push(c);
             }
@@ -475,6 +505,29 @@ impl ExternalWatchdog {
             .await;
         }
     }
+}
+
+/// Is the map entry for this candidate's thread still the session the snapshot
+/// pass saw?
+///
+/// A recovery-mode spawn (`recovery_worktree: Some(..)`) skips the
+/// already-running guard, so it can insert a replacement over this thread's
+/// entry in the window since the snapshot.
+///
+/// It gates the THREAD-scoped half of the recovery, and only that half.
+/// Removing a replacement's entry strands a live subprocess no watchdog can
+/// see, and a `ContinuationRequested` beside it spawns a second agent on the
+/// same worktree. `external_continuation` goes with them, because it promises
+/// the emit. The cancel and `external_terminal` ride the candidate's own Arcs
+/// and are still owed: the wedged subprocess has to die either way.
+///
+/// `last_event_at` is a live handle to the snapshotted session, so pointer
+/// identity answers the question exactly. It is the watchdog's form of the
+/// question `SessionEntryGuard` answers with `same_channel`.
+fn owns_session_entry(sessions: &HashMap<Uuid, AgentSession>, c: &StuckSession) -> bool {
+    sessions
+        .get(&c.thread_id)
+        .is_some_and(|s| Arc::ptr_eq(&s.last_event_at, &c.last_event_at))
 }
 
 /// One stuck-session snapshot — produced by tick's first pass, consumed by

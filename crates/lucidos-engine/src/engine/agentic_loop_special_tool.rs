@@ -160,6 +160,31 @@ pub(crate) fn spawn_origin(
     })
 }
 
+/// Longest argument dump an MCP permission card carries. Past it the summary is
+/// clamped, so neither the card nor the persisted payload is unbounded.
+const MCP_ARGS_SUMMARY_LIMIT: usize = 500;
+
+/// The argument text an `McpPermissionRequested` card shows, and the same text
+/// the event payload keeps and SSE broadcasts.
+///
+/// Redacted before it is written down. A connection string reaches an MCP tool
+/// as an ordinary argument, and the event row is immutable. Every sibling
+/// permission lane scrubs the same way: see `command_permission`'s
+/// `redact_postgres_secrets` and `cc_permission`'s JSON walk.
+fn mcp_arguments_summary(tool_args: &serde_json::Value) -> String {
+    let mut redacted = tool_args.clone();
+    crate::core::redact_postgres_secrets_in_json(&mut redacted);
+    let text = serde_json::to_string_pretty(&redacted).unwrap_or_else(|_| redacted.to_string());
+    if text.len() > MCP_ARGS_SUMMARY_LIMIT {
+        format!(
+            "{}...",
+            &text[..text.floor_char_boundary(MCP_ARGS_SUMMARY_LIMIT)]
+        )
+    } else {
+        text
+    }
+}
+
 fn coding_agent_label(agent: crate::runtime::CodingAgent) -> &'static str {
     match agent {
         crate::runtime::CodingAgent::ClaudeCode => "Claude Code",
@@ -758,16 +783,7 @@ impl LucidosEngine {
             // ask the user (in-thread `McpPermissionRequested` card), which also
             // honors a prior session / `mcp-allowed-tools` grant.
             if let McpGate::Ask = mcp_gate(auto_approve, meta.channel) {
-                let args_summary = serde_json::to_string_pretty(tool_args)
-                    .unwrap_or_else(|_| tool_args.to_string());
-                let args_summary = if args_summary.len() > 500 {
-                    format!(
-                        "{}...",
-                        &args_summary[..args_summary.floor_char_boundary(500)]
-                    )
-                } else {
-                    args_summary
-                };
+                let args_summary = mcp_arguments_summary(tool_args);
 
                 if let McpAsk::Refuse(refusal) = self
                     .ask_mcp_permission(
@@ -1247,6 +1263,33 @@ fn intent_narration_to_surface(content: Option<&str>) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The summary is persisted into the event payload and broadcast over SSE.
+    /// A connection string in a tool argument was written down in the clear.
+    /// Every sibling permission lane scrubs first.
+    #[test]
+    fn mcp_arguments_summary_redacts_a_postgres_password() {
+        let args = json!({
+            "conn": "postgresql://app:hunter2@db.example.com/prod",
+            "nested": { "url": "postgres://u:s3cr3t@h/db" },
+            "sql": "SELECT 1",
+        });
+        let summary = mcp_arguments_summary(&args);
+        assert!(!summary.contains("hunter2"), "{summary}");
+        assert!(!summary.contains("s3cr3t"), "{summary}");
+        assert!(summary.contains("app:***@"), "{summary}");
+        assert!(summary.contains("SELECT 1"), "{summary}");
+    }
+
+    /// The clamp keeps the card and the payload bounded, and must land on a
+    /// character boundary rather than mid-codepoint.
+    #[test]
+    fn mcp_arguments_summary_clamps_on_a_char_boundary() {
+        let args = json!({ "note": "æ".repeat(2000) });
+        let summary = mcp_arguments_summary(&args);
+        assert!(summary.len() <= 503, "{}", summary.len());
+        assert!(summary.ends_with("..."));
+    }
 
     #[test]
     fn intent_narration_surfaces_real_prose() {

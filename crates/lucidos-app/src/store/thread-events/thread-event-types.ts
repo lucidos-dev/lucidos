@@ -315,8 +315,10 @@ export type StoredEvent = ThreadEvent & {
   _displayCreated?: string;
   _eventId?: string;
   /** Marks the one synthetic event nothing on the engine will ever write: the
-   *  caller's utterance while they are still saying it. See *live utterance*
-   *  in `docs/glossary.md`. */
+   *  caller's utterance before the engine's own row for it exists. Its `text`
+   *  is empty while they are still speaking, and their words from the instant
+   *  the provider transcribes them. See *live utterance* in
+   *  `docs/glossary.md`. */
   _liveUtterance?: true;
 };
 

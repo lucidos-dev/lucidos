@@ -45,8 +45,13 @@ use crate::api::standing_instruction::carries_standing_instruction;
 pub(crate) enum ThreadReachVerb {
     Archive,
     Cancel,
+    /// Driving a live coding-agent session: interrupt it, or change its model,
+    /// reasoning effort or permission mode (`POST /api/v1/claude-code/control`).
+    /// Controlling another thread's session is as much a reach as cancelling it.
+    Control,
     Apply,
     Discard,
+    Revert,
     AnswerQuestion,
     Continue,
     /// Creating a thread with no parent, which aims at the workspace root. The
@@ -65,8 +70,10 @@ impl ThreadReachVerb {
         match self {
             Self::Archive => "archive",
             Self::Cancel => "cancel",
+            Self::Control => "control the session on",
             Self::Apply => "apply a change from",
             Self::Discard => "discard a change from",
+            Self::Revert => "revert a change from",
             Self::AnswerQuestion => "answer a question card on",
             Self::Continue => "restart the turn on",
             Self::CreateTopThread => "create a top-thread beside",
@@ -81,8 +88,10 @@ impl ThreadReachVerb {
         match self {
             Self::Archive => "archiving a thread",
             Self::Cancel => "cancelling a turn",
+            Self::Control => "controlling a session",
             Self::Apply => "applying a change",
             Self::Discard => "discarding a change",
+            Self::Revert => "reverting a change",
             Self::AnswerQuestion => "answering a question card",
             Self::Continue => "restarting a turn",
             Self::CreateTopThread => "creating a top-thread",

@@ -907,3 +907,135 @@ async fn orphan_pass_settles_only_after_the_agents_own_output_goes_quiet() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// A candidate snapshotted from `session`, carrying the live Arcs the mutate
+/// pass re-reads.
+fn stuck_from(thread_id: Uuid, session: &AgentSession) -> super::StuckSession {
+    super::StuckSession {
+        thread_id,
+        elapsed_ms: ORPHAN_LIMIT_MS,
+        external_terminal: session.external_terminal_emitted.clone(),
+        external_continuation: session.external_continuation_requested.clone(),
+        idle_notify: session.idle_notify.clone(),
+        agent_cancel: session.agent_cancel.clone(),
+        last_event_at: session.last_event_at.clone(),
+        snapshot_last_ms: 0,
+        needs_running_check: false,
+    }
+}
+
+/// The mutate pass removes the map entry and emits a `ContinuationRequested`,
+/// and both address the THREAD rather than the snapshotted session. A
+/// recovery-mode spawn can insert a replacement in that window. Removing its
+/// entry would strand a live subprocess neither watchdog can see, and the
+/// continuation would spawn a second agent on the same worktree.
+#[test]
+fn a_replacement_session_is_not_this_candidates_entry() {
+    let thread_id = Uuid::new_v4();
+    let (snapshotted, _snapshotted_rx) = AgentSession::for_test();
+    let candidate = stuck_from(thread_id, &snapshotted);
+
+    let mut sessions = HashMap::new();
+    sessions.insert(thread_id, snapshotted);
+    assert!(
+        super::owns_session_entry(&sessions, &candidate),
+        "the entry the candidate was snapshotted from is its own"
+    );
+
+    let (replacement, _replacement_rx) = AgentSession::for_test();
+    sessions.insert(thread_id, replacement);
+    assert!(
+        !super::owns_session_entry(&sessions, &candidate),
+        "a replacement registered since the snapshot is not this candidate's session"
+    );
+
+    sessions.remove(&thread_id);
+    assert!(
+        !super::owns_session_entry(&sessions, &candidate),
+        "an entry another pass already reaped is not ours either"
+    );
+}
+
+/// A replacement session took the thread over between the snapshot and the
+/// mutate pass, so the recovery splits. The wedged subprocess is still
+/// cancelled: its entry is gone, so nothing else can reach it. The
+/// replacement's entry and its turn are left alone, because emitting a
+/// continuation beside a live one is the double-process bug this prevents.
+#[tokio::test]
+async fn recover_stuck_cancels_the_wedged_subprocess_but_spares_a_replacement() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let bus = Arc::new(bus);
+
+    let limit_ms = 50;
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(&bus, thread_id).await;
+
+    let snapshot_last_ms = stale_for(limit_ms);
+    let (wedged, _wedged_rx) = make_session(snapshot_last_ms);
+    let cancel = wedged.agent_cancel.clone();
+    let external_terminal = wedged.external_terminal_emitted.clone();
+    let external_continuation = wedged.external_continuation_requested.clone();
+    let candidate = super::StuckSession {
+        thread_id,
+        elapsed_ms: 0,
+        external_terminal: external_terminal.clone(),
+        external_continuation: external_continuation.clone(),
+        idle_notify: wedged.idle_notify.clone(),
+        agent_cancel: cancel.clone(),
+        last_event_at: wedged.last_event_at.clone(),
+        snapshot_last_ms,
+        needs_running_check: false,
+    };
+
+    // The map now holds somebody else: a recovery-mode spawn inserted over it.
+    let (replacement, _replacement_rx) = make_session(snapshot_last_ms);
+    let replacement_last_event = replacement.last_event_at.clone();
+    let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    sessions.lock().await.insert(thread_id, replacement);
+
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
+    watchdog.recover_stuck(vec![candidate]).await;
+
+    assert!(
+        cancel.is_cancelled(),
+        "the wedged subprocess must still be killed: its entry is gone, so no \
+         later tick, Stop or shutdown sweep can reach it"
+    );
+    assert!(
+        external_terminal.load(std::sync::atomic::Ordering::Acquire),
+        "suppress the wedged loop's own terminal, which would land on the \
+         replacement's live turn"
+    );
+    assert!(
+        !external_continuation.load(std::sync::atomic::Ordering::Acquire),
+        "the continuation flag promises a ContinuationRequested this path does \
+         not emit, so it must stay unset"
+    );
+
+    let guard = sessions.lock().await;
+    let entry = guard
+        .get(&thread_id)
+        .expect("replacement entry must survive");
+    assert!(
+        Arc::ptr_eq(&entry.last_event_at, &replacement_last_event),
+        "the surviving entry must be the replacement's, not a rebuilt one"
+    );
+    drop(guard);
+
+    assert_eq!(
+        count_continuation_requests(&pool, thread_id).await,
+        0,
+        "a replacement is already running this thread: a second --resume would \
+         put two agents on one worktree"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

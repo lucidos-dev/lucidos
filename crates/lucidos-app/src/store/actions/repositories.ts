@@ -4,7 +4,7 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
-  threadMap, type RepoDiff, type RepoLocator,
+  threadMap, type RepoDiff, type RepoLocator, type Repository,
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
@@ -209,13 +209,32 @@ async function ensureRepositoriesLoaded(): Promise<boolean> {
   return true;
 }
 
+/** The registered `Repository` whose root is `path`, or null.
+ *
+ *  A miss re-reads the registry before answering. `repositories` is a cached
+ *  projection refreshed by `Repository*` SSE. A repo registered moments ago by
+ *  a sibling thread, by `manage_repositories`, or at engine startup therefore
+ *  leaves it stale. Answering "no" off that cache reports a live repo as
+ *  unregistered, which `.claude/rules/frontend.md` forbids. Mirrors
+ *  `navigateToTrigger`.
+ *
+ *  The re-read hands the snapshot back if it fails. A blip on this second read
+ *  must not turn a loaded registry into `failed` for every other surface. */
+async function findRegisteredRepo(path: string): Promise<Repository | null> {
+  const hit = loadedOr(repositories.value, []).find(r => r.path === path);
+  if (hit) return hit;
+  const snapshot = repositories.value;
+  await loadRepositories();
+  if (repositories.value.status === 'failed') repositories.value = snapshot;
+  return loadedOr(repositories.value, []).find(r => r.path === path) ?? null;
+}
+
 /** Load the repo + diff state for a change without touching navigation/overlay.
  *  Used to restore diff context after a reload, when the panel overlay was
  *  re-hydrated from nav history but its repoDiff/repoSource backing state was lost. */
 export async function loadChangeContext(change: Change): Promise<void> {
   if (!(await ensureRepositoriesLoaded())) return;
-  const repos = loadedOr(repositories.value, []);
-  const repo = repos.find(r => r.path === change.repo_root);
+  const repo = await findRegisteredRepo(change.repo_root);
   if (!repo) {
     // No registered Repository matches change.repo_root — app coding-agent
     // changes use the workspace root, and a change whose repo was later removed
@@ -386,8 +405,7 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
     return;
   }
 
-  const repos = loadedOr(repositories.value, []);
-  const repo = repos.find(r => r.path === diff.repo_root);
+  const repo = await findRegisteredRepo(diff.repo_root);
 
   if (!repo) {
     const meta = threadMap.value.get(threadId)?.meta;

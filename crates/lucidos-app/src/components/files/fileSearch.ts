@@ -6,6 +6,15 @@ export interface FileSearchResult {
   changeStatus?: string;
 }
 
+/** The pending changes this surface can actually open.
+ *
+ *  A `change` row opens through `openRepoFilePreview`, which needs a bound
+ *  repository and returns silently without one. Offer them only where they
+ *  lead somewhere. */
+export function openableChangeFiles<T>(files: T[], hasRepo: boolean): T[] {
+  return hasRepo ? files : [];
+}
+
 /** Collect searchable files from workspace, repo, and change sources.
  *  Deduplicates within the repo and change categories (workspace paths come
  *  from a disk listing that is already unique); the same path may appear in

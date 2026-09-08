@@ -423,6 +423,7 @@ Run the test suites for the layers touched on this branch.
 Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:
 
 - `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
+- `crates/lucidos-app/src/**/*.rs` → also `cargo test --locked -p lucidos-app --lib` (`make test` runs the ENGINE crate alone, so the client's own unit tests run nowhere else; seconds, no Postgres)
 - `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`

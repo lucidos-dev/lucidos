@@ -67,7 +67,7 @@ describe('the row lands under everything, and moves nothing', () => {
   it('draws at the bottom while a doer turn is still working', () => {
     const quiet = computeExchanges(withADoerWorking());
     const thread = withADoerWorking();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     const speaking = computeExchanges(thread);
 
     expect(speaking).toHaveLength(quiet.length + 1);
@@ -77,14 +77,14 @@ describe('the row lands under everything, and moves nothing', () => {
 
   it('leaves the working turn every step it had', () => {
     const thread = withADoerWorking();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     const [turn] = computeExchanges(thread);
     expect(turn.steps.map(s => s.event.type)).toEqual(['TextStreamed', 'ToolCalled']);
   });
 
   it('keys on its own id, so it is one node rather than a remount per frame', () => {
     const thread = withADoerWorking();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     const row = computeExchanges(thread)[1];
     expect(row.userEvent._eventId).toBe(SPEAKING.eventId);
   });
@@ -124,7 +124,7 @@ describe('the fold cannot see it', () => {
   it('folds a re-anchoring call the same way with a caller mid-sentence', () => {
     const quiet = computeExchanges(aReanchoringCall());
     const thread = aReanchoringCall();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     const speaking = computeExchanges(thread);
     expect(speaking.slice(0, -1)).toEqual(quiet);
   });
@@ -133,7 +133,7 @@ describe('the fold cannot see it', () => {
 describe('the row holds no turn', () => {
   function speakingOverADoer(): ThreadState {
     const thread = withADoerWorking();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     return thread;
   }
 
@@ -164,7 +164,7 @@ describe('the row holds no turn', () => {
       status: 'idle',
     });
     expect(effectiveThreadStatus(idle)).toBe('idle');
-    idle.liveUtterance = SPEAKING;
+    idle.liveUtterances = [SPEAKING];
     expect(effectiveThreadStatus(idle)).toBe('idle');
   });
 });
@@ -172,14 +172,14 @@ describe('the row holds no turn', () => {
 describe('the words replace the row', () => {
   function threadWithARow(): Map<string, ThreadState> {
     const thread = withADoerWorking();
-    thread.liveUtterance = SPEAKING;
+    thread.liveUtterances = [SPEAKING];
     return new Map([[THREAD, thread]]);
   }
 
   it('goes when the talker answered the caller alone', () => {
     const map = threadWithARow();
     handleEvent(map, THREAD, 9, { type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'and the tests' } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
-    expect(map.get(THREAD)?.liveUtterance).toBeNull();
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   it('goes when the talker delegated it instead', () => {
@@ -191,7 +191,7 @@ describe('the words replace the row', () => {
       channel: 'chat',
       voice_session_id: 'sess-1',
     } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
-    expect(map.get(THREAD)?.liveUtterance).toBeNull();
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   /** The engine holds one utterance at a time, so a caller who barges in has a
@@ -204,17 +204,17 @@ describe('the words replace the row', () => {
       count: 2,
       created: '2026-08-31T07:16:02Z',
     };
-    thread.liveUtterance = second;
+    thread.liveUtterances = [second];
     const map = new Map([[THREAD, thread]]);
     const spoken = (seq: number, text: string): void => {
       handleEvent(map, THREAD, seq, { type: 'SpokenMessageReceived', session_id: 'sess-1', text } as StoredEvent, `2026-08-31T07:16:0${seq}Z`, `e-${seq}`);
     };
 
     spoken(9, 'what is going on today');
-    expect(map.get(THREAD)?.liveUtterance).toEqual(second);
+    expect(map.get(THREAD)?.liveUtterances).toEqual([second]);
 
     spoken(10, 'and the tests');
-    expect(map.get(THREAD)?.liveUtterance).toBeNull();
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   /** A message somebody typed mid-call says nothing about what is being said
@@ -227,7 +227,7 @@ describe('the words replace the row', () => {
       mode: 'human',
       channel: 'chat',
     } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
-    expect(map.get(THREAD)?.liveUtterance).toEqual(SPEAKING);
+    expect(map.get(THREAD)?.liveUtterances).toEqual([SPEAKING]);
   });
 });
 
@@ -309,10 +309,10 @@ describe('the live wiring', () => {
       utterance: 'live',
       utteranceCount: 1,
     };
-    expect(threadMap.value.get(THREAD)?.liveUtterance?.count).toBe(1);
+    expect(threadMap.value.get(THREAD)?.liveUtterances?.[0].count).toBe(1);
 
     voiceCall.value = CALL_IDLE;
-    expect(threadMap.value.get(THREAD)?.liveUtterance).toBeNull();
+    expect(threadMap.value.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   /** A second call counts from one again, so the tally of landed words starts
@@ -331,7 +331,7 @@ describe('the live wiring', () => {
       utteranceCount: 1,
     };
     expect(thread.settledUtterances).toBe(0);
-    expect(thread.liveUtterance?.count).toBe(1);
+    expect(thread.liveUtterances?.[0].count).toBe(1);
     voiceCall.value = CALL_IDLE;
   });
 });

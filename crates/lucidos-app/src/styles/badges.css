@@ -1,0 +1,94 @@
+/* ── Where a number sits inside its badge ─────────────────────────────────
+ *
+ * One rule for every badge carrying a number or a sign, because they all had
+ * the same bug. Each centred its text LINE BOX, and a line box is not the
+ * digits: the baseline sits wherever the font's ascent and descent put it, and
+ * those are asymmetric. So the digits rode high in every badge, and the two
+ * engines disagreed about how high. Measured over the whole set, the worst was
+ * 1.55px off in Chromium and 0.48px in WebKit, which is the same badge drawn
+ * differently on iOS and on Chrome.
+ *
+ * `text-box-trim` takes the font metrics out of the question. It trims the
+ * line box down to the cap band, so the thing being centred IS the digits.
+ * That drops the worst badge to 0.05px on both engines, and no badge changes
+ * size.
+ *
+ * Imported LAST (see main.tsx), which is also why it can be one rule: these
+ * badges come from six stylesheets, five of which set their own `display`, so
+ * a later file re-homes their centring without doubling every selector.
+ * `styles/__tests__/badge-glyph-centring.test.ts` holds that position. */
+
+/* ── And where it sits ACROSS the badge ───────────────────────────────────
+ *
+ * `letter-spacing` is added after EVERY character, the last one included. So a
+ * centred box carries one trailing gap with no glyph after it, and centring
+ * that box parks the digits half a gap to the left.
+ *
+ * One badge inherits any today: the collapsed-section count, from the 0.05em
+ * its section title wears. The title's font is the larger of the two, so the
+ * pill inherits 6.5% of its OWN em. At 200% ui-scale that put the digits
+ * 0.65px left of the pill's middle, about two device pixels on a phone, and
+ * plain enough to be reported.
+ *
+ * `normal` rather than a compensating margin, because a count is data and not
+ * a heading. Tracking belongs to the uppercase title; the pill has no use for
+ * it, and the pill is content-sized, so it simply comes in a little tighter.
+ * Stated for every badge, so the next one to land inside a tracked host does
+ * not acquire the lean. NOT gated below: this half needs no new feature. */
+.badge,
+.drawer-view-count,
+.collapse-count-badge,
+.drawer-badge,
+.brand-menu-ws-badge,
+.ws-picker-badge,
+.thread-status-question-badge {
+    letter-spacing: normal;
+}
+
+/* Gated on support, so a browser without `text-box-trim` keeps exactly the
+   flex centring each badge already declares. Nothing to fall back to, and
+   nothing lost by waiting for it. */
+@supports (text-box-trim: trim-both) {
+    /* The trim applies to the block container holding the text. A flex
+       container's text lives in an ANONYMOUS item, which inherits none of it,
+       so each badge stops being a flex box and `align-content` takes over the
+       job `align-items` was doing.
+
+       `inline-block` rather than `block`: every badge here is absolutely
+       positioned or a flex item, so both blockify to the same shrink-to-fit
+       box, and this is the one that also survives a badge landing in a plain
+       line of text. */
+    .badge,
+    .drawer-view-count,
+    .collapse-count-badge,
+    .drawer-badge,
+    .brand-menu-ws-badge,
+    .ws-picker-badge,
+    .thread-status-question-badge {
+        display: inline-block;
+        text-align: center;
+        align-content: center;
+        text-box-trim: trim-both;
+        text-box-edge: cap alphabetic;
+    }
+
+    /* These two take their HEIGHT from the line box the trim shrinks, so they
+       would lose a few pixels of pill. `1lh` IS that line box, stated, so each
+       keeps the exact box it has today at any font or ui-scale. Every other
+       badge already states a `height` or a `min-height`. */
+    .collapse-count-badge,
+    .brand-menu-ws-badge {
+        min-height: 1lh;
+    }
+
+    /* The one badge whose content is not text. While the engine is building,
+       the brand badge holds a spinning glyph instead of the "!", and a line box
+       trimmed to a cap band it has no part in would park it off centre. It
+       keeps the flex centring. */
+    .badge:has(.brand-badge-spinner) {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-box-trim: none;
+    }
+}

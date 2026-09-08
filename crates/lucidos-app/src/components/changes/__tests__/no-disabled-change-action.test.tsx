@@ -31,7 +31,7 @@ vi.mock('../../../store/actions/chat-changes', async (importOriginal) => ({
   disarmAllStandingApplies: disarmAll,
 }));
 
-import { ChangesView } from '../ChangesView';
+import { ChangesView, SWEEP_ONLY_TIP } from '../ChangesView';
 import { getStandingApplyControl } from '../../chat/WaitingBanner';
 import {
   changes,
@@ -221,14 +221,15 @@ describe('the Changes panel bulk control', () => {
     expect(disarmAll).toHaveBeenCalledTimes(1);
   });
 
-  // The one disabled face this control has is progress, not a blocked action.
-  // A tooltip on it would be unreachable, which is the whole disabled ban.
-  it('drops the tooltip on the in-flight face, which nobody could read', () => {
+  // Two faces, never a third. It arms, so it has no progress of its own to
+  // report: a press lands on the armed face. Apply All's "Applying..." belongs
+  // to a batch this press never starts.
+  it('keeps its own face and its tooltip while the arm is in flight', () => {
     applyAllInProgress.value = true;
     render(<ChangesView />, host);
-    expect(bulkButton().textContent).toBe('Applying...');
-    expect(bulkButton().disabled).toBe(true);
-    expect(bulkButton().hasAttribute('data-tooltip')).toBe(false);
+    expect(bulkButton().textContent).toBe('Apply as they settle');
+    expect(bulkButton().disabled).toBe(false);
+    expect(bulkButton().getAttribute('data-tooltip')).toBe(SWEEP_ONLY_TIP);
   });
 
   it('keeps the armed face live while a batch runs, so the off is reachable', () => {

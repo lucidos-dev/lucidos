@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs } from '../../store/store';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents, threadLoadInFlightMs } from '../../store/actions/thread-loading';
@@ -14,6 +14,7 @@ import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, exchangeResponseEvents, hasContentEvents } from '../../store/thread-events';
+import { statusLabel } from '../../store/exchange-status';
 import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isElementVisible, isNavigationScroll, deepLinkRenderAll } from './scrollState';
 import { MAX_FILL_EXPANSIONS, WHOLE_THREAD, canSeedRenderWindow, deepLinkMustPersist, edgeHasMoreAbove, edgeMustReachIndex, exchangeRenderCost, expandWindowEdge, seedWindowEdge, windowNeedsFill, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type WindowEdge } from './threadWindow';
 import { useScrollMemory, threadScrollKey, readSavedScroll } from '../../hooks/useScrollMemory';
@@ -174,6 +175,7 @@ export type EmptyReason =
     | { kind: 'failed'; threadId: string }
     | { kind: 'corrupt'; threadId: string }
     | { kind: 'disconnected'; threadId: string }
+    | { kind: 'working' }
     | { kind: 'empty' };
 
 /** Derive the empty reason from thread state. During the compose→thread send
@@ -196,10 +198,19 @@ export function emptyReason(
     hasContent: boolean,
     threadId: string,
     disconnected: boolean,
+    /** Is a turn running on this thread right now? Default `false`, so the many
+     *  existing callers that only ever describe a settled thread are unchanged. */
+    turnInFlight: boolean = false,
 ): EmptyReason {
     if (animating) return { kind: 'animating' };
     if (eventsLoadFailed) return { kind: 'failed', threadId };
     if (eventsLoaded && hasContent) return { kind: 'corrupt', threadId };
+    // Loaded, nothing to draw, and work is running. That is not an empty
+    // thread, and "No messages in this thread" over a live turn is the blank
+    // this whole change exists to stop. Two ways in: a voice thread whose
+    // first content event has yet to be written, and a thread opened fresh
+    // mid-turn. See docs/plans/2026-09-05-a-turn-is-never-blank.md.
+    if (eventsLoaded && turnInFlight) return { kind: 'working' };
     if (eventsLoaded) return { kind: 'empty' };
     // The thread never loaded AND the engine is unreachable (the dot is red). Show
     // an honest "can't reach this workspace" state instead of a spinner that
@@ -218,7 +229,20 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
     // scroll container. This component only owns the terminal text states + the
     // 8s "stuck load" reload affordance (a delay-only fuse).
     const showReload = useDelayedFlag(reason.kind === 'loading', RELOAD_TIMEOUT);
+    return threadEmptyStateBody(reason, showReload);
+}
 
+/** What a transcript with no exchanges draws, as a pure function of the reason
+ *  and the one clock above it.
+ *
+ *  Split out of the component so the invariant over it can be enumerated
+ *  without a DOM: `the-transcript-is-never-blank.test.tsx` walks every arm and
+ *  asserts each one says something. Only two are allowed to say nothing, and
+ *  both are named there.
+ *
+ *  Exported ONLY for that test, which is why it takes its clock rather than
+ *  reading one. Render it through `ThreadEmptyState`. */
+export function threadEmptyStateBody(reason: EmptyReason, showReload: boolean) {
     switch (reason.kind) {
         case 'animating':
             // Content is gated by the compose→thread send FLIP, not a DB fetch —
@@ -255,6 +279,20 @@ function ThreadEmptyState({ reason }: { reason: EmptyReason }) {
                 </div>
             );
         }
+        case 'working':
+            // Nothing has been written down yet, but a turn is running. It
+            // wears the same running-text shimmer a turn's own header wears,
+            // so the two read as one affordance rather than two loaders.
+            //
+            // The word comes from `statusLabel`, never a literal. A transcript
+            // with no turns yet must not say something different from the turn
+            // that appears under it a moment later. No steps have arrived by
+            // construction here, which is "Requesting".
+            return (
+                <div class="thread-empty-state">
+                    <p class="running-shimmer">{statusLabel('pending', false).label}</p>
+                </div>
+            );
         case 'empty':
             return (
                 <div class="thread-empty-state">
@@ -1187,7 +1225,7 @@ export function ThreadView() {
                     <MobileThreadTitleBar />
 
                     {exchanges.length === 0 ? (
-                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected')} />
+                        <ThreadEmptyState key={threadId} reason={emptyReason(animating, eventsLoaded, eventsLoadFailed, hasContentEvents(eventThread.events), threadId!, connectionStatus.value === 'disconnected', isMidTurn(effectiveThreadStatus(eventThread)))} />
                     ) : (
                         renderExchanges(exchanges, threadId!, streamingBuffer, renderFromIndex, edge.rowsHidden)
                     )}

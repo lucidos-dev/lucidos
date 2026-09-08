@@ -62,6 +62,12 @@ async fn the_write_then_execute_chain_is_refused() {
     let edited_rel = format!("scripts/auth/{}.py", edited);
     let benign = "import json\nprint(json.dumps({\"headers\": {}, \"expires_in\": 60}))\n";
 
+    // This test creates and DELETES non-ignored files under the workspace
+    // (`data/scripts/auth/*.py`, `data/config/apis.json`). A file disappearing
+    // mid-scan makes the command-checkpoint test's whole-tree `git add -A` fail,
+    // so hold the tree read guard for the whole test; see `workspace_tree_lock`.
+    let _tree = crate::support::workspace_tree_lock().read().await;
+
     // Step 1: land the Python files. Allowed, deliberately: ADR 0144 guards
     // what runs, not what is written.
     assert_eq!(

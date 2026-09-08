@@ -619,7 +619,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
   // The caller is mid-sentence, so nothing is in flight behind this bubble and
   // no panel belongs under it. It draws the bubble and stops there.
-  const isLiveUtterance = isLiveUtteranceRow(exchange.userEvent);
+  //
+  // Once the words are on the row, something IS in flight: the engine is
+  // holding them while the talker decides. So the panel comes back, carrying
+  // the Requesting shimmer directly under the caller's own turn. That is what
+  // keeps the transcript non-empty for the whole wait (ADR 0174).
+  const isLiveUtterance = isLiveUtteranceRow(exchange.userEvent) && !userMessage;
   // The trash button lives INSIDE the status label, an existing `display: flex`
   // row, rather than in a separate wrapper. "Queued" and the trash then stay on
   // one line using only CSS that already ships.
@@ -850,6 +855,12 @@ function sameStepSeqs(a: Set<number> | undefined, b: Set<number> | undefined): b
   return true;
 }
 
+/** The words in a user bubble, for the fingerprint below. */
+function userBubbleText(exchange: Exchange): string | undefined {
+  const ev = exchange.userEvent;
+  return ev.type === 'MessageReceived' ? ev.text : undefined;
+}
+
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
  *
  *  Default `memo` shallow-compares props, and a from-scratch `computeExchanges`
@@ -898,6 +909,13 @@ export function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
+  // The one row whose TEXT moves under a stable identity: the caller's own
+  // bubble, rewritten the instant the provider transcribes it (ADR 0174).
+  // Every other term here holds across that swap, so without this the memo
+  // keeps drawing the pulse over words the reader could be reading. A
+  // persisted event is immutable and identity-stable, so this compare is a
+  // reference check everywhere else.
+  if (userBubbleText(a) !== userBubbleText(b)) return false;
   if (a.questionOvertaken !== b.questionOvertaken) return false;
   if (a.continuationMoved !== b.continuationMoved) return false;
   if (a.steps.length !== b.steps.length) return false;
@@ -1151,10 +1169,20 @@ export function describeInitiator(
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   // Ahead of the switch, because the row wears a `MessageReceived` and would
-  // otherwise take that arm and draw an empty bubble. The caller is speaking
-  // and no words exist yet, so the bubble holds a pulse where they will go.
+  // otherwise take that arm's origin reasoning on a row that has no origin.
+  //
+  // Two shapes, one row. While the caller is speaking there are no words, so
+  // the bubble holds a pulse where they will go. Once the provider ends the
+  // turn the words are there. The bubble is then the one a spoken message
+  // gets, because that is what the row now is. The swap costs no round trip
+  // and no frame (ADR 0174).
   if (isLiveUtteranceRow(ev)) {
-    return youInitiator({ details: <LiveUtteranceBody />, status: <SpokenChip /> });
+    return youInitiator({
+      details: userMessageHtml
+        ? <UserMessageBody html={userMessageHtml} imageHashes={[]} />
+        : <LiveUtteranceBody />,
+      status: <SpokenChip />,
+    });
   }
   const summary = initiatorSummary(ev);
   switch (ev.type) {

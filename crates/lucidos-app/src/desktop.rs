@@ -2609,6 +2609,7 @@ mod tests {
                 .iter()
                 .map(|(id, frame)| (id.to_string(), *frame))
                 .collect(),
+            units: crate::window_session::FrameUnits::LogicalPoints,
         }
     }
 

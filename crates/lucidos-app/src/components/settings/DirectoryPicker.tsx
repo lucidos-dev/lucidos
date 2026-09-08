@@ -94,7 +94,6 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const [manualPath, setManualPath] = useState('');
   const [editingPath, setEditingPath] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
   const showLoading = useDelayedLoading(data);
 
   useEffect(() => {
@@ -135,86 +134,87 @@ export function DirectoryPicker({ onSelect, onCancel }: DirectoryPickerProps) {
   const joinPath = (parent: string, child: string) => parent === '/' ? '/' + child : parent + '/' + child;
 
   return (
-    <div class="confirm-overlay">
-      <Overlay open onClose={onCancel} backdrop={false} panelClass="dir-picker" panelRef={panelRef}>
-        <div class="dir-picker-header">
-          <span class="dir-picker-title">Select Directory</span>
-          <button class="icon-btn header-icon" onClick={onCancel} aria-label="Close">
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-              <path d="M4 4l8 8M12 4l-8 8" />
-            </svg>
-          </button>
-        </div>
+    // A centered modal, so it takes `<Overlay>`'s own `.modal-overlay`
+    // container. `.dir-picker` places nothing itself, so a wrapper of its own
+    // would leave the panel unscrimmed and in flow.
+    <Overlay open onClose={onCancel} panelClass="dir-picker" panelRole="dialog" ariaModal>
+      <div class="dir-picker-header">
+        <span class="dir-picker-title">Select Directory</span>
+        <button class="icon-btn header-icon" onClick={onCancel} aria-label="Close">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M4 4l8 8M12 4l-8 8" />
+          </svg>
+        </button>
+      </div>
 
-        <div class="dir-picker-breadcrumb">
-          {editingPath ? (
-            <input
-              ref={inputRef}
-              class="dir-picker-path-input"
-              value={manualPath}
-              onInput={(e) => setManualPath((e.target as HTMLInputElement).value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') navigateTo(manualPath);
-                if (e.key === 'Escape') setEditingPath(false);
-              }}
-              onBlur={() => setEditingPath(false)}
-            />
-          ) : (
-            <div class="dir-picker-segments" onClick={() => setEditingPath(true)}>
-              <span class="dir-picker-segment" onClick={(e) => { e.stopPropagation(); navigateTo('/'); }}>/</span>
-              {segments.map((seg, i) => (
-                <span key={i}>
-                  <span
-                    class="dir-picker-segment"
-                    onClick={(e) => { e.stopPropagation(); navigateTo('/' + segments.slice(0, i + 1).join('/')); }}
-                  >{seg}</span>
-                  {i < segments.length - 1 && <span class="dir-picker-sep">/</span>}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
+      <div class="dir-picker-breadcrumb">
+        {editingPath ? (
+          <input
+            ref={inputRef}
+            class="dir-picker-path-input"
+            value={manualPath}
+            onInput={(e) => setManualPath((e.target as HTMLInputElement).value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') navigateTo(manualPath);
+              if (e.key === 'Escape') setEditingPath(false);
+            }}
+            onBlur={() => setEditingPath(false)}
+          />
+        ) : (
+          <div class="dir-picker-segments" onClick={() => setEditingPath(true)}>
+            <span class="dir-picker-segment" onClick={(e) => { e.stopPropagation(); navigateTo('/'); }}>/</span>
+            {segments.map((seg, i) => (
+              <span key={i}>
+                <span
+                  class="dir-picker-segment"
+                  onClick={(e) => { e.stopPropagation(); navigateTo('/' + segments.slice(0, i + 1).join('/')); }}
+                >{seg}</span>
+                {i < segments.length - 1 && <span class="dir-picker-sep">/</span>}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
 
-        <div class="dir-picker-list" onKeyDown={(e) => {
-          if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIndex(i => Math.min(i + 1, navMaxIdx)); }
-          if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedIndex(i => Math.max(i - 1, -1)); }
-          if (e.key === 'Enter' && data.status === 'loaded') {
-            e.preventDefault();
-            if (selectedIndex === 0 && currentPath !== '/') goUp();
-            else {
-              const dirIdx = currentPath !== '/' ? selectedIndex - 1 : selectedIndex;
-              if (dirIdx >= 0) navigateTo(joinPath(data.data.path, data.data.directories[dirIdx]));
-            }
+      <div class="dir-picker-list" onKeyDown={(e) => {
+        if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIndex(i => Math.min(i + 1, navMaxIdx)); }
+        if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedIndex(i => Math.max(i - 1, -1)); }
+        if (e.key === 'Enter' && data.status === 'loaded') {
+          e.preventDefault();
+          if (selectedIndex === 0 && currentPath !== '/') goUp();
+          else {
+            const dirIdx = currentPath !== '/' ? selectedIndex - 1 : selectedIndex;
+            if (dirIdx >= 0) navigateTo(joinPath(data.data.path, data.data.directories[dirIdx]));
           }
-          if (e.key === 'Escape') onCancel();
-        }} tabIndex={0}>
-          {directoryPickerBody({
-            data,
-            showLoading,
-            currentPath,
-            selectedIndex,
-            onGoUp: goUp,
-            onSelectDir: (dir) => {
-              if (data.status === 'loaded') navigateTo(joinPath(data.data.path, dir));
-            },
-            onHoverIndex: setSelectedIndex,
-          })}
-        </div>
+        }
+        if (e.key === 'Escape') onCancel();
+      }} tabIndex={0}>
+        {directoryPickerBody({
+          data,
+          showLoading,
+          currentPath,
+          selectedIndex,
+          onGoUp: goUp,
+          onSelectDir: (dir) => {
+            if (data.status === 'loaded') navigateTo(joinPath(data.data.path, dir));
+          },
+          onHoverIndex: setSelectedIndex,
+        })}
+      </div>
 
-        <div class="dir-picker-footer">
-          <div class="dir-picker-status">
-            {isGitRepo && <span class="dir-picker-git-badge">git repo</span>}
-          </div>
-          <div class="dir-picker-actions">
-            <button class="action-btn" onClick={onCancel}>Cancel</button>
-            <button
-              class="action-btn action-btn-confirm"
-              disabled={data.status !== 'loaded'}
-              onClick={() => { if (data.status === 'loaded') onSelect(data.data.path); }}
-            >Select</button>
-          </div>
+      <div class="dir-picker-footer">
+        <div class="dir-picker-status">
+          {isGitRepo && <span class="dir-picker-git-badge">git repo</span>}
         </div>
-      </Overlay>
-    </div>
+        <div class="dir-picker-actions">
+          <button class="action-btn" onClick={onCancel}>Cancel</button>
+          <button
+            class="action-btn action-btn-confirm"
+            disabled={data.status !== 'loaded'}
+            onClick={() => { if (data.status === 'loaded') onSelect(data.data.path); }}
+          >Select</button>
+        </div>
+      </div>
+    </Overlay>
   );
 }

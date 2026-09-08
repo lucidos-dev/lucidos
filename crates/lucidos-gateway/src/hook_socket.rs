@@ -218,7 +218,14 @@ fn forwarded_to_engine(name_lower: &str) -> bool {
     // otherwise be refused before reaching the webhook route at all.
     let browser =
         matches!(name_lower, "origin" | "referer") || name_lower.starts_with("sec-fetch-");
-    !(framing || ours || browser || is_hop_by_hop(name_lower))
+    // The two forwarding headers the gateway owns on its proxy hop
+    // (`proxy::gateway_owns_header`). The engine reads `x-forwarded-prefix` as
+    // proof that a request came through that proxy
+    // (`api::base_path::arrived_through_gateway_proxy`), and that only holds
+    // because no client can supply one. This listener is the surface a user may
+    // put on the open internet, so it owes the same strip.
+    let forwarding = matches!(name_lower, "x-forwarded-prefix" | "x-forwarded-host");
+    !(framing || ours || browser || forwarding || is_hop_by_hop(name_lower))
 }
 
 /// Hop-by-hop headers per RFC 7230 §6.1.
@@ -416,6 +423,20 @@ mod tests {
             crate::auth::HEADER_LOCAL_TOKEN,
             crate::auth::HEADER_WEBHOOK_TOKEN,
         ] {
+            assert!(!forwarded_to_engine(name), "{name} must be dropped");
+        }
+    }
+
+    #[test]
+    fn a_public_caller_cannot_claim_the_delivery_came_through_the_proxy() {
+        // `x-forwarded-prefix` is what the engine reads as proof a request
+        // crossed the gateway's browser-facing proxy
+        // (`api::base_path::arrived_through_gateway_proxy`). That proof rests on
+        // the proxy stripping any inbound one, and this listener is the surface
+        // a user may expose with `tailscale funnel`. `x-forwarded-host` rides
+        // along for the reason the proxy owns it: a forged value reaches an
+        // upstream that generates URLs from it.
+        for name in ["x-forwarded-prefix", "x-forwarded-host"] {
             assert!(!forwarded_to_engine(name), "{name} must be dropped");
         }
     }

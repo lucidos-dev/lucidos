@@ -25,7 +25,7 @@ vi.mock('./thread-loading', async (importOriginal) => ({
 }));
 
 import { cancelCurrentExchange, removeQueuedMessage } from './chat';
-import { focusedThreadId, threadMap, cancelingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { focusedThreadId, threadMap, cancelingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey, toasts } from '../store';
 import { setDraft, _resetComposeDraftsForTesting } from '../composeDrafts';
 import type { StoredEvent, ThreadState } from '../thread-events';
 
@@ -170,8 +170,13 @@ describe('cancelCurrentExchange — stop clears queued messages to compose', () 
     expect(cancelIndex(calls)).toBeGreaterThanOrEqual(0);
   });
 
-  it('when every retract fails, nothing is appended to compose', async () => {
+  it('when every retract fails, nothing is appended to compose and the user is told', async () => {
+    // A retract that got no tombstone leaves the follow-up queued, so it runs
+    // as a fresh response after the cancel. That is the outcome this whole
+    // path exists to prevent, and the user pressed Stop, so it cannot be
+    // silent (.claude/rules/frontend.md, no hidden errors).
     setThread([{ text: 'follow 1', eventId: 'q1' }]);
+    toasts.value = [];
     const calls: Call[] = [];
     installFetch(calls, { removeThrows: new Set(['q1']) });
 
@@ -179,6 +184,7 @@ describe('cancelCurrentExchange — stop clears queued messages to compose', () 
 
     expect(updateComposeSpy).not.toHaveBeenCalled();
     expect(cancelIndex(calls)).toBeGreaterThanOrEqual(0);
+    expect(toasts.value.some((t) => t.type === 'error' && t.message.includes('may still run'))).toBe(true);
   });
 
   it('trash-then-Stop: Stop awaits the in-flight removal and never appends a failed one', async () => {

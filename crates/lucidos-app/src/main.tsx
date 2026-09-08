@@ -39,6 +39,9 @@ import './styles/skills.css';
 import './styles/thread-queue.css';
 import './styles/mobile.css';
 import './styles/drawer.css';
+// LAST, deliberately: it re-homes the glyph centring of badges declared across
+// the sheets above, and wins their `display` on source order. See badges.css.
+import './styles/badges.css';
 import './store/effects';
 import './store/actions/wipPreview';
 

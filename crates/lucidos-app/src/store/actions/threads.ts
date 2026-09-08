@@ -42,6 +42,11 @@ export interface FocusThreadOptions {
    *  on mobile the thread drawer IS a pane, so revealing would swipe them off
    *  the list they're triaging. Mirrors `unfocusThread({ revealPane: false })`. */
   revealPane?: boolean;
+  /** Where the navigate came from, when it was not a direct click: a sibling
+   *  thread's `NavigationRequested`, an app iframe, a notification. Named in the
+   *  miss toast so a failure says who asked, the way the `app` and `trigger`
+   *  branches of `handleNavigationRequest` already do. */
+  source?: string;
 }
 
 export function focusThread(threadId: string, options?: FocusThreadOptions): void {
@@ -234,16 +239,22 @@ function releaseBootstrap(threadId: string, previousFocus: string | null): void 
  *  failure itself. The entry point for every caller with no retry state of its
  *  own (thread-link clicks, notification taps, search results). */
 export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOptions): void {
+  // Name the thread and, when the navigate was not a direct click, who asked.
+  // A bare "Thread not found" is a swallowed error under
+  // `.claude/rules/frontend.md`. This runs for a sibling thread's
+  // `NavigationRequested` and a notification tap, not only a link click.
+  const from = options?.source ? ` (requested by ${options.source})` : '';
   void focusThreadOrBootstrapResult(threadId, options).then(outcome => {
-    if (outcome.kind === 'not-found') showToast('Thread not found', 'error');
-    else if (outcome.kind === 'failed') {
-      showToast(`Failed to open thread: ${errorDetail(outcome.error)}`, 'error');
+    if (outcome.kind === 'not-found') {
+      showToast(`Thread "${threadId}" no longer exists${from}`, 'error');
+    } else if (outcome.kind === 'failed') {
+      showToast(`Couldn't open thread "${threadId}"${from}: ${errorDetail(outcome.error)}`, 'error');
     }
   }).catch(err => {
     // `focusThreadOrBootstrapResult` converts a fetch failure into a `failed`
     // outcome, so reaching here means `focusThread` itself threw. Surface it
     // rather than leave an unhandled rejection (frontend.md, no hidden errors).
-    showToast(`Failed to open thread: ${errorDetail(err)}`, 'error');
+    showToast(`Couldn't open thread "${threadId}"${from}: ${errorDetail(err)}`, 'error');
   });
 }
 

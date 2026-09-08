@@ -390,7 +390,7 @@ async fn resolve_direct_providers(
 /// belongs to a *different* provider. Small, current, broadly-available ids —
 /// the search call is a short summary over the results, so the cheapest capable
 /// model is the right tier. `gpt-5.5` additionally satisfies OpenAI's
-/// `uses_responses_api` prefix check, which the `web_search` tool requires.
+/// `uses_responses_api` check, which the `web_search` tool requires.
 const ANTHROPIC_FALLBACK_SEARCH_MODEL: &str = "claude-haiku-4-5";
 const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-5.5";
 
@@ -1419,11 +1419,14 @@ mod tests {
     /// The OpenAI fallback must satisfy `uses_responses_api`, because the
     /// `web_search` tool only exists on the Responses API — a Chat-Completions
     /// id would make the backend dead on arrival.
+    ///
+    /// Calls the real predicate rather than re-spelling it. A copy of the rule
+    /// keeps passing after the rule itself narrows, which is exactly the drift
+    /// this test exists to catch.
     #[test]
     fn openai_fallback_search_model_routes_to_the_responses_api() {
         assert!(
-            OPENAI_FALLBACK_SEARCH_MODEL.starts_with("gpt-5")
-                || OPENAI_FALLBACK_SEARCH_MODEL.contains("codex"),
+            crate::llm::openai::uses_responses_api(OPENAI_FALLBACK_SEARCH_MODEL),
             "{OPENAI_FALLBACK_SEARCH_MODEL} must route to the Responses API"
         );
     }

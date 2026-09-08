@@ -27,8 +27,8 @@ import { inAppBrowserAvailable } from './preferences';
 // refreshes that fire all session long (artifact created/edited during an
 // agent run → DataFileEdited → loadArtifacts). Without this one-shot gate, any
 // such refresh re-opens the last-viewed file and yanks the content pane there,
-// clobbering an open app/URL/form mid-conversation — e.g. "Refreshing Planer"
-// jumping back to the last generated PDF. Resets to false on page reload
+// clobbering an open app/URL/form mid-conversation, e.g. "Refreshing
+// demo-director" jumping back to the last generated PDF. Resets on page reload
 // (module re-init).
 let filePreviewRestoreAttempted = false;
 

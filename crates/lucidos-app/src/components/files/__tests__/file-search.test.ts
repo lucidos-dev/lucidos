@@ -1,5 +1,25 @@
 import { describe, it, expect } from 'vitest';
-import { collectSearchResults, filterSearchResults, type FileSearchResult } from '../fileSearch';
+import {
+  collectSearchResults,
+  filterSearchResults,
+  openableChangeFiles,
+  type FileSearchResult,
+} from '../fileSearch';
+
+/** Regression: the workspace Files view listed every pending change's files,
+ *  badged "C". Selecting one closed the modal and did nothing, because
+ *  `openRepoFilePreview` returns silently with no bound repository. */
+describe('openableChangeFiles', () => {
+  const files = [{ path: 'src/api.rs' }, { path: 'src/new.rs' }];
+
+  it('keeps change rows while a repository is bound', () => {
+    expect(openableChangeFiles(files, true)).toEqual(files);
+  });
+
+  it('drops them with no repository bound, where they would open nothing', () => {
+    expect(openableChangeFiles(files, false)).toEqual([]);
+  });
+});
 
 describe('collectSearchResults', () => {
   it('collects workspace files', () => {

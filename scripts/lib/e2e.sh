@@ -488,13 +488,15 @@ cleanup_e2e_worktrees() {
 
 # ── stop_e2e_background_guards ───────────────────────────────────────
 # Stop every run-scoped background helper the browser phase starts: the WebKit
-# RSS reaper and the mid-run host-load sampler. Both are idempotent no-ops when
-# nothing was started (e2e-api.sh starts neither), so this is safe in any
-# teardown path. One function so a future guard gets wired into every teardown at
-# once rather than being forgotten in one of them.
+# RSS reaper, the mid-run host-load sampler, and the host-memory peak sampler.
+# All three are idempotent no-ops when nothing was started (e2e-api.sh starts
+# none of them), so this is safe in any teardown path. One function so a future
+# guard gets wired into every teardown at once rather than being forgotten in one
+# of them.
 stop_e2e_background_guards() {
     stop_webkit_reaper
     stop_host_load_sampler
+    stop_host_memory_sampler
 }
 
 # ── playwright_file_filter ───────────────────────────────────────────

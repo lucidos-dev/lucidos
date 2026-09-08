@@ -29,6 +29,7 @@ import { requestPromptOverrideSync } from '../../components/chat/promptValueSync
 import { bumpThreadEvents } from '../threadActivity';
 import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
+import { formatThreadLabel } from './thread-label';
 import { revealThreadPane } from './pane';
 import { followSentMessage } from '../../components/chat/scrollState';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../../components/chat/prompt-input-helpers';
@@ -709,13 +710,28 @@ async function clearQueuedMessagesToCompose(threadId: string): Promise<void> {
   const queued = getQueuedMessages(threadId);
   if (queued.length === 0) return;
   const removedTexts: string[] = [];
+  let failed = 0;
   for (const q of queued) {
     const { outcome } = await retractQueuedMessage(threadId, q.id);
     if (outcome === 'removed') removedTexts.push(q.text);
-    // 'already-injected' → now part of the cancelled response; 'failed' →
-    // stays queued (user can trash it). Neither goes to compose.
+    // 'already-injected' → now part of the cancelled response, so nothing is
+    // owed. 'failed' → no tombstone persisted, so the loop will NOT drop it at
+    // finalize. Neither goes to compose.
+    if (outcome === 'failed') failed++;
   }
   appendQueuedTextToCompose(threadId, removedTexts);
+  // The user pressed Stop, so this is theirs to know. A retract that got no
+  // tombstone leaves the follow-up queued, and it runs as a fresh response
+  // after the cancel. That is the exact outcome this function exists to
+  // prevent, so it cannot be silent. The row stays on screen and trashable.
+  if (failed > 0) {
+    showToast(
+      `Stopped, but ${failed} queued message${failed > 1 ? 's' : ''} could not be retracted `
+      + `in ${formatThreadLabel(threadId)}. They may still run.`,
+      'error',
+      { key: `queued-retract-${threadId}` },
+    );
+  }
 }
 
 /**

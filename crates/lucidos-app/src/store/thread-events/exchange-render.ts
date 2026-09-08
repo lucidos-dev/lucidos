@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -1306,27 +1306,6 @@ export function stampedEventIds(exchange: Exchange): string[] {
   return ids;
 }
 
-/** Events that merely LANDED in a turn rather than being produced by it, and
- *  that render nothing of their own. They have no anchor at all.
- *
- *  The containing-turn fallback below infers "this step has no element of its
- *  own, so show the turn that produced it". Sound for a step the turn caused,
- *  false for an event that arrived asynchronously and was grouped into
- *  whichever exchange happened to be open. A background bash task finishing
- *  under an open question would pulse that question, which the two are
- *  causally unrelated to.
- *
- *  Deliberately an explicit list rather than a clever predicate. Membership is
- *  a claim about CAUSATION, which nothing in the event's shape reveals, so it
- *  is stated per type with the reasoning attached and grows on evidence.
- *
- *  `BackgroundBashStarted` is deliberately NOT here. The turn's own
- *  `run_bash_background` call emits it, so landing there is honest. Only the
- *  COMPLETION floats free, firing whenever the process happens to exit. */
-const UNANCHORABLE_ASYNC_EVENTS: ReadonlySet<string> = new Set([
-  'BackgroundBashCompleted',
-]);
-
 /** The `data-event-id` a deep-link to `eventId` should target within
  *  `exchanges`, or `null` when there is nowhere honest to land.
  *
@@ -1654,11 +1633,12 @@ export interface QueuedFollowupRun {
  *  rather than as one contiguous trailing run. Coding agents are excluded:
  *  their follow-ups go straight to subprocess stdin, and only chat uses the
  *  agentic-loop queue. */
-/** The bottom exchange that could own a turn, stepping over a *live utterance*.
+/** The bottom exchange that could own a turn, stepping over every *live
+ *  utterance*.
  *
- *  That row is the caller mid-sentence and holds nothing: no stream, no badge,
- *  no `last` role. Every fallback here means "whatever is at the bottom", and
- *  the row is at the bottom by construction while somebody is speaking. */
+ *  Such a row owns no turn whether or not it carries the caller's words: no
+ *  stream, no `last` role. Every fallback here means "whatever is at the
+ *  bottom", and the rows are at the bottom by construction. */
 function lastTurnBearingIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     if (!isLiveUtteranceRow(exchanges[i].userEvent)) return i;
@@ -1800,6 +1780,14 @@ export function activeExchangeIndex(exchanges: Exchange[], threadBusy: boolean):
  *         gap. A genuine crash settles to `idle` or `failed`, never to
  *         `waiting_for_user_answer`, so this cannot mask a real abort. */
 export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLast: boolean, hasPriorActive?: boolean, threadIsCC?: boolean, threadIdle = false, threadAwaitingAnswer = false): ExchangeStatus {
+  // A row the client drew for the caller's own utterance, before the engine's
+  // row for it exists. It carries no steps and can carry none. So no terminal
+  // verdict below is about it, and every one of them would be a guess.
+  //
+  // Always pending, which is the honest reading either way: the caller is
+  // still speaking, or their words are held while the talker decides. The
+  // reader is waiting in both, and the shimmer says so (ADR 0174).
+  if (isLiveUtteranceRow(exchange.userEvent)) return 'pending';
   let isComplete = false;
   let isCanceled = false;
   let isAborted = false;

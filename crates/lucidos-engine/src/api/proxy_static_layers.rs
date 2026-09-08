@@ -115,8 +115,10 @@ impl AuthLayer for QueryParamLayer {
     async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         // Credentials in query strings must be redacted before logs/error
         // bodies — publish a redacted `log_url` for the pipeline runner to
-        // swap into `PipelineOutcome.log_url`.
-        let redacted = crate::api::proxy::append_query_param(input.url, &self.param, "REDACTED");
+        // swap into `PipelineOutcome.log_url`. It masks a value the URL already
+        // carries under this name too, which is what a redirect echoing our own
+        // query back needs.
+        let redacted = crate::api::proxy::redacted_query_log_url(input.url, &self.param);
         Ok(AuthMutation {
             add_query: vec![(self.param.clone(), self.value.clone())],
             outputs: serde_json::json!({"log_url_replacement": redacted}),
@@ -228,5 +230,36 @@ mod tests {
         let log_url = m.outputs["log_url_replacement"].as_str().unwrap();
         assert!(!log_url.contains("actual-secret"));
         assert!(log_url.contains("REDACTED"));
+    }
+
+    /// A same-origin redirect whose `Location` echoes the query hands the next
+    /// hop a target URL that already carries the credential. Masking only the
+    /// copy this layer appends left the real one in the line `forward_request`
+    /// writes when that hop fails.
+    #[tokio::test]
+    async fn a_credential_already_in_the_url_is_masked_rather_than_shadowed() {
+        let layer = QueryParamLayer::new(
+            "svc".into(),
+            "api-key".into(),
+            "actual-secret".into(),
+            ScopeBinding::StoredCredential("svc".into()),
+        );
+        let body = Bytes::new();
+        let prior = HashMap::new();
+        let input = input_for(
+            &body,
+            "https://example.com/v2/data?page=2&api-key=actual-secret",
+            &prior,
+        );
+        let m = layer.apply(&input).await.unwrap();
+
+        let log_url = m.outputs["log_url_replacement"].as_str().unwrap();
+        assert!(!log_url.contains("actual-secret"), "got: {log_url}");
+        assert!(
+            log_url.contains("page=2"),
+            "an unrelated parameter survives: {log_url}"
+        );
+        // The forwarded request is untouched: only the log line is masked.
+        assert_eq!(m.add_query[0], ("api-key".into(), "actual-secret".into()));
     }
 }

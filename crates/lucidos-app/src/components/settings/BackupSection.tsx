@@ -46,7 +46,7 @@ import {
 } from '../../api/client';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
-import { useDelayedFlag, useDelayedLoading } from '../../hooks/useDelayedLoading';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { errorDetail } from '../../utils/errorDetail';
 
 // Restore lives in the workspace picker now (it provisions the new workspace);
@@ -270,7 +270,7 @@ export function backupHealthCardSkeleton(): VNode {
 }
 
 /**
- * A dropdown that shows a skeleton while its own value is still being read.
+ * A dropdown that shows a skeleton while its value is still being read.
  *
  * Every control on this page is fed by a separate request, and each one used to
  * be conditionally rendered on its own flag, so the row grew a control at a time
@@ -278,21 +278,24 @@ export function backupHealthCardSkeleton(): VNode {
  * space instead: the skeleton is the trigger's own box, so the real control lands
  * in it rather than beside it.
  *
- * The delay gate and the crossfade are the standard pair from
- * `.claude/rules/frontend.md`: a load that beats `SPINNER_DELAY_MS` shows no
- * skeleton at all, and a slower one dissolves rather than snapping.
+ * The delay gate is the section's, not this slot's, so the whole page raises its
+ * skeletons in one wave. The caller therefore passes `showSkeleton` in rather
+ * than deriving it here. The crossfade out is `LoadingFade`'s, per
+ * `.claude/rules/frontend.md`.
  */
 function DropdownSlot({
   pending,
+  showSkeleton,
   skeletonWidth,
   children,
 }: {
   pending: boolean;
+  /** The section's gate, already ANDed with this slot's own pending flag. */
+  showSkeleton: boolean;
   /** Width of the widest label this slot will settle on. */
   skeletonWidth: string;
   children: ComponentChildren;
 }) {
-  const showSkeleton = useDelayedFlag(pending);
   return (
     <LoadingFade class="dropdown-slot" showSkeleton={showSkeleton} skeleton={<DropdownSkeleton w={skeletonWidth} />}>
       {/* Withheld only while genuinely unknown. Once the read settles the
@@ -300,6 +303,37 @@ function DropdownSlot({
       {pending ? null : children}
     </LoadingFade>
   );
+}
+
+/** Which of the section's slots are still waiting on a first read, and so owe a
+ *  skeleton.
+ *
+ *  One decision for the whole section. The reads finish at different times, and
+ *  a per-read gate turned that into shimmer arriving in waves.
+ *
+ *  The three dropdowns share `controls`: one `Promise.allSettled`, applied
+ *  together, so they are pending at exactly the same times.
+ *
+ *  `status` holds the health card from the FIRST render rather than from the
+ *  moment its own fetch starts. That read is per destination, so it waits on the
+ *  registry, and it is the slowest one here. Keyed on its own fetch, the card
+ *  kept a zero-height box through the registry read. It then grew one at the top
+ *  of a settled-looking page. */
+export function backupSlotsPending(
+  providers: Loadable<BackupProviderInfo[]>,
+  selectedReady: boolean,
+  status: Loadable<BackupStatus>,
+): { controls: boolean; status: boolean } {
+  const controls = providers.status === 'not-loaded' || providers.status === 'loading';
+  return {
+    controls,
+    // `selectedReady` says whether a card is coming at all: without it the page
+    // never reads the status, and the setup offer takes that space. `failed`
+    // counts as settled, since the card renders the failure itself.
+    status:
+      controls
+      || (selectedReady && status.status !== 'loaded' && status.status !== 'failed'),
+  };
 }
 
 /** Whether to keep polling `/backup/status`. The engine holds
@@ -338,12 +372,6 @@ export function BackupSection() {
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
   const [retention, setRetention] = useState<string>('5');
-  // SETTLED, not "loaded": set on both the success and the failure path, because
-  // it answers "is the read still in flight?" (which drives the skeleton) rather
-  // than "is the value known?". Its neighbour `scheduleLoaded` deliberately
-  // means the other thing: a failed schedule read leaves it false so the 'off'
-  // default is never mistaken for a real setting and written back.
-  const [retentionSettled, setRetentionSettled] = useState(false);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
@@ -371,15 +399,21 @@ export function BackupSection() {
   useEffect(() => {
     setProvidersLoadable({ status: 'loading' });
 
-    // The registry and the configured destination are fetched concurrently but
-    // applied TOGETHER. Seeding from whichever settled first is what let the
-    // registry's first entry (always Google Drive) override a real
-    // `backup_provider`; settling both first also means the dropdown never
-    // renders one provider and then flips to another.
+    // The three controls are fetched concurrently but applied TOGETHER.
+    //
+    // For the registry and the schedule that is a correctness rule. Seeding from
+    // whichever settled first let the registry's first entry (always Google
+    // Drive) override a real `backup_provider`. It also made the dropdown render
+    // one provider and then flip to another.
+    //
+    // Retention joins them because the three sit in one row. Applied on its own
+    // it settled first, so a live dropdown stood beside a shimmering one and the
+    // row cleared in two steps.
     void (async () => {
-      const [providers, schedule] = await Promise.allSettled([
+      const [providers, schedule, retention] = await Promise.allSettled([
         getBackupProviders(),
         getBackupSchedule(),
+        getBackupRetention(),
       ]);
       const seed = backupSeed(providers, schedule, { provider: '', providers: [] });
 
@@ -409,15 +443,15 @@ export function BackupSection() {
       // page still has to select something, and both failures are already
       // surfaced above.
       setSelectedProvider(seed.provider);
-    })();
 
-    getBackupRetention().then((r) => {
-      setRetention(String(r.keep));
-      setRetentionSettled(true);
-    }).catch((err) => {
-      setRetentionSettled(true);
-      showToast(`Failed to load backup retention: ${errorDetail(err)}`, 'error');
-    });
+      // A failed read leaves the dropdown on its '5' default, which is safe:
+      // only the user's own pick ever writes retention back.
+      if (retention.status === 'fulfilled') {
+        setRetention(String(retention.value.keep));
+      } else {
+        showToast(`Failed to load backup retention: ${errorDetail(retention.reason)}`, 'error');
+      }
+    })();
 
     // Probe whether a backup key already exists so the key button labels itself
     // correctly ("Show backup key" vs "Generate new backup key") without
@@ -498,10 +532,7 @@ export function BackupSection() {
         setScheduleLoaded(true);
       }
       setSelectedProvider(seed.provider);
-      if (retention.status === 'fulfilled') {
-        setRetention(String(retention.value.keep));
-        setRetentionSettled(true);
-      }
+      if (retention.status === 'fulfilled') setRetention(String(retention.value.keep));
     })();
   }, [backupPreferencesVersion.value, backupPairSaving, retentionSaving, granting]);
 
@@ -760,19 +791,22 @@ export function BackupSection() {
     !!providerInfo?.connected && !providerInfo.ready,
   );
   const backingUp = progress !== null;
-  const offerSetup = showBackupSetupOffer(providersLoadable, !!providerInfo?.ready, statusLoadable);
+  // Same `selectedReady` the status fetch and the skeleton gate key off, so the
+  // offer and the health card cannot disagree about whether a destination works.
+  const offerSetup = showBackupSetupOffer(providersLoadable, selectedReady, statusLoadable);
 
-  // Which reads are still in flight, and therefore which controls show a
-  // skeleton. The destination registry and the schedule are ONE
-  // `Promise.allSettled` that is applied together, so they are in flight at
-  // exactly the same times and share a flag rather than each guessing at the
-  // other's. Retention is its own request and answers for itself. The
-  // background refresh on `backupPreferencesVersion` deliberately does NOT go
-  // through here: it keeps what is already loaded, so no settled control ever
+  // Which reads are still in flight, and therefore which slots owe a skeleton.
+  // The background refresh on `backupPreferencesVersion` deliberately does NOT
+  // reach this: it keeps what is already loaded, so no settled control ever
   // falls back to a skeleton under the user.
-  const providersPending =
-    providersLoadable.status === 'not-loaded' || providersLoadable.status === 'loading';
-  const schedulePending = providersPending;
+  const pending = backupSlotsPending(providersLoadable, selectedReady, statusLoadable);
+
+  // ONE delay gate for the section, armed on the first render and held until the
+  // last of these reads settles. Per-slot gates each armed when their own read
+  // started, which is what made the shimmer arrive in waves. Each slot still
+  // CLEARS on its own read, so the gate withholds nothing already loaded.
+  const skeletonsVisible = useDelayedFlag(pending.controls || pending.status);
+  const showControlSkeleton = pending.controls && skeletonsVisible;
 
   const healthCard = backupHealthCard({
     status: statusLoadable,
@@ -782,7 +816,7 @@ export function BackupSection() {
   // Gated on the card having nothing to draw, not merely on the status being in
   // flight: a refetch while a backup runs keeps rendering the live progress
   // card, and stacking a skeleton in the same grid cell would smear the two.
-  const showHealthCardSkeleton = useDelayedLoading(statusLoadable) && healthCard === null;
+  const showHealthCardSkeleton = pending.status && skeletonsVisible && healthCard === null;
 
   return (
     <div class="settings-section">
@@ -832,7 +866,7 @@ export function BackupSection() {
 
       <div class="settings-row" data-search-anchor="backup:provider">
         <span class="settings-row-label">Provider</span>
-        <DropdownSlot pending={providersPending} skeletonWidth="5rem">
+        <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="5rem">
           <Dropdown
             options={providerOptions}
             value={selectedProvider}
@@ -922,8 +956,8 @@ export function BackupSection() {
             has to disappear with it rather than staying as an empty child, or
             the row's gap would open twice where the control used to be. The
             skeleton covers only the window before that verdict exists. */}
-        {(schedulePending || scheduleLoaded) && (
-          <DropdownSlot pending={schedulePending} skeletonWidth="6.5rem">
+        {(pending.controls || scheduleLoaded) && (
+          <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="6.5rem">
             <Dropdown
               options={SCHEDULE_OPTIONS}
               value={schedule}
@@ -932,7 +966,7 @@ export function BackupSection() {
             />
           </DropdownSlot>
         )}
-        <DropdownSlot pending={!retentionSettled} skeletonWidth="3rem">
+        <DropdownSlot pending={pending.controls} showSkeleton={showControlSkeleton} skeletonWidth="3rem">
           <Dropdown
             options={RETENTION_OPTIONS}
             value={retention}

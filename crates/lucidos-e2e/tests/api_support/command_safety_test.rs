@@ -341,15 +341,26 @@ async fn set_preference(client: &reqwest::Client, key: &str, value: Option<&str>
     );
 }
 
-fn checkpoint_ref_count() -> usize {
+/// The set of `refs/lucidos/` refs in the workspace repo, by name.
+///
+/// A SET, not a count, because the count is not stable across the guarded window
+/// even under the tree lock. `create_command_checkpoint` opportunistically runs
+/// `prune_expired_checkpoints`, which reclaims pairs left in this persistent repo
+/// by PRIOR runs: the git repo is not reset per run, only the database is. The
+/// count then falls as old pairs age out mid-test, unrelated to this command.
+/// Comparing sets isolates what THIS command added: `after - before` is exactly
+/// the refs it left behind, and pruning only ever removes members of `before`.
+fn checkpoint_ref_set() -> std::collections::BTreeSet<String> {
     let out = crate::support::git_in(
         &crate::support::workspace_path(),
         &["for-each-ref", "--format=%(refname)", "refs/lucidos/"],
     );
     String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The reported 2026-08-06 bug, driven through the **real guard** instead of a
@@ -407,7 +418,7 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     // for the guarded turn; see `workspace_tree_lock`.
     let _tree_quiet = crate::support::workspace_tree_lock().write().await;
 
-    let refs_before = checkpoint_ref_count();
+    let refs_before = checkpoint_ref_set();
     let marker = crate::support::unique_marker("api-command-guard");
     let code = format!("import shutil; shutil.rmtree('{scratch_rel}')");
     let resp = client
@@ -484,9 +495,16 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
         "a command whose destruction was gitignored must leave no undo card"
     );
     // And the pair it snapshotted was dropped rather than left pinning objects.
-    assert_eq!(
-        checkpoint_ref_count(),
-        refs_before,
-        "the empty-diff path should have deleted both checkpoint refs"
+    // Compare the ref SETS, not their counts: the count also moves when
+    // `create_command_checkpoint`'s opportunistic prune reclaims stale pairs from
+    // prior runs mid-window. What must hold is that THIS command added no
+    // surviving ref, which is exactly `after - before`.
+    let leaked: Vec<String> = checkpoint_ref_set()
+        .difference(&refs_before)
+        .cloned()
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the empty-diff path should have deleted both checkpoint refs, but these survived: {leaked:?}"
     );
 }

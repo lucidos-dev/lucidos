@@ -1339,6 +1339,61 @@ async fn user_slot_queues_at_true_pool_max_then_admits_on_release() {
     teardown_test_db(&f.db).await;
 }
 
+/// A chat task torn down while its request still WAITS for a slot must leave
+/// nothing behind. The guard used to be built only after the wake resolved, so
+/// an abort dropped the future with the reservation still in `user_queued`. The
+/// drainer then admitted that dead waiter, its wake send failed into `let _ =`,
+/// and the slot was held for the life of the process.
+#[tokio::test]
+async fn a_cancelled_waiter_releases_its_reserved_slot() {
+    let f = fixture(1).await;
+    // Fill the only slot with background work, so the user request queues.
+    let bg = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None, None)
+        .await;
+    assert!(bg.admitted);
+
+    let tid = Uuid::new_v4();
+    let acquiring = f.queue.clone();
+    let waiter = tokio::spawn(async move {
+        let _guard = acquiring
+            .acquire_user_slot(Some(tid), "user message".to_string())
+            .await;
+        // Never reached: this task is aborted while its request is queued.
+        std::future::pending::<()>().await;
+    });
+
+    let q = f.queue.clone();
+    wait_until(|| {
+        let q = q.clone();
+        async move { user_status(&q, tid).await == Some("queued") }
+    })
+    .await;
+
+    waiter.abort();
+    wait_until(|| {
+        let q = q.clone();
+        async move { user_status(&q, tid).await.is_none() }
+    })
+    .await;
+
+    // Free the pool and send a fresh request: it admits at once, which is only
+    // true if the abandoned waiter left no slot occupied.
+    f.executor.release_one();
+    bg.completion.await.ok();
+    let next_tid = Uuid::new_v4();
+    let _release = spawn_user_slot(f.queue.clone(), next_tid);
+    wait_until(|| {
+        let q = q.clone();
+        async move { user_status(&q, next_tid).await == Some("admitted") }
+    })
+    .await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 #[tokio::test]
 async fn reserved_background_floor_reclaims_ahead_of_waiting_user() {
     let f = fixture(2).await;

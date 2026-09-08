@@ -108,6 +108,8 @@ lift() {
 }
 
 lift merge_rc
+lift webkit_chunk_range
+lift report_webkit_chunk_range
 lift run_specs_chunked
 lift _run_browser_project_body
 
@@ -125,6 +127,7 @@ PW_ARGS=()
 # shellcheck disable=SC2034 # read by the lifted functions, not from this file
 CMD=(npx playwright test)
 OUTPUT_ARG=()
+WEBKIT_CHUNK_RANGE_APPLIED=""
 
 # ── the stubs ───────────────────────────────────────────────────────────
 # Each one echoes, and the driver captures stdout, so the trace is ONE ordered
@@ -180,6 +183,18 @@ mkdir -p "$NAV_ONLY/e2e"
 printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/chat.spec.ts"
 printf 'await page.goto("/")\n' > "$NAV_ONLY/e2e/drafts.spec.ts"
 
+# A wider fixture for the chunk-range cases: two CC specs (one chunk) and eight
+# nav specs (four chunks at size 2). Four nav chunks is the smallest count where a
+# range can have chunks skipped on BOTH sides of it, which is the shape a
+# carry-over discharge actually takes.
+RANGE="$SANDBOX/range"
+mkdir -p "$RANGE/e2e"
+printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/coding-agent.spec.ts"
+printf 'await pickComposeDestination(page)\n' > "$RANGE/e2e/model-switching.spec.ts"
+for n in 1 2 3 4 5 6 7 8; do
+    printf 'await page.goto("/")\n' > "$RANGE/e2e/nav$n.spec.ts"
+done
+
 # Chunk size 2 against the fixture: CC is one chunk, nav is two. That gives the
 # nav phase an INTERNAL boundary, which is where a real shortfall lands.
 export LUCIDOS_E2E_WEBKIT_CHUNK=2
@@ -190,6 +205,7 @@ export LUCIDOS_E2E_WEBKIT_CHUNK=2
 drive_in() {
     local dir="$1" out="$2" prev="$PWD" rc=0
     MEMORY_STOPPED=""
+    WEBKIT_CHUNK_RANGE_APPLIED=""
     # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
     OUTPUT_ARG=()
     cd "$dir" || return 99
@@ -346,6 +362,148 @@ test_the_real_inventory_puts_cc_first() {
         "the phase boundary is checked before navigation starts"
 }
 
+# ── Test 7: the nav chunk range ─────────────────────────────────────────────
+# LUCIDOS_E2E_WEBKIT_CHUNKS exists for two jobs: proving a guard change without an
+# unfiltered pass, and discharging the tail a memory stop lost. Both are worthless
+# if a ranged run can read as a complete one, so every case here checks that the
+# narrowing is SAID OUT LOUD as well as applied.
+
+test_the_range_parser_resolves_and_clamps() {
+    echo "test: the range parser handles a range, an open end, and every bad value"
+    assert_eq "1 4" "$(webkit_chunk_range '' 4 2>/dev/null)" "no value means every chunk"
+    assert_eq "2 3" "$(webkit_chunk_range '2-3' 4 2>/dev/null)" "a closed range passes through"
+    assert_eq "3 4" "$(webkit_chunk_range '3-' 4 2>/dev/null)" "an open end runs to the last chunk"
+    assert_eq "1 4" "$(webkit_chunk_range '1-9' 4 2>/dev/null)" "a last past the end is clamped"
+    # A FIRST past the end is a different case and must not clamp. Clamping "9-"
+    # to "4 4" would run one chunk for a range naming none, which is the silent
+    # reduction this knob must never do.
+    assert_eq "1 4" "$(webkit_chunk_range '9-' 4 2>/dev/null)" "a first past the end runs everything"
+    assert_eq "1 4" "$(webkit_chunk_range '9-10' 4 2>/dev/null)" "a range entirely past the end runs everything"
+    # Every unusable value widens back to the full range. Running everything is
+    # the safe direction; running nothing would report green having tested none.
+    assert_eq "1 4" "$(webkit_chunk_range 'banana' 4 2>/dev/null)" "a non-range value runs everything"
+    assert_eq "1 4" "$(webkit_chunk_range '3-2' 4 2>/dev/null)" "a backwards range runs everything"
+    assert_eq "1 4" "$(webkit_chunk_range '0-2' 4 2>/dev/null)" "a zero first runs everything"
+    assert_eq "1 4" "$(webkit_chunk_range '-3' 4 2>/dev/null)" "a missing first runs everything"
+    assert_eq "1 4" "$(webkit_chunk_range 'a-b' 4 2>/dev/null)" "non-numeric bounds run everything"
+    # Normalised, because the caller decides "did this narrow anything?" by
+    # STRING-comparing these against 1 and nchunks. Unnormalised, `01-4` runs
+    # every chunk and still reports itself as partial coverage.
+    assert_eq "1 4" "$(webkit_chunk_range '01-4' 4 2>/dev/null)" "a leading-zero first is normalised"
+    assert_eq "2 4" "$(webkit_chunk_range '2-04' 4 2>/dev/null)" "a leading-zero last is normalised"
+    # `08` and `09` are the ones that matter: bash arithmetic reads a bare
+    # leading-zero literal as octal and errors on those two digits.
+    assert_eq "1 8" "$(webkit_chunk_range '01-08' 9 2>/dev/null)" "08 is read as decimal 8, not as an octal error"
+    assert_eq "9 9" "$(webkit_chunk_range '09-' 9 2>/dev/null)" "09 is read as decimal 9, not as an octal error"
+    # And it says so, rather than widening in silence. A typo that runs the whole
+    # suite is safe; a typo nobody is told about is how it goes unnoticed.
+    if webkit_chunk_range 'banana' 4 2>&1 >/dev/null | grep -q 'not a chunk range'; then
+        pass "an unusable value is named on stderr"
+    else
+        fail "an unusable value widened silently"
+    fi
+}
+
+test_no_range_runs_every_nav_chunk() {
+    echo "test: with no range set the nav phase runs every chunk"
+    local rc
+    reset_stubs
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    drive_in "$RANGE" "$OUT/norange.out"
+    rc=$?
+    assert_eq "0" "$rc" "the full run returns 0"
+    assert_says "$OUT/norange.out" "mobile-webkit nav chunk 1/4" "chunk 1 ran"
+    assert_says "$OUT/norange.out" "mobile-webkit nav chunk 4/4" "chunk 4 ran"
+    assert_silent_about "$OUT/norange.out" "SKIPPED, outside chunk range" "nothing was skipped"
+    assert_silent_about "$OUT/norange.out" "LIMITED to chunks" "no narrowing was announced"
+    assert_eq "" "$WEBKIT_CHUNK_RANGE_APPLIED" "the run is not recorded as ranged"
+}
+
+test_a_range_runs_only_its_members_and_says_so() {
+    echo "test: a range runs its own chunks, skips the rest out loud, and restates itself"
+    local rc
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_CHUNKS=2-3
+    drive_in "$RANGE" "$OUT/range.out"
+    rc=$?
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    assert_eq "0" "$rc" "a ranged run returns 0 when its chunks pass"
+    assert_says "$OUT/range.out" "LIMITED to chunks 2-3 of 4" "the narrowing is announced up front"
+    assert_says "$OUT/range.out" "nav chunk 1/4: SKIPPED, outside chunk range 2-3" "chunk 1 says it was skipped"
+    assert_says "$OUT/range.out" "nav chunk 4/4: SKIPPED, outside chunk range 2-3" "chunk 4 says it was skipped"
+    assert_says "$OUT/range.out" "nav chunk 2/4: 2 specs (fresh browser)" "chunk 2 ran"
+    assert_says "$OUT/range.out" "nav chunk 3/4: 2 specs (fresh browser)" "chunk 3 ran"
+    # The CC phase is four chunks in the real inventory and always runs whole, so
+    # a range can never cost the ten specs the phase order exists to protect.
+    assert_says "$OUT/range.out" "mobile-webkit CC chunk 1/1" "the CC phase still ran in full"
+    assert_eq "2-3 of 4" "$WEBKIT_CHUNK_RANGE_APPLIED" "the run records itself as ranged"
+
+    # One boundary inside the range, and none after its last chunk: the chunks
+    # past the range are not work this run was going to do, so stopping "before"
+    # them would report a complete run as one cut short.
+    assert_says "$OUT/range.out" "boundary: mobile-webkit nav chunk 2/4" "the boundary inside the range is checked"
+    assert_silent_about "$OUT/range.out" "boundary: mobile-webkit nav chunk 3/4" "no boundary after the range's last chunk"
+
+    # And the end-of-run report refuses to let it read as a whole project.
+    report_webkit_chunk_range >"$OUT/rangereport.out" 2>&1
+    assert_says "$OUT/rangereport.out" "CHUNK RANGE ONLY: 2-3 of 4" "the final report restates the range"
+    assert_says "$OUT/rangereport.out" "Coverage is incomplete" "the final report calls the coverage incomplete"
+}
+
+test_an_open_ended_range_runs_to_the_last_chunk() {
+    echo "test: an open-ended range discharges the tail a memory stop lost"
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_CHUNKS=3-
+    drive_in "$RANGE" "$OUT/openrange.out" || true
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    assert_says "$OUT/openrange.out" "LIMITED to chunks 3-4 of 4" "the open end resolves to the last chunk"
+    assert_says "$OUT/openrange.out" "nav chunk 1/4: SKIPPED" "chunk 1 was skipped"
+    assert_says "$OUT/openrange.out" "nav chunk 3/4: 2 specs" "chunk 3 ran"
+    assert_says "$OUT/openrange.out" "nav chunk 4/4: 2 specs" "chunk 4 ran"
+}
+
+test_a_garbage_range_runs_every_chunk() {
+    echo "test: an unparseable range runs everything rather than nothing"
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_CHUNKS=chunks-2-through-3
+    drive_in "$RANGE" "$OUT/junkrange.out" || true
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    assert_says "$OUT/junkrange.out" "mobile-webkit nav chunk 1/4" "chunk 1 ran"
+    assert_says "$OUT/junkrange.out" "mobile-webkit nav chunk 4/4" "chunk 4 ran"
+    assert_silent_about "$OUT/junkrange.out" "SKIPPED, outside chunk range" "nothing was skipped"
+    assert_eq "" "$WEBKIT_CHUNK_RANGE_APPLIED" "a widened range is not recorded as a narrowing"
+}
+
+# The sibling knob is one character away, so a typo lands `2-3` in the SIZE. Bash
+# arithmetic reads that as -1, nchunks goes negative, and the loop counts down
+# forever. It must fall back rather than hang.
+test_a_non_numeric_chunk_size_falls_back_instead_of_hanging() {
+    echo "test: a range accidentally set as the chunk SIZE falls back to 3"
+    local rc
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_CHUNK=2-3
+    drive_in "$RANGE" "$OUT/badsize.out"
+    rc=$?
+    export LUCIDOS_E2E_WEBKIT_CHUNK=2
+    assert_eq "0" "$rc" "the run completes rather than hanging"
+    # Ten specs at the fallback size of 3: CC is one chunk of 2, nav is three
+    # chunks (3, 3, 2). A negative size would never have printed chunk 1 at all.
+    assert_says "$OUT/badsize.out" "mobile-webkit nav chunk 1/3: 3 specs" "the fallback size of 3 is in force"
+    assert_says "$OUT/badsize.out" "mobile-webkit nav chunk 3/3: 2 specs" "the remainder chunk is right"
+}
+
+test_a_full_width_range_is_not_announced_as_a_narrowing() {
+    echo "test: an explicit range covering everything is not reported as incomplete"
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_CHUNKS=1-4
+    drive_in "$RANGE" "$OUT/fullrange.out" || true
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    assert_silent_about "$OUT/fullrange.out" "LIMITED to chunks" "a full-width range announces nothing"
+    assert_eq "" "$WEBKIT_CHUNK_RANGE_APPLIED" "a full-width range is not a ranged run"
+    report_webkit_chunk_range >"$OUT/fullreport.out" 2>&1
+    assert_silent_about "$OUT/fullreport.out" "CHUNK RANGE ONLY" "the final report says nothing"
+}
+
 test_the_cc_phase_runs_first_and_nav_second
 test_both_phases_still_shard
 test_desktop_specs_are_excluded_from_both_phases
@@ -354,6 +512,13 @@ test_a_failing_cc_phase_outranks_the_boundary_stop
 test_a_stop_inside_navigation_keeps_the_cc_verdict
 test_a_set_with_no_cc_specs_runs_in_one_pass
 test_the_real_inventory_puts_cc_first
+test_the_range_parser_resolves_and_clamps
+test_no_range_runs_every_nav_chunk
+test_a_range_runs_only_its_members_and_says_so
+test_an_open_ended_range_runs_to_the_last_chunk
+test_a_garbage_range_runs_every_chunk
+test_a_non_numeric_chunk_size_falls_back_instead_of_hanging
+test_a_full_width_range_is_not_announced_as_a_narrowing
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

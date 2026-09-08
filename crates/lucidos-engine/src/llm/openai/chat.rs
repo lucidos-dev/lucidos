@@ -329,6 +329,18 @@ impl OpenAiProvider {
             for tc in tc_array {
                 let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
+                // The index comes straight off provider JSON, and an
+                // OpenAI-compatible host (OpenRouter, a local server, the keyless
+                // relay) is untrusted. A huge index would grow `tool_call_map` to
+                // billions of empty entries and OOM the engine. Legitimate indexes
+                // are small and contiguous, so anything past the cap is malformed.
+                if index >= MAX_STREAMED_TOOL_CALLS {
+                    return Err(format!(
+                        "provider streamed tool_call index {index}, past the {MAX_STREAMED_TOOL_CALLS} cap"
+                    )
+                    .into());
+                }
+
                 while tool_call_map.len() <= index {
                     tool_call_map.push(AccumulatedToolCall {
                         id: String::new(),
@@ -421,6 +433,12 @@ impl OpenAiProvider {
 /// would be unreadable there.
 const PROVIDER_DETAIL_MAX: usize = 300;
 
+/// Upper bound on a streamed tool-call index before we treat the frame as
+/// malformed. Real turns emit a handful of tool calls. This sits far above any
+/// legitimate stream and exists only to stop an untrusted host OOMing the
+/// engine with a huge index.
+const MAX_STREAMED_TOOL_CALLS: usize = 1024;
+
 /// Render one Chat Completions SSE error frame as a single readable line.
 ///
 /// This builder serves OpenRouter and local servers as well as OpenAI, and
@@ -510,6 +528,24 @@ fn truncate_detail(mut detail: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_stream_rejects_an_out_of_range_tool_call_index() {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut meta = StreamMeta::default();
+
+        // A hostile OpenAI-compatible host sends a tool_call index near u32::MAX.
+        // Without the cap this grows `tools` to billions of entries and OOMs.
+        let result = OpenAiProvider::process_chat_chunk(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":4000000000,"id":"x","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        );
+        assert!(result.is_err(), "out-of-range tool_call index must error");
+        assert!(tools.is_empty(), "must not grow the tool-call map");
+    }
 
     /// The Chat Completions stream MUST surface `finish_reason` (from the
     /// last per-choice chunk) and token usage (from the final empty-choices

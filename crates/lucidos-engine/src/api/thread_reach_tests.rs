@@ -18,8 +18,10 @@ use sqlx::PgPool;
 const EVERY_VERB: &[ThreadReachVerb] = &[
     ThreadReachVerb::Archive,
     ThreadReachVerb::Cancel,
+    ThreadReachVerb::Control,
     ThreadReachVerb::Apply,
     ThreadReachVerb::Discard,
+    ThreadReachVerb::Revert,
     ThreadReachVerb::AnswerQuestion,
     ThreadReachVerb::Continue,
     ThreadReachVerb::CreateTopThread,
@@ -27,14 +29,15 @@ const EVERY_VERB: &[ThreadReachVerb] = &[
 
 /// Every surface carrying a clause-4 verb, and the file its handler lives in.
 ///
-/// Fourteen HTTP routes for seven verbs, since Apply, Discard and cancel each
-/// arrive by more than one path. Plus the three LLM tools that press Apply
-/// in-process. Hand-written, which is its weakness: a route added elsewhere is
-/// invisible here until somebody adds the row, and that is how arming an apply
-/// shipped ungated. Review a new change route against this list.
+/// Several HTTP routes per verb, since Apply, Discard and cancel each arrive by
+/// more than one path. The LLM tools that press Apply in-process are here too.
+/// Hand-written, which is its weakness: a route added elsewhere is invisible
+/// here until somebody adds the row, and that is how arming an apply shipped
+/// ungated. Review a new change route against this list.
 const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("changes.rs", CHANGES_RS, "apply_change"),
     ("changes.rs", CHANGES_RS, "discard_change"),
+    ("changes.rs", CHANGES_RS, "revert_change"),
     ("changes.rs", CHANGES_RS, "apply_all_changes"),
     ("changes.rs", CHANGES_RS, "discard_all_changes"),
     ("chat.rs", CHAT_RS, "chat_submit"),
@@ -43,6 +46,7 @@ const GATED_HANDLERS: &[(&str, &str, &str)] = &[
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_apply_now"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_discard"),
     ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_interrupt"),
+    ("claude_code.rs", CLAUDE_CODE_RS, "claude_code_control"),
     ("threads/actions.rs", ACTIONS_RS, "answer_thread_question"),
     ("threads/actions.rs", ACTIONS_RS, "continue_thread"),
     ("threads/archive.rs", ARCHIVE_RS, "archive_thread"),

@@ -103,7 +103,7 @@ Per `system-knowhow/js-sdk.md`:
 
 - `index.html` matches the current boilerplate (script order, which pieces are required vs optional).
 - Every `lucidos.*` call used in app code appears in the SDK reference. Calls not listed are either deprecated or invented.
-- **External-API calls from the iframe — USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side, injects the configured auth header from the credential store, and strips Cookie/Origin/Referer/Host. The credential never reaches the iframe. Configure the backend once in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+- **External-API calls from the iframe: USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side and injects the configured auth header from the credential store. It strips the headers belonging to this side of the hop. The credential never reaches the iframe. Configure the backend once in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the strip list.
 
   **DO NOT USE** either of the following. Flag each occurrence and recommend the SDK helper:
 

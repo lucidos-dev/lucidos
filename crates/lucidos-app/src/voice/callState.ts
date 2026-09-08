@@ -59,11 +59,12 @@ export const WORDS_BOUND_MS = 10_000;
 export const HEARING_YOU = 'Hearing you';
 
 /**
- * A call holds no words.
+ * A call holds the caller's last finished sentence, and nothing else.
  *
- * Nothing captions a call in flight, so the utterances the engine reports are
- * read for what they imply and dropped. What was said is written down by the
- * engine as thread events, which is where the reader finds it.
+ * Nothing captions a call in flight, so a reply being spoken is read for what
+ * it implies and dropped. The caller's own finished words are the exception,
+ * and ADR 0174 is why: the engine holds them across the talker's decision, so
+ * a client that drops them has nothing to draw for as long as that takes.
  */
 export interface CallState {
   phase: CallPhase;
@@ -85,6 +86,18 @@ export interface CallState {
    * utterances in a row are both `live`.
    */
   utteranceCount: number;
+  /**
+   * What the provider says utterance `utteranceCount` was, or `null`.
+   *
+   * The one caption a call keeps, and it captions nothing in flight: it is set
+   * only once the provider has ENDED the turn, so the sentence is final. The
+   * transcript draws it the moment the speaking bars stop, instead of waiting
+   * on the engine's own row for it.
+   *
+   * A revision replaces it. Two `user_turn_ended` frames for one turn mean the
+   * provider corrected itself, and the reader is owed the better text.
+   */
+  heard: string | null;
 }
 
 export const CALL_IDLE: CallState = {
@@ -93,6 +106,7 @@ export const CALL_IDLE: CallState = {
   note: null,
   utterance: 'none',
   utteranceCount: 0,
+  heard: null,
 };
 
 /** Everything that can move a call. */
@@ -201,7 +215,7 @@ export function stepCall(
       // The words never came, so the row promising them is withdrawn. Only a
       // wait can time out: a `live` utterance is bounded by the caller.
       return state.utterance === 'landing' || state.utterance === 'transcribed'
-        ? { state: { ...state, utterance: 'none' }, effects: [] }
+        ? { state: { ...state, utterance: 'none', heard: null }, effects: [] }
         : unchanged(state);
     case 'socket-closed':
       return state.phase === 'idle' ? unchanged(state) : hungUp(state);
@@ -251,7 +265,10 @@ function onSpeech(state: CallState, open: boolean): { state: CallState; effects:
 function startUtterance(state: CallState): CallState {
   if (state.utterance === 'live') return state;
   if (state.utterance === 'landing') return { ...state, utterance: 'live' };
-  return { ...state, utterance: 'live', utteranceCount: state.utteranceCount + 1 };
+  // A fresh turn, so the words of the last one are no longer this one's. The
+  // ROW keeps them: `store/liveUtterance.ts` copied them out, and only the
+  // engine's own row retires that (ADR 0174).
+  return { ...state, utterance: 'live', utteranceCount: state.utteranceCount + 1, heard: null };
 }
 
 function place(threadId: string): { state: CallState; effects: CallEffect[] } {
@@ -273,8 +290,12 @@ function ringOff(state: CallState): { state: CallState; effects: CallEffect[] } 
   if (state.phase === 'connecting') return { state: CALL_IDLE, effects: [TEARDOWN] };
   // The utterance goes with the call. Whatever the caller was mid-way through
   // saying, nothing will transcribe it now, so the row promising it must go.
+  //
+  // A FINISHED sentence is not mid-way through anything, and its row stays.
+  // `call.rs` writes down whatever it is holding for every end reason, so the
+  // words are still owed a row (ADR 0174). The bridge keeps that one standing.
   return {
-    state: { ...state, phase: 'ending', utterance: 'none' },
+    state: { ...state, phase: 'ending', utterance: 'none', heard: null },
     effects: [HANG_UP, STOP_PLAYBACK],
   };
 }
@@ -315,12 +336,24 @@ function onFrame(
       if (state.utterance === 'none') return unchanged(state);
       if (!frame.transcript.trim()) {
         return state.utterance === 'landing'
-          ? { state: { ...state, utterance: 'none' }, effects: [] }
+          ? { state: { ...state, utterance: 'none', heard: null }, effects: [] }
           : unchanged(state);
       }
-      return state.utterance === 'transcribed'
-        ? unchanged(state)
-        : { state: { ...state, utterance: 'transcribed' }, effects: [] };
+      // The words are kept, and this is the only place they enter the state.
+      // An already-`transcribed` utterance still takes them: a second frame for
+      // one turn is the provider revising itself, and the row is rewritten in
+      // place rather than left showing the worse text.
+      //
+      // A `live` one takes NONE. The frame carries no id and lands well after
+      // the caller stopped, so one arriving mid-word describes something they
+      // have already finished saying. The state still moves, exactly as
+      // before; only the caption is withheld, and the caller's own frame
+      // supplies it when they stop. Putting an earlier sentence in the bubble
+      // for the one being said is the failure this avoids (ADR 0174).
+      const heard = state.utterance === 'live' ? state.heard : frame.transcript;
+      // A frame saying nothing new is a no-op, so nothing downstream wakes.
+      if (state.utterance === 'transcribed' && state.heard === heard) return unchanged(state);
+      return { state: { ...state, utterance: 'transcribed', heard }, effects: [] };
     }
     case 'talker_transcript': {
       // Read for what it means rather than what it says: the first delta of a

@@ -36,6 +36,7 @@ import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
 import { cancelAppUpdate } from '../utils/tauri';
 import { documentTitle } from '../utils/windowTitle';
+import { errorDetail } from '../utils/errorDetail';
 import { restartDialogState, appUpdateDialogState } from './progressDialogCopy';
 import { clampToastMessage } from '../components/shared/toastMessage';
 import type { EventSubscription, ThreadState, ThreadStatus, Exchange } from './thread-events';
@@ -2006,6 +2007,20 @@ export const progressDialog = signal<ProgressDialogState>({
  *  `engineRestarting` is true, so it needs no clearing. */
 export const engineRestartNewVersion = signal(false);
 
+/** The progress dialog's Cancel, with the refusal reported.
+ *
+ *  The dialog is modal and carries no close button. A rejected cancel therefore
+ *  leaves the user staring at an install they just tried to stop, with nothing
+ *  said. The telemetry carve-out does not reach a button the user pressed
+ *  (`.claude/rules/frontend.md`). */
+async function requestAppUpdateCancel(): Promise<void> {
+  try {
+    await cancelAppUpdate();
+  } catch (e) {
+    showToast(`Could not cancel the update: ${errorDetail(e)}`, 'error');
+  }
+}
+
 /** The progress dialog on screen, or an invisible state when there is none.
  *
  *  DERIVED, and that is the whole point: a modal written by hand at each site
@@ -2021,7 +2036,7 @@ export const engineRestartNewVersion = signal(false);
 export const activeProgressDialog = computed<ProgressDialogState>(() => {
   if (engineRestarting.value) return restartDialogState(engineRestartNewVersion.value);
   const frame = appUpdateProgress.value;
-  if (frame) return appUpdateDialogState(frame, () => { void cancelAppUpdate(); });
+  if (frame) return appUpdateDialogState(frame, () => { void requestAppUpdateCancel(); });
   return progressDialog.value;
 });
 

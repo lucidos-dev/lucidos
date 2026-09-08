@@ -384,6 +384,33 @@ pub(crate) fn is_merge_of_branch_into_main(line: &str, branch_name: &str) -> boo
     true
 }
 
+/// What the leftover rebase directories are, once git has answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleRebase {
+    /// git aborted the rebase, and the directories went with it.
+    Aborted,
+    /// git ran and refused, so what is left on disk is residue.
+    Residue,
+    /// git could not be asked, so nothing is known about the state.
+    Unanswered,
+}
+
+/// Classify a `git rebase --abort` result. Pure, so the `Unanswered` arm is
+/// unit-testable without starving a real git process.
+///
+/// `Err` is a spawn failure or the [`GIT_TIMEOUT`] ceiling, which a live rebase
+/// on a saturated host really does hit. Deleting `.git/rebase-merge` there
+/// destroys the user's only route back to the pre-rebase HEAD, so an unanswered
+/// probe must never authorize it. A non-zero exit is a different thing: git ran
+/// and said there is no rebase to abort, which makes the leftovers residue.
+pub(crate) fn classify_rebase_abort(result: &Result<std::process::Output, String>) -> StaleRebase {
+    match result {
+        Ok(o) if o.status.success() => StaleRebase::Aborted,
+        Ok(_) => StaleRebase::Residue,
+        Err(_) => StaleRebase::Unanswered,
+    }
+}
+
 /// Clean up stale git state and re-attach HEAD to main if needed.
 ///
 /// A Claude Code session (or any git operation) can leave behind:
@@ -392,34 +419,43 @@ pub(crate) fn is_merge_of_branch_into_main(line: &str, branch_name: &str) -> boo
 /// 2. A detached HEAD -- causes `git status` to report false dirty files.
 ///
 /// This is a no-op when git state is clean and HEAD is on main.
+///
+/// An unanswered abort makes the whole function stand down, re-attach included.
+/// The two halves are one decision. HEAD is legitimately detached during a live
+/// rebase, so the re-attach below would force-check-out main over the tree the
+/// `Unanswered` arm just declined to disturb. Standing down leaves the caller's
+/// `git status` to report dirty, which refuses the apply loudly.
 pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
     let rebase_merge = repo_root.join(".git/rebase-merge");
     let rebase_apply = repo_root.join(".git/rebase-apply");
     if rebase_merge.exists() || rebase_apply.exists() {
         log!("[Changes] Stale rebase state detected -- aborting");
-        let aborted = match git_cmd(&["rebase", "--abort"], repo_root).await {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                log!(
-                    "[Changes] git rebase --abort failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                false
-            }
-            Err(e) => {
-                log!("[Changes] git rebase --abort failed: {}", e);
-                false
-            }
+        let abort = git_cmd(&["rebase", "--abort"], repo_root).await;
+        let detail = match &abort {
+            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            Err(e) => e.clone(),
         };
-        if !aborted {
-            for dir in [&rebase_merge, &rebase_apply] {
-                if dir.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(dir) {
-                        log!("[Changes] Failed to remove {}: {}", dir.display(), e);
+        match classify_rebase_abort(&abort) {
+            StaleRebase::Aborted => {}
+            StaleRebase::Residue => {
+                log!("[Changes] git rebase --abort refused: {}", detail);
+                for dir in [&rebase_merge, &rebase_apply] {
+                    if dir.exists() {
+                        if let Err(e) = std::fs::remove_dir_all(dir) {
+                            log!("[Changes] Failed to remove {}: {}", dir.display(), e);
+                        }
                     }
                 }
+                log!("[Changes] Removed stale rebase directories directly");
             }
-            log!("[Changes] Removed stale rebase directories directly");
+            StaleRebase::Unanswered => {
+                log!(
+                    "[Changes] cannot run git rebase --abort: {}. Leaving the rebase state \
+                     and HEAD untouched",
+                    detail
+                );
+                return;
+            }
         }
     }
 

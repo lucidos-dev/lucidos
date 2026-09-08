@@ -231,6 +231,11 @@ pub(super) async fn revert_change(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
+    // Reverting an applied change is at least as destructive as discarding a
+    // pending one, so it takes the same subtree-reach gate its siblings do. The
+    // change keeps its `thread_id` after applying, so `refuse_change_verb` scopes
+    // revert to the change's own thread exactly like discard.
+    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Revert).await?;
     match state.engine.revert_change(id, actor).await {
         Ok(message) => {
             broadcast_changes(&state).await;

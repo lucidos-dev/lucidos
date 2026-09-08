@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.36.0 — 2026-09-08
+
+### Added
+
+- **GPT-6 Astra** joins the chat model picker as a builtin OpenAI model, with its full 1,050,000 token context window and reasoning tiers up to xhigh. Calls reach it once your OpenAI account is entitled to the model.
+
+### Changed
+
+- The Notifications page draws its toolbar and a skeleton list while the inbox loads, so the page has its shape from the first frame.
+- The Backup page raises every skeleton in a section together, and the health card holds its space from the first render.
+- Collapsed-section counts sit on their label's line with the digits centred, at every UI scale and on both browser engines.
+
+### Fixed
+
+- An app's proxy call no longer carries the engine's own trust headers to the upstream it calls. The whole `x-lucidos-` namespace and the two forwarding headers the gateway owns are stripped from every forwarded request.
+- A credential already present in a proxy URL is masked in the log line, on the first hop and on every redirect that follows it.
+- The webhook socket drops forwarding headers a client supplies, so nothing reaching it from outside can claim to have crossed the gateway.
+- The unattended command guard sees through a wrapper. `nohup bash -c '...'`, `sudo bash -c '...'` and `arch <command>` are resolved to the real command before every danger scan, and a command the guard cannot classify is refused.
+- A command inside a substitution, such as `echo $(curl -X POST ...)`, is categorised by what it actually does, so a trigger grant is checked against the real call.
+- MCP tool arguments are scrubbed before they reach the event log and the live event stream.
+- Installing a plugin never follows a symlink, so a plugin tree cannot reach a file outside itself.
+- Reverting a change, and controlling a coding-agent session, are held to the same thread-reach rule that already covers applying and discarding.
+- A model provider cannot exhaust the engine's memory by sending an oversized index in a streamed response.
+- A coding-agent teardown removes only its own session, so a follow-up session stays reachable by Stop and keeps the worktree it is writing into.
+- The stuck-session watchdog acts only on the session it snapshotted, so a replacement session on the same thread is left alone.
+- A rebase git could not be asked about is left untouched. Apply and Revert report the repository as dirty, and `git rebase --abort` still works.
+- A cancelled chat request releases its queue slot, so the thread queue cannot fill with slots nobody holds.
+- Your words appear in your call bubble the moment you stop speaking, and stay there until the engine's own record of the utterance replaces them.
+- A caller who keeps speaking gets a row per utterance, and a row left over from an earlier call is cleared when the next one starts.
+- Opening a thread that contains a call no longer sweeps the bubble somebody is speaking into.
+- Answering a question card out loud leaves no shimmering bubble behind, and typing during a call no longer collides with the call's own rows.
+- A notification arriving while you scroll the inbox is shown as well as counted, and paging re-reads the list when a reload moves it.
+- Scrolling the thread drawer while you type keeps your draft row on screen.
+- The Thinking spinner clears when the transcript resyncs.
+- A message queued during a running turn leaves that turn its own stream and badge, and Stop returns the queued text to the composer.
+- Searching Files shows the loader while the list is still loading, and offers only change rows it can open.
+- The Browse dialog for adding a repository is drawn as a modal: centred, scrimmed and scrollable.
+- The thread filter measures Include deleted against every trigger, so selecting all of them reads as all.
+- The standing-apply control appears on a paused coding-agent thread, which is still working and can still settle.
+- Four silent failures now speak: a queued message that could not be retracted on Stop, a repository registered moments earlier reading as unregistered, a missing thread saying which one, and Cancel on the app-update dialog.
+- A window keeps its size and position when it moves between monitors of different scale.
+- Apply as they settle lands straight on its armed face when pressed.
+- Fetching news reports an unreadable response as an error, so an unreachable service is never reported as no news.
+- Two identical files uploaded at the same moment both succeed.
 ## v0.35.1 — 2026-09-04
 
 ### Fixed

@@ -142,10 +142,10 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-30. Anything not
+The currently-accepted categories, counted as of 2026-09-05. Anything not
 on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 80 sites across 51 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 52 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -153,9 +153,9 @@ on this list is fair game to remove and re-fix:
   the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-  One of the 80 shares an attribute with `format_in_format_args`, which is
+  One of the 81 shares an attribute with `format_in_format_args`, which is
   the same site that entry counts. Grepping the bare form alone therefore
-  reports 79 across 50 files. Both numbers here count the shared attribute.
+  reports 80 across 51 files. Both numbers here count the shared attribute.
 - **`#[allow(dead_code)]`**, 4 sites: the `SpawnTrigger` taxonomy enum
   (`agent_session/spawn_dispatcher.rs`, one attribute on the enum) and test
   scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
@@ -177,11 +177,12 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 532 sites across 186 files, every one of them
-  test-only code: 178 `*.test.ts`, seven `*.test.tsx`
+  `@types/node` in project**, 559 sites across 195 files, every one of them
+  test-only code: 186 `*.test.ts`, eight `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
+  `components/chat/__tests__/the-bubble-pulses-before-the-words.test.tsx`,
   `components/picker/__tests__/pairing-code-boxes.test.tsx`,
   `components/settings/__tests__/mcp-servers-page.test.tsx`,
   `components/shared/__tests__/apps-glyph-single-source.test.tsx` and
@@ -283,8 +284,8 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   It had one real error, `SharedWorkerGlobalScope` undeclared, which that run
   fixed by adding `WebWorker` to the SDK's `lib`.
 
-- **Phase 4's entry chunk is 713.53 kB against its 600 kB ceiling, and the
-  2026-08-30 run left it there.** `vite build` exits 0 and prints no code
+- **Phase 4's entry chunk is 744.63 kB against its 600 kB ceiling, and the
+  2026-09-08 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -304,7 +305,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.28 kB, against a 113.53 kB gap:
+  attribution now puts the whole list at 38.28 kB, against a 144.63 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
@@ -317,7 +318,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | `OverflowMenu` | 2.52 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 75 kB of it. The next
+  leave the advisory firing, and would now leave 106 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
@@ -330,6 +331,25 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   and re-ran the check for the usual culprit, a component gone from lazy to
   eager. There was none, for the fifth run running. That run's growth arrived
   with a wide batch of merged feature work, not from one module.
+
+  Every run since has re-run the check and found no lazy-to-eager regression:
+
+  | Run | Entry chunk | Change |
+  |---|---|---|
+  | 2026-08-30 | 713.53 kB | +21.18 kB |
+  | 2026-09-05 | 733.21 kB | +19.68 kB |
+  | 2026-09-06 | 743.87 kB | +10.66 kB |
+  | 2026-09-07 | 743.87 kB | 0 kB |
+  | 2026-09-08 | 744.63 kB | +0.76 kB |
+
+  The 2026-09-08 run makes nine in a row with no regression. Sourcemap
+  attribution put the same 393 of our own modules in the entry chunk as the
+  run before, and zero `node_modules` bytes. No module sits in both the entry
+  chunk and a separate one. Non-test app source holds 40 relative `import()`
+  sites: 8 are type-position and 32 resolve to a real target. None of the 32
+  sits in the entry chunk, and the SDK has no relative `import()` site at all.
+  The per-surface figures above are the 2026-08-30 deep-dive, not re-measured
+  here.
 
   **That check is two questions, not one.** Does any module sit in both the
   entry chunk and a separately emitted chunk? And does any target of a

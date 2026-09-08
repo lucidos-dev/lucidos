@@ -58,6 +58,7 @@ const {
   markAllRead,
   markReadOptimistic,
   loadNotifications,
+  loadMoreNotifications,
   navigateAdjacentNotification,
   viewNotification,
   resetViewDedup,
@@ -919,5 +920,91 @@ describe('unread set is resilient to out-of-order responses', () => {
     } else {
       throw new Error('expected the unread set to be reconciled to loaded');
     }
+  });
+});
+
+// Infinite scroll pages off the list's tail, and `handleNotificationSSE` can
+// reload page 1 while that request is out. Three answers are wrong. Writing the
+// pre-await snapshot back reverts the reload. Appending the page spans the
+// truncation, so the rows between become unreachable. Dropping it wedges the
+// sentinel, which re-arms only when `hasMore` changes. The fourth is to
+// re-cursor from the new tail and ask again.
+describe('loadMoreNotifications: a reload that lands mid-request', () => {
+  /** `n` rows, newest first, ids `p{start}`..., each a second older. */
+  function page(start: number, n: number): Notification[] {
+    return Array.from({ length: n }, (_, i) => ({
+      ...makeNotification(`p${start + i}`, true),
+      created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, 0) - (start + i) * 1000).toISOString(),
+    }));
+  }
+
+  beforeEach(() => {
+    notificationsFilter.value = 'all';
+    notificationsHasMore.value = true;
+    notificationsLoadingMore.value = false;
+    (getNotifications as Mock).mockReset();
+  });
+
+  it('appends the page when nothing moved under it', async () => {
+    notifications.value = { status: 'loaded', data: page(0, 3) };
+    (getNotifications as Mock).mockResolvedValueOnce({
+      notifications: page(3, 2), unread_count: 0, has_more: false,
+    });
+
+    await loadMoreNotifications();
+
+    const ids = (notifications.value as Loadable<Notification[]> & { data: Notification[] }).data.map(n => n.id);
+    expect(ids).toEqual(['p0', 'p1', 'p2', 'p3', 'p4']);
+    expect(notificationsHasMore.value).toBe(false);
+  });
+
+  it('re-cursors from the new tail instead of appending across a reload', async () => {
+    notifications.value = { status: 'loaded', data: page(0, 4) };
+    // First response answers the OLD cursor. While it is out, a reload
+    // truncates the list to its two newest rows.
+    (getNotifications as Mock).mockImplementationOnce(async () => {
+      notifications.value = { status: 'loaded', data: page(0, 2) };
+      return { notifications: page(4, 2), unread_count: 0, has_more: true };
+    });
+    (getNotifications as Mock).mockResolvedValueOnce({
+      notifications: page(2, 2), unread_count: 0, has_more: true,
+    });
+
+    await loadMoreNotifications();
+
+    const ids = (notifications.value as Loadable<Notification[]> & { data: Notification[] }).data.map(n => n.id);
+    // p2 and p3 must NOT be skipped: appending the stale page would have gone
+    // straight from p1 to p4 and left them unreachable by scrolling.
+    expect(ids).toEqual(['p0', 'p1', 'p2', 'p3']);
+    expect(getNotifications).toHaveBeenCalledTimes(2);
+    expect((getNotifications as Mock).mock.calls[1][0]).toMatchObject({
+      before: new Date(page(0, 2)[1].created_at).getTime() / 1000,
+    });
+  });
+
+  it('never doubles a row the reload already carried', async () => {
+    notifications.value = { status: 'loaded', data: page(0, 2) };
+    (getNotifications as Mock).mockResolvedValueOnce({
+      notifications: [...page(1, 1), ...page(2, 1)], unread_count: 0, has_more: false,
+    });
+
+    await loadMoreNotifications();
+
+    const ids = (notifications.value as Loadable<Notification[]> & { data: Notification[] }).data.map(n => n.id);
+    expect(ids).toEqual(['p0', 'p1', 'p2']);
+  });
+
+  it('gives up after a bounded number of retries rather than spinning', async () => {
+    notifications.value = { status: 'loaded', data: page(0, 3) };
+    // Every response moves the list, so no attempt can ever settle.
+    (getNotifications as Mock).mockImplementation(async () => {
+      notifications.value = { status: 'loaded', data: page(0, 3) };
+      return { notifications: page(3, 1), unread_count: 0, has_more: true };
+    });
+
+    await loadMoreNotifications();
+
+    expect((getNotifications as Mock).mock.calls.length).toBeLessThanOrEqual(3);
+    expect(notificationsLoadingMore.value).toBe(false);
   });
 });

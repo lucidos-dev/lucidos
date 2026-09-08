@@ -173,6 +173,12 @@ pub fn drop_empty_changes(changes: Vec<Change>) -> Vec<Change> {
 /// batch-loading thread state. Applied changes are left alone (their thread
 /// state no longer gates Apply). Two batch queries, no N+1: the serialize-time
 /// companion to `enrich_thread_titles`.
+///
+/// Both queries always run, because `working` is NOT a subset of `unsettled`.
+/// A `paused` coding-agent thread is working, and its status is outside
+/// `LIVE_THREAD_STATUSES`. Skipping the second query on an empty `unsettled`
+/// hid the standing-apply control whenever no other change in the batch had a
+/// live thread.
 pub async fn enrich_thread_unsettled(
     pool: &PgPool,
     changes: &mut [Change],
@@ -184,9 +190,6 @@ pub async fn enrich_thread_unsettled(
             .filter_map(|c| c.thread_id)
     };
     let unsettled = unsettled_thread_ids(pool, pending_ids()).await?;
-    if unsettled.is_empty() {
-        return Ok(());
-    }
     let working = crate::engine::standing_apply::working_thread_ids(pool, pending_ids()).await?;
     for change in changes.iter_mut() {
         if let Some(tid) = change.thread_id {
@@ -402,6 +405,39 @@ mod tests {
             .expect("filter");
         assert_eq!(kept.len(), 1, "only the settled thread's change survives");
         assert_eq!(kept[0].thread_id, Some(settled));
+
+        teardown_test_db(&db).await;
+    }
+
+    /// A `paused` coding-agent thread is working but not unsettled, so
+    /// `thread_working` must be set even when nothing in the batch is
+    /// unsettled. Otherwise the Changes panel hides the standing-apply control
+    /// that `available_thread_actions` offers for the same thread.
+    #[tokio::test]
+    async fn a_paused_thread_is_working_even_when_nothing_is_unsettled() {
+        let (pool, db) = setup_test_db().await;
+
+        let paused = Uuid::new_v4();
+        insert_thread_summary_with_status(&pool, paused, "paused").await;
+        sqlx::query("UPDATE thread_summaries SET is_coding_agent = TRUE WHERE thread_id = $1")
+            .bind(paused)
+            .execute(&pool)
+            .await
+            .expect("mark it a coding-agent thread");
+
+        let mut changes = vec![make_change(Some(paused))];
+        enrich_thread_unsettled(&pool, &mut changes)
+            .await
+            .expect("enrich");
+
+        assert!(
+            !changes[0].thread_unsettled,
+            "a paused thread is not mid-turn, so Apply stays offered"
+        );
+        assert!(
+            changes[0].thread_working,
+            "a standing apply on a paused thread still has a settle to wait for"
+        );
 
         teardown_test_db(&db).await;
     }

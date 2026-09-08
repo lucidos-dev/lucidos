@@ -1083,12 +1083,18 @@ export async function refreshThreadEvents(
       });
     // Always apply currentAggregate even when no new events arrived — the
     // snapshot may have advanced (e.g. status flipped) since the last refresh.
-    if (snapshot.events.length > 0 || snapshot.currentAggregate) {
+    // Re-read from the CURRENT map, the same guard `loadThreadEvents` carries.
+    // An archive flip or a save installs a fresh `ThreadState` with a fresh
+    // `meta` while this fetch is in flight. Applying to the detached object
+    // would drop the snapshot's whole meta overlay, which is the half that
+    // repairs a stuck spinner after an SSE gap.
+    const live = threadMap.value.get(threadId);
+    if (live && (snapshot.events.length > 0 || snapshot.currentAggregate)) {
       // Applied even when superseded: rows are append-only and gated on
       // `lastDbSeq`, and `applyEventRows` has its own aggregate staleness guard,
       // so a late snapshot can only add what is missing. Only the REPORTING is
       // ownership-gated, because that is what a superseded attempt gets wrong.
-      applyEventRows(map, threadId, thread, snapshot.events, snapshot.currentAggregate);
+      applyEventRows(threadMap.value, threadId, live, snapshot.events, snapshot.currentAggregate);
       threadMap.value = new Map(threadMap.value);
     }
     // The thread is caught up, so drop its stale mark. Outside the ownership
@@ -1285,11 +1291,10 @@ export async function loadOlderThreads(): Promise<void> {
   threadLoadingMore.value = true;
 
   try {
-    const map = threadMap.value;
     const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
 
     let oldestTime: string | null = null;
-    for (const t of map.values()) {
+    for (const t of threadMap.value.values()) {
       if (t.meta.saved) continue;
       // `t.meta.section` is the raw `archive_state`. The cursor tracks the
       // Archive pile, which `get_recent_threads` returns as one contiguous
@@ -1328,6 +1333,13 @@ export async function loadOlderThreads(): Promise<void> {
     }
 
     const response = await fetchOlderThreads(oldestTime, 15, sources, triggerIds, repoIds, appIds);
+    // Captured AFTER the fetch, the way `loadAllThreadsInner` does. Several
+    // paths install a FRESH Map while a page is in flight: the lazy
+    // compose-draft insert, `sendCompose`'s promotion, an archive flip, a save.
+    // Publishing a pre-fetch snapshot at the end reverts every one of them. The
+    // sharpest case drops the draft row the user is typing into, while the
+    // focus still points at it.
+    const map = threadMap.value;
     // The server has answered for THESE params. Every way out below is a
     // settled answer, so the stamp goes here rather than at each of them. It
     // stamps `applied`, captured before the await. The selection may have moved
@@ -1382,6 +1394,16 @@ export async function loadOlderThreads(): Promise<void> {
   }
 }
 
+/** Replay a page of history onto a thread. Exported under `_ForTest` only so
+ *  the caller's-bubble suite can drive the real path rather than a copy. */
+export function _applyEventRowsForTest(
+  map: Map<string, ThreadState>,
+  thread: ThreadState,
+  rows: ThreadEventRow[],
+): void {
+  applyEventRows(map, thread.meta.id, thread, rows, null);
+}
+
 function applyEventRows(
   map: Map<string, ThreadState>,
   threadId: string,
@@ -1389,6 +1411,13 @@ function applyEventRows(
   rows: ThreadEventRow[],
   currentAggregate: ThreadAggregate | null,
 ): void {
+  // A caller's un-landed bubble is live client state, and history knows
+  // nothing about it. Replay walks the SAME `handleEvent` a live event does.
+  // So a past call's rows would settle the tally, and its session end would
+  // sweep the bubble of somebody speaking right now. Snapshotted here for the
+  // same reason the aggregate is overlaid below: a replay must not leak.
+  const liveUtterances = thread.liveUtterances;
+  const settledUtterances = thread.settledUtterances;
   for (const row of rows) {
     const event = { type: row.event_type, ...row.payload } as ThreadEvent;
     handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
@@ -1402,6 +1431,8 @@ function applyEventRows(
       thread.meta.channel = row.payload.channel as ThreadMeta['channel'];
     }
   }
+  thread.liveUtterances = liveUtterances;
+  thread.settledUtterances = settledUtterances;
   // Backend snapshot is the source of truth for meta — overlay last so any
   // per-event mutations during replay don't leak through to thread.meta.
   if (currentAggregate) {

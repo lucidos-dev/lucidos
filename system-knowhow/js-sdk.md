@@ -468,7 +468,7 @@ async function eventsNewerThan(knownId) {
 
 ## lucidos.proxy — Call External APIs
 
-Call backends configured in `data/config/apis.json` through the engine. The engine injects the configured auth header from the credential store and strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request — **the credential never enters the iframe**.
+Call backends configured in `data/config/apis.json` through the engine. The engine injects the configured auth header from the credential store. It strips `Cookie`/`Origin`/`Referer`/`Host` from the forwarded request, and with them every `x-lucidos-*` header and the two `x-forwarded-*` ones the gateway owns. So **the credential never enters the iframe**, and no Lucidos credential reaches the upstream.
 
 This is the preferred way for app UIs to talk to external HTTP APIs. Direct `fetch` from the iframe runs into two walls:
 

@@ -451,9 +451,20 @@ fn is_hop_by_hop(name_lower: &str) -> bool {
 /// Hop-by-hop + Host (reqwest sets it from the URL) + Cookie/Origin/Referer
 /// (these belong to the engine's own origin and would leak browser session
 /// context to the upstream).
+///
+/// Plus everything that MEANS something to us, which is the mirror of
+/// `hook_socket::forwarded_to_engine` on the way in. The gateway stamps
+/// `x-lucidos-local-token` on every hop it proxies, and that is the machine's
+/// full-authority credential. `apis.json` is writable over the API, so the host
+/// on the other end of this forward is caller data: passing our own namespace
+/// through hands a credential to whoever an app pointed an entry at. The two
+/// forwarding headers go for the reason the gateway owns them. A value we
+/// generated must not reach an upstream that reads it as its own client's.
 pub fn should_strip_request_header(name: &HeaderName) -> bool {
     let s = name.as_str();
-    is_hop_by_hop(s) || matches!(s, "host" | "cookie" | "origin" | "referer")
+    let ours = s.starts_with("x-lucidos-");
+    let forwarding = matches!(s, "x-forwarded-prefix" | "x-forwarded-host");
+    is_hop_by_hop(s) || ours || forwarding || matches!(s, "host" | "cookie" | "origin" | "referer")
 }
 
 /// Headers to strip from the *upstream* response before returning to client.
@@ -657,6 +668,34 @@ fn decoded_readings(path: &str) -> Vec<String> {
 pub(crate) fn append_query_param(url: &str, key: &str, value: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{}{}{}={}", url, separator, key, urlencoding::encode(value),)
+}
+
+/// The log-safe form of a URL carrying a credential under `key`.
+///
+/// Masks every value ALREADY carried under `key`, then appends one masked copy
+/// standing for the value the layer is about to add.
+///
+/// Masking the existing ones is the load-bearing half. A same-origin redirect
+/// echoing the query back hands the next hop a target URL that already carries
+/// the secret (see `forward_with_redirects`). Appending a redacted copy beside
+/// it would leave the real one in the line `forward_request` writes on a
+/// transport failure.
+pub(crate) fn redacted_query_log_url(url: &str, key: &str) -> String {
+    const REDACTED: &str = "REDACTED";
+    let masked = match url.split_once('?') {
+        None => url.to_string(),
+        Some((base, query)) => {
+            let pairs: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((name, _)) if name == key => format!("{key}={REDACTED}"),
+                    _ => pair.to_string(),
+                })
+                .collect();
+            format!("{base}?{}", pairs.join("&"))
+        }
+    };
+    append_query_param(&masked, key, REDACTED)
 }
 
 /// Compute HMAC over `data` with `secret` and return lowercase hex.

@@ -7,7 +7,7 @@ import {
   selectedRepoIds,
   selectedAppIds,
 } from './store';
-import { triggerFilterOptions, triggerFilterOptionsAll } from './triggerFilters';
+import { triggerFilterOptionsAll } from './triggerFilters';
 import { repoFilterOptionsAll } from './repoFilters';
 import { appFilterOptionsAll } from './appFilters';
 import { hasHiddenDeleted } from './deletedFilterOptions';
@@ -22,7 +22,13 @@ export const threadFilterActive = computed<boolean>(() => {
 
   if (threadChannelFilter.value.has('trigger')) {
     const selected = selectedTriggerIds.value.size;
-    const total = triggerFilterOptions.value.length;
+    // The WHOLE universe, not the visible slice. `triggerFilterOptions` drops
+    // an unselected deleted trigger while "Include deleted" is off, so picking
+    // every row on screen read as `selected === total` and reported neutral.
+    // `threadPassesChannelFilter` still hides the deleted trigger's threads on
+    // any non-empty selection, so the Filter button went dark over a narrowed
+    // list. The panel already ORs in `deletedOptionsHidden` and disagreed.
+    const total = triggerFilterOptionsAll.value.length;
     if (selected > 0 && (total === 0 || selected < total)) return true;
   }
 

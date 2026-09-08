@@ -141,10 +141,11 @@ pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
 /// A lock the checkpoint test holds against only SOME writers still lets the
 /// rest recreate the card. The writers today are the three apply tests, the two
 /// trigger tests (their script files appearing and being removed), the
-/// file-edit tests, the CLI data-write test, and the app-seeding helper. If you
-/// add a test that creates, edits or deletes a non-ignored file under the e2e
-/// workspace, take a `read()` guard across that mutation, or a `write()` one if
-/// the mutation is a merge. Writes under
+/// file-edit tests, the CLI data-write test, and the app-seeding helper. The
+/// handshake-approval test is one too, for its `data/scripts` and `data/config`
+/// writes. If you add a test that creates, edits or deletes a non-ignored file
+/// under the e2e workspace, take a `read()` guard across that mutation. Take a
+/// `write()` one if the mutation is a merge. Writes under
 /// `.lucidos/` and `data/blobs/` need nothing: the workspace gitignores both, so
 /// no snapshot ever sees them.
 ///

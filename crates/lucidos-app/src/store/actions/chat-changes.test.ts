@@ -1,18 +1,20 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Change } from '../../api/client';
-import { changes, appliedChanges, lazyChanges } from '../store';
+import { changes, appliedChanges, lazyChanges, applyAllInProgress } from '../store';
 
 const mockGetChangeById = vi.fn();
+const mockApplyAll = vi.fn();
 
 vi.mock(import('../../api/client'), async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
     getChangeById: (...args: Parameters<typeof actual.getChangeById>) => mockGetChangeById(...args),
+    applyAllChanges: (...args: Parameters<typeof actual.applyAllChanges>) => mockApplyAll(...args),
   };
 });
 
-const { ensureChangeLoaded } = await import('./chat-changes');
+const { ensureChangeLoaded, applyAllChanges } = await import('./chat-changes');
 
 function makeChange(id: string, overrides: Partial<Change> = {}): Change {
   return {
@@ -43,6 +45,31 @@ beforeEach(() => {
   changes.value = { status: 'loaded', data: [] };
   appliedChanges.value = { status: 'loaded', data: [] };
   lazyChanges.value = new Map();
+  applyAllInProgress.value = false;
+});
+
+/** "Apply as they settle" presses this and is never disabled, because it arms
+ *  rather than applies and so wears no in-flight face. The single flight has to
+ *  live in the action instead. */
+describe('applyAllChanges', () => {
+  it('drops a second press while the first is in flight', async () => {
+    mockApplyAll.mockResolvedValue({ batch_size: 0, armed: 2, message: 'armed' });
+
+    const first = applyAllChanges(true);
+    await applyAllChanges(true);
+    await first;
+
+    expect(mockApplyAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes the next press once the arm has landed', async () => {
+    mockApplyAll.mockResolvedValue({ batch_size: 0, armed: 1, message: 'armed' });
+
+    await applyAllChanges(true);
+    await applyAllChanges(true);
+
+    expect(mockApplyAll).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('ensureChangeLoaded', () => {

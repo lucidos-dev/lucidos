@@ -12,7 +12,7 @@ vi.mock('../../api/client', () => ({
   isTransportError: () => false,
 }));
 
-const { notificationsTabSource } = await import('./NotificationsView');
+const { notificationsTabSource, notificationsTabIsLoading } = await import('./NotificationsView');
 const { unreadNotifications, notifications, unreadCount } = await import('../../store/store');
 
 function n(id: string, read: boolean): Notification {
@@ -45,5 +45,29 @@ describe('notificationsTabSource — single source of truth for the Unread tab',
 
     expect(rendered).toBe(unreadCount.value);
     expect(rendered).toBe(3);
+  });
+});
+
+describe('notificationsTabIsLoading: what the panel owes a skeleton', () => {
+  it("counts 'not-loaded' as loading, on either tab", () => {
+    // The reported blank panel. Between the panel opening and its loader
+    // claiming the signal, the tab holds 'not-loaded' and no rows. Reading only
+    // 'loading' left that window drawing nothing at all.
+    expect(notificationsTabIsLoading({ status: 'not-loaded' })).toBe(true);
+  });
+
+  it("counts 'loading' as loading", () => {
+    expect(notificationsTabIsLoading({ status: 'loading' })).toBe(true);
+  });
+
+  it('stops once rows land, empty ones included', () => {
+    // An empty inbox is an answer, and it gets the empty state, never a
+    // skeleton that would claim rows are still on their way.
+    expect(notificationsTabIsLoading({ status: 'loaded', data: [] })).toBe(false);
+    expect(notificationsTabIsLoading({ status: 'loaded', data: [n('a1', true)] })).toBe(false);
+  });
+
+  it('stops on failure, which the error state owns instead', () => {
+    expect(notificationsTabIsLoading({ status: 'failed', error: 'nope' })).toBe(false);
   });
 });

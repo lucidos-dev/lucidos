@@ -18,10 +18,12 @@ import { apiUrl } from './_fetch';
  * lucidos.proxy('comfort').fetch('/api/v1/devices', { method: 'POST', body });
  * ```
  *
- * The engine forwards the request to the configured backend, strips
- * Cookie/Origin/Referer/Host (so the upstream doesn't see the engine's
- * browser session), and injects the configured auth header from the
- * credential store. The credential value never reaches the iframe.
+ * The engine forwards the request to the configured backend and injects the
+ * configured auth header from the credential store. It strips
+ * Cookie/Origin/Referer/Host, so the upstream never sees the engine's browser
+ * session. It strips every `x-lucidos-*` header and the two `x-forwarded-*`
+ * ones the gateway owns with them, so no Lucidos credential travels either.
+ * The credential value never reaches the iframe.
  */
 export interface ProxyClient {
   /** Make a request to the configured backend. Returns the raw `Response`

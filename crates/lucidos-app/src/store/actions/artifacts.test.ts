@@ -113,14 +113,14 @@ describe('loadArtifacts — previously-open file preview restore', () => {
     const { loadArtifacts } = await import('./artifacts');
     await loadArtifacts(); // first load consumes the one-shot restore
 
-    // The user then opens the Planer app — content pane is now an app-ui.
-    panelOverlay.value = { type: 'app-ui', app: { id: 'plan' } as never };
+    // The user then opens an app, so the content pane is now an app-ui.
+    panelOverlay.value = { type: 'app-ui', app: { id: 'demo-director' } as never };
 
     // An agent run edits artifacts/plans/index.json → DataFileEdited → another
     // loadArtifacts(). This must NOT yank the pane back to the last PDF.
     await loadArtifacts();
 
-    expect(panelOverlay.value).toEqual({ type: 'app-ui', app: { id: 'plan' } });
+    expect(panelOverlay.value).toEqual({ type: 'app-ui', app: { id: 'demo-director' } });
   });
 
   it('drops a stale saved path that no longer exists, on the first load', async () => {

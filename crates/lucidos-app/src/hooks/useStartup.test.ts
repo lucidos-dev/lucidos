@@ -213,3 +213,47 @@ describe('useStartup app toast bridge wiring', () => {
     expect(body.indexOf('handleAppToastMessage(')).toBeGreaterThan(frameAt);
   });
 });
+
+/**
+ * Cold-starting on the Notifications panel does not wait out the preferences
+ * round-trip before asking for the inbox.
+ *
+ * Chaining the list load onto `loadPreferences()` held the panel empty for one
+ * whole round-trip, before the one that would fill it even began. What it
+ * guarded was the filter: read from the server rather than from its cache. The
+ * load goes first now, and the served filter corrects it where the two
+ * disagree, which is a tab switched on another device.
+ *
+ * That chaining was itself a fix. A list loaded under 'all' while the toggle
+ * then flipped to 'unread', so read rows showed under Unread. Two later changes
+ * retired it. The filter signal is seeded from its cache when the module loads,
+ * so no effect outruns it. And the Unread tab renders `unreadNotifications`, so
+ * a browse list cannot surface there whatever filter fetched it.
+ */
+describe('useStartup notifications cold start', () => {
+  const src = stripComments(readFileSync(SOURCE, 'utf8'));
+  const eagerAt = src.indexOf('void loadNotifications()');
+  const preferencesAt = src.indexOf('loadPreferences().then(');
+
+  it('asks for the inbox before the preferences round-trip, not inside it', () => {
+    expect(eagerAt, 'the cold-start inbox load must exist').toBeGreaterThan(-1);
+    expect(preferencesAt).toBeGreaterThan(-1);
+    expect(eagerAt, 'a load inside the .then() costs the panel a whole round-trip of blank')
+      .toBeLessThan(preferencesAt);
+  });
+
+  it('still corrects the tab when the served filter disagrees with the cache', () => {
+    expect(src).toContain('const filterBeforePreferences = notificationsFilter.value');
+    expect(src).toContain('notificationsFilter.value !== filterBeforePreferences');
+    expect(src, 're-sourcing must cover whichever tab won, not just the browse list')
+      .toContain('refreshActiveNotificationsTab()');
+  });
+
+  it('rests on a filter the store seeds before any effect runs', () => {
+    // The precondition for loading first. Seed the signal from the served
+    // value's cache at module load and this effect cannot outrun it. Move the
+    // seed into an effect or an await and the eager load starts guessing.
+    const store = readFileSync(resolve(dirname(SOURCE), '../store/store.ts'), 'utf8');
+    expect(store).toContain(`localStorage.getItem('lucidos-notifications-filter')`);
+  });
+});

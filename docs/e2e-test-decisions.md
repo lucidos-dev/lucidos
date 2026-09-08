@@ -421,15 +421,34 @@ the Concerns rollup.
 
 ### mobile-webkit runs last, and alone
 
-One project costs about **15 GB of macOS VM compressor**. Everything else in the
-suite costs about 0.6 GB between them. That asymmetry, not any test, is what
+One project grows the **macOS VM compressor by about 15 GB**. Everything else in
+the suite costs about 0.6 GB between them. That asymmetry, not any test, is what
 decides the run order.
+
+**What that 15 GB is, measured.** It is not the run's memory. Per-boundary
+attribution over a full nightly puts the summed `phys_footprint` of every
+process the run owns at 7.41 GB rising to 7.99 GB. The compressor over the same
+37 boundaries went 4.86 GB to 17.11 GB.
+
+The pool holds compressed pages belonging to whatever was idle when each fresh
+browser needed room, and macOS never proactively decompresses them. So the
+number tracks the run's peak-demand excursions rather than what it holds. ADR
+0175 carries the full measurement.
+
+Two consequences follow, and they pull in opposite directions. Running the
+project last still protects everything queued behind it, because the excursions
+are real and the host's morning pays for them. But the number is not a danger
+reading, and treating it as one is what kept this project from ever finishing.
 
 The reaper below cannot see it. `webkit_reaps` was **0** across a climb from
 11.93 GB to 17.27 GB. The reaper caps per-process RSS at 6 GB and no single
 WebContent process comes near that, because the cost is spread over many
-short-lived ones. `kern.memorystatus_vm_pressure_level` is no use either: it
-read normal for the whole climb.
+short-lived ones.
+
+**`kern.memorystatus_vm_pressure_level` reading normal throughout was the
+finding, not a dead end.** This page used to call it "no use" for exactly that
+reason. It was right about the host and the compressor was wrong, so it is now
+the guard's primary stop. See ADR 0175 and `scripts/lib/host_memory_guard.sh`.
 
 Three levers were tried, in order of cost.
 
@@ -459,12 +478,12 @@ chunking is actually for. Two things bite, and the second is structural.
 **Chunking is not the same problem as chunked reporting**, and conflating them
 is what made removal look right. See "one verdict per project" below.
 
-**Lever 2 measures swap, not the compressor.** It used to be one number: a fixed
+**Lever 2 does not measure the compressor.** It used to be one number: a fixed
 12 GB of compressor. That number is what kept the unfiltered mobile-webkit
 project from ever reaching a verdict. Compressor size is how much idle memory
-macOS has squeezed, so it tracks total host demand rather than danger. It is also
-host-cumulative and does not drain (see below), so a run was charged for whatever
-was already compressed when it started.
+macOS has squeezed, so it tracks total host demand rather than danger. It is
+also host-cumulative, and drains only when the pages are asked for (see below).
+A run was therefore charged for whatever was already compressed at its start.
 
 That made the outcome structural. A full pass costs roughly 8 GB of growth, so it
 completed only from a host under about 4 GB and was cut short otherwise. The
@@ -472,55 +491,78 @@ growth rate is not constant either: two identical passes grew 0.22 and 0.46 GB
 per chunk, the second on a busier host. No byte budget can be calibrated against
 that, and a delta budget fails the same way.
 
-So the stop condition is **swap in use**, over `LUCIDOS_E2E_SWAP_MAX_GB` (1 GB).
-macOS compresses before it swaps, so swap is the point where compression stopped
-keeping up and the run began costing the host. That is the primary guard, and the
-stop message now says which of the two fired, in those words.
+**So the stop condition is the kernel's own verdict** (ADR 0175).
+`kern.memorystatus_vm_pressure_level` at `critical` stops the run. It is what
+separated the single recorded freeze from every healthy night. Three other stops
+sit beside it, in this order.
 
-The compressor survives as a **runaway backstop**, and it resolves to the **lower**
-of two ceilings. Both are ceilings, so the tighter one is the only one worth
-applying.
+- **Swap in use**, over `LUCIDOS_E2E_SWAP_MAX_GB` (1 GB). macOS compresses
+  before it swaps, so swap is the point where compression stopped keeping up.
+- **The available-memory floor**, `max(8 GB, 20% of RAM)`, which is real
+  scarcity and matches the pre-flight gate.
+- **The compressor runaway backstop**, `LUCIDOS_E2E_COMPRESSOR_MAX_PCT` (50) of
+  RAM. Not a danger reading: a net for a host doing something nobody modelled.
 
-- A **share of RAM** (`LUCIDOS_E2E_COMPRESSOR_MAX_PCT`, 50) keeps a small host
-  honest. A fixed 12 GB is 75% of a 16 GB Mac and 25% of a 48 GB one. It could
-  not mean the same thing on both.
-- An **absolute 16 GB cap** (`HOST_MEMORY_COMPRESSOR_CAP_GB`) keeps a large host
-  honest, and that half was missing. Half of 48 GB is 24 GB, which no run here
-  has come near, so on this machine the share alone could never fire. 17.41 GB is
-  the compressor reading that hard-froze this host on 2026-07-26, so 16 leaves a
-  real margin under a number already paid for.
-- `LUCIDOS_E2E_COMPRESSOR_MAX_GB` replaces **both** when set, above the cap as
-  well as below it. An operator who names a number means that number.
+`warn` pressure is **reported and never a stop**. It occurred 92 times in three
+months of host samples with no freeze, and it tracks host load as much as
+memory: one warn sample sat at load average 254.
 
-**Nothing else sets a ceiling, and nothing else should.** `e2e-browser.sh` sets
-none and the umbrella sets none, so an unset run gets the checked-in default of
-16. Exporting a different one from a caller is how a run comes to stop at a
-number nobody chose: for months the operative default was the 24 GB share, the
-instruction said 14, and a third place still documented 12.
+**Two ceilings were retired.** `LUCIDOS_E2E_COMPRESSOR_CAP_GB` and `_CAP_PCT`
+are gone, not renamed. Setting one is named at run start rather than left
+looking like a cap. The absolute 16 GB cap they replaced was calibrated on
+17.41 GB, the compressor reading at the recorded freeze. That night also read
+free 0.04 GB under pressure critical. A healthy night stopped at 17.11 GB with
+free 4.16 GB under pressure normal, so the compressor was the one number the two
+hosts shared.
 
-**This host has swap; it has simply never needed it.** `vm.swapusage` reporting
-`total = 0.00M` was read as swap being off. Nothing disables it: macOS grows
-swapfiles on demand, and the pile-up recorded in `scripts/lib/e2e_lock.sh` reached
-23.5 GB compressed **and 14 GB of swap**. Swap is the half of that pair which says
-it went wrong, and the old guard ignored it.
+**The check is peak-aware.** A run-scoped sampler ticks every 5 s
+(`LUCIDOS_E2E_MEM_POLL_SECS`) and each boundary folds the worst sample since the
+previous boundary over its own reading. A boundary sample alone bounds the
+reading at the boundary and never the chunk, whose observed compressor deltas
+reach 1.16 GB.
+
+**No caller may export a ceiling, and that lesson outlived the cap.**
+`e2e-browser.sh` sets none and the umbrella sets none, so an unset run gets the
+checked-in default. Exporting one is how a run comes to stop at a number nobody
+chose: for months the operative default was the 24 GB share, the nightly
+instruction said 14, and a third place still documented 12. Three numbers in
+play, and the one that would have bitten was the one nobody had written down.
+
+**Swap is currently inert on this host, and that is why the cap was the only
+stop that ever fired.** This page used to say the host "has swap; it has simply
+never needed it". Since the reboot five days before ADR 0175,
+`/System/Volumes/VM` is empty and `dynamic_pager` is not running. Every sample
+reports swap 0.00 GB, including samples at free 0.05 GB under pressure warn. The
+stop stays, because it is correct wherever swap exists.
 
 - **Test.** `scripts/lib/host_memory_guard_test.sh` (run directly, no harness,
   same convention as `host_load_guard_test.sh`). Readings are injected through
-  the `HOST_COMPRESSOR_GB_OVERRIDE` / `HOST_SWAP_USED_GB_OVERRIDE` /
-  `HOST_PHYSMEM_GB_OVERRIDE` seams. It covers the regression directly: 12.25 GB
-  of compressor with no swap on a 48 GB host must run on. It also covers swap
-  stopping the run, the backstop scaling with RAM, and both knobs. Finally,
-  garbage knobs falling back, failing open on an unreadable host, and the
-  `vm.swapusage` unit parse. The 16 GB cap and the stop wording add their own:
-  - 48 GB resolves to 16.00, and 16 GB still resolves to 8.00.
-  - An explicit ceiling above the cap is honored rather than clamped.
-  - 14.98 GB, where the 2026-08-31 nightly stopped, now runs on.
-  - The distress stop and the backstop stop cannot read alike.
+  the `HOST_COMPRESSOR_GB_OVERRIDE` / `HOST_AVAIL_GB_OVERRIDE` /
+  `HOST_SWAP_USED_GB_OVERRIDE` / `HOST_PHYSMEM_GB_OVERRIDE` /
+  `HOST_PRESSURE_LEVEL_OVERRIDE` seams. It covers swap, the floor, the backstop
+  scaling with RAM, and every knob. It also covers garbage knobs falling back,
+  failing open on an unreadable host, and the `vm.swapusage` unit parse. The
+  pressure stop and the peak sampler add their own:
+  - critical stops even when every other reading is fine; warn never stops.
+  - An unreadable or non-level pressure value is discarded, never guessed at.
+  - 17.11 GB with 13.74 GB available and pressure normal runs on. That is the
+    boundary that lost a spec on the best night recorded.
+  - The freeze reading (critical, 0.30 GB available) stops.
+  - A critical sample mid-chunk stops at the next boundary even when the
+    instantaneous reading there is healthy.
+  - A window dimension no sample could read never erases the direct reading.
+  - The sampler is reaped, and it signals no pid it did not spawn.
 
-**The compressor does not drain between projects.** It fell 0.55 GB at WebKit
-teardown and then stayed within 0.7 GB of its high-water mark for three more
-hours. So a WebKit run permanently spends the session's budget, and the two
-consequences are separate.
+**The compressor drains, but only when the host asks for the pages back.** This
+page used to say it does not drain, on one observation of 0.55 GB at teardown
+holding for three hours. A longer series shows both shapes. It once fell from
+13.95 GB to 0.17 GB the instant a run tore down. On another morning it released
+12.65 GB inside one ten-minute sample as the machine came back into use, at
+pressure normal throughout. What decides it is whether the compressed pages
+belonged to processes that died with the run.
+
+So a WebKit run spends the session's budget until something reclaims it, and the
+two consequences are separate.
 
 - **Running it last protects everything else.** `scripts/e2e.sh` runs api, wasm
   and embedder before the browser phase, and the browser phase runs `chromium

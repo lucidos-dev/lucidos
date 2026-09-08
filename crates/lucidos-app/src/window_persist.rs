@@ -335,20 +335,23 @@ pub(crate) fn persist_window_session(app: &tauri::AppHandle) {
             let window = webview.window();
             // The same pair the plugin persists and `window_restore` clamps, so
             // all three reason about one set of numbers.
-            let (Ok(url), Ok(position), Ok(size)) =
-                (webview.url(), window.outer_position(), window.inner_size())
-            else {
+            //
+            // The window's own scale factor comes with them, because that is
+            // what tao multiplied them by. Unreadable drops the window from the
+            // capture: a frame recorded at the wrong scale is what puts it off
+            // screen at twice its size on the next restore (ADR 0173).
+            let (Ok(url), Ok(position), Ok(size), Ok(scale)) = (
+                webview.url(),
+                window.outer_position(),
+                window.inner_size(),
+                window.scale_factor(),
+            ) else {
                 return None;
             };
             Some(window_session::WindowSnapshot {
                 label,
                 url: url.to_string(),
-                frame: window_restore::Rect {
-                    x: position.x as i64,
-                    y: position.y as i64,
-                    width: size.width as i64,
-                    height: size.height as i64,
-                },
+                frame: window_restore::Rect::from_physical(position, size, scale),
             })
         })
         .collect();

@@ -105,9 +105,9 @@ pub fn empty() -> ModelRegistry {
 ///   no 1M beta, so 200k is the window of the request the engine actually makes
 ///   — not a stale guess about the model's maximum. Declaring 1M on a bare row
 ///   would let the context packer exceed the API mode the request selected.
-/// - `gpt-5` → 400k **understates** the GPT-5.5 / GPT-5.6 families (1,050,000).
-///   The OpenAI path has no context opt-in, so the full window always applies;
-///   those rows declare it instead.
+/// - `gpt-` major 5 or newer → 400k **understates** GPT-5.5, GPT-5.6 and GPT-6
+///   Astra, which are all 1,050,000. The OpenAI path has no context opt-in, so
+///   the full window applies to every request, and those rows declare it.
 /// - There is **no rule at all** for OpenRouter / xAI / Gemini / local ids, so they
 ///   take the bare 200k default — kimi-k3 (1,048,576 real) was budgeted at 200k
 ///   and the trim loop evicted context at ~8% of the true window. That is the
@@ -131,10 +131,26 @@ pub fn context_window_from_prefix(model: &str) -> usize {
     if model.starts_with("claude-") {
         return 200_000;
     }
-    if model.starts_with("gpt-5") {
+    if gpt_major_version(model).is_some_and(|major| major >= 5) {
         return 400_000;
     }
     200_000
+}
+
+/// The major version in a `gpt-` model id: 5 for `gpt-5` and `gpt-5.6-sol`, 6
+/// for `gpt-6-astra`, 4 for `gpt-4o`. `None` when the id names no GPT version.
+///
+/// Two id-shape rules read this instead of matching the literal `gpt-5`: the
+/// Responses-API split in [`crate::llm::openai`] and the window guess above.
+/// Both used to say `starts_with("gpt-5")`, so `gpt-6-astra` routed to Chat
+/// Completions and was budgeted at 200k. Reading the number means the next
+/// family needs no edit at either site.
+///
+/// Each site keeps its own threshold, because they answer different questions.
+pub fn gpt_major_version(model: &str) -> Option<u32> {
+    let rest = model.strip_prefix("gpt-")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// Normalize a stored `models.context_window` into a usable window.
@@ -466,15 +482,51 @@ mod tests {
             );
         }
 
-        // `gpt-5` → 400k, but the 5.5 / 5.6 families are really 1,050,000 and
-        // the OpenAI path has no context opt-in to gate it behind.
-        for id in ["gpt-5.5", "gpt-5.5-pro", "gpt-5.6-sol"] {
+        // Major 5 and up → 400k. But 5.5, 5.6 and GPT-6 Astra are really
+        // 1,050,000, and the OpenAI path has no context opt-in to gate that
+        // behind.
+        //
+        // Astra is the regression. The rule used to read `starts_with("gpt-5")`,
+        // so a `gpt-6-` id fell to the bare 200k default. The trim loop then
+        // evicted context at roughly a fifth of the true window.
+        for id in ["gpt-5.5", "gpt-5.5-pro", "gpt-5.6-sol", "gpt-6-astra"] {
             assert_eq!(
                 context_window_from_prefix(id),
                 400_000,
-                "{id} guesses 400k — its real window must come from the registry"
+                "{id} guesses 400k, and its real window must come from the registry"
             );
         }
+    }
+
+    /// The version parser both id-shape rules read. It answers the number, so a
+    /// family after Astra needs no edit at either call site.
+    #[test]
+    fn gpt_major_version_reads_the_number_not_the_spelling() {
+        for (id, expected) in [
+            ("gpt-5", Some(5)),
+            ("gpt-5.5-pro", Some(5)),
+            ("gpt-5.6-sol", Some(5)),
+            ("gpt-6-astra", Some(6)),
+            ("gpt-7-whatever", Some(7)),
+            ("gpt-4o", Some(4)),
+            ("gpt-3.5-turbo", Some(3)),
+            // Not a GPT id, or a GPT id naming no version.
+            ("gpt-oss", None),
+            ("gpt-", None),
+            ("claude-opus-5", None),
+            ("z-ai/glm-5.2", None),
+        ] {
+            assert_eq!(gpt_major_version(id), expected, "{id}");
+        }
+    }
+
+    /// A declared window still wins over the widened guess. Astra's row carries
+    /// the real 1,050,000, and 400k is what an id with no row falls back to.
+    #[test]
+    fn astras_declared_window_beats_the_widened_prefix_guess() {
+        let reg = registry_with_windows(&[("gpt-6-astra", Some(1_050_000))]);
+        assert_eq!(context_window_for(&reg, "gpt-6-astra"), 1_050_000);
+        assert_eq!(context_window_for(&empty(), "gpt-6-astra"), 400_000);
     }
 
     /// The `[1m]`-vs-bare split is NOT an oversight — it mirrors what the engine

@@ -329,30 +329,37 @@ export type ThreadState = {
    *  never confirmed and the row is kept so the text stays visible, but it no
    *  longer counts as a turn in flight (see `effectiveThreadStatus`). */
   pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[]; unconfirmed?: boolean }>;
-  /** The caller's utterance while they are still saying it, or `null`.
+  /** Every utterance of this call the engine has not written down yet, oldest
+   *  first.
    *
-   *  One slot, because a caller says one thing at a time. It is deliberately
-   *  NOT a `pendingUserMessages` entry: nothing was sent, nothing is in flight,
-   *  and there is nothing to retract. Every rule that array carries would need
-   *  a carve-out, `effectiveThreadStatus`'s running flip most of all.
+   *  A LIST rather than a slot, because the engine holds one utterance at a
+   *  time while the talker decides what to do with it. A caller who carries on
+   *  speaking therefore has a second row up before the first one's row exists.
+   *  A slot would drop the first one's words to draw the second (ADR 0174).
    *
-   *  `store/liveUtterance.ts` writes it from the call, and `handleEvent`
-   *  clears it when the words themselves land.
+   *  Deliberately NOT `pendingUserMessages` entries: nothing was sent, nothing
+   *  is in flight, and there is nothing to retract. Every rule that array
+   *  carries would need a carve-out, `effectiveThreadStatus`'s running flip
+   *  most of all, and its safety timer drops a row on a clock.
    *
-   *  Optional for the reason `latestTodoNotes` is: absent and `null` say the
+   *  `store/liveUtterance.ts` writes them from the call, and `handleEvent`
+   *  retires them as the words themselves land.
+   *
+   *  Optional for the reason `latestTodoNotes` is: absent and empty say the
    *  same thing, and requiring it would have every hand-built fixture declare
    *  "nobody is speaking". */
-  liveUtterance?: LiveUtterance | null;
+  liveUtterances?: LiveUtterance[];
   /** How many of this call's utterances have reached the transcript as real
    *  words.
    *
-   *  It is what stops a late one erasing a newer row. Compared against
-   *  `liveUtterance.count` in `handleEvent`, and reset when a call draws its
-   *  first row. Optional for the same reason as the field above. */
+   *  It is what stops a late one erasing a newer row. Compared against each
+   *  row's `count` in `handleEvent`, and reset when a call draws its first
+   *  row. Optional for the same reason as the field above. */
   settledUtterances?: number;
 };
 
-/** A caller's utterance the transcript is drawing before its words exist.
+/** A caller's utterance the transcript is drawing before the engine's own row
+ *  for it exists.
  *
  *  The count is the call's own, so a second utterance is told from the first
  *  even though both are just "the caller speaking". */
@@ -361,6 +368,12 @@ export type LiveUtterance = {
   count: number;
   /** When the row was drawn, for the timestamp its bubble header shows. */
   created: string;
+  /** What the caller said, once the provider has ended the turn.
+   *
+   *  Absent while they are still speaking, and the row then draws a pulse.
+   *  Present from the instant the speaking stops, which is the whole point:
+   *  the swap from bars to words costs no frame and no round trip. */
+  text?: string;
 };
 
 /** Build a fresh `ThreadState` for optimistic / SSE-bootstrapped threads.
@@ -437,7 +450,7 @@ export function makeOptimisticThreadState(opts: {
     eventsLoadFailed: false,
     lastDbSeq: 0,
     pendingUserMessages: opts.pendingUserMessages ?? [],
-    liveUtterance: null,
+    liveUtterances: [],
   };
 }
 

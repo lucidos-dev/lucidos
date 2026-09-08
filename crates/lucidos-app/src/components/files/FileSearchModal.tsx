@@ -7,7 +7,7 @@ import { openFilePreview } from '../../store/actions/artifacts';
 import { openRepoFilePreview } from '../../store/actions/repositories';
 import { FileTypeIcon } from '../../utils/fileIcons';
 import {
-  collectSearchResults, filterSearchResults, type FileSearchResult,
+  collectSearchResults, filterSearchResults, openableChangeFiles, type FileSearchResult,
 } from './fileSearch';
 import { closeFileSearch } from './fileSearchActions';
 import { changeBadgeLabel } from './changeBadge';
@@ -53,7 +53,12 @@ function FileSearchPanel() {
   // loaded AND the primary source has reached a terminal state — otherwise the
   // modal still functions on what's available, and a still-loading primary
   // shows "Loading..." rather than a premature "Failed to load files" flash.
-  const ccChanges = loadedOr(changes.value, []);
+  //
+  // The repo gate runs HERE, before `anyLoaded` counts them: a change this
+  // surface cannot open contributes no row, so it cannot stand in for a loaded
+  // source either. Counting one that is filtered out renders an empty result
+  // list while the primary source is still loading.
+  const ccChanges = openableChangeFiles(loadedOr(changes.value, []), isRepo);
   const ccChangesFailed = changes.value.status === 'failed';
   const anyLoaded = primarySource.status === 'loaded' || ccChanges.length > 0;
   const primaryPending =
@@ -66,9 +71,7 @@ function FileSearchPanel() {
   const diffFiles = isRepo && repoDiff.value.status === 'loaded'
     ? repoDiff.value.data.files.map(f => ({ path: f.path, status: f.status }))
     : [];
-  const ccChangeFiles = ccChanges.flatMap(c =>
-    c.files.map(f => ({ path: f })),
-  );
+  const ccChangeFiles = ccChanges.flatMap(c => c.files.map(f => ({ path: f })));
 
   const allResults = collectSearchResults(workspacePaths, repoPaths, diffFiles, ccChangeFiles);
   const filtered = filterSearchResults(allResults, query);

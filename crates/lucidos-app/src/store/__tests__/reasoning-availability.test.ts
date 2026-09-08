@@ -12,11 +12,18 @@ describe('availableReasoningLevels', () => {
     expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh']);
   });
 
-  it('exposes full set (incl max) for the GPT-5.6 family', () => {
-    for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+  it('exposes full set (incl max) for the GPT-5.6 family and GPT-6 Astra', () => {
+    for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra']) {
       const values = availableReasoningLevels(model).map(l => l.value);
       expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
     }
+  });
+
+  // Astra is matched by name. A `gpt-6` prefix rule would offer `max` to a
+  // later GPT-6 model that rejects it, which is a 400 rather than a downgrade.
+  it('does not extend max to every gpt-6 id', () => {
+    const values = availableReasoningLevels('gpt-6-mini').map(l => l.value);
+    expect(values).toEqual(['none', 'low', 'medium', 'high', 'xhigh']);
   });
 
   it('exposes full set for Opus 4.7', () => {

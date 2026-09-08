@@ -23,33 +23,57 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
 }
 
 /**
- * Draw the caller's utterance under everything, while they are still saying it.
+ * Draw the caller's utterances under everything, from the first word to the
+ * moment the engine's own row for each of them lands.
  *
  * Appended HERE, past every path through the fold, and that is the whole of its
- * safety. The fold never sees it. So it cannot be re-anchored, cannot become a
- * wall a re-anchor stops at, and cannot take a step off a running turn. The
- * engine will write the real row soon, and this one goes then.
+ * safety. The fold never sees them. So one cannot be re-anchored, cannot become
+ * a wall a re-anchor stops at, and cannot take a step off a running turn.
  *
- * `MAX_SAFE_INTEGER` puts it under a pending typed message too, which is right:
- * the caller is speaking now, and that message was sent before.
+ * A row carries `text` from the instant the provider ends the turn. The words
+ * replace the pulse in the same frame the speaking stops, and the engine's own
+ * row lands later and retires this one (ADR 0174).
+ *
+ * They take the very top of the synthetic seq range, above every pending typed
+ * message, which is right: the caller is speaking now, and those were sent
+ * before. `syntheticSeqBase` is what keeps the two blocks from overlapping.
  */
 function withLiveUtterance(thread: ThreadState, exchanges: Exchange[]): Exchange[] {
-  const live = thread.liveUtterance;
-  if (!live) return exchanges;
-  const userEvent = {
-    type: 'MessageReceived' as const,
-    text: '',
-    _eventId: live.eventId,
-    _displayCreated: live.created,
-    _liveUtterance: true as const,
-    channel: thread.meta.channel,
-  } as StoredEvent;
-  return [...exchanges, { userEvent, userSeq: Number.MAX_SAFE_INTEGER, steps: [] }];
+  const live = thread.liveUtterances;
+  if (!live || live.length === 0) return exchanges;
+  const rows = live.map((row, i) => {
+    const userEvent = {
+      type: 'MessageReceived' as const,
+      text: row.text ?? '',
+      _eventId: row.eventId,
+      _displayCreated: row.created,
+      _liveUtterance: true as const,
+      channel: thread.meta.channel,
+    } as StoredEvent;
+    return {
+      userEvent,
+      userSeq: Number.MAX_SAFE_INTEGER - (live.length - 1 - i),
+      steps: [],
+    };
+  });
+  return [...exchanges, ...rows];
 }
 
 /** True for the synthetic row above, and for nothing the engine ever wrote. */
 export function isLiveUtteranceRow(event: { _liveUtterance?: true }): boolean {
   return event._liveUtterance === true;
+}
+
+/** Where the PENDING typed messages' synthetic seqs start.
+ *
+ *  Two synthetic blocks share the top of the range, and a `userSeq` is an
+ *  identity: `exchangeKey` falls back to it, the collapse stores key on it, and
+ *  the transcript stamps it as `data-user-seq`. Both blocks counting down from
+ *  `MAX_SAFE_INTEGER` would collide the moment a reader typed during a call
+ *  with two utterances still un-landed. The caller's rows take the top, so the
+ *  typed ones start below them. */
+function syntheticSeqBase(thread: ThreadState): number {
+  return Number.MAX_SAFE_INTEGER - (thread.liveUtterances?.length ?? 0);
 }
 
 function foldedExchanges(thread: ThreadState): Exchange[] {
@@ -71,7 +95,7 @@ function foldedExchanges(thread: ThreadState): Exchange[] {
   const synthetic: SequencedEvent[] = [];
   for (let i = 0; i < pendingCount; i++) {
     const pending = thread.pendingUserMessages[i];
-    const seq = Number.MAX_SAFE_INTEGER - pendingCount + i;
+    const seq = syntheticSeqBase(thread) - pendingCount + i;
     synthetic.push({
       seq,
       event: {
@@ -630,6 +654,27 @@ export const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
   'WorkDelegated',
 ]);
 
+/** Events that merely LANDED in a turn rather than being produced by it, and
+ *  that render nothing of their own.
+ *
+ *  Two readers, and both need the same claim about CAUSATION.
+ *  `isUningestedMessage` below asks whether a turn has landed here, so a row
+ *  that only arrived is no evidence. `deepLinkAnchorForEvent`
+ *  (exchange-render.ts) would otherwise show the turn "containing" the step,
+ *  which no turn produced. A background bash task finishing under an open
+ *  question would pulse that question, and the two are causally unrelated.
+ *
+ *  Deliberately an explicit list rather than a clever predicate. Nothing in the
+ *  event's shape reveals causation, so it is stated per type with the reasoning
+ *  attached and grows on evidence.
+ *
+ *  `BackgroundBashStarted` is deliberately NOT here. The turn's own
+ *  `run_bash_background` call emits it, so landing there is honest. Only the
+ *  COMPLETION floats free, firing whenever the process happens to exit. */
+export const UNANCHORABLE_ASYNC_EVENTS: ReadonlySet<string> = new Set([
+  'BackgroundBashCompleted',
+]);
+
 /** A user message the agentic loop has not picked up yet, in EITHER direction.
  *
  *  **Judged by whether a TURN has landed here, not by whether the exchange is
@@ -637,6 +682,11 @@ export const VOICE_ONLY_STEP_TYPES: ReadonlySet<string> = new Set([
  *  the talker spoke, or a delegation it made, leaves a step behind without the
  *  loop having touched the message. Read as ingested, the message takes the
  *  running turn's live stream and badge, and loses its own place in the queue.
+ *
+ *  A queued message is `current` for as long as the previous turn runs, so an
+ *  async row carrying no `request_event_id` lands in it. That is
+ *  `UNANCHORABLE_ASYNC_EVENTS`, counted here for the reason a voice row is: it
+ *  arrived, the loop did not put it there.
  *
  *  An optimistic one carries `_displayCreated` and no `created`, a persisted
  *  queued one carries `created`. Both wait until a `UserPromptInjected` lands
@@ -647,7 +697,9 @@ export function isUningestedMessage(exchange: Exchange): boolean {
   // waits on the loop to take it. Counted as awaiting, it would take the
   // running turn's stream the moment a caller drew breath.
   if (isLiveUtteranceRow(exchange.userEvent)) return false;
-  return exchange.steps.every(s => VOICE_ONLY_STEP_TYPES.has(s.event.type));
+  return exchange.steps.every(
+    s => VOICE_ONLY_STEP_TYPES.has(s.event.type) || UNANCHORABLE_ASYNC_EVENTS.has(s.event.type),
+  );
 }
 
 /** The narrower half: a message the reader may RETRACT.
@@ -1542,9 +1594,22 @@ export function handleEvent(
     if (isCallerUtterance(event)) {
       const settled = (thread.settledUtterances ?? 0) + 1;
       thread.settledUtterances = settled;
-      if (thread.liveUtterance && thread.liveUtterance.count <= settled) {
-        thread.liveUtterance = null;
+      const rows = thread.liveUtterances;
+      if (rows && rows.length > 0) {
+        thread.liveUtterances = rows.filter(r => r.count > settled);
       }
+    }
+    // The call is over, so nobody is owed a caller bubble any more. This is
+    // the backstop for the one utterance the engine writes no row for: words
+    // the caller spent ANSWERING a question card, which `call.rs` drops
+    // because the answer's own row already carries them. Left standing, such
+    // a row shimmers on an idle thread for the life of the page.
+    //
+    // Safe because `call.rs` flushes whatever it still holds BEFORE it emits
+    // this, on one bus and in order. So every row the engine did write has
+    // already been retired above.
+    if (event.type === 'VoiceSessionEnded' && thread.liveUtterances?.length) {
+      thread.liveUtterances = [];
     }
     // A real MessageReceived from the backend removes the matching optimistic
     // pending message by event_id.
