@@ -46,6 +46,28 @@ fi
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 
+# Pin the query classifier, because LUCIDOS_MODEL=mock does not reach it.
+#
+# That variable swaps the TURN provider only. Every auxiliary call still
+# resolves through `MemoryExtractor::provider_for_model`, whose default is real
+# Gemini Flash on Vertex. The others run detached, but query classification runs
+# INLINE, ahead of the turn's first event, under a 30s deadline
+# (`engine::aux_purpose`). So a slow provider misses the deadlines the tests
+# themselves give a turn, on a healthy host over a working network.
+#
+# `all` is the value that changes the least. It is what the call already falls
+# back to on error and on timeout. A host with no Vertex project gets it too,
+# since that host builds no extractor at all. It also keeps the memory,
+# file-list and credentials sections assembling on every e2e turn, which `none`
+# would stop exercising.
+#
+# `-` and not `:-`, so an explicitly EMPTY value means what the engine reads it
+# as: no pin, classify live. That is the only way to measure the unpinned suite,
+# and it is worth measuring: pinning speeds a turn up, and
+# `e2e/thread-scroll-belongs-to-the-reader.spec.ts` reads as calibrated on the
+# delay this removes.
+export LUCIDOS_FORCE_QUERY_CLASSIFICATION="${LUCIDOS_FORCE_QUERY_CLASSIFICATION-all}"
+
 # E2E builds opt into the `e2e-test-hooks` cargo feature so the engine
 # compiles in the push-log stub (replaces real web-push send with an
 # in-process write) and the `GET /api/v1/_test/push-log` endpoint that

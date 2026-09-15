@@ -1895,6 +1895,21 @@ const RELAUNCH_POLL_SECONDS: &str = "0.1";
 #[cfg(target_os = "macos")]
 const RELAUNCH_WAIT_PROBES: u32 = 3000;
 
+/// How many times the watcher asks LaunchServices for the bundle before giving
+/// up. The same bound the login agent keeps, for the same reason: one refused
+/// `open` must not be the end of it.
+///
+/// Retrying is safe by construction. `open -a` without `-n` activates a running
+/// app rather than launching a second one, so an attempt made after the client
+/// is already back costs nothing. ADR 0072 records the rest.
+#[cfg(target_os = "macos")]
+const RELAUNCH_OPEN_ATTEMPTS: u32 = 10;
+
+/// Seconds between asking and checking. It is also the gap before the next
+/// attempt, since the check is what ends the loop.
+#[cfg(target_os = "macos")]
+const RELAUNCH_OPEN_RETRY_SECONDS: u32 = 2;
+
 /// This client's argv, minus [`LOGIN_FLAG`], for handing to a relaunch of
 /// itself.
 ///
@@ -1924,7 +1939,12 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     let bundle = app_bundle_root_from_exe(&exe)
         .ok_or_else(|| format!("{} is not inside a .app bundle", exe.display()))?;
     let args = relaunch_args();
-    let script = relaunch_watcher_script(std::process::id(), &bundle, &args)?;
+    let script = relaunch_watcher_script(
+        std::process::id(),
+        &bundle,
+        &relaunched_exe_forms(&exe),
+        &args,
+    )?;
     Command::new("/bin/sh")
         .arg("-c")
         .arg(&script)
@@ -1940,13 +1960,43 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     Err("a LaunchServices relaunch is macOS-only".to_string())
 }
 
-/// The watcher script: wait (bounded) for `pid` to disappear and then, ONLY if
-/// it did, hand `bundle` to LaunchServices, forwarding `args` as the new
-/// instance's arguments.
+/// Every path the relaunched client might report as its `argv[0]`: the one we
+/// were given, and the symlink-free form of it.
 ///
-/// The launch is guarded by a second `kill -0` rather than following the loop
-/// unconditionally, because the loop can also end at its ceiling. ADR 0072
-/// records what launching there would cost.
+/// LaunchServices resolves the executable path before it execs, so an app under
+/// a symlinked directory comes up naming the real one. A probe anchored on the
+/// unresolved path would never match it. The watcher would then spend its whole
+/// budget and report a give-up over a client that was already back.
+///
+/// Impure by necessity, which is why it is separate from the pure script
+/// builder. A path that cannot be resolved contributes nothing.
+#[cfg(target_os = "macos")]
+fn relaunched_exe_forms(exe: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![exe.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(exe) {
+        if real != *exe {
+            forms.push(real);
+        }
+    }
+    forms
+}
+
+/// The watcher script: wait (bounded) for `pid` to disappear and then, ONLY if
+/// it did, hand `bundle` to LaunchServices until one of `exes` is running again,
+/// forwarding `args` as the new instance's arguments.
+///
+/// Three properties are load-bearing, and ADR 0072 records all three.
+///
+/// **The launch is guarded by a second `kill -0`** rather than following the
+/// loop unconditionally, because the loop can also end at its ceiling.
+///
+/// **Asking once is not enough.** LaunchServices can refuse, and it can answer
+/// without launching anything. So the ask repeats until `pgrep` finds the
+/// client, up to [`RELAUNCH_OPEN_ATTEMPTS`].
+///
+/// **Every give-up says so** on stderr, which for a packaged client is the log
+/// `client_log` opened. A relaunch that silently failed is exactly the report
+/// nobody could answer.
 ///
 /// Errors on a path or argument that is not valid UTF-8: it cannot be quoted
 /// into a shell word without corrupting it, and the caller's fallback passes
@@ -1955,27 +2005,103 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
 fn relaunch_watcher_script(
     pid: u32,
     bundle: &Path,
+    exes: &[PathBuf],
     args: &[std::ffi::OsString],
 ) -> Result<String, String> {
     let bundle = bundle
         .to_str()
         .ok_or_else(|| format!("bundle path is not valid UTF-8: {}", bundle.display()))?;
-    let mut launch = format!("exec /usr/bin/open -a {}", sh_quote(bundle));
+    let args = args
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| "an argument is not valid UTF-8".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // No `-n`: `open -a` on a running app activates it, which is what keeps a
+    // retry from ever producing a second client.
+    let mut launch = format!("/usr/bin/open -a {}", sh_quote(bundle));
     if !args.is_empty() {
         launch.push_str(" --args");
-        for arg in args {
-            let arg = arg
-                .to_str()
-                .ok_or_else(|| "an argument is not valid UTF-8".to_string())?;
+        for arg in &args {
             launch.push(' ');
             launch.push_str(&sh_quote(arg));
         }
     }
+    let running = sh_quote(&running_pattern(exes, &args)?);
+    // Every message is one quoted word too. A bundle path may hold a `$` or a
+    // backtick, and inside double quotes the shell would run it.
+    let stuck = sh_quote(&format!(
+        "[relaunch] pid {pid} never exited, so Lucidos was not relaunched"
+    ));
+    let refused = sh_quote(&format!("[relaunch] LaunchServices refused {bundle}"));
+    let gave_up = sh_quote(&format!(
+        "[relaunch] gave up on {bundle} after {RELAUNCH_OPEN_ATTEMPTS} attempts; \
+         Lucidos must be started by hand"
+    ));
     Ok(format!(
         "i=0; while [ $i -lt {RELAUNCH_WAIT_PROBES} ] && kill -0 {pid} 2>/dev/null; \
          do sleep {RELAUNCH_POLL_SECONDS}; i=$((i+1)); done; \
-         kill -0 {pid} 2>/dev/null || {launch}"
+         if kill -0 {pid} 2>/dev/null; then echo {stuck} >&2; exit 1; fi; \
+         a=0; while [ $a -lt {RELAUNCH_OPEN_ATTEMPTS} ]; do \
+         {launch} || echo {refused} >&2; \
+         sleep {RELAUNCH_OPEN_RETRY_SECONDS}; \
+         /usr/bin/pgrep -f {running} >/dev/null 2>&1 && exit 0; \
+         a=$((a+1)); done; \
+         echo {gave_up} >&2; exit 1"
     ))
+}
+
+/// The `pgrep -f` pattern that means "the client is back": one of `exes`
+/// followed by exactly `args`, and nothing else.
+///
+/// **Anchored at BOTH ends, and that is the whole correctness of this probe.**
+/// The service role runs the same executable out of the same bundle, so its
+/// command line begins with the same path. It is a `KeepAlive` job, so it is
+/// essentially always up. A head-anchored pattern therefore matches it and
+/// reports success whether or not the client came back.
+///
+/// The tail is the argv the watcher is about to ask for, so the whole command
+/// line is known in advance. `--service` never appears in it, which is what the
+/// closing anchor turns into a distinction.
+#[cfg(target_os = "macos")]
+fn running_pattern(exes: &[PathBuf], args: &[&str]) -> Result<String, String> {
+    let escaped = exes
+        .iter()
+        .map(|exe| {
+            exe.to_str()
+                .map(ere_escape)
+                .ok_or_else(|| format!("executable path is not valid UTF-8: {}", exe.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let head = match escaped.as_slice() {
+        [] => return Err("no executable path to watch for".to_string()),
+        [one] => format!("^{one}"),
+        many => format!("^({})", many.join("|")),
+    };
+    let tail: String = args.iter().map(|a| format!(" {}", ere_escape(a))).collect();
+    Ok(format!("{head}{tail}$"))
+}
+
+/// Escape `s` so a POSIX extended regular expression matches it literally.
+///
+/// `pgrep -f` reads its pattern as a regex, and a bundle path is wherever the
+/// user dragged the app. A `+` or a `(` in that path would make the probe an
+/// error rather than a question. The watcher would then re-open ten times over
+/// a client that was already back.
+#[cfg(target_os = "macos")]
+fn ere_escape(s: &str) -> String {
+    const META: &[char] = &[
+        '\\', '.', '[', ']', '(', ')', '{', '}', '*', '+', '?', '^', '$', '|',
+    ];
+    s.chars()
+        .flat_map(|c| {
+            META.contains(&c)
+                .then_some('\\')
+                .into_iter()
+                .chain(std::iter::once(c))
+        })
+        .collect()
 }
 
 /// Quote `s` as one POSIX shell word. Single quotes take everything literally,
@@ -3722,11 +3848,28 @@ mod tests {
 
     // ── The relaunch watcher ─────────────────────────────────────────────────
 
-    /// The script for a plain `/Applications` install with no arguments.
+    /// The bundle and executable of a plain `/Applications` install.
+    #[cfg(target_os = "macos")]
+    const INSTALLED_BUNDLE: &str = "/Applications/Lucidos.app";
+    #[cfg(target_os = "macos")]
+    const INSTALLED_EXE: &str = "/Applications/Lucidos.app/Contents/MacOS/lucidos-app";
+
+    /// The script for that install, with no arguments.
     #[cfg(target_os = "macos")]
     fn watcher_script(pid: u32) -> String {
-        relaunch_watcher_script(pid, Path::new("/Applications/Lucidos.app"), &[])
-            .expect("an ASCII path and no args build a script")
+        relaunch_watcher_script(
+            pid,
+            Path::new(INSTALLED_BUNDLE),
+            &[PathBuf::from(INSTALLED_EXE)],
+            &[],
+        )
+        .expect("an ASCII path and no args build a script")
+    }
+
+    /// Where the wait loop ends, which is where the launch half begins.
+    #[cfg(target_os = "macos")]
+    fn end_of_wait(script: &str) -> usize {
+        script.find("done;").expect("the wait loop ends")
     }
 
     // The whole point of the watcher: LaunchServices must be asked only once we
@@ -3745,8 +3888,8 @@ mod tests {
         );
     }
 
-    // The wait is bounded so an orphaned shell cannot loop forever, and the
-    // launch sits after the loop rather than inside it.
+    // Both loops are bounded, so an orphaned shell cannot outlive the machine.
+    // The wait ends at its ceiling, and the asking ends at its own.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_watcher_stops_waiting_eventually() {
@@ -3755,9 +3898,15 @@ mod tests {
             script.contains(&format!("[ $i -lt {RELAUNCH_WAIT_PROBES} ]")),
             "the wait must be bounded, got: {script}"
         );
-        let done = script.rfind("done;").expect("the loop ends");
+        assert!(
+            script.contains(&format!("[ $a -lt {RELAUNCH_OPEN_ATTEMPTS} ]")),
+            "the asking must be bounded too, got: {script}"
+        );
         let launch = script.find("/usr/bin/open").expect("it launches the app");
-        assert!(done < launch, "the launch follows the loop: {script}");
+        assert!(
+            end_of_wait(&script) < launch,
+            "the launch follows the wait loop: {script}"
+        );
     }
 
     // Reaching the ceiling is NOT a reason to launch. `open` against a client
@@ -3767,7 +3916,7 @@ mod tests {
     #[test]
     fn the_watcher_launches_only_once_the_client_is_actually_gone() {
         let script = watcher_script(4242);
-        let done = script.rfind("done;").expect("the loop ends");
+        let done = end_of_wait(&script);
         let guard = script[done..]
             .find("kill -0 4242")
             .map(|i| done + i)
@@ -3778,8 +3927,197 @@ mod tests {
             "the guard must precede the launch: {script}"
         );
         assert!(
-            script[guard..launch].contains("||"),
-            "the launch must run only when that probe FAILS: {script}",
+            script[guard..launch].contains("exit 1"),
+            "a client still alive must leave WITHOUT launching: {script}",
+        );
+    }
+
+    // One refused `open` must not be the end of it, which is the rule the login
+    // agent already keeps. The loop ends on a confirmed client, not on a
+    // command that merely returned.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_keeps_asking_until_the_client_is_actually_back() {
+        let script = watcher_script(4242);
+        let launch = script.find("/usr/bin/open").expect("it launches the app");
+        let confirm = script
+            .find("/usr/bin/pgrep")
+            .expect("it confirms the launch");
+        assert!(launch < confirm, "ask, then confirm: {script}");
+        assert!(
+            script[confirm..].contains("&& exit 0"),
+            "a confirmed client is the only way out of the loop: {script}",
+        );
+        assert!(
+            script.contains(&format!("sleep {RELAUNCH_OPEN_RETRY_SECONDS}")),
+            "the confirmation gives the client time to appear: {script}",
+        );
+    }
+
+    /// Does `pattern` match `cmdline` under POSIX ERE? `grep -E` compiles the
+    /// same dialect `pgrep` hands to `regcomp`, so the probe is tested by
+    /// RUNNING it rather than by asserting on its text.
+    #[cfg(target_os = "macos")]
+    fn ere_matches(pattern: &str, cmdline: &str) -> bool {
+        check_with("/usr/bin/grep", &["-qE", pattern], cmdline).is_ok()
+    }
+
+    /// The probe the watcher would use for a plain install relaunched with
+    /// `args`.
+    #[cfg(target_os = "macos")]
+    fn probe(args: &[&str]) -> String {
+        running_pattern(&[PathBuf::from(INSTALLED_EXE)], args).expect("an ASCII path builds")
+    }
+
+    // The bug this test exists for: the service runs the SAME executable out of
+    // the same bundle, and it is a KeepAlive job. A head-anchored probe matched
+    // it, so the confirmation passed whether or not the client came back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_tells_the_client_apart_from_the_always_running_service() {
+        let pattern = probe(&[]);
+        assert!(
+            ere_matches(&pattern, INSTALLED_EXE),
+            "the relaunched client must match: {pattern}"
+        );
+        assert!(
+            !ere_matches(&pattern, &format!("{INSTALLED_EXE} --service")),
+            "the service must NOT satisfy the confirmation: {pattern}"
+        );
+    }
+
+    // The watcher and the `open` it runs both carry the executable path further
+    // along their own command lines. Only the client carries it as argv[0].
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_matches_neither_the_watcher_nor_the_open_it_runs() {
+        let pattern = probe(&[]);
+        for other in [
+            "/bin/sh -c i=0; while kill -0 1; do sleep 0.1; done; /usr/bin/open -a '/Applications/Lucidos.app'",
+            "/usr/bin/open -a /Applications/Lucidos.app",
+            "/Applications/Lucidos.app/Contents/MacOS/lucidos-app-helper",
+        ] {
+            assert!(!ere_matches(&pattern, other), "{pattern} matched {other}");
+        }
+    }
+
+    // The relaunch forwards argv, so the command line it produces is known in
+    // advance. The probe has to expect exactly that one, closing anchor included.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_expects_the_argv_the_relaunch_is_about_to_ask_for() {
+        let pattern = probe(&["--kiosk"]);
+        assert!(ere_matches(&pattern, &format!("{INSTALLED_EXE} --kiosk")));
+        assert!(
+            !ere_matches(&pattern, INSTALLED_EXE),
+            "an argv-less client is not the one we asked for: {pattern}"
+        );
+        assert!(
+            !ere_matches(&pattern, &format!("{INSTALLED_EXE} --kiosk --service")),
+            "the closing anchor must still hold: {pattern}"
+        );
+    }
+
+    // Guard the guard: `grep -E` really does reject a non-match, so a passing
+    // assertion above means something.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_ere_harness_can_fail() {
+        assert!(ere_matches("^a$", "a"));
+        assert!(!ere_matches("^a$", "b"));
+    }
+
+    // `pgrep -f` reads a regex. An unescaped `+` is a quantifier and an
+    // unescaped `(` is a syntax error. Either would spend the whole retry
+    // budget on a client that was already back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_escapes_a_bundle_path_that_looks_like_a_regex() {
+        assert_eq!(
+            ere_escape("/Users/me/C++ (old)/Lucidos.app"),
+            r"/Users/me/C\+\+ \(old\)/Lucidos\.app"
+        );
+        assert_eq!(ere_escape("plain"), "plain");
+    }
+
+    // LaunchServices execs the resolved path, so an app under a symlinked
+    // directory comes up naming a path `current_exe()` never reported. The
+    // probe has to accept either.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_probe_accepts_every_form_the_relaunched_client_might_report() {
+        let pattern = running_pattern(
+            &[PathBuf::from("/tmp/a"), PathBuf::from("/private/tmp/a")],
+            &[],
+        )
+        .expect("two forms build");
+        assert_eq!(pattern, "^(/tmp/a|/private/tmp/a)$");
+        assert!(ere_matches(&pattern, "/tmp/a"));
+        assert!(ere_matches(&pattern, "/private/tmp/a"));
+        assert!(!ere_matches(&pattern, "/private/tmp/a --service"));
+    }
+
+    // Nothing to watch for is a bug in the caller, not a pattern that matches
+    // everything. `^$` would confirm on the first process pgrep looked at.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_probe_with_no_executable_to_look_for_is_refused() {
+        assert!(running_pattern(&[], &[]).is_err());
+    }
+
+    // The forms come off the running executable, so the pair is what a
+    // symlinked install produces and a plain one collapses to a single form.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_path_with_nothing_to_resolve_contributes_one_form() {
+        let tmp = crate::test_support::TempDir::new("relaunch-forms");
+        let exe = tmp.path().join("lucidos-app");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write a stand-in executable");
+        let forms = relaunched_exe_forms(&exe);
+        assert!(forms.contains(&exe), "the path we were given is always in");
+        assert!(
+            forms.len() <= 2,
+            "one form, or one plus the resolved: {forms:?}"
+        );
+    }
+
+    // A path that does not exist cannot be resolved, and that must not drop the
+    // one form we do have.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unresolvable_path_still_contributes_itself() {
+        let exe = PathBuf::from("/Applications/Gone.app/Contents/MacOS/gone");
+        assert_eq!(relaunched_exe_forms(&exe), vec![exe]);
+    }
+
+    // A retry is only safe because `open -a` activates a running app instead of
+    // starting a second one. `-n` would undo that and leave two clients.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_never_asks_for_a_second_instance() {
+        let script = watcher_script(4242);
+        assert!(!script.contains("open -n"), "got: {script}");
+        assert!(!script.contains(" -n "), "got: {script}");
+    }
+
+    // Giving up silently is the failure this whole change exists to end. Both
+    // dead ends have to reach the client's log.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_way_out_without_a_client_says_so() {
+        let script = watcher_script(4242);
+        assert!(
+            script.contains("never exited"),
+            "the client that would not die must be named: {script}"
+        );
+        assert!(
+            script.contains("gave up on"),
+            "the exhausted retry must be named: {script}"
+        );
+        assert_eq!(
+            script.matches(">&2").count(),
+            3,
+            "both dead ends and the refused open report: {script}"
         );
     }
 
@@ -3790,11 +4128,36 @@ mod tests {
     #[test]
     fn the_watcher_quotes_an_awkward_bundle_path() {
         let bundle = Path::new("/Users/me/My Apps/It's Lucidos.app");
-        let script = relaunch_watcher_script(1, bundle, &[]).expect("an awkward path still builds");
+        let exe = bundle.join("Contents/MacOS/lucidos-app");
+        let script =
+            relaunch_watcher_script(1, bundle, &[exe], &[]).expect("an awkward path still builds");
         assert!(
             script.contains(r#"open -a '/Users/me/My Apps/It'\''s Lucidos.app'"#),
             "got: {script}"
         );
+        assert_eq!(sh_parses(&script), Ok(()));
+    }
+
+    // A path holding a `$` or a backtick is legal on macOS, and the reporting
+    // lines carry the bundle path. Unquoted, the shell would expand them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_neutralises_a_bundle_path_the_shell_would_expand() {
+        let bundle = Path::new("/Users/me/$HOME `whoami`/Lucidos.app");
+        let exe = bundle.join("Contents/MacOS/lucidos-app");
+        let script = relaunch_watcher_script(1, bundle, &[exe], &[])
+            .expect("an expandable path still builds");
+        assert_eq!(sh_parses(&script), Ok(()));
+        assert!(
+            !script.contains("\"[relaunch]"),
+            "no message may sit inside double quotes: {script}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_script_parses_as_a_shell_script() {
+        assert_eq!(sh_parses(&watcher_script(4242)), Ok(()));
     }
 
     #[cfg(target_os = "macos")]
@@ -3814,12 +4177,17 @@ mod tests {
     fn the_watcher_forwards_arguments_and_omits_the_flag_when_there_are_none() {
         use std::ffi::OsString;
 
-        let bundle = Path::new("/Applications/Lucidos.app");
         let args = vec![OsString::from("--flag"), OsString::from("a value")];
-        let with = relaunch_watcher_script(1, bundle, &args).expect("args build");
+        let with = relaunch_watcher_script(
+            1,
+            Path::new(INSTALLED_BUNDLE),
+            &[PathBuf::from(INSTALLED_EXE)],
+            &args,
+        )
+        .expect("args build");
         assert!(
-            with.ends_with(r#"--args '--flag' 'a value'"#),
-            "got: {with}"
+            with.contains(r#"--args '--flag' 'a value' ||"#),
+            "the arguments ride on the open, got: {with}"
         );
         assert!(!watcher_script(1).contains("--args"), "no args, no flag");
     }
@@ -3835,7 +4203,13 @@ mod tests {
 
         let args = vec![OsString::from_vec(vec![0x2d, 0x2d, 0xff])];
         assert!(
-            relaunch_watcher_script(1, Path::new("/Applications/Lucidos.app"), &args).is_err(),
+            relaunch_watcher_script(
+                1,
+                Path::new(INSTALLED_BUNDLE),
+                &[PathBuf::from(INSTALLED_EXE)],
+                &args
+            )
+            .is_err(),
             "a non-UTF-8 argument must not be silently mangled into the script",
         );
     }

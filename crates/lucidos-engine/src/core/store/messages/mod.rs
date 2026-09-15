@@ -109,7 +109,7 @@ impl EventStore {
     }
 }
 
-/// The handles a `ContextDismissed` dropped from future resume context.
+/// The set of event ids a `ContextDismissed` dropped from future resume context.
 ///
 /// They came from the retired `dismiss_from_context` tool (ADR 0109), so no new
 /// ones are written and every row is historical. The resume helper consults

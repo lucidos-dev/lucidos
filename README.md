@@ -25,6 +25,8 @@ You own the data. It lives in a local Postgres event store, or as git-versioned 
 
 <sub>The same loop on a personal app: a training plan described in chat, running beside it, reading this morning's Oura readiness.</sub>
 
+<sub>Second demo, 35 seconds: [one question, every model at once, with the bill landing live](https://www.youtube.com/watch?v=k_zvG1JiCBU). A dashboard app built inside the workspace it reports on, filling in over the same event stream the engine emits when it bills a model call.</sub>
+
 ---
 
 <!--quickstart-start-->

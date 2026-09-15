@@ -817,7 +817,11 @@ export interface ToastItem {
 // Credential request from SSE (engine needs credentials)
 export interface CredentialRequest {
   service?: string;
-  base_url?: string;
+  /** The *credential scope* to seed, one form row per host. A set, because one
+   *  key often covers several hostnames of one provider (ADR 0161): a token
+   *  reaching an API host and a git host is ONE credential, not two rows
+   *  holding the same secret. Absent for a `secret`, which is sent nowhere. */
+  base_urls?: string[];
   auth_type?: AuthType;
   prompt?: string;
   /** Pre-fill values for `oauth_client` requests. The agent supplies these from
@@ -845,14 +849,26 @@ export interface CredentialRequest {
    *  this exact name (in addition to the default `CRED_<NAME>`). The user can
    *  edit or clear it before saving. */
   env_var_name?: string;
-  /** Set when this request REPAIRS an existing `oauth_client` rather than
-   *  creating one: the credential's id, so the save updates that row.
+  /** Set when this request targets an EXISTING row rather than creating one:
+   *  the credential's id, so the save updates that row.
    *
    *  Without it the save would `POST /credentials` and try to create a second
    *  OAuth Client for the same provider. A credential is identified by its name
-   *  together with its auth type, so that pair is a duplicate, which is the
-   *  2026-08-05 incident. */
+   *  together with its auth type, so that pair is a duplicate. See
+   *  `docs/plans/2026-08-05-dropbox-backup-oauth-setup-fixes.md`.
+   *
+   *  Two requests carry it. An **OAuth repair** reopens a registration saved
+   *  without the endpoints a flow needs, naming them in `missing`. A **scope
+   *  widening** reopens a credential asked for at a host it does not reach,
+   *  naming those in `adding_base_urls`. Both pre-load the stored secret, so
+   *  the user presses Save rather than retyping it. */
   existing_credential_id?: string;
+  /** On a scope widening, the hosts this save ADDS. `base_urls` already holds
+   *  the union, so the form cannot say which rows are new; this can.
+   *
+   *  It is what the user consents to. A widening costs them no secret, so the
+   *  form reading clearly is the whole of the consent. */
+  adding_base_urls?: string[];
   /** On a repair, the required fields the stored credential was missing
    *  (`client_id` / `auth_url` / `token_url`). Rendered so the form says why it
    *  reopened rather than looking like a form the user already filled in. */

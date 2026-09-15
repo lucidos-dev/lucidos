@@ -1,12 +1,13 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { useSignalEffect } from '@preact/signals';
 import type { VNode } from 'preact';
-import { filePreviewModal, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
+import { filePreviewModal, filePreviewSource, filePreviewWrap, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
+import { previewShowsSource } from '../../store/previewWrap';
 import { closeFilePreviewModal, escalateFilePreviewModal } from '../../store/actions/filePreviewModal';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { viewportIsMobile } from '../../utils/viewport';
 import { Overlay } from '../shared/Overlay';
-import { CloseIcon } from '../shared/icons';
+import { CloseIcon, WrapTextIcon } from '../shared/icons';
 import { trapDialogTab } from '../shared/dialogFocusTrap';
 import { FilePreviewInline } from './FilePreviewInline';
 import { RepoFileContent, previewGitRef } from './RepoFilePreview';
@@ -126,6 +127,16 @@ export function FilePreviewModal() {
 
   const { name, detail } = filePreviewModalTitle(state.path, state.range);
   const layout = viewportIsMobile.value ? 'mobile' : 'desktop';
+  // The modal renders none of the Files header's controls, so this is the only
+  // place a reader can choose here. Both constants are true by construction:
+  // the opener clears `filePreviewEditing`, and a diff locator always renders
+  // the whole file here (see `filePreviewModalBody`).
+  const wrapOn = filePreviewWrap.value;
+  const canWrap = previewShowsSource(state.path, {
+    sourceToggle: filePreviewSource.value,
+    editing: false,
+    diffShowsWholeFile: true,
+  });
 
   return (
     <Overlay
@@ -146,6 +157,17 @@ export function FilePreviewModal() {
           <span class="file-preview-modal-detail">{detail}</span>
         </div>
         <div class="file-preview-modal-actions">
+          {canWrap && (
+            <button
+              class={`icon-btn file-preview-wrap-toggle${wrapOn ? ' filter-active' : ''}`}
+              aria-label={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
+              aria-pressed={wrapOn}
+              data-tooltip={wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines'}
+              onClick={() => { filePreviewWrap.value = !wrapOn; }}
+            >
+              <WrapTextIcon />
+            </button>
+          )}
           <button class="accent-link" onClick={escalateFilePreviewModal}>
             Open in Files
           </button>

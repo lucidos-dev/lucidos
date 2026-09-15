@@ -29,7 +29,7 @@ const {
 
 const helius: CredentialRequest = {
   service: 'helius',
-  base_url: 'https://api.helius.xyz',
+  base_urls: ['https://api.helius.xyz'],
   auth_type: 'api_key',
   prompt: 'Paste your Helius API key.\n1. Go to https://dev.helius.xyz/dashboard\n2. Copy API Key',
 };

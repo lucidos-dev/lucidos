@@ -8,7 +8,13 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
-import { VoiceSection, TRANSCRIBER_MODELS } from '../VoiceSection';
+import {
+  VoiceSection,
+  TalkerModelExplainer,
+  TranscriberModelExplainer,
+  TALKER_MODELS,
+  TRANSCRIBER_MODELS,
+} from '../VoiceSection';
 import { preferences } from '../../../store/store';
 import {
   DEFAULT_VOICE_TALKER_MODEL,
@@ -18,7 +24,11 @@ import {
 } from '../../../store/actions/preferences';
 
 /** Flatten a vnode tree to text, keeping scalar props. Same shallow walk as
- *  `opencode-free-notice.test.tsx`. */
+ *  `opencode-free-notice.test.tsx`.
+ *
+ *  A prop holding a vnode is named and not walked. A row can be handed a whole
+ *  explainer, and a walk that dumped it would drown the row it belongs to. Its
+ *  contents are read by rendering that component on its own. */
 function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -27,9 +37,14 @@ function vnodeToText(node: ComponentChildren): string {
   const props = (v.props ?? {}) as Record<string, unknown>;
   const scalar = (value: unknown) =>
     typeof value === 'string' || typeof value === 'number' || value === true;
+  const isVNode = (value: unknown) =>
+    typeof value === 'object' && value !== null && !Array.isArray(value) && 'type' in value;
   const attrs = Object.entries(props)
-    .filter(([k, value]) => k !== 'children' && scalar(value))
-    .map(([k, value]) => ` ${k}="${String(value)}"`)
+    .filter(([k]) => k !== 'children')
+    .map(([k, value]) => {
+      if (scalar(value)) return ` ${k}="${String(value)}"`;
+      return isVNode(value) ? ` ${k}="[vnode]"` : '';
+    })
     .join('');
   const tag = typeof v.type === 'string' ? v.type : ((v.type as { name?: string })?.name ?? 'C');
   return `<${tag}${attrs}>${vnodeToText(props.children as ComponentChildren)}</${tag}>`;
@@ -75,16 +90,77 @@ describe('the Voice settings section', () => {
   /** The list is read rather than rendered: `vnodeToText` keeps scalar props,
    *  so the array never reaches the string above.
    *
-   *  Live transcription leads because it is the one built for a microphone. The
-   *  engine branches on that same id to send `languages` instead of `language`.
-   *  A typo here offers a row the call cannot pin a language for. */
-  it('offers live transcription first, without dropping the older models', () => {
+   *  The two streaming models lead because they are the ones built for a
+   *  microphone. The engine branches on `gpt-live-transcribe` to send
+   *  `languages` instead of `language`. A typo here offers a row the call
+   *  cannot pin a language for. */
+  it('offers the streaming transcribers first, without dropping the older models', () => {
     const ids = TRANSCRIBER_MODELS.map((m) => m.value);
-    expect(ids[0]).toBe('gpt-live-transcribe');
+    expect(ids.slice(0, 2)).toEqual(['gpt-live-transcribe', 'gpt-realtime-whisper']);
     expect(ids).toContain('gpt-transcribe');
     expect(ids).toEqual(
       expect.arrayContaining(['gpt-4o-mini-transcribe', 'gpt-4o-transcribe', 'whisper-1']),
     );
+  });
+
+  /** The picker went stale once: it offered `gpt-realtime`, which left the
+   *  provider's catalog, and `gpt-realtime-mini`, which is deprecated. Both are
+   *  gone, and the default is the one the picker leads with. */
+  it('offers the current realtime family, newest first, led by the default', () => {
+    const ids = TALKER_MODELS.map((m) => m.value);
+    expect(ids[0]).toBe(DEFAULT_VOICE_TALKER_MODEL);
+    expect(ids.slice(0, 4)).toEqual([
+      'gpt-realtime-2.1',
+      'gpt-realtime-2.1-mini',
+      'gpt-realtime-2',
+      'gpt-realtime-1.5',
+    ]);
+  });
+
+  /** Two families in one row, and the engine picks the protocol from the id.
+   *  Live is offered and never defaulted: it bills by the minute and holds no
+   *  tools, so it is a choice rather than the one a fresh workspace makes. */
+  it('offers the Live talker, after the realtime family and never as the default', () => {
+    const ids = TALKER_MODELS.map((m) => m.value);
+    expect(ids).toContain('gpt-live-1');
+    expect(ids.indexOf('gpt-live-1')).toBeGreaterThan(ids.indexOf('gpt-realtime-1.5'));
+    expect(DEFAULT_VOICE_TALKER_MODEL.startsWith('gpt-live')).toBe(false);
+  });
+
+  /** The two families differ in what a call can do, which no model name says.
+   *  The row carries that, since a reader picking a talker is not reading the
+   *  section explainer above it.
+   *
+   *  Rendered on its own, because the section's walk keeps scalar props and an
+   *  explainer handed over as a prop is not one. */
+  it('explains what a Live call cannot do, on the talker row itself', () => {
+    const rendered = vnodeToText(TalkerModelExplainer());
+    expect(rendered).toContain('title="Talker model"');
+    expect(rendered).toContain('It holds no tools');
+    expect(rendered).toContain('bills by the minute');
+    expect(rendered).toContain('does not reach the usage rollup');
+  });
+
+  /** The transcriber row is read by a Realtime call and by nothing else. A
+   *  setting with no effect and nothing saying so is the worst kind, and only
+   *  the row itself can say it. */
+  it('says the transcriber row does nothing on a Live call', () => {
+    const rendered = vnodeToText(TranscriberModelExplainer());
+    expect(rendered).toContain('title="Transcriber model"');
+    expect(rendered).toContain('does nothing on a GPT Live call');
+    expect(rendered).toContain('Spoken voice still applies');
+  });
+
+  /** The prop reaches both rows, which is what puts the explainers on screen.
+   *  A component nothing renders passes the tests above and shows nobody
+   *  anything. */
+  it('hands each explainer to its row', () => {
+    const rendered = render({ voice_enabled: 'true' });
+    for (const label of ['Talker model', 'Transcriber model']) {
+      expect(rendered).toMatch(
+        new RegExp(`<ModelSelectionRow label="${label}"[^>]*explainer="\\[vnode\\]"`),
+      );
+    }
   });
 
   /** The list stays curated, which the user asked for explicitly. Free text
@@ -137,10 +213,16 @@ describe('the Voice settings section', () => {
   });
 
   /** The agent can write any id through `set_preference`. A picker that only
-   *  knew its own list would render a model the call is not dialling. */
+   *  knew its own list would render a model the call is not dialling.
+   *
+   *  `gpt-realtime-mini` is the case that made this load-bearing: the list
+   *  dropped it when the provider deprecated it, and a workspace pinned to it
+   *  still dials it. */
   it('keeps a stored talker the curated list does not carry', () => {
-    const rendered = render({ voice_enabled: 'true', model_voice_talker: 'gpt-realtime-next' });
-    expect(rendered).toContain('model="gpt-realtime-next"');
+    for (const pinned of ['gpt-realtime-next', 'gpt-realtime-mini']) {
+      const rendered = render({ voice_enabled: 'true', model_voice_talker: pinned });
+      expect(rendered).toContain(`model="${pinned}"`);
+    }
   });
 
   /** The toast's Open settings button lands on the Models subview, and the

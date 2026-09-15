@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync } from 'node:fs';
-import { fileRows, renderRows } from './LineNumberedCode';
+import { codeBlockClass, fileRows, renderRows } from './LineNumberedCode';
 
 describe('fileRows', () => {
   it('numbers a file 1..N', () => {
@@ -14,6 +14,43 @@ describe('fileRows', () => {
 
   it('has no rows for an empty file', () => {
     expect(fileRows([])).toEqual([]);
+  });
+});
+
+/** Each wide-line mode has its own class, and one mode's CSS must never reach a
+ *  `<pre>` another owns. `pan` paints an opaque row surface, which outranks a
+ *  caller's own single-class tint. Keeping that off a side-by-side diff column
+ *  is exactly what `caller` is for. */
+describe('codeBlockClass', () => {
+  const MODE_CLASSES = ['line-numbered-wrap', 'line-numbered-pan'];
+  const modesIn = (cls: string) => cls.split(' ').filter(c => MODE_CLASSES.includes(c));
+
+  it('names at most one mode, never both', () => {
+    for (const selectable of [true, false]) {
+      for (const wideLines of ['wrap', 'pan', 'caller'] as const) {
+        expect(modesIn(codeBlockClass(selectable, wideLines)).length,
+          `selectable=${selectable} wideLines=${wideLines}`).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it('names the mode the caller asked for', () => {
+    expect(modesIn(codeBlockClass(true, 'wrap'))).toEqual(['line-numbered-wrap']);
+    expect(modesIn(codeBlockClass(true, 'pan'))).toEqual(['line-numbered-pan']);
+  });
+
+  // A diff column owns its own overflow and its own row tints. So it opts out
+  // of both treatments rather than picking the less wrong one.
+  it('gives a caller-owned block neither treatment', () => {
+    expect(modesIn(codeBlockClass(false, 'caller'))).toEqual([]);
+    expect(codeBlockClass(false, 'caller')).toBe('file-preview-code line-numbered line-numbered-static');
+  });
+
+  // The selection mode is orthogonal: a diff column is static AND caller-owned,
+  // and a file preview is selectable in either of its two modes.
+  it('carries the static marker independently of the wide-line mode', () => {
+    expect(codeBlockClass(true, 'wrap')).toBe('file-preview-code line-numbered line-numbered-wrap');
+    expect(codeBlockClass(true, 'pan')).toBe('file-preview-code line-numbered line-numbered-pan');
   });
 });
 

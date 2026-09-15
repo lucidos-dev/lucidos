@@ -3,8 +3,8 @@
 # Run: ./scripts/lib/e2e_browser_phases_test.sh   (no harness; direct, like host_memory_guard_test.sh)
 #
 # e2e-browser.sh is a SCRIPT, not a library: sourcing it would set up an e2e
-# session and launch Playwright. So the three functions under test are lifted out
-# with sed and sourced alone, the way build_dmg_test.sh, install_test.sh and
+# session and launch Playwright. So the functions under test are lifted out with
+# sed and sourced alone, the way build_dmg_test.sh, install_test.sh and
 # release_abandon_test.sh already lift functions out of their scripts. Every lift
 # is checked, so a rename fails this suite loudly rather than silently testing
 # nothing.
@@ -13,6 +13,12 @@
 # expensive navigation phase second, so a shortfall lands in nav, where a partial
 # chunk range carries over. Reversed, the 10 CC specs went months without a WebKit
 # verdict because the guard kept ending the run at the phase boundary.
+#
+# It also pins the TWO NARROWINGS, which share one rule: a narrowed run may never
+# read as a complete project. LUCIDOS_E2E_WEBKIT_CHUNKS picks a chunk range inside
+# nav, and LUCIDOS_E2E_WEBKIT_PHASE picks which phases run at all. Both stay on
+# the real chunked path, both announce every skip, both restate themselves at the
+# end, and both widen back on a value nobody can parse.
 #
 # Hermetic: no Playwright, no browser, no host-memory read. Every collaborator is
 # a stub that records what it was asked to do, into one ordered trace.
@@ -110,6 +116,8 @@ lift() {
 lift merge_rc
 lift webkit_chunk_range
 lift report_webkit_chunk_range
+lift webkit_phase_selection
+lift report_webkit_phase_selection
 lift run_specs_chunked
 lift _run_browser_project_body
 
@@ -128,6 +136,7 @@ PW_ARGS=()
 CMD=(npx playwright test)
 OUTPUT_ARG=()
 WEBKIT_CHUNK_RANGE_APPLIED=""
+WEBKIT_PHASE_APPLIED=""
 
 # ── the stubs ───────────────────────────────────────────────────────────
 # Each one echoes, and the driver captures stdout, so the trace is ONE ordered
@@ -206,6 +215,7 @@ drive_in() {
     local dir="$1" out="$2" prev="$PWD" rc=0
     MEMORY_STOPPED=""
     WEBKIT_CHUNK_RANGE_APPLIED=""
+    WEBKIT_PHASE_APPLIED=""
     # shellcheck disable=SC2034 # cleared per run; set_output_dir refills it for the lifted code
     OUTPUT_ARG=()
     cd "$dir" || return 99
@@ -504,6 +514,154 @@ test_a_full_width_range_is_not_announced_as_a_narrowing() {
     assert_silent_about "$OUT/fullreport.out" "CHUNK RANGE ONLY" "the final report says nothing"
 }
 
+# ── Test 8: the phase selector ──────────────────────────────────────────────
+# LUCIDOS_E2E_WEBKIT_CHUNKS narrows nav and leaves the CC phase whole, and three
+# measurements put the CC phase at 93 to 97 percent of the memory a discharge
+# costs. So the cheapest possible discharge, two nav specs, used to pay for all
+# ten CC specs. LUCIDOS_E2E_WEBKIT_PHASE drops that half. It carries the same
+# guarantees the range does: the real chunked path, every skip announced, and a
+# final report that refuses to let a narrowed run read as a complete one.
+
+test_the_phase_parser_resolves_and_widens() {
+    echo "test: the phase parser takes nav, cc and both, and widens everything else"
+    assert_eq "both" "$(webkit_phase_selection '' 2>/dev/null)" "no value means both phases"
+    assert_eq "both" "$(webkit_phase_selection both 2>/dev/null)" "an explicit both passes through"
+    assert_eq "nav" "$(webkit_phase_selection nav 2>/dev/null)" "nav passes through"
+    assert_eq "cc" "$(webkit_phase_selection cc 2>/dev/null)" "cc passes through"
+    # Every unusable value widens back. Running everything is the safe direction;
+    # running nothing would report green having tested none.
+    assert_eq "both" "$(webkit_phase_selection banana 2>/dev/null)" "an unknown word runs both"
+    assert_eq "both" "$(webkit_phase_selection NAV 2>/dev/null)" "the match is exact, so NAV is not nav"
+    assert_eq "both" "$(webkit_phase_selection 'nav cc' 2>/dev/null)" "a pair of values is not a selection"
+    assert_eq "both" "$(webkit_phase_selection 1 2>/dev/null)" "a number is not a phase"
+    # And it says so, rather than widening in silence.
+    if webkit_phase_selection banana 2>&1 >/dev/null | grep -q 'is not nav, cc or both'; then
+        pass "an unusable phase value is named on stderr"
+    else
+        fail "an unusable phase value widened silently"
+    fi
+}
+
+test_no_phase_selection_runs_both_phases() {
+    echo "test: with no phase set both phases run and nothing is called incomplete"
+    reset_stubs
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    drive_in "$RANGE" "$OUT/nophase.out" || true
+    assert_says "$OUT/nophase.out" "mobile-webkit CC chunk 1/1" "the CC phase ran"
+    assert_says "$OUT/nophase.out" "mobile-webkit nav chunk 1/4" "the nav phase ran"
+    assert_silent_about "$OUT/nophase.out" "PHASE=" "no phase narrowing was announced"
+    assert_eq "" "$WEBKIT_PHASE_APPLIED" "the run is not recorded as phase-narrowed"
+    report_webkit_phase_selection >"$OUT/nophasereport.out" 2>&1
+    assert_silent_about "$OUT/nophasereport.out" "ONE PHASE ONLY" "the final report says nothing"
+}
+
+test_the_nav_phase_alone_runs_only_nav_and_says_so() {
+    echo "test: PHASE=nav skips the CC phase out loud and keeps nav on the chunked path"
+    local rc
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_PHASE=nav
+    drive_in "$RANGE" "$OUT/navonly.out"
+    rc=$?
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    assert_eq "0" "$rc" "a nav-only run returns 0 when nav passes"
+    assert_says "$OUT/navonly.out" "phase 1/2 SKIPPED: 2 CC-subprocess specs, LUCIDOS_E2E_WEBKIT_PHASE=nav" \
+        "the skipped CC phase says so, with the count it did not run"
+    assert_silent_about "$OUT/navonly.out" "mobile-webkit CC chunk" "no CC spec ran"
+    # The whole point: nav stays on the REAL chunked path, so the boundary check,
+    # the reaper and the peak sampler are all still live.
+    assert_says "$OUT/navonly.out" "mobile-webkit nav chunk 1/4: 2 specs (fresh browser)" "nav chunk 1 ran in its own fresh browser"
+    assert_says "$OUT/navonly.out" "mobile-webkit nav chunk 4/4: 2 specs (fresh browser)" "nav chunk 4 ran"
+    assert_says "$OUT/navonly.out" "boundary: mobile-webkit nav chunk 1/4" "the boundary between nav chunks is still checked"
+    # With no CC phase there is no CC-to-nav boundary to stand at, and a stop
+    # needs work left to stop.
+    assert_silent_about "$OUT/navonly.out" "boundary: mobile-webkit phase 1/2 (CC)" "no phase boundary is checked when the CC phase did not run"
+    assert_eq "nav" "$WEBKIT_PHASE_APPLIED" "the run records itself as phase-narrowed"
+
+    report_webkit_phase_selection >"$OUT/navonlyreport.out" 2>&1
+    assert_says "$OUT/navonlyreport.out" "ONE PHASE ONLY: LUCIDOS_E2E_WEBKIT_PHASE=nav" "the final report restates the selection"
+    assert_says "$OUT/navonlyreport.out" "Coverage is incomplete" "the final report calls the coverage incomplete"
+    assert_says "$OUT/navonlyreport.out" "the CC-subprocess phase has no verdict" "the final report names the phase that has no verdict"
+}
+
+test_the_cc_phase_alone_runs_only_cc_and_says_so() {
+    echo "test: PHASE=cc skips the navigation phase out loud"
+    local rc
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_PHASE=cc
+    drive_in "$RANGE" "$OUT/cconly.out"
+    rc=$?
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    assert_eq "0" "$rc" "a cc-only run returns 0 when the CC phase passes"
+    assert_says "$OUT/cconly.out" "mobile-webkit CC chunk 1/1: 2 specs (fresh browser)" "the CC phase ran on the chunked path"
+    assert_says "$OUT/cconly.out" "phase 2/2 SKIPPED: 8 navigation specs, LUCIDOS_E2E_WEBKIT_PHASE=cc" \
+        "the skipped nav phase says so, with the count it did not run"
+    assert_silent_about "$OUT/cconly.out" "mobile-webkit nav chunk" "no navigation spec ran"
+    assert_silent_about "$OUT/cconly.out" "boundary: mobile-webkit phase 1/2 (CC)" "no phase boundary is checked when nav will not run"
+    assert_eq "cc" "$WEBKIT_PHASE_APPLIED" "the run records itself as phase-narrowed"
+
+    report_webkit_phase_selection >"$OUT/cconlyreport.out" 2>&1
+    assert_says "$OUT/cconlyreport.out" "ONE PHASE ONLY: LUCIDOS_E2E_WEBKIT_PHASE=cc" "the final report restates the selection"
+    assert_says "$OUT/cconlyreport.out" "the navigation phase has no verdict" "the final report names the phase that has no verdict"
+}
+
+test_a_garbage_phase_value_runs_both_phases() {
+    echo "test: an unparseable phase runs everything rather than nothing"
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_PHASE=navigation
+    drive_in "$RANGE" "$OUT/junkphase.out" || true
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    assert_says "$OUT/junkphase.out" "mobile-webkit CC chunk 1/1" "the CC phase ran"
+    assert_says "$OUT/junkphase.out" "mobile-webkit nav chunk 4/4" "the nav phase ran to the end"
+    assert_says "$OUT/junkphase.out" "is not nav, cc or both" "the widening is named on stderr"
+    assert_silent_about "$OUT/junkphase.out" "SKIPPED" "nothing was skipped"
+    assert_eq "" "$WEBKIT_PHASE_APPLIED" "a widened phase is not recorded as a narrowing"
+}
+
+# The two knobs compose, and that pairing is the actual discharge recipe: the
+# phase selector drops the expensive half, the range narrows what is left.
+test_a_nav_only_run_composes_with_a_chunk_range() {
+    echo "test: PHASE=nav and a chunk range narrow together, and both are reported"
+    local rc
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_PHASE=nav
+    export LUCIDOS_E2E_WEBKIT_CHUNKS=3-4
+    drive_in "$RANGE" "$OUT/navrange.out"
+    rc=$?
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    unset LUCIDOS_E2E_WEBKIT_CHUNKS
+    assert_eq "0" "$rc" "the narrowed run returns 0 when its chunks pass"
+    assert_says "$OUT/navrange.out" "phase 1/2 SKIPPED" "the CC phase is skipped"
+    assert_says "$OUT/navrange.out" "LIMITED to chunks 3-4 of 4" "the range is announced inside nav"
+    assert_says "$OUT/navrange.out" "nav chunk 1/4: SKIPPED, outside chunk range 3-4" "chunk 1 says it was skipped"
+    assert_says "$OUT/navrange.out" "nav chunk 3/4: 2 specs (fresh browser)" "chunk 3 ran"
+    assert_says "$OUT/navrange.out" "nav chunk 4/4: 2 specs (fresh browser)" "chunk 4 ran"
+    assert_says "$OUT/navrange.out" "boundary: mobile-webkit nav chunk 3/4" "the boundary inside the range is still checked"
+    assert_eq "nav" "$WEBKIT_PHASE_APPLIED" "the phase narrowing is recorded"
+    assert_eq "3-4 of 4" "$WEBKIT_CHUNK_RANGE_APPLIED" "the range narrowing is recorded too"
+
+    # Both reports fire. Either one alone would understate what has no verdict.
+    report_webkit_chunk_range >"$OUT/navrangereport.out" 2>&1
+    report_webkit_phase_selection >>"$OUT/navrangereport.out" 2>&1
+    assert_says "$OUT/navrangereport.out" "CHUNK RANGE ONLY: 3-4 of 4" "the range is restated"
+    assert_says "$OUT/navrangereport.out" "ONE PHASE ONLY: LUCIDOS_E2E_WEBKIT_PHASE=nav" "the phase is restated"
+    assert_eq "2" "$(grep -c 'Coverage is incomplete' "$OUT/navrangereport.out")" "both reports call the coverage incomplete"
+}
+
+# A set that cannot be split has no phases to choose between, so the selection
+# runs everything. That must be said: a selection that silently ran the whole
+# project is the same lie as a silent skip.
+test_a_phase_selection_on_an_unsplittable_set_says_it_ran_everything() {
+    echo "test: a phase selection on a set with no CC specs names what it did"
+    reset_stubs
+    export LUCIDOS_E2E_WEBKIT_PHASE=nav
+    drive_in "$NAV_ONLY" "$OUT/nosplitphase.out" || true
+    unset LUCIDOS_E2E_WEBKIT_PHASE
+    assert_says "$OUT/nosplitphase.out" "did not split (0 CC, 2 nav)" "it names the counts it found"
+    assert_says "$OUT/nosplitphase.out" "ran everything" "it says the selection did not narrow anything"
+    assert_eq "1" "$(grep -c '^playwright:' "$OUT/nosplitphase.out")" "the single pass still ran"
+    assert_eq "" "$WEBKIT_PHASE_APPLIED" "a selection that narrowed nothing is not recorded as a narrowing"
+}
+
 test_the_cc_phase_runs_first_and_nav_second
 test_both_phases_still_shard
 test_desktop_specs_are_excluded_from_both_phases
@@ -519,6 +677,13 @@ test_an_open_ended_range_runs_to_the_last_chunk
 test_a_garbage_range_runs_every_chunk
 test_a_non_numeric_chunk_size_falls_back_instead_of_hanging
 test_a_full_width_range_is_not_announced_as_a_narrowing
+test_the_phase_parser_resolves_and_widens
+test_no_phase_selection_runs_both_phases
+test_the_nav_phase_alone_runs_only_nav_and_says_so
+test_the_cc_phase_alone_runs_only_cc_and_says_so
+test_a_garbage_phase_value_runs_both_phases
+test_a_nav_only_run_composes_with_a_chunk_range
+test_a_phase_selection_on_an_unsplittable_set_says_it_ran_everything
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

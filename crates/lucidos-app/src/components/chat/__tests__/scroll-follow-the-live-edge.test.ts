@@ -3112,9 +3112,10 @@ describe('a submit holds the bottom until the agent draws', () => {
   });
 
   it('lets go for a row drawn DURING the glide, without waiting for another resize', () => {
-    // A growth round that lands mid-glide is swallowed: `honourGrowth` stands
-    // down for a tween. A turn drawing its one row there then goes quiet and
-    // sends no later resize, so the release happens when the glide ends.
+    // A turn that draws its one row mid-glide then goes quiet and sends no
+    // later resize. The round inside the glide is the only one the release can
+    // happen on. So `honourGrowth` hands it to `honourLanding` rather than
+    // standing down for the landing's own tween.
     const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
     const { onResize } = makeScrollObservers(el);
     setActiveScrollElement(el);
@@ -3126,17 +3127,138 @@ describe('a submit holds the bottom until the agent draws', () => {
     vi.advanceTimersByTime(60);  // the glide is running
     el.drawResponseRow(sent.turn);
     el.scrollHeight = 3200;
-    onResize();                  // swallowed by the tween guard
+    onResize();                  // the release lands on THIS round
     vi.advanceTimersByTime(1500);
 
-    const landed = el.scrollTop;
+    expect(el.scrollTop).toBe(2700); // 3200 - 500: where the first row left it
     el.writes = 0;
     el.scrollHeight = 9000;      // and the reply streams on, moving nobody
     onResize();
     vi.advanceTimersByTime(1500);
 
     expect(el.writes).toBe(0);
-    expect(el.scrollTop).toBe(landed);
+    expect(el.scrollTop).toBe(2700);
+  });
+
+  it('lets go at once for a turn that renders WITH the agent already drawing', () => {
+    // THE BASELINE. The turn a send creates can arrive with the agent's opening
+    // already in it, in one Preact commit. Reading its rows when it first
+    // becomes addressable swallowed them. The hold then waited for the NEXT
+    // row, which is the reply, and carried the reader through it.
+    //
+    // A send's turn did not exist when the reader submitted, so its baseline is
+    // zero and any row at all ends the hold.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.drawResponseRow(sent.turn); // the agent's opening, in the SAME commit
+    el.drawResponseRow(sent.turn);
+    el.scrollHeight = 3120;
+    onResize();                    // so the hold is over on its FIRST look
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2620); // 3120 - 500: the opening's own edge
+
+    el.writes = 0;
+    el.scrollHeight = 9000;        // and the reply that follows carries nobody
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.writes).toBe(0);
+    expect(el.scrollTop).toBe(2620);
+  });
+
+  it('keeps holding a CARD whose turn already carried a reply before it asked', () => {
+    // The baseline's other half, and the opposite rule. A card's turn was on
+    // screen when the reader tapped it, so the rows in it are what the agent
+    // said BEFORE it asked. Zero there would read those as the answer's own
+    // reply and end the hold at once, which is the one-shot ADR 0080 replaced.
+    const el = makeEl({ scrollTop: 0, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    const card = el.addQuestionCard({ toolUseId: 'q1', top: 2400, height: 300, status: true, rows: 3 });
+    atBottom(el);
+
+    followAnsweredQuestion('q1');
+    el.scrollHeight = 3200;
+    onResize();                    // a round with no new row: still holding
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2700);
+
+    el.drawResponseRow(card.panel.turn); // the agent resumes: NOW it lets go
+    el.scrollHeight = 3400;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(2900);
+
+    el.writes = 0;
+    el.scrollHeight = 9000;
+    onResize();
+    vi.advanceTimersByTime(1500);
+    expect(el.writes).toBe(0);
+  });
+
+  it('freezes the glide at the FIRST row, so a fast reply carries nobody', () => {
+    // THE RULE. An unarmed reader's landing tracks the live edge every frame,
+    // which catches the agent's opening instalments. A reply drawing itself
+    // INSIDE that glide was tracked too. The hold then let go only at the
+    // tween's end, by which point the reply had largely arrived. The reader was
+    // carried through a turn they never asked to follow.
+    //
+    // Most replies are fast, so this was most replies. The e2e spec
+    // `thread-scroll-belongs-to-the-reader` measured it at 82% of the way down.
+    // It had been passing on an inline query classifier the harness no longer
+    // pays for, whose delay held the reply outside the glide by accident.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3080;
+    onResize();                    // the landing glide starts, tracking
+    vi.advanceTimersByTime(60);
+
+    el.drawResponseRow(sent.turn); // the agent's first row, inside the glide
+    el.scrollHeight = 3200;
+    onResize();
+    vi.advanceTimersByTime(60);
+    el.scrollHeight = 9000;        // and the whole reply, still inside it
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(2700);      // 3200 - 500: the first row's edge
+    expect(el.scrollTop).not.toBe(8500);  // and not the end of the reply
+  });
+
+  it('carries an ARMED reader through that same fast reply', () => {
+    // The half that must NOT change. A reader pinned to the live edge asked to
+    // be carried, and being carried is the whole point of the ask. The reply
+    // that stops an unarmed reader at its first row takes this one to the end.
+    const el = makeEl({ scrollTop: 500, scrollHeight: 3000, panels: [{ top: 200, height: 120 }] });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    atBottom(el);
+    setFollowLiveEdge(true); // pinned to the live edge, by the toggle
+
+    followSentMessage();
+    const sent = el.addUserMessage({ top: 2900, height: 120 });
+    el.scrollHeight = 3080;
+    onResize();
+    vi.advanceTimersByTime(60);
+
+    el.drawResponseRow(sent.turn);
+    el.scrollHeight = 3200;
+    onResize();
+    vi.advanceTimersByTime(60);
+    el.scrollHeight = 9000;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(8500); // 9000 - 500, the live edge
   });
 
   it('lets go when its turn LEAVES the layout, rather than sitting out the backstop', () => {

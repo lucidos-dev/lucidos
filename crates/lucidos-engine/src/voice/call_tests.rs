@@ -175,11 +175,28 @@ fn the_caller_says(text: &str) -> VoiceEvent {
     }
 }
 
+/// A piece of what the caller is saying, while they are still saying it.
+fn the_caller_is_saying(text: &str) -> VoiceEvent {
+    VoiceEvent::UserTranscript {
+        text: text.to_string(),
+    }
+}
+
 /// The talker finishing a reply.
 fn the_talker_says(text: &str) -> VoiceEvent {
     VoiceEvent::TalkerTurnEnded {
         transcript: text.to_string(),
         usage: usage(),
+    }
+}
+
+/// A piece of the reply the talker is speaking now.
+///
+/// Before the turn ends, these deltas are the whole account of a reply. That
+/// is what makes a call stopping first worth scripting.
+fn the_talker_is_saying(text: &str) -> VoiceEvent {
+    VoiceEvent::TalkerTranscript {
+        text: text.to_string(),
     }
 }
 
@@ -853,9 +870,7 @@ fn reaches_the_caller(event: &VoiceEvent) -> bool {
 /// whatever the script did. An empty transcript delta is the cheapest event
 /// with that shape: it sends a frame and touches only the floor.
 fn the_talker_draws_breath() -> VoiceEvent {
-    VoiceEvent::TalkerTranscript {
-        text: String::new(),
-    }
+    the_talker_is_saying("")
 }
 
 /// What one scripted call left behind.
@@ -991,6 +1006,150 @@ async fn an_utterance_the_talker_handles_alone_wakes_nobody() {
     assert_eq!(rows[0].0, "SpokenMessageReceived");
     assert_eq!(rows[0].1["text"], "hei");
     assert_eq!(rows[0].1["session_id"], session_id.to_string());
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A partial is drawn and never written down.
+///
+/// It reaches the caller, which the sentinel accounting proves: every visible
+/// frame is counted and the hangup waits for all of them, so a partial the
+/// loop swallowed would leave this call hanging. What it must NOT do is settle
+/// anything WHILE THE CALL RUNS. A partial pairing with a waiting ask would
+/// spend it on half a sentence.
+///
+/// A call that ends holding only partials is the other case, and it is covered
+/// below: those words are the caller's, and losing them is the defect the
+/// hold exists to prevent.
+#[tokio::test]
+async fn a_caller_partial_settles_nothing_while_the_call_runs() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![
+            the_caller_is_saying("what have "),
+            the_caller_is_saying("I got running"),
+            // The ask is what a partial must not pair with. Half a sentence
+            // would run as a turn, and the rest would arrive with no ask left.
+            asks_for_the_doer("they asked what is running"),
+        ],
+    )
+    .await;
+
+    assert!(did.woken.is_empty(), "a partial paired with an ask");
+    let kinds: Vec<_> = voice_rows(&did.events)
+        .into_iter()
+        .map(|(kind, _)| kind)
+        .collect();
+    assert!(
+        !kinds.iter().any(|kind| kind == "WorkDelegated"),
+        "a partial started a turn: {:?}",
+        kinds
+    );
+    // Still owed a row, because the words are the caller's. It is written when
+    // the call ends and nothing better is coming.
+    assert_eq!(kinds, vec!["SpokenMessageReceived".to_string()]);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **Defect 3 of the seven-bubble call: the caller's last words were lost.**
+///
+/// A provider with no turn-end frame reports the caller through partials alone.
+/// The call ends, nothing ever says the turn finished, and the words reached no
+/// row. They are the caller's either way, so they are written down.
+#[tokio::test]
+async fn a_call_that_ends_on_a_partial_still_writes_the_words_down() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![
+            the_caller_is_saying("restart the "),
+            the_caller_is_saying("computer when"),
+        ],
+    )
+    .await;
+
+    let rows = voice_rows(&did.events);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0].0, "SpokenMessageReceived");
+    assert_eq!(rows[0].1["text"], "restart the computer when");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The row carries the transcript as the frame carried it.
+///
+/// The transcript client-side must be matchable against the row, because that
+/// is how a *live utterance* row is retired (`claimUtteranceRows`). Only ONE
+/// leg of the chain normalizes, `doer.rs::wake`, which trims before it writes
+/// a delegated row. So trimming both sides is the whole of the match, and a
+/// second normalization added here would break it silently.
+#[tokio::test]
+async fn a_spoken_row_carries_the_transcript_unchanged() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+    let spoken = "  what have I got running  ";
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![the_caller_says(spoken), the_talker_says("Two things.")],
+    )
+    .await;
+
+    let rows = voice_rows(&did.events);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0].0, "SpokenMessageReceived");
+    assert_eq!(rows[0].1["text"], spoken);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The partials give way to the finished words, which are the only ones any
+/// row is written from.
+#[tokio::test]
+async fn the_finished_words_are_what_the_row_carries() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![
+            the_caller_is_saying("what have "),
+            the_caller_says("what have I got running"),
+            the_talker_says("Two things."),
+        ],
+    )
+    .await;
+
+    let rows = voice_rows(&did.events);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0].0, "SpokenMessageReceived");
+    assert_eq!(rows[0].1["text"], "what have I got running");
 
     teardown_test_db(&db_name).await;
 }
@@ -1390,6 +1549,157 @@ async fn a_call_that_drops_mid_utterance_loses_nothing() {
         assert_eq!(rows[0].0, "SpokenMessageReceived", "{:?}", ending);
         assert_eq!(rows[0].1["text"], "book it for tuesday", "{:?}", ending);
     }
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The same property for the talker, which is the half that lacked it. A call
+/// ending mid-reply keeps the caller's words AND the answer they heard.
+///
+/// The same three reasons, because a teardown flush that covers only the
+/// hangup is the hole again under another name. Both rows come out of teardown
+/// here, so the order they land in is asserted too.
+#[tokio::test]
+async fn a_call_that_drops_mid_reply_keeps_what_the_caller_heard() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    for ending in [
+        VoiceSessionEndReason::Hangup,
+        VoiceSessionEndReason::Disconnected,
+        VoiceSessionEndReason::ProviderFailed,
+    ] {
+        let thread_id = a_chat_thread(&pool).await;
+        // No turn end anywhere: the talker is still speaking when it stops.
+        let script = vec![
+            the_caller_says("what have I got running"),
+            the_talker_is_saying("Two things are "),
+            the_talker_is_saying("running."),
+        ];
+        // Four deliveries: SessionStarted, then one frame per scripted event.
+        // So the end always lands with the reply half said.
+        let (provider, mut caller) = match ending {
+            VoiceSessionEndReason::Hangup => (
+                MockVoiceProvider::new(script),
+                ScriptedCaller::new(vec![]).hanging_up_after(4),
+            ),
+            VoiceSessionEndReason::Disconnected => (
+                MockVoiceProvider::new(script),
+                ScriptedCaller::new(vec![]).dropping_after(4),
+            ),
+            // The talker drops the call instead, and the caller waits.
+            _ => (
+                MockVoiceProvider::ending_after(script),
+                ScriptedCaller::new(vec![]),
+            ),
+        };
+
+        run_call(
+            &bus,
+            &provider,
+            &mut caller,
+            &RecordingTurns::default(),
+            free_doer(),
+            opening(),
+            subject(thread_id, uuid::Uuid::new_v4()),
+        )
+        .await;
+
+        let events = thread_events(&pool, thread_id).await;
+        assert_eq!(
+            spoken_kinds(&events),
+            vec!["SpokenMessageReceived", "SpokenReplyGenerated"],
+            "{:?} lost the reply or misordered it: {:?}",
+            ending,
+            events
+        );
+        let reply = events
+            .iter()
+            .find(|(kind, _)| kind == "SpokenReplyGenerated")
+            .map(|(_, payload)| payload.clone())
+            .expect("the reply row");
+        assert_eq!(reply["text"], "Two things are running.", "{:?}", ending);
+        // The caller left before the reply finished, so the row says so.
+        assert_eq!(reply["interrupted"], true, "{:?}", ending);
+        // The talker's own name, exactly as a finished reply carries.
+        assert_eq!(reply["actor"]["agent"]["kind"], "guest", "{:?}", ending);
+    }
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A reply the talker never started is not invented at teardown. Nothing was
+/// heard, so nothing is written.
+#[tokio::test]
+async fn a_call_that_drops_before_a_word_writes_no_reply() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![the_caller_says("what have I got running")]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let events = thread_events(&pool, thread_id).await;
+    assert_eq!(
+        spoken_kinds(&events),
+        vec!["SpokenMessageReceived"],
+        "a reply nobody heard was written down: {:?}",
+        events
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A reply the turn end already recorded is not recorded again at teardown.
+/// One writer, so the held deltas go with it.
+#[tokio::test]
+async fn a_finished_reply_is_not_written_twice_by_the_teardown() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("what have I got running"),
+        the_talker_is_saying("Two things are running."),
+        the_talker_says("Two things are running."),
+    ]);
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(4);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &RecordingTurns::default(),
+        free_doer(),
+        opening(),
+        subject(thread_id, uuid::Uuid::new_v4()),
+    )
+    .await;
+
+    let events = thread_events(&pool, thread_id).await;
+    assert_eq!(
+        spoken_kinds(&events),
+        vec!["SpokenMessageReceived", "SpokenReplyGenerated"],
+        "{:?}",
+        events
+    );
+    let reply = events
+        .iter()
+        .find(|(kind, _)| kind == "SpokenReplyGenerated")
+        .map(|(_, payload)| payload.clone())
+        .expect("the reply row");
+    assert_eq!(reply["interrupted"], false);
 
     teardown_test_db(&db_name).await;
 }
@@ -3092,6 +3402,431 @@ async fn a_held_answer_gives_up_rather_than_claiming_a_later_sentence() {
     let resolved = log.lock().unwrap().resolved_tool_calls.clone();
     assert_eq!(resolved.len(), 1, "{:?}", resolved);
     assert!(resolved[0].1.contains("dropped"), "{:?}", resolved);
+
+    teardown_test_db(&db_name).await;
+}
+
+// The call that cost seven bubbles and one answer.
+//
+// `docs/plans/2026-09-14-one-thing-the-caller-said-is-one-row.md` has the event
+// log these three replay.
+
+/// **The headline regression.** One sentence, seven finished transcription
+/// items, twenty-one talker turns that said nothing, and no delegation.
+///
+/// The row's unit is the thing the caller SAID, not the slice the provider
+/// closed an item on. Nothing in this sequence moves the conversation, so
+/// nothing closes the row until the call does.
+#[tokio::test]
+async fn seven_transcription_items_inside_one_breath_are_one_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // The provider's own item boundaries, exactly as they landed.
+    let fragments = [
+        "Why",
+        "didn't you",
+        "tell me",
+        "to",
+        "restart the",
+        "computer",
+        "when",
+    ];
+    let mut script = Vec::new();
+    for fragment in fragments {
+        script.push(the_caller_says(fragment));
+        // A talker turn that ended having said nothing, three per item, which
+        // is the rate the reported call ran at.
+        for _ in 0..3 {
+            script.push(the_talker_says(""));
+        }
+    }
+
+    let did = a_call_that_hears(&pool, &bus, thread_id, session_id, script).await;
+
+    let rows = voice_rows(&did.events);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one breath drew {} rows: {:?}",
+        rows.len(),
+        rows
+    );
+    assert_eq!(rows[0].0, "SpokenMessageReceived");
+    assert_eq!(
+        rows[0].1["text"],
+        "Why didn't you tell me to restart the computer when"
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// The other half of the rule: a talker that DOES answer closes the row, so the
+/// next thing the caller says is a row of its own.
+#[tokio::test]
+async fn a_talker_that_answers_closes_the_row_and_the_next_sentence_opens_one() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![
+            the_caller_says("what is on today"),
+            the_talker_says("Two meetings."),
+            the_caller_says("and tomorrow"),
+            the_talker_says("One."),
+        ],
+    )
+    .await;
+
+    let spoken: Vec<_> = voice_rows(&did.events)
+        .into_iter()
+        .filter(|(kind, _)| kind == "SpokenMessageReceived")
+        .map(|(_, payload)| payload["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(spoken, vec!["what is on today", "and tomorrow"]);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **Defect 2: the turn never ran.** A caller asks a question and the talker
+/// does nothing at all with it, which is what twenty-one wordless turns are.
+///
+/// The doer takes the question rather than leaving the caller in silence. The
+/// caller is told on screen too, because the one route to their ear is the
+/// thing that failed.
+///
+/// It waits out the real bound. A test-only one would leave the shipped number
+/// unexercised, and the number is the whole of the behaviour.
+#[tokio::test]
+async fn a_caller_nobody_answers_reaches_the_doer_and_is_told_so() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("why didn't you tell me to restart the computer"),
+        // Not one word, however many turns it takes.
+        the_talker_says(""),
+        the_talker_says(""),
+    ]);
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let rang_off = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&rang_off));
+    let sent = caller.sent.clone();
+
+    let call = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        opening(),
+        subject(thread_id, session_id),
+    );
+    let watcher = {
+        let woken = Arc::clone(&woken);
+        let rang_off = Arc::clone(&rang_off);
+        async move {
+            until("the doer to be woken with nobody having answered", || {
+                !woken.lock().unwrap().is_empty()
+            })
+            .await;
+            rang_off.notify_one();
+        }
+    };
+    tokio::join!(call, watcher);
+
+    let woken = woken.lock().unwrap().clone();
+    assert_eq!(
+        woken,
+        vec!["why didn't you tell me to restart the computer".to_string()]
+    );
+
+    // Said out loud in the log, recorded as a row, and shown to the caller.
+    let rows = voice_rows(&thread_events(&pool, thread_id).await);
+    assert!(
+        rows.iter().any(|(kind, payload)| kind == "WorkDelegated"
+            && payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("the talker said nothing")),
+        "{:?}",
+        rows
+    );
+    let told: Vec<_> = sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            ServerFrame::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(told.len(), 1, "{:?}", told);
+    assert!(told[0].contains("not answering"), "{:?}", told[0]);
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A provider still holding the caller's words when the line closes hands them
+/// back, and they reach the row.
+///
+/// A turn-less protocol accumulates the caller and gives them up only as the
+/// socket goes. That is after the loop stopped reading, so the sentence used to
+/// die with the session.
+#[tokio::test]
+async fn words_the_session_was_still_holding_reach_the_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let provider = MockVoiceProvider::new(vec![the_caller_says("restart the computer")])
+        .still_holding(vec![the_caller_says("when it is idle")]);
+    let turns = RecordingTurns::default();
+    // Two deliveries: the session opening, then the caller's own turn end.
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_after(2);
+
+    run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        opening(),
+        subject(thread_id, session_id),
+    )
+    .await;
+
+    let rows = voice_rows(&thread_events(&pool, thread_id).await);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0].1["text"], "restart the computer when it is idle");
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **An empty output cycle settles nothing.** A talker turn that said no words
+/// delivered nothing to the caller. So it may neither close their row nor leave
+/// a reply behind claiming they heard something.
+///
+/// The utterance stays pending, which is what keeps it reachable by the three
+/// things that CAN settle it: real words, a delegation, or the bounded wait
+/// that hands it to the doer.
+#[tokio::test]
+async fn an_empty_talker_turn_neither_answers_the_caller_nor_closes_their_row() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let did = a_call_that_hears(
+        &pool,
+        &bus,
+        thread_id,
+        session_id,
+        vec![
+            the_caller_says("why didn't you tell me"),
+            the_talker_says(""),
+            the_talker_says(""),
+            the_caller_says("to restart the computer"),
+            the_talker_says(""),
+        ],
+    )
+    .await;
+
+    // One row, and it carries both stretches: nothing in between moved the
+    // conversation on.
+    let rows = voice_rows(&did.events);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(
+        rows[0].1["text"],
+        "why didn't you tell me to restart the computer"
+    );
+    // And nothing claims the caller heard a reply.
+    let replies: Vec<_> = did
+        .events
+        .iter()
+        .filter(|(kind, _)| kind == "SpokenReplyGenerated")
+        .collect();
+    assert!(
+        replies.is_empty(),
+        "a silent turn wrote a reply: {:?}",
+        replies
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **A blank talker delta holds nothing off.** Both providers forward one
+/// exactly as it arrives, so a mute talker can stream them for the whole call.
+/// Reading one as the talker answering is how the bound would never fire on
+/// precisely the failure it exists for.
+#[tokio::test]
+async fn blank_talker_deltas_do_not_hold_the_bound_off() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_says("why didn't you tell me to restart the computer"),
+        the_talker_is_saying(""),
+        the_talker_is_saying(""),
+        the_talker_is_saying(""),
+    ]);
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let rang_off = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&rang_off));
+
+    let call = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        opening(),
+        subject(thread_id, session_id),
+    );
+    let watcher = {
+        let woken = Arc::clone(&woken);
+        let rang_off = Arc::clone(&rang_off);
+        async move {
+            until("the doer to be woken past a stream of blank deltas", || {
+                !woken.lock().unwrap().is_empty()
+            })
+            .await;
+            rang_off.notify_one();
+        }
+    };
+    tokio::join!(call, watcher);
+
+    assert_eq!(
+        woken.lock().unwrap().clone(),
+        vec!["why didn't you tell me to restart the computer".to_string()]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// **The words the bound spends are spent everywhere.** A provider with no
+/// turn-end frame keeps its own copy, so the engine tells it they are gone.
+/// Left holding them, its next boundary draws the same breath a second time.
+#[tokio::test]
+async fn words_the_bound_spends_are_not_written_twice() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    // What a turn-less provider does: partials only, and the same sentence
+    // handed over again when the socket closes.
+    let provider = MockVoiceProvider::new(vec![
+        the_caller_is_saying("why didn't you tell me "),
+        the_caller_is_saying("to restart the computer"),
+    ])
+    .still_holding(vec![the_caller_says(
+        "why didn't you tell me to restart the computer",
+    )]);
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let rang_off = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&rang_off));
+
+    let call = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        free_doer(),
+        opening(),
+        subject(thread_id, session_id),
+    );
+    let watcher = {
+        let woken = Arc::clone(&woken);
+        let rang_off = Arc::clone(&rang_off);
+        async move {
+            until("the doer to take the unanswered words", || {
+                !woken.lock().unwrap().is_empty()
+            })
+            .await;
+            rang_off.notify_one();
+        }
+    };
+    tokio::join!(call, watcher);
+
+    // One wake, and NO second row from what the session was still holding.
+    let rows = voice_rows(&thread_events(&pool, thread_id).await);
+    let spoken: Vec<_> = rows
+        .iter()
+        .filter(|(kind, _)| kind == "SpokenMessageReceived")
+        .collect();
+    assert!(spoken.is_empty(), "the breath was drawn twice: {:?}", rows);
+    assert_eq!(
+        woken.lock().unwrap().clone(),
+        vec!["why didn't you tell me to restart the computer".to_string()]
+    );
+
+    teardown_test_db(&db_name).await;
+}
+
+/// A doer parked inside a card has no turn to start, so the bound does not
+/// pretend otherwise. The caller is still told, and their words still land.
+#[tokio::test]
+async fn a_parked_doer_is_not_woken_by_the_bound_and_the_caller_is_told() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = a_chat_thread(&pool).await;
+    let session_id = uuid::Uuid::new_v4();
+
+    let provider = MockVoiceProvider::new(vec![the_caller_says("the second one")]);
+    let turns = RecordingTurns::default();
+    let woken = turns.woken();
+    let parked = NoDecisions::parked();
+    let rang_off = Arc::new(Notify::new());
+    let mut caller = ScriptedCaller::new(vec![]).hanging_up_on(Arc::clone(&rang_off));
+    let sent = caller.sent.clone();
+
+    let call = run_call(
+        &bus,
+        &provider,
+        &mut caller,
+        &turns,
+        &parked,
+        opening(),
+        subject(thread_id, session_id),
+    );
+    let watcher = {
+        let sent = Arc::clone(&sent);
+        let rang_off = Arc::clone(&rang_off);
+        async move {
+            until("the caller to be told the voice is not answering", || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|f| matches!(f, ServerFrame::Error { .. }))
+            })
+            .await;
+            rang_off.notify_one();
+        }
+    };
+    tokio::join!(call, watcher);
+
+    assert!(woken.lock().unwrap().is_empty(), "a parked doer was woken");
+    let rows = voice_rows(&thread_events(&pool, thread_id).await);
+    assert_eq!(rows.len(), 1, "{:?}", rows);
+    assert_eq!(rows[0].0, "SpokenMessageReceived");
+    assert_eq!(rows[0].1["text"], "the second one");
 
     teardown_test_db(&db_name).await;
 }

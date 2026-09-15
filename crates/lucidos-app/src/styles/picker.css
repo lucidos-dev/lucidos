@@ -28,6 +28,24 @@
   max-width: 30rem;
 }
 
+/* The band the macOS traffic lights centre on, and nothing else. The picker
+   draws no header, so without this the shell centres the OS buttons on whatever
+   bar the last app page happened to persist. Measured through
+   [data-titlebar-band], exactly like the shell's own header.
+
+   The SAME token the shell's bar is built from, so the two cannot drift. That
+   token is declared inside the desktop media query, and the 3rem fallback covers
+   a window narrow enough to miss it. Invisible, and never a hit target: the
+   whole picker background is the window drag region. */
+.ws-picker-titlebar-band {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--desktop-bar-height, 3rem);
+  pointer-events: none;
+}
+
 /* Buttons/inputs don't inherit font-family from their container, so opt them
    into the picker's neutral sans explicitly — otherwise they'd fall back to the
    UA default and read differently from the surrounding text. */

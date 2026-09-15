@@ -206,19 +206,21 @@ describe('rowForService', () => {
 });
 
 /**
- * A repair must load the credential it is repairing.
+ * A request naming a row must load that row. Two do: an OAuth repair, and a
+ * scope widening.
  *
- * Saving rebuilds the whole `auth_value` from the form, so a repair rendered
+ * Saving rebuilds the whole `auth_value` from the form, so either one rendered
  * against a blank form would write back only what the request happened to seed.
  * A confidential client would lose its `client_secret` and start failing the
  * token exchange; a provider the registry does not know would lose its
- * endpoints, scopes and redirect override too. Both are silent at save time.
+ * endpoints, scopes and redirect override too. A widening would wipe the very
+ * secret it exists to avoid retyping. All of it is silent at save time.
  *
  * Source-scan because the failure is in which component renders, and mounting
  * the modal would pull in the credential API, the inline-form store and the
  * secret loader to assert one routing decision.
  */
-describe('the repair path renders against the stored credential', () => {
+describe('a request naming a row renders against that stored credential', () => {
   const source = readFileSync(
     resolve(dirname(fileURLToPath(import.meta.url)), '../CredentialModal.tsx'),
     'utf8',
@@ -227,16 +229,16 @@ describe('the repair path renders against the stored credential', () => {
   it('routes a request carrying existing_credential_id through the loader', () => {
     expect(source).toMatch(/existing_credential_id/);
     // The loader fetches the stored secret; the plain create branch does not.
-    const repair = source.slice(
-      source.indexOf('const repairing'),
+    const targeted = source.slice(
+      source.indexOf('const targetedRow'),
       source.indexOf('editing={undefined}'),
     );
-    expect(repair).toContain('CredentialStoredLoader');
-    expect(repair).toContain('credentialId={repairing}');
-    expect(repair).toContain('request={form.request}');
+    expect(targeted).toContain('CredentialStoredLoader');
+    expect(targeted).toContain('credentialId={targetedRow}');
+    expect(targeted).toContain('request={form.request}');
   });
 
-  it('keeps the repair on the create rules rather than the edit relaxation', () => {
+  it('keeps both on the create rules rather than the edit relaxation', () => {
     // `editing` unset is what makes the endpoints genuinely required, which is
     // the whole point of reopening the form.
     expect(source).toContain('editing={request ? undefined : credentialId}');

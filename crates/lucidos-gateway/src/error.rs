@@ -31,6 +31,20 @@ impl ApiError {
         }
     }
 
+    /// 404, for a workspace slug this gateway does not have in its registry.
+    ///
+    /// Load-bearing rather than tidy. Several gateways run on one machine (the
+    /// dev one on 5251, the packaged `Lucidos.app` one on 5252), each owning a
+    /// different set of workspaces. A caller that posts to the wrong one must be
+    /// able to tell. A 202 for a slug that cannot exist tells it nothing. See
+    /// `scripts/stop.sh`, which reads this status.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     /// 409 — used by the restore flow when the derived/requested workspace name
     /// collides with an existing one (the picker then asks for a different name)
     /// or when a restore is already in progress.

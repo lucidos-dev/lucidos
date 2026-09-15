@@ -32,10 +32,11 @@
 //!
 //! So every physical number converts the moment it is read, through the scale
 //! factor of the thing that reported it: [`Rect::from_physical`] for a window,
-//! [`work_area_points`] for a monitor. Corrections go back out as
-//! `LogicalPosition` and `LogicalSize`, which tao passes through untouched.
+//! [`work_area_points`] for a monitor. Corrections go back out through
+//! `app_window::place_window`, which applies logical values and moves a window
+//! before it resizes it (ADR 0178).
 
-use tauri::{LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize};
+use tauri::{Manager, PhysicalPosition, PhysicalSize};
 
 /// Height of the strip at the top of the window that counts as the drag handle:
 /// one standard macOS title bar, the same 28 the shell stamps as
@@ -392,15 +393,12 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
         fixed.x,
         fixed.y
     );
-    // Logical, so tao applies the numbers as they are. A physical correction
-    // would be divided by the scale factor of whatever display the window is
-    // on when the call lands. That is the defect this module now avoids.
-    if let Err(e) = window.set_size(LogicalSize::new(fixed.width as f64, fixed.height as f64)) {
-        eprintln!("[Tauri] Failed to correct the restored window size: {e}");
-    }
-    if let Err(e) = window.set_position(LogicalPosition::new(fixed.x as f64, fixed.y as f64)) {
-        eprintln!("[Tauri] Failed to correct the restored window position: {e}");
-    }
+    // Through the one placer, rather than a setter pair of its own. It applies
+    // logical values, which tao passes through untouched, and it MOVES before
+    // it resizes. A correction can send a window to another display. A resize
+    // queued across that change is read back at the wrong scale factor
+    // (ADR 0178).
+    crate::app_window::place_window(&window, fixed, &format!("`{label}` back on screen"));
 }
 
 /// A monitor's usable frame as a [`Rect`]. Deliberately the work area rather

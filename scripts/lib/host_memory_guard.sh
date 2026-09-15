@@ -34,7 +34,7 @@
 # allocating and touching 4 GB drove free RAM from 4.70 GB to 0.62 GB and the
 # compressor did not move by a single page.
 #
-# WHAT REPLACES IT: THE KERNEL'S OWN VERDICT.
+# WHAT REPLACES IT: THE KERNEL'S OWN VERDICT, ONCE IT HOLDS STILL.
 #
 # kern.memorystatus_vm_pressure_level is 1 normal, 2 warn, 4 critical. One
 # sysctl, no root. It is what separated the one recorded freeze from every
@@ -43,17 +43,54 @@
 # 4.16 GB, pressure NORMAL. The compressor readings differ by 0.30 GB and
 # nothing else about the two hosts is comparable.
 #
+# AN INSTANTANEOUS CRITICAL READING IS NOT THAT VERDICT. Ten samples of an idle
+# host, 18 seconds apart, with nothing of ours running, read
+# 2 2 4 4 2 4 4 2 4 4. Available memory stayed flat at 11 GB, the compressor did
+# not move by a page, swap was 0.00 and load was falling. Six of ten read
+# critical on a machine doing nothing. The level is a transient edge
+# notification, raised as the compressed idle pool is probed, and it clears on
+# its own. A single reading is therefore the same class of false positive as the
+# retired compressor cap and the uncorroborated available floor.
+#
+# SO CRITICAL STOPS ON THREE GROUNDS, AND ON NOTHING ELSE.
+#
+#   1. COLLAPSE, immediately and unconditionally. Critical with available memory
+#      at or under max(HOST_MEMORY_COLLAPSE_ABS_GB, a share of RAM), 2.40 GB
+#      here. That is the freeze, which read 0.04 GB free. An idle host cannot
+#      reach it: the lowest idle reading on record is 8.79 GB.
+#   2. SWAP, immediately. Critical with any swap in use. Swap is accumulated
+#      state and means compression stopped keeping up, so it needs no sustain.
+#   3. SUSTAIN, otherwise. Critical still standing at the boundary, re-sampled
+#      HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES times at
+#      HOST_MEMORY_CRITICAL_CONFIRM_SECS intervals, with EVERY sample critical.
+#      The loop exits on the first sample that is not, so a healthy host pays a
+#      few seconds rather than the whole window.
+#
+# UNANIMOUS, NOT A MAJORITY. Six of the ten idle samples above read critical, so
+# a majority rule would still refuse a healthy host. Unanimity across 40 seconds
+# is a claim that oscillation cannot make.
+#
+# THE AVAILABLE FLOOR IS NOT THE CORROBORATOR HERE, and the collapse level is.
+# An idle host read 8.79 GB against the 9.60 GB floor, and the same host
+# produces critical ticks, so that conjunction is reachable with nothing
+# running. The runaway backstop is not a corroborator either, because it already
+# stops on its own.
+#
 # WARN IS REPORTED, NEVER A STOP. Across 5749 host samples it occurred 92 times
 # with no freeze, and it tracks host load as much as memory: one warn sample sat
 # at load average 254. Stopping on it would trade one false positive for
-# another. CRITICAL is the freeze signature, and it is the stop.
+# another.
 #
-# THE CHECK IS PEAK-AWARE. A boundary sample bounds the reading at the boundary
-# and says nothing about the chunk that just ran, whose observed deltas reach
-# 1.16 GB. So a run-scoped sampler ticks every few seconds, and the boundary
-# judges the WORST observation since the previous boundary. With no sampler the
-# boundary falls back to one direct read, which is the old behaviour and never
-# worse than it.
+# THE CHECK IS PEAK-AWARE, AND THE SUSTAIN ARM READS THE BOUNDARY INSTANT. A
+# boundary sample bounds the reading at the boundary and says nothing about the
+# chunk that just ran, whose observed deltas reach 1.16 GB. So a run-scoped
+# sampler ticks every few seconds, and the boundary judges the WORST observation
+# since the previous boundary. The sustain arm is the one exception: a critical
+# that had cleared by the boundary is recorded and never acted on, because there
+# is nothing live left to confirm. The collapse and swap arms still read the
+# folded window, since critical with the headroom gone is the freeze whenever it
+# happened. With no sampler the boundary falls back to one direct read, which is
+# the old behaviour and never worse than it.
 #
 # THE OTHER TWO STOPS ARE UNCHANGED, and both measure real conditions.
 #
@@ -62,11 +99,43 @@
 # swapfile at all and reports 0.00 GB on every sample. That is precisely why the
 # retired compressor cap was the only stop that ever fired here.
 #
-# The FREE-HEADROOM FLOOR is the guard for real scarcity. A run stops when
-# available memory (free + speculative + purgeable + file-backed) drops below
-# max(HOST_MEMORY_FREE_FLOOR_ABS_GB, a share of RAM). That means the same danger
-# on a 16 GB host and a 48 GB one, which a byte count never could, and it
-# matches the pre-flight gate's AVAILABLE_MIN_GB so the two guards agree.
+# The FREE-HEADROOM FLOOR is a CORROBORATED stop, and it used to be an absolute
+# one. Available memory (free + speculative + purgeable + file-backed) below
+# max(HOST_MEMORY_FREE_FLOOR_ABS_GB, a share of RAM) is now necessary and never
+# sufficient. The floor still scales with the host, so it means the same danger
+# on a 16 GB machine and a 48 GB one, and its 8 GB minimum still matches the
+# pre-flight gate's AVAILABLE_MIN_GB.
+#
+# WHY THE FLOOR NEEDED CORROBORATING. It inherited the retired cap's defect
+# through the same pool. `available` is depressed by the idle compressed pages,
+# because each fresh browser squeezes cold pages host-wide and macOS never
+# proactively decompresses. So the number reads low while the host is healthy.
+# This host read 8.79 GB available at 09:00 with nothing running, under the
+# 9.60 GB floor. A threshold a quiet idle Mac cannot clear is not measuring
+# scarcity. The run is not holding it either: over one nightly the summed
+# phys_footprint of every process the run owns went 7.41 GB to 7.99 GB.
+#
+# WHAT CORROBORATES: the kernel at warn or worse, or ANY swap in use. Both
+# measure the host rather than the pool. Swap counts from the first byte, a
+# lower bar than the 1 GB ceiling that stops on its own. Pressure counts at the
+# boundary instant, or in two window samples, which is the sustain shape the
+# floor already has. WARN ALONE IS STILL NEVER A STOP. What is new is the
+# conjunction, and sustained sub-floor headroom under warn is far rarer than
+# either half. When neither signal can be READ, the floor fails open and the
+# boundary line says the corroboration was unavailable.
+#
+# STAYS BELOW, NOT DIPS BELOW (ADR 0176). The floor folds available with MIN,
+# and the minimum of a noisy series falls as the window grows. So the boundary
+# was judging the deepest 5-second trough of 50 to 120 samples. A fresh browser
+# per chunk makes exactly such troughs. The floor needs the same sustain the
+# critical-pressure stop needs: under it at the boundary instant, or under it in
+# at least two samples of the window. A stop needs sustain AND corroboration.
+#
+# THE SWAP FOLD IS THE RIGHT DIRECTION and needs no sustain rule. It folds with
+# MAX, so a longer window can only find a HIGHER reading. Swap in use is
+# accumulated state rather than an instantaneous level. A sample over the limit
+# means the host really did swap that much out, which a later sample does not
+# undo.
 #
 # The compressor keeps ONE ceiling, the RUNAWAY BACKSTOP at 50% of RAM. It is
 # neither a danger reading nor a survivability margin. It is a net for a host
@@ -78,17 +147,23 @@
 #   LUCIDOS_E2E_SWAP_MAX_GB          swap in use that stops the run (default 1)
 #   LUCIDOS_E2E_FREE_FLOOR_MIN_GB    absolute available-memory floor (default 8)
 #   LUCIDOS_E2E_FREE_FLOOR_PCT       available floor as a share of RAM (default 20)
+#   LUCIDOS_E2E_COLLAPSE_MIN_GB      absolute collapse level (default 2)
+#   LUCIDOS_E2E_COLLAPSE_PCT         collapse level as a share of RAM (default 5)
+#   LUCIDOS_E2E_CRITICAL_SAMPLES     confirm samples a sustained critical needs (default 8)
+#   LUCIDOS_E2E_CRITICAL_SECS        seconds between confirm samples (default 5)
 #   LUCIDOS_E2E_COMPRESSOR_MAX_PCT   runaway backstop as a share of RAM (default 50)
 #   LUCIDOS_E2E_COMPRESSOR_MAX_GB    runaway backstop absolute; when set it wins
 #   LUCIDOS_E2E_MEM_POLL_SECS        sampler tick in seconds (default 5)
 #
-# Four stops, in order: kernel pressure critical, swap distress, the headroom
-# floor, the runaway backstop. The available floor is max(the MIN_GB, the PCT
-# share of RAM): 9.6 GB on a 48 GB host, 8 GB on a 16 GB one. The 8 GB minimum
-# matches the pre-flight gate's AVAILABLE_MIN_GB, so the running guard never
-# continues on a host the gate would refuse to start. An explicit
-# LUCIDOS_E2E_COMPRESSOR_MAX_GB replaces its share, because an operator naming a
-# number means that number.
+# Four stops, in order: kernel pressure critical, swap distress, the corroborated
+# headroom floor, the runaway backstop. The available floor is max(the MIN_GB,
+# the PCT share of RAM): 9.6 GB on a 48 GB host, 8 GB on a 16 GB one. The
+# collapse level is the same shape one order down: 2.40 GB on a 48 GB host,
+# 2 GB on a 16 GB one. The 8 GB minimum matches the pre-flight gate's
+# AVAILABLE_MIN_GB, and the gate carries the same corroboration rule, the same
+# collapse level and the same confirm window, so the two never disagree. An
+# explicit LUCIDOS_E2E_COMPRESSOR_MAX_GB replaces its share, because an operator
+# naming a number means that number.
 #
 # LUCIDOS_E2E_COMPRESSOR_CAP_GB and _CAP_PCT are GONE, not renamed. A caller
 # still setting one is passing a knob nothing reads, so the start report names
@@ -107,13 +182,28 @@
 # 130, so 71 can never collide with a Playwright code.
 HOST_MEMORY_STOP_EXIT=71
 
-# The free-headroom floor. A run stops when available memory drops below
-# max(HOST_MEMORY_FREE_FLOOR_ABS_GB, the RAM share). The 8 GB minimum matches the
-# pre-flight gate's AVAILABLE_MIN_GB so the two guards agree. The header says why
-# free memory predicts a freeze, why the floor is set conservatively rather than
-# calibrated, and where the flat compressor cap these replace went wrong.
+# The free-headroom floor. A run stops when available memory stays below
+# max(HOST_MEMORY_FREE_FLOOR_ABS_GB, the RAM share) AND a second signal agrees.
+# The 8 GB minimum matches the pre-flight gate's AVAILABLE_MIN_GB so the two
+# guards agree. The header says why a bare available reading is not scarcity,
+# what corroborates it, and where the flat compressor cap went wrong.
 HOST_MEMORY_FREE_FLOOR_ABS_GB=8
 HOST_MEMORY_FREE_FLOOR_PCT=20
+
+# The COLLAPSE level, the headroom that critical pressure needs beside it to stop
+# the run at once. Same max(absolute, share of RAM) shape as the floor, one order
+# down: 2.40 GB on a 48 GB host. The freeze read 0.04 GB free and the lowest
+# reading an idle host has produced is 8.79 GB, so the level sits between the two
+# with room on both sides. The pre-flight gate carries the same pair.
+HOST_MEMORY_COLLAPSE_ABS_GB=2
+HOST_MEMORY_COLLAPSE_PCT=5
+
+# The sustain window a critical reading must survive when nothing corroborates
+# it. Eight samples five seconds apart span 40 seconds. The confirm exits on the
+# first sample that is not critical, so these are a ceiling rather than a cost.
+# The pre-flight gate carries the same pair.
+HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES=8
+HOST_MEMORY_CRITICAL_CONFIRM_SECS=5
 
 # Kernel memory-pressure levels, as macOS reports them in
 # kern.memorystatus_vm_pressure_level. Only CRITICAL stops a run; the header says
@@ -226,6 +316,17 @@ _host_mem_read_pressure_level() {
     esac
 }
 
+# True when the level in $1 is warn or worse, which is what corroborates the
+# available floor. EXACT matches only. A garbage value, an unknown one and an
+# unreadable one all corroborate nothing, because a reading nobody can interpret
+# is not evidence that the host is in trouble.
+_host_mem_pressure_is_warn_or_worse() {
+    case "$1" in
+        "$HOST_MEMORY_PRESSURE_WARN" | "$HOST_MEMORY_PRESSURE_CRITICAL") return 0 ;;
+    esac
+    return 1
+}
+
 # The level as the word a human reads at 06:30. An unknown value is named as
 # unknown rather than guessed at, because a wrong word here is how a log lies.
 _host_mem_pressure_word() {
@@ -272,18 +373,18 @@ _host_mem_swap_ceiling_gb() {
     printf '%s' "$max"
 }
 
-# The available-memory floor, in GB. A run stops when available memory drops below
-# it. It is max(the MIN_GB, the PCT share of RAM), so it scales with the host: 9.60
-# on a 48 GB machine, 8.00 on a 16 GB one. The MIN_GB alone applies when physical
-# memory is unreadable, because a floor in bytes needs no RAM total to compute, and
-# a floor is the one threshold that must not lapse just because the share cannot.
-_host_mem_available_floor_gb() {
-    local abs="${LUCIDOS_E2E_FREE_FLOOR_MIN_GB:-$HOST_MEMORY_FREE_FLOOR_ABS_GB}"
-    _host_mem_is_number "$abs" || abs="$HOST_MEMORY_FREE_FLOOR_ABS_GB"
-    local pct="${LUCIDOS_E2E_FREE_FLOOR_PCT:-$HOST_MEMORY_FREE_FLOOR_PCT}"
+# max(an absolute GB level, a share of physical RAM), which is the shape BOTH the
+# available floor and the collapse level take. $1 and $2 are the resolved
+# override values, $3 and $4 their defaults. An unusable override falls back to
+# its default, and an unreadable RAM total leaves the absolute standing: a level
+# in bytes needs no RAM total to compute, and neither level may lapse just
+# because the share cannot be worked out.
+_host_mem_scaled_level_gb() {
+    local abs="$1" pct="$2" abs_default="$3" pct_default="$4"
+    _host_mem_is_number "$abs" || abs="$abs_default"
     if ! _host_mem_is_number "$pct" ||
         ! awk -v p="$pct" 'BEGIN { exit (p + 0 > 0 && p + 0 <= 100) ? 0 : 1 }'; then
-        pct="$HOST_MEMORY_FREE_FLOOR_PCT"
+        pct="$pct_default"
     fi
     local phys
     phys="$(_host_mem_read_physical_gb)"
@@ -293,6 +394,27 @@ _host_mem_available_floor_gb() {
     fi
     awk -v a="$abs" -v p="$phys" -v q="$pct" \
         'BEGIN { share = p * q / 100; printf "%.2f", (share > a) ? share : a }'
+}
+
+# The available-memory floor, in GB. A run stops when available memory stays below
+# it AND something corroborates. It scales with the host: 9.60 on a 48 GB machine,
+# 8.00 on a 16 GB one.
+_host_mem_available_floor_gb() {
+    _host_mem_scaled_level_gb \
+        "${LUCIDOS_E2E_FREE_FLOOR_MIN_GB:-$HOST_MEMORY_FREE_FLOOR_ABS_GB}" \
+        "${LUCIDOS_E2E_FREE_FLOOR_PCT:-$HOST_MEMORY_FREE_FLOOR_PCT}" \
+        "$HOST_MEMORY_FREE_FLOOR_ABS_GB" "$HOST_MEMORY_FREE_FLOOR_PCT"
+}
+
+# The collapse level, in GB. Critical pressure with available memory at or under
+# it stops the run at once, with no sustain window. 2.40 on a 48 GB machine,
+# 2.00 on a 16 GB one. It sits between the 0.04 GB the freeze read and the
+# 8.79 GB an idle host has produced, so neither end is a coincidence.
+_host_mem_collapse_level_gb() {
+    _host_mem_scaled_level_gb \
+        "${LUCIDOS_E2E_COLLAPSE_MIN_GB:-$HOST_MEMORY_COLLAPSE_ABS_GB}" \
+        "${LUCIDOS_E2E_COLLAPSE_PCT:-$HOST_MEMORY_COLLAPSE_PCT}" \
+        "$HOST_MEMORY_COLLAPSE_ABS_GB" "$HOST_MEMORY_COLLAPSE_PCT"
 }
 
 # The compressor RUNAWAY BACKSTOP, in GB. An explicit LUCIDOS_E2E_COMPRESSOR_MAX_GB
@@ -319,6 +441,66 @@ _host_mem_compressor_ceiling_gb() {
     phys="$(_host_mem_read_physical_gb)"
     [ -n "$phys" ] || return 0
     awk -v p="$phys" -v q="$pct" 'BEGIN { printf "%.2f", p * q / 100 }'
+}
+
+# ── the critical-pressure sustain window ────────────────────────────────
+# How many samples a critical reading must survive, and the seconds between
+# them. Eight at five is a 40 s window. Each has a floor of its own: one sample
+# is not a window, and a zero interval would take every reading of the same
+# latched level in the same instant, which is the false positive this exists to
+# remove. An unusable override falls back rather than disarming the rule.
+_host_mem_critical_confirm_samples() {
+    local n="${LUCIDOS_E2E_CRITICAL_SAMPLES:-$HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES}"
+    case "$n" in
+        '' | *[!0-9]*) n="$HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES" ;;
+        *) [ "$((10#$n))" -ge 2 ] || n="$HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES" ;;
+    esac
+    printf '%s' "$((10#$n))"
+}
+
+_host_mem_critical_confirm_secs() {
+    local s="${LUCIDOS_E2E_CRITICAL_SECS:-$HOST_MEMORY_CRITICAL_CONFIRM_SECS}"
+    if ! _host_mem_is_number "$s" ||
+        ! awk -v v="$s" 'BEGIN { exit (v + 0 >= 1) ? 0 : 1 }'; then
+        s="$HOST_MEMORY_CRITICAL_CONFIRM_SECS"
+    fi
+    printf '%s' "$s"
+}
+
+# The confirm loop's wait, as its own seam so a test can drive the loop without
+# spending 40 seconds on it. Production has one behaviour and one caller. Same
+# posture as the HOST_*_OVERRIDE reader seams above.
+_host_mem_confirm_wait() {
+    sleep "$1"
+}
+
+# Does CRITICAL pressure still stand after the sustain window? Re-reads the level
+# up to `samples` times, `secs` apart, and answers 0 only when EVERY read was
+# critical. It returns on the first read that is not, so a host whose level
+# oscillates costs a few seconds rather than the whole window. An unreadable
+# level ends the confirm without a stop, the fail-open posture every reader here
+# has: a host nobody can judge is never stopped.
+#
+# Echoes "<taken> <of> <span_secs> <word>", where <word> names the level that
+# ended it. The caller prints that whichever way the answer went, so a 06:30
+# reader sees how long the kernel actually held critical.
+_host_mem_critical_persists() {
+    local total secs taken=0 level word=critical rc=0
+    total="$(_host_mem_critical_confirm_samples)"
+    secs="$(_host_mem_critical_confirm_secs)"
+    while [ "$taken" -lt "$total" ]; do
+        _host_mem_confirm_wait "$secs"
+        level="$(_host_mem_read_pressure_level)"
+        taken=$((taken + 1))
+        if [ "$level" != "$HOST_MEMORY_PRESSURE_CRITICAL" ]; then
+            word="$(_host_mem_pressure_word "$level")"
+            rc=1
+            break
+        fi
+    done
+    printf '%s %s %s %s' "$taken" "$total" \
+        "$(awk -v n="$taken" -v s="$secs" 'BEGIN { printf "%g", n * s }')" "$word"
+    return "$rc"
 }
 
 # True when $1 is strictly greater than $2. Float math goes through awk, never
@@ -473,16 +655,23 @@ stop_host_memory_sampler() {
 }
 
 # Fold every sample since the previous boundary into one worst-case reading, and
-# echo "<level> <compressor> <available> <swap> <criticals> <count>". Worst means:
-# the HIGHEST pressure level, the HIGHEST compressor, the LOWEST available, the
-# HIGHEST swap. A dimension no sample could read comes back as "-" rather than
-# empty, because an empty FIELD would shift every field after it when the caller
-# splits the line. Echoes nothing when there are no samples at all.
+# echo "<level> <compressor> <available> <swap> <criticals> <warns> <under-floor>
+# <count>". Worst means: the HIGHEST pressure level, the HIGHEST compressor, the
+# LOWEST available, the HIGHEST swap. A dimension no sample could read comes back
+# as "-" rather than empty, because an empty FIELD would shift every field after
+# it when the caller splits the line. Echoes nothing with no samples at all.
 #
-# `<criticals>` is how many samples read CRITICAL pressure, which the caller
-# needs separately from the max: one 5-second blip is not the freeze signature,
-# and treating it as one would reintroduce the false stop this guard exists to
-# remove.
+# THE THREE COUNTS ARE WHY A WORST-CASE FOLD IS NOT A VERDICT ON ITS OWN. The
+# caller needs each separately from its dimension's extreme. `<criticals>` is how
+# many samples read CRITICAL pressure, and `<warns>` how many read WARN or worse,
+# which is the floor's corroboration. `<under-floor>` is how many read available
+# memory strictly under $1, the caller's floor, and it is 0 when no usable floor
+# was passed. One 5-second blip on any of them is not the freeze signature, and
+# treating it as one is the false stop this guard exists to remove.
+#
+# The available fold is the one that needs this most. It folds with MIN, so its
+# value is the deepest instantaneous trough of the window and gets lower the
+# longer the chunk ran. The count does not move with window length.
 #
 # A SHORT RECORD IS DISCARDED WHOLE. A truncated final line leaves `$3` empty,
 # which is not the "-" sentinel, and `"" + 0` is 0. That zero can never be
@@ -501,26 +690,33 @@ stop_host_memory_sampler() {
 # fires and the dimension comes back "-" as if nothing could read it. The
 # pressure level is the one exception: 0 is not a level macOS reports.
 _host_mem_window_worst() {
+    local floor_gb="${1:-}"
+    _host_mem_is_number "$floor_gb" || floor_gb=""
     local file
     file="$(_host_mem_samples_file)"
     [ -s "$file" ] || return 0
     local window
-    window="$(awk -v crit="$HOST_MEMORY_PRESSURE_CRITICAL" '
+    window="$(awk -v crit="$HOST_MEMORY_PRESSURE_CRITICAL" -v warn="$HOST_MEMORY_PRESSURE_WARN" \
+        -v floor_gb="$floor_gb" '
         NF < 4 { next }
         { n++ }
         $1 != "-" && ($1 + 0) > lvl { lvl = $1 + 0 }
         $1 != "-" && ($1 + 0) == crit + 0 { ncrit++ }
+        $1 != "-" && (($1 + 0) == warn + 0 || ($1 + 0) == crit + 0) { nwarn++ }
         $2 != "-" && (comp_seen == 0 || ($2 + 0) > comp) { comp = $2 + 0; comp_seen = 1 }
         $3 != "-" && (avail_seen == 0 || ($3 + 0) < avail) { avail = $3 + 0; avail_seen = 1 }
+        $3 != "-" && floor_gb != "" && ($3 + 0) < (floor_gb + 0) { nunder++ }
         $4 != "-" && (swap_seen == 0 || ($4 + 0) > swap) { swap = $4 + 0; swap_seen = 1 }
         END {
             if (n == 0) exit 0
-            printf "%s %s %s %s %d %d\n",
+            printf "%s %s %s %s %d %d %d %d\n",
                 (lvl > 0 ? sprintf("%d", lvl) : "-"),
                 (comp_seen ? sprintf("%.2f", comp) : "-"),
                 (avail_seen ? sprintf("%.2f", avail) : "-"),
                 (swap_seen ? sprintf("%.2f", swap) : "-"),
                 ncrit + 0,
+                nwarn + 0,
+                nunder + 0,
                 n
         }' "$file")"
     : > "$file" 2>/dev/null || true
@@ -799,7 +995,7 @@ EOF
 # where it stopped.
 check_host_memory_at_boundary() {
     local where="$1"
-    local gb avail swap level level_now gb_now ceiling floor swap_max
+    local gb avail swap level level_now gb_now avail_now ceiling floor swap_max
     level="$(_host_mem_read_pressure_level)"
     gb="$(_host_mem_read_compressor_gb)"
     avail="$(_host_mem_read_available_gb)"
@@ -807,22 +1003,25 @@ check_host_memory_at_boundary() {
     ceiling="$(_host_mem_compressor_ceiling_gb)"
     floor="$(_host_mem_available_floor_gb)"
     swap_max="$(_host_mem_swap_ceiling_gb)"
-    # The readings AT the boundary, kept before the fold overwrites them. Two
+    # The readings AT the boundary, kept before the fold overwrites them. Three
     # things need the instant rather than the window: the sustained-critical rule
-    # below, and the attribution block, whose per-process footprints are
-    # instantaneous and cannot honestly be compared against a mid-chunk peak.
+    # below, the sustained-floor rule beside it, and the attribution block. That
+    # block's per-process footprints are instantaneous, so a mid-chunk peak
+    # cannot honestly be compared against them.
     level_now="$level"
     gb_now="$gb"
+    avail_now="$avail"
 
     # Fold the sampler's window over the instantaneous reading, worst wins per
     # dimension. Folding rather than replacing is what makes the sampler purely
     # additive: the boundary is never blinder than a direct read, and the window
     # can only make it stricter. `<<EOF` rather than `<<<`, which bash 3.2 has
     # but the repo's other libs avoid for the same portability reason.
-    local window w_level w_gb w_avail w_swap w_crit w_n samples="" crit_seen=0
-    window="$(_host_mem_window_worst)"
+    local window w_level w_gb w_avail w_swap w_crit w_warn w_under w_n
+    local samples="" crit_seen=0 warn_seen=0 under_seen=0
+    window="$(_host_mem_window_worst "$floor")"
     if [ -n "$window" ]; then
-        read -r w_level w_gb w_avail w_swap w_crit w_n <<EOF
+        read -r w_level w_gb w_avail w_swap w_crit w_warn w_under w_n <<EOF
 $window
 EOF
         level="$(_host_mem_worse_of max "$level" "$w_level")"
@@ -832,6 +1031,10 @@ EOF
         samples="$w_n"
         case "$w_crit" in '' | *[!0-9]*) w_crit=0 ;; esac
         crit_seen="$w_crit"
+        case "$w_warn" in '' | *[!0-9]*) w_warn=0 ;; esac
+        warn_seen="$w_warn"
+        case "$w_under" in '' | *[!0-9]*) w_under=0 ;; esac
+        under_seen="$w_under"
     fi
 
     if [ -z "$gb" ] && [ -z "$avail" ] && [ -z "$swap" ] && [ -z "$level" ]; then
@@ -852,28 +1055,87 @@ EOF
     # which one fired, because this line is what somebody reads at 06:30 to decide
     # whether the Mac was in trouble or the run merely got greedy.
     #
-    # Kernel pressure first: it is the kernel's own verdict and the only reading
-    # that distinguished the recorded freeze from a healthy night. Swap second,
+    # Kernel pressure first: it is the kernel's own verdict, and the reading that
+    # distinguished the recorded freeze from a healthy night. Swap second,
     # because it means compression stopped keeping up. Available memory third,
     # because it is the headroom a freeze exhausts. The runaway backstop last,
     # and it is not a danger reading.
-    # CRITICAL stops, but a SUSTAINED critical, not a single tick. The window is
-    # sampled every 5 s while the evidence that critical is the freeze signature
-    # comes from a ten-minute host series, so one isolated sample is below the
-    # resolution anything was judged at. Two arms: critical still standing at the
-    # boundary, or critical seen more than once during the chunk. A genuinely
-    # critical host satisfies both; a blip satisfies neither.
-    if { [ -n "$level_now" ] && [ "$level_now" = "$HOST_MEMORY_PRESSURE_CRITICAL" ]; } ||
-        [ "${crit_seen:-0}" -ge 2 ]; then
-        HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
-        MEMORY_STOP_DETAIL="At $where the kernel reported CRITICAL memory pressure, with available ${avail:-?} GB and swap ${swap:-?} GB. That is the signature of the one freeze this host has had."
-        echo ""
-        echo "[e2e-mem] STOP: the kernel reports CRITICAL memory pressure."
-        echo "[e2e-mem] This is the KERNEL'S OWN VERDICT, not a proxy. It is the reading"
-        echo "[e2e-mem] that distinguished the one recorded freeze from every healthy"
-        echo "[e2e-mem] night, where the compressor size did not. The run must stop at"
-        echo "[e2e-mem] this boundary."
-        return 1
+
+    # CRITICAL NEEDS A SECOND FACT BEFORE IT IS BELIEVED, and the header carries
+    # the evidence: an idle host read critical in six of ten samples while
+    # available memory was flat at 11 GB and swap was zero. Three arms, cheapest
+    # first, so a host in real trouble never waits out a window it does not need.
+    local crit_now="" collapse confirm=""
+    if [ -n "$level_now" ] && [ "$level_now" = "$HOST_MEMORY_PRESSURE_CRITICAL" ]; then
+        crit_now=1
+    fi
+    if [ -n "$crit_now" ] || [ "${crit_seen:-0}" -ge 1 ]; then
+        # Resolved here rather than beside the floor and the ceiling above,
+        # because only this branch reads it and it costs a sysctl. Most
+        # boundaries never see a critical reading at all.
+        collapse="$(_host_mem_collapse_level_gb)"
+        # 1. The freeze signature, folded over the window, because a freeze
+        # counts whenever in the chunk it happened. Unconditional and immediate.
+        if [ -n "$avail" ] && [ -n "$collapse" ] && ! _host_mem_over "$avail" "$collapse"; then
+            HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
+            MEMORY_STOP_DETAIL="At $where the kernel reported CRITICAL memory pressure with available memory at $avail GB, at or under the $collapse GB collapse level. That is the signature of the one freeze this host has had."
+            echo ""
+            echo "[e2e-mem] STOP: the kernel reports CRITICAL memory pressure and available"
+            echo "[e2e-mem] memory is $avail GB, at or under the $collapse GB collapse level."
+            echo "[e2e-mem] This is the FREEZE SIGNATURE, and it is unconditional. The one"
+            echo "[e2e-mem] recorded freeze on this host read critical pressure with 0.04 GB"
+            echo "[e2e-mem] free. Critical alone oscillates here while memory is flat, so it"
+            echo "[e2e-mem] waits out a sustain window. Critical with the headroom gone does"
+            echo "[e2e-mem] not wait. The run must stop at this boundary."
+            return 1
+        fi
+        # 2. Swap corroborates from the first byte and needs no sustain rule: it
+        # is accumulated state rather than an instantaneous level.
+        if [ -n "$swap" ] && _host_mem_over "$swap" 0; then
+            HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
+            MEMORY_STOP_DETAIL="At $where the kernel reported CRITICAL memory pressure with $swap GB of swap in use. Two instruments agreed the host was in trouble."
+            echo ""
+            echo "[e2e-mem] STOP: the kernel reports CRITICAL memory pressure and $swap GB of"
+            echo "[e2e-mem] swap is in use."
+            echo "[e2e-mem] This is CORROBORATED CRITICAL PRESSURE. Swap means compression"
+            echo "[e2e-mem] stopped keeping up, so a second instrument agrees with the kernel."
+            echo "[e2e-mem] It is accumulated state rather than an instantaneous level, so it"
+            echo "[e2e-mem] needs no sustain window. The run must stop at this boundary."
+            return 1
+        fi
+        # 3. Nothing corroborates, so the level itself has to hold. Only a
+        # critical STANDING at the boundary is worth confirming: one that cleared
+        # during the chunk leaves nothing live to re-sample.
+        if [ -n "$crit_now" ]; then
+            # The confirm's answer is its EXIT STATUS, and its line is the
+            # evidence both branches print. So the status is captured first and
+            # the line parsed once, rather than in each branch.
+            local c_taken c_of c_span c_word held=""
+            if confirm="$(_host_mem_critical_persists)"; then
+                held=1
+            fi
+            read -r c_taken c_of c_span c_word <<EOF
+$confirm
+EOF
+            if [ -n "$held" ]; then
+                HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
+                MEMORY_STOP_DETAIL="At $where the kernel reported CRITICAL memory pressure and held it through all $c_of confirm samples over ${c_span}s, with available ${avail:-?} GB and swap ${swap:-?} GB."
+                echo ""
+                echo "[e2e-mem] STOP: the kernel reports CRITICAL memory pressure, and it HELD."
+                echo "[e2e-mem] This is the KERNEL'S OWN VERDICT, not a proxy, and it was"
+                echo "[e2e-mem] re-sampled before it was believed: $c_taken of $c_of samples over"
+                echo "[e2e-mem] ${c_span}s all read critical. A single reading oscillates on this"
+                echo "[e2e-mem] host while memory is flat, so only a sustained one is evidence."
+                echo "[e2e-mem] The run must stop at this boundary."
+                return 1
+            fi
+            echo "[e2e-mem] note: the kernel read CRITICAL at this boundary and did not hold it. Sample $c_taken of $c_of, ${c_span}s in, read $c_word."
+            echo "[e2e-mem] Recorded, not a stop: an instantaneous critical reading is a transient edge notification on this host, seen in 6 of 10 samples of an idle machine. Available ${avail:-?} GB, swap ${swap:-?} GB."
+            echo "[e2e-mem] A stop needs critical to persist through the whole window, or available at or under ${collapse:-no} GB, or swap in use."
+        else
+            echo "[e2e-mem] note: the kernel read CRITICAL in ${crit_seen:-0} of ${samples:-1} samples during the chunk, and read $(_host_mem_pressure_word "$level_now") at the boundary itself."
+            echo "[e2e-mem] Recorded, not a stop: the excursion had cleared by the boundary, so there was nothing left to confirm. Available ${avail:-?} GB, swap ${swap:-?} GB."
+        fi
     fi
 
     # WARN is stated and not acted on. It has occurred 92 times in three months of
@@ -894,16 +1156,61 @@ EOF
         return 1
     fi
 
+    # THE FLOOR NEEDS SUSTAIN AND CORROBORATION, and they are different claims.
+    #
+    # SUSTAIN says the dip was not a 5-second trough. Available is the one
+    # dimension the window folds with MIN, so the folded value is the deepest
+    # instantaneous trough and it falls further the longer the chunk ran. A fresh
+    # browser per chunk produces exactly such troughs as normal operation. Same
+    # two arms as the pressure rule: still under the floor at the boundary itself,
+    # or under it in at least two samples.
+    #
+    # CORROBORATION says something other than the available number agrees the
+    # host is in trouble. A low reading alone measures the idle compressed-page
+    # pool, which a quiet host also produces, so it is necessary and never
+    # sufficient. The header carries the evidence.
+    #
+    # A survived breach always logs the same measurement line, then one reason
+    # line per missing half. So a 06:30 reader gets the window minimum, the
+    # sample count and the boundary reading whichever half declined the stop,
+    # and reads WHICH one declined right underneath them.
     if [ -n "$avail" ] && [ -n "$floor" ] && _host_mem_over "$floor" "$avail"; then
-        HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
-        MEMORY_STOP_DETAIL="At $where available memory was $avail GB, under the $floor GB floor. The host was genuinely low on memory."
-        echo ""
-        echo "[e2e-mem] STOP: available memory $avail GB is under the $floor GB floor."
-        echo "[e2e-mem] This is REAL SCARCITY. Free, speculative, purgeable and file-backed"
-        echo "[e2e-mem] pages are the headroom a new allocation draws on, and a freeze is what"
-        echo "[e2e-mem] happens when they run out. The floor scales with this host's RAM and"
-        echo "[e2e-mem] matches the pre-flight gate, so it means the same danger on any machine."
-        return 1
+        local sustained="" corroborated_by="" swap_word="unreadable"
+        [ -n "$swap" ] && swap_word="$swap GB"
+        if { [ -n "$avail_now" ] && _host_mem_over "$floor" "$avail_now"; } ||
+            [ "${under_seen:-0}" -ge 2 ]; then
+            sustained=1
+        fi
+        # Swap from the first byte, which is a lower bar than the ceiling that
+        # stops on its own. It folds with max, so no sustain rule applies.
+        if [ -n "$swap" ] && _host_mem_over "$swap" 0; then
+            corroborated_by="$swap GB of swap in use"
+        fi
+        if _host_mem_pressure_is_warn_or_worse "$level_now"; then
+            corroborated_by="${corroborated_by:+$corroborated_by and }the kernel at $(_host_mem_pressure_word "$level_now") pressure"
+        elif [ "${warn_seen:-0}" -ge 2 ]; then
+            corroborated_by="${corroborated_by:+$corroborated_by and }the kernel at warn or worse in $warn_seen of ${samples:-1} samples"
+        fi
+        if [ -n "$sustained" ] && [ -n "$corroborated_by" ]; then
+            HOST_MEMORY_STOP_COMPRESSOR_GB="$gb"
+            MEMORY_STOP_DETAIL="At $where available memory was $avail GB, under the $floor GB floor, corroborated by $corroborated_by. The host was genuinely low on memory."
+            echo ""
+            echo "[e2e-mem] STOP: available memory $avail GB is under the $floor GB floor, corroborated by $corroborated_by."
+            echo "[e2e-mem] This is CORROBORATED SCARCITY. Free, speculative, purgeable and"
+            echo "[e2e-mem] file-backed pages are the headroom a new allocation draws on. That"
+            echo "[e2e-mem] reading alone also falls on an idle host, so it is not scarcity by"
+            echo "[e2e-mem] itself. Here it is sustained AND a signal that measures the host"
+            echo "[e2e-mem] rather than the compressed-page pool agrees. The run must stop."
+            return 1
+        fi
+        echo "[e2e-mem] note: available dipped to $avail GB, under the $floor GB floor, in ${under_seen:-0} of ${samples:-1} samples. It read ${avail_now:-?} GB at the boundary itself."
+        if [ -z "$sustained" ]; then
+            echo "[e2e-mem] Recorded, not a stop: it is not sustained. The floor needs the boundary reading, or two samples under it. One 5-second trough is a browser launch, not host scarcity."
+        fi
+        if [ -z "$corroborated_by" ]; then
+            echo "[e2e-mem] Recorded, not a stop: it is uncorroborated. Pressure $(_host_mem_pressure_word "$level_now") at the boundary, warn or worse in ${warn_seen:-0} of ${samples:-1} samples, swap $swap_word."
+            echo "[e2e-mem] A low available reading on its own measures the idle compressed-page pool, which an idle host also produces. The floor needs the kernel at warn or worse, or swap in use."
+        fi
     fi
 
     if [ -n "$gb" ] && [ -n "$ceiling" ] && _host_mem_over "$gb" "$ceiling"; then
@@ -935,14 +1242,17 @@ EOF
 # record the compressor baseline. Stating the thresholds here is what lets an
 # unattended log be read without also knowing the machine's RAM.
 report_host_memory_start() {
-    local gb avail swap level ceiling floor swap_max
+    local gb avail swap level ceiling floor swap_max collapse c_of c_secs
     level="$(_host_mem_read_pressure_level)"
     gb="$(_host_mem_read_compressor_gb)"
     avail="$(_host_mem_read_available_gb)"
     swap="$(_host_mem_read_swap_used_gb)"
     ceiling="$(_host_mem_compressor_ceiling_gb)"
     floor="$(_host_mem_available_floor_gb)"
+    collapse="$(_host_mem_collapse_level_gb)"
     swap_max="$(_host_mem_swap_ceiling_gb)"
+    c_of="$(_host_mem_critical_confirm_samples)"
+    c_secs="$(_host_mem_critical_confirm_secs)"
     HOST_MEMORY_BASELINE_GB="$gb"
 
     if [ -z "$gb" ]; then
@@ -950,7 +1260,9 @@ report_host_memory_start() {
     else
         echo "[e2e-mem] browser phase start: pressure $(_host_mem_pressure_word "$level"), compressor $gb GB, available ${avail:-?} GB, swap ${swap:-?} GB"
     fi
-    echo "[e2e-mem] stops at: kernel pressure critical (the freeze signature), swap over $swap_max GB (distress), available under ${floor:-no} GB (scarcity), or compressor over ${ceiling:-no} GB (runaway backstop)."
+    echo "[e2e-mem] stops at: kernel pressure critical (the freeze signature), swap over $swap_max GB (distress), available under ${floor:-no} GB WITH a corroborating signal (corroborated scarcity), or compressor over ${ceiling:-no} GB (runaway backstop)."
+    echo "[e2e-mem] Critical pressure stops the run when it PERSISTS through $c_of re-samples ${c_secs}s apart, or with available at or under ${collapse:-no} GB, or with any swap in use. One critical reading on its own is recorded and never stops the run: it oscillates here while memory is flat."
+    echo "[e2e-mem] The corroborating signals are the kernel at warn or worse, or any swap in use. Available under the floor on its own is recorded and never stops the run."
     echo "[e2e-mem] The compressor has no survivability cap: it measures squeezed idle pages host-wide, not what this run holds."
 
     # A retired knob that is still set would otherwise leave the run looking
@@ -978,4 +1290,7 @@ report_memory_stop() {
     echo "[e2e-mem] Free memory on the host and rerun. Chunk size cannot help:"
     echo "[e2e-mem] LUCIDOS_E2E_WEBKIT_CHUNK bounds the per-chunk delta, not the total."
     echo "[e2e-mem] To finish only what was lost, rerun with LUCIDOS_E2E_WEBKIT_CHUNKS=<first>-<last>."
+    echo "[e2e-mem] Add LUCIDOS_E2E_WEBKIT_PHASE=nav when the loss is in nav: the"
+    echo "[e2e-mem] range narrows nav only, and the CC phase it leaves whole owns"
+    echo "[e2e-mem] 93 to 97 percent of the memory a discharge costs."
 }

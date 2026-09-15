@@ -189,15 +189,13 @@ impl LucidosEngine {
                                 change.id,
                                 thread_id
                             );
+                            // Log only: `apply_change` announces this failure
+                            // itself, and a second emit draws the same card
+                            // twice. The two errors it leaves unannounced mean
+                            // the row it was just handed no longer reads, so
+                            // the spinner is not the problem then.
                             if let Err(e) = self.apply_change(change.id, actor.clone()).await {
                                 log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
-                                self.emit_apply_failed(
-                                    thread_id,
-                                    change.id,
-                                    &e.to_string(),
-                                    actor.clone(),
-                                )
-                                .await;
                             }
                         }
                         return Ok(());
@@ -242,15 +240,9 @@ impl LucidosEngine {
                             change.id,
                             thread_id
                         );
+                        // Log only, for the same reason as the fast path above.
                         if let Err(e) = self.apply_change(change.id, actor.clone()).await {
                             log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
-                            self.emit_apply_failed(
-                                thread_id,
-                                change.id,
-                                &e.to_string(),
-                                actor.clone(),
-                            )
-                            .await;
                         }
                     }
                     return Ok(());

@@ -160,10 +160,9 @@ pub(crate) fn collect_tool_pairs_chronological(events: &[EventRow]) -> Vec<Resum
     slots
 }
 
-/// Partition resume pairs into (pinned, tail) — the shared step both the
-/// resume-block builder and the skip-set builder need. Pinned pairs survive
-/// regardless of N (see [`PINNED_TOOL_NAMES`]); tail is the last N non-pinned
-/// pairs in chronological order.
+/// Partition resume pairs into (pinned, tail) for the resume-block builder.
+/// Pinned pairs survive regardless of N (see [`PINNED_TOOL_NAMES`]); tail is
+/// the last N non-pinned pairs in chronological order.
 fn select_pinned_and_tail(
     pairs: &[ResumeToolPair],
     n: usize,

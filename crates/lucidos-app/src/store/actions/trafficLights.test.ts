@@ -31,6 +31,7 @@ vi.mock('../../utils/tauri', () => ({
 
 import {
   measureHeaderBarHeight, pushTrafficLightOffset, resetTrafficLightPush,
+  TITLEBAR_BAND_SELECTOR,
 } from './trafficLights';
 
 /** The header's bottom edge below the viewport's top, which under the overlay
@@ -57,7 +58,7 @@ beforeEach(() => {
   headerBottom = 48;
   headerOffsetHeight = 20;
   vi.spyOn(document, 'querySelector').mockImplementation((selector: string) =>
-    selector === '.app-header' && headerBottom !== null
+    selector === TITLEBAR_BAND_SELECTOR && headerBottom !== null
       ? ({
         getBoundingClientRect: () => ({ bottom: headerBottom }),
         offsetHeight: headerOffsetHeight,
@@ -84,9 +85,9 @@ describe('measureHeaderBarHeight', () => {
     expect(measureHeaderBarHeight()).toBe(72);
   });
 
-  it('answers null when there is no header mounted to measure', () => {
-    // The workspace picker is its own full-window surface with no .app-header,
-    // and a push with nothing measured must not invent a bar.
+  it('answers null when no surface has declared a band to measure', () => {
+    // A push with nothing measured must not invent a bar. The pre-gateway boot
+    // splash is the surface that legitimately declares none.
     mountHeader(null);
     expect(measureHeaderBarHeight()).toBeNull();
   });
@@ -243,5 +244,34 @@ describe('the push is wired into every apply that can move the bar', () => {
     const body = bodyOf('applyUiScale');
     expect(body.indexOf('pushTrafficLightOffset()'))
       .toBeGreaterThan(body.indexOf('reapplyStyleOverrides()'));
+  });
+});
+
+describe('every surface with native lights on it declares its own band', () => {
+  // The other half of the contract, and a source scan for the same reason: what
+  // makes the placement right is that the surface STATES its bar rather than
+  // inheriting one. The picker mounts no app shell. Keyed on `.app-header`, the
+  // measurement therefore found nothing there, so the picker pushed nothing and
+  // wore whichever bar the last app page had persisted.
+  const here: string = dirname(fileURLToPath(import.meta.url));
+  const read = (path: string): string =>
+    readFileSync(resolve(here, '../../components', path), 'utf-8');
+
+  const surfaces = {
+    'the app shell header': 'layout/AppHeader.tsx',
+    'the workspace picker': 'picker/WorkspacePicker.tsx',
+  };
+
+  for (const [what, path] of Object.entries(surfaces)) {
+    it(`${what} carries data-titlebar-band`, () => {
+      expect(read(path)).toContain('data-titlebar-band');
+    });
+  }
+
+  it('the picker pushes its band itself, since no preferences load will', () => {
+    // `pushTrafficLightOffset` otherwise rides `applyUiScale`, which only the
+    // app shell's `loadPreferences` reaches. The picker renders instead of
+    // `<App/>`, so nothing there would ever measure.
+    expect(read(surfaces['the workspace picker'])).toContain('pushTrafficLightOffset()');
   });
 });

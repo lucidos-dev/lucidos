@@ -5,9 +5,9 @@
  *  right-aligned user bubble, it says something to a screen reader, and no
  *  panel is drawn under it.
  *
- *  The third is a source scan. The decision lives inside `ChatExchange`, and
- *  there is no jsdom here to mount it in, so the expression is what can be
- *  read. Same shape as `composer-live-during-a-call.test.ts`.
+ *  The third is read off `liveRowDrawsNoPanel`, the decision itself, rather
+ *  than off the source line that consumes it. One source scan is left, and it
+ *  only checks that `showResponsePanel` still consults that decision at all.
  */
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -16,7 +16,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { chatExchangePropsEqual, describeInitiator, isUserBubbleEvent } from '../ChatExchange';
+import { chatExchangePropsEqual, describeInitiator, isUserBubbleEvent, liveRowDrawsNoPanel } from '../ChatExchange';
 import { vnodeToText } from './vnodeToText';
 import { HEARING_YOU } from '../../../voice/callState';
 import { exchangeStatus } from '../../../store/thread-events';
@@ -78,17 +78,40 @@ describe('nothing is drawn under it', () => {
       .split('\n')
       .find(l => l.includes('const showResponsePanel'));
     expect(line).toBeDefined();
-    expect(line).toContain('!isLiveUtterance');
+    expect(line).toContain('!isLiveRow');
   });
 
-  /** And the exclusion lifts the moment the words are there. The engine is
-   *  then holding them while the talker decides. Something IS in flight, and
-   *  the reader is owed the shimmer under their own turn (ADR 0174). */
-  it('stops being excluded once the row carries the words', () => {
-    const line = chatExchangeSource
-      .split('\n')
-      .find(l => l.includes('const isLiveUtterance ='));
-    expect(line).toContain('!userMessage');
+  /** And the exclusion lifts the moment the FINAL words are there. The engine
+   *  is then holding them while the talker decides. Something IS in flight,
+   *  and the reader is owed the shimmer under their own turn (ADR 0174).
+   *
+   *  A partial does not lift it. The caller is still speaking, so nothing is
+   *  in flight behind the bubble yet.
+   *
+   *  Read off the RENDERED decision rather than off the source line. A token
+   *  scan passes on any code containing the token and fails on a reformat, so
+   *  it measures the spelling instead of the behaviour. */
+  it('draws a panel for the final words and none for a partial', () => {
+    expect(liveRowDrawsNoPanel({ ...theRow.userEvent, text: 'the tests' } as StoredEvent)).toBe(false);
+    expect(liveRowDrawsNoPanel({
+      ...theRow.userEvent,
+      text: 'the tes',
+      _livePartial: true,
+    } as StoredEvent)).toBe(true);
+    expect(liveRowDrawsNoPanel(theRow.userEvent)).toBe(true);
+  });
+
+  /** The talker's own live row takes the same exclusion. The words moving in
+   *  it are the activity, so a status badge below would be a second one. */
+  it('excludes the talker\'s live row too', () => {
+    expect(liveRowDrawsNoPanel({
+      type: 'SpokenReplyGenerated',
+      session_id: '',
+      text: 'On it',
+      interrupted: false,
+      _eventId: 'live-reply:t:1',
+      _liveReply: true,
+    } as StoredEvent)).toBe(true);
   });
 });
 

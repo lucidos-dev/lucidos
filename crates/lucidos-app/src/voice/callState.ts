@@ -59,12 +59,14 @@ export const WORDS_BOUND_MS = 10_000;
 export const HEARING_YOU = 'Hearing you';
 
 /**
- * A call holds the caller's last finished sentence, and nothing else.
+ * A call holds every word either side has said, as it is said.
  *
- * Nothing captions a call in flight, so a reply being spoken is read for what
- * it implies and dropped. The caller's own finished words are the exception,
- * and ADR 0174 is why: the engine holds them across the talker's decision, so
- * a client that drops them has nothing to draw for as long as that takes.
+ * ADR 0174 is why the caller's finished words are kept: the engine holds them
+ * across the talker's decision, so a client that drops them has nothing to
+ * draw for as long as that takes. The two live captions beside them, `hearing`
+ * and `said`, carry the same argument further. Both ride frames the client
+ * already receives. Dropping them left the transcript empty for the whole of
+ * a reply, and for the whole of a sentence.
  */
 export interface CallState {
   phase: CallPhase;
@@ -98,6 +100,34 @@ export interface CallState {
    * provider corrected itself, and the reader is owed the better text.
    */
   heard: string | null;
+  /**
+   * What the provider has heard of utterance `utteranceCount` SO FAR.
+   *
+   * A partial, and the one caption that is not final. It captions the bubble
+   * while they speak and settles nothing: `heard` replaces it the moment the
+   * turn ends, and the transcript's claim ledger reads `heard` alone.
+   *
+   * Null when the caller has said nothing yet this utterance, and null for the
+   * whole call when the transcriber streams no deltas. The bubble then pulses,
+   * exactly as it did before anything here was partial.
+   */
+  hearing: string | null;
+  /**
+   * The reply the talker is speaking, built from its deltas as they arrive.
+   *
+   * Empty between replies. The transcript's row for it is NOT withdrawn when
+   * this empties: the engine's own row is on its way. Dropping the words to
+   * wait for it is the blank ADR 0174 removed from the other side.
+   */
+  said: string;
+  /**
+   * Which reply of this call `said` is, counted from one.
+   *
+   * The row's identity, exactly as `utteranceCount` is for the caller's. It
+   * tells a fresh reply from a revision of the one being spoken, so a reply
+   * already on screen does not have its timestamp jump.
+   */
+  replyCount: number;
 }
 
 export const CALL_IDLE: CallState = {
@@ -107,6 +137,9 @@ export const CALL_IDLE: CallState = {
   utterance: 'none',
   utteranceCount: 0,
   heard: null,
+  hearing: null,
+  said: '',
+  replyCount: 0,
 };
 
 /** Everything that can move a call. */
@@ -155,17 +188,44 @@ export type CallEffect =
    * spent here.
    */
   | { kind: 'forget-speech' }
+  /**
+   * Send the audio captured before the socket was up, oldest first.
+   *
+   * The microphone opens ahead of the dial, so a caller who starts talking at
+   * once is already being recorded. Their words are held until there is
+   * somewhere to send them, and this is that moment.
+   */
+  | { kind: 'flush-audio' }
   | { kind: 'teardown' };
 
 const HANG_UP: CallEffect = { kind: 'send', control: { type: 'hang_up' } };
 const BARGE_IN: CallEffect = { kind: 'send', control: { type: 'barge_in' } };
 const STOP_PLAYBACK: CallEffect = { kind: 'stop-playback' };
 const FORGET_SPEECH: CallEffect = { kind: 'forget-speech' };
+const FLUSH_AUDIO: CallEffect = { kind: 'flush-audio' };
 const TEARDOWN: CallEffect = { kind: 'teardown' };
 
 /** True while the socket is up and the call is neither starting nor ending. */
 export function isLive(phase: CallPhase): boolean {
   return phase === 'listening' || phase === 'speaking';
+}
+
+/**
+ * True while the microphone is open and the caller's voice still counts.
+ *
+ * Wider than [`isLive`] by exactly `connecting`, and that gap is the whole
+ * point. The device opens before the socket is dialled, and the engine sends
+ * `session_started` only once the PROVIDER session is up. Measured at 3.79
+ * seconds on one reported call.
+ *
+ * Gating the caller's indicator on the socket left that window drawing
+ * nothing. Somebody who speaks the moment they press the button then watches
+ * an empty transcript. Their audio is held rather than dropped, which is what
+ * makes drawing it honest. See
+ * `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`.
+ */
+export function hearsTheCaller(phase: CallPhase): boolean {
+  return phase === 'connecting' || isLive(phase);
 }
 
 /** True while a call exists in any form, so the toggle reads as on. */
@@ -215,7 +275,7 @@ export function stepCall(
       // The words never came, so the row promising them is withdrawn. Only a
       // wait can time out: a `live` utterance is bounded by the caller.
       return state.utterance === 'landing' || state.utterance === 'transcribed'
-        ? { state: { ...state, utterance: 'none', heard: null }, effects: [] }
+        ? { state: { ...state, utterance: 'none', heard: null, hearing: null }, effects: [] }
         : unchanged(state);
     case 'socket-closed':
       return state.phase === 'idle' ? unchanged(state) : hungUp(state);
@@ -239,7 +299,7 @@ function unchanged(state: CallState): { state: CallState; effects: CallEffect[] 
  * the two would cost the row the 120 ms the gate has already spent.
  */
 function onSpeech(state: CallState, open: boolean): { state: CallState; effects: CallEffect[] } {
-  if (!isLive(state.phase)) return unchanged(state);
+  if (!hearsTheCaller(state.phase)) return unchanged(state);
   if (!open) {
     return state.utterance === 'live'
       ? { state: { ...state, utterance: 'landing' }, effects: [] }
@@ -265,10 +325,17 @@ function onSpeech(state: CallState, open: boolean): { state: CallState; effects:
 function startUtterance(state: CallState): CallState {
   if (state.utterance === 'live') return state;
   if (state.utterance === 'landing') return { ...state, utterance: 'live' };
-  // A fresh turn, so the words of the last one are no longer this one's. The
-  // ROW keeps them: `store/liveUtterance.ts` copied them out, and only the
-  // engine's own row retires that (ADR 0174).
-  return { ...state, utterance: 'live', utteranceCount: state.utteranceCount + 1, heard: null };
+  // A fresh turn, so the words of the last one are no longer this one's, and
+  // neither is what was heard of it. The ROW keeps the finished ones:
+  // `store/liveUtterance.ts` copied them out, and only the engine's own row
+  // retires that (ADR 0174).
+  return {
+    ...state,
+    utterance: 'live',
+    utteranceCount: state.utteranceCount + 1,
+    heard: null,
+    hearing: null,
+  };
 }
 
 function place(threadId: string): { state: CallState; effects: CallEffect[] } {
@@ -295,7 +362,7 @@ function ringOff(state: CallState): { state: CallState; effects: CallEffect[] } 
   // `call.rs` writes down whatever it is holding for every end reason, so the
   // words are still owed a row (ADR 0174). The bridge keeps that one standing.
   return {
-    state: { ...state, phase: 'ending', utterance: 'none', heard: null },
+    state: { ...state, phase: 'ending', utterance: 'none', heard: null, hearing: null },
     effects: [HANG_UP, STOP_PLAYBACK],
   };
 }
@@ -311,9 +378,28 @@ function onFrame(
 ): { state: CallState; effects: CallEffect[] } {
   switch (frame.type) {
     case 'session_started':
+      // The gate was already running, so whatever the caller said into the
+      // connect window is held and goes up now. The utterance it may have
+      // started is left exactly as it is: they are mid-sentence, and the
+      // socket coming up is nothing they did.
       return state.phase === 'connecting'
-        ? { state: { ...state, phase: 'listening' }, effects: [] }
+        ? { state: { ...state, phase: 'listening' }, effects: [FLUSH_AUDIO] }
         : unchanged(state);
+    case 'user_transcript': {
+      // The caller's own words as the provider hears them, mid-sentence. It
+      // captions the bubble and decides nothing: the utterance does not move,
+      // and `heard` is what the transcript settles a row on.
+      //
+      // Only while they hold an utterance. A delta landing outside one belongs
+      // to a sentence already captioned by `heard`, and drawing it would put
+      // the sentence before last in the bubble.
+      if (state.utterance === 'none' || state.heard !== null) return unchanged(state);
+      // A delta with no words captions nothing. Taken, it would swap the pulse
+      // for an empty caption. The engine drops one too; this is the second net.
+      if (frame.text === '') return unchanged(state);
+      const hearing = (state.hearing ?? '') + frame.text;
+      return { state: { ...state, hearing }, effects: [] };
+    }
     case 'user_turn_ended': {
       // The floor is already the caller's while they are speaking, so a
       // finished utterance moves no phase. The words are the engine's to write
@@ -336,7 +422,7 @@ function onFrame(
       if (state.utterance === 'none') return unchanged(state);
       if (!frame.transcript.trim()) {
         return state.utterance === 'landing'
-          ? { state: { ...state, utterance: 'none', heard: null }, effects: [] }
+          ? { state: { ...state, utterance: 'none', heard: null, hearing: null }, effects: [] }
           : unchanged(state);
       }
       // The words are kept, and this is the only place they enter the state.
@@ -353,37 +439,64 @@ function onFrame(
       const heard = state.utterance === 'live' ? state.heard : frame.transcript;
       // A frame saying nothing new is a no-op, so nothing downstream wakes.
       if (state.utterance === 'transcribed' && state.heard === heard) return unchanged(state);
-      return { state: { ...state, utterance: 'transcribed', heard }, effects: [] };
+      // The partial has been superseded by the final text, so it goes. Kept,
+      // it would caption the next utterance with the tail of this one.
+      const hearing = heard === null ? state.hearing : null;
+      return { state: { ...state, utterance: 'transcribed', heard, hearing }, effects: [] };
     }
     case 'talker_transcript': {
-      // Read for what it means rather than what it says: the first delta of a
-      // reply is how the client learns the talker has taken the floor. Only
-      // the FIRST one moves anything, the rest arriving mid-reply.
+      // Read for what it says AND for what it means. The words build the reply
+      // the transcript draws, and the first of them is how the client learns
+      // the talker has taken the floor.
       //
-      // The gate is measured afresh from here, and that is what keeps a
-      // barge-in reachable. Only an EDGE reaches this reducer, so a gate left
-      // open from before swallows the one a barge-in is made of: the caller
-      // would have to stop for a third of a second before they could cut in.
+      // The gate is measured afresh on that first one, and that is what keeps
+      // a barge-in reachable. Only an EDGE reaches this reducer, so a gate
+      // left open from before swallows the one a barge-in is made of: the
+      // caller would have to stop for a third of a second before cutting in.
       //
       // Their utterance goes with the floor, and goes as `transcribed`. The
       // talker answering PROVES the provider ended that turn and read it, so
       // the words are on their way. Speech from here is a new turn, and gets a
       // row of its own.
-      if (state.phase !== 'listening') return unchanged(state);
+      if (!isOnCall(state.phase)) return unchanged(state);
+      // A delta with no words moves NOTHING, and that is the whole of this
+      // line. It opens no reply, so it spends no count. It takes no floor, so
+      // it cannot retire the caller's bubble or reset the speech gate under
+      // somebody mid-word. The engine really does send one: every provider
+      // forwards a blank delta as it arrives.
+      if (frame.text === '') return unchanged(state);
+      // An empty `said` means this delta OPENS a reply, so the row it draws is
+      // a new one and takes a fresh count.
+      const opens = state.said === '';
+      const said = state.said + frame.text;
+      const replyCount = opens ? state.replyCount + 1 : state.replyCount;
+      if (state.phase !== 'listening') {
+        return { state: { ...state, said, replyCount }, effects: [] };
+      }
       const utterance = state.utterance === 'live' ? 'transcribed' : state.utterance;
-      return { state: { ...state, phase: 'speaking', utterance }, effects: [FORGET_SPEECH] };
+      return {
+        state: { ...state, phase: 'speaking', utterance, said, replyCount },
+        effects: [FORGET_SPEECH],
+      };
     }
     case 'talker_turn_ended':
       // The floor comes back with audio still in the air: this says the
       // provider stopped generating, and the speaker plays what it already
       // sent. So the run measured under it is discarded.
       //
-      // Only a real flip. On a floor the caller already holds, this follows
-      // their own barge-in. Shutting the gate mid-word would take the
-      // utterance they are still saying with it.
-      return state.phase === 'speaking'
-        ? { state: { ...state, phase: 'listening' }, effects: [FORGET_SPEECH] }
-        : unchanged(state);
+      // `said` empties here and the ROW it drew does not. The engine writes a
+      // `SpokenReplyGenerated` for every reply, and that row is what retires
+      // this one. Withdrawing it on the turn's end would blank the reply the
+      // caller is still hearing the tail of.
+      //
+      // The gate is reset on a real flip only. On a floor the caller already
+      // holds, this follows their own barge-in. Shutting the gate mid-word
+      // takes the utterance they are still saying with it.
+      if (state.phase === 'speaking') {
+        return { state: { ...state, phase: 'listening', said: '' }, effects: [FORGET_SPEECH] };
+      }
+      // Nothing to empty and no floor to flip, so nothing downstream wakes.
+      return state.said === '' ? unchanged(state) : { state: { ...state, said: '' }, effects: [] };
     case 'interrupted':
       return isLive(state.phase)
         ? { state: { ...state, phase: 'listening' }, effects: [STOP_PLAYBACK] }

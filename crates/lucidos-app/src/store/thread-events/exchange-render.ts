@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -1633,15 +1633,15 @@ export interface QueuedFollowupRun {
  *  rather than as one contiguous trailing run. Coding agents are excluded:
  *  their follow-ups go straight to subprocess stdin, and only chat uses the
  *  agentic-loop queue. */
-/** The bottom exchange that could own a turn, stepping over every *live
- *  utterance*.
+/** The bottom exchange that could own a turn, stepping over every live row a
+ *  call is drawing, on either side.
  *
- *  Such a row owns no turn whether or not it carries the caller's words: no
- *  stream, no `last` role. Every fallback here means "whatever is at the
- *  bottom", and the rows are at the bottom by construction. */
+ *  Such a row owns no turn whether or not it carries words: no stream, no
+ *  `last` role. Every fallback here means "whatever is at the bottom", and the
+ *  rows are at the bottom by construction. */
 function lastTurnBearingIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (!isLiveUtteranceRow(exchanges[i].userEvent)) return i;
+    if (!isLiveCallRow(exchanges[i].userEvent)) return i;
   }
   return -1;
 }
@@ -1788,6 +1788,10 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // still speaking, or their words are held while the talker decides. The
   // reader is waiting in both, and the shimmer says so (ADR 0174).
   if (isLiveUtteranceRow(exchange.userEvent)) return 'pending';
+  // The talker's own live row. Nothing is in flight BEHIND it: the row is the
+  // activity, and the words moving in it are what says so. A pending verdict
+  // here would put a second waiting mark under a reply already being read.
+  if (isLiveReplyRow(exchange.userEvent)) return 'done';
   let isComplete = false;
   let isCanceled = false;
   let isAborted = false;
@@ -2051,7 +2055,18 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // arms. A call is not a turn (ADR 0148), so none of those verdicts is about
   // it. The terminal arms above stay above: a real terminator lands only in an
   // exchange this no longer matches.
-  if (threadIdle && isCallOnly(exchange)) {
+  //
+  // `exchangeHoldsNoTurn` is the other way in, and it is what makes the arm
+  // reachable on a thread whose turn ended badly. A thread's status describes
+  // its TURN, and such an exchange holds none, so the status is not about it.
+  // Voice moves the status nowhere, so a doer that failed leaves `failed`
+  // behind for good. The caller's last words never reached this arm, and
+  // shimmered "Requesting" for as long as the thread existed.
+  //
+  // A DELEGATED utterance keeps the `threadIdle` gate, being a turn itself. It
+  // queues behind another one like any message, and the queued arm below is
+  // live exactly when the thread is busy.
+  if ((threadIdle || exchangeHoldsNoTurn(exchange)) && isCallOnly(exchange)) {
     if (!isLast) return 'done';
     if (callAnswered(exchange)) return 'done';
     if (!callHasEnded(exchange)) return 'streaming';

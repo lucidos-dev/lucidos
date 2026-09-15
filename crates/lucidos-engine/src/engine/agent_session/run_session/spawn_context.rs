@@ -610,16 +610,15 @@ impl LucidosEngine {
             // Much faster than `npm ci` (~1-2s hardlink vs 2-10min install).
             //
             // The repo is an npm WORKSPACE (root package.json `workspaces:
-            // [crates/lucidos-app, packages/lucidos-sdk]`), so MOST deps hoist
+            // [crates/lucidos-app, packages/lucidos-sdk]`), so deps hoist
             // to the REPO ROOT (`<repo>/node_modules`). Provision the root tree
             // first: its workspace-member symlinks (e.g. `lucidos-app ->
             // ../crates/lucidos-app`) are relative and resolve inside the
             // worktree, and Node resolution walks up to `<wt>/node_modules`.
-            // The root tree is NOT the whole story though. An un-hoistable dep
-            // (notably `vitest`, which lives only in
-            // `crates/lucidos-app/node_modules`) sits in the MEMBER's own
-            // nested tree, so the member loop further below provisions those
-            // too; without it `npm test` in a worktree cannot find vitest.
+            // The committed lockfile nests nothing under a member today, so the
+            // root tree carries `vitest` and everything else `npm test` needs.
+            // The member loop below is the safety net for a dep npm cannot
+            // hoist, and links nothing while the lockfile stays flat.
             // (Pointing the ROOT link at crates/lucidos-app is what silently killed the
             // fast path after the workspace migration: the marker was never
             // found, so every CC worktree fell back to a cold `npm ci` that
@@ -635,9 +634,9 @@ impl LucidosEngine {
                     let src_node_modules = repo_root.join("node_modules");
                     if has_install_marker(&src_node_modules) {
                         // Fast path (~1-2s vs a 2-10min npm ci): hardlink main's
-                        // hoisted ROOT node_modules into the worktree. Workspace
-                        // MEMBER trees (un-hoistable deps like vitest) are linked
-                        // separately below, independent of this root-marker gate.
+                        // hoisted ROOT node_modules into the worktree. Any
+                        // MEMBER tree npm could not hoist is linked separately
+                        // below, independent of this root-marker gate.
                         link_node_modules_tree(&src_node_modules, &wt_node_modules, "node_modules")
                             .await;
                     } else {
@@ -668,16 +667,15 @@ impl LucidosEngine {
                     }
                 }
 
-                // Workspace MEMBER node_modules (un-hoistable deps like vitest,
-                // which npm nests in crates/lucidos-app/node_modules rather than
-                // the hoisted root) are the trees the ROOT link above misses.
+                // A MEMBER node_modules holds only what npm could not hoist, and
+                // is the tree the ROOT link above misses.
                 // Provision them here — independent of the root marker — so a
                 // worktree created by the old root-only provisioning (root
                 // marker present, member tree absent) still gets its member tree
                 // on the next spawn/resume. `member_node_modules_links` returns
-                // only members present in main AND not already installed here, so
-                // this is a no-op on the npm-ci path (which installs members
-                // itself) and on a resume that already has them.
+                // only members really installed in main AND not already
+                // installed here. So it is a no-op on the npm-ci path, on a
+                // resume that already has them, and on a flat lockfile.
                 for (member_src, member_dst) in member_node_modules_links(repo_root, &wt_path) {
                     let label = member_dst
                         .strip_prefix(&wt_path)

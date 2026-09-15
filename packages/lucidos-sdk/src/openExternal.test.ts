@@ -11,7 +11,10 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-const navigate = vi.hoisted(() => vi.fn(() => Promise.resolve()));
+/** Stands in for `requestVoid`, so it takes the path and the decoded body. */
+const navigate = vi.hoisted(
+  () => vi.fn<(path: string, body?: unknown) => Promise<void>>(() => Promise.resolve()),
+);
 
 const { ui } = await import('./ui');
 

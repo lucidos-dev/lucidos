@@ -43,6 +43,9 @@ pub struct MockVoiceProvider {
     script: Mutex<Vec<VoiceEvent>>,
     /// A talker the test drives event by event, instead of by a fixed script.
     live: Mutex<Option<mpsc::Receiver<VoiceEvent>>>,
+    /// What `close` hands back, standing in for a real provider still holding
+    /// the caller's last words as the line goes.
+    holding: Mutex<Vec<VoiceEvent>>,
     log: Arc<Mutex<MockLog>>,
     open_error: Option<String>,
     ends_after_script: bool,
@@ -59,6 +62,7 @@ impl MockVoiceProvider {
         Self {
             script: Mutex::new(script),
             live: Mutex::new(None),
+            holding: Mutex::new(Vec::new()),
             log: Arc::new(Mutex::new(MockLog::default())),
             open_error: None,
             ends_after_script: false,
@@ -80,6 +84,15 @@ impl MockVoiceProvider {
         (provider, tx)
     }
 
+    /// A provider whose session is STILL HOLDING `held` when it is closed.
+    ///
+    /// A turn-less protocol accumulates the caller's words and gives them up
+    /// only as the socket goes. This is that, with no socket.
+    pub fn still_holding(mut self, held: Vec<VoiceEvent>) -> Self {
+        self.holding = Mutex::new(held);
+        self
+    }
+
     /// A provider that replays `script` and then drops the call.
     pub fn ending_after(script: Vec<VoiceEvent>) -> Self {
         Self {
@@ -94,6 +107,7 @@ impl MockVoiceProvider {
         Self {
             script: Mutex::new(Vec::new()),
             live: Mutex::new(None),
+            holding: Mutex::new(Vec::new()),
             log: Arc::new(Mutex::new(MockLog::default())),
             open_error: Some(message.to_string()),
             ends_after_script: false,
@@ -129,6 +143,7 @@ impl VoiceProvider for MockVoiceProvider {
         Ok(Box::new(MockVoiceSession {
             script: script.into_iter().collect(),
             live: self.live.lock().expect("mock live lock").take(),
+            holding: std::mem::take(&mut *self.holding.lock().expect("mock holding lock")),
             log: Arc::clone(&self.log),
             ends_after_script: self.ends_after_script,
         }))
@@ -138,6 +153,8 @@ impl VoiceProvider for MockVoiceProvider {
 struct MockVoiceSession {
     script: std::collections::VecDeque<VoiceEvent>,
     live: Option<mpsc::Receiver<VoiceEvent>>,
+    /// What `close` hands back. See `MockVoiceProvider::still_holding`.
+    holding: Vec<VoiceEvent>,
     log: Arc<Mutex<MockLog>>,
     ends_after_script: bool,
 }
@@ -197,7 +214,21 @@ impl VoiceSession for MockVoiceSession {
         Ok(())
     }
 
-    async fn close(&mut self) {
+    /// Drop the caller's words, exactly as a turn-less provider does.
+    ///
+    /// Only the caller's: the talker's half of what this session holds is
+    /// untouched, matching `LiveSession`, which clears one accumulator.
+    async fn caller_words_were_taken(&mut self) {
+        self.holding.retain(|event| {
+            !matches!(
+                event,
+                VoiceEvent::UserTurnEnded { .. } | VoiceEvent::UserTranscript { .. }
+            )
+        });
+    }
+
+    async fn close(&mut self) -> Vec<VoiceEvent> {
         self.log.lock().expect("mock log lock").closed = true;
+        std::mem::take(&mut self.holding)
     }
 }

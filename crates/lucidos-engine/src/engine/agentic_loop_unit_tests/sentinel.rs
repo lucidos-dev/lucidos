@@ -73,7 +73,7 @@ mod sentinel_redaction_tests {
     fn credential_sentinel_extracts_payload_and_redacts() {
         let raw = format!(
             "{CREDENTIAL_REQUEST_PREFIX}{}",
-            r#"{"service":"openai","prompt":"Enter API key","base_url":"https://api.openai.com","auth_type":"api_key"}"#
+            r#"{"service":"openai","prompt":"Enter API key","base_urls":["https://api.openai.com"],"auth_type":"api_key"}"#
         );
         let m = match_sentinel(&raw).expect("credential sentinel must match");
         match m.event {
@@ -84,6 +84,44 @@ mod sentinel_redaction_tests {
         }
         let redacted = m.redacted_text.expect("credential must redact for the LLM");
         assert!(!redacted.contains('{'));
+        assert!(
+            redacted.contains("saves the credential as \"openai\""),
+            "a collection names the row it will write: {redacted}"
+        );
+    }
+
+    /// A WIDENING reopens a row that already holds its secret. Told it "saves
+    /// the credential", the agent narrates a token the user need not type. That
+    /// is the mis-narration the redaction's own comment block cites as the
+    /// reason it names the service at all.
+    #[test]
+    fn a_widening_sentinel_says_the_secret_is_already_stored() {
+        let raw = format!(
+            "{CREDENTIAL_REQUEST_PREFIX}{}",
+            r#"{"service":"github","prompt":"...","auth_type":"bearer","base_urls":["https://api.github.com","https://github.com"],"existing_credential_id":"c","adding_base_urls":["https://github.com"]}"#
+        );
+        let m = match_sentinel(&raw).expect("credential sentinel must match");
+        let redacted = m.redacted_text.expect("credential must redact for the LLM");
+        assert!(redacted.contains("widens the existing \"github\" credential"));
+        assert!(redacted.contains("presses Save"));
+        assert!(
+            !redacted.contains("saves the credential as"),
+            "the collection wording must not also fire: {redacted}"
+        );
+    }
+
+    /// An EMPTY list is not a widening. Nothing is being added, so the request
+    /// is an ordinary collection and has to read as one.
+    #[test]
+    fn an_empty_adding_list_narrates_as_a_collection() {
+        let raw = format!(
+            "{CREDENTIAL_REQUEST_PREFIX}{}",
+            r#"{"service":"github","prompt":"...","auth_type":"bearer","adding_base_urls":[]}"#
+        );
+        let m = match_sentinel(&raw).expect("credential sentinel must match");
+        let redacted = m.redacted_text.expect("credential must redact for the LLM");
+        assert!(redacted.contains("saves the credential as \"github\""));
+        assert!(!redacted.contains("widens"));
     }
 
     #[test]

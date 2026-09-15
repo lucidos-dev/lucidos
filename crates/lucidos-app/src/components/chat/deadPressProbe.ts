@@ -234,7 +234,9 @@ type PressVerdict =
   | 'click-no-touch'
   | 'unreachable'
   | 'repaired'
-  | 'repair-failed';
+  | 'repair-failed'
+  | 'activated'
+  | 'keyboard-touch';
 
 /** How often the reachability question may be asked.
  *
@@ -242,6 +244,11 @@ type PressVerdict =
  *  touches that never reach the composer. A wedge persists, so asking on every
  *  touch buys nothing that the user's second tap does not. */
 const REACHABILITY_THROTTLE_MS = 400;
+
+/** How often a touch that reached nowhere near the composer may be logged.
+ *
+ *  Slow enough that a scroll or a flick writes one line, not a stream. */
+const STRAY_TOUCH_THROTTLE_MS = 250;
 
 /** How long a press may stay armed before the lift is called lost.
  *
@@ -328,6 +335,13 @@ function recordPress(facts: {
   underFace?: string | null;
   faceCount?: number;
   watchableCount?: number;
+  /** Where the finger landed, and the nearest face it failed to reach. A near
+   *  miss and a press nowhere near a target are one verdict without these. */
+  point?: { x: number; y: number };
+  missedBy?: { face: string; px: number } | null;
+  /** `screenOffset` for this press. The one reading not taken from the layout
+   *  side, so a page hit-testing away from the glass says so here. */
+  screenOff?: { x: number; y: number };
   /** Written with no user input behind it, by the scheduled check. */
   scheduled?: boolean;
   /** Whether the relayout actually ran. A `repair-failed` that never nudged
@@ -348,6 +362,46 @@ function recordPress(facts: {
   });
 }
 
+/** A touch that reached the page while the keyboard was up, and did NOT reach
+ *  the composer's row.
+ *
+ *  The blind spot twelve episodes have died in. Every other line here needs the
+ *  touch to be attributable to the composer, so "no line" has meant two
+ *  opposite things at once: iOS delivered no touch at all, and iOS delivered it
+ *  somewhere the composer is not.
+ *
+ *  Those two have different fixes and no shared one, which is why guessing
+ *  between them has failed four times. A WKWebView that scrolled itself for the
+ *  keyboard, and did not tell the page, displaces every touch by that amount.
+ *  The page reads `scrollY` and `visualViewport.offsetTop` as zero throughout.
+ *  This line says which: it carries where the finger was reported, what
+ *  answered there, and the screen-to-client offset.
+ *
+ *  Throttled, and only while the keyboard is up, which is the only state any
+ *  report describes. */
+let lastStrayTouchAt = Number.NEGATIVE_INFINITY;
+
+function noteStrayTouch(
+  t: { clientX: number; clientY: number; screenX: number; screenY: number },
+  target: Element | null,
+  rowRect: ProbeRect | null,
+): void {
+  if (!readViewport().keyboardActive) return;
+  const now = Date.now();
+  if (now - lastStrayTouchAt < STRAY_TOUCH_THROTTLE_MS) return;
+  lastStrayTouchAt = now;
+  const point = { x: Math.round(t.clientX), y: Math.round(t.clientY) };
+  recordPress({
+    face: describe(target) ?? 'nothing',
+    verdict: 'keyboard-touch',
+    movedPx: 0,
+    point,
+    screenOff: screenOffset(t),
+    elementAtPoint: describe(document.elementFromPoint(point.x, point.y)),
+    rowRect,
+  });
+}
+
 /** The morph button as the DOM currently holds it. */
 function readMorphState(): MorphState {
   const el = document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
@@ -357,6 +411,33 @@ function readMorphState(): MorphState {
     disabled: !!el?.disabled,
     label: el?.getAttribute('aria-label') ?? null,
   });
+}
+
+/** Run Send for a press the page dropped, and say whether it did.
+ *
+ *  The app knows enough to do this. A touch reached the document, its
+ *  coordinates were inside the composer row, no button claimed it, and Send is
+ *  live with a draft behind it. Relaying out the shell helps the NEXT tap. This
+ *  is what answers the one the user just made (ADR 0183).
+ *
+ *  Four bounds, and each is a state where the intent is not certain. Nothing
+ *  may be covering the composer. SEND mode only, so a dropped tap can never
+ *  stop a running turn. The keyboard must be UP, which is the state every
+ *  report describes. And the morph is re-read at the moment of firing. A
+ *  second tap that got through has already moved it off `send`. */
+function rescueSend(): boolean {
+  // A cover can go up in the grace window between the tap and this, and a
+  // synthetic click ignores it. Under one, the composer is unreachable by
+  // design and the user is looking at something else.
+  if (coveredOnPurpose()) return false;
+  if (readMorphState() !== 'send') return false;
+  if (!readViewport().keyboardActive) return false;
+  const el = document.querySelector<HTMLButtonElement>(`${ROW_SELECTOR} .send-cancel-morph`);
+  if (!el || el.disabled || !el.isConnected) return false;
+  // The morph's click path asks its tap gate, and a gate holding no press
+  // counts as a tap: that is how a keyboard Enter activates. See `createTapGate`.
+  el.click();
+  return true;
 }
 
 /** The composer's action row, and the faces inside it a press may activate.
@@ -409,6 +490,51 @@ export function underFingerReason(f: {
   if (f.actionFace === 'disabled') return 'disabled-face';
   if (f.otherButton) return 'other-button';
   return 'nothing';
+}
+
+/** How far a point falls outside a rect, in px. Zero anywhere inside it. */
+export function distanceOutside(rect: ProbeRect, p: { x: number; y: number }): number {
+  const dx = Math.max(rect.left - p.x, 0, p.x - rect.right);
+  const dy = Math.max(rect.top - p.y, 0, p.y - rect.bottom);
+  return Math.round(Math.hypot(dx, dy));
+}
+
+/** The face the finger came closest to, and by how much it missed.
+ *
+ *  A `missed` line said only that the press took no face, which left two very
+ *  different states reading alike: a finger just outside a live target, and a
+ *  finger nowhere near one. The second is the wedge. It is what a page
+ *  hit-testing somewhere other than the glass produces.
+ *
+ *  Returns the caller's own entry, so the lift can repair the face the finger
+ *  was reaching for. Null for a row holding no face at all. */
+export function nearestFaceMiss<T extends { name: string; rect: ProbeRect }>(
+  faces: T[],
+  p: { x: number; y: number },
+): { face: T; px: number } | null {
+  let best: { face: T; px: number } | null = null;
+  for (const f of faces) {
+    const px = distanceOutside(f.rect, p);
+    if (!best || px < best.px) best = { face: f, px };
+  }
+  return best;
+}
+
+/** The fixed offset between where the finger is and where the page says it is.
+ *
+ *  Every other reading here comes from the layout side: a rect, a hit test, a
+ *  viewport height. They therefore agree with each other. The split this
+ *  chases is between layout and the GLASS, and twelve episodes of those
+ *  readings agreeing have settled nothing.
+ *
+ *  A touch carries both. `screenX/Y` is physical and owes nothing to layout.
+ *  `clientX/Y` is what the page hit-tests with. In a standalone PWA their
+ *  difference is a constant, moved only by a visual-viewport scroll the line
+ *  already records. A jump in it IS the fault, stated rather than inferred. */
+export function screenOffset(t: {
+  screenX: number; screenY: number; clientX: number; clientY: number;
+}): { x: number; y: number } {
+  return { x: Math.round(t.screenX - t.clientX), y: Math.round(t.screenY - t.clientY) };
 }
 
 /** The morph button's own mode, which is what "the send button" means.
@@ -500,22 +626,40 @@ function watchableRow(): HTMLElement | null {
  *  the moment it answers again, so a state that returns reports again. */
 const reportedUnreachable = new Set<string>();
 
+/** Is something MEANT to be over the row? The probe answers no question through
+ *  a cover the app raised on purpose.
+ *
+ *  An open overlay inerts the shell behind it, and a client refresh dims and
+ *  locks the whole page until the reload lands. A face under either is
+ *  unreachable by design. Reporting it is a false alarm, and the episode's one
+ *  repair goes on a layout nobody is waiting for.
+ *
+ *  The refresh half was missing, so a user got the wedge report naming
+ *  `div.ui-blocking-overlay`, stacked over the app's own "Refreshing" status. */
+function coveredOnPurpose(): boolean {
+  const root = document.documentElement;
+  return root.hasAttribute('data-overlay-open') || root.hasAttribute('data-ui-blocked');
+}
+
 /** The first watchable face the browser does not answer with at its own centre,
  *  as a ready report. Null when every face is reachable, which is the healthy
  *  case and the usual one.
  *
- *  Silent while an overlay is open: that is the one time something is MEANT to
- *  cover the row, and the app inerts the shell behind it on purpose. Silent too
- *  for a face with no box, which is a row mid-layout rather than a fault. */
-interface UnreachableFace {
+ *  Silent under a cover the app raised itself, which `coveredOnPurpose` names.
+ *  Silent too for a face with no box, which is a row mid-layout rather than a
+ *  fault. */
+interface RepairTarget {
   face: string;
   el: HTMLButtonElement;
-  report: string;
   rect: ProbeRect;
 }
 
+interface UnreachableFace extends RepairTarget {
+  report: string;
+}
+
 function firstUnreachableFace(faces: HTMLButtonElement[]): UnreachableFace | null {
-  if (document.documentElement.hasAttribute('data-overlay-open')) return null;
+  if (coveredOnPurpose()) return null;
   let fresh: UnreachableFace | null = null;
   for (const face of faces) {
     const rect = face.getBoundingClientRect();
@@ -579,6 +723,26 @@ const REPAIR_SETTLE_MS = 50;
  *  work on the next tick either. */
 const repairAttempted = new Set<string>();
 
+/** The height to relayout the shell at before putting it back.
+ *
+ *  The AMPLITUDE of the user's own recovery: the keyboard's own span, which is
+ *  the layout viewport less the shell's current height. A 1px wobble relaid the
+ *  same boxes out at the same size and moved nothing else.
+ *
+ *  DOWNWARD, though the keyboard bounce goes up, and that is deliberate.
+ *  Growing the shell shrinks every scroller in it. The browser clamps their
+ *  scroll offsets at that layout, and putting the height back does NOT put the
+ *  offsets back. A transcript at the live edge would jump most of a screen on
+ *  every dead tap. Shrinking cannot clamp anything: it only makes room, and the
+ *  restore returns to geometry those offsets were already valid in.
+ *
+ *  Floored at 1px, since a shell of zero height is not a layout. */
+export function bounceHeight(current: number, layoutViewport: number): number {
+  const keyboard = Math.round(layoutViewport - current);
+  const span = keyboard > 0 ? keyboard : 1;
+  return Math.max(1, Math.round(current - span));
+}
+
 /** Force the shell to relayout, which is what the user's own recovery does.
  *
  *  Closing and reopening the keyboard rewrites the visual viewport, and the app
@@ -601,7 +765,9 @@ function nudgeLayout(): boolean {
   if (!/^-?[\d.]+px$/.test(prior.trim())) return false;
   const px = Number.parseFloat(prior);
   if (!Number.isFinite(px)) return false;
-  root.style.setProperty('--app-height', `${px - 1}px`);
+  const inner = window.innerHeight;
+  const away = Number.isFinite(inner) && inner > 0 ? bounceHeight(px, inner) : Math.max(1, px - 1);
+  root.style.setProperty('--app-height', `${away}px`);
   void root.offsetHeight;
   root.style.setProperty('--app-height', prior);
   void root.offsetHeight;
@@ -617,10 +783,16 @@ function nudgeLayout(): boolean {
  *  the user has their composer back. `repair-failed` rules that out, which is
  *  the reading ten reports have not produced.
  *
- *  Only `repaired` toasts. The user pressed something that did nothing, and the
- *  message tells them it is worth pressing again. A failed repair changes
- *  nothing they can see or act on. */
-function attemptRepair(found: UnreachableFace, scheduled: boolean): void {
+ *  Only `repaired` toasts, and only where the face had actually stopped
+ *  answering. The user pressed something that did nothing, and the message
+ *  tells them it is worth pressing again. A failed repair changes nothing they
+ *  can see or act on.
+ *
+ *  `announce` is false for the DEAD-TAP caller, whose face answers at its own
+ *  centre throughout. The hit test cannot score that repair, so a toast there
+ *  would claim a fix on every stray tap on empty row space. It runs the same
+ *  recovery and says so only in the log. */
+function attemptRepair(found: RepairTarget, scheduled: boolean, announce = true): void {
   if (repairAttempted.has(found.face)) return;
   repairAttempted.add(found.face);
   if (!nudgeLayout()) {
@@ -660,13 +832,14 @@ function attemptRepair(found: UnreachableFace, scheduled: boolean): void {
       scheduled,
       nudged: true,
       connected: true,
-      toasted: ok,
+      toasted: ok && announce,
       faceRect: roundRect(found.el.getBoundingClientRect()),
     });
     if (!ok) return;
     // The episode is over, so let a later one report and repair itself.
     reportedUnreachable.delete(found.face);
     repairAttempted.delete(found.face);
+    if (!announce) return;
     showToast(
       `${found.face} had stopped taking taps and has been reset. Try again.`,
       'warning',
@@ -729,6 +902,9 @@ interface ArmedPress {
   /** Which finger this press belongs to. A second finger's lift, cancel or
    *  travel must not settle or move somebody else's press. */
   touchId: number;
+  /** Taken at touchdown, since the lift's own reading would already carry any
+   *  re-sync the gesture provoked. */
+  screenOff: { x: number; y: number };
   faceRect: ProbeRect | null;
   rowRect: ProbeRect | null;
   /** Fires if no lift and no cancel ever arrive. Without it the probe reports a
@@ -751,6 +927,7 @@ interface SettlingPress {
   movedPx: number;
   connectedAtLift: boolean;
   rowMutations: number;
+  screenOff: { x: number; y: number };
   faceRect: ProbeRect | null;
   rowRect: ProbeRect | null;
   /** Who claimed the press, snapshotted right after ITS OWN lift.
@@ -766,6 +943,21 @@ interface SettlingPress {
   graceTimer: ReturnType<typeof setTimeout> | null;
 }
 
+/** A press that reached the composer row and no face, waiting for its lift.
+ *
+ *  The one press shape the module never ruled. Its line asserted `movedPx: 0`
+ *  instead of measuring, so a swipe beginning on the row read exactly like a
+ *  tap that died there. The two want opposite answers: one is the platform
+ *  working, and the other is the wedge this module exists for. */
+interface ArmedMiss {
+  touchId: number;
+  startX: number;
+  startY: number;
+  movedPx: number;
+  /** The face the finger came nearest to, which is the one to repair. */
+  target: RepairTarget | null;
+}
+
 let installed = false;
 
 /** Install the probe. Idempotent, and mobile-only: the report is an iOS PWA one,
@@ -778,6 +970,11 @@ export function installDeadPressProbe(): void {
   installed = true;
 
   let armed: ArmedPress | null = null;
+  /** The row-missed press waiting for its lift. See `ArmedMiss`. */
+  let missedPress: ArmedMiss | null = null;
+  /** Its grace window, once lifted. Cancelled by anything proving the gesture
+   *  was not dead after all. */
+  let missSettle: ReturnType<typeof setTimeout> | null = null;
   const settling = new Set<SettlingPress>();
   /** When the document last saw ANY `touchstart`, wherever it landed.
    *
@@ -801,6 +998,7 @@ export function installDeadPressProbe(): void {
         movedPx: press.movedPx,
         rowRect: press.rowRect,
         faceRect: press.faceRect,
+        screenOff: press.screenOff,
       });
       return;
     }
@@ -822,8 +1020,43 @@ export function installDeadPressProbe(): void {
       toasted: report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
+      screenOff: press.screenOff,
     });
     if (report) showToast(report, 'warning');
+  };
+
+  /** Rule a press that reached the row and no face.
+   *
+   *  A stationary one is the wedge the user recovers by dismissing and
+   *  reopening the keyboard, and `nudgeLayout` is that recovery without the
+   *  keyboard. Running it here is what makes the SECOND tap work instead of
+   *  the tenth.
+   *
+   *  Silent, because nothing here can score the repair. The face answers at its
+   *  own centre throughout this state, so a toast would claim a fix on every
+   *  stray tap on empty row space.
+   *
+   *  A press that travelled is a scroll or a swipe that began on the row, and
+   *  the platform is entitled to drop it. */
+  const ruleMissedPress = (miss: ArmedMiss) => {
+    if (miss.movedPx > TAP_MOVE_THRESHOLD_PX) return;
+    // The grace window first. A click still on its way means the press was not
+    // dead, and running Send over it would send the draft twice.
+    if (missSettle !== null) clearTimeout(missSettle);
+    missSettle = setTimeout(() => {
+      missSettle = null;
+      if (rescueSend()) {
+        recordPress({
+          face: 'Send message',
+          verdict: 'activated',
+          movedPx: miss.movedPx,
+          toasted: true,
+        });
+        showToast('That tap did not register, so Send was run for you.', 'warning');
+      }
+      // The relayout runs either way: it is what the NEXT tap needs.
+      if (miss.target) attemptRepair(miss.target, false, false);
+    }, CLICK_GRACE_MS);
   };
 
   /** Give up on an armed press whose lift never came, and SAY so.
@@ -847,6 +1080,7 @@ export function installDeadPressProbe(): void {
       toasted: toast && report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
+      screenOff: press.screenOff,
     });
     if (toast && report) showToast(report, 'warning');
   };
@@ -860,13 +1094,17 @@ export function installDeadPressProbe(): void {
     const previous = armed;
     armed = null;
     if (previous) ruleArmedWithNoLift(previous, true);
+    // A row-missed press whose lift never came is superseded here. Its line is
+    // already written, so only the recovery is dropped. A lift that never
+    // arrives is not the stationary tap that earns one.
+    missedPress = null;
     if (!isMobile()) return;
     lastTouchStartAt = Date.now();
     noteInput(lastTouchStartAt);
     const touch = e.changedTouches?.[0];
     if (!touch) return;
     const row = watchableRow();
-    if (!row) return;
+    if (!row) { noteStrayTouch(touch, e.target as Element | null, null); return; }
     const rowRect = row.getBoundingClientRect();
     const target = e.target as Element | null;
     const onRow = !!target && !!target.closest(ROW_SELECTOR);
@@ -879,6 +1117,10 @@ export function installDeadPressProbe(): void {
     const faces = every.filter((btn) => exclusionOf(btn) === 'watchable');
     const pressed = faces.find((f) => !!target && (target === f || f.contains(target)));
     if (!pressed) {
+      // Something is over the row on purpose, so no reading here means anything.
+      // The cover answers at the composer's own pixels, and both reports below
+      // would name it.
+      if (coveredOnPurpose()) return;
       // The reachability question comes FIRST, in front of the row-attribution
       // gate below. It is the one check immune to a coordinate space out of
       // step with layout. For two rounds it sat behind the very gate such a
@@ -910,17 +1152,25 @@ export function installDeadPressProbe(): void {
       // Past that, only the composer's own row is this module's business. A
       // touch counts as the row's when it was DISPATCHED there, or when it
       // landed on the row's painted box.
-      if (!onRow && !inRow) return;
-      const aimedAt = faces.find((f) => inside(f.getBoundingClientRect(), touch.clientX, touch.clientY));
+      //
+      // A touch that is neither still gets ONE line while the keyboard is up.
+      // That is the blind spot: the composer being untappable and the page
+      // taking no touch at all used to be the same silence.
+      if (!onRow && !inRow) { noteStrayTouch(touch, target, roundRect(rowRect)); return; }
+      // One layout read per watchable face. Three questions here are about the
+      // same boxes: which face the finger was on, the box the line carries, and
+      // the distance it missed by. Each used to re-measure them.
+      const boxes = faces.map((f) => ({ el: f, name: nameOf(f), rect: roundRect(f.getBoundingClientRect()) as ProbeRect }));
+      const aimedAt = boxes.find((b) => inside(b.rect, touch.clientX, touch.clientY)) ?? null;
       const at = document.elementFromPoint(touch.clientX, touch.clientY);
       // Read once: `pointerEventsOf` is a computed-style call, and the report
       // and the log line want the same answer.
       const elementAtPoint = describe(at);
       const pointerEventsAtPoint = pointerEventsOf(at);
       const report = aimedAt ? landingReport({
-        face: nameOf(aimedAt),
+        face: aimedAt.name,
         point: { x: touch.clientX, y: touch.clientY },
-        faceRect: aimedAt.getBoundingClientRect(),
+        faceRect: aimedAt.rect,
         targetIsFace: false,
         elementAtPoint,
         pointerEventsAtPoint,
@@ -934,8 +1184,12 @@ export function installDeadPressProbe(): void {
         actionFace: held ? exclusionOf(held) : null,
         otherButton: !!at && at.closest('button') !== null,
       });
+      const point = { x: Math.round(touch.clientX), y: Math.round(touch.clientY) };
+      // Measured against the WATCHABLE faces: a press the row could have taken
+      // is the question, and an inert placeholder answers it wrongly.
+      const nearest = nearestFaceMiss(boxes, point);
       recordPress({
-        face: aimedAt ? nameOf(aimedAt) : 'the row',
+        face: aimedAt ? aimedAt.name : 'the row',
         verdict: 'missed',
         movedPx: 0,
         elementAtPoint,
@@ -945,11 +1199,30 @@ export function installDeadPressProbe(): void {
         faceCount: every.length,
         watchableCount: faces.length,
         rowRect: roundRect(rowRect),
-        faceRect: roundRect(aimedAt?.getBoundingClientRect() ?? null),
+        faceRect: roundRect(aimedAt?.rect ?? null),
+        point,
+        missedBy: nearest && { face: nearest.face.name, px: nearest.px },
+        screenOff: screenOffset(touch),
       });
+      // Rule it at the lift, where the travel is known. The user recovers this
+      // state by hand, and the lift now runs the same recovery for them.
+      //
+      // `nothing` under the finger is the whole trigger. An `other-button` tap
+      // ran an icon button's action, and an excluded face is a press the app
+      // drops on purpose. Only a tap that reached NOTHING is a dead composer.
+      missedPress = under !== 'nothing' ? null : {
+        touchId: touch.identifier,
+        startX: touch.screenX,
+        startY: touch.screenY,
+        movedPx: 0,
+        target: nearest && { face: nearest.face.name, el: nearest.face.el, rect: nearest.face.rect },
+      };
       if (report) showToast(report, 'warning');
       return;
     }
+    // The finger is on a real face now, so a rescue armed by an earlier dead
+    // tap must not fire behind this press.
+    if (missSettle !== null) { clearTimeout(missSettle); missSettle = null; }
     const press: ArmedPress = {
       el: pressed,
       face: nameOf(pressed),
@@ -960,6 +1233,7 @@ export function installDeadPressProbe(): void {
       mutations: 0,
       observer: null,
       touchId: touch.identifier,
+      screenOff: screenOffset(touch),
       faceRect: roundRect(pressed.getBoundingClientRect()),
       rowRect: roundRect(rowRect),
       liftDeadline: null,
@@ -992,17 +1266,22 @@ export function installDeadPressProbe(): void {
   }, { capture: true, passive: true });
 
   document.addEventListener('touchmove', (e) => {
-    if (!armed) return;
-    const touch = touchOf(e, armed.touchId);
-    if (!touch) return;
     // Screen coordinates, for the reason `TapPointer` records: with the keyboard
     // up the visual viewport settles under a stationary finger, so client ones
     // report travel that never happened.
-    armed.movedPx = Math.max(
-      armed.movedPx,
-      Math.abs(touch.screenX - armed.startX),
-      Math.abs(touch.screenY - armed.startY),
-    );
+    const travel = (
+      p: { touchId: number; startX: number; startY: number; movedPx: number },
+    ) => {
+      const touch = touchOf(e, p.touchId);
+      if (!touch) return;
+      p.movedPx = Math.max(
+        p.movedPx,
+        Math.abs(touch.screenX - p.startX),
+        Math.abs(touch.screenY - p.startY),
+      );
+    };
+    if (armed) travel(armed);
+    if (missedPress) travel(missedPress);
   }, { capture: true, passive: true });
 
   // CAPTURE phase. It used to bubble, and read `defaultPrevented` as proof a
@@ -1018,6 +1297,11 @@ export function installDeadPressProbe(): void {
   // `defaultPrevented` never distinguished a press that ran from one that was
   // eaten. Both now say which they were, through `takePressOutcome`.
   document.addEventListener('touchend', (e) => {
+    const miss = missedPress;
+    if (miss && touchOf(e, miss.touchId)) {
+      missedPress = null;
+      ruleMissedPress(miss);
+    }
     const press = armed;
     if (!press || !touchOf(e, press.touchId)) return;
     armed = null;
@@ -1031,6 +1315,7 @@ export function installDeadPressProbe(): void {
       movedPx: press.movedPx,
       connectedAtLift: press.el.isConnected,
       rowMutations: press.mutations,
+      screenOff: press.screenOff,
       faceRect: press.faceRect,
       rowRect: press.rowRect,
       outcome: null,
@@ -1055,6 +1340,9 @@ export function installDeadPressProbe(): void {
   }, { capture: true, passive: true });
 
   document.addEventListener('touchcancel', (e) => {
+    // A gesture the system took is the platform working, so the row-missed
+    // press goes with it and earns no recovery.
+    if (missedPress && touchOf(e, missedPress.touchId)) missedPress = null;
     const press = armed;
     if (!press || !touchOf(e, press.touchId)) return;
     armed = null;
@@ -1072,6 +1360,7 @@ export function installDeadPressProbe(): void {
       toasted: report !== null,
       rowRect: press.rowRect,
       faceRect: press.faceRect,
+      screenOff: press.screenOff,
     });
     if (report) showToast(report, 'warning');
   }, { capture: true, passive: true });
@@ -1088,6 +1377,9 @@ export function installDeadPressProbe(): void {
   // `touchstart` behind it, the page is taking clicks while the touch pipeline
   // is dead. iOS standalone PWAs are reported to reach exactly that.
   document.addEventListener('click', (e) => {
+    // Any click at all means the gesture was not dead, so the rescue below
+    // stands down. It runs only where nothing else answered.
+    if (missSettle !== null) { clearTimeout(missSettle); missSettle = null; }
     const target = e.target as Element | null;
     if (!target) return;
     // A TOUCHLESS click opens a fresh quiet window, and a paired one must not.

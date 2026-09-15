@@ -24,6 +24,7 @@ export type ClientControl = { type: 'barge_in' } | { type: 'hang_up' };
 /** Everything the engine may say as text. Its binary frames are talker audio. */
 export type ServerFrame =
   | { type: 'session_started'; audio: AudioSpec }
+  | { type: 'user_transcript'; text: string }
   | { type: 'user_turn_ended'; transcript: string }
   | { type: 'talker_transcript'; text: string }
   | { type: 'talker_turn_ended' }
@@ -39,6 +40,7 @@ export type ServerFrame =
  */
 export const SERVER_FRAME_PAYLOAD = {
   session_started: ['audio', 'object'],
+  user_transcript: ['text', 'string'],
   user_turn_ended: ['transcript', 'string'],
   talker_transcript: ['text', 'string'],
   talker_turn_ended: null,

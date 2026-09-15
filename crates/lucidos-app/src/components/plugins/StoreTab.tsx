@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import {
   marketplaceCatalog,
+  marketplaceScanning,
   installedPlugins,
   appSearchQuery,
   pluginsInstalledOnly,
@@ -16,7 +17,7 @@ import { refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
 import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { loadInstalledPlugins } from '../../store/actions/plugins';
 import { openAppById } from '../../store/actions/apps';
-import { focusThread } from '../../store/actions/threads';
+import { focusSpawnedThread } from '../../store/actions/threads';
 import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall';
 import { ProposeUpstreamButton } from './ProposeUpstreamButton';
 import { openSettingsSubview } from '../../store/actions/menu';
@@ -205,6 +206,17 @@ export function pluginRowsSettled(
 ): boolean {
   const settled = (l: Loadable<unknown>) => l.status === 'loaded' || l.status === 'failed';
   return settled(catalog) && settled(installed);
+}
+
+/** What an unfiltered, empty catalog list says.
+ *
+ *  A registered marketplace is listed the moment its registry write lands, and
+ *  its plugins are unknown until the scan has cloned the repo. So "none" is
+ *  wrong for the seconds that takes, and it is wrong at the one moment the user
+ *  is most likely to be looking: right after registering their first
+ *  marketplace. Pure + exported for the unit test. */
+export function emptyCatalogMessage(scanning: boolean): string {
+  return scanning ? 'Scanning marketplaces…' : 'No plugins found.';
 }
 
 export function StoreTab() {
@@ -408,7 +420,7 @@ function StoreTabLoaded({
               to install one.
             </p>
           ) : (
-            <p>No plugins found.</p>
+            <p>{emptyCatalogMessage(marketplaceScanning.value)}</p>
           )}
         </div>
       ) : (
@@ -455,14 +467,13 @@ function PluginStoreRow({ plugin, installingSource, stageInstall }: Partial<Plug
       break;
     case 'setup':
       label = 'Setup';
-      // focusThread (not …OrBootstrap): the setup thread may be spawned but
-      // not yet materialized as a thread_summaries row (queued in the
-      // Thread Queue), so a bootstrap fetch would 404 → "Thread not found".
-      // focusThread sets focus and lets the row + events stream in over
-      // SSE — same rationale as the confirm-navigation path in
-      // plugin-install.ts. The catalog only surfaces this button for a
-      // present-or-queued setup thread (a gone one resolves to Open).
-      onPrimary = () => focusThread(action.threadId);
+      // The catalog surfaces this button for a present-or-queued setup thread;
+      // a gone one resolves to Open. A QUEUED one has no thread_summaries row
+      // at all. So a bootstrap fetch would 404, and a plain focusThread would
+      // be undone by ThreadView's stale-pointer cleanup and land on the compose
+      // view. `focusSpawnedThread` holds the focus until the row arrives,
+      // exactly as the confirm path in plugin-install.ts does.
+      onPrimary = () => focusSpawnedThread(action.threadId);
       break;
     case 'open':
       label = 'Open';

@@ -16,7 +16,7 @@ import { listArtifacts, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
-import { openExternalUrl } from '../../utils/openExternalUrl';
+import { openExternalUrl, refuseDangerousUrl } from '../../utils/openExternalUrl';
 import { DATA_PATH_PREFIXES } from '../../utils/linkifyPaths';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
@@ -114,7 +114,7 @@ export async function uploadFiles(files: FileList | File[]): Promise<void> {
     const summary = succeeded > 0
       ? `${succeeded} imported, ${failed} failed`
       : failed === 1 ? 'Import failed' : `${failed} imports failed`;
-    showToast(`${summary} — ${errors.join('; ')}`, 'error', { key: UPLOAD_TOAST_KEY });
+    showToast(`${summary}: ${errors.join('; ')}`, 'error', { key: UPLOAD_TOAST_KEY });
   }
 
   await loadArtifacts();
@@ -233,6 +233,7 @@ export function normalizeUrl(url: string): string {
  *  label, or "an app"). A "couldn't open it" toast then names what asked,
  *  instead of appearing out of nowhere. Same shape as `openAppById`'s. */
 export function openUrlOutsideApp(url: string, source?: string): void {
+  if (refuseDangerousUrl(url, source)) return;
   const normalized = normalizeUrl(url);
   if (!isTauri()) {
     // Browser + PWA: a new tab, except on an installed iOS PWA where that would
@@ -252,6 +253,7 @@ export function openUrlOutsideApp(url: string, source?: string): void {
  *  browser is opt-in and desktop-only, so it mounts the url-preview panel only
  *  when it is the live target. Everything else goes to `openUrlOutsideApp`. */
 export function openUrl(url: string, source?: string): void {
+  if (refuseDangerousUrl(url, source)) return;
   if (!inAppBrowserAvailable()) {
     openUrlOutsideApp(url, source);
     return;

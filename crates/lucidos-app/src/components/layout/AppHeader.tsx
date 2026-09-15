@@ -259,7 +259,7 @@ export function AppHeader() {
 
   return (
     <>
-      <header ref={headerRef} class="pane-header app-header" data-mobile-view={mobileView.value} onClick={onHeaderClick} onDblClick={onHeaderDblClick}>
+      <header ref={headerRef} class="pane-header app-header" data-titlebar-band data-mobile-view={mobileView.value} onClick={onHeaderClick} onDblClick={onHeaderDblClick}>
         {/* Focused-pane wash: a faint lighter-blue tint over the focused pane's
             header segment (drawer / thread / content) — the visual cue for which
             pane is focused. One box per pane, each STATICALLY positioned over its

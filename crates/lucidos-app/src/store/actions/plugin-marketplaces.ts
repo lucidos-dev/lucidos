@@ -5,9 +5,9 @@ import {
   removePluginMarketplace,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
-import { marketplaceCatalog, showToast } from '../store';
+import { marketplaceCatalog, marketplaceScanning, showToast } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
-import type { MarketplaceCatalog } from '../types';
+import type { MarketplaceCatalog, PluginMarketplace } from '../types';
 
 /** The official Lucidos plugin marketplace. Suggested as a one-click add in the
  *  Plugins panel catalog and Settings → Marketplaces empty states so a fresh workspace has a
@@ -58,6 +58,38 @@ async function fetchCatalogWithRetry(): Promise<MarketplaceCatalog> {
 // starts, so a steady stream can never build a backlog or spin.
 let catalogRefreshQueued = false;
 
+// The marketplace list the latest local mutation put on screen, set by
+// `applyMarketplaceMutation` and consumed by the next scan to finish. A scan
+// disagreeing with it read the registry before that write, so its list is older
+// than one already on screen: drop it, or the row the user just added blinks
+// out. Consumed whatever it says, so a peer's concurrent change costs one extra
+// scan instead of looping.
+let expectedMarketplaces: string | null = null;
+
+/** Every field a mutation can change, not just the id. A marketplace id is a
+ *  hash of its canonical source, so re-registering a source under a new name
+ *  keeps the id. An id-only key is therefore blind to a rename, which is the
+ *  mutation that had the panel showing a stale name in the first place. Both
+ *  lists come from the one registry file, so equal values compare identical. */
+function marketplaceKey(marketplaces: PluginMarketplace[]): string {
+  return marketplaces
+    .map((m) => [m.id, m.name, m.source].join(' '))
+    .sort()
+    .join('\n');
+}
+
+/** Did this scan come back with an older marketplace list than the one a local
+ *  mutation already applied? Consumes the expectation either way.
+ *
+ *  The engine writes the registry before it announces, so the scan our own SSE
+ *  frame started reads the new registry and passes. Only a scan that began
+ *  before the write is dropped. */
+function scanRanBehindAMutation(scanned: PluginMarketplace[]): boolean {
+  const expected = expectedMarketplaces;
+  expectedMarketplaces = null;
+  return expected !== null && marketplaceKey(scanned) !== expected;
+}
+
 /** Load the catalog. `force` re-reads even when it is already loaded, but a
  *  call landing during another scan still JOINS that scan: this is the reader's
  *  entry point, and a reader has no mutation to be fresher than. Use
@@ -67,9 +99,20 @@ export function loadPluginCatalog(force = false): Promise<void> {
   if (catalogLoadInFlight) return catalogLoadInFlight;
   catalogLoadInFlight = (async () => {
     setLoadingIfFresh(marketplaceCatalog);
+    marketplaceScanning.value = true;
     try {
-      marketplaceCatalog.value = { status: 'loaded', data: await fetchCatalogWithRetry() };
+      const catalog = await fetchCatalogWithRetry();
+      if (scanRanBehindAMutation(catalog.marketplaces)) {
+        // Queue the re-scan here rather than trust the caller to have queued
+        // one, so a dropped result can never leave the panel with none coming.
+        catalogRefreshQueued = true;
+        return;
+      }
+      marketplaceCatalog.value = { status: 'loaded', data: catalog };
     } catch (e) {
+      // The applied list goes with the catalog it lived in, so there is nothing
+      // left for a later scan to be checked against.
+      expectedMarketplaces = null;
       marketplaceCatalog.value = toFailed(e);
     }
   })().finally(() => {
@@ -77,7 +120,11 @@ export function loadPluginCatalog(force = false): Promise<void> {
     if (catalogRefreshQueued) {
       catalogRefreshQueued = false;
       void loadPluginCatalog(true);
+      return;
     }
+    // Cleared only when nothing follows, so a trailing scan reads as one
+    // continuous scan rather than blinking the flag off between the two.
+    marketplaceScanning.value = false;
   });
   return catalogLoadInFlight;
 }
@@ -113,6 +160,43 @@ export async function refreshPluginCatalogAfterMutation(): Promise<void> {
   await loadPluginCatalog(true);
 }
 
+/** Show the marketplace list an add/remove response carried, then fill in the
+ *  plugins behind it.
+ *
+ *  A scan git-clones every registered marketplace, so it takes seconds per
+ *  repo, and the write it will report is already committed when the response
+ *  returns. Waiting for one before showing the row is what left the Add form
+ *  disabled with the URL still in it. Reasoning and rejected variants:
+ *  `docs/plans/2026-09-15-marketplace-add-must-not-wait-on-the-catalog-scan.md`.
+ *
+ *  Plugins and scan errors still come from a scan. Only those under a
+ *  marketplace that is no longer registered are dropped here, since keeping
+ *  them would offer a removed marketplace's plugins as installable. A catalog
+ *  that is not yet `loaded` shows nothing: synthesising one with no plugins
+ *  would swap the Store tab's skeleton for an empty state the scan contradicts.
+ *
+ *  The list is recorded as the expectation either way. THAT is what lets the
+ *  rescan join an in-flight scan rather than queue a trailing one. So the two
+ *  are one function, not a pairing a caller could split. */
+function applyMarketplaceMutation(marketplaces: PluginMarketplace[]): void {
+  expectedMarketplaces = marketplaceKey(marketplaces);
+  const current = marketplaceCatalog.value;
+  if (current.status === 'loaded') {
+    const registered = new Set(marketplaces.map((m) => m.id));
+    marketplaceCatalog.value = {
+      status: 'loaded',
+      data: {
+        marketplaces,
+        plugins: current.data.plugins.filter((p) => registered.has(p.marketplace_id)),
+        errors: current.data.errors.filter((e) => registered.has(e.marketplace_id)),
+      },
+    };
+  }
+  // Never awaited: the mutation itself is done, so holding a form open for a
+  // clone-everything pass is the freeze this fixes.
+  void refreshPluginCatalog();
+}
+
 export async function addPluginMarketplaceAction(source: string, name?: string): Promise<boolean> {
   const trimmed = source.trim();
   if (!trimmed) {
@@ -120,9 +204,9 @@ export async function addPluginMarketplaceAction(source: string, name?: string):
     return false;
   }
   try {
-    await addPluginMarketplace(trimmed, name?.trim() || undefined);
+    const { marketplaces } = await addPluginMarketplace(trimmed, name?.trim() || undefined);
+    applyMarketplaceMutation(marketplaces);
     showToast('Marketplace registered', 'success');
-    await refreshPluginCatalogAfterMutation();
     return true;
   } catch (e) {
     showToast(`Failed to register marketplace: ${errorDetail(e)}`, 'error');
@@ -140,9 +224,9 @@ export function addOfficialMarketplaceAction(): Promise<boolean> {
 
 export async function removePluginMarketplaceAction(id: string): Promise<void> {
   try {
-    await removePluginMarketplace(id);
+    const { marketplaces } = await removePluginMarketplace(id);
+    applyMarketplaceMutation(marketplaces);
     showToast('Marketplace removed', 'success');
-    await refreshPluginCatalogAfterMutation();
   } catch (e) {
     showToast(`Failed to remove marketplace: ${errorDetail(e)}`, 'error');
   }

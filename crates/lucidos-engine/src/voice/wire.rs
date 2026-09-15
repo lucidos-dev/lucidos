@@ -51,6 +51,12 @@ pub enum ClientControl {
 pub enum ServerFrame {
     /// The call is up. Carries the PCM to send and to expect.
     SessionStarted { audio: AudioSpec },
+    /// A piece of what the CALLER is saying, as they say it.
+    ///
+    /// A partial, so it is revised by the ones after it and replaced outright
+    /// by [`Self::UserTurnEnded`]. The client draws it and settles nothing on
+    /// it: only a finished turn is a sentence.
+    UserTranscript { text: String },
     /// The caller stopped talking, and this is what was heard.
     UserTurnEnded { transcript: String },
     /// A piece of what the talker is saying, as it says it.
@@ -87,6 +93,10 @@ mod tests {
                     audio: AudioFormat::default().into(),
                 },
                 vec!["audio", "type"],
+            ),
+            (
+                ServerFrame::UserTranscript { text: "hel".into() },
+                vec!["text", "type"],
             ),
             (
                 ServerFrame::UserTurnEnded {

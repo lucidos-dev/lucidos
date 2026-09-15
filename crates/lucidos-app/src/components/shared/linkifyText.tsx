@@ -9,13 +9,22 @@ const URL_RE = /https?:\/\/[^\s<>"')\]]+/g;
 // ending a sentence ("… /docs/getting-started.") must not swallow the period.
 const TRAILING_PUNCT = /[.,;:!?]+$/;
 
-/** Turn bare URLs in plain text into clickable links for rendering as JSX.
+/** Turn bare URLs in plain text into clickable links, as JSX.
  *
- *  Unlike `utils/linkifyPaths` (which post-processes an HTML string for chat),
- *  this returns Preact children built from the text directly — the text is never
- *  interpreted as HTML, so it is safe for arbitrary toast content without
- *  `dangerouslySetInnerHTML`. Returns the input string unchanged when it holds
- *  no URL, so the common (no-link) toast allocates nothing extra. */
+ *  `utils/linkifyPaths` post-processes an HTML string for chat. This builds
+ *  Preact children from the text instead, so nothing is ever interpreted as
+ *  HTML and no caller needs `dangerouslySetInnerHTML`. Text with no URL comes
+ *  back unchanged, so a link-free caller allocates nothing.
+ *
+ *  The anchor carries NO click handler, deliberately. `onGlobalClick`
+ *  (hooks/useStartup.ts) claims every absolute http(s) anchor and routes it
+ *  through `openUrl`. That is where the in-app browser, the packaged client's
+ *  OS opener and the iOS PWA Safari hand-off live.
+ *
+ *  A `stopPropagation` here would keep the click off that funnel. WKWebView
+ *  drops a bare `_blank` navigation, so the link would then be dead in the
+ *  packaged app. A clickable ANCESTOR skips its own action instead, as `Toast`
+ *  does. */
 export function linkifyText(text: string): ComponentChildren {
   const matches = [...text.matchAll(URL_RE)];
   if (matches.length === 0) return text;
@@ -36,14 +45,14 @@ export function linkifyText(text: string): ComponentChildren {
     if (!url) continue;
     if (start > cursor) nodes.push(text.slice(cursor, start));
     nodes.push(
+      // `accent-link` is the app's link appearance, so a surface adopting this
+      // helper needs no stylesheet rule of its own.
       <a
         key={nodes.length}
+        class="accent-link"
         href={url}
         target="_blank"
         rel="noopener noreferrer"
-        // The toast message span may carry its own onClick (toast-clickable);
-        // opening a link must not also fire it.
-        onClick={(e) => e.stopPropagation()}
       >
         {url}
       </a>,

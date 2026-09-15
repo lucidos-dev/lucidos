@@ -65,11 +65,12 @@ describe('a finished call is not aborted', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
   });
 
-  it('does not answer for a doer turn still running elsewhere on the thread', () => {
+  // A thread's status is about its TURN, and this exchange holds none, so the
+  // status is not about it. A doer working, or one that failed an hour ago,
+  // says nothing about whether the caller is still owed an answer.
+  it('settles whatever a turn elsewhere on the thread is doing', () => {
     const exchange = lastExchange(theCall());
-    // The thread is not idle, so the call falls through to the ordinary
-    // machinery rather than declaring the thread finished.
-    expect(exchangeStatus(exchange, '', true, false, false, false)).not.toBe('done');
+    expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('done');
   });
 
   // Voice never moves the thread's status, so `threadIdle` is true for the
@@ -174,6 +175,16 @@ describe('a call in progress says so', () => {
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
   });
 
+  // The same on a busy thread, which is where a delegated utterance still
+  // needs the thread's status: it IS a turn, so it queues behind another one
+  // and the ordinary machinery owns its verdict.
+  it('leaves a delegated utterance to the ordinary machinery while the thread works', () => {
+    const events = delegatedAndWaiting();
+    put(events, 5, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12 });
+    const exchange = lastExchange(events);
+    expect(exchangeStatus(exchange, '', true, false, false, false)).not.toBe('done');
+  });
+
   // The talker-only half of the same rule. Nobody else was asked, so ringing
   // off IS the end of it.
   it('lets a hangup settle an utterance the talker held', () => {
@@ -203,5 +214,56 @@ describe('a call in progress says so', () => {
     // Not the call arm any more: a real step landed, so the ordinary machinery
     // owns the verdict and the stale detector is live again.
     expect(exchangeStatus(exchange, '', true, false, false, true)).toBe('aborted');
+  });
+});
+
+/** The reported thread. A delegated turn failed, the caller asked for it
+ *  again, and rang off before the talker could answer.
+ *
+ *  Voice moves nothing on the thread's status (ADR 0148), so it stays `failed`
+ *  from the doer's own turn, and no later event can clear it. `threadIdle` is
+ *  therefore false for good. The caller's last words hold no turn, so nothing
+ *  will ever terminate them either.
+ *
+ *  Gated on the thread's status, the call arm never ran, and the last thing
+ *  said shimmered "Requesting" for as long as the thread existed.
+ */
+describe('a call that rang off after a failed turn settles', () => {
+  function theReportedThread(): Map<number, StoredEvent> {
+    return new Map([
+      ev(1, { type: 'VoiceSessionStarted', session_id: 'sess-1' }),
+      ev(2, { type: 'WorkDelegated', session_id: 'sess-1', reason: 'What are the best ideas' }),
+      ev(3, {
+        type: 'MessageReceived',
+        text: 'What are the best ideas',
+        mode: 'human',
+        channel: 'chat',
+        voice_session_id: 'sess-1',
+        _eventId: MSG,
+      }),
+      ev(4, { type: 'ResponseFailed', error: 'model_not_found', request_event_id: MSG }),
+      heard(5, 'Again, please'),
+      ev(6, { type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 54 }),
+    ]);
+  }
+
+  it('reads done rather than spinning for ever', () => {
+    const exchange = lastExchange(theReportedThread());
+    expect(exchangeStatus(exchange, '', true, false, false, false)).toBe('done');
+  });
+
+  it('never shows the reported "Requesting" label', () => {
+    const exchange = lastExchange(theReportedThread());
+    const status = exchangeStatus(exchange, '', true, false, false, false);
+    expect(statusLabel(status, /* hasSteps */ false).label).not.toBe('Requesting');
+  });
+
+  // The failed turn keeps its own verdict. Settling the call must not reach
+  // back and hide why the caller asked again.
+  it('leaves the failed doer turn reading as an error', () => {
+    const exchanges = groupIntoExchanges(theReportedThread());
+    const doer = exchanges.find(e => e.userEvent.type === 'MessageReceived');
+    expect(doer).toBeDefined();
+    expect(exchangeStatus(doer!, '', false, false, false, false)).toBe('error');
   });
 });

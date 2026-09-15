@@ -147,8 +147,8 @@ describe('device attribution', () => {
   async function headerOn(deviceId: string | null): Promise<string | undefined> {
     if (deviceId === null) localStorage.removeItem('lucidos-device-id');
     else localStorage.setItem('lucidos-device-id', deviceId);
-    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
-    globalThis.fetch = spy as unknown as typeof fetch;
+    const spy = vi.fn<typeof fetch>(async () => new Response('{}', { status: 200 }));
+    globalThis.fetch = spy;
     await request('/triggers');
     const init = spy.mock.calls[0][1] as RequestInit;
     return (init.headers as Record<string, string>)[DEVICE_ID_HEADER];
@@ -166,8 +166,8 @@ describe('device attribution', () => {
 
   it('lets a caller-supplied header win, so an explicit device is never masked', async () => {
     localStorage.setItem('lucidos-device-id', 'stored');
-    const spy = vi.fn(async () => new Response('{}', { status: 200 }));
-    globalThis.fetch = spy as unknown as typeof fetch;
+    const spy = vi.fn<typeof fetch>(async () => new Response('{}', { status: 200 }));
+    globalThis.fetch = spy;
     await request('/triggers', { headers: { [DEVICE_ID_HEADER]: 'explicit' } });
     const init = spy.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)[DEVICE_ID_HEADER]).toBe('explicit');

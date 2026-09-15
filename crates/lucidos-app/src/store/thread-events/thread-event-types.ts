@@ -320,6 +320,13 @@ export type StoredEvent = ThreadEvent & {
    *  the provider transcribes them. See *live utterance* in
    *  `docs/glossary.md`. */
   _liveUtterance?: true;
+  /** The same for the talker's reply while it is being spoken. See *live
+   *  reply* in `docs/glossary.md`. */
+  _liveReply?: true;
+  /** On a `_liveUtterance` row, marks its `text` as a PARTIAL: the provider
+   *  has not ended the turn, so the caller is still saying it. Nothing may
+   *  settle on those words, and nothing is in flight behind them. */
+  _livePartial?: true;
 };
 
 /** Events that define (or redefine) a thread's channel/source. */

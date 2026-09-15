@@ -16,6 +16,7 @@ pub mod call;
 pub mod decision;
 pub mod doer;
 pub mod language;
+pub mod live;
 pub mod provider;
 pub mod realtime;
 pub mod recovery;
@@ -529,6 +530,46 @@ mod tests {
         assert_eq!(
             instructions_for(language.as_ref()),
             instructions_for(language.as_ref())
+        );
+    }
+
+    /// Two providers answer this seam, and nothing outside it may name one.
+    ///
+    /// The point of ADR 0149's seam, made checkable. `voice/build.rs` picks
+    /// between them from the model id, and every other engine source talks to
+    /// `VoiceProvider`. A second site that knew the answer would be the place
+    /// the two implementations start to diverge above the line.
+    ///
+    /// Model IDS are deliberately not in the needle list. Settings and the
+    /// preference catalog carry them, which is how a user picks one, and
+    /// neither learns anything about a protocol from doing so.
+    #[test]
+    fn nothing_outside_the_voice_module_names_a_provider() {
+        let needles = [
+            "RealtimeProvider",
+            "LiveProvider",
+            "v1/realtime",
+            "v1/live/sessions",
+        ];
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for (rel, text) in crate::test_support::source_scan::production_sources() {
+            if rel.starts_with("voice/") {
+                continue;
+            }
+            scanned += 1;
+            for needle in needles {
+                if text.contains(needle) {
+                    offenders.push(format!("{}: {}", rel, needle));
+                }
+            }
+        }
+        // A moved module would otherwise make this pass by reading nothing.
+        assert!(scanned > 100, "the scan found only {} sources", scanned);
+        assert!(
+            offenders.is_empty(),
+            "only voice/ may name a talker provider (ADR 0149): {:?}",
+            offenders
         );
     }
 

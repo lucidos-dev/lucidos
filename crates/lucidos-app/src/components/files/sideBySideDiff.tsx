@@ -144,7 +144,12 @@ function cellRow(cell: SideBySideCell | null, highlighted: string[], change: 'de
  *  `white-space: pre`, so every row is exactly one line tall and the two
  *  columns stay in step by construction. That is also why this view cannot wrap
  *  long lines the way the unified one does; each column scrolls horizontally
- *  instead. */
+ *  instead.
+ *
+ *  Hence `wideLines="caller"`. It says the column's own scroller owns the
+ *  overflow AND its own rules own the row backgrounds, so neither file-preview
+ *  mode reaches these rows. The `pan` mode's opaque surface is two classes
+ *  deep and would paint over every green and red tint below. */
 export function SideBySideDiff({ file }: { file: DiffFile }) {
   const ext = file.path.split('.').pop()?.toLowerCase() || '';
   const { left, right } = sideBySideColumns(file, ext);
@@ -152,10 +157,10 @@ export function SideBySideDiff({ file }: { file: DiffFile }) {
   return (
     <div class="side-by-side-diff" data-role="side-by-side-diff">
       <div class="side-by-side-diff-side" data-role="side-by-side-diff-original" aria-label="Original">
-        <LineNumberedCode rows={left} selection="none" />
+        <LineNumberedCode rows={left} selection="none" wideLines="caller" />
       </div>
       <div class="side-by-side-diff-side" data-role="side-by-side-diff-changed" aria-label="Changed">
-        <LineNumberedCode rows={right} selection="none" />
+        <LineNumberedCode rows={right} selection="none" wideLines="caller" />
       </div>
     </div>
   );

@@ -671,8 +671,9 @@ fn arm_engine_env(
 /// is the region a context benchmark is about.
 ///
 /// The engine spells the same name in `engine::eval_capture::FULL_CAPTURE_ENV`,
-/// and the name IS the contract. Set on the arms alone, exactly as the query
-/// classifier pin is. See ADR 0110 decision 12.
+/// and the name IS the contract. Set on the arms alone, which the classifier
+/// pin below no longer is: the e2e harness sets that one too
+/// (`scripts/lib/e2e.sh`). See ADR 0110 decision 12.
 pub const FULL_CAPTURE_ENV: &str = "LUCIDOS_EVAL_FULL_CAPTURE";
 
 /// Pins what the engine's query classifier answers, instead of asking an LLM.

@@ -225,7 +225,7 @@ export async function sendCodingAgentControl(threadId: string, request: Record<s
       return 'pending';
     }
     const detail = err instanceof ApiError ? err.reason : 'session may have ended';
-    showToast(`Failed to send control request — ${detail}`, 'error');
+    showToast(`Failed to send control request: ${detail}`, 'error');
     return 'error';
   }
 }

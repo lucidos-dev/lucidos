@@ -42,13 +42,13 @@ export function previewMediaKind(ext: string): PreviewMediaKind {
 // source (or the rendered view for the RENDERABLE_EXTS subset) and editable
 // inline. Excludes binary previews (image / pdf / audio / video).
 //
-// This list is the DISPATCH gate: FilePreviewInline routes to `TextContent`
-// for an extension listed here, or for one carrying an explicit special case in
-// that condition (today `svg`, which is image-like unless `sourceMode` is on).
-// So a RENDERABLE_EXTS entry that is neither listed here nor special-cased has
-// an unreachable rich-render branch and falls through to "Preview not
-// available". `htm` was missing exactly that way, despite RENDERABLE_EXTS
-// listing it and `TextContent` branching on it. Pinned by
+// This list is the DISPATCH gate. `dataPreviewBody` (previewBody.ts) answers
+// with a text body for an extension listed here, or for one carrying an
+// explicit special case there. Today that is `svg` alone, image-like unless
+// the Source toggle is on. So a RENDERABLE_EXTS entry that is neither listed
+// here nor special-cased has an unreachable rich-render branch and falls
+// through to "Preview not available". `htm` was missing exactly that way,
+// despite RENDERABLE_EXTS listing it and the preview branching on it. Pinned by
 // `previewExts.test.ts` § "TEXT_EXTS is the dispatch gate", which asserts the
 // set of special cases is exactly `svg` so a new one cannot be added silently.
 export const TEXT_EXTS = [

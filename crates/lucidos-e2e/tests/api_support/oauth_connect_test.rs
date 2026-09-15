@@ -83,7 +83,9 @@ async fn connecting_a_known_provider_with_no_client_prefills_its_endpoints() {
     // modal made the user type a provider's own URLs by hand.
     assert_eq!(request["defaults"]["auth_url"], known["auth_url"]);
     assert_eq!(request["defaults"]["token_url"], known["token_url"]);
-    assert_eq!(request["base_url"], known["base_url"]);
+    // A one-member scope: a registration names the provider's own API host, and
+    // `base_urls` is the spelling every layer uses (ADR 0161).
+    assert_eq!(request["base_urls"], serde_json::json!([known["base_url"]]));
 }
 
 /// A registration that exists but cannot drive a flow reopens the SAME form,

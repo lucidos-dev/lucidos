@@ -33,6 +33,10 @@ source "$WORKSPACE_LIB_DIR/docker.sh"
 # functions. What it buys is that a caller of workspace.sh alone still has it.
 # shellcheck source=scripts/lib/ports.sh
 source "$WORKSPACE_LIB_DIR/ports.sh"
+# For `proc_env_value`, which `engine_gateway_port` reads a running engine's own
+# environment with. Pure parsing, no host call, so sourcing it costs nothing.
+# shellcheck source=scripts/lib/proc_env.sh
+source "$WORKSPACE_LIB_DIR/proc_env.sh"
 
 # ── path_is_in_cc_worktree ──────────────────────────────────────────────
 # True (exit 0) when $1 lies inside a coding-agent worktree — one of the
@@ -2216,6 +2220,54 @@ gateway_curl() {
     else
         curl "$@"
     fi
+}
+
+# ── which gateway owns a workspace ──────────────────────────────────────
+# More than one gateway runs on this machine: the dev one on 5251, serving
+# source-checkout workspaces, and the packaged Lucidos.app one on 5252. Each has
+# its own registry, and a stop posted to the wrong one reaches a process that
+# has never heard of the workspace. So the port cannot be a constant.
+#
+# It does not have to be. The gateway puts its own port into every engine it
+# spawns (`engine_env_overrides` in crates/lucidos-gateway/src/stack.rs), so the
+# engine being stopped carries the answer in its own environment.
+
+# The gateway port of the engine recorded in the pidfile $1, or nothing.
+#
+# Nothing means: no pidfile, a stale pid, an engine started with no gateway
+# (LUCIDOS_NO_GATEWAY dev, the e2e harness), or a platform whose `ps` refuses
+# `-E`. Only macOS prints another process's environment that way, and Linux
+# lands on the same fallback the whole script used before. The caller falls back
+# and says so, rather than guessing which gateway a dead engine belonged to.
+engine_gateway_port() {
+    local pid
+    pid="$(cat "$1" 2>/dev/null || true)"
+    case "$pid" in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 0
+    proc_env_value "$(ps -E -p "$pid" -o command= 2>/dev/null)" LUCIDOS_GATEWAY_PORT
+}
+
+# POST the gateway's stop control for $2 on port $1, printing the HTTP status.
+#
+# https first, then http: the dev gateway serves TLS when certs exist and plain
+# http otherwise. A refused or unencrypted connection gives curl's own `000`,
+# which is the signal to try the other scheme rather than a gateway answer.
+# "000" is also what a caller sees when no gateway is listening at all.
+#
+# Each call is `|| true`, and that is load-bearing under the caller's `set -e`:
+# curl exits non-zero on a refused connection, which would otherwise take
+# stop.sh down before it ever reached the engine signal. The status still
+# reaches us, because `-w` prints 000 on its way out.
+gateway_stop_status() {
+    local port="$1" slug="$2" path code
+    path="/~/api/v1/control/workspaces/$slug/stop"
+    code="$(gateway_curl -sk -o /dev/null -w '%{http_code}' -X POST "https://localhost:$port$path" 2>/dev/null || true)"
+    case "${code:-000}" in
+        000) code="$(gateway_curl -s -o /dev/null -w '%{http_code}' -X POST "http://localhost:$port$path" 2>/dev/null || true)" ;;
+    esac
+    printf '%s' "${code:-000}"
 }
 
 # Stable, filesystem/URL-safe slug from the workspace dir basename — the routing

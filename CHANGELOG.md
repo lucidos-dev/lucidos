@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.37.0 — 2026-09-15
+
+### Added
+
+- **GPT Live 1** joins the talker picker as a second voice family. It listens while it speaks, so it takes an interruption well. It holds no tools, so you settle a question card by tapping it and end the call on the button. It bills by the minute, and that spend does not appear in the usage rollup.
+- The talker picker offers GPT Realtime 2.1, 2.1 mini, 2 and 1.5, with 2.1 as the default. A workspace pinned to an older id keeps it.
+- The transcriber picker offers GPT Realtime Whisper, which streams your words as you speak them.
+- Both voice model rows carry an explainer describing what each family does. The transcriber row states that it has no effect on a GPT Live call.
+- **Wrap long lines in the file preview.** A Wrap long lines button sits in the preview header over any source view, in the Files panel and the preview modal alike. With wrapping off you pan a long line sideways and the line-number gutter stays pinned to the left edge.
+
+### Changed
+
+- `request_credential` names every host a credential may be sent to. When a request needs a host an existing credential does not cover, the modal reopens that credential and widens it, so one provider keeps one entry. A reauthorize names the whole request.
+- The unattended command guard sends three more shapes to the judge: a read-only command carrying a flag that runs another program, a Python dynamic import that shells out, and a write to a raw or mapped disk device.
+- Stopping a workspace asks the gateway that owns it, and reports the answer. A stop for a workspace a gateway does not know returns a clear refusal.
+
+### Fixed
+
+- A `javascript:` URL is refused at every opener: a deep link, an agent navigation over the event stream, a notification toast and a notification inbox row.
+- A base URL carrying a newline cannot forge a script approval.
+- A failed backup no longer records the access token in the event it writes.
+- A call's transcript fills in as the call happens. One thing the caller says is one row, and it gets an answer. A call that ends mid-reply keeps what the caller heard.
+- A packaged client that does not come back after an update keeps asking until it does, and writes what happened to a log file next to the service logs.
+- Registering a plugin marketplace adds the row at once. The form no longer sits disabled through a scan of every marketplace already registered.
+- A `[Plugins](plugins)` link in chat opens the Plugins panel.
+- The URL in a credential prompt is a link.
+- On iOS, a tap the composer never saw while the keyboard is up now runs Send.
+- The cited-line highlight in the file preview paints the whole line, not just the width of the viewer.
+- A new thread keeps the focus you gave it until its row appears in the list.
+- Submitting a message lands the view on the first row of the reply and holds it there.
+- A change that fails to apply draws one Change failed card.
+- Each app window is watched on its own, so one healthy window no longer speaks for the rest. A window you have hidden or minimized is left alone and keeps its state.
+- A window opens on the display its saved frame names.
+- The App row in the executor popover reads as one line of value text. The icon sits on the name's line, and a long name wraps in place.
+- The workspace picker's title bar takes the app's own bar height, at every UI scale.
+- The dead-press probe stays quiet while the client is refreshing, so no wedge report is drawn over the Refreshing status.
+- A path traversal advisory in a build-time test dependency is resolved.
 ## v0.36.0 — 2026-09-08
 
 ### Added

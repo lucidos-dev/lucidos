@@ -19,7 +19,9 @@
 //! reverts the placement on **every window resize**, so [`watch_resizes`] owns
 //! re-applying it.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Where the LEFT edge of the traffic-light cluster goes, in logical px from
 /// the window's left edge. Ours to choose, and one pixel off AppKit's own.
@@ -57,12 +59,24 @@ const DEFAULT_BAR_HEIGHT_PX: f64 = 48.0;
 const MIN_BAR_HEIGHT_PX: f64 = 16.0;
 const MAX_BAR_HEIGHT_PX: f64 = 400.0;
 
-/// The bar height the lights are currently placed against, as `f64::to_bits`.
-/// Seeded from disk in [`load_persisted`] and rewritten by every frontend push,
-/// so the re-apply that each resize forces costs no disk read. A CACHE:
-/// [`BAR_HEIGHT_FILE`] is the durable copy. `0` means "nothing loaded yet" and
-/// is unambiguous, since `0.0` is not a plausible bar height.
-static BAR_HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// The bar height to place a window against before its own page has reported
+/// one, as `f64::to_bits`. Loaded from disk in [`load_persisted`] and rewritten
+/// by every frontend push. `0` means "nothing loaded yet" and is unambiguous,
+/// since `0.0` is not a plausible bar height.
+///
+/// A GUESS, and it covers the frames between a window appearing and its page
+/// measuring. Two surfaces disagree about the bar: the workspace shell renders
+/// at the user's UI scale, and the picker at the browser default. So the last
+/// pusher wins here, and each window's own report wins over it at once.
+static SEED_BAR_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// What each window's OWN page reported, keyed by window label.
+///
+/// Per window, because the bar is a property of the SURFACE a window is showing
+/// rather than of the device. A single shared value let the picker's 48px bar
+/// move a workspace window's lights, and the workspace's scaled bar move the
+/// picker's.
+static BAR_HEIGHTS: Mutex<BTreeMap<String, f64>> = Mutex::new(BTreeMap::new());
 
 /// Remembers the last bar height the frontend reported, so a cold launch places
 /// the lights on the user's bar rather than the compiled default. A bare
@@ -130,12 +144,53 @@ fn persist_bar_height(app: &tauri::AppHandle, px: f64) {
     );
 }
 
-/// The bar height to place with right now: the last one pushed or loaded, else
-/// the compiled default.
-fn current_bar_height() -> f64 {
-    let px = f64::from_bits(BAR_HEIGHT.load(Ordering::SeqCst));
-    if is_plausible_bar_height(px) {
-        px
+/// Where the cluster actually sits, read back off AppKit.
+///
+/// The inverse of [`inset_lights`], and the only way to tell a placement that
+/// held from one AppKit put back the way it likes it. Its one caller is the
+/// window-lifecycle probe, which asserts on it.
+#[cfg(all(target_os = "macos", feature = "window-probe"))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ClusterGeometry {
+    /// The cluster's vertical centre, in points below the window's top edge. A
+    /// correct placement puts it on half the bar height.
+    pub(crate) centre_from_top: f64,
+    /// The left edge of the close button's frame, which [`LIGHTS_X_PX`] sets.
+    pub(crate) left_x: f64,
+}
+
+/// Read the cluster's live geometry off `ns_window`, or `None` for a window with
+/// no standard buttons.
+///
+/// Derived from the window's own frame, not from the container's height. It
+/// stays true whether or not the container is still pinned to the top edge.
+/// AppKit's own layout reads back a centre of 16pt, which is what a reverted
+/// placement looks like.
+#[cfg(all(target_os = "macos", feature = "window-probe"))]
+pub(crate) fn measure_cluster(ns_window: &objc2_app_kit::NSWindow) -> Option<ClusterGeometry> {
+    use objc2_app_kit::NSWindowButton;
+
+    let close = ns_window.standardWindowButton(NSWindowButton::CloseButton)?;
+    // SAFETY: as in `inset_lights`. `superview` is unbounded in what it can
+    // return, we only read a frame off it, and we are on the main thread.
+    let container = unsafe { close.superview().and_then(|view| view.superview()) }?;
+    let frame = close.frame();
+    let centre_in_window = container.frame().origin.y + frame.origin.y + frame.size.height / 2.0;
+    Some(ClusterGeometry {
+        centre_from_top: ns_window.frame().size.height - centre_in_window,
+        left_x: frame.origin.x,
+    })
+}
+
+/// The bar height to place `label` against: what its own page reported, else the
+/// seed, else the compiled default.
+fn bar_height_for(label: &str) -> f64 {
+    if let Some(px) = BAR_HEIGHTS.lock().unwrap().get(label).copied() {
+        return px;
+    }
+    let seed = f64::from_bits(SEED_BAR_HEIGHT.load(Ordering::SeqCst));
+    if is_plausible_bar_height(seed) {
+        seed
     } else {
         DEFAULT_BAR_HEIGHT_PX
     }
@@ -149,13 +204,13 @@ pub(crate) fn load_persisted(app: &tauri::AppHandle) {
         .as_deref()
         .and_then(crate::config_scalar::read);
     let px = bar_height_or_default(persisted.as_deref());
-    BAR_HEIGHT.store(px.to_bits(), Ordering::SeqCst);
+    SEED_BAR_HEIGHT.store(px.to_bits(), Ordering::SeqCst);
 }
 
-/// Place the lights on one window at the current bar height. The re-apply path:
-/// called on every `Resized`, because AppKit reverts the placement on each one.
+/// Place the lights on one window at ITS bar height. The re-apply path: called
+/// on every `Resized`, because AppKit reverts the placement on each one.
 pub(crate) fn place(window: &tauri::Window) {
-    place_at(window, current_bar_height());
+    place_at(window, bar_height_for(window.label()));
 }
 
 /// Place the lights on every top-level app window. Used at the two moments a
@@ -163,10 +218,9 @@ pub(crate) fn place(window: &tauri::Window) {
 /// New-Window child is built. Panel preview webviews (`url-preview-*`) are
 /// skipped, exactly as in `crate::paint_title_bars`.
 pub(crate) fn place_all(app: &tauri::AppHandle) {
-    let bar_height_px = current_bar_height();
     for (label, window) in tauri::Manager::windows(app) {
         if crate::app_window::is_app_window(&label) {
-            place_at(&window, bar_height_px);
+            place_at(&window, bar_height_for(&label));
         }
     }
 }
@@ -174,10 +228,10 @@ pub(crate) fn place_all(app: &tauri::AppHandle) {
 /// Apply a bar height the frontend just measured: remember it, place the calling
 /// window's lights, and persist it for the next cold launch.
 ///
-/// Only the CALLING window is placed. Every window resolves the same bar
-/// height, a function of the one device-wide UI scale, and each reports for
-/// itself as it boots. Fanning out here would only re-place windows that are
-/// about to say the same thing.
+/// Only the CALLING window is placed, and the height is stored under ITS label.
+/// Two windows can show surfaces with different bars, so a push is never news
+/// about anybody else. The same value also becomes the seed for a window that
+/// has not reported yet, and the durable copy for the next cold launch.
 pub(crate) fn set_bar_height(
     app: &tauri::AppHandle,
     window: &tauri::Window,
@@ -196,7 +250,11 @@ pub(crate) fn set_bar_height(
              {MAX_BAR_HEIGHT_PX})"
         ));
     }
-    BAR_HEIGHT.store(bar_height_px.to_bits(), Ordering::SeqCst);
+    BAR_HEIGHTS
+        .lock()
+        .unwrap()
+        .insert(window.label().to_string(), bar_height_px);
+    SEED_BAR_HEIGHT.store(bar_height_px.to_bits(), Ordering::SeqCst);
     place_at(window, bar_height_px);
     // Deliberately AFTER the validation, so the file can only ever hold a value
     // the startup path accepts. Same ordering as `persist_title_bar_color`.
@@ -301,7 +359,8 @@ fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
         return;
     }
 
-    let block = block2::RcBlock::new(|notification: std::ptr::NonNull<NSNotification>| {
+    let owner = label.to_string();
+    let block = block2::RcBlock::new(move |notification: std::ptr::NonNull<NSNotification>| {
         // AppKit posts this on the main thread and we registered with a nil
         // queue, so the block runs there. Checked rather than assumed: reaching
         // into AppKit off the main thread would be unsound, and skipping costs
@@ -318,7 +377,7 @@ fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
         // `NSWindow`, and it is alive because it is the one posting.
         let ns_window: &objc2_app_kit::NSWindow =
             unsafe { &*objc2::rc::Retained::as_ptr(&object).cast() };
-        inset_lights(ns_window, LIGHTS_X_PX, current_bar_height());
+        inset_lights(ns_window, LIGHTS_X_PX, bar_height_for(&owner));
     });
 
     let object: &objc2::runtime::AnyObject = ns_window;
@@ -339,7 +398,9 @@ fn watch_resizes(label: &str, ns_window: &objc2_app_kit::NSWindow) {
 
 /// Off macOS no window was ever watched.
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn unwatch(_label: &str) {}
+pub(crate) fn unwatch(label: &str) {
+    BAR_HEIGHTS.lock().unwrap().remove(label);
+}
 
 /// Drop a closed window's resize observer. Called from the `Destroyed` arm of
 /// `on_window_event`, and the only thing that stops the notification centre
@@ -348,7 +409,11 @@ pub(crate) fn unwatch(_label: &str) {}
 /// else's window.
 #[cfg(target_os = "macos")]
 pub(crate) fn unwatch(label: &str) {
-    // The map is the main thread's (see [`RESIZE_OBSERVERS`]) and
+    // Before the main-thread guard: a plain mutex needs no thread, and a
+    // reported height left behind would be handed to the next window to take
+    // this label.
+    BAR_HEIGHTS.lock().unwrap().remove(label);
+    // The observer map is the main thread's (see [`RESIZE_OBSERVERS`]) and
     // `on_window_event` runs there. This checks the invariant rather than
     // taking a branch we expect.
     if objc2::MainThreadMarker::new().is_none() {
@@ -374,7 +439,7 @@ pub(crate) fn unwatch(label: &str) {
 /// previous run leaves the buttons' `origin.y` and their pitch unchanged, so a
 /// second call reads the same inputs and writes the same frames.
 #[cfg(target_os = "macos")]
-fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64) {
+pub(crate) fn inset_lights(ns_window: &objc2_app_kit::NSWindow, x: f64, bar_height_px: f64) {
     use objc2_app_kit::NSWindowButton;
 
     let (Some(close), Some(miniaturize)) = (
@@ -522,6 +587,56 @@ mod tests {
         assert_eq!(bar_height_or_default(read.as_deref()), 72.0);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Held by every test that writes the two placement globals. Cargo runs
+    /// tests in threads of one process, so without it a clear or a seed write
+    /// lands inside another test's assertions.
+    static GLOBALS: Mutex<()> = Mutex::new(());
+
+    /// Leaves both placement globals empty, whichever way the test ended.
+    fn clear_globals() {
+        BAR_HEIGHTS.lock().unwrap().clear();
+        SEED_BAR_HEIGHT.store(0_f64.to_bits(), Ordering::SeqCst);
+    }
+
+    /// Two windows can show surfaces with different bars: the workspace shell
+    /// renders at the user's UI scale, the picker at the browser default. One
+    /// shared value let each move the other's lights.
+    #[test]
+    fn each_window_places_against_the_bar_its_own_page_reported() {
+        let _held = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_globals();
+        let mut heights = BAR_HEIGHTS.lock().unwrap();
+        heights.insert("main".to_string(), 48.0);
+        heights.insert("window-1".to_string(), 54.0);
+        drop(heights);
+
+        assert_eq!(bar_height_for("main"), 48.0);
+        assert_eq!(bar_height_for("window-1"), 54.0);
+        // A window nobody has reported for takes the seed, and the compiled
+        // default while there is no seed either.
+        assert_eq!(bar_height_for("window-2"), DEFAULT_BAR_HEIGHT_PX);
+        SEED_BAR_HEIGHT.store(72_f64.to_bits(), Ordering::SeqCst);
+        assert_eq!(bar_height_for("window-2"), 72.0);
+        assert_eq!(bar_height_for("main"), 48.0, "a report beats the seed");
+        clear_globals();
+    }
+
+    /// A label is a per-process counter, so the next `window-1` must not inherit
+    /// the dead one's bar.
+    #[test]
+    fn a_closed_window_takes_its_reported_bar_with_it() {
+        let _held = GLOBALS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_globals();
+        BAR_HEIGHTS
+            .lock()
+            .unwrap()
+            .insert("window-9".to_string(), 96.0);
+        assert_eq!(bar_height_for("window-9"), 96.0);
+        unwatch("window-9");
+        assert_eq!(bar_height_for("window-9"), DEFAULT_BAR_HEIGHT_PX);
+        clear_globals();
     }
 
     #[test]

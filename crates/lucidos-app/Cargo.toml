@@ -3,6 +3,25 @@ name = "lucidos-app"
 version = "0.1.0"
 edition = "2021"
 
+# The macOS window-lifecycle probe (src/window_probe.rs), off by default so the
+# shipped client carries none of it. It drives AppKit and a bare WKWebView with
+# no Tauri, no engine and no workspace, which is what makes it safe to run from
+# a worktree. See docs/plans/2026-09-10-on-screen-is-a-fact-the-client-owns.md.
+[features]
+window-probe = [
+    "dep:objc2-web-kit",
+    "objc2-app-kit/NSEvent",
+    "objc2-app-kit/NSGraphics",
+    "objc2-app-kit/NSScreen",
+    "objc2-foundation/NSDate",
+    "objc2-foundation/NSRunLoop",
+    "objc2-foundation/NSURL",
+]
+
+[[example]]
+name = "window_lifecycle_probe"
+required-features = ["window-probe"]
+
 [dependencies]
 # Tailnet state (CLI-free) + Tailscale CLI resolution for Mobile Access.
 lucidos-tailscale = { path = "../lucidos-tailscale" }
@@ -91,6 +110,14 @@ objc2-app-kit = { version = "0.3", features = [
     "NSButton",
 ] }
 block2 = "0.6"
+# The `window-probe` feature only: a bare WKWebView for the window-lifecycle
+# probe. wry already pulls this crate in, so it costs no extra compilation, and
+# the optional flag keeps the probe out of every shipped build.
+objc2-web-kit = { version = "0.3", optional = true, features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+    "WKNavigation",
+] }
 
 # uid lookup + signal handlers for the always-on launchd service (desktop.rs):
 # `launchctl` domain targets need the numeric uid, and the service supervisor

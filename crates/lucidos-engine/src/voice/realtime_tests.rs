@@ -542,6 +542,43 @@ fn a_finished_user_utterance_becomes_one_turn() {
     );
 }
 
+/// The caller's words while they are still saying them.
+///
+/// The provider streams these and the engine dropped every one, so the
+/// transcript pulsed until the turn ended instead of filling in.
+#[test]
+fn a_caller_partial_becomes_one_transcript_event() {
+    let frame = serde_json::json!({
+        "type": "conversation.item.input_audio_transcription.delta",
+        "delta": "what have I"
+    });
+    assert_eq!(
+        map_event(&frame),
+        vec![VoiceEvent::UserTranscript {
+            text: "what have I".to_string()
+        }]
+    );
+}
+
+/// A frame with no words carries nothing to draw, so it is dropped rather than
+/// forwarded as an empty caption.
+///
+/// An EMPTY `delta` counts as none. The client draws whatever it is sent, so
+/// one would swap the caller's pulse for a blank caption with a caret.
+#[test]
+fn a_partial_with_no_words_is_dropped() {
+    let absent = serde_json::json!({
+        "type": "conversation.item.input_audio_transcription.delta"
+    });
+    assert_eq!(map_event(&absent), vec![]);
+
+    let empty = serde_json::json!({
+        "type": "conversation.item.input_audio_transcription.delta",
+        "delta": ""
+    });
+    assert_eq!(map_event(&empty), vec![]);
+}
+
 /// A provider error must reach the caller as a failure rather than as silence.
 #[test]
 fn an_error_frame_names_what_went_wrong() {
@@ -656,8 +693,8 @@ async fn a_real_session_accepts_the_opening_payload() {
         println!("skipped: OPENAI_API_KEY is not set");
         return;
     };
-    let model =
-        std::env::var("LUCIDOS_VOICE_TALKER_MODEL").unwrap_or_else(|_| "gpt-realtime".to_string());
+    let model = std::env::var("LUCIDOS_VOICE_TALKER_MODEL")
+        .unwrap_or_else(|_| "gpt-realtime-2.1".to_string());
     println!("opening a session on {}", model);
 
     let provider = RealtimeProvider::new(api_key, model);

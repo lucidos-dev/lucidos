@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::provider::{SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
+use super::provider::{drain_held, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 use super::{
     ANSWER_CHOICE_ARG, ANSWER_TOOL, ANSWER_TOOL_DESCRIPTION, DELEGATE_REASON_ARG, DELEGATE_TOOL,
     DELEGATE_TOOL_DESCRIPTION, HANGUP_TOOL, HANGUP_TOOL_DESCRIPTION,
@@ -176,8 +176,15 @@ impl VoiceSession for RealtimeSession {
         Ok(())
     }
 
-    async fn close(&mut self) {
+    /// Close the socket, then take anything the reader had already mapped.
+    ///
+    /// This protocol states its own turn ends, so it rarely holds a sentence
+    /// the way a turn-less one does. Two things it CAN hold are a frame that
+    /// landed as the call loop left, and a transcription completed while the
+    /// line goes. Both are the caller's words.
+    async fn close(&mut self) -> Vec<VoiceEvent> {
         let _ = self.writer.close().await;
+        drain_held(&mut self.rx).await
     }
 }
 
@@ -327,6 +334,31 @@ pub fn map_event(value: &Value) -> Vec<VoiceEvent> {
                     text: text.to_string(),
                 }],
                 None => vec![],
+            }
+        }
+        // A partial, emitted while the caller is still speaking. Which
+        // transcriber is configured decides whether any arrive: the `gpt-4o`
+        // ones and [`LIVE_TRANSCRIBE_MODEL`] stream them, `whisper-1` sends
+        // only the completed frame below. Silence there is ordinary.
+        // An EMPTY delta is dropped with an absent one. It carries no words, and
+        // the client draws whatever it is sent: one would flip the bubble from
+        // the pulse to an empty caption with a caret under it.
+        //
+        // **`item_id` is deliberately dropped, and it costs one narrow case.**
+        // This provider transcribes asynchronously, so two items can stream at
+        // once, and the consumer holds one accumulator. Interleaved partials
+        // still reach the right ROW, because the `completed` frames carry the
+        // whole text and supersede them. What is lost is a second item's
+        // partials when the FIRST item completes and the call then ends before
+        // the second one does. Closing that means carrying the stretch through
+        // the seam, the wire and the client. It is a named residual in
+        // `docs/plans/2026-09-14-one-thing-the-caller-said-is-one-row.md`.
+        "conversation.item.input_audio_transcription.delta" => {
+            match value.get("delta").and_then(Value::as_str) {
+                Some(text) if !text.is_empty() => vec![VoiceEvent::UserTranscript {
+                    text: text.to_string(),
+                }],
+                _ => vec![],
             }
         }
         "conversation.item.input_audio_transcription.completed" => {

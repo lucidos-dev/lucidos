@@ -277,7 +277,7 @@ async function loadUnregisteredChangeDiff(change: Change): Promise<void> {
   repoPending.value = {
     branch_name: change.branch_name,
     files: diff.files.map(f => f.path),
-    description: appId ? `${change.description} — ${appId}` : change.description,
+    description: appId ? `${change.description} (${appId})` : change.description,
     thread_id: change.thread_id,
   };
   repoViewMode.value = 'changes';
@@ -422,7 +422,7 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
         branch_name: diff.branch_name,
         files: diff.files.map(f => f.path),
         description: appId
-          ? `${diff.branch_name} vs ${diff.base_ref} — ${appId}`
+          ? `${diff.branch_name} vs ${diff.base_ref} (${appId})`
           : `${diff.branch_name} vs ${diff.base_ref}`,
         thread_id: threadId,
       };

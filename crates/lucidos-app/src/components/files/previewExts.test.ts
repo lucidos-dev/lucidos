@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { isEditableDataFile, previewMediaKind, RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, TEXT_EXTS } from './previewExts';
 
 describe('TEXT_EXTS is the dispatch gate', () => {
-  // Regression: `htm` was in RENDERABLE_EXTS and `TextContent` branched on it,
-  // but it was missing from TEXT_EXTS. FilePreviewInline dispatches to
-  // TextContent on `TEXT_EXTS.includes(ext) || (ext === 'svg' && sourceMode)`,
+  // Regression: `htm` was in RENDERABLE_EXTS and the preview branched on it,
+  // but it was missing from TEXT_EXTS. `dataPreviewBody` answers with a text
+  // body on `TEXT_EXTS.includes(ext) || (ext === 'svg' && sourceView)`,
   // so `htm` had neither membership nor a special case: the rich-render branch
   // was unreachable, a .htm artifact fell through to "Preview not available for
   // .htm files", and isEditableDataFile refused to edit it, while .html worked.
@@ -17,7 +17,7 @@ describe('TEXT_EXTS is the dispatch gate', () => {
   // case plus a line in this test.
   it('covers every RENDERABLE_EXTS entry except the explicitly special-cased svg', () => {
     const notDispatchable = RENDERABLE_EXTS.filter(e => !TEXT_EXTS.includes(e));
-    expect(notDispatchable, 'a RENDERABLE_EXTS entry outside TEXT_EXTS needs an explicit dispatch special case in FilePreviewInline, like svg has').toEqual(['svg']);
+    expect(notDispatchable, 'a RENDERABLE_EXTS entry outside TEXT_EXTS needs an explicit special case in dataPreviewBody, like svg has').toEqual(['svg']);
   });
 
   it('routes htm exactly like html', () => {

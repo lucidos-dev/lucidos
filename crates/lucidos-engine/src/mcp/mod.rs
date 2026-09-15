@@ -681,9 +681,7 @@ impl McpManager {
     /// into (server_id, tool_name).
     pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
         let rest = name.strip_prefix("mcp__")?;
-        let sep = rest.find("__")?;
-        let server_id = &rest[..sep];
-        let tool_name = &rest[sep + 2..];
+        let (server_id, tool_name) = rest.split_once("__")?;
         if server_id.is_empty() || tool_name.is_empty() {
             return None;
         }

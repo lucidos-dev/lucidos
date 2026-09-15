@@ -1,0 +1,794 @@
+use base64::Engine as _;
+
+use super::*;
+use crate::voice::provider::AudioFormat;
+
+fn opening() -> SessionOpening {
+    SessionOpening {
+        instructions: "You are Lucidos.".to_string(),
+        resident_block: "[WHAT YOU ALREADY KNOW]\nWorkspace: dev".to_string(),
+        voice: "marin".to_string(),
+        transcriber: "gpt-4o-mini-transcribe".to_string(),
+        audio: AudioFormat::default(),
+        language: None,
+    }
+}
+
+fn frame(value: serde_json::Value, turn: &mut TurnState) -> Vec<VoiceEvent> {
+    map_event(&value, turn, Instant::now())
+}
+
+fn caller_said(text: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "session.input_transcript.delta", "delta": text })
+}
+
+fn talker_said(text: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "session.output_transcript.delta", "delta": text })
+}
+
+// The opening frame.
+
+/// The model rides the payload rather than the URL, which is the first thing
+/// this protocol does differently from the Realtime one.
+#[test]
+fn the_opening_frame_names_the_model_and_starts_a_session() {
+    let start = session_start("gpt-live-1", &opening());
+    assert_eq!(start["type"], "session.start");
+    assert_eq!(start["session"]["model"], "gpt-live-1");
+}
+
+/// Client delegation, never the managed one. Responses mode would rent a second
+/// brain that holds tools and acts, which ADR 0149 forbids.
+#[test]
+fn the_session_delegates_to_us_and_never_to_a_rented_backend() {
+    let start = session_start("gpt-live-1", &opening());
+    assert_eq!(start["session"]["delegation"]["type"], "client");
+    assert!(
+        start["session"]["delegation"]["responses"].is_null(),
+        "a responses backend was configured: {}",
+        start
+    );
+}
+
+/// The persona is the cached prefix, so it is the whole of the opening
+/// instructions. What this session knows arrives separately.
+#[test]
+fn the_opening_frame_carries_the_persona_and_not_the_resident_block() {
+    let start = session_start("gpt-live-1", &opening());
+    assert_eq!(start["session"]["instructions"], "You are Lucidos.");
+    assert!(
+        !start.to_string().contains("WHAT YOU ALREADY KNOW"),
+        "the resident block was folded into the opening frame"
+    );
+}
+
+/// One format both ways, at the rate the seam named. A client that cannot
+/// negotiate must not be handed a rate it did not ask for.
+#[test]
+fn the_audio_format_and_voice_come_from_the_opening() {
+    let start = session_start("gpt-live-1", &opening());
+    let audio = &start["session"]["audio"];
+    assert_eq!(audio["format"]["type"], "audio/pcm");
+    assert_eq!(audio["format"]["rate"], 24_000);
+    assert_eq!(audio["output"]["voice"], "marin");
+}
+
+/// The talker declares no tools, because client delegation has none to declare.
+/// A payload that grew a tool list would be Responses mode by another name.
+#[test]
+fn the_opening_frame_declares_no_tools() {
+    let start = session_start("gpt-live-1", &opening()).to_string();
+    for absent in ["tools", "tool_choice", "delegate", "hang_up"] {
+        assert!(
+            !start.contains(absent),
+            "{} reached the opening frame",
+            absent
+        );
+    }
+}
+
+// Appends.
+
+/// The provider requires the key on all three appends. Left out, the append is
+/// refused and the note reaches nobody.
+#[test]
+fn every_append_writes_its_delegation_key_even_when_there_is_none() {
+    let session = append_frame(COMMENTARY, "lucidos-1", None, "the order shipped");
+    assert!(
+        session
+            .as_object()
+            .expect("object")
+            .contains_key("delegation_id"),
+        "{}",
+        session
+    );
+    assert!(session["delegation_id"].is_null());
+
+    let owned = append_frame(THINKING, "lucidos-2", Some("item_9tA"), "Taken.");
+    assert_eq!(owned["delegation_id"], "item_9tA");
+}
+
+/// Every append names itself, which is what lets a refusal say what it
+/// refused. With no name, `error_events` reads every refusal as the session
+/// ending and drops a working call.
+#[test]
+fn every_append_names_itself() {
+    let frame = append_frame(COMMENTARY, "lucidos-7", None, "the order shipped");
+    assert_eq!(frame["event_id"], "lucidos-7");
+}
+
+/// Three kinds, and which one is used decides whether the caller hears it.
+#[test]
+fn each_append_kind_is_the_one_its_seam_member_promises() {
+    assert_eq!(append_frame(COMMENTARY, "e", None, "x")["type"], COMMENTARY);
+    assert_eq!(append_frame(THINKING, "e", None, "x")["type"], THINKING);
+    assert_eq!(
+        append_frame(INSTRUCTIONS, "e", None, "x")["type"],
+        INSTRUCTIONS
+    );
+}
+
+/// A note inside the cap is one append, whole and unchanged.
+#[test]
+fn a_short_note_is_one_chunk_and_keeps_every_character() {
+    assert_eq!(
+        chunks("the order shipped today"),
+        vec!["the order shipped today"]
+    );
+}
+
+/// Even nothing yields a piece, so a caller cannot lose a note to an empty
+/// return.
+#[test]
+fn an_empty_note_still_yields_one_chunk() {
+    assert_eq!(chunks(""), vec![""]);
+}
+
+/// A blank resident block is a real state: every section can be switched off.
+/// Sending it would be a frame the provider has to refuse.
+#[test]
+fn a_blank_note_is_worth_no_append_at_all() {
+    for blank in ["", "   ", "\n\n"] {
+        assert!(
+            appendable(blank).is_empty(),
+            "{:?} produced an append",
+            blank
+        );
+    }
+    assert_eq!(appendable("Workspace: dev"), vec!["Workspace: dev"]);
+}
+
+/// The cap is the provider's, and going over it is refused. A refused answer is
+/// one the caller never hears, so a long one is split rather than cut.
+#[test]
+fn a_long_answer_is_split_and_nothing_is_lost() {
+    let long = "alpha bravo ".repeat(400);
+    let pieces = chunks(&long);
+    assert!(pieces.len() > 1, "a 4800-char answer stayed one append");
+    for piece in &pieces {
+        assert!(
+            piece.chars().count() <= APPEND_CHARS,
+            "a piece of {} chars is over the cap",
+            piece.chars().count()
+        );
+    }
+    let rejoined = pieces.join(" ");
+    assert_eq!(
+        rejoined.split_whitespace().count(),
+        long.split_whitespace().count()
+    );
+}
+
+/// A whitespace run longer than the cap yields a piece that trims to nothing.
+/// An empty append is a frame the provider refuses, so it is dropped.
+#[test]
+fn a_long_run_of_whitespace_yields_no_empty_piece() {
+    let padded = format!("{}the order shipped", " ".repeat(APPEND_CHARS * 2));
+    let pieces = chunks(&padded);
+    assert!(!pieces.is_empty());
+    for piece in &pieces {
+        assert!(!piece.trim().is_empty(), "an empty piece would be refused");
+    }
+    assert!(pieces.concat().contains("the order shipped"));
+}
+
+/// Multi-byte text is split on a char boundary. Slicing by byte index would
+/// panic mid-character.
+#[test]
+fn a_long_answer_of_multibyte_text_never_splits_a_character() {
+    let long = "é".repeat(APPEND_CHARS * 3);
+    let pieces = chunks(&long);
+    assert!(pieces.len() > 1);
+    let rejoined: String = pieces.concat();
+    assert_eq!(rejoined.chars().count(), long.chars().count());
+    assert!(rejoined.chars().all(|c| c == 'é'));
+}
+
+// The talker's own stream.
+
+/// Audio is forwarded as it arrives. Nothing here writes it down.
+#[test]
+fn talker_audio_is_decoded_and_forwarded() {
+    let mut turn = TurnState::default();
+    let encoded = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+    let events = frame(
+        serde_json::json!({ "type": "session.output_audio.delta", "delta": encoded }),
+        &mut turn,
+    );
+    assert_eq!(events, vec![VoiceEvent::Audio(vec![1, 2, 3])]);
+}
+
+/// What the talker is saying reaches the caller's screen as it says it.
+#[test]
+fn talker_words_are_forwarded_as_they_arrive() {
+    let mut turn = TurnState::default();
+    let events = frame(talker_said("checking"), &mut turn);
+    assert_eq!(
+        events,
+        vec![VoiceEvent::TalkerTranscript {
+            text: "checking".to_string()
+        }]
+    );
+}
+
+/// The turn ends when the talker's own output goes quiet, and it carries
+/// everything that turn said.
+#[test]
+fn a_quiet_output_stream_ends_the_talkers_turn() {
+    let mut turn = TurnState::default();
+    frame(talker_said("on it, "), &mut turn);
+    frame(talker_said("one moment"), &mut turn);
+
+    assert_eq!(
+        talker_went_quiet(&mut turn),
+        vec![VoiceEvent::TalkerTurnEnded {
+            transcript: "on it, one moment".to_string(),
+            usage: ApiUsage::default(),
+        }]
+    );
+}
+
+/// One end per turn. A second idle with nothing said would write a reply the
+/// caller never heard.
+#[test]
+fn a_turn_ends_once_however_often_the_stream_is_quiet() {
+    let mut turn = TurnState::default();
+    frame(talker_said("hello"), &mut turn);
+    assert_eq!(talker_went_quiet(&mut turn).len(), 1);
+    assert!(talker_went_quiet(&mut turn).is_empty());
+}
+
+/// Usage is zero because this provider reports no tokens. Its own duration
+/// figures are cumulative snapshots, so summing them per turn would overstate
+/// every call.
+#[test]
+fn a_talker_turn_reports_no_tokens_rather_than_invented_ones() {
+    let mut turn = TurnState::default();
+    frame(talker_said("done"), &mut turn);
+    let VoiceEvent::TalkerTurnEnded { usage, .. } = talker_went_quiet(&mut turn).remove(0) else {
+        panic!("the turn did not end");
+    };
+    assert_eq!(usage, ApiUsage::default());
+    assert!(usage.modality.is_none());
+}
+
+// The caller's words.
+
+/// Deltas are forwarded as PARTIALS and held as well. The partial draws the
+/// caller's bubble as they speak; the held copy is what a delegation hands over.
+#[test]
+fn caller_deltas_are_forwarded_as_partials_and_still_held() {
+    let mut turn = TurnState::default();
+    assert_eq!(
+        frame(caller_said("what is "), &mut turn),
+        vec![VoiceEvent::UserTranscript {
+            text: "what is ".to_string()
+        }]
+    );
+    assert_eq!(
+        frame(caller_said("on today"), &mut turn),
+        vec![VoiceEvent::UserTranscript {
+            text: "on today".to_string()
+        }]
+    );
+    // Still whole when something finally asks for it, so the partial path
+    // costs the delegation nothing.
+    assert_eq!(
+        caller_finished(&mut turn),
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "what is on today".to_string()
+        }]
+    );
+}
+
+/// A partial with nothing in it captions nothing, so it is not sent.
+#[test]
+fn an_empty_caller_delta_reaches_nobody() {
+    let mut turn = TurnState::default();
+    assert!(frame(caller_said(""), &mut turn).is_empty());
+}
+
+/// **The seven-bubble regression.** The talker's own output stream has holes in
+/// it, and `TALKER_IDLE` closes its turn on every one. The frame that resumes
+/// the stream must not be read as the talker answering: it said no words, so
+/// the caller has not been judged finished by anybody.
+#[test]
+fn a_hole_in_the_talkers_audio_never_cuts_the_callers_sentence() {
+    let mut turn = TurnState::default();
+    let audio = serde_json::json!({ "type": "session.output_audio.delta", "delta": "" });
+
+    frame(caller_said("Why "), &mut turn);
+    for _ in 0..7 {
+        frame(audio.clone(), &mut turn);
+        // The stream went quiet, exactly as it did on the reported call.
+        talker_went_quiet(&mut turn);
+        frame(caller_said("didn't you "), &mut turn);
+        let resumed = frame(audio.clone(), &mut turn);
+        assert!(
+            !resumed
+                .iter()
+                .any(|e| matches!(e, VoiceEvent::UserTurnEnded { .. })),
+            "an audio frame ended the caller's turn: {:?}",
+            resumed
+        );
+    }
+    // One sentence, still whole, still waiting for a real boundary.
+    let VoiceEvent::UserTurnEnded { transcript } = caller_finished(&mut turn).remove(0) else {
+        panic!("the caller's words were not held");
+    };
+    assert!(transcript.starts_with("Why didn't you"));
+    assert_eq!(transcript.matches("didn't you").count(), 7);
+}
+
+/// **A hole in the MIDDLE of one answer is not a new answer.** `TALKER_IDLE` is
+/// 700 ms, so a 900 ms gap ends the talker's turn and empties its accumulator.
+/// The caller said nothing in that gap, so nothing of theirs may be handed over
+/// a second time.
+///
+/// This is why the boundary reads the CALLER's accumulator and nothing else.
+/// Gating on the talker's turn being fresh would cut here, which is the same
+/// split at a higher threshold rather than the split removed.
+#[test]
+fn a_nine_hundred_millisecond_hole_in_one_answer_never_cuts_the_caller() {
+    let mut turn = TurnState::default();
+    frame(
+        caller_said("why didn't you tell me to restart the computer"),
+        &mut turn,
+    );
+
+    // The answer opens, and THAT is the caller's boundary.
+    let opened = frame(talker_said("Because "), &mut turn);
+    assert_eq!(
+        opened[0],
+        VoiceEvent::UserTurnEnded {
+            transcript: "why didn't you tell me to restart the computer".to_string()
+        }
+    );
+
+    // 900 ms with no output of any kind, so the reader ends the turn.
+    assert_eq!(talker_went_quiet(&mut turn).len(), 1);
+    assert!(
+        turn.talker_words.is_empty(),
+        "the accumulator survived the hole"
+    );
+
+    // The rest of the same answer, and not one word of the caller's with it.
+    let resumed = frame(talker_said("the update needed it"), &mut turn);
+    assert_eq!(
+        resumed,
+        vec![VoiceEvent::TalkerTranscript {
+            text: "the update needed it".to_string()
+        }]
+    );
+}
+
+/// The caller speaking INTO that hole is a real boundary, and exactly one.
+///
+/// What they said is handed over whole, and nothing of the sentence before it
+/// comes back: that one was already spent when the answer opened.
+#[test]
+fn a_caller_who_speaks_into_the_hole_gets_one_boundary_for_it() {
+    let mut turn = TurnState::default();
+    frame(caller_said("what is on today"), &mut turn);
+    frame(talker_said("Two "), &mut turn);
+    talker_went_quiet(&mut turn);
+
+    frame(caller_said("and tomorrow"), &mut turn);
+    let resumed = frame(talker_said("meetings"), &mut turn);
+
+    assert_eq!(
+        resumed[0],
+        VoiceEvent::UserTurnEnded {
+            transcript: "and tomorrow".to_string()
+        }
+    );
+    assert_eq!(resumed.len(), 2, "{:?}", resumed);
+}
+
+/// A talker that streams audio and never a word ends no caller turn either.
+/// Its turn still ends, so the call can tell that nothing was said.
+#[test]
+fn a_wordless_talker_turn_ends_with_an_empty_transcript() {
+    let mut turn = TurnState::default();
+    let encoded = base64::engine::general_purpose::STANDARD.encode([9u8]);
+    frame(
+        serde_json::json!({ "type": "session.output_audio.delta", "delta": encoded }),
+        &mut turn,
+    );
+    assert_eq!(
+        talker_went_quiet(&mut turn),
+        vec![VoiceEvent::TalkerTurnEnded {
+            transcript: String::new(),
+            usage: ApiUsage::default(),
+        }]
+    );
+}
+
+/// The talker answering IS its judgment that the caller stopped. No timer
+/// decides it, which is the parent plan's decision 11.
+#[test]
+fn the_talker_taking_the_floor_finishes_the_callers_turn() {
+    let mut turn = TurnState::default();
+    frame(caller_said("what is on today"), &mut turn);
+
+    let events = frame(talker_said("checking"), &mut turn);
+    assert_eq!(
+        events[0],
+        VoiceEvent::UserTurnEnded {
+            transcript: "what is on today".to_string()
+        }
+    );
+}
+
+/// Only the FIRST delta of a turn finishes the caller's. Every later one would
+/// otherwise hand over an empty utterance.
+#[test]
+fn only_the_start_of_a_talker_turn_finishes_the_callers() {
+    let mut turn = TurnState::default();
+    frame(caller_said("what is on today"), &mut turn);
+    frame(talker_said("check"), &mut turn);
+
+    let later = frame(talker_said("ing"), &mut turn);
+    assert_eq!(
+        later,
+        vec![VoiceEvent::TalkerTranscript {
+            text: "ing".to_string()
+        }]
+    );
+}
+
+/// A talker turn with nothing said before it hands over no utterance. A blank
+/// row would claim the caller spoke when they did not.
+#[test]
+fn a_talker_turn_with_no_caller_words_hands_over_nothing() {
+    let mut turn = TurnState::default();
+    let events = frame(talker_said("hello"), &mut turn);
+    assert_eq!(
+        events,
+        vec![VoiceEvent::TalkerTranscript {
+            text: "hello".to_string()
+        }]
+    );
+}
+
+/// Whatever ended the call, the caller said what they said. Dropping it would
+/// lose a sentence from the thread for good.
+#[test]
+fn the_socket_closing_still_hands_over_what_the_caller_said() {
+    let mut turn = TurnState::default();
+    frame(caller_said("book it for tuesday"), &mut turn);
+
+    assert_eq!(
+        closing_events(&mut turn),
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "book it for tuesday".to_string()
+        }]
+    );
+}
+
+/// A turn the talker was mid-way through is owed too, or its words reach no
+/// transcript.
+#[test]
+fn the_socket_closing_ends_a_turn_the_talker_was_still_speaking() {
+    let mut turn = TurnState::default();
+    frame(caller_said("what is on today"), &mut turn);
+    frame(talker_said("you have two"), &mut turn);
+
+    assert_eq!(
+        closing_events(&mut turn),
+        vec![VoiceEvent::TalkerTurnEnded {
+            transcript: "you have two".to_string(),
+            usage: ApiUsage::default(),
+        }]
+    );
+}
+
+// Delegation, which is the whole of this protocol's tool surface.
+
+/// The ask carries an id and no words, so the caller's own words are both the
+/// utterance and the reason.
+#[test]
+fn a_delegation_hands_over_the_callers_words_and_then_asks() {
+    let mut turn = TurnState::default();
+    frame(caller_said("move my three o'clock"), &mut turn);
+
+    let events = frame(
+        serde_json::json!({
+            "type": "session.delegation.created",
+            "delegation": { "id": "item_9tA", "type": "delegation", "target": "client" }
+        }),
+        &mut turn,
+    );
+    assert_eq!(
+        events,
+        vec![
+            VoiceEvent::UserTurnEnded {
+                transcript: "move my three o'clock".to_string()
+            },
+            VoiceEvent::DelegationRequested {
+                tool_call_id: "item_9tA".to_string(),
+                reason: "move my three o'clock".to_string(),
+            },
+        ]
+    );
+}
+
+/// An ask with nothing held still reaches the doer, and says so rather than
+/// inventing a reason. Dropping it would lose the work the caller asked for.
+#[test]
+fn a_delegation_with_no_held_words_still_asks() {
+    let mut turn = TurnState::default();
+    let events = frame(
+        serde_json::json!({
+            "type": "session.delegation.created",
+            "delegation": { "id": "item_9tA" }
+        }),
+        &mut turn,
+    );
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        VoiceEvent::DelegationRequested { tool_call_id, .. } if tool_call_id == "item_9tA"
+    ));
+}
+
+/// An ask with no id can never be answered, so it is dropped with a line
+/// saying so rather than acknowledged into nothing.
+#[test]
+fn a_delegation_with_no_id_is_dropped() {
+    let mut turn = TurnState::default();
+    let events = frame(
+        serde_json::json!({ "type": "session.delegation.created", "delegation": {} }),
+        &mut turn,
+    );
+    assert!(events.is_empty());
+}
+
+/// A long question is clipped for the row that records it, never for the
+/// utterance itself.
+#[test]
+fn a_long_question_is_clipped_in_the_reason_and_whole_in_the_utterance() {
+    let mut turn = TurnState::default();
+    let long = "a".repeat(super::super::READ_ALOUD_CHARS * 2);
+    frame(caller_said(&long), &mut turn);
+
+    let events = frame(
+        serde_json::json!({
+            "type": "session.delegation.created",
+            "delegation": { "id": "item_9tA" }
+        }),
+        &mut turn,
+    );
+    let VoiceEvent::UserTurnEnded { transcript } = &events[0] else {
+        panic!("the caller's words were not handed over");
+    };
+    assert_eq!(transcript.chars().count(), long.chars().count());
+    let VoiceEvent::DelegationRequested { reason, .. } = &events[1] else {
+        panic!("nothing was delegated");
+    };
+    assert!(reason.ends_with('…'), "{}", reason);
+}
+
+// Errors and the frames the seam has no word for.
+
+#[test]
+fn an_error_frame_ends_the_call_with_what_it_said() {
+    let mut turn = TurnState::default();
+    let events = frame(
+        serde_json::json!({ "type": "error", "error": { "message": "no such model" } }),
+        &mut turn,
+    );
+    assert_eq!(
+        events,
+        vec![VoiceEvent::Failed {
+            message: "no such model".to_string()
+        }]
+    );
+}
+
+/// One frame carries two things, and only one of them is the session dying.
+/// A refused append costs one note, and dropping a working call over it is the
+/// worse failure.
+#[test]
+fn a_refused_command_is_logged_and_never_ends_the_call() {
+    let mut turn = TurnState::default();
+    let events = frame(
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "message": "content is too long",
+                "client_event_id": "lucidos-4",
+            }
+        }),
+        &mut turn,
+    );
+    assert!(events.is_empty(), "a refused append ended the call");
+}
+
+/// An error with nothing to say still ends the call, rather than leaving the
+/// caller listening to silence.
+#[test]
+fn an_error_frame_with_no_message_still_says_something() {
+    let mut turn = TurnState::default();
+    let events = frame(serde_json::json!({ "type": "error" }), &mut turn);
+    assert_eq!(
+        events,
+        vec![VoiceEvent::Failed {
+            message: "the talker reported an error with no message".to_string()
+        }]
+    );
+}
+
+/// Most of what this protocol sends narrates its own state machine, and the
+/// seam has no word for any of it.
+///
+/// `session.closed` is deliberately absent. It is the terminal frame, and
+/// `read_frame` acts on it before this ever sees it.
+#[test]
+fn the_frames_the_seam_has_no_word_for_produce_nothing() {
+    let mut turn = TurnState::default();
+    for kind in [
+        "session.started",
+        "session.updated",
+        "session.thinking.appended",
+        "session.commentary.appended",
+        "session.instructions.appended",
+        "response.event",
+    ] {
+        let events = frame(serde_json::json!({ "type": kind }), &mut turn);
+        assert!(events.is_empty(), "{} produced an event", kind);
+    }
+}
+
+// The three ways a session ends.
+
+fn text_frame(value: serde_json::Value) -> Option<Result<Message, WsError>> {
+    Some(Ok(Message::Text(value.to_string())))
+}
+
+/// The terminal frame carries the final usage, so it arrives while the socket
+/// is still open. Read as ordinary narration, the reader would wait on a socket
+/// nothing more is coming down and the caller would hear silence.
+#[test]
+fn the_terminal_frame_ends_the_session_and_hands_over_what_is_held() {
+    let mut turn = TurnState::default();
+    read_frame(text_frame(caller_said("book it for tuesday")), &mut turn);
+
+    let (events, over) = read_frame(
+        text_frame(serde_json::json!({ "type": "session.closed" })),
+        &mut turn,
+    );
+    assert!(over, "the terminal frame did not end the session");
+    assert_eq!(
+        events,
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "book it for tuesday".to_string()
+        }]
+    );
+}
+
+/// A socket that fails owes the same. It used to break without flushing, which
+/// lost the caller's last sentence from the thread.
+#[test]
+fn a_failed_socket_ends_the_session_and_hands_over_what_is_held() {
+    let mut turn = TurnState::default();
+    read_frame(text_frame(caller_said("cancel that")), &mut turn);
+
+    let (events, over) = read_frame(Some(Err(WsError::ConnectionClosed)), &mut turn);
+    assert!(over);
+    assert_eq!(
+        events,
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "cancel that".to_string()
+        }]
+    );
+}
+
+/// A socket that simply goes is the third way, and the reader keeps reading
+/// until one of the three lands.
+#[test]
+fn an_ordinary_frame_leaves_the_session_running() {
+    let mut turn = TurnState::default();
+    let (_, over) = read_frame(text_frame(talker_said("checking")), &mut turn);
+    assert!(!over);
+
+    let (_, gone) = read_frame(None, &mut turn);
+    assert!(gone);
+}
+
+/// A frame with no type is not a frame this maps. It must not panic either.
+#[test]
+fn an_untyped_frame_produces_nothing() {
+    let mut turn = TurnState::default();
+    assert!(frame(serde_json::json!({ "delta": "x" }), &mut turn).is_empty());
+}
+
+/// The one test that talks to the real provider. Only it can tell us the
+/// opening payload above is still a shape the API accepts.
+///
+/// Ignored, because it needs a credential and a network. Run it deliberately:
+///
+/// ```text
+/// cargo test -p lucidos-engine --lib voice::live -- --ignored --nocapture
+/// ```
+///
+/// It opens a session and listens. A pass means the provider accepted the
+/// opening frame and held the socket open. No audio, so the call costs a
+/// handshake.
+///
+/// Skips itself with a printed line when no key is configured, rather than
+/// failing: a machine with no OpenAI key is not a broken one.
+#[tokio::test]
+#[ignore]
+async fn a_real_session_accepts_the_opening_payload() {
+    crate::net_config::install_crypto_provider();
+    let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
+        println!("skipped: OPENAI_API_KEY is not set");
+        return;
+    };
+    let model =
+        std::env::var("LUCIDOS_VOICE_TALKER_MODEL").unwrap_or_else(|_| "gpt-live-1".to_string());
+    println!("opening a session on {}", model);
+
+    let provider = LiveProvider::new(api_key, model);
+    let mut session = provider.open(opening()).await.expect("connect");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, session.next()).await {
+            Ok(Some(VoiceEvent::Failed { message })) => {
+                panic!("the opening payload was refused: {}", message)
+            }
+            Ok(Some(other)) => println!("received {:?}", other),
+            Ok(None) => panic!("the provider closed the socket"),
+            Err(_) => break,
+        }
+    }
+    session.close().await;
+}
+
+/// The engine taking the caller's words empties the reader's own copy.
+///
+/// Without it the next boundary hands the same sentence over again, and one
+/// breath draws two rows. The session reaches the accumulator through the
+/// handle it shares with the reader.
+#[test]
+fn words_the_engine_took_are_gone_from_the_reader() {
+    let mut turn = TurnState::default();
+    let shared = Arc::clone(&turn.caller_words);
+    frame(caller_said("why didn't you tell me"), &mut turn);
+
+    // What `LiveSession::caller_words_were_taken` does.
+    shared.lock().expect("caller words").clear();
+
+    assert!(caller_finished(&mut turn).is_empty());
+    // And the next thing they say is still theirs.
+    frame(caller_said("to restart it"), &mut turn);
+    assert_eq!(
+        caller_finished(&mut turn),
+        vec![VoiceEvent::UserTurnEnded {
+            transcript: "to restart it".to_string()
+        }]
+    );
+}

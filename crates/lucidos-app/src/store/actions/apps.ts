@@ -160,7 +160,7 @@ export async function openAppById(
   if (apps.status !== 'loaded') {
     // loadApps stamped the failure on appsList (Loadable failed), but the user
     // who clicked the link is not on the apps tab — they'd see nothing.
-    showToast(`Couldn't open app "${appId}"${from} — apps failed to load`, 'error');
+    showToast(`Couldn't open app "${appId}"${from}: apps failed to load`, 'error');
     return;
   }
   let app = apps.data.find((s) => s.id === appId);
@@ -416,7 +416,7 @@ async function captureAppUIInner(appId: string, requestId: string): Promise<void
   const iframe = getVisibleAppFrame();
 
   if (!iframe) {
-    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Ask the user to open the app, or use navigate_ui (target=app-ui) first — refresh_app no longer opens.');
+    await postAppCapture(requestId, '', 'Error: No app UI is currently open. Ask the user to open the app, or use navigate_ui (target=app-ui) first. refresh_app no longer opens.');
     return;
   }
 

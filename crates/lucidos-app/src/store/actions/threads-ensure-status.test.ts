@@ -32,9 +32,9 @@ import { PENDING_TITLE_PLACEHOLDER, type ThreadState } from '../thread-events';
 import { fetchThreads, fetchThreadById } from '../../api/threads';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, bootstrappingThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
+import { archivingThreadIds, awaitedThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
 import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
-import { focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult } from './threads';
+import { focusSpawnedThread, focusThread, focusThreadOrBootstrap, focusThreadOrBootstrapResult, unfocusThread } from './threads';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -315,7 +315,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
   beforeEach(() => {
     threadsLoaded.value = true;
     threadMap.value = new Map();
-    bootstrappingThreadId.value = null;
+    awaitedThreadId.value = null;
     (fetchThreadById as any).mockReset();
   });
 
@@ -329,7 +329,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     // moves the pane; the flag is what stops ThreadView's stale-pointer cleanup
     // from immediately undoing it (the thread is legitimately not in the map).
     expect(focusedThreadId.value).toBe('target');
-    expect(bootstrappingThreadId.value).toBe('target');
+    expect(awaitedThreadId.value).toBe('target');
 
     d.resolve(summary('target'));
     await pending;
@@ -343,7 +343,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     expect(outcome.kind).toBe('focused');
     expect(focusedThreadId.value).toBe('target');
     // Left set, it would exempt a genuinely stale pointer from cleanup later.
-    expect(bootstrappingThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
   });
 
   it('restores the previous focus when the thread does not exist', async () => {
@@ -356,7 +356,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     expect(outcome.kind).toBe('not-found');
     // Not left staring at a skeleton for a thread that will never arrive.
     expect(focusedThreadId.value).toBe('was-here');
-    expect(bootstrappingThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
   });
 
   it('names the thread and the origin when the bootstrap misses', async () => {
@@ -395,7 +395,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     expect(outcome.kind).toBe('failed');
     expect(focusedThreadId.value).toBe('was-here');
-    expect(bootstrappingThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
   });
 
   it('a superseded bootstrap does not yank focus off the newer one', async () => {
@@ -408,7 +408,7 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
 
     const p1 = focusThreadOrBootstrapResult('first');
     const p2 = focusThreadOrBootstrapResult('second');
-    expect(bootstrappingThreadId.value).toBe('second');
+    expect(awaitedThreadId.value).toBe('second');
 
     // The FIRST one now fails. It must not restore its own `previousFocus`,
     // which would drag the user off the thread they actually asked for last.
@@ -416,12 +416,12 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     await p1;
 
     expect(focusedThreadId.value).toBe('second');
-    expect(bootstrappingThreadId.value).toBe('second');
+    expect(awaitedThreadId.value).toBe('second');
 
     second.resolve(summary('second'));
     await p2;
     expect(focusedThreadId.value).toBe('second');
-    expect(bootstrappingThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
   });
 
   it('a thread already in the map focuses synchronously and never flags a bootstrap', () => {
@@ -430,8 +430,43 @@ describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', (
     void focusThreadOrBootstrapResult('warm');
 
     expect(focusedThreadId.value).toBe('warm');
-    expect(bootstrappingThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
     expect(fetchThreadById).not.toHaveBeenCalled();
+  });
+
+  // The other producer of an awaited thread. The engine hands back the id of a
+  // thread it has just spawned: a plugin setup thread, an upstream-patch
+  // thread. Its row reaches this client over SSE, which can land after the
+  // response that named it. A plain focusThread on that id is undone by
+  // ThreadView's stale-pointer cleanup, which lands the user on the compose
+  // view. That is the plugin-update bug this pair of tests pins.
+  it('focusSpawnedThread claims the await for a thread not in the map', () => {
+    focusSpawnedThread('spawned');
+
+    expect(focusedThreadId.value).toBe('spawned');
+    expect(awaitedThreadId.value).toBe('spawned');
+    // The exemption ThreadView reads, stated as ThreadView states it.
+    expect(threadsLoaded.value && awaitedThreadId.value !== 'spawned').toBe(false);
+  });
+
+  it('moving the focus off an awaited thread releases the await', () => {
+    focusSpawnedThread('spawned');
+    threadMap.value = new Map([['elsewhere', makeThreadState('elsewhere')]]);
+
+    focusThread('elsewhere');
+
+    // Left set, it would exempt a genuinely stale pointer for the rest of the
+    // session. The arrival release lives in ThreadView, its only reader.
+    expect(awaitedThreadId.value).toBeNull();
+  });
+
+  it('unfocusing releases the await too', () => {
+    focusSpawnedThread('spawned');
+
+    unfocusThread();
+
+    expect(focusedThreadId.value).toBeNull();
+    expect(awaitedThreadId.value).toBeNull();
   });
 });
 

@@ -16,6 +16,7 @@ paths:
   - "scripts/dev-refresh-app-frontend.sh"
   - "scripts/deps-state.sh"
   - "scripts/test-engine.sh"
+  - "scripts/test-scripts.sh"
   - "scripts/with-build-slot.sh"
   - "scripts/lint-shell.sh"
   - "scripts/check-em-dashes.sh"
@@ -44,9 +45,12 @@ paths:
   - "scripts/lib/codesign.sh"
   - "scripts/lib/docker*.sh"
   - "scripts/lib/preflight.sh"
+  - "scripts/lib/proc_env*.sh"
   - "scripts/lib/sleep.sh"
   - "scripts/lib/host_load_guard*.sh"
   - "scripts/lib/host_memory_guard*.sh"
+  - "scripts/preflight-reclaim-engines.sh"
+  - "scripts/lib/preflight_reclaim*.sh"
   - "scripts/lib/webkit_reaper*.sh"
   - "scripts/lib/sigterm_contract_test.sh"
   - "scripts/lib/wait_for_engine_shutdown_test.sh"
@@ -97,6 +101,8 @@ opt-in itself, and never starts a gateway.
 ./scripts/dev-codesign-setup.sh           # One-time: stable macOS code-signing identity
 ./scripts/dev-refresh-app-frontend.sh [-a <app>] [--no-build] [--restart]  # macOS: rebuild dist + sync into an installed .app's Resources/frontend + re-seal (fast frontend-only loop; native path is inert in tauri dev so the packaged app is the only place to test it)
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
+./scripts/test-scripts.sh                 # Run every scripts/lib/*_test.sh (= make test-scripts): per-suite pass/fail + a total, exits non-zero if any suite fails. Needs no Postgres; separate from `make lint` and the engine suite. See below
+./scripts/preflight-reclaim-engines.sh    # Pre-flight: stop every engine that should not be running, and prove what it freed. Exits non-zero if one survived. See below
 ./scripts/e2e-packaged.sh [--rebuild]     # macOS-only: boot the packaged .app (service + embedded PG) and smoke-test the chain (heavy: builds the .app)
 ./scripts/with-build-slot.sh [--label "<t>"] -- <cmd>  # Run a heavy build under a build slot (ADR 0070). Resolves the `lucidos` broker, or runs the command unrestricted when there is none. Already wired into `make lint-rust`, `test-engine.sh` and `run_engine_cargo_build`; reach for it directly only for a NEW heavy build command
 ./scripts/lint-shell.sh                   # ShellCheck over every tracked *.sh (= make lint-shell; part of make lint / make check)
@@ -159,6 +165,59 @@ Three more things follow, and each is enforced rather than remembered.
   `LUCIDOS_EVAL_PG_BASE` at the shared dev cluster, or a browsed arm opens empty
   once the run has ended. The script header says why.
 
+### Pre-flight engine reclaim (`preflight-reclaim-engines.sh`)
+
+Run before the nightly memory gate, so the gate reads a host that has already
+given back what it can. The logic lives in `scripts/lib/preflight_reclaim.sh`
+and is tested by `scripts/lib/preflight_reclaim_test.sh`. Three rules make it
+work, and each replaces a way the previous pasted bash snippet was a silent
+no-op:
+
+- **`scripts/stop.sh`, never a raw signal.** The engine ignores SIGTERM on
+  purpose (`main.rs`), so a graceful SIGTERM pass can never land. A bare
+  SIGUSR1 does stop the process, and the gateway supervisor respawns it in the
+  same second with a fresh pid. Only the full `stop.sh` path holds, because it
+  asks the shared gateway to drop the workspace first.
+- **The workspace path comes out of the process environment.** Both
+  `LUCIDOS_WORKSPACE_ID` and `LUCIDOS_WORKSPACE` are read from `ps -E`, and no
+  path is ever built from an assumed layout. A non-dev workspace lives under
+  `~/.lucidos/gateway/workspaces/<slug>`, so a guessed `~/workspaces/<slug>`
+  makes `stop.sh` print "Workspace not found" and exit 1, which reads clean.
+  The value runs to the next `NAME=` token, because the packaged workspace path
+  holds a space.
+- **A survivor fails the step, and so does a comeback.** After the stops the
+  script WATCHES. It polls every 2s until every workspace it stopped has been
+  absent long enough that nothing can still be returning it. A reclaim that
+  cannot show what it freed must not look like success, which is why the
+  before-list and the available-memory delta are printed too.
+- **The window is derived, and the derivation is pinned by a test.** 39s of
+  quiet: `DEAD_MISS_THRESHOLD * SUPERVISE_INTERVAL + RESPAWN_BACKOFF` from
+  `crates/lucidos-gateway/src/server.rs`, plus the 15s boot watchdog in
+  `crates/lucidos-app/index.html` and its one retry. `preflight_reclaim_test.sh`
+  reads all four out of source and fails when the arithmetic stops holding. So a
+  change to the supervisor's pacing cannot silently shorten the window. The old
+  10s sleep was shorter than the respawn it must catch, so a run said success
+  while the workspace came back (ADR 0179).
+- **A comeback names the log line that explains it.** `respawning '<ws>' after N
+  missed probe(s)` is the supervisor, which means the stop never reached the
+  owning gateway. `lazy-starting '<ws>' on demand` is a client window navigating
+  back, which the reclaim cannot prevent and must not hide. Each gateway log is
+  measured before the first stop and read only from there, so an older episode
+  is never quoted as this one's cause.
+- **`LUCIDOS_RECLAIM_SETTLE_S` is retired.** Honouring its 10 would put the bug
+  back, so it prints a note naming `LUCIDOS_RECLAIM_QUIET_S` and
+  `LUCIDOS_RECLAIM_DEADLINE_S`, and changes nothing.
+
+The keep list defaults to `dev personal` and matches exactly, so `devbox` is
+not caught by `dev`. Those two are the picker's first-run name suggestions. A
+packaged install runs under launchd with `KeepAlive` true, so stopping one only
+churns the host. `dev` is doubly protected, since `pgrep` cannot see an
+ancestor of the calling process, but the guard stays anyway. An
+engine whose workspace id cannot be read is left alone and never counted as a
+survivor: killing what you cannot name is how a reclaim takes out the wrong
+engine. The available reading is `host_memory_guard.sh`'s, so there is no
+second formula.
+
 ### One Docker-daemon probe, shared by preflight and provisioning
 
 `scripts/lib/docker.sh` owns the answer to "is the Docker daemon up?", and both
@@ -192,6 +251,24 @@ shell callers go through it: `preflight.sh` at launch time and `workspace.sh`
   `assert_no_host_calls` fails the suite if one happened. Same posture as
   `ports_test.sh`'s `kill` shim and `webkit_reaper_test.sh`'s `ps` feed, for the
   same reason (ADR 0025).
+
+### Shell-library unit tests (`make test-scripts`)
+
+`scripts/test-scripts.sh` runs every `scripts/lib/*_test.sh`, one after another,
+and reports per-suite pass or fail plus a total. It exits non-zero if any suite
+fails. These are the unit tests for the shell libraries under `scripts/lib/`,
+and nothing else collected them, so a suite could rot unrun.
+
+- **Discovery is `git ls-files 'scripts/lib/*_test.sh'`**, the same reason
+  `lint-shell.sh` discovers that way: a suite added in any commit is covered the
+  day it lands, with no hand-maintained list to forget.
+- **It is separate from `make lint` and from the engine `make test` suite.** It
+  needs no Postgres and no build slot, so it is cheap to run on its own.
+- **Every suite is hermetic by construction, and that is load-bearing.** The
+  libraries these suites exercise find and stop real engines, so a suite that
+  reached the real host would stop live workspaces (ADR 0025). The runner adds
+  no isolation of its own. Read a suite's stubs before running it alone, the
+  same caution CLAUDE.md states for a `scripts/lib/*_test.sh`.
 
 ### Shell lint (`make lint-shell`)
 
@@ -315,6 +392,8 @@ and `ENGINE_BIN` / `GATEWAY_BIN` / `LUCIDOS_ENGINE_BIN` / the engine's `current_
 - **`crates/lucidos-e2e` must never request `features = ["e2e-test-hooks"]`** on its `lucidos-engine` dev-dependency. It is a *dev*-dependency, so cargo unifies the feature at workspace scope and a bare `cargo test` then builds + uplifts a hooks-enabled engine (push transport stubbed, `/api/v1/_test/*` exposed). The hooks belong to the engine BINARY the harness builds via `ENGINE_BUILD_FEATURES`.
 
 **Stopping:** `stop.sh -w <ws>` does NOT kill the shared gateway — it POSTs `/~/api/v1/control/workspaces/<id>/stop` (gateway drops that stack so its supervisor won't respawn it; the registry entry survives, so the workspace stays listed) and leaves the gateway up for peers. Stop the gateway itself with `kill $(cat $HOME/.lucidos/gateway/gateway.pid)`.
+
+**Which gateway it POSTs to is read off the engine, never assumed.** More than one gateway runs here: dev on 5251 and the packaged `Lucidos.app` on 5252, each owning different workspaces. `engine_gateway_port` (`scripts/lib/workspace.sh`) reads `LUCIDOS_GATEWAY_PORT` out of the target engine's own environment with `ps -E`, which the gateway put there when it spawned it. `${LUCIDOS_DEV_GATEWAY_PORT:-5251}` is the fallback for when there is no live engine to ask, and the script says which of the two it used. A 404 means this gateway does not own the workspace (ADR 0179). It is printed rather than fatal: a no-gateway workspace is legitimately unknown to all of them, and its SIGUSR1 is the real stop.
 
 - **Standalone crate (ADR 0014 §1):** the gateway is `crates/lucidos-gateway/` with NO dependency on `lucidos-engine` — the only network-facing process links proxy + supervise + registry code, not the engine's heavy core. It spawns the engine by path via `LUCIDOS_ENGINE_BIN` (its own `current_exe` is the gateway).
 - **Engine serves the frontend directly:** both the gateway (picker) and every spawned engine serve the built `dist/` from `LUCIDOS_STATIC_DIR`. The engine stamps `<base href="/<slug>/">` into `index.html` from `X-Forwarded-Prefix` (default `/` when hit directly) so relative asset refs resolve back through the gateway. **No Vite in the serving path** (no `dev_proxy`, no `vite preview`).

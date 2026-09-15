@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pluginRowsSettled } from '../StoreTab';
+import { emptyCatalogMessage, pluginRowsSettled } from '../StoreTab';
 import type { Loadable } from '../../../store/types';
 
 const NOT_LOADED: Loadable<unknown> = { status: 'not-loaded' };
@@ -40,5 +40,19 @@ describe('pluginRowsSettled — the loading-skeleton gate for the Plugins list',
     expect(pluginRowsSettled(NOT_LOADED, NOT_LOADED)).toBe(false);
     expect(pluginRowsSettled(NOT_LOADED, LOADED)).toBe(false);
     expect(pluginRowsSettled(LOADED, NOT_LOADED)).toBe(false);
+  });
+});
+
+// A registered marketplace joins the catalog as soon as its registry write
+// lands, so its plugins are unknown until the scan has cloned the repo. The
+// scan takes seconds per marketplace, and the window is most visible right
+// after the user registers their first one from this very empty state.
+describe('emptyCatalogMessage: an empty catalog list mid-scan', () => {
+  it('says the scan is running rather than claiming there are no plugins', () => {
+    expect(emptyCatalogMessage(true)).toBe('Scanning marketplaces…');
+  });
+
+  it('says there are none once nothing is scanning', () => {
+    expect(emptyCatalogMessage(false)).toBe('No plugins found.');
   });
 });

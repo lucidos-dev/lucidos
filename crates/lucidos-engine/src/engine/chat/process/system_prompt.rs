@@ -516,7 +516,7 @@ FILE REFERENCES:
 - ONLY THE LEADING `!` DRAWS AN IMAGE: `![what it shows](artifacts/branding/card.png)`. Without it a path is a LINK the user must click, and `read_file` on an image shows it to YOU, never to them. When the point IS the picture, draw it. Same for a chart, diagram or page you rendered.
 - LINK EVERY APP YOU NAME, since a bare app name does not auto-link: `[Habit Tracker](app:habit-tracker)`. Not linking should be a rare exception. A `#fragment` arrives as the app's `location.hash`, so name the ITEM when the app reads one: `[Some report](app:pr-understanding#pr-1645)`.
 - LINK EVERY TRIGGER YOU NAME, at the trigger and not the panel: `[Nightly digest](trigger:<id>)`, id from `triggers` action 'list'. It lands on the row, where Run once is. `[Triggers](triggers)` is the LIST.
-- Link a UI panel by its bare name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Apps and other plugins are downloaded from `[Plugins](app-store)`; call it the Plugins panel, never the retired "App Store" or "Store".
+- Link a UI panel by its bare name: `[Notifications](notifications)`, `[Settings](settings)`, `[Plugins](plugins)`, or `[Plugins](app-store)` for its catalog. Call it the Plugins panel, never the retired "App Store" or "Store".
 
 __NAMES_NOT_IDS_RULE__
 
@@ -1124,7 +1124,14 @@ mod tests {
     /// philosophy rule 2 half-kept. One action covers both scopes, so the cost
     /// is a single entry. Knowhow cannot carry it: the action enum is what the
     /// model picks from when it writes the argument.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 117_370;
+    ///
+    /// Raised by 160 to a measured 117,530 for `request_credential`'s
+    /// `base_urls`. A credential scope has been a SET since ADR 0161, and the
+    /// singular argument was the last layer that could not say so. So a token
+    /// serving a provider's API host and its git host was stored twice, under
+    /// two service names, with two places to rotate it. Knowhow cannot carry
+    /// it: the argument is what the model writes.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 117_530;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1373,13 +1380,18 @@ mod tests {
         ),
         (
             "request_credential",
-            2_200,
+            2_351,
             "thirteen properties, seven of them the oauth_client endpoint set, \
              each already one line pointing at system-knowhow/oauth-providers. \
              Raised from 2,150 by the `secret` type: it adds a sixth enum \
-             value, and `base_url` left `required` because a secret declares \
-             no scope, so this schema is the only surface saying which types \
-             still need one",
+             value, and the scope argument stays outside `required` because a \
+             secret declares no scope, so this schema is the only surface \
+             saying which types still need one. Raised again from 2,200 by \
+             `base_urls`: an array schema plus the sentence saying a credential \
+             names every host it reaches, and that naming a missed host widens \
+             the existing one. Knowhow cannot carry it, since the argument is \
+             what the model writes, and the failure it prevents is storing one \
+             token under two service names",
         ),
         (
             "ask_user_question",

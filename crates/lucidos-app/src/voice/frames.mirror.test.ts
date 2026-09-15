@@ -73,6 +73,7 @@ function keysOf(sample: object): string[] {
 /** One of every server frame, so the TS types are read rather than restated. */
 const SERVER_SAMPLES: ServerFrame[] = [
   { type: 'session_started', audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' } },
+  { type: 'user_transcript', text: '' },
   { type: 'user_turn_ended', transcript: '' },
   { type: 'talker_transcript', text: '' },
   { type: 'talker_turn_ended' },

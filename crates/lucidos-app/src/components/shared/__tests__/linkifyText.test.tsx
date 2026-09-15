@@ -6,6 +6,8 @@ type AnchorProps = {
   href?: string;
   target?: string;
   rel?: string;
+  class?: string;
+  onClick?: unknown;
   children?: ComponentChildren;
 };
 
@@ -38,6 +40,14 @@ describe('linkifyText', () => {
     expect(anchor.props.target).toBe('_blank');
     expect(anchor.props.rel).toBe('noopener noreferrer');
     expect(anchor.props.children).toBe('https://example.com/news/x');
+  });
+
+  it('wears the shared link appearance and no click handler of its own', () => {
+    // `onGlobalClick` routes the click through `openUrl`, and a handler here
+    // that stopped propagation would keep it off that funnel.
+    const anchor = toArray(linkifyText('go https://example.com')).find(isAnchor);
+    expect(anchor?.props.class).toBe('accent-link');
+    expect(anchor?.props.onClick).toBeUndefined();
   });
 
   it('keeps trailing sentence punctuation outside the link', () => {

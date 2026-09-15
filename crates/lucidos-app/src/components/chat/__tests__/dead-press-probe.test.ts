@@ -14,6 +14,10 @@ import {
   pressIsWatchable,
   faceExclusion,
   underFingerReason,
+  distanceOutside,
+  nearestFaceMiss,
+  screenOffset,
+  bounceHeight,
   morphStateOf,
   faceName,
   type FaceHitTestFacts,
@@ -350,6 +354,83 @@ describe('underFingerReason: why no watchable face took the press', () => {
   });
 });
 
+describe('nearestFaceMiss: how far the finger fell outside a face', () => {
+  // The reading the twelfth episode needed. Its line said only that the press
+  // took no face. A finger 8px off a live Send produces that, and so does one
+  // in the middle of the row. Only the first is geometry we own (ADR 0183).
+  const SEND = { name: 'Send message', rect: { left: 330, right: 374, top: 400, bottom: 444 } };
+  const DIFF = { name: 'Diff', rect: { left: 250, right: 310, top: 408, bottom: 436 } };
+
+  it('is zero anywhere inside the face', () => {
+    expect(distanceOutside(SEND.rect, { x: 350, y: 420 })).toBe(0);
+    expect(distanceOutside(SEND.rect, { x: 374, y: 444 })).toBe(0);
+  });
+
+  it('measures the gap to the nearest edge', () => {
+    expect(distanceOutside(SEND.rect, { x: 382, y: 420 })).toBe(8);
+    expect(distanceOutside(SEND.rect, { x: 350, y: 450 })).toBe(6);
+  });
+
+  it('measures a corner as the diagonal it is', () => {
+    expect(distanceOutside(SEND.rect, { x: 377, y: 448 })).toBe(5);
+  });
+
+  it('picks the face the finger came closest to', () => {
+    expect(nearestFaceMiss([DIFF, SEND], { x: 382, y: 420 }))
+      .toEqual({ face: SEND, px: 8 });
+    expect(nearestFaceMiss([DIFF, SEND], { x: 320, y: 420 }))
+      .toEqual({ face: DIFF, px: 10 });
+  });
+
+  // The caller's own entry comes back, not a copy of its name, because the
+  // lift repairs the element the finger was reaching for.
+  it('hands back the entry it was given', () => {
+    const picked = nearestFaceMiss([DIFF, SEND], { x: 382, y: 420 });
+    expect(picked?.face).toBe(SEND);
+  });
+
+  it('answers for a row holding no face at all', () => {
+    // An empty composer is faceless, and a tap into it misses nothing.
+    expect(nearestFaceMiss([], { x: 10, y: 420 })).toBeNull();
+  });
+});
+
+describe('screenOffset: where the finger is against where the page says it is', () => {
+  // Every other reading in the module comes from the layout side, so they
+  // agree with each other during an episode. This one does not (ADR 0183).
+  it('is the difference between the two coordinate spaces', () => {
+    expect(screenOffset({ screenX: 350, screenY: 479, clientX: 350, clientY: 420 }))
+      .toEqual({ x: 0, y: 59 });
+  });
+
+  it('rounds, because a sub-pixel offset is noise against a finger', () => {
+    expect(screenOffset({ screenX: 350.4, screenY: 479.6, clientX: 350, clientY: 420 }))
+      .toEqual({ x: 0, y: 60 });
+  });
+});
+
+describe('bounceHeight: the relayout that stands in for a keyboard bounce', () => {
+  it('travels the keyboard\'s own span', () => {
+    // A 476 shell inside an 844 layout viewport is a 368px keyboard.
+    expect(bounceHeight(476, 844)).toBe(108);
+  });
+
+  // Growing clamps every scroller's offset at that layout, and the restore
+  // does not put those offsets back (ADR 0183).
+  it('goes down, never up', () => {
+    expect(bounceHeight(476, 844)).toBeLessThan(476);
+    expect(bounceHeight(844, 844)).toBeLessThan(844);
+  });
+
+  it('still moves when no keyboard is up', () => {
+    expect(bounceHeight(844, 844)).toBe(843);
+  });
+
+  it('never asks for a shell of no height', () => {
+    expect(bounceHeight(10, 900)).toBe(1);
+  });
+});
+
 describe('morphStateOf: what "the send button" was showing', () => {
   // "The button is there, it just doesn't work" is a claim about this, and no
   // line has ever carried it.
@@ -473,13 +554,14 @@ describe('the probe consumes no gesture', () => {
     expect(code).toMatch(/querySelectorAll<HTMLButtonElement>\(\s*`\$\{ROW_SELECTOR\} \$\{FACE_SELECTOR\}`/);
   });
 
-  it('names the morph only to read its mode, never to pick what it watches', () => {
+  it('names the morph to read it and to run it, never to pick what it watches', () => {
     // "The button is there, it just doesn't work" is a claim about the morph's
-    // own state, and no line used to carry it. Reading that one node is
-    // legitimate; building the watched SET from it is the miss above.
+    // own state, and no line used to carry it. Two singular reaches are
+    // legitimate: reading that mode, and running Send for a tap the page
+    // dropped (ADR 0183). Building the watched SET from it is the miss above.
     const morphLines = code.split('\n').filter((l: string) => l.includes('send-cancel-morph'));
-    expect(morphLines).toHaveLength(1);
-    expect(morphLines[0]).toContain('querySelector<HTMLButtonElement>');
+    expect(morphLines).toHaveLength(2);
+    for (const line of morphLines) expect(line).toContain('querySelector<HTMLButtonElement>');
   });
 
   it('reads isConnected at the lift, which is the decisive question', () => {
@@ -558,8 +640,16 @@ describe('the probe consumes no gesture', () => {
   });
 
   it('stands the reachability check down while an overlay is open', () => {
-    // That is the one time something is MEANT to cover the row.
+    // One of the two times something is MEANT to cover the row.
     expect(code).toContain(`'data-overlay-open'`);
+  });
+
+  it('stands it down under the cover a client refresh raises too', () => {
+    // The other one, and it was missing. A refresh dims and locks the page on
+    // purpose, so the composer under it is unreachable by design. The probe
+    // named the blocker in a wedge report, over the app's own "Refreshing"
+    // status. It then spent the episode's one repair on a doomed layout.
+    expect(code).toContain(`'data-ui-blocked'`);
   });
 
   it('latches the reachability report, so one state is one toast', () => {

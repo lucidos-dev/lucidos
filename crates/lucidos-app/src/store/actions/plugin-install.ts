@@ -11,7 +11,7 @@ import {
 import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState, replaceNavState } from './navigation';
 import { revealContentPane } from './pane';
-import { focusThread } from './threads';
+import { focusSpawnedThread } from './threads';
 import type { MarketplacePlugin, PluginInstallRequest } from '../types';
 import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 
@@ -108,9 +108,9 @@ export async function confirmPluginInstallAction(
   // already on disk, so a throw there is not an install failure: inside the try
   // it would toast "Install failed" over a stamped "Installed" receipt, and the
   // close would silently no-op because the active form is by then the receipt
-  // rather than `form`. `focusThread` is the concrete hazard, not a theoretical
-  // one: it loads events and scrolls, and `focusThreadOrBootstrap` in
-  // `threads.ts` already documents that it can throw.
+  // rather than `form`. The focus call is the concrete hazard, not a
+  // theoretical one: it loads events and scrolls, and `focusThreadOrBootstrap`
+  // in `threads.ts` already documents that it can throw.
   let result: PluginConfirmInstallResponse;
   try {
     result = await confirmPluginInstall(installId, keepLocalChanges);
@@ -127,14 +127,13 @@ export async function confirmPluginInstallAction(
   // we skip the success toast in that case (the panel already showed the setup
   // instructions; dumping them into a toast as well was the noise we removed).
   // The engine spawns it as a SubThread, whose queue `prepare` step eager-emits
-  // MessageReceived, so on the common immediate-admit path the thread_summaries
-  // row exists before this response returns and the thread is real and already
-  // running when we focus. Use focusThread (not …OrBootstrap): if the spawn is
-  // briefly queued (no row yet) a bootstrap fetch would 404 → "Thread not
-  // found"; focusThread just sets focus and lets the row + events stream in
-  // over SSE.
+  // MessageReceived, so on the common immediate-admit path the row exists
+  // before this response returns. It exists in the DATABASE, though. This
+  // client learns of it over SSE, which can land after the response, and a
+  // briefly queued spawn has no row at all. `focusSpawnedThread` covers both by
+  // telling ThreadView the absence is expected.
   //
-  // The setup thread and the receipt do NOT compete: `focusThread` reveals
+  // The setup thread and the receipt do NOT compete: the focus reveals
   // the THREAD pane, while the receipt sits in the CONTENT pane, so both
   // land. Closing the panel is what used to make them look exclusive.
   if (result.setup_thread_id) {
@@ -145,7 +144,7 @@ export async function confirmPluginInstallAction(
     // (`.claude/rules/frontend.md` § No Hidden Errors), and the plugin IS
     // installed, so the user is owed both halves of that sentence.
     try {
-      focusThread(result.setup_thread_id);
+      focusSpawnedThread(result.setup_thread_id);
     } catch (e) {
       showToast(
         `Installed ${pluginName} v${pluginVersion}, but couldn't open its setup thread: ${errorDetail(e)}`,
@@ -198,7 +197,7 @@ export async function proposePluginUpstreamAction(
   // Guarded separately: the patch is already written and committed, so a failed
   // navigation is not a failed proposal and must not say it was.
   try {
-    focusThread(result.thread_id);
+    focusSpawnedThread(result.thread_id);
   } catch (e) {
     showToast(
       `Saved your ${pluginName} patch to data/${result.patch_path}, but couldn't open the thread: ${errorDetail(e)}`,

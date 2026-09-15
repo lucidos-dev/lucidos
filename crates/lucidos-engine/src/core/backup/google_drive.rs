@@ -371,12 +371,23 @@ impl GoogleDriveBackupProvider {
         struct TokenInfo {
             scope: Option<String>,
         }
+        // `without_url` is load-bearing, not tidiness. Tokeninfo takes the
+        // access token as a QUERY PARAMETER, and reqwest's error `Display`
+        // appends " for url (...)" with that parameter still in it.
+        //
+        // Every caller of this is on the backup path, where an error string is
+        // persisted: it becomes the `BackupFailed` event body, the
+        // `PREF_BACKUP_LAST_RUN` preference, an SSE frame to every device, and
+        // the `/api/v1/backup/status` response. The events table is append
+        // only, so a live OAuth token written there cannot be redacted later.
+        // One offline moment during a scheduled backup was enough.
         let resp = self
             .client
             .get(GOOGLE_TOKENINFO_URL)
             .query(&[("access_token", token)])
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         if !resp.status().is_success() {
             return Err(format!(
                 "Could not verify Google Drive token scope (tokeninfo HTTP {})",
@@ -384,7 +395,9 @@ impl GoogleDriveBackupProvider {
             )
             .into());
         }
-        let info: TokenInfo = resp.json().await?;
+        // Same reasoning: a decode error carries the response's url, and the
+        // token is in it.
+        let info: TokenInfo = resp.json().await.map_err(reqwest::Error::without_url)?;
         let granted = info.scope.unwrap_or_default();
         if super::missing_scopes(&granted, self.required_scopes).is_empty() {
             Ok(())
@@ -938,6 +951,45 @@ impl BackupProvider for GoogleDriveBackupProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `verify_scope` puts the access token in the query string, because that
+    /// is the interface tokeninfo offers. Its error must not carry it.
+    ///
+    /// Every error out of the backup path is persisted: a `BackupFailed` event,
+    /// a preference, an SSE frame, and the status endpoint. The events table is
+    /// append only, so a token written there stays there.
+    ///
+    /// Port 1 on loopback refuses instantly, so this needs no network and no
+    /// clock. The first assertion is the one that matters: it pins that reqwest
+    /// really does embed the url, so this test cannot quietly pass by testing
+    /// nothing if that behaviour ever changes.
+    #[tokio::test]
+    async fn a_send_failure_carries_no_access_token() {
+        let token = "ya29.a0-super-secret-access-token";
+        let client = reqwest::Client::new();
+        let build = || {
+            client
+                .get("http://127.0.0.1:1/oauth2/v3/tokeninfo")
+                .query(&[("access_token", token)])
+        };
+
+        let leaked = build().send().await.unwrap_err().to_string();
+        assert!(
+            leaked.contains(token),
+            "reqwest no longer embeds the url; re-check what this test is pinning: {leaked}"
+        );
+
+        let guarded = build()
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !guarded.contains(token),
+            "the access token reached a persisted error string: {guarded}"
+        );
+    }
 
     #[test]
     fn parse_range_next_handles_drive_format() {

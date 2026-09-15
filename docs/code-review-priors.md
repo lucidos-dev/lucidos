@@ -15,6 +15,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Rust engine
 
+- **`voice::call` accumulating a caller's turn across several `UserTurnEnded`
+  events is the rule, not a missing flush.** A reviewer sees `caller_said_more`
+  append where the old code replaced, and reads it as a lost boundary. The
+  boundary is deliberate: a persisted caller row is one thing the caller SAID,
+  and a provider closes a transcription item for its own reasons. Reading the
+  two as the same thing drew seven bubbles for one sentence (ADR 0185). What
+  closes a row is the conversation MOVING: the talker saying words, the doer
+  being asked, or the call ending.
+
+- **`voice::live::caller_finished` being called on EVERY transcript delta, with
+  no "is this the turn's first" gate, is deliberate.** A reviewer proposes
+  gating on `talker_words.is_empty()` so a mid-answer delta cannot hand the
+  caller's words over twice. It cannot anyway: `caller_finished` empties
+  `caller_words` and answers with nothing when it is already empty. The proposed
+  gate is worse than redundant, because `TALKER_IDLE` owns `talker_words`: a
+  hole over 700 ms inside one answer empties it, and the next delta then re-opens
+  a turn and cuts the caller again. Any gate that bound owns puts the caller's
+  boundary back on the talker's clock. Pinned by
+  `a_nine_hundred_millisecond_hole_in_one_answer_never_cuts_the_caller`.
+
 - **`voice_resident_sections` is the one preference where an empty row and an
   absent row mean opposite things, and `get_preferences` renders `(empty)` on
   purpose.** A reviewer sees the tool listing print `(empty)` and objects: a blank
@@ -2486,8 +2506,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   from a PREVIOUS call can still clear one. There is no client-side identity to
   match on.** A reviewer traces `handleEvent`'s tally against `writeRow`'s
   count-1 reset and points out the window: an old call's event, delayed past a
-  hangup and a redial, increments `settledUtterances` and clears the new call's
-  first row. The suggested fix is to compare the voice session.
+  hangup and a redial, increments the tally and clears the new call's first
+  row. The suggested fix is to compare the voice session.
+
+  **Superseded in part: the match is no longer a count.** A row is claimed by
+  the WORDS it carries (`claimUtteranceRows`). An old call's event therefore
+  clears a new call's row only when the caller repeated the sentence verbatim.
+  What stands is everything below about the session id and the clocks: neither
+  is available, and the words are the identity this entry calls missing.
 
   **The client is never told the session id.** ADR 0149 keeps it dumb, and
   `voice/frames.ts` carries no such field on any frame, so a call cannot name

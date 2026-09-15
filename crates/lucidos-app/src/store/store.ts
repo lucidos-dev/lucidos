@@ -120,6 +120,19 @@ export const previewFile = computed(() => {
 /** When true, file preview shows raw source instead of rendered output (for md, html, csv, svg). */
 export const filePreviewSource = signal(localStorage.getItem('lucidos-file-preview-source') === 'true');
 
+/** When true, the line-numbered source view soft-wraps a line too wide for it.
+ *  When false it pans instead, under a gutter pinned to the left edge.
+ *
+ *  Defaults ON, hence the `!== 'false'` rather than the `=== 'true'` above. A
+ *  clipped tail is unreachable, and a reader following a citation into a wide
+ *  line needs the part the citation was about.
+ *
+ *  Persisted, and deliberately NOT in `store/effects.ts`'s per-file reset: this
+ *  is a way of READING a file rather than a per-file override, the same class
+ *  as `diffSideBySide`. Shared by both surfaces that render the view, the Files
+ *  panel's preview pane and the app-facing preview modal. */
+export const filePreviewWrap = signal(localStorage.getItem('lucidos-file-preview-wrap') !== 'false');
+
 /** User override for the diff whole-file toggle. `null` means no explicit
  *  choice, so the effective view defaults by file status (see
  *  `diffWholeFileEffective`): an added file opens as the whole file,
@@ -705,6 +718,12 @@ export const focusedThreadId = signal<string | null>(
  *  repeatedly and the storage write is synchronous. */
 export function setFocusedThread(id: string | null): void {
   if (focusedThreadId.peek() === id) return;
+  // An await belongs to the thread it was claimed for. Moving the focus ends
+  // it, whether the thread ever arrived or not: left set, it would exempt a
+  // genuinely stale pointer from ThreadView's cleanup for the rest of the
+  // session. The two producers both claim BEFORE they focus, so neither
+  // clears its own await here.
+  if (awaitedThreadId.peek() !== id) awaitedThreadId.value = null;
   focusedThreadId.value = id;
   if (id) {
     localStorage.setItem(FOCUSED_THREAD_KEY, id);
@@ -870,19 +889,22 @@ export const threadSearchResults = signal<Loadable<import('../api/threads').Thre
 // --- Event-driven thread store ---
 export const threadMap = signal<Map<string, ThreadState>>(new Map());
 export const threadsLoaded = signal(false);
-/** The thread `focusThreadOrBootstrapResult` is currently fetching metadata for,
- *  or null. Set only on the miss path, where the thread is not in `threadMap`
- *  yet and a round-trip stands between the user's tap and anything appearing.
+/** The focused thread the client is WAITING for, or null. It is not in
+ *  `threadMap` yet, and its absence is expected rather than stale.
  *
- *  Two readers, both about that window:
- *   - The bootstrap focuses the thread OPTIMISTICALLY, so the pane moves on
- *     the tap and `ThreadView` renders its delay-gated skeleton rather than a
- *     dead interval.
- *   - `ThreadView` clears a `focusedThreadId` whose thread is not in the map
- *     once `threadsLoaded` is true. It must NOT do that to a thread whose
- *     metadata is still in flight, or the optimistic focus would be undone on
- *     the next render. This signal is the exemption. */
-export const bootstrappingThreadId = signal<string | null>(null);
+ *  Two producers reach that state by different routes:
+ *   - `focusThreadOrBootstrapResult` focuses OPTIMISTICALLY on its miss path,
+ *     so the pane moves on the tap while the metadata fetch runs.
+ *   - `focusSpawnedThread` focuses a thread the engine has just spawned for us.
+ *     Its row reaches this client over SSE, which can land after the response
+ *     that named the thread.
+ *
+ *  One reader, `ThreadView`, which clears a `focusedThreadId` whose thread is
+ *  not in the map once `threadsLoaded` is true. It must NOT do that here, or
+ *  the focus is undone on the next render and the pane falls back to the
+ *  compose view. This signal is the exemption, and ThreadView drops it as soon
+ *  as the thread lands. `setFocusedThread` drops it when focus moves away. */
+export const awaitedThreadId = signal<string | null>(null);
 /** Thread IDs whose title was set by a ThreadTitleGenerated event (authoritative). */
 export const generatedTitleIds = new Set<string>();
 /** Whether the server has more older threads to load (infinite scroll). */
@@ -1922,6 +1944,15 @@ export function resetCodingAgentPendingPreferences(): void {
 // --- Apps ---
 export const appsList = signal<Loadable<App[]>>({ status: 'not-loaded' });
 export const marketplaceCatalog = signal<Loadable<MarketplaceCatalog>>({ status: 'not-loaded' });
+/** True while a catalog scan is cloning the registered marketplace repos.
+ *
+ *  The `Loadable` above cannot say this: a re-scan of an already-loaded catalog
+ *  deliberately stays `loaded` so the visible list is never withheld. A
+ *  marketplace registered mid-session lands in that list at once, with its
+ *  plugins still unknown. So a surface listing PLUGINS needs to tell "none"
+ *  from "not scanned yet". Without it the Store tab says "No plugins found" at
+ *  the one moment it is most certainly wrong. */
+export const marketplaceScanning = signal(false);
 /** Installed plugins for the Plugins → Installed tab, from GET
  *  /plugins/installed. That is the event projection rather than a marketplace
  *  scan, so it works offline and still lists a plugin whose marketplace was

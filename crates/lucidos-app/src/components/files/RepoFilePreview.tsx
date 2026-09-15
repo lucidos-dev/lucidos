@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'preact/hooks';
 import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
-import { repoDiff, repoPending, filePreviewSource, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
+import { repoDiff, repoPending, filePreviewSource, filePreviewWrap, diffSideBySide, repoSelectedChangeId, openFilePreviewRevision } from '../../store/store';
 import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
@@ -10,7 +10,7 @@ import { escapeHtml } from '../../utils/escapeHtml';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { renderCsvTable } from '../../utils/csv';
 import { PreviewImage } from './PreviewImage';
-import { REPO_RENDERABLE_EXTS, previewMediaKind } from './previewExts';
+import { previewExt, repoPreviewBody } from './previewBody';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -205,21 +205,20 @@ interface RepoFileContentProps {
  *  content alone: the panel's chrome (the changed-files sidebar, the diff modes)
  *  stays with `RepoFilePreviewWithSidebar`. */
 export function RepoFileContent({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps) {
-  const ext = path.split('.').pop()?.toLowerCase() || '';
-  if (previewMediaKind(ext) !== 'text') {
-    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} ext={ext} />;
+  const body = repoPreviewBody(path, { sourceToggle: filePreviewSource.value });
+  if (body === 'image' || body === 'pdf' || body === 'video' || body === 'audio') {
+    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} kind={body} />;
   }
-  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} />;
+  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} revision={revision} body={body} />;
 }
 
 /** Binary-media preview. Builds the file URL (same change-vs-branch ref logic as
  *  RepoFileText) and renders it without fetching the bytes as text. */
-function RepoFileMedia({ repoId, path, changeId, gitRef, revision, ext }: RepoFileContentProps & { ext: string }) {
+function RepoFileMedia({ repoId, path, changeId, gitRef, revision, kind }: RepoFileContentProps & { kind: 'image' | 'pdf' | 'video' | 'audio' }) {
   const url = withPreviewRevision(
     changeId ? changeFileUrl(changeId, path) : repoFileUrl(repoId, path, gitRef ?? undefined),
     revision ?? 0,
   );
-  const kind = previewMediaKind(ext);
 
   if (kind === 'image') {
     return <PreviewImage src={url} alt={path} />;
@@ -229,7 +228,7 @@ function RepoFileMedia({ repoId, path, changeId, gitRef, revision, ext }: RepoFi
   return <audio src={url} controls style="width:100%;" />;
 }
 
-function RepoFileText({ repoId, path, changeId, gitRef, revision }: RepoFileContentProps) {
+function RepoFileText({ repoId, path, changeId, gitRef, revision, body }: RepoFileContentProps & { body: 'markdown' | 'csv' | 'svg' | 'source' }) {
   // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
   // the correct ref for both pending (branch) and applied (post_merge_sha). Without
   // one (external-repo CC), fall back to the branch ref. Mirrors RenderedDiff.
@@ -245,25 +244,21 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision }: RepoFileCont
     [repoId, path, changeId, gitRef, revision],
   );
 
-  const ext = path.split('.').pop()?.toLowerCase() || '';
+  const ext = previewExt(path);
   const content = loadable.status === 'loaded' ? loadable.data : null;
-  // REPO_RENDERABLE_EXTS (not RENDERABLE_EXTS): repo HTML is source under review,
-  // so it falls through to the syntax-highlighted source path below instead of a
-  // live srcDoc iframe that would show the app shell's boot splash.
-  const renderPreview = content !== null && !filePreviewSource.value && REPO_RENDERABLE_EXTS.includes(ext);
   const isCode = CODE_EXTS.includes(ext);
 
   const renderedHtml = useMemo(() => {
-    if (!content || !renderPreview) return null;
-    if (ext === 'md') return renderMarkdown(content);
-    if (ext === 'csv') return renderCsvTable(content);
-    if (ext === 'svg') return URL.createObjectURL(new Blob([content], { type: 'image/svg+xml' }));
+    if (!content) return null;
+    if (body === 'markdown') return renderMarkdown(content);
+    if (body === 'csv') return renderCsvTable(content);
+    if (body === 'svg') return URL.createObjectURL(new Blob([content], { type: 'image/svg+xml' }));
     return null;
-  }, [content, ext, renderPreview]);
+  }, [content, body]);
 
   useEffect(() => {
-    if (renderedHtml && ext === 'svg') return () => URL.revokeObjectURL(renderedHtml);
-  }, [renderedHtml, ext]);
+    if (renderedHtml && body === 'svg') return () => URL.revokeObjectURL(renderedHtml);
+  }, [renderedHtml, body]);
 
   const rows = useMemo(
     () => fileRows(content ? (isCode ? highlightFileLines(content, ext) : content.split('\n').map(escapeHtml)) : []),
@@ -273,21 +268,21 @@ function RepoFileText({ repoId, path, changeId, gitRef, revision }: RepoFileCont
   if (loadable.status === 'failed') return <LoadableError noun="file" error={loadable.error} />;
   if (content === null) return showLoading ? <div class="loading-spinner" /> : null;
 
-  if (renderPreview) {
-    // No html/htm branch: REPO_RENDERABLE_EXTS excludes them, so a repo HTML file
-    // never reaches here — it renders as syntax-highlighted source below.
-    // `.repo-file-rendered` insets the content to match the rendered diff
-    // (.rendered-diff), so toggling diff ↔ full file keeps the same gutter.
-    if (ext === 'md') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} /></div>;
-    if (ext === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
-    // The media variant keeps a definite height so the image's max-height:100%
-    // still fits the pane (the bare padding wrapper would leave it unconstrained).
-    if (ext === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedHtml!} alt={path} /></div>;
-  }
+  // There is no html body here. `REPO_RENDERABLE_EXTS` excludes it, so a repo
+  // HTML file renders as syntax-highlighted source. A live srcDoc iframe would
+  // show the app shell's boot splash instead of the file.
+  //
+  // `.repo-file-rendered` insets the content to match the rendered diff
+  // (.rendered-diff), so toggling between them keeps the same gutter.
+  if (body === 'markdown') return <div class="repo-file-rendered"><div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderedHtml! }} /></div>;
+  if (body === 'csv') return <div class="repo-file-rendered" dangerouslySetInnerHTML={{ __html: renderedHtml! }} />;
+  // The media variant keeps a definite height so the image's max-height:100%
+  // still fits the pane (the bare padding wrapper would leave it unconstrained).
+  if (body === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><PreviewImage src={renderedHtml!} alt={path} /></div>;
 
   return (
     <div class="repo-file-content">
-      <LineNumberedCode rows={rows} />
+      <LineNumberedCode rows={rows} wideLines={filePreviewWrap.value ? 'wrap' : 'pan'} />
     </div>
   );
 }

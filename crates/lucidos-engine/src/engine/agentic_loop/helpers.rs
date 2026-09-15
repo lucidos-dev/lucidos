@@ -827,14 +827,30 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         // instead of `oauth:dropbox`, and the agent narrated a theory rather
         // than the fact. The service name is engine-authored (see
         // `oauth::client_service_name`), not user text.
+        //
+        // A widening says so instead. The modal reopened a credential that
+        // already holds its secret. "It saves the credential as X" would send
+        // the agent off narrating a token the user does not have to type.
         if prefix == CREDENTIAL_REQUEST_PREFIX {
-            if let Some(service) = serde_json::from_str::<serde_json::Value>(&payload)
-                .ok()
-                .and_then(|v| v["service"].as_str().map(str::to_string))
+            let parsed = serde_json::from_str::<serde_json::Value>(&payload).ok();
+            if let Some(service) = parsed
+                .as_ref()
+                .and_then(|v| v["service"].as_str())
                 .filter(|s| !s.is_empty())
             {
+                let widening = parsed
+                    .as_ref()
+                    .and_then(|v| v["adding_base_urls"].as_array())
+                    .is_some_and(|hosts| !hosts.is_empty());
                 if let Some(t) = redacted_text.as_mut() {
-                    t.push_str(&format!(" It saves the credential as \"{service}\"."));
+                    t.push_str(&if widening {
+                        format!(
+                            " It widens the existing \"{service}\" credential to reach another \
+                             host. The stored secret is unchanged, so the user only presses Save."
+                        )
+                    } else {
+                        format!(" It saves the credential as \"{service}\".")
+                    });
                 }
             }
         }

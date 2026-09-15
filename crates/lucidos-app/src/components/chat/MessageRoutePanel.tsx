@@ -632,7 +632,7 @@ export function renderExecutorSection(
           <strong>App</strong>
           <span class="route-value-group">
             <span class="route-app-icon" aria-hidden="true">{appInfo.icon}</span>
-            <span class={appInfo.failed ? 'route-app-name error-text' : 'route-app-name'}>{appInfo.name}</span>
+            <span class={appInfo.failed ? 'error-text' : undefined}>{appInfo.name}</span>
           </span>
         </div>
       )}

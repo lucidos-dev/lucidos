@@ -23,6 +23,7 @@ import {
   type CallerUtterance,
   LANDING_BOUND_MS,
   WORDS_BOUND_MS,
+  hearsTheCaller,
   isLive,
   stepCall,
 } from './callState';
@@ -31,6 +32,24 @@ import { floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, CallSocket } from './ports';
 import { CALL_REFUSED, NO_ROUTE_FOR_A_CALL, setupRefusal } from './refusals';
 import { errorDetail } from '../utils/errorDetail';
+
+/**
+ * How many captured frames may wait for the socket before the oldest go.
+ *
+ * The microphone opens before the dial, so a caller who starts talking at once
+ * is recorded with nowhere to send it. A captured frame is 40 ms, so 200 of
+ * them is eight seconds, at about 384 kB while they are held.
+ *
+ * **Sized well above the window, because every frame counts, silence too.**
+ * ADR 0184 measures one connect at 3.79 s, and the ring fills from the moment
+ * the microphone opens rather than from the first word. A bound at the measured
+ * window would therefore have dropped that call's opening words, with the
+ * bubble already on screen saying nothing about the cut.
+ *
+ * Bounded at all because a dial that never completes would otherwise grow this
+ * for the life of the page.
+ */
+export const PREROLL_FRAMES_MAX = 200;
 
 /**
  * How long this utterance may wait before its row is withdrawn, or `null`.
@@ -93,6 +112,15 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
    */
   let held: { count: number; at: CallerUtterance } | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Caller audio captured before the socket was up, oldest first.
+   *
+   * Emptied by the `flush-audio` effect on `session_started`, and dropped by
+   * `teardown`. Capped at {@link PREROLL_FRAMES_MAX}, which is sized above the
+   * measured connect window. Holding more only grows the leak on a dial that
+   * never lands.
+   */
+  let preroll: ArrayBuffer[] = [];
   /** True once the handshake succeeded. A close before it is a refusal. */
   let handshook = false;
   /**
@@ -121,7 +149,11 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
    */
   function holdTheUtterance(): void {
     const at = state.utterance;
-    const bound = utteranceBound(at);
+    // Both bounds wait on the PROVIDER, and during `connecting` there is no
+    // provider to wait on: the caller's audio is held rather than sent. Running
+    // the clock there withdraws the bubble of somebody who spoke into a slow
+    // connect, which is the vanishing bubble ADR 0184 argues against.
+    const bound = isLive(state.phase) ? utteranceBound(at) : null;
     if (bound === null) {
       dropTheHold();
       return;
@@ -160,6 +192,9 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
         return;
       case 'forget-speech':
         gate = SPEECH_GATE_SHUT;
+        return;
+      case 'flush-audio':
+        flushPreroll();
         return;
       case 'teardown':
         teardown();
@@ -252,17 +287,34 @@ export function createCallRunner(options: CallRunnerOptions): CallRunner {
    *  what any reader wants from them is the moment speech starts and the moment
    *  it stops. */
   function captured(samples: Float32Array): void {
-    if (!isLive(state.phase)) return;
-    socket?.sendAudio(floatToPcm16(samples));
+    if (!hearsTheCaller(state.phase)) return;
+    const pcm = floatToPcm16(samples);
+    // A frame with nowhere to go is held, never dropped. That is what makes
+    // the bubble the gate raises a promise the words behind it can keep.
+    if (socket && isLive(state.phase)) {
+      socket.sendAudio(pcm);
+    } else {
+      if (preroll.length === PREROLL_FRAMES_MAX) preroll.shift();
+      preroll.push(pcm);
+    }
     const wasOpen = gate.open;
     gate = stepSpeechGate(gate, frameEnergy(samples), options.speechGate);
     if (gate.open !== wasOpen) input({ kind: 'speech', open: gate.open });
+  }
+
+  /** Send what the connect window captured, oldest first, and forget it. */
+  function flushPreroll(): void {
+    const waiting = preroll;
+    preroll = [];
+    for (const pcm of waiting) socket?.sendAudio(pcm);
   }
 
   function teardown(): void {
     generation++;
     dropTheHold();
     gate = SPEECH_GATE_SHUT;
+    // A dial that never landed holds audio nothing will ever read.
+    preroll = [];
     handshook = false;
     socket?.close();
     socket = null;

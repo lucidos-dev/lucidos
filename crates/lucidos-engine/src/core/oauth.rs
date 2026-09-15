@@ -127,8 +127,11 @@ pub fn client_provider_name(name: &str) -> String {
 }
 
 /// Build the credential-request JSON the frontend modal opens for an
-/// `oauth_client` flow. Single source of truth for service/prompt/base_url
+/// `oauth_client` flow. Single source of truth for service/prompt/base_urls
 /// shape — both the LLM tool path and the OAuth re-auth API path call here.
+///
+/// The scope is a one-member set. A registration names the provider's own API
+/// host, and `base_urls` is the spelling every layer uses (ADR 0161).
 pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) -> serde_json::Value {
     let base_url = overrides
         .base_url
@@ -137,7 +140,7 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
     let mut request = serde_json::json!({
         "service": client_provider_name(provider),
         "prompt": format!("Enter your OAuth client credentials for {provider}."),
-        "base_url": base_url,
+        "base_urls": [base_url],
         "auth_type": "oauth_client",
     });
     // Only keys the caller supplied go into `defaults`, never present-but-null,
@@ -231,6 +234,13 @@ pub fn oauth_client_repair_request(
     missing: &[&str],
 ) -> serde_json::Value {
     let mut request = oauth_client_request(provider, overrides);
+    // A repair carries NO scope, and dropping the key is what says so. The row
+    // already exists, so its stored `base_urls` are the answer and the form
+    // seeds from those. The overrides here come from the registry, or from the
+    // `https://{provider}.com` guess for a derived name the registry misses.
+    // Sending either would have the form save it over whatever the user
+    // actually scoped the credential to.
+    request.as_object_mut().map(|r| r.remove("base_urls"));
     request["existing_credential_id"] = serde_json::json!(credential_id.to_string());
     request["missing"] = serde_json::json!(missing);
     request["prompt"] = serde_json::json!(format!(

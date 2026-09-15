@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { ModelSelectionField } from '../shared/ModelSelectionField';
 import type { ModelSelectionPatch } from '../../hooks/useModelSelection';
 import type { ModelChoice, TierChoice } from '../../store/modelSelection';
@@ -11,6 +12,7 @@ export function ModelSelectionRow({
   label,
   anchor,
   nested,
+  explainer,
   models,
   vocabulary,
   model,
@@ -23,6 +25,9 @@ export function ModelSelectionRow({
   anchor?: string;
   /** The row sits under a parent control, so it indents. Layout only. */
   nested?: boolean;
+  /** An `<Explainer>` beside the label, for a row whose choices differ in
+   *  something the model names cannot say. */
+  explainer?: ComponentChildren;
   models: readonly ModelChoice[];
   vocabulary: readonly TierChoice[];
   model: string;
@@ -32,7 +37,10 @@ export function ModelSelectionRow({
 }) {
   return (
     <div class={`settings-row${nested ? ' settings-row-child' : ''}`} data-search-anchor={anchor}>
-      <span class="settings-row-label">{label}</span>
+      <span class="settings-row-label">
+        {label}
+        {explainer}
+      </span>
       <ModelSelectionField
         label={label}
         models={models}

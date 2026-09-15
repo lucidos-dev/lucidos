@@ -35,9 +35,23 @@ has just ended. The live utterance row carries them, so the pulse becomes the
 caller's own bubble in the same frame the speaking stops.
 
 No clock withdraws such a row. Two things retire it, and both are facts rather
-than timers: the engine's own row for it landing, through the tally
-`handleEvent` already keeps, and the voice session ending. A row that never got
-any words is still withdrawn on the spot, which is the noise case.
+than timers: the engine's own row for it landing, and the voice session ending.
+A row that never got any words is still withdrawn on the spot, which is the
+noise case.
+
+**Superseded in part, 2026-09-14.** Two clauses of this decision no longer hold,
+and the plan that replaced them is
+`docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`.
+
+- The row was retired through a TALLY comparing the engine's landed rows
+  against each row's utterance count. No count works, of either shape: the two
+  sides disagree about which live row is next, in both directions. A landing
+  row now claims the live row carrying the SAME WORDS
+  (`claimUtteranceRows`), trimmed on both sides because `doer.rs::wake` trims.
+- "A reply being spoken is still not captioned at all", below, is withdrawn.
+  The invariant in the Rationale is what withdrew it: it held for the caller
+  and not for the talker, and the words were already here. See *live reply* in
+  `docs/glossary.md`. The caller's own PARTIALS are drawn for the same reason.
 
 The session end is the backstop, not the usual path. It exists because the
 engine writes no row for one utterance: words the caller spent ANSWERING a

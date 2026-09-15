@@ -28,13 +28,26 @@ import { pickCredentialAutofocus } from './credentialAutofocus';
 import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './credentialSecret';
 import {
   addScopeRow,
+  initialScopeRows,
   removeScopeRow,
-  seedScopeRows,
   setScopeRow,
   submittedScopes,
 } from './credentialScopes';
 import { LoadableError } from '../shared/LoadableError';
+import { linkifyText } from '../shared/linkifyText';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+
+/** The credential prompt the engine sent, with its URLs made clickable.
+ *
+ *  A prompt names the page where the token is created, so that URL is the one
+ *  thing on the card to act on.
+ *
+ *  Linkified rather than rendered as markdown: the prompt is agent-written, and
+ *  `linkifyText` interprets no HTML. Hook-free and exported so its test can
+ *  call it, since the form around it holds hooks. */
+export function CredentialInstructions({ text }: { text: string }) {
+  return <blockquote class="credential-instructions">{linkifyText(text)}</blockquote>;
+}
 
 /** The `email_accounts.name` an `email_password` credential belongs to.
  *
@@ -59,20 +72,20 @@ export function CredentialModal() {
   // stale `data` from the previous credential can never seed the next form.
   if (form.editing) return <CredentialStoredLoader key={form.editing} credentialId={form.editing} />;
 
-  // A REPAIR targets a credential that already exists, so it loads the stored
-  // secret too. Saving rebuilds the whole `auth_value` from the form, so a form
-  // seeded only with the request's `client_id` would drop every other stored
-  // field on save: a confidential client would silently lose its
-  // `client_secret` and start failing the token exchange, and a provider the
-  // registry does not know would lose its endpoints, scopes and redirect
-  // override as well. The stored values win; the request's registry defaults
-  // fill only what is genuinely missing (see `initialAuthUrl` and friends).
-  const repairing = form.request?.existing_credential_id;
-  if (repairing) {
+  // A request naming a row targets one that already exists (an OAuth repair, or
+  // a scope widening), so it loads the stored secret too. Saving rebuilds the
+  // whole `auth_value` from the form, so a form seeded only with the request's
+  // `client_id` would drop every other stored field on save. A confidential
+  // client would silently lose its `client_secret` and fail the token exchange.
+  // A provider the registry does not know would lose its endpoints, scopes and
+  // redirect override too. The stored values win; the request fills only what
+  // is genuinely missing (see `initialAuthUrl`).
+  const targetedRow = form.request?.existing_credential_id;
+  if (targetedRow) {
     return (
       <CredentialStoredLoader
-        key={repairing}
-        credentialId={repairing}
+        key={targetedRow}
+        credentialId={targetedRow}
         request={form.request}
       />
     );
@@ -98,14 +111,17 @@ interface EditData {
  *  pre-filled. The secret is fetched via the same endpoint the copy buttons use,
  *  so this is no new exposure.
  *
- *  Serves the form's two "this row already exists" entry points, which differ
+ *  Serves the form's three "this row already exists" entry points, which differ
  *  only in what happens on save. An **edit** the user opened updates the row and
  *  stops. A **repair** was opened by the engine refusing to start an
- *  authorization, so it carries the `request` and saving continues that flow
- *  (`submitRequestedCredential`, routed to update by `existing_credential_id`).
- *  Passing `request` is what tells the two apart, and a repair deliberately
- *  leaves `editing` unset so the form applies the stricter create rules: the
- *  endpoints it reopened for are genuinely required.
+ *  authorization, and a **scope widening** by the engine being asked for a host
+ *  the row does not reach. Both of those carry the `request`, so saving
+ *  continues whatever was blocked (`submitRequestedCredential`, routed to update
+ *  by `existing_credential_id`).
+ *
+ *  Passing `request` is what tells an edit from the other two. Both of them
+ *  leave `editing` unset on purpose, so the form applies the stricter create
+ *  rules: the endpoints a repair reopened for are genuinely required.
  *
  *  `credentialId` is the row's `id`, not its service name: a name no longer
  *  identifies one row (an `oauth_client` registration may share it with an API
@@ -218,15 +234,10 @@ function CredentialFormInner({
 }: CredentialFormInnerProps) {
   // `editing` is an id, so the name shown comes off the resolved row.
   const initialService = existingCred?.service_name || request?.service || '';
-  // The stored set wins. A request proposes ONE base URL, because the agent is
-  // asking for one API; the user adds the provider's other hosts here.
-  const initialBaseUrls = seedScopeRows(
-    existingCred?.base_urls?.length
-      ? existingCred.base_urls
-      : request?.base_url
-        ? [request.base_url]
-        : [],
-  );
+  const initialBaseUrls = initialScopeRows(request?.base_urls, existingCred?.base_urls);
+  /** The hosts a widening ADDS, so the form says what the Save grants. The
+   *  seeded rows cannot: they hold the stored hosts too. */
+  const addingBaseUrls = request?.adding_base_urls ?? [];
   const initialAuthType = existingCred?.auth_type || request?.auth_type || 'api_key';
   const initialAuthHeader = existingCred?.auth_header || 'Authorization';
   const initialEnvVarName = existingCred?.env_var_name || request?.env_var_name || '';
@@ -477,7 +488,18 @@ function CredentialFormInner({
       // two reasons: a repair carries the id of the row it must update (creating
       // would make a second OAuth Client for one provider), and a save here has
       // an authorization waiting behind it that must now continue.
-      await submitRequestedCredential(request, service, scopes, authType, authValue, envVarName);
+      // The Advanced block holding the auth-header input renders only while
+      // EDITING, and a request never is. So this resolves to the stored value
+      // on a widening, and to the default on a create.
+      await submitRequestedCredential(
+        request,
+        service,
+        scopes,
+        authType,
+        authValue,
+        envVarName,
+        authHeaderRef.current?.value.trim() || initialAuthHeader,
+      );
     } else {
       await submitNewCredential(service, scopes, authType, authValue, envVarName);
     }
@@ -485,9 +507,7 @@ function CredentialFormInner({
 
   return (
     <div class="inline-form">
-      {instructions && (
-        <blockquote class="credential-instructions">{instructions}</blockquote>
-      )}
+      {instructions && <CredentialInstructions text={instructions} />}
       <form onSubmit={handleSubmit}>
         {!isEmailPassword && (
           <>
@@ -522,6 +542,16 @@ function CredentialFormInner({
                     key.
                   </p>
               </FieldLabel>
+              {/* What the Save actually grants. The rows below hold the stored
+                  hosts too, so they cannot say which ones are new, and a
+                  widening costs the user no secret: reading this IS the
+                  consent. */}
+              {addingBaseUrls.length > 0 && (
+                <p class="credential-scope-notice">
+                  Adding {addingBaseUrls.join(', ')} to the hosts this credential
+                  may be sent to.
+                </p>
+              )}
               {/* These inputs are CONTROLLED, so write every edit through
                   state. A bare `value=` with no handler is reverted by the next
                   re-render, and picking an Auth Type or a base provider is one. */}

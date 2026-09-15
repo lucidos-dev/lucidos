@@ -221,7 +221,7 @@ export function pushUnsupportedReason(ctx: {
     return DEV_SERVER_SW_REASON;
   }
   if (!ctx.secureContext) {
-    return 'Push needs a secure origin (https or localhost). Open Lucidos over https://, an SSH tunnel to localhost, or tailscale serve — plain http://<host> cannot register notifications.';
+    return 'Push needs a secure origin (https or localhost). Open Lucidos over https://, an SSH tunnel to localhost, or tailscale serve: plain http://<host> cannot register notifications.';
   }
   if (!ctx.hasServiceWorker || !ctx.hasPushManager) {
     return 'Push notifications are not supported in this browser';

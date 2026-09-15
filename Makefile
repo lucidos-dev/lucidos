@@ -1,4 +1,4 @@
-.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-full clean clean-all run run-local start stop restart status logs fresh
+.PHONY: build build-local check lint lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-eval test-full test-scripts clean clean-all run run-local start stop restart status logs fresh
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -133,6 +133,13 @@ test: test-eval
 # Full test suite
 test-full: test-eval
 	./scripts/test-engine.sh --full
+
+# Run the shell-library unit tests: every scripts/lib/*_test.sh, per-suite pass
+# or fail and a total. Separate from `lint` and from the engine `test` suite,
+# because nothing else collected these and they need no Postgres. Discovery and
+# rationale live in the script header.
+test-scripts:
+	./scripts/test-scripts.sh
 
 # The context-mode eval crate's own unit tests. Needs no Postgres and runs in
 # well under a second, so it goes first: a broken invariant should surface

@@ -12,5 +12,5 @@ export function changeToastMessage(action: string, threadId: string, detail?: st
   if (title) parts.push(title);
   if (detail) parts.push(detail);
   if (parts.length === 0) return `${action}.`;
-  return `${action}: ${parts.join(' — ')}`;
+  return `${action}: ${parts.join(', ')}`;
 }

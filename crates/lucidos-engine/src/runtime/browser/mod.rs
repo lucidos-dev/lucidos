@@ -8,9 +8,8 @@ use tokio::task::JoinHandle;
 
 /// Extract the host/domain from a URL using simple string parsing.
 fn extract_domain(url: &str) -> Option<String> {
-    // Find the start after the scheme ("://")
-    let after_scheme = url.find("://").map(|i| i + 3).unwrap_or(0);
-    let rest = &url[after_scheme..];
+    // Drop the scheme prefix ("scheme://"), keeping the whole string when absent.
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     // Take everything before the first '/' or '?' or '#'
     let host = rest.split(&['/', '?', '#'][..]).next().unwrap_or(rest);
     // Strip port

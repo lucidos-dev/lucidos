@@ -1862,6 +1862,169 @@ test_another_workspaces_dev_script_is_not_selected
 test_init_and_self_are_never_selected
 test_an_empty_feed_never_reaches_the_real_ps
 
+# ── engine_gateway_port: which gateway owns this workspace ─────────────
+#
+# Hermetic: `ps` is shadowed as a function inside each subshell, so no real
+# process is listed. It is the only host call the function makes. `kill -0` runs
+# for real, because signal 0 sends nothing, and the two pids below are chosen so
+# its answer is fixed: this shell is alive, and DEAD_PID is above the macOS pid
+# ceiling, so no process can ever carry it. Shadowing `ps` per subshell rather
+# than for the whole file keeps the eight probes above reading the real host, as
+# they need to.
+DEAD_PID=4194304
+
+# Run engine_gateway_port against a pidfile holding $1 ("none" writes no file),
+# with `ps` answering the line $2.
+gateway_port_for() {
+    local pid="$1" psline="$2" dir
+    dir="$SANDBOX/gwport-$RANDOM/.lucidos"
+    mkdir -p "$dir"
+    [ "$pid" = "none" ] || printf '%s\n' "$pid" >"$dir/engine.pid"
+    (
+        # shellcheck disable=SC2317 # called through engine_gateway_port
+        ps() {
+            printf 'PS\n' >>"$SANDBOX/gwport-calls"
+            printf '%s\n' "$psline"
+        }
+        engine_gateway_port "$dir/engine.pid"
+    )
+}
+
+PACKAGED_PS="/Applications/Lucidos.app/Contents/MacOS/lucidos-engine \
+LUCIDOS_WORKSPACE=/home/u/Library/Application Support/com.lucidos.app/workspaces/packaged \
+LUCIDOS_WORKSPACE_ID=packaged LUCIDOS_GATEWAY_PORT=5252 LUCIDOS_API_PORT=59704 PATH=/bin"
+
+test_engine_gateway_port_reads_the_packaged_gateway() {
+    echo "test: engine_gateway_port reads the port off the engine being stopped"
+    local got
+    got="$(gateway_port_for "$$" "$PACKAGED_PS")"
+    if [ "$got" = "5252" ]; then
+        pass "a packaged workspace's engine names the gateway that owns it"
+    else
+        fail "want 5252, got '$got'"
+    fi
+}
+
+test_engine_gateway_port_is_empty_without_a_gateway() {
+    echo "test: engine_gateway_port answers nothing when there is no gateway to name"
+    local got
+    # LUCIDOS_NO_GATEWAY dev and the e2e harness: a live engine, no gateway var.
+    got="$(gateway_port_for "$$" "/opt/lucidos/bin/lucidos-engine LUCIDOS_WORKSPACE=/ws/e2e PATH=/bin")"
+    if [ -z "$got" ]; then
+        pass "an engine started with no gateway names none"
+    else
+        fail "invented a port: '$got'"
+    fi
+}
+
+test_engine_gateway_port_never_lists_a_dead_or_absent_pid() {
+    echo "test: engine_gateway_port lists no process for a dead, absent or junk pid"
+    : >"$SANDBOX/gwport-calls"
+    local got
+    for pid in "$DEAD_PID" none not-a-pid; do
+        got="$(gateway_port_for "$pid" "$PACKAGED_PS")"
+        [ -z "$got" ] || fail "pid '$pid' yielded '$got'"
+    done
+    if [ ! -s "$SANDBOX/gwport-calls" ]; then
+        pass "nothing was listed, so a recycled pid can never be read as the engine"
+    else
+        fail "ps was called for a pid we could not confirm alive"
+    fi
+}
+
+test_engine_gateway_port_reads_the_packaged_gateway
+test_engine_gateway_port_is_empty_without_a_gateway
+test_engine_gateway_port_never_lists_a_dead_or_absent_pid
+
+# ── gateway_stop_status: https first, then http ────────────────────────
+#
+# `curl` is shadowed in a subshell and answers from a queue, one status per
+# call, so the two-scheme fallback is pinned rather than assumed. No request
+# leaves this process.
+
+# Run gateway_stop_status with `curl` answering the queued statuses in $1
+# (space separated). Writes the call count to $SANDBOX/curl-calls.
+#
+# The subshell runs under `set -e`, as stop.sh does, and the stub exits 7 on a
+# `000` exactly as curl does when a connection is refused. Together those pin
+# the arm that used to take the whole script down before the engine signal.
+stop_status_with() {
+    local queue="$1"
+    printf '%s' "$queue" >"$SANDBOX/curl-queue"
+    : >"$SANDBOX/curl-calls"
+    (
+        set -e
+        # shellcheck disable=SC2317 # called through gateway_curl
+        curl() {
+            local seq head rest
+            printf 'CALL\n' >>"$SANDBOX/curl-calls"
+            seq="$(cat "$SANDBOX/curl-queue")"
+            head="${seq%% *}"
+            rest="${seq#* }"
+            [ "$rest" = "$seq" ] && rest=""
+            printf '%s' "$rest" >"$SANDBOX/curl-queue"
+            printf '%s' "$head"
+            [ "$head" != "000" ]
+        }
+        gateway_stop_status 5252 packaged
+    )
+}
+
+curl_calls() { wc -l <"$SANDBOX/curl-calls" | tr -d ' '; }
+
+test_stop_status_reports_the_first_scheme_that_answers() {
+    echo "test: gateway_stop_status reports what the gateway answered"
+    local got
+    got="$(stop_status_with "202 000")"
+    if [ "$got" = "202" ] && [ "$(curl_calls)" = "1" ]; then
+        pass "https answered 202, so http is never tried"
+    else
+        fail "want 202 in one call, got '$got' in $(curl_calls)"
+    fi
+
+    got="$(stop_status_with "404 000")"
+    if [ "$got" = "404" ]; then
+        pass "a 404 is reported, not swallowed as a failure to reach anything"
+    else
+        fail "want 404, got '$got'"
+    fi
+}
+
+test_stop_status_falls_back_to_http() {
+    echo "test: gateway_stop_status falls back to http when TLS refuses"
+    local got
+    # curl's own 000: no HTTP answer at all. The dev gateway serves plain http
+    # when no certs exist, so this is the ordinary local case, not an error.
+    got="$(stop_status_with "000 202")"
+    if [ "$got" = "202" ] && [ "$(curl_calls)" = "2" ]; then
+        pass "http answered after https could not connect"
+    else
+        fail "want 202 in two calls, got '$got' in $(curl_calls)"
+    fi
+}
+
+test_stop_status_says_000_when_nothing_answers() {
+    echo "test: gateway_stop_status says 000 when no gateway answers"
+    local got
+    got="$(stop_status_with "000 000")"
+    if [ "$got" = "000" ]; then
+        pass "no gateway on that port reads as 000, never as success"
+    else
+        fail "want 000, got '$got'"
+    fi
+
+    got="$(stop_status_with " ")"
+    if [ "$got" = "000" ]; then
+        pass "an empty answer is 000 too, so the case arms stay exhaustive"
+    else
+        fail "want 000 for an empty answer, got '$got'"
+    fi
+}
+
+test_stop_status_reports_the_first_scheme_that_answers
+test_stop_status_falls_back_to_http
+test_stop_status_says_000_when_nothing_answers
+
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"
 [ $FAIL -eq 0 ]

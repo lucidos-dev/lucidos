@@ -188,3 +188,51 @@ describe('a repair updates the existing registration', () => {
     expect(createCredential).toHaveBeenCalled();
   });
 });
+
+/* A scope widening reaches the same update path as an OAuth repair, but its
+   credential is an ordinary API one, so every field it does not mean to change
+   has to survive. The auth header is the one that used to be hardcoded. */
+describe('a scope widening keeps everything but the scope', () => {
+  const widening: CredentialRequest = {
+    service: 'github',
+    existing_credential_id: 'cred-2',
+    base_urls: ['https://api.github.com', 'https://github.com'],
+    adding_base_urls: ['https://github.com'],
+  };
+
+  it('writes the stored auth header, not the Authorization default', async () => {
+    await submitRequestedCredential(
+      widening,
+      'github',
+      widening.base_urls!,
+      'api_key',
+      'ghp_secret',
+      undefined,
+      'X-Api-Key',
+    );
+
+    expect(createCredential).not.toHaveBeenCalled();
+    expect(updateCredential).toHaveBeenCalledWith('cred-2', expect.objectContaining({
+      auth_header: 'X-Api-Key',
+      auth_type: 'api_key',
+      base_urls: ['https://api.github.com', 'https://github.com'],
+      auth_value: 'ghp_secret',
+    }));
+  });
+
+  /* An oauth_client has no meaningful header, and the form never shows the
+     field on a create. Both land here with nothing to pass. */
+  it('falls back to Authorization when no header is passed', async () => {
+    await submitRequestedCredential(
+      widening,
+      'github',
+      widening.base_urls!,
+      'api_key',
+      'ghp_secret',
+    );
+
+    expect(updateCredential).toHaveBeenCalledWith('cred-2', expect.objectContaining({
+      auth_header: 'Authorization',
+    }));
+  });
+});

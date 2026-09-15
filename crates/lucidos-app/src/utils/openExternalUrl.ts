@@ -1,5 +1,6 @@
 import { isIOSPwa } from './platform';
 import { openNewTab } from './newTab';
+import { hasDangerousScheme } from './dangerousUrlScheme';
 import { currentExternalLinkTarget } from '../store/actions/preferences';
 import { postClientLog } from './clientLog';
 import { showToast, dismissToast } from '../store/store';
@@ -93,6 +94,29 @@ function offerBlockedUrl(url: string, source: string | undefined, retried: boole
   );
 }
 
+/** Refuse a url whose scheme must never be opened, and say so. Returns whether
+ *  it refused, so a caller can `if (refuseDangerousUrl(...)) return;`.
+ *
+ *  Lives here beside the other refusal, and is shared with `openUrl` /
+ *  `openUrlOutsideApp` (`store/actions/artifacts.ts`), so the three sinks
+ *  behind them raise ONE wording: the browser tab, the OS opener, and the
+ *  in-app webview. A second copy would be a second string for one condition,
+ *  pinned by exact-text assertions in two suites.
+ *
+ *  It sits at the SINK rather than at each ingress because there are four
+ *  ingresses and only one screened: the deep-link parser did, while an agent
+ *  `navigate_ui` over SSE, a notification-toast tap and a notification
+ *  inbox-row tap did not. A guard per ingress is a guard the next one forgets.
+ *
+ *  The toast names what asked. A navigate arriving over SSE is not something
+ *  the user did (`.claude/rules/frontend.md` § No Hidden Errors). */
+export function refuseDangerousUrl(url: string, source?: string): boolean {
+  if (!hasDangerousScheme(url)) return false;
+  const from = source ? ` (requested by ${source})` : '';
+  showToast(`Refused to open a scripted url${from}`, 'error');
+  return true;
+}
+
 function retryBlockedUrl(url: string, source: string | undefined): void {
   if (openNewTab(url)) {
     // Log the recovery too, so engine.log answers "did the user ever get
@@ -140,6 +164,10 @@ function retryBlockedUrl(url: string, source: string | undefined): void {
  *  desktop app's OS opener (an IPC call into Rust). This is the browser/PWA
  *  side, and `openUrl` picks between them. */
 export function openExternalUrl(url: string, source?: string): void {
+  // Every branch below reaches `window.open` or navigates the document, so a
+  // scripted scheme is refused before any of them is chosen. `openUrl` checks
+  // too, but this function has callers that never go through it.
+  if (refuseDangerousUrl(url, source)) return;
   if (!isIOSPwa() || !HTTP_SCHEME_RE.test(url)) {
     openNewTabOrOffer(url, source);
     return;

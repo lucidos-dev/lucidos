@@ -176,6 +176,11 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Three readings joined in the tenth round. The morph's own mode, the quiet
   window before the line, and, on a `missed`, why no watchable face took the
   press.
+
+  Two more joined in the twelfth. A `missed` line now carries the touch point
+  and the distance from it to the nearest watchable face. Read `missedBy`
+  first: a single-digit `px` is a near miss on a small target, and a large one
+  is a press that was never aimed at a face.
 - **Removal / resolution condition:** An episode arrives carrying a verdict, and
   the fix that verdict points at ships, OR two months pass with no report. The
   eighth episode reopened this: the cause is NOT named, and the probe's job is
@@ -212,10 +217,63 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   returns without a line. A `missed` line says why no face took the press. And
   every line carries the quiet window before it. The plan is
   [`docs/plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md`](plans/2026-09-05-the-probe-speaks-when-no-face-can-take-the-press.md).
-- **Status:** `active`, and back to gathering evidence rather than confirming a
-  repair.
-- **Not a workaround.** It changes no behaviour and takes no gesture. Real fixes
-  ship beside it, and this only decides what the user is told when they fail.
+- **What the eleventh report found: a false alarm through the app's own cover.**
+  A client refresh raises `UiBlockingOverlay` over the whole page and holds it
+  until the reload lands. The probe read that blocker at Cancel's own centre,
+  called the face unreachable, and toasted the wedge report over the app's own
+  "Refreshing" status. It then spent the episode's one repair nudging a layout
+  about to be torn down.
+
+  The stand-down knew only `data-overlay-open`. `coveredOnPurpose` now names
+  both covers, and gates the landing report as well as the reachability check.
+  A tap that lands on either cover writes no line, because a cover the app
+  raised itself is not the fault being chased.
+- **What the twelfth report found: the press never reached the button.** The
+  line is `missed`, `under nothing`, `at div.prompt-actions-row`, with
+  `morph=send` and the keyboard up. So the face was live, and the three
+  scheduled checks in the previous ten seconds found it reachable at its own
+  centre. The next tap, one second later, sent the message.
+
+  **It is not where the finger lands. Read that again before proposing
+  anything.** This round read the line as a near miss on a small target, shipped
+  a wider touch box, and was corrected inside the hour: the composer is dead
+  ANYWHERE while the keyboard is up, and it has always been. The touch-box
+  change and its ADR were reverted. Every round that has treated this as aim has
+  been wrong.
+
+  Three things shipped instead. A row-missed press is ruled at its LIFT, with
+  the travel it measured rather than an asserted zero. A stationary one that
+  reached nothing RUNS SEND itself, then relayouts the shell a keyboard's span
+  away and straight back
+  ([ADR 0183](adr/0183-a-dead-composer-tap-runs-send-itself.md)). And every line
+  carries `screenOff`, the touch's screen-to-client offset.
+
+  The Send half is the one that needs no theory. The app knows a touch reached
+  the document inside the composer row, that no button claimed it, and that the
+  morph is live. That is enough to run the button rather than relayout and hope.
+
+  That last one is the reading twelve episodes have lacked. Every other reading
+  here comes from the layout side, so they agree with each other. The user is
+  describing a page hit-testing away from the glass.
+
+  A touch that reaches the page while the keyboard is up and misses the composer
+  now writes a `keyboard-touch` line, throttled. That closes the blind spot the
+  whole investigation has died in: a silent ledger has meant both "iOS delivered
+  no touch" and "iOS delivered it somewhere else". The platform research behind
+  that split, and the two candidates it retires, are in
+  [ADR 0183](adr/0183-a-dead-composer-tap-runs-send-itself.md).
+- **Status:** `active`, and now carrying a recovery as well as evidence. The
+  cause is still NOT named. So the removal condition needs a quiet period with
+  the bounce in place, or an episode whose `screenOff` names it.
+- **It is no longer behaviour-free, and the removal condition changes with
+  that.** The module now RUNS Send for a tap the page dropped, and relayouts the
+  shell behind it. Those two are a fix rather than a diagnostic, so deleting the
+  module would delete them. Removal therefore means moving `rescueSend`,
+  `ruleMissedPress`, `bounceHeight` and `nudgeLayout` to a permanent home first,
+  and dropping only the reporting around them.
+- **Still consumes no gesture.** Every listener stays passive, and none calls
+  `preventDefault` or `stopPropagation`. What it adds is an action on a press
+  that reached NOTHING, which is a press no other path was going to take.
 
 ### Dead-keystroke probe on the composer's textarea
 
@@ -1535,6 +1593,29 @@ event that retires it.
   this row and the ADR, and the nightly Step 5 spawn intent in the
   `lucidos-ops/nightly-pipeline` knowhow should name neither. Then delete the
   block and its test.
+- **Status:** active
+
+### The retired-settle notice in the pre-flight engine reclaim
+
+- **Added:** 2026-09-10
+- **Lives in:** `scripts/lib/preflight_reclaim.sh`
+  (`_reclaim_warn_retired_settle`, called first in `preflight_reclaim_main`),
+  plus the `the retired settle knob is named and not honoured` case in
+  `preflight_reclaim_test.sh`.
+- **What it is:** the single settle delay became a poll, so
+  `LUCIDOS_RECLAIM_SETTLE_S` no longer exists. Its old default of 10s is
+  shorter than the respawn the watch exists to catch, so honouring a caller's
+  value would put the bug back. Ignoring it in silence would leave that caller
+  believing it had set the window. The run names the variable instead, and the
+  two that replaced it.
+- **Impermanent because:** it exists only for callers written against the old
+  knob. Once none set it, the notice is telling nobody anything. It validates
+  nothing: no value is accepted, rejected or defaulted.
+- **Removal condition:** after one full nightly cycle on the watch, confirm no
+  caller sets it. `grep -rn LUCIDOS_RECLAIM_SETTLE_S` should return only this
+  row, the function and its test, and the nightly's own step intent in the
+  `lucidos-ops/nightly-pipeline` knowhow should not name it. Then delete the
+  function, its call and its test.
 - **Status:** active
 
 ### `self_curated_context_mode` flag (ADR 0085)

@@ -850,6 +850,100 @@ fn api_handlers_never_drive_a_coding_agent_session_directly() {
     }
 }
 
+// ── One failed apply, one card ──
+
+/// A caller of `apply_change` must not emit its own `ChangeApplyFailed`.
+///
+/// The apply path announces every failure it decides, then returns the same
+/// text as `Err`. A caller that emits on that `Err` therefore writes the event
+/// a second time, and the thread draws two identical "Change failed" cards.
+/// Four callers did: both no-live-session paths in `apply_now`, and both
+/// auto-apply paths in `claude_code/spawn.rs`.
+///
+/// Whole-tree rather than a hand-kept file list. The callers are spread over
+/// six modules, and a new one must inherit the rule without being enrolled.
+/// Test sources are skipped: this file names the banned tokens to assert on
+/// them, and would otherwise match itself.
+#[test]
+fn apply_change_callers_do_not_re_announce_the_failure() {
+    for (path, source) in engine_sources() {
+        for block in apply_change_result_blocks(&source) {
+            for banned in ["emit_apply_failed(", "ThreadEvent::ChangeApplyFailed"] {
+                assert!(
+                    !block.contains(banned),
+                    "{path} handles an apply_change result with `{banned}`. The apply path \
+                     already emitted that failure, so this draws the same card twice. Log it \
+                     and let the event stand, as apply_all_driver.rs does. Block was:\n{block}"
+                );
+            }
+        }
+    }
+}
+
+/// Every non-test `.rs` under this crate's `src/`, as (display path, contents).
+fn engine_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(dir).expect("engine src must be readable");
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+                continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.ends_with(".rs") || name.contains("_test") {
+                continue;
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            out.push((
+                rel.to_string_lossy().into_owned(),
+                std::fs::read_to_string(&path).expect("source must be readable"),
+            ));
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    out
+}
+
+/// The block that handles each `apply_change` result in `source`.
+///
+/// A call is followed either by `{ … }` (its `if let Err` / `match` arms) or by
+/// a `;` and a later block over the bound result. Both are found the same way:
+/// take the first `{` after the call and read to its match. A commented-out
+/// call is skipped, so naming the method in prose costs nothing.
+fn apply_change_result_blocks(source: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut cursor = 0;
+    while let Some(hit) = source[cursor..].find(".apply_change(") {
+        let call = cursor + hit;
+        cursor = call + 1;
+        let line_start = source[..call].rfind('\n').map_or(0, |i| i + 1);
+        if source[line_start..call].contains("//") {
+            continue;
+        }
+        let Some(open) = source[call..].find('{').map(|i| call + i) else {
+            continue;
+        };
+        let mut depth = 0usize;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        blocks.push(&source[open..=open + offset]);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    blocks
+}
+
 // ── An unanswerable `git worktree list` is not a "no worktree" ──
 
 mod unknown_worktree_lookup_is_not_a_no {

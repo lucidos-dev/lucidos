@@ -1,7 +1,10 @@
 # 0175: The browser e2e memory guard stops on kernel pressure, not the compressor
 
 - **Status**: Accepted (supersedes the compressor survivability cap decided two
-  days earlier in `docs/plans/2026-09-05-e2e-memory-guard-stops-on-real-headroom.md`)
+  days earlier in `docs/plans/2026-09-05-e2e-memory-guard-stops-on-real-headroom.md`).
+  Decision 5, leaving the available floor unchanged, is superseded by
+  [ADR 0176](0176-available-floor-measures-sustained-scarcity.md). Everything
+  else here still holds.
 - **Date**: 2026-09-07
 
 ## Context
@@ -71,7 +74,10 @@ boundary check becomes peak-aware.
    compressor keeps only its runaway backstop at 50% of RAM.
 4. A run-scoped sampler ticks every 5 s, and the boundary folds the worst
    observation since the previous boundary over its own instantaneous reading.
-5. The available-memory floor and the swap stop are unchanged.
+5. The available-memory floor and the swap stop are unchanged. **[Superseded by
+   ADR 0176:** the floor keeps its value and gains a sustain rule, because the
+   minimum of a noisy series over a growing window is the wrong statistic. The
+   swap stop is genuinely unchanged.**]**
 6. `LUCIDOS_E2E_WEBKIT_CHUNKS=<first>-<last>` narrows the nav phase to a chunk
    range, announcing every skipped chunk and restating the range at the end.
 

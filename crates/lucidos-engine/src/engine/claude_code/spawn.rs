@@ -190,28 +190,14 @@ impl LucidosEngine {
                             );
                             engine.broadcast_changes_updated().await;
                         }
+                        // Log only: `apply_change` announces its own failures,
+                        // and a second emit draws the same card twice.
                         Err(e) => {
                             log!(
                                 "[ClaudeCode] Auto-apply failed after hardening for change {}: {}",
                                 change_id,
                                 e
                             );
-                            engine
-                                .event_bus
-                                .emit_or_log(
-                                    crate::engine::event_bus::BusEvent::Thread {
-                                        thread_id,
-                                        event:
-                                            crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                                change_id: change_id.to_string(),
-                                                error: e.to_string(),
-                                                actor: actor.clone(),
-                                            },
-                                        meta: crate::engine::thread_events::EventMeta::NONE,
-                                    },
-                                    "[ClaudeCode] ChangeApplyFailed",
-                                )
-                                .await;
                         }
                     }
                 }
@@ -455,7 +441,7 @@ impl LucidosEngine {
                     if res.proposed_change {
                         if res.auto_apply {
                             engine
-                                .auto_apply_proposed_change(res.request_id, cc_thread_id, None)
+                                .auto_apply_proposed_change(res.request_id, None)
                                 .await;
                         }
 
@@ -478,12 +464,12 @@ impl LucidosEngine {
 
     /// Look up the pending change a finished background turn proposed (by
     /// `request_id`) and apply it; an apply failure surfaces as a
-    /// `ChangeApplyFailed` event on the thread. Shared by the coding-agent
-    /// and agent-chat Thread Queue execution paths.
+    /// `ChangeApplyFailed` event on the thread, emitted by the apply path
+    /// itself. Shared by the coding-agent and agent-chat Thread Queue
+    /// execution paths.
     pub(crate) async fn auto_apply_proposed_change(
         self: &Arc<Self>,
         request_id: Uuid,
-        thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) {
         let pending = match self.changes().list_pending().await {
@@ -499,26 +485,13 @@ impl LucidosEngine {
         let Some(change) = pending.iter().find(|c| c.request_id == request_id) else {
             return;
         };
-        match self.apply_change(change.id, actor.clone()).await {
+        match self.apply_change(change.id, actor).await {
             Ok(r) => {
                 log!("[ClaudeCode] Auto-applied change: {}", r.message)
             }
+            // Log only: `apply_change` announces its own failures.
             Err(e) => {
                 log!("[ClaudeCode] Failed to auto-apply: {}", e);
-                self.event_bus
-                    .emit_or_log(
-                        crate::engine::event_bus::BusEvent::Thread {
-                            thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
-                                change_id: change.id.to_string(),
-                                error: e.to_string(),
-                                actor,
-                            },
-                            meta: crate::engine::thread_events::EventMeta::NONE,
-                        },
-                        "[ClaudeCode] ChangeApplyFailed",
-                    )
-                    .await;
             }
         }
     }

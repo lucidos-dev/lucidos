@@ -140,10 +140,13 @@ git ls-files '*.ts' '*.tsx' | xargs grep -n 'eslint-disable'
 git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 # TS: any @ts-expect-error outside a *.test.ts file (the claim below that drifted)
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
+# TS: the SDK typecheck no phase invokes (see Known exceptions). Restate, do not gate on it.
+(cd packages/lucidos-sdk && npx tsc --noEmit -p tsconfig.json); echo "SDK EXIT: $?"
 ```
 
-The currently-accepted categories, counted as of 2026-09-05. Anything not
-on this list is fair game to remove and re-fix:
+The currently-accepted categories, re-counted on 2026-09-15 with every number
+below confirmed unchanged. Anything not on this list is fair game to remove
+and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 81 sites across 52 files,
   by far the largest category. Internal helpers that legitimately need
@@ -177,8 +180,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 559 sites across 195 files, every one of them
-  test-only code: 186 `*.test.ts`, eight `*.test.tsx`
+  `@types/node` in project**, 562 sites across 196 files, every one of them
+  test-only code: 187 `*.test.ts`, eight `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx`,
   `components/chat/__tests__/welcome-onboarding.test.tsx`,
   `components/chat/__tests__/event-wait-surfaces.test.tsx`,
@@ -245,47 +248,56 @@ for f in $(git ls-files '*.rs'); do awk -v F="$f" '
 Where "When to give up" (below) sends an unfixable finding. Kept inside
 `## Documented exceptions` so the two inventories read as one list.
 
-- **`packages/lucidos-sdk`'s own `npm run typecheck` cannot run, and no
-  phase above invokes it.** Recorded 2026-08-04. The npm workspace has two
-  JS members (`crates/lucidos-app` and `packages/lucidos-sdk`), but only
-  the app is gated by phases 3 and 4. Running the SDK's script directly
-  fails with 16 `TS2307: Cannot find module 'vitest'` errors, one per
-  `packages/lucidos-sdk/src/**/*.test.ts`. It was eight when this was first
-  recorded, and the count grows with the SDK's test suite.
+- **`packages/lucidos-sdk`'s own `npm run typecheck` RUNS now, and exits 0.
+  No phase above invokes it.** Recorded 2026-08-04 as unrunnable, reopened
+  and cleared on the 2026-09-15 run. The entry stays because the coverage
+  gap it describes is still real: no phase reads the SDK's test files.
 
-  The cause is a resolution gap. The SDK's `tsconfig.json` includes its
-  whole `src` tree, and its test files import `vitest`. `vitest` is declared
-  only by `crates/lucidos-app`, and `package-lock.json` pins it to
-  `crates/lucidos-app/node_modules/vitest`, which the SDK's resolution path
-  never reaches. This is not a worktree-provisioning artifact: the lockfile
-  puts it there for a root `npm ci` too. Nothing in the repo calls the
-  script, so it has been inert rather than failing.
+  The old blocker is gone. It was a resolution gap: the SDK's test files
+  import `vitest`, which only `crates/lucidos-app` declares, and the lockfile
+  put it at `crates/lucidos-app/node_modules/vitest`. The SDK never reaches
+  that path. The vitest path-traversal bump (`fix(deps): npm audit fix, vitest
+  path-traversal advisory`) hoisted it to the root `node_modules/vitest`,
+  which every member resolves through. So a security bump closed the gap as a
+  side effect, and the 16 `TS2307: Cannot find module 'vitest'` errors are
+  gone.
 
-  **Do not "fix" this by trimming the SDK tsconfig's `include`.** That
-  would drop the test files from type checking rather than type check
-  them. The real fix is to declare `vitest` as a devDependency of
-  `packages/lucidos-sdk` and regenerate the lockfile, which is a
-  dependency + lockfile change (ADR 0020) and belongs in its own commit,
-  not inside a clean-build run.
+  **Running it then exposed 5 real type errors**, which the 2026-09-15 run
+  fixed at source: two untyped `vi.fn` mocks whose `mock.calls` tuples were
+  empty, in `src/_fetch.test.ts` and `src/openExternal.test.ts`. Both now
+  carry the repo's `vi.fn<Signature>()` idiom, and the two casts to
+  `typeof fetch` are gone with it. The 29 tests in those files still pass.
 
-  Coverage today, so the gap is neither overstated nor understated: the SDK's
-  **non-test** sources are type checked transitively by phase 3, because
-  `crates/lucidos-app/node_modules/@lucidos/sdk` symlinks to the package
-  and its `types` field points at `src/index.ts`. The SDK's **test** files
-  are type checked by nothing, though they do execute: the app's
-  `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
-  the vitest include list, so `/run-tests` runs them.
+  **Do not "fix" a future failure here by trimming the SDK tsconfig's
+  `include`.** That would drop the test files from type checking rather
+  than type check them.
+
+  Here is the coverage today, so the gap is neither overstated nor
+  understated. The SDK's **non-test** sources are type checked
+  transitively by phase 3, because
+  `node_modules/@lucidos/sdk` symlinks to the package and its `types` field
+  points at `src/index.ts`. The SDK's **test** files are read by no phase,
+  though they do execute: the app's `vite.config.ts` adds
+  `../../packages/lucidos-sdk/src/**/*.test.ts` to the vitest include list,
+  so `/run-tests` runs them.
 
   **`src/worker/` is the hole in that transitive coverage**, found on the
   2026-08-29 run. `src/index.ts` never imports it, so phase 3 never reaches
   it. `sseWorker.build.mjs` bundles it with esbuild into
   `src/generated/sse-worker.js`, which the engine `include_str!`s and serves,
-  and esbuild type checks nothing. So it is shipping code that no gate reads.
+  and esbuild type checks nothing. So it is shipping code that no phase reads.
   It had one real error, `SharedWorkerGlobalScope` undeclared, which that run
-  fixed by adding `WebWorker` to the SDK's `lib`.
+  fixed by adding `WebWorker` to the SDK's `lib`. The SDK typecheck does reach
+  it, which is why the regeneration block above now runs that command.
 
-- **Phase 4's entry chunk is 744.63 kB against its 600 kB ceiling, and the
-  2026-09-08 run left it there.** `vite build` exits 0 and prints no code
+  **Promoting it to a sixth phase is the maintainer's call, not this
+  skill's.** It would widen the nightly gate. It also runs only because npm
+  hoists a dependency the SDK does not declare. Declaring `vitest` as a
+  devDependency of `packages/lucidos-sdk` would make that solid. That is a
+  dependency plus lockfile change (ADR 0020), and belongs in its own commit.
+
+- **Phase 4's entry chunk is 750.02 kB against its 600 kB ceiling, and the
+  2026-09-15 run left it there.** `vite build` exits 0 and prints no code
   diagnostic. What fires is Rollup's size advisory against
   `chunkSizeWarningLimit: 600`, the repo's own number, whose comment in
   `crates/lucidos-app/vite.config.ts` says to code-split rather than raise
@@ -305,7 +317,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   **The on-demand surfaces can no longer close the gap, and the shortfall is
   widening.** That is new since 2026-08-19, when the same list was 36 kB
   against a 36 kB gap. It stopped there on a product call. Sourcemap
-  attribution now puts the whole list at 38.28 kB, against a 144.63 kB gap:
+  attribution now puts the whole list at 38.28 kB, against a 150.02 kB gap:
 
   | Surface | kB of the built chunk |
   |---|---|
@@ -318,7 +330,7 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | `OverflowMenu` | 2.52 |
 
   So paying the loading-flash trade on every permission prompt would still
-  leave the advisory firing, and would now leave 106 kB of it. The next
+  leave the advisory firing, and would now leave 112 kB of it. The next
   cut has to come out of first-paint code instead, which is a wider decision
   than this skill makes.
 
@@ -341,15 +353,18 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   | 2026-09-06 | 743.87 kB | +10.66 kB |
   | 2026-09-07 | 743.87 kB | 0 kB |
   | 2026-09-08 | 744.63 kB | +0.76 kB |
+  | 2026-09-11 | 744.77 kB | +0.14 kB |
+  | 2026-09-12 | 744.75 kB | -0.02 kB |
+  | 2026-09-15 | 750.02 kB | +5.27 kB |
 
-  The 2026-09-08 run makes nine in a row with no regression. Sourcemap
+  The 2026-09-15 run makes twelve in a row with no regression. Sourcemap
   attribution put the same 393 of our own modules in the entry chunk as the
   run before, and zero `node_modules` bytes. No module sits in both the entry
-  chunk and a separate one. Non-test app source holds 40 relative `import()`
-  sites: 8 are type-position and 32 resolve to a real target. None of the 32
-  sits in the entry chunk, and the SDK has no relative `import()` site at all.
-  The per-surface figures above are the 2026-08-30 deep-dive, not re-measured
-  here.
+  chunk and a separate one. All 32 non-test relative `import()` targets have
+  their own emitted chunk. They are reached from `App.tsx`, `main.tsx`,
+  `PairingGate.tsx`, `ContentPane.tsx` and `InlineForm.tsx`, and not one of
+  the 32 sits in the entry chunk. The per-surface figures above are the
+  2026-08-30 deep-dive, not re-measured here.
 
   **That check is two questions, not one.** Does any module sit in both the
   entry chunk and a separately emitted chunk? And does any target of a
@@ -371,7 +386,14 @@ Where "When to give up" (below) sends an unfixable finding. Kept inside
   Then drop TypeScript's type-position `import('...').Type`, which is erased at
   compile time and reaches no bundle. All 6 apparent entry-chunk hits were that
   form, in `api/threads.ts`, `api/types.ts`, `store/actions/navigation.ts` and
-  `store/store.ts`. So the real answer was zero.
+  `store/store.ts`. So the real answer was zero. The 2026-09-15 run found the
+  same four files holding 8 of them.
+
+  **Write that second filter carefully.** "The character after the closing
+  paren is a dot" also drops every `import('./x').then(...)` site, which is
+  the entire value-import population. The 2026-09-15 run hit that and read 1
+  site where there were 32. Keep `.then`, `.catch` and `.finally`; drop only
+  the other dotted forms.
 
   The top is unchanged: `icons.tsx` at 20.62 kB, `ThreadDrawer.tsx` at 17.93
   and `store.ts` at 17.23. The three thread-event exchange modules add

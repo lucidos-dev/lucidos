@@ -242,8 +242,8 @@ pub const CATALOG: &[PrefSpec] = &[
         label: "Voice talker model",
         scope: PrefScope::Global,
         value: PrefValue::Text,
-        default: "gpt-realtime",
-        description: "Speech-to-speech model a voice session speaks through. It holds the conversation and nothing else: it has no tools and can change nothing, so every action still goes through the ordinary agent. Not a chat-model registry row, because a realtime model cannot serve an ordinary turn.",
+        default: "gpt-realtime-2.1",
+        description: "Speech-to-speech model a voice session speaks through. It holds the conversation and nothing else: it can change nothing, so every action still goes through the ordinary agent. Two families, and this id picks which protocol the call opens on. A 'gpt-realtime-*' model bills by the token, and the caller can settle a card or ring off out loud. 'gpt-live-1' listens while it speaks, so it takes an interruption better, but it holds no tools: a card is settled by tapping it and a call is ended on the button. It bills by the minute, which the usage rollup does not show. Not a chat-model registry row, because neither family can serve an ordinary turn.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -252,7 +252,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "gpt-4o-mini-transcribe",
-        description: "Model turning the caller's speech into text inside a voice session. The second and last model in the voice loop: nothing translates and nothing summarises. Which language it is pinned to comes from 'language', not from here.",
+        description: "Model turning the caller's speech into text inside a voice session, and only on a realtime one. A 'gpt-live-1' talker transcribes the caller itself and reads no id here, so this key does nothing for it. The second and last model in the voice loop: nothing translates and nothing summarises. Which language it is pinned to comes from 'language', not from here.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {

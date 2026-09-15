@@ -33,6 +33,12 @@ beforeEach(() => {
   toasts.value = [];
 });
 
+/** A click whose target is (or is not) inside an anchor. Enough of an event for
+ *  the body handler, which asks its target one question. */
+function clickOn(inLink: boolean) {
+  return { target: { closest: (sel: string) => (inLink && sel === 'a[href]' ? {} : null) } };
+}
+
 describe('the toast message splits into a heading that stays and sections that scroll', () => {
   it('puts line 1 in the heading and the rest in the scroll box', () => {
     showToast(SECTIONED, 'info');
@@ -82,7 +88,18 @@ describe('the toast message splits into a heading that stays and sections that s
     // Both boxes are inside it. So a tap on a bullet acts like a tap on the
     // heading, and the hover underline covers the whole message.
     expect((body.props.class as string).split(' ')).toContain('toast-clickable');
-    (body.props.onClick as () => void)();
+    (body.props.onClick as (e: unknown) => void)(clickOn(false));
     expect(clicked).toEqual(['hit']);
+  });
+
+  it('stands down for a link in the message, which is its own destination', () => {
+    // The anchor carries no handler (see `linkifyText`), so the toast's action
+    // is the only thing that could eat the click and leave the URL unopened.
+    const clicked: string[] = [];
+    showToast('Read https://example.com/notes', 'info', { onClick: () => clicked.push('hit') });
+    const body = findByClass(ToastList(), 'toast-body')[0];
+
+    (body.props.onClick as (e: unknown) => void)(clickOn(true));
+    expect(clicked).toEqual([]);
   });
 });

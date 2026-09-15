@@ -222,7 +222,10 @@ fn oauth_client_request_attaches_supplied_endpoints_as_defaults() {
     let req = oauth_client_request("ghealth", &overrides);
     assert_eq!(req["service"], "ghealth");
     assert_eq!(req["auth_type"], "oauth_client");
-    assert_eq!(req["base_url"], "https://healthcare.googleapis.com");
+    assert_eq!(
+        req["base_urls"],
+        serde_json::json!(["https://healthcare.googleapis.com"])
+    );
     assert_eq!(
         req["defaults"]["auth_url"],
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -252,7 +255,7 @@ fn oauth_client_request_without_overrides_has_no_defaults_and_falls_back_base_ur
     // base_url falls back to a best-effort guess.
     let req = oauth_client_request("acme", &OAuthClientOverrides::default());
     assert_eq!(req["service"], "acme");
-    assert_eq!(req["base_url"], "https://acme.com");
+    assert_eq!(req["base_urls"], serde_json::json!(["https://acme.com"]));
     assert!(
         req.get("defaults").is_none(),
         "no defaults block expected when nothing was supplied: {req}"
@@ -269,7 +272,7 @@ fn oauth_client_request_partial_overrides_only_include_supplied_keys() {
         ..OAuthClientOverrides::default()
     };
     let req = oauth_client_request("example", &overrides);
-    assert_eq!(req["base_url"], "https://example.com");
+    assert_eq!(req["base_urls"], serde_json::json!(["https://example.com"]));
     assert_eq!(
         req["defaults"]["auth_url"],
         "https://login.example.com/authorize"
@@ -2021,7 +2024,10 @@ fn a_registry_prefilled_request_asks_only_for_the_client_id() {
     // the modal's endpoint section is prefilled and collapsed rather than blank
     // and titled "(required)".
     let req = oauth_client_request("acme", &OAuthClientOverrides::from_registry(&row(None)));
-    assert_eq!(req["base_url"], "https://api.acme.test");
+    assert_eq!(
+        req["base_urls"],
+        serde_json::json!(["https://api.acme.test"])
+    );
     assert_eq!(req["defaults"]["auth_url"], "https://acme.test/authorize");
     assert_eq!(req["defaults"]["token_url"], "https://api.acme.test/token");
     // Absent on the row means absent in the request, never present-as-null: the
@@ -2128,6 +2134,41 @@ fn a_repair_request_with_no_registry_row_still_carries_its_target() {
     );
     assert_eq!(req["existing_credential_id"], id.to_string());
     assert_eq!(req["defaults"]["client_id"], "abc");
+}
+
+/// A repair must not touch the *credential scope*. The row already exists, so
+/// its stored `base_urls` are the answer, and the form takes a request's set as
+/// authoritative when one is present.
+///
+/// The overrides here come from the registry, or from the
+/// `https://{provider}.com` guess for a derived name it misses. Either one,
+/// carried, is saved over whatever the user actually scoped the credential to.
+#[test]
+fn a_repair_request_declares_no_scope_so_the_stored_one_wins() {
+    for overrides in [
+        OAuthClientOverrides::from_registry(&row(None)),
+        OAuthClientOverrides::default(),
+    ] {
+        let req = oauth_client_repair_request(
+            "acme",
+            &overrides,
+            uuid::Uuid::new_v4(),
+            Some("abc"),
+            &["auth_url"],
+        );
+        assert!(
+            req.get("base_urls").is_none(),
+            "a repair must carry no scope at all: {req}"
+        );
+    }
+
+    // A brand-new registration is the other half, and it still seeds the
+    // provider's own host: there is no stored row to read one from.
+    let fresh = oauth_client_request("acme", &OAuthClientOverrides::from_registry(&row(None)));
+    assert_eq!(
+        fresh["base_urls"],
+        serde_json::json!(["https://api.acme.test"])
+    );
 }
 
 // ─── desired_scopes: Reconnect must be able to widen ───────────────────────

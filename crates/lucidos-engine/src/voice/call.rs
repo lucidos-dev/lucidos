@@ -20,7 +20,7 @@
 //! while the doer is parked inside a card of its own.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast::error::RecvError;
@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use super::decision::{DecisionKind, DecisionResolver, OpenDecision, Resolution};
 use super::doer::TurnStarter;
-use super::provider::{SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
+use super::provider::{wait_until, SessionOpening, VoiceEvent, VoiceProvider, VoiceSession};
 use super::wire::{ClientControl, ServerFrame};
 use super::{build, language, resident};
 use crate::engine::event_bus::{BusEvent, EmittedEvent, EventBus};
@@ -124,6 +124,37 @@ const ASK_LOST_ITS_WORDS: &str = "\
 [NOT STARTED] The caller's words settled what was waiting, so the request \
 below never started. Nothing is running for it. Offer it to them again if they \
 still want it.";
+
+/// How long a caller may wait with nobody answering them.
+///
+/// **This is not the forbidden silence timer, and the subject is the
+/// difference.** That rule is about deciding when a PERSON stopped talking, and
+/// nothing here decides that: the words this hands over are the words the
+/// provider already transcribed. What it measures is OUR failure to respond.
+///
+/// A caller asking a question and hearing nothing until they hang up is the one
+/// outcome a call may not have. The talker is the fast path to an answer, and
+/// past this bound it has demonstrably not taken it, so the doer does.
+///
+/// Re-armed on every word the caller says, so a long sentence is never cut in
+/// half by it. It runs from the last thing they said.
+const CALLER_WAITED_LONG_ENOUGH: Duration = Duration::from_secs(6);
+
+/// The reason on a wake nobody asked for.
+///
+/// It says what happened rather than inventing an intent. The talker composed
+/// no reason, because the talker did nothing at all.
+const NOBODY_ANSWERED: &str =
+    "the talker said nothing, so the caller's question came straight here";
+
+/// What the caller is shown when the talker has gone quiet on them.
+///
+/// Shown, because there is nothing else left: the one way to reach a caller's
+/// EAR is the talker, and the talker is what failed. So the transcript carries
+/// it, and it says where the answer will appear.
+const VOICE_IS_NOT_ANSWERING: &str =
+    "The voice is not answering. Your question went to Lucidos anyway, \
+                                      and the answer will appear in this conversation.";
 
 /// Above this many characters, an answer is offered rather than delivered.
 ///
@@ -290,18 +321,30 @@ pub async fn run_call(
         interrupted: false,
         relaying: false,
         waiting_to_be_said: VecDeque::new(),
+        spoken_so_far: String::new(),
         pending_utterance: None,
         pending_delegation: None,
         pending_answer: None,
         hanging_up: false,
         delegated_this_turn: false,
+        heard_so_far: String::new(),
+        answer_owed_by: None,
+        told_the_caller: false,
     };
     let reason = call.drive(&mut *session, transport).await;
-    // Before the session closes, and for EVERY end reason. A hangup, a dropped
-    // socket and a provider failure all leave the same thing held, and the
-    // caller said it whether or not anybody answered.
-    call.write_down_whatever_is_left().await;
-    session.close().await;
+    // Closed FIRST, and that ordering is the whole of it. A provider with no
+    // turn-end frame holds the caller's last sentence until the socket goes.
+    // The flush below used to run while those words were still upstream.
+    // `VoiceSession::close` hands them back.
+    call.take_what_was_still_held(session.close().await);
+    // Both flushes run for EVERY end reason. A hangup, a dropped socket and a
+    // provider failure all leave the same two things held: what the caller
+    // said, and what they heard back.
+    call.write_down_every_last_word().await;
+    // The reply after the utterance, because the caller spoke first. The other
+    // way round puts every answer above its question, which is the ordering the
+    // turn-ended handler keeps too.
+    call.write_down_whatever_was_said().await;
 
     // Dropped on failure, deliberately. The call is already over, and the
     // reason is on its way into the event log. A caller who has gone missed
@@ -339,6 +382,9 @@ enum Step {
     TalkerGone,
     /// Boxed because the payload dwarfs every other variant here.
     Thread(Box<EmittedEvent>),
+    /// The caller has been waiting [`CALLER_WAITED_LONG_ENOUGH`] with nothing
+    /// answering them.
+    NobodyAnsweredTheCaller,
     Ended(VoiceSessionEndReason),
 }
 
@@ -368,6 +414,13 @@ struct Call<'a> {
     /// rather than a slot, because dropping one loses an answer the caller
     /// asked for and never hears.
     waiting_to_be_said: VecDeque<String>,
+    /// What the talker has said in the reply it is speaking now.
+    ///
+    /// Built from the transcript deltas as they pass through, because the
+    /// provider reports a whole reply only when the turn ends. A call that
+    /// stops first never reads that event, and the caller heard the words
+    /// anyway. Cleared by [`Call::record_spoken`], the one writer of the row.
+    spoken_so_far: String,
     /// A finished utterance not yet written down.
     ///
     /// Held because how it is recorded depends on what the talker does next.
@@ -400,6 +453,24 @@ struct Call<'a> {
     /// The talker already asked once in the turn it is speaking now. Cleared
     /// when that turn ends, so the next one may ask again.
     delegated_this_turn: bool,
+    /// What the provider has heard of the caller SO FAR, before it says the
+    /// turn finished.
+    ///
+    /// The caller's half of [`Self::spoken_so_far`], held for the same reason.
+    /// A protocol with no turn-end frame reports the caller through these
+    /// partials alone. A call that stops first has nothing else to write a row
+    /// from. Superseded by the finished transcript, which covers the same
+    /// stretch.
+    heard_so_far: String,
+    /// When the caller stops being owed an answer by nobody in particular.
+    ///
+    /// Armed by the caller saying anything, and disarmed by the conversation
+    /// moving: the talker speaking, a delegation, an answer, or the doer being
+    /// woken. See [`CALLER_WAITED_LONG_ENOUGH`].
+    answer_owed_by: Option<tokio::time::Instant>,
+    /// The caller has already been told the voice is not answering. Once per
+    /// call: a second card says nothing the first did not.
+    told_the_caller: bool,
 }
 
 /// An answer waiting on the caller's words, and the tool call that owes an
@@ -417,6 +488,7 @@ impl Call<'_> {
         transport: &mut dyn CallTransport,
     ) -> VoiceSessionEndReason {
         loop {
+            let owed = self.answer_owed_by;
             let step = tokio::select! {
                 from_caller = transport.recv() => from_caller.into(),
                 from_talker = session.next() => match from_talker {
@@ -424,6 +496,7 @@ impl Call<'_> {
                     None => Step::TalkerGone,
                 },
                 from_thread = self.thread.recv() => thread_step(from_thread),
+                _ = wait_until(owed) => Step::NobodyAnsweredTheCaller,
             };
 
             match step {
@@ -461,6 +534,9 @@ impl Call<'_> {
                     return provider_failed(transport).await;
                 }
                 Step::Thread(emitted) => self.on_thread_event(*emitted, session).await,
+                Step::NobodyAnsweredTheCaller => {
+                    self.nobody_answered_the_caller(session, transport).await
+                }
                 Step::Ended(reason) => return reason,
             }
         }
@@ -483,19 +559,40 @@ impl Call<'_> {
                 self.talker_has_the_floor = true;
                 return delivered(transport.send_audio(pcm).await);
             }
+            // Held as well as forwarded, exactly as the talker's deltas are.
+            // A partial is not a sentence, so it never becomes
+            // `pending_utterance`. It is still the only account of the caller
+            // a turn-less protocol gives before it closes. See
+            // [`Call::heard_so_far`].
+            //
+            // Concatenated raw, never space-joined: a delta carries its own
+            // spacing, and one can split a word in two.
+            VoiceEvent::UserTranscript { text } => {
+                self.heard_so_far.push_str(&text);
+                self.caller_is_owed_an_answer();
+                ServerFrame::UserTranscript { text }
+            }
             VoiceEvent::UserTurnEnded { transcript } => {
                 // Held rather than recorded. Which row it becomes depends on
                 // whether the talker asks for the doer, and it may already
-                // have. A second utterance arriving first flushes the one
-                // before it, so nothing is overwritten.
-                self.write_down_whatever_is_left().await;
+                // have.
+                //
+                // APPENDED, never replacing what is held. A provider closing a
+                // transcription item says nothing about the caller finishing a
+                // thought, and the thought is the row's unit. Flushing here cut
+                // one spoken sentence into seven rows.
+                //
                 // A transcript with no words is not held at all. Held, it
                 // would pair with a waiting ask and spend it on nothing: a
                 // `WorkDelegated` with no turn behind it, and the caller's
                 // real words then arriving with no ask left to claim them.
                 if !transcript.trim().is_empty() {
-                    self.pending_utterance = Some(transcript.clone());
+                    self.caller_said_more(&transcript);
+                    self.caller_is_owed_an_answer();
                 }
+                // The finished text covers the stretch the partials described,
+                // so they are spent rather than written down twice.
+                self.heard_so_far.clear();
                 // The answer first: it is the one thing that can SPEND the
                 // transcript. A delegation pairing with words already sent as
                 // an answer would run that answer as a turn of its own.
@@ -511,6 +608,20 @@ impl Call<'_> {
             }
             VoiceEvent::TalkerTranscript { text } => {
                 self.talker_has_the_floor = true;
+                // The talker is answering, so nobody else owes the caller one.
+                //
+                // Read off its WORDS, and a BLANK delta carries none. Audio the
+                // caller cannot hear is silence, and so is a stream of empty
+                // deltas: both providers forward one exactly as it arrives.
+                // Disarming on those is how a mute talker would hold the bound
+                // off for the whole call, which is the failure this guards.
+                if !text.trim().is_empty() {
+                    self.answer_is_no_longer_owed();
+                }
+                // Held as well as forwarded. This is the only account of the
+                // reply the call holds before the turn ends, and a call can end
+                // first. See [`Call::spoken_so_far`].
+                self.spoken_so_far.push_str(&text);
                 ServerFrame::TalkerTranscript { text }
             }
             VoiceEvent::DelegationRequested {
@@ -531,6 +642,8 @@ impl Call<'_> {
             }
             VoiceEvent::HangupRequested { tool_call_id } => {
                 self.acknowledge(session, &tool_call_id, HANGUP_TAKEN).await;
+                // The line is closing, so nothing is owed an answer any more.
+                self.answer_is_no_longer_owed();
                 // Held, NOT acted on. A tool call lands while the talker is
                 // still speaking, which is what makes delegation free and what
                 // would cut the goodbye off mid-word here. The turn's end is
@@ -553,7 +666,22 @@ impl Call<'_> {
                 // spoke first. Both rows leave this one handler, so the order
                 // here is the order the transcript reads. The other way round
                 // put every answer above its question.
-                self.write_down_whatever_is_left().await;
+                //
+                // Only a turn that SAID something closes the caller's row. A
+                // silent one moved the conversation nowhere, and closing on it
+                // is what turned one sentence into a bubble per fragment.
+                if transcript.trim().is_empty() {
+                    // Loud, because it costs the caller a reply and nothing
+                    // else records it. Twenty-one of these in one call is what
+                    // a caller hears as the agent never answering.
+                    log!("[Voice] A talker turn ended with nothing said");
+                } else {
+                    // The caller was answered, so nothing is owed. Said again
+                    // here as well as on the first delta, because a transcript
+                    // that lands late re-arms the bound after the reply.
+                    self.answer_is_no_longer_owed();
+                    self.write_down_whatever_is_left().await;
+                }
                 self.record_spoken(transcript).await;
                 // The next turn may ask again, and must be able to.
                 self.delegated_this_turn = false;
@@ -743,6 +871,9 @@ impl Call<'_> {
                 .await;
             return;
         }
+        // The talker asked for the doer, so the answer is on its way from
+        // somebody. Nothing else needs to step in.
+        self.answer_is_no_longer_owed();
         // Owed whatever happens next, duplicate or not.
         self.acknowledge(session, tool_call_id, DELEGATION_TAKEN)
             .await;
@@ -786,6 +917,14 @@ impl Call<'_> {
                 self.subject.actor.clone(),
             )
             .await;
+        // Disarmed only where something SETTLED. A refusal and a held retry
+        // both leave the caller with nothing, so the bound is still theirs.
+        if matches!(
+            outcome,
+            Resolution::Settled | Resolution::SettledWithTheirWords
+        ) {
+            self.answer_is_no_longer_owed();
+        }
         match outcome {
             Resolution::Settled => self.acknowledge(session, &tool_call_id, ANSWER_TAKEN).await,
             Resolution::SettledWithTheirWords => {
@@ -881,6 +1020,10 @@ impl Call<'_> {
         }
         let transcript = self.pending_utterance.take().unwrap_or_default();
         let reason = self.pending_delegation.take().unwrap_or_default();
+        // The words are spent on the wake, so the partials behind them are too.
+        self.heard_so_far.clear();
+        // A turn is starting on them, which is the answer the caller waited on.
+        self.answer_is_no_longer_owed();
 
         // The wake first, so the doer's history already carries the reason by
         // the time the turn reading that history starts.
@@ -925,11 +1068,33 @@ impl Call<'_> {
     ///
     /// The caller's own actor, not the talker's. Whoever handled it, the
     /// caller said it.
+    /// **Finished words only.** A partial is left held, because the provider's
+    /// own final text for it is still on its way. Writing both would draw the
+    /// sentence twice, and on a protocol that transcribes asynchronously the
+    /// final text really does land after the talker has answered.
     async fn write_down_whatever_is_left(&mut self) {
         // Never empty: `UserTurnEnded` refuses to hold a wordless transcript.
         let Some(transcript) = self.pending_utterance.take() else {
             return;
         };
+        self.write_a_spoken_row(transcript).await;
+    }
+
+    /// The same, plus a partial nothing is going to finish.
+    ///
+    /// For the one moment where no better text is coming: the call is over. A
+    /// provider with no turn-end frame reports the caller through partials
+    /// alone, so this is the whole of what they said.
+    async fn write_down_every_last_word(&mut self) {
+        let said = self.everything_the_caller_said();
+        self.write_a_spoken_row(said).await;
+    }
+
+    /// Put one caller row on the thread, unless there is nothing to put.
+    async fn write_a_spoken_row(&mut self, transcript: String) {
+        if transcript.trim().is_empty() {
+            return;
+        }
         emit(
             &self.bus,
             self.subject.thread_id,
@@ -940,6 +1105,154 @@ impl Call<'_> {
             EventMeta::with_actor(self.subject.actor.clone()),
         )
         .await;
+    }
+
+    /// Everything the caller has said this turn, and it is now spent.
+    ///
+    /// The finished stretches first, then whatever partial the provider never
+    /// closed. Both, because a provider with no turn-end frame reports only the
+    /// second kind, and a call that stops mid-sentence holds one of each.
+    fn everything_the_caller_said(&mut self) -> String {
+        let mut said = self.pending_utterance.take().unwrap_or_default();
+        let partial = std::mem::take(&mut self.heard_so_far);
+        append_spoken(&mut said, &partial);
+        said
+    }
+
+    /// Add a finished stretch to what the caller has already said this turn.
+    fn caller_said_more(&mut self, text: &str) {
+        let mut said = self.pending_utterance.take().unwrap_or_default();
+        append_spoken(&mut said, text);
+        if !said.is_empty() {
+            self.pending_utterance = Some(said);
+        }
+    }
+
+    /// The caller said something, so somebody owes them an answer from now.
+    fn caller_is_owed_an_answer(&mut self) {
+        self.answer_owed_by = Some(tokio::time::Instant::now() + CALLER_WAITED_LONG_ENOUGH);
+    }
+
+    /// Something is answering the caller, so the wait is over.
+    fn answer_is_no_longer_owed(&mut self) {
+        self.answer_owed_by = None;
+    }
+
+    /// Nobody answered the caller, so the doer is woken with what they said.
+    ///
+    /// **The talker is the fast path to an answer, never the only one.** It
+    /// decides whether to answer itself or ask for the doer. A talker that
+    /// decides neither leaves the caller in silence until they hang up. That is
+    /// the one outcome a call may not have, so the doer takes the question
+    /// here instead.
+    ///
+    /// Loud in three places, because a silent recovery hides a broken talker.
+    /// The log says it happened, the `WorkDelegated` row says why, and the
+    /// caller is told on screen.
+    async fn nobody_answered_the_caller(
+        &mut self,
+        session: &mut dyn VoiceSession,
+        transport: &mut dyn CallTransport,
+    ) {
+        self.answer_is_no_longer_owed();
+        let said = self.everything_the_caller_said();
+        if said.trim().is_empty() {
+            return;
+        }
+        // Taken above the seam, so the provider must stop holding its own copy.
+        // A turn-less one accumulates until something asks, and would hand the
+        // same sentence over again at its next boundary or at close. That is
+        // one breath and two rows, which is the whole defect.
+        session.caller_words_were_taken().await;
+        // Refused for the same reason `delegated` refuses: the doer is blocked
+        // inside the very card that is waiting, so there is no turn to start.
+        // The caller is still told, because they are still owed an answer.
+        if self.decisions.doer_is_parked(self.subject.thread_id).await {
+            log!(
+                "[Voice] Nothing answered {:?}, and the doer is parked on a card",
+                said
+            );
+            self.pending_utterance = Some(said);
+            self.write_down_whatever_is_left().await;
+            self.tell_the_caller(transport).await;
+            return;
+        }
+        log!(
+            "[Voice] Nothing answered {:?} in {}s, so the doer takes it",
+            said,
+            CALLER_WAITED_LONG_ENOUGH.as_secs()
+        );
+        self.pending_utterance = Some(said);
+        // Never over a sticky ask. The talker's own reason outlives the turn
+        // that made it, exactly so a transcript still in flight can pair with
+        // it. Clobbering it here would spend the caller's words under the wrong
+        // reason and leave that ask to claim a later, unrelated sentence.
+        self.pending_delegation
+            .get_or_insert_with(|| NOBODY_ANSWERED.to_string());
+        self.settle_the_pending_utterance(session).await;
+        self.tell_the_caller(transport).await;
+    }
+
+    /// Say on screen that the voice is not answering, once per call.
+    ///
+    /// Once, because a second card says nothing the first did not. Dropped on
+    /// failure: a caller who has already gone cannot read it, and the row is on
+    /// the thread either way.
+    async fn tell_the_caller(&mut self, transport: &mut dyn CallTransport) {
+        if self.told_the_caller {
+            return;
+        }
+        self.told_the_caller = true;
+        let _ = transport
+            .send_frame(ServerFrame::Error {
+                message: VOICE_IS_NOT_ANSWERING.to_string(),
+            })
+            .await;
+    }
+
+    /// Fold what the session was still holding into what is about to be
+    /// written.
+    ///
+    /// Only the two accounts a row is built from are read. The loop has already
+    /// stopped, so a tool call or a floor change arriving here has nothing left
+    /// to act on it.
+    fn take_what_was_still_held(&mut self, held: Vec<VoiceEvent>) {
+        for event in held {
+            match event {
+                VoiceEvent::UserTurnEnded { transcript } => {
+                    self.caller_said_more(&transcript);
+                    self.heard_so_far.clear();
+                }
+                VoiceEvent::UserTranscript { text } => self.heard_so_far.push_str(&text),
+                VoiceEvent::TalkerTranscript { text } => self.spoken_so_far.push_str(&text),
+                // The provider's own account of the whole reply, which is what
+                // the deltas were building. It replaces them rather than
+                // doubling them.
+                VoiceEvent::TalkerTurnEnded { transcript, .. } if !transcript.trim().is_empty() => {
+                    self.spoken_so_far = transcript;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Write down the reply the caller was hearing when the call stopped.
+    ///
+    /// The talker's half of [`Self::write_down_whatever_is_left`], and it
+    /// closes the same hole on the other side. A hangup returns from the loop
+    /// at once, so the turn end carrying the whole reply is often never read.
+    /// The caller still heard what had already been said.
+    ///
+    /// Marked interrupted, because by construction the caller left before the
+    /// reply finished. Routed through [`Self::record_spoken`], so the row has
+    /// one writer and a late turn end cannot write the same words twice.
+    async fn write_down_whatever_was_said(&mut self) {
+        if self.spoken_so_far.trim().is_empty() {
+            return;
+        }
+        self.interrupted = true;
+        let said = self.spoken_so_far.clone();
+        self.record_spoken(said).await;
     }
 
     /// Say this next, or queue it while the talker is mid-sentence.
@@ -987,6 +1300,9 @@ impl Call<'_> {
     /// before the talker said anything, and an empty row would claim the caller
     /// heard something they did not.
     async fn record_spoken(&mut self, transcript: String) {
+        // The reply is accounted for now, however it ended. Forgotten by the
+        // one writer, so a teardown flush after a turn end writes nothing.
+        self.spoken_so_far.clear();
         let interrupted = std::mem::take(&mut self.interrupted);
         let relaying = std::mem::take(&mut self.relaying);
         if transcript.trim().is_empty() {
@@ -1028,6 +1344,27 @@ impl From<CallerFrame> for Step {
             CallerFrame::Closed => Step::Ended(VoiceSessionEndReason::Disconnected),
         }
     }
+}
+
+/// Join one stretch of speech onto another, with a space between.
+///
+/// A space because two finished transcriptions are two pieces of one sentence,
+/// and nothing carries the pause that joined them. NOT for deltas: those carry
+/// their own spacing, and one can split a word in two.
+///
+/// **Only the JOIN is normalized.** A single stretch is stored exactly as it
+/// arrived. The client retires the bubble it drew by matching its text against
+/// the row's. One leg of that match already normalizes (`doer.rs::wake`), and a
+/// second one here would break it silently.
+fn append_spoken(so_far: &mut String, more: &str) {
+    if more.trim().is_empty() {
+        return;
+    }
+    if so_far.is_empty() {
+        so_far.push_str(more);
+        return;
+    }
+    *so_far = format!("{} {}", so_far.trim_end(), more.trim_start());
 }
 
 /// One read of the thread's traffic, as a step.

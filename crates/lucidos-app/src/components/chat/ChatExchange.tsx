@@ -5,8 +5,8 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
-import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLiveUtteranceRow, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import type { Exchange, StoredEvent, ThreadEvent, MessageOrigin } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, dividerBodyIsSuppressed, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -23,7 +23,7 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, extractTriggerIdFromHref, hasUrlScheme, browserHandlesHref } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { navigateToTrigger } from '../../store/actions/triggers';
-import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitRow, FileList, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeNoteBody, SpokenChip, SpokenReply, TriggerFiredBody, UserMessageBody, changeAccent, changeActions, describeExecutor, turnControls } from './chat-exchange-parts';
 import { TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon } from '../shared/icons';
 import { setThreadLive } from './scrollState';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
@@ -137,6 +137,24 @@ interface Props {
   matchedEventType?: string;
   matchedEventId?: string;
   matchedPayloadJson?: string;
+}
+
+/**
+ * True when a live call row draws its bubble and nothing under it.
+ *
+ * Three cases, one rule: nothing is in flight BEHIND any of them. A caller
+ * mid-sentence has said nothing the engine holds yet, whether the bubble shows
+ * a pulse or a partial. The talker's row IS the activity, so a badge under it
+ * would be a second one.
+ *
+ * The caller's FINAL words are the exception the panel exists for. The engine
+ * is holding them while the talker decides, so the Requesting shimmer belongs
+ * directly under their own turn (ADR 0174).
+ */
+export function liveRowDrawsNoPanel(userEvent: StoredEvent): boolean {
+  if (isLiveReplyRow(userEvent)) return true;
+  if (!isLiveUtteranceRow(userEvent)) return false;
+  return isLivePartialRow(userEvent) || !(userEvent as { text?: string }).text;
 }
 
 /** Which boundaries the reader owns, and so draw the right-aligned bubble.
@@ -617,14 +635,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // should each read as waiting.
   const isQueuedUserMessage = !!isQueued && isUserMessageBubble;
   const queuedMessageId = isQueuedUserMessage ? exchange.userEvent._eventId : undefined;
-  // The caller is mid-sentence, so nothing is in flight behind this bubble and
-  // no panel belongs under it. It draws the bubble and stops there.
-  //
-  // Once the words are on the row, something IS in flight: the engine is
-  // holding them while the talker decides. So the panel comes back, carrying
-  // the Requesting shimmer directly under the caller's own turn. That is what
-  // keeps the transcript non-empty for the whole wait (ADR 0174).
-  const isLiveUtterance = isLiveUtteranceRow(exchange.userEvent) && !userMessage;
+  const isLiveRow = liveRowDrawsNoPanel(exchange.userEvent);
   // The trash button lives INSIDE the status label, an existing `display: flex`
   // row, rather than in a separate wrapper. "Queued" and the trash then stay on
   // one line using only CSS that already ships.
@@ -681,7 +692,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // boundaries it takes no continuation exception: the header line IS the whole
   // turn, and a response panel would be a status badge over an empty body.
   const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveUtterance && (hasResponse || hasEvents || showStatus);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isUnansweredDivider && !isEmptyContinued && !isQueuedUserMessage && !isLiveRow && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -855,10 +866,16 @@ function sameStepSeqs(a: Set<number> | undefined, b: Set<number> | undefined): b
   return true;
 }
 
-/** The words in a user bubble, for the fingerprint below. */
+/** The words in the row's own bubble, for the fingerprint below.
+ *
+ *  Both types a LIVE call row can wear. The caller's is a `MessageReceived`
+ *  and the talker's a `SpokenReplyGenerated`, and each is rewritten in place as
+ *  the words arrive. A persisted event of either type is immutable, so this
+ *  compare costs nothing everywhere else. */
 function userBubbleText(exchange: Exchange): string | undefined {
   const ev = exchange.userEvent;
-  return ev.type === 'MessageReceived' ? ev.text : undefined;
+  if (ev.type === 'MessageReceived') return ev.text;
+  return ev.type === 'SpokenReplyGenerated' ? ev.text : undefined;
 }
 
 /** Custom prop equality for the `memo`-wrapped `ChatExchange` below.
@@ -1177,10 +1194,13 @@ export function describeInitiator(
   // gets, because that is what the row now is. The swap costs no round trip
   // and no frame (ADR 0174).
   if (isLiveUtteranceRow(ev)) {
+    const partial = isLivePartialRow(ev) ? (ev as { text?: string }).text ?? '' : null;
     return youInitiator({
-      details: userMessageHtml
-        ? <UserMessageBody html={userMessageHtml} imageHashes={[]} />
-        : <LiveUtteranceBody />,
+      details: partial !== null
+        ? <LivePartialBody text={partial} />
+        : userMessageHtml
+          ? <UserMessageBody html={userMessageHtml} imageHashes={[]} />
+          : <LiveUtteranceBody />,
       status: <SpokenChip />,
     });
   }
@@ -1312,6 +1332,10 @@ export function describeInitiator(
     // A call greeting, said before anything had started a turn, so it opened a
     // boundary of its own (`exchange-grouping`). Every other spoken reply is a
     // step and renders through `exchangeResponseEvents` instead.
+    //
+    // The talker's LIVE row wears this type too, and takes this arm with it.
+    // One shape for a reply being said and for the same reply written down.
+    // The swap to the engine's own row then moves nothing on screen.
     case 'SpokenReplyGenerated':
       return {
         variant: 'lucidos',
@@ -1320,6 +1344,7 @@ export function describeInitiator(
         details: (
           <SpokenReply
             event={{ type: 'spoken_reply', text: ev.text, interrupted: ev.interrupted === true }}
+            live={isLiveReplyRow(ev)}
           />
         ),
       };

@@ -174,6 +174,28 @@ pub fn injects_are_recordable(injects: &BTreeSet<String>) -> bool {
         .all(|member| !member.contains(',') && !member.contains(char::is_whitespace))
 }
 
+/// Whether `base_url` can be written to the scope column and read back whole.
+///
+/// The sibling of [`injects_are_recordable`], for the column beside it, and it
+/// matters more. A value carrying a NEWLINE does not merely re-cut its own
+/// line. [`write_all`] ends every record with one, so the tail of the value
+/// becomes a RECORD OF ITS OWN.
+///
+/// That is a forged approval. A caller who can write `apis.json` picks the hash
+/// on the forged line, against a path they did not author. The runner's hash
+/// gate then approves whatever bytes match it. `apis.json` is writable over the
+/// unauthenticated data API, and this record decides who may run (ADR 0144).
+///
+/// Three callers, each doing a different job. The proxy gates first, for a 502
+/// naming the file to fix. The seed filters, writing the record directly.
+/// [`bind_scope_if_absent`] refuses as a floor under any future caller.
+///
+/// All three pass the TRIMMED value, which is what gets recorded. Padding is
+/// not forgery, and every other layer here trims before it uses the string.
+pub fn scope_is_recordable(base_url: &str) -> bool {
+    !base_url.contains(char::is_whitespace)
+}
+
 /// The record key for an `apis.json` `script` value.
 ///
 /// Config says `scripts/auth/x.py`, the record says `data/scripts/auth/x.py`.
@@ -318,6 +340,17 @@ pub fn bind_scope_if_absent(
     if wanted.is_empty() {
         return Ok(BindOutcome::NotBindable);
     }
+    // `trim` takes the ends and leaves the middle, so an interior newline
+    // survives it and would forge a second record. The caller gates on
+    // [`scope_is_recordable`] and answers 502; this is the backstop that keeps
+    // any other caller from writing one.
+    if !scope_is_recordable(wanted) {
+        return Err(format!(
+            "refusing to record base_url for '{rel_path}': a scope containing whitespace \
+             cannot be written to the approvals record"
+        )
+        .into());
+    }
     if !runs_the_approved_bytes(workspace_path, rel_path, &approval.hash) {
         return Ok(BindOutcome::NotBindable);
     }
@@ -411,7 +444,17 @@ pub fn seed_if_absent(
                     entry.path.clone(),
                     Approval {
                         hash: content_hash(&bytes),
-                        base_url: entry.base_url.clone(),
+                        // Filtered on the same terms as `injects` below: the
+                        // seed writes the record directly, so it cannot lean on
+                        // the proxy's gate having run. Trimmed first, and the
+                        // trimmed value is what lands, matching what
+                        // `bind_scope_if_absent` records for the same config.
+                        base_url: entry
+                            .base_url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|url| !url.is_empty() && scope_is_recordable(url))
+                            .map(str::to_string),
                         injects: entry
                             .injects
                             .clone()
@@ -895,6 +938,125 @@ mod tests {
         assert!(!injects_are_recordable(&secrets(&["c:my key"])));
         assert!(!injects_are_recordable(&secrets(&["c:a,b"])));
         assert!(!injects_are_recordable(&secrets(&["c:two\nlines"])));
+    }
+
+    /// The scope column is the one an attacker picks, because `apis.json` is
+    /// writable over the unauthenticated data API. A newline there would end
+    /// the record early and start a second one.
+    #[test]
+    fn a_scope_that_would_re_cut_the_line_is_not_recordable() {
+        assert!(scope_is_recordable("https://api.example.com"));
+        assert!(scope_is_recordable("https://api.example.com/v1/path?q=1"));
+        assert!(!scope_is_recordable("https://ok.test/ https://evil.test"));
+        assert!(!scope_is_recordable("https://ok.test/\nhttps://evil.test"));
+        assert!(!scope_is_recordable("https://ok.test/\thttps://evil.test"));
+    }
+
+    /// The whole attack, end to end. A crafted `apis.json` base_url would
+    /// otherwise write a second line carrying a hash the attacker chose,
+    /// against a path they did not author. The runner would then run whatever
+    /// bytes match that hash.
+    #[test]
+    fn a_newline_in_the_scope_cannot_forge_an_approval_line() {
+        let ws = ws();
+        let script = "data/scripts/auth/legit.py";
+        write_script(ws.path(), script, "print(1)");
+        record(ws.path(), script, b"print(1)").unwrap();
+
+        // 64 hex characters, so the forged line would pass `parse`'s hash test.
+        let forged_hash = "a".repeat(64);
+        let hostile = format!("https://ok.test/\n{forged_hash}  https://evil.test");
+
+        let outcome = bind_scope_if_absent(ws.path(), script, &hostile);
+        assert!(outcome.is_err(), "a scope with a newline must be refused");
+
+        // Nothing was written, so the record still holds exactly one entry and
+        // the script is still bound to nothing.
+        let after = entries(ws.path());
+        assert_eq!(after.len(), 1, "no second record was forged");
+        assert!(after.contains_key(script));
+        assert_eq!(scope_for(ws.path(), script), None);
+
+        // And the forged hash never became an approval for the real path.
+        assert!(
+            !is_approved(ws.path(), script, b"whatever the attacker wrote"),
+            "the runner must not accept bytes the forged line would have named"
+        );
+    }
+
+    /// Padding is not forgery. Every layer on this path trims before it uses
+    /// the value, so the guard must too: refusing a padded base_url would
+    /// reject a config that bound fine before the guard existed.
+    #[test]
+    fn a_padded_scope_still_binds_and_records_trimmed() {
+        let ws = ws();
+        let script = "data/scripts/auth/legit.py";
+        write_script(ws.path(), script, "print(1)");
+        record(ws.path(), script, b"print(1)").unwrap();
+
+        let outcome = bind_scope_if_absent(ws.path(), script, "  https://api.example.com  ");
+        assert!(matches!(outcome, Ok(BindOutcome::Bound)), "got {outcome:?}");
+        assert_eq!(
+            scope_for(ws.path(), script),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    /// The seed half of the rule above.
+    #[test]
+    fn seeding_a_padded_scope_records_it_trimmed() {
+        let ws = ws();
+        write_script(ws.path(), "data/scripts/auth/live.py", "print(1)");
+        seed_if_absent(
+            ws.path(),
+            &[SeedEntry {
+                path: "data/scripts/auth/live.py".to_string(),
+                base_url: Some("  https://api.example.com  ".to_string()),
+                injects: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            scope_for(ws.path(), "data/scripts/auth/live.py"),
+            Some("https://api.example.com".to_string())
+        );
+    }
+
+    /// The seed writes the record directly, so it filters the scope the same
+    /// way rather than trusting the proxy's gate to have run first.
+    #[test]
+    fn seeding_skips_a_scope_it_could_not_read_back() {
+        let ws = ws();
+        write_script(ws.path(), "data/scripts/auth/live.py", "print(1)");
+        seed_if_absent(
+            ws.path(),
+            &[SeedEntry {
+                path: "data/scripts/auth/live.py".to_string(),
+                base_url: Some("https://ok.test/\nforged  https://evil.test".to_string()),
+                injects: None,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            scope_for(ws.path(), "data/scripts/auth/live.py"),
+            None,
+            "an unrecordable scope is dropped, never written"
+        );
+
+        // `scope_for` alone does not bind this test to the guard. Written
+        // through, the hostile value re-cuts the record into a junk first line
+        // plus a hash-less second one that `parse` drops. The scope reads as
+        // None either way. What separates the two states is WHICH key survives:
+        // the seeded path, or the fragment the re-cut left behind.
+        let after = entries(ws.path());
+        assert_eq!(after.len(), 1, "no second record was forged");
+        assert!(
+            after.contains_key("data/scripts/auth/live.py"),
+            "the seeded script must still be the recorded path, got {:?}",
+            after.keys().collect::<Vec<_>>()
+        );
     }
 
     /// The seed writes the record directly, so it filters the same way rather

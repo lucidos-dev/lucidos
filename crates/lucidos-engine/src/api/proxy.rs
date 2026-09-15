@@ -1120,6 +1120,26 @@ async fn check_handshake_scope(
             false => Err(refuse(&scope)),
         };
     }
+    // A base_url carrying whitespace cannot be written to the record without
+    // re-cutting the line. A NEWLINE is worse: it starts a second record, with
+    // a hash this caller picked. Refused before anything is written, the same
+    // way the injects column is.
+    //
+    // Gated on the TRIMMED value, because that is what gets written:
+    // `bind_scope_if_absent` trims before it records, as does
+    // `credential_base_url_matches` before it compares. Gating on the raw
+    // string would refuse a padded base_url that every other layer accepts,
+    // and only for a script that is not yet bound.
+    if !handshake_approvals::scope_is_recordable(base_url.trim()) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "proxy '{name}': a base_url containing whitespace cannot be recorded against \
+                 the handshake script '{script}'. Fix the base_url in \
+                 {PROXY_CONFIG_REL_PATH}"
+            ),
+        ));
+    }
     // Trust on first sight. Two concurrent first requests race here, so the
     // outcome carries whichever scope won and this one is checked against it.
     match handshake_approvals::bind_scope_if_absent(workspace, script, base_url) {

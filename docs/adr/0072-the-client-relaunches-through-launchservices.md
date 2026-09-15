@@ -31,7 +31,7 @@ The watcher has to wait for our exit rather than launching straight away.
 one, and `open -n` would leave two clients overlapping. Waiting is what keeps
 the relaunch to exactly one instance.
 
-Three properties of the watcher script are load-bearing:
+Four properties of the watcher script are load-bearing:
 
 - **The wait is bounded.** A detached shell that could loop forever is the
   failure the bound exists to prevent. The ceiling is far longer than a
@@ -40,10 +40,29 @@ Three properties of the watcher script are load-bearing:
   the loop, which can also end at its ceiling. Launching there would aim `open`
   at a live process, which merely activates it. Nothing would then be left to
   bring the client back when it finally did exit.
+- **Asking once is not enough** (added 2026-09-15, after a user's client did not
+  come back from an update). LaunchServices can refuse, and it can answer
+  without launching anything. So the ask repeats until `pgrep` finds the client,
+  up to ten attempts. Every refusal and the final give-up reach stderr. The
+  login agent already kept this rule, and the watcher did not, so the failure it
+  left behind was silent.
+
+  Retrying is safe by construction: `open -a` without `-n` activates a running
+  app rather than starting a second one. The probe is regex-escaped, and it
+  accepts the executable path we were handed and its symlink-free form, since
+  LaunchServices execs the resolved one.
+
+  **The probe is anchored at BOTH ends, and that is its whole correctness.** The
+  service role runs the same executable out of the same bundle, so its command
+  line begins with the same path. It is a `KeepAlive` job, so it is always up. A
+  head-anchored probe matched it, and confirmed a relaunch that had not
+  happened. The watcher knows the argv it is about to ask for. So it expects the
+  whole command line, and the closing anchor rules the service out.
 - **Every path is quoted as one shell word.** The bundle path comes from
   `current_exe()` and can be anywhere the user dragged the app. A path or
   argument that is not valid UTF-8 is an error rather than a corrupted word,
-  and the caller's fallback passes `OsString`s through faithfully.
+  and the caller's fallback passes `OsString`s through faithfully. The reporting
+  lines are quoted too, since a path may hold a `$` or a backtick.
 
 ## Consequences
 

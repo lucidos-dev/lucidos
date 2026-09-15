@@ -39,13 +39,25 @@ import {
   voiceSectionEnabled,
 } from '../../store/actions/preferences';
 
-/** The realtime models a talker can speak through.
+/** The models a talker can speak through.
  *
- *  Curated, because there is no registry to read: these are the ids the
- *  provider's realtime socket answers to, and a chat-model row is not one. */
-const TALKER_MODELS = [
-  { value: 'gpt-realtime', label: 'GPT Realtime' },
-  { value: 'gpt-realtime-mini', label: 'GPT Realtime mini' },
+ *  Curated, because there is no registry to read: these are the ids a voice
+ *  socket answers to, and a chat-model row is not one.
+ *
+ *  **Two families, and the engine picks the protocol from the id.** The
+ *  realtime ones come first, newest first, because one of them is the default
+ *  and they are the pair the talker's three tools work on. GPT Live follows: it
+ *  interrupts better and holds no tools, which the row's explainer says.
+ *
+ *  A workspace pinned to an id this list dropped keeps it, since
+ *  `voiceModelChoices` appends an unlisted current model under its own name.
+ *  Exported so a test can read the order. */
+export const TALKER_MODELS = [
+  { value: 'gpt-realtime-2.1', label: 'GPT Realtime 2.1' },
+  { value: 'gpt-realtime-2.1-mini', label: 'GPT Realtime 2.1 mini' },
+  { value: 'gpt-realtime-2', label: 'GPT Realtime 2' },
+  { value: 'gpt-realtime-1.5', label: 'GPT Realtime 1.5' },
+  { value: 'gpt-live-1', label: 'GPT Live 1' },
 ];
 
 /** The models that turn the caller's speech into text inside that socket.
@@ -54,11 +66,13 @@ const TALKER_MODELS = [
  *  summarises: the language is a rule in the talker's own instructions, and the
  *  agent's answer reaches it as written.
  *
- *  Live transcription leads, because it is the one built for a microphone: it
- *  streams the transcript as the caller speaks. The rest transcribe a turn once
- *  it is committed. Exported so a test can read the order. */
+ *  The two streaming models lead, because they are the ones built for a
+ *  microphone: each emits the transcript as the caller speaks. The rest
+ *  transcribe a turn once it is committed. Exported so a test can read the
+ *  order. */
 export const TRANSCRIBER_MODELS = [
   { value: 'gpt-live-transcribe', label: 'GPT live transcribe' },
+  { value: 'gpt-realtime-whisper', label: 'GPT Realtime Whisper' },
   { value: 'gpt-transcribe', label: 'GPT transcribe' },
   { value: 'gpt-4o-mini-transcribe', label: 'GPT-4o mini transcribe' },
   { value: 'gpt-4o-transcribe', label: 'GPT-4o transcribe' },
@@ -100,6 +114,57 @@ function voiceModelChoices(
     rows.push({ value: current, label: current, reasoningEfforts: [] });
   }
   return rows;
+}
+
+/**
+ * What the two talker families differ in, which no model name can say.
+ *
+ * It lives on the row rather than in the section explainer above, because a
+ * reader picking a talker is not reading that one. Its own component so a test
+ * can render it: the section's shallow walk keeps scalar props, and an
+ * explainer handed over as a prop is not one.
+ */
+export function TalkerModelExplainer() {
+  return (
+    <Explainer title="Talker model">
+      <p>Which model holds the spoken conversation. Two families, and they behave differently.</p>
+      <p>
+        The <strong>Realtime</strong> models bill by the token. They can settle things out
+        loud: say which option you want, or say goodbye to ring off.
+      </p>
+      <p>
+        <strong>GPT Live 1</strong> listens while it speaks, so it handles being interrupted
+        better. It holds no tools, so you settle a card by tapping it and end a call on the
+        button. It bills by the minute, and that spend does not reach the usage rollup.
+      </p>
+    </Explainer>
+  );
+}
+
+/**
+ * That this row does nothing on a Live call.
+ *
+ * A setting with no effect and nothing saying so is the worst kind. A Live
+ * talker transcribes the caller inside its own socket and reads no model id.
+ * So the row above this one decides whether this one matters at all.
+ */
+export function TranscriberModelExplainer() {
+  return (
+    <Explainer title="Transcriber model">
+      <p>
+        What turns your speech into text for the talker. The second and last model in a
+        call: nothing translates and nothing summarises.
+      </p>
+      <p>
+        The two at the top stream the transcript as you speak. The rest transcribe a turn
+        once you have finished it.
+      </p>
+      <p>
+        <strong>This row does nothing on a GPT Live call.</strong> That talker transcribes
+        you itself and reads no model id here. Spoken voice still applies to both.
+      </p>
+    </Explainer>
+  );
 }
 
 export function VoiceSection() {
@@ -149,6 +214,7 @@ export function VoiceSection() {
           <ModelSelectionRow
             label="Talker model"
             anchor="models:voice-talker"
+            explainer={<TalkerModelExplainer />}
             models={voiceModelChoices(TALKER_MODELS, talker)}
             vocabulary={LUCIDOS_TIER_VOCABULARY}
             model={talker}
@@ -158,6 +224,7 @@ export function VoiceSection() {
           <ModelSelectionRow
             label="Transcriber model"
             anchor="models:voice-transcriber"
+            explainer={<TranscriberModelExplainer />}
             models={voiceModelChoices(TRANSCRIBER_MODELS, transcriber)}
             vocabulary={LUCIDOS_TIER_VOCABULARY}
             model={transcriber}

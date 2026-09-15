@@ -31,7 +31,7 @@ import { fetchThreads, fetchThreadEvents } from '../../api/threads';
 import type { ThreadsResponse, ThreadSummary } from '../../api/threads';
 import { postClientLog } from '../../utils/liveness';
 import { loadAllThreads } from '../actions/thread-loading';
-import { threadMap, focusedThreadId, FOCUSED_THREAD_KEY } from '../store';
+import { threadMap, awaitedThreadId, focusedThreadId, FOCUSED_THREAD_KEY } from '../store';
 
 const fetchThreadsMock = vi.mocked(fetchThreads);
 const fetchEventsMock = vi.mocked(fetchThreadEvents);
@@ -90,6 +90,7 @@ describe('loadAllThreads — ghost focused-thread clear', () => {
     postClientLogMock.mockClear();
     threadMap.value = new Map();
     focusedThreadId.value = null;
+    awaitedThreadId.value = null;
     try { localStorage.removeItem(FOCUSED_THREAD_KEY); } catch { /* ignore */ }
   });
 
@@ -188,6 +189,27 @@ describe('loadAllThreads — ghost focused-thread clear', () => {
 
     expect(focusedThreadId.value).toBe(userPickedId);
     expect(localStorage.getItem(FOCUSED_THREAD_KEY)).toBe(userPickedId);
+    expect(postClientLogMock).not.toHaveBeenCalledWith(
+      'lifecycle',
+      'cleared_ghost_focus',
+      expect.anything(),
+    );
+  });
+
+  it('keeps an awaited thread the backend has not heard of yet', async () => {
+    // A spawn the Thread Queue has only QUEUED owns no thread_summaries row, so
+    // the backend truthfully reports it missing. Clearing it here would undo
+    // the navigation the confirm just made, which is the compose-view bug in
+    // the other direction. Same exemption ThreadView's cleanup applies.
+    const spawnedId = 'queued-setup-thread';
+    awaitedThreadId.value = spawnedId;
+    focusedThreadId.value = spawnedId;
+    localStorage.setItem(FOCUSED_THREAD_KEY, spawnedId);
+    fetchThreadsMock.mockResolvedValue(emptyResponse());
+
+    await loadAllThreads();
+
+    expect(focusedThreadId.value).toBe(spawnedId);
     expect(postClientLogMock).not.toHaveBeenCalledWith(
       'lifecycle',
       'cleared_ghost_focus',

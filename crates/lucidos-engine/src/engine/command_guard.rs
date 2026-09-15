@@ -1083,6 +1083,23 @@ fn bash_fast_path(command: &str) -> Option<FastPathDecline> {
     declined
 }
 
+/// Flags that make an otherwise read-only head run an arbitrary program.
+/// Ripgrep runs `--pre` per file and `--hostname-bin` per host; `sort
+/// --compress-program` runs a compressor; many tools run a `--pager`.
+const EXEC_CAPABLE_READ_FLAGS: &[&str] =
+    &["--pre", "--hostname-bin", "--compress-program", "--pager"];
+
+/// True when `args` carry an [`EXEC_CAPABLE_READ_FLAGS`] flag, in either the
+/// separate (`--pre CMD`) or the glued (`--pre=CMD`) form.
+fn args_have_exec_capable_flag(args: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        EXEC_CAPABLE_READ_FLAGS.contains(arg)
+            || EXEC_CAPABLE_READ_FLAGS
+                .iter()
+                .any(|f| arg.starts_with(&format!("{f}=")))
+    })
+}
+
 /// Why one shell command segment is not obviously safe, or `None` when it is.
 fn segment_safety(segment: &str) -> Option<FastPathDecline> {
     use FastPathDecline::{Omission, Refusal};
@@ -1136,6 +1153,17 @@ fn segment_safety(segment: &str) -> Option<FastPathDecline> {
         // ordinary side-effect shape the fallback tags, not an evasion.
         "curl" | "wget" if segment_escapes_workspace(segment) => Some(Refusal),
         "curl" | "wget" => is_mutating_http(args).then_some(Omission),
+        // A read-only head can still EXEC an arbitrary program through a flag.
+        // On the allowlist such a call settles Safe and runs that program with
+        // no card and no judge. That is the write-then-run escalation `PATH=`, a
+        // path-qualified head and `arch <command>` already route to the judge.
+        // Tried before the arms below, so a plain and a write-capable head are
+        // both covered.
+        _ if (READ_ONLY_HEADS.contains(&base) || WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base))
+            && args_have_exec_capable_flag(args) =>
+        {
+            Some(Refusal)
+        }
         // Read-only in the ordinary form, but able to write a named file: the
         // same shape as the curl/wget arm above, and it must be tried BEFORE
         // the plain read-only arm below. See [`WRITE_CAPABLE_READ_ONLY_HEADS`].
@@ -1258,7 +1286,9 @@ fn python_side_effect_signal(code: &str) -> bool {
         "paramiko",
         "ftplib",
         "telnetlib",
-        // Arbitrary shell-out / eval (incl. dynamic-import indirection)
+        // Arbitrary shell-out / eval (incl. dynamic-import indirection).
+        // `from os import system` and `importlib.import_module('os').system`
+        // pull the entry point in by name, so the dotted forms above miss them.
         "subprocess",
         "os.system(",
         "os.popen(",
@@ -1267,6 +1297,10 @@ fn python_side_effect_signal(code: &str) -> bool {
         "eval(",
         "exec(",
         "__import__(",
+        "import_module(",
+        "importlib",
+        "from os import",
+        "from pty import",
     ];
     // Filesystem destruction also routes to the judge, which reads the path to
     // decide the lane. The static fallback derives the same split from string
@@ -1509,7 +1543,12 @@ fn is_disk_device(raw: &str) -> bool {
     let Some(dev) = path.strip_prefix("/dev/") else {
         return false;
     };
-    const DISK_PREFIXES: &[&str] = &["sd", "hd", "vd", "xvd", "nvme", "mmcblk", "disk", "loop"];
+    // `rdisk` is the macOS raw device `dd` targets; `mapper`, `dm-` and `md`
+    // are the linux mapped and raid block devices. Overwriting any of them is
+    // as destructive as writing `/dev/disk0`.
+    const DISK_PREFIXES: &[&str] = &[
+        "sd", "hd", "vd", "xvd", "nvme", "mmcblk", "disk", "rdisk", "loop", "mapper", "dm-", "md",
+    ];
     DISK_PREFIXES.iter().any(|pre| dev.starts_with(pre))
 }
 
@@ -2372,6 +2411,55 @@ mod tests {
             matches!(v, StaticVerdict::NeedsJudge(_)),
             "{ctx} — expected NeedsJudge, got {v:?}"
         );
+    }
+
+    // --- Static-classification bypass regressions (nightly harden) ----------
+
+    #[test]
+    fn exec_via_flag_read_head_needs_judge() {
+        // A read-only head that execs a program through a flag must reach the
+        // judge, not settle Safe. Both the glued and the separate forms count.
+        for cmd in [
+            "rg --pre=/bin/sh x data/f",
+            "rg --pre /bin/sh x data/f",
+            "rg --hostname-bin=/bin/sh x data/f",
+            "sort --compress-program=data/bin/x -S1 data/f",
+            "ack --pager=/bin/sh pattern data/f",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // The ordinary read stays Safe, so the fix does not over-block.
+        for cmd in ["rg pattern data/f", "sort data/f", "ack pattern data/f"] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
+    fn python_dynamic_import_shellout_needs_judge() {
+        // Pulling a shell-out entry point in by name skipped the side-effect
+        // signal and settled Safe, so the judge never saw it.
+        for code in [
+            "from os import system\nsystem('id')",
+            "from os import popen\npopen('id')",
+            "import importlib\nimportlib.import_module('os').system('id')",
+        ] {
+            assert_needs_judge(python(code), code);
+        }
+    }
+
+    #[test]
+    fn catastrophic_raw_and_mapped_disk_devices() {
+        // The raw macOS device and the linux mapped devices are disk targets
+        // like /dev/disk0, so overwriting one is catastrophic too.
+        for cmd in [
+            "dd if=/dev/zero of=/dev/rdisk0",
+            "dd if=/dev/zero of=/dev/mapper/cryptroot",
+            "dd if=/dev/zero of=/dev/dm-0",
+            "dd if=/dev/zero of=/dev/md0",
+            "cat img > /dev/rdisk0",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
     }
 
     // --- Catastrophic: recursive rm/chmod of root or home -------------------

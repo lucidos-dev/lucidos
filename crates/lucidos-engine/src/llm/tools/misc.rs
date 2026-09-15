@@ -216,9 +216,10 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Shown in the modal, including where to find the credential."
                     },
-                    "base_url": {
-                        "type": "string",
-                        "description": "Base URL for the API. Required except for 'secret'."
+                    "base_urls": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Every host it may be sent to; an API host and a git host differ. Required except for 'secret'. A host an existing credential misses reopens that one to widen, never a second credential."
                     },
                     "auth_type": {
                         "type": "string",
@@ -259,7 +260,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                         "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
                     }
                 },
-                // `base_url` is required for every type but `secret`, which is
+                // `base_urls` is required for every type but `secret`, which is
                 // sent nowhere. A JSON Schema cannot say that, so the handler
                 // enforces it and names the type in its refusal.
                 "required": ["service_name", "prompt", "auth_type"]

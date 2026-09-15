@@ -1,7 +1,7 @@
-import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
+import { threadMap, awaitedThreadId, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_EVENTS_PREFETCH_LIMIT, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
 import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
-import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -391,8 +391,15 @@ async function loadAllThreadsInner(): Promise<void> {
   // and we leave it alone. Without the guard, a workspace with a ghost id in
   // localStorage would snap any concurrent navigation back to the compose
   // screen.
+  //
+  // An *awaited thread* is exempt on the same footing as ThreadView's cleanup.
+  // A spawn the Thread Queue has only queued owns no `thread_summaries` row, so
+  // the backend truthfully reports it missing and this would clear it. The
+  // exemption cannot outlive the session: the signal is in-memory, so a reload
+  // hydrates the id with no await and the clear does its job.
   let ghostFocusedThread: string | null = null;
-  if (focused && !map.has(focused) && focusedThreadId.peek() === focused) {
+  if (focused && !map.has(focused) && focusedThreadId.peek() === focused
+      && awaitedThreadId.peek() !== focused) {
     ghostFocusedThread = focused;
     setFocusedThread(null);
     postClientLog('lifecycle', 'cleared_ghost_focus', { thread_id: focused });
@@ -1411,13 +1418,14 @@ function applyEventRows(
   rows: ThreadEventRow[],
   currentAggregate: ThreadAggregate | null,
 ): void {
-  // A caller's un-landed bubble is live client state, and history knows
-  // nothing about it. Replay walks the SAME `handleEvent` a live event does.
-  // So a past call's rows would settle the tally, and its session end would
-  // sweep the bubble of somebody speaking right now. Snapshotted here for the
-  // same reason the aggregate is overlaid below: a replay must not leak.
+  // A call's un-landed rows are live client state, and history knows nothing
+  // about them. Replay walks the SAME `handleEvent` a live event does. So a
+  // past call's rows would run the ledger up, and its session end would sweep
+  // the bubble of somebody speaking right now. Snapshotted here for the same
+  // reason the aggregate is overlaid below: a replay must not leak.
   const liveUtterances = thread.liveUtterances;
-  const settledUtterances = thread.settledUtterances;
+  const unclaimedUtterances = thread.unclaimedUtterances;
+  const liveReply = thread.liveReply;
   for (const row of rows) {
     const event = { type: row.event_type, ...row.payload } as ThreadEvent;
     handleEvent(map, threadId, row.sequence, event, row.created, row.event_id);
@@ -1432,7 +1440,20 @@ function applyEventRows(
     }
   }
   thread.liveUtterances = liveUtterances;
-  thread.settledUtterances = settledUtterances;
+  thread.unclaimedUtterances = unclaimedUtterances;
+  thread.liveReply = liveReply;
+  // The restore above is about a PAST call, and a catch-up fetch can carry the
+  // CURRENT one's rows too: an SSE gap is exactly when a thread refetches. The
+  // later SSE copy is then deduped by seq, so nothing else would ever claim
+  // them.
+  //
+  // Offered to the rows still standing, and never REMEMBERED. An old call's
+  // words therefore reach a bubble only while the caller is repeating that
+  // sentence verbatim, rather than whenever they next say it.
+  for (const row of rows) {
+    if (!isCallerUtterance({ type: row.event_type, ...row.payload })) continue;
+    offerCallerUtterance(thread, (row.payload as { text?: string }).text ?? '');
+  }
   // Backend snapshot is the source of truth for meta — overlay last so any
   // per-event mutations during replay don't leak through to thread.meta.
   if (currentAggregate) {

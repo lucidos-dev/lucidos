@@ -31,9 +31,28 @@ export interface CodeRow {
  *  view, and (finding no such row) null the selection out from under it. */
 export type LineSelectionMode = 'file' | 'none';
 
+/** What a line too wide for the box does.
+ *
+ *  `wrap`   soft-wrap it. A file preview's default, because a clipped tail is
+ *           unreachable and a reader following a citation needs the part it
+ *           was about.
+ *  `pan`    keep it on one line and pan it, under a gutter pinned to the left
+ *           edge and over an opaque surface.
+ *  `caller` neither. The caller's own scroller owns the overflow, and its own
+ *           rules own the row's background.
+ *
+ *  `caller` is what a side-by-side diff column passes, and the distinction is
+ *  load-bearing rather than tidy. Those columns tint rows green and red, and
+ *  `pan`'s opaque surface outranks a single caller class and would paint over
+ *  every one of them. */
+export type WideLineMode = 'wrap' | 'pan' | 'caller';
+
 interface Props {
   rows: CodeRow[];
   selection?: LineSelectionMode;
+  /** Required rather than defaulted: the three modes make different promises,
+   *  so a new caller has to pick one. */
+  wideLines: WideLineMode;
 }
 
 /** Turn a file's lines into rows: numbered 1..N, no tint. The shape every
@@ -87,6 +106,22 @@ export function renderRows(
   });
 }
 
+/** Every class on the `<pre>`, given the mode it renders in.
+ *
+ *  `line-numbered-wrap` and `line-numbered-pan` are mutually exclusive, so
+ *  neither mode's rules can reach a `<pre>` the other owns. `caller` carries
+ *  neither, which is what keeps both sets off a diff column. Pure and exported
+ *  so the pairing is checkable without a DOM. */
+export function codeBlockClass(selectable: boolean, wideLines: WideLineMode): string {
+  const mode = wideLines === 'caller' ? '' : `line-numbered-${wideLines}`;
+  return [
+    'file-preview-code',
+    'line-numbered',
+    selectable ? '' : 'line-numbered-static',
+    mode,
+  ].filter(Boolean).join(' ');
+}
+
 /** The line-numbered source view: numbered rows, click to select a line,
  *  shift-click to extend the range, and the selection rendered as a highlight.
  *
@@ -101,7 +136,7 @@ export function renderRows(
  *  Callers render this inside their own scroll container: `.repo-file-content`
  *  for the repo preview, `.file-preview-content` for the data-file one,
  *  `.side-by-side-diff-side` for a diff column. */
-export function LineNumberedCode({ rows, selection = 'file' }: Props) {
+export function LineNumberedCode({ rows, selection = 'file', wideLines }: Props) {
   const preRef = useRef<HTMLPreElement>(null);
   const selectable = selection === 'file';
 
@@ -147,7 +182,7 @@ export function LineNumberedCode({ rows, selection = 'file' }: Props) {
 
   return (
     <pre
-      class={`file-preview-code line-numbered${selectable ? '' : ' line-numbered-static'}`}
+      class={codeBlockClass(selectable, wideLines)}
       ref={preRef}
     >
       {renderRows(rows, sel, selectable).map((r) => (

@@ -993,15 +993,21 @@ export function SpokenChip() {
  *
  *  Not a `.step`: a reply the caller heard is a *transcript marker*. No audio
  *  is kept, so the steps control would hide the only record of it. */
-export function SpokenReply({ event }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }> }) {
+export function SpokenReply(
+  { event, live }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }>; live?: boolean },
+) {
   return (
-    <div class="spoken-reply" data-role="spoken-reply">
+    <div class="spoken-reply" data-role="spoken-reply" data-live={live ? 'true' : undefined}>
       <span class="spoken-reply-who">
         <CallIcon />
-        <span class="visually-hidden">{'Said aloud'}</span>
+        <span class="visually-hidden">{live ? 'Saying aloud' : 'Said aloud'}</span>
       </span>
       <span class="spoken-reply-text">
         {event.text}
+        {/* Still being said, so the words are still arriving. The caret marks
+            where the next one lands, which is what tells a reply in progress
+            from one that stopped there. */}
+        {live && <span class="live-caret" aria-hidden="true" />}
         {/* The caller talked over it, so the text stops where they cut in. */}
         {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
       </span>
@@ -1009,11 +1015,32 @@ export function SpokenReply({ event }: { event: Extract<ResponseEvent, { type: '
   );
 }
 
-/** What a caller's bubble holds while they are still speaking.
+/** What a caller's bubble holds once the provider has heard some of it.
  *
- *  No words, and none are possible: the client is never sent a partial, so
- *  there is nothing to caption. Three bars in the slot the words will fill, so
- *  the swap to the real text moves nothing around it.
+ *  Plain text and a caret, on one line. NOT the markdown path a finished
+ *  message takes: a partial is a sentence cut mid-word, so half an emphasis
+ *  marker or a stray backtick would render as markup the caller never meant.
+ *
+ *  Inline, so the caret hugs the last word rather than dropping below the
+ *  block a rendered paragraph would make.
+ *
+ *  It carries the pulse's hidden phrase, so the bubble reads the same to a
+ *  screen reader whichever of the two it holds. */
+export function LivePartialBody({ text }: { text: string }) {
+  return (
+    <span class="live-partial" data-role="live-partial">
+      {text}
+      <span class="live-caret" aria-hidden="true" />
+      <span class="visually-hidden">{HEARING_YOU}</span>
+    </span>
+  );
+}
+
+/** What a caller's bubble holds before any words at all.
+ *
+ *  Three bars in the slot the words will fill, so the swap to text moves
+ *  nothing around it. Drawn until the first partial arrives, and for the whole
+ *  utterance when the transcriber streams none.
  *
  *  The hidden phrase is the same one the call toggle's status region speaks, so
  *  a screen reader hears one thing said one way. Without it the bubble reads as

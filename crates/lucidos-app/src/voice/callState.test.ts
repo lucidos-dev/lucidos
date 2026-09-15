@@ -215,10 +215,10 @@ describe('who has the floor', () => {
     expect(effects).toEqual([]);
   });
 
-  /** A reply being spoken can still be revised or cut off, so captioning one
-   *  is state that can only go stale. The caller's own FINISHED sentence is
-   *  the exception, and it is kept (ADR 0174). */
-  it('keeps no words of the talker, and the caller\'s own only once ended', () => {
+  /** Both sides are kept, and the fields say which is which. `heard` is the
+   *  caller's FINISHED sentence and `said` is the reply in flight, which the
+   *  engine's own row replaces when the turn ends (ADR 0174). */
+  it('keeps the caller\'s finished words and the reply being spoken', () => {
     const words = ['what is on today', 'one moment'];
     const { state } = drive(
       [
@@ -230,7 +230,26 @@ describe('who has the floor', () => {
       live(),
     );
     expect(state.heard).toBe(words[0]);
-    expect(JSON.stringify(state)).not.toContain(words[1]);
+    expect(state.said).toBe(words[1]);
+    expect(state.replyCount).toBe(1);
+  });
+
+  /** Every delta builds the reply, not just the first. Only the first moved
+   *  anything while the words were being dropped. */
+  it('builds the reply from every delta, and empties it at the turn\'s end', () => {
+    const { state } = drive(
+      [
+        frame({ type: 'talker_transcript', text: 'One ' }),
+        frame({ type: 'talker_transcript', text: 'moment.' }),
+      ],
+      live(),
+    );
+    expect(state.said).toBe('One moment.');
+
+    const ended = drive([frame({ type: 'talker_turn_ended' })], state).state;
+    expect(ended.said).toBe('');
+    // The count does NOT reset: the next reply is a new row, not this one.
+    expect(ended.replyCount).toBe(1);
   });
 });
 
@@ -338,9 +357,31 @@ describe('the caller speaking', () => {
     expect(state.utteranceCount).toBe(2);
   });
 
-  it('ignores a gate edge on a call that is not live', () => {
+  it('ignores a gate edge when there is no call at all', () => {
     expect(drive([SPOKE]).state.utterance).toBe('none');
-    expect(drive([SPOKE], drive([PRESS]).state).state.utterance).toBe('none');
+  });
+
+  /** The microphone opens before the socket is dialled, and the engine sends
+   *  `session_started` only once the PROVIDER session is up. Gating the row on
+   *  that left the whole connect window drawing nothing, measured at 3.79
+   *  seconds on one call. The audio is held meanwhile, so the row is honest. */
+  it('starts the utterance while the call is still connecting', () => {
+    const { state } = drive([SPOKE], drive([PRESS]).state);
+    expect(state.utterance).toBe('live');
+    expect(state.utteranceCount).toBe(1);
+  });
+
+  /** The caller may be mid-sentence when the socket comes up, so the handshake
+   *  moves the phase and leaves their utterance exactly as it is. */
+  it('sends the held audio when the session opens, keeping the utterance', () => {
+    const speaking = drive([SPOKE], drive([PRESS]).state).state;
+    const { state, effects } = drive(
+      [frame({ type: 'session_started', audio: { sample_rate_hz: 24_000, channels: 1, encoding: 'pcm_s16le' } })],
+      speaking,
+    );
+    expect(state.phase).toBe('listening');
+    expect(state.utterance).toBe('live');
+    expect(effects).toEqual([{ kind: 'flush-audio' }]);
   });
 
   /** The talker answering PROVES the provider ended that turn and read it. It
@@ -447,5 +488,36 @@ describe('reading a phase', () => {
     const waiting = drive([SPOKE, HUSHED], live()).state;
     expect(callStatusLabel(waiting)).toBe(callStatusLabel(live()));
     expect(callStatusLabel(drive([HEARD], waiting).state)).toBe(callStatusLabel(live()));
+  });
+});
+
+/**
+ * A blank delta is a real frame, not a hypothetical: both providers forward
+ * whatever `delta` carried, and a talker draws breath.
+ *
+ * Taking the floor on one is three separate wrongs. It retires the caller's
+ * bubble mid-sentence and it resets the speech gate under them. The
+ * `interrupted` frame behind it then stops playback on their next edge.
+ */
+describe('a talker delta with no words', () => {
+  it('moves nothing at all while the caller holds the floor', () => {
+    const speaking = drive([SPOKE], live()).state;
+    expect(speaking.utterance).toBe('live');
+
+    const { state, effects } = drive([frame({ type: 'talker_transcript', text: '' })], speaking);
+    expect(state).toBe(speaking);
+    expect(effects).toEqual([]);
+  });
+
+  it('spends no reply count, so the real reply is still the first', () => {
+    const after = drive(
+      [
+        frame({ type: 'talker_transcript', text: '' }),
+        frame({ type: 'talker_transcript', text: 'Two things.' }),
+      ],
+      live(),
+    ).state;
+    expect(after.replyCount).toBe(1);
+    expect(after.said).toBe('Two things.');
   });
 });

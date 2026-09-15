@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, awaitedThreadId, promptAnimating, revealOnFocus, connectionStatus, scaledDurationMs, effectiveThreadStatus, isMidTurn } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents, threadLoadInFlightMs } from '../../store/actions/thread-loading';
@@ -655,6 +655,15 @@ export function ThreadView() {
         }
     }, [threadId, threadInMap, eventsLoaded]);
 
+    // The awaited thread arrived, so the exemption below has nothing left to
+    // protect. Released here because this component is its only reader: a clear
+    // at each map-insert site would drift the next time one is added.
+    useEffect(() => {
+        if (threadId && threadInMap && awaitedThreadId.value === threadId) {
+            awaitedThreadId.value = null;
+        }
+    }, [threadId, threadInMap]);
+
     // Safety retry: if eventsLoaded=true but thread is empty, loadThreadEvents
     // may have fetched before the backend committed events. Retry with escalating
     // delays (500ms, 2s, 5s) to give the backend time to commit.
@@ -1152,13 +1161,14 @@ export function ThreadView() {
         // three panes mount), so revealing the thread pane here would swipe a
         // user on the content pane away mid-render.
         //
-        // A thread being bootstrapped is exempt: focusThreadOrBootstrapResult
-        // focuses it optimistically so the tap is acknowledged while its
-        // metadata is in flight, and it is absent from the map for exactly that
-        // reason. Cleaning it up here would undo the focus on the next render
-        // and put the dead interval straight back. The bootstrap restores the
+        // An AWAITED thread is exempt, because its absence is expected rather
+        // than stale. Two ways in: `focusThreadOrBootstrapResult` focuses
+        // optimistically while the metadata is in flight, and
+        // `focusSpawnedThread` focuses a thread whose row is still on its way
+        // over SSE. Cleaning either up here undoes the focus on the next render
+        // and leaves the user on the compose view. The bootstrap restores the
         // prior focus itself if the thread turns out not to exist.
-        if (threadsLoaded.value && bootstrappingThreadId.value !== threadId) {
+        if (threadsLoaded.value && awaitedThreadId.value !== threadId) {
             unfocusThread({ revealPane: false });
         }
         // Waiting for the thread to appear in the map — same delayed-spinner

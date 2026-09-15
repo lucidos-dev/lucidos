@@ -1325,7 +1325,7 @@ export function setVoiceEnabled(enabled: boolean): Promise<void> {
  *  Deliberately NOT a chat-model registry row, so it is a typed id rather than
  *  a pick from `backgroundModelChoices()`: a realtime model cannot serve an
  *  ordinary turn and never appears in that registry. */
-export const DEFAULT_VOICE_TALKER_MODEL = 'gpt-realtime';
+export const DEFAULT_VOICE_TALKER_MODEL = 'gpt-realtime-2.1';
 
 /**
  * What is STORED, which is empty until somebody sets it.

@@ -148,13 +148,23 @@ let _heldAnim = false;
  *  that forgot to set it reads as restartable, the harmless direction. */
 type HeldGlide = 'ride' | 'landing';
 let _heldAnimTarget: HeldGlide | null = null;
+/** Where the held glide in flight has FROZEN its target, or null while it is
+ *  still tracking the live edge. A frozen glide rests on the edge as it stood
+ *  at the instant it froze, and ignores everything drawn after that.
+ *
+ *  A variable rather than a closure argument, because the freeze can arrive
+ *  AFTER the glide started. That is the ordinary case for a fast reply: the
+ *  hold's releasing round lands inside its own glide. See `freezeLandingGlide`,
+ *  the one writer: a RIDE reads this field and never sets it. */
+let _heldGlideFrozenTop: number | null = null;
 /** Forget the tween: no rAF pending, and nobody owning one. EVERY way a tween
- *  ends goes through this, the natural landing included. So both flags above
- *  mean "in flight" rather than "was in flight last time". */
+ *  ends goes through this, the natural landing included. So all three fields
+ *  above mean "in flight" rather than "was in flight last time". */
 function endScrollAnim() {
   _scrollAnimRaf = null;
   _heldAnim = false;
   _heldAnimTarget = null;
+  _heldGlideFrozenTop = null;
 }
 function cancelScrollAnim() {
   if (_scrollAnimRaf !== null) cancelAnimationFrame(_scrollAnimRaf);
@@ -630,10 +640,22 @@ export function onFollowArmed(listener: () => void): () => void {
   return () => { _followArmedListeners.delete(listener); };
 }
 
+/** The turn a submit was made on, and THE HOLD'S BASELINE: what the agent had
+ *  drawn into that turn when the reader submitted. The hold ends when the
+ *  turn's row count differs from it.
+ *
+ *  Carried together, so a turn without an honest baseline is not expressible.
+ *  Reading the count when the turn first becomes ADDRESSABLE is the tempting
+ *  shortcut, and it is wrong for the turn a submit CREATES. Such a turn can
+ *  render with the agent's opening already in it, in one commit. The snapshot
+ *  then swallows the rows the hold waits for. It waits for the NEXT row
+ *  instead, which is the reply, and carries the reader through it. */
+type ResolvedTurn = { turn: HTMLElement; drawnAtSubmit: number };
+
 /** Resolves the turn a submit was made on, or null while that turn is not
  *  addressable yet. Asked at submit time and again on every growth round, until
  *  the landing lets go or lapses (see `_pendingLanding`). */
-type TurnResolver = (el: HTMLElement) => HTMLElement | null;
+type TurnResolver = (el: HTMLElement) => ResolvedTurn | null;
 
 /** THE SUBMIT'S LANDING, from the submit until the agent starts (ADR 0080). It
  *  re-aims at the live edge on every growth round, and each round writes
@@ -646,13 +668,13 @@ type TurnResolver = (el: HTMLElement) => HTMLElement | null;
  *
  *  The turn is resolved ONCE, into `on`, and then kept. Re-asking every round
  *  would let the hold change which turn it is watching underneath itself: a
- *  queued follow-up makes `awaitsNewTurn` answer with a NEWER turn, while
- *  `drawnAtStart` came from the first. It also spares a `querySelectorAll` and
- *  an ancestor walk per round of a streaming reply.
+ *  queued follow-up makes `awaitsNewTurn` answer with a NEWER turn, while the
+ *  baseline came from the first. It also spares a `querySelectorAll` and an
+ *  ancestor walk per round of a streaming reply.
  *
- *  The turn and its row count are ONE field, so a turn without its snapshot is
- *  not expressible. `drawnAtStart` is what that turn had drawn when it
- *  resolved, and the hold's end condition is the count differing from it. */
+ *  `on` is the resolver's whole answer, turn and baseline together, so the
+ *  hold's end condition is the turn's count differing from it. See
+ *  `ResolvedTurn` for why the baseline belongs to the SUBMIT. */
 let _pendingLanding: {
   resolveTurn: TurnResolver;
   /** Does this submit WAIT for the agent to start? True for the four that ask
@@ -660,7 +682,7 @@ let _pendingLanding: {
    *  it to FINISH: no first row is coming, so the landing aims once and lets
    *  go. */
   holds: boolean;
-  on: { turn: HTMLElement; drawnAtStart: number } | null;
+  on: ResolvedTurn | null;
   at: number;
 } | null = null;
 
@@ -992,8 +1014,16 @@ export function stopFollowingBottom() {
  *  would retire the ride on a scroll event the disarm deliberately ignores,
  *  such as a shrink clamping the reader down. */
 function cancelLanding() {
-  if (_heldAnim && _heldAnimTarget === 'landing') cancelScrollAnim();
+  if (landingGlideInFlight()) cancelScrollAnim();
   _pendingLanding = null;
+}
+
+/** Is the tween in flight the LANDING's own glide, as opposed to a RIDE's or a
+ *  plain navigation's? THREE callers ask it, and each acts on the landing's
+ *  motion alone: the cancel above, `landingInFlight`, and the growth branch's
+ *  one exception to standing down for a tween. */
+function landingGlideInFlight(): boolean {
+  return _heldAnim && _heldAnimTarget === 'landing';
 }
 
 /** Retire a landing that has outlived its deadline, which of the two above
@@ -1015,7 +1045,7 @@ function dropLapsedLanding(): void {
 /** Is a submit's landing in flight, in either of its two phases: held open for
  *  its turn, or gliding to the live edge. */
 function landingInFlight(): boolean {
-  return _pendingLanding !== null || (_heldAnim && _heldAnimTarget === 'landing');
+  return _pendingLanding !== null || landingGlideInFlight();
 }
 
 /** Carry the held stamp onto a scroll THE APP just wrote to hold the reader on
@@ -1500,34 +1530,57 @@ function snapToLiveEdge(el: HTMLElement): void {
  *  cancel, since a caller arming the follow outranks a submit's landing. The
  *  reverse cannot arise: arming drops a pending landing (`armFollowOn`). */
 function glideToLiveEdge(el: HTMLElement, owner: HeldGlide, freeze = false): void {
-  if (_heldAnim && _heldAnimTarget === owner) return;
+  if (_heldAnim && _heldAnimTarget === owner) {
+    // The glide in flight is this owner's own, so its MOTION is left alone. A
+    // freeze still reaches it, because a freeze changes where the glide is
+    // going rather than restarting how it gets there.
+    if (freeze) freezeLandingGlide(el);
+    return;
+  }
   if (prefersReducedMotion()) {
     snapToLiveEdge(el);
     return;
   }
-  // The hold's LAST glide stops chasing. Its target is the live edge as the
-  // agent's first row left it. A second row arriving inside the tween therefore
-  // cannot carry the reader on to that one as well. Every other glide keeps the
-  // live target, which is what catches the opening instalments.
-  const frozen = freeze ? liveEdgeTop(el) : 0;
-  const targetOf = freeze ? () => frozen : liveEdgeTop;
   // Reconcile the chevron on landing for the same reason `scrollToBottomAnimated`
   // does: the last frame can write where the previous one already left the
   // container, and then no scroll event arrives to do it.
   //
-  // A LANDING also gives its hold the round the glide swallowed. `honourGrowth`
-  // stands down for a tween, so a first row drawn mid-glide never reaches the
-  // release check. The hold would then wait for a later resize that a turn
-  // going quiet never sends. It cannot spin: a fresh glide needs the live edge
-  // to have moved again, which needs real growth. A frozen glide replays into
-  // a landing already let go, so its round costs nothing.
-  animateScroll(targetOf, () => {
+  // A LANDING also replays its hold's round here, for the glide that ends with
+  // nothing left to release on. It cannot spin: a fresh glide needs the live
+  // edge to have moved again, which needs real growth. A frozen glide replays
+  // into a landing already let go, so its round costs nothing.
+  animateScroll((c) => _heldGlideFrozenTop ?? liveEdgeTop(c), () => {
     syncAwayFromBottom();
     if (owner !== 'landing') return;
     const cur = resolveTarget();
     if (cur) honourLanding(cur);
   }, markHeldScroll);
   _heldAnimTarget = owner;
+  // After `animateScroll`, whose own cancel clears the frozen target with the
+  // tween it replaced.
+  if (freeze) freezeLandingGlide(el);
+}
+
+/** STOP the landing's glide chasing the live edge, and rest it on the edge as it
+ *  stands NOW. The hold's LAST glide is what asks. It aims at the edge the
+ *  agent's FIRST row left, so a row arriving later cannot carry the reader on to
+ *  that one as well. Every other glide keeps the live target, which is what
+ *  catches the opening instalments (ADR 0080).
+ *
+ *  It is called from TWO moments of one act, and that is the point. The hold
+ *  usually releases with no tween running, and freezes the glide it is about to
+ *  start. A FAST reply releases it inside the glide already running, and that
+ *  one has to be frozen where it is. Without the second moment the glide tracked
+ *  on to the tween's end, and the reader was carried through a reply they never
+ *  asked to follow.
+ *
+ *  Two guards. Only the LANDING's glide may freeze: a ride tracks the live edge
+ *  on purpose, and with no glide at all a target left behind would be inherited
+ *  by the next one. Already frozen means the first freeze named the edge the
+ *  reader is owed. */
+function freezeLandingGlide(el: HTMLElement): void {
+  if (!landingGlideInFlight() || _heldGlideFrozenTop !== null) return;
+  _heldGlideFrozenTop = liveEdgeTop(el);
 }
 
 /** Take a rider to the live edge, writing nothing where they are already on it.
@@ -1628,13 +1681,39 @@ function followSubmit(resolveTurn: TurnResolver, holds = true): void {
 /** Waits for a turn the submit is about to CREATE: it snapshots what `newest`
  *  answers NOW and resolves only once that answer changes. Both deferred
  *  submits have this shape, and differ only in what "newest" means: the
- *  reader's own message row for a send, the last turn for Continue. */
+ *  reader's own message row for a send, the last turn for Continue.
+ *
+ *  ITS BASELINE IS ZERO, and that is a statement about the turn rather than a
+ *  default. The turn did not exist when the reader submitted. So every row in
+ *  it is one the agent drew afterwards, and the FIRST of them ends the hold.
+ *
+ *  Counting what it happens to hold when it first becomes addressable is the
+ *  bug this replaced. The app looks at a transcript Preact already committed,
+ *  so a turn arriving WITH the agent's opening reads as one that drew nothing.
+ *  The hold then ran on until the reply landed, and took the reader with it. */
 function awaitsNewTurn(newest: (el: HTMLElement) => HTMLElement | null): TurnResolver {
   const el = resolveTarget();
   const before = el ? newest(el) : null;
   return (c) => {
     const now = newest(c);
-    return now && now !== before ? now : null;
+    return now && now !== before ? { turn: now, drawnAtSubmit: 0 } : null;
+  };
+}
+
+/** Lands on a CARD the reader acted on, which is the other shape of submit. Two
+ *  callers, the question card and the three permission-shaped cards.
+ *
+ *  ITS BASELINE IS WHAT THE TURN HOLDS, the opposite of the rule above and for
+ *  the opposite reason. The turn was on screen when the reader tapped it, so
+ *  its rows are what the agent said BEFORE it asked. A zero baseline would read
+ *  those as the answer's own reply and end the hold at once.
+ *
+ *  Read on the round the card resolves, which is the submit's own first look:
+ *  the caller holds the card's id because the card is rendered. */
+function landsOnCard(bodySelector: string, attr: string, value: string): TurnResolver {
+  return (el) => {
+    const turn = cardTurn(el, bodySelector, attr, value);
+    return turn ? { turn, drawnAtSubmit: drawnRows(turn) } : null;
   };
 }
 
@@ -1674,7 +1753,7 @@ export function followSentMessage(): void {
  *  composer is a send, and `followSentMessage` routes it here for the reason
  *  given there. */
 export function followAnsweredQuestion(toolUseId: string): void {
-  followSubmit((el) => cardTurn(el, '.question-body', 'data-tool-use-id', toolUseId));
+  followSubmit(landsOnCard('.question-body', 'data-tool-use-id', toolUseId));
 }
 
 /** The reader decided the permission card `requestId`, on any of the three
@@ -1685,7 +1764,7 @@ export function followAnsweredQuestion(toolUseId: string): void {
  *  A submit like the others, because from the reader's side they are all the
  *  same act. The card is on screen already, so like the answer it glides now. */
 export function followResolvedPermission(requestId: string): void {
-  followSubmit((el) => cardTurn(el, '.permission-body', 'data-request-id', requestId));
+  followSubmit(landsOnCard('.permission-body', 'data-request-id', requestId));
 }
 
 /** The reader pressed Continue on an aborted turn, asking the agent to pick the
@@ -1735,7 +1814,7 @@ export function followCanceledTurn(toolUseId?: string): void {
   // liveness term of its own.
   followSubmit(
     toolUseId
-      ? (el) => cardTurn(el, '.question-body', 'data-tool-use-id', toolUseId)
+      ? landsOnCard('.question-body', 'data-tool-use-id', toolUseId)
       : awaitsNewTurn(lastTurn),
     false,
   );
@@ -1762,7 +1841,12 @@ export function followCanceledTurn(toolUseId?: string): void {
  *  It is the LANDING half of `glideToLiveEdge`, so the reader's own scroll can
  *  cancel it while a ride survives one. See `_heldAnimTarget`. */
 function landAtLiveEdge(el: HTMLElement, freeze = false): void {
-  if (isAtLiveEdge(el)) return;
+  if (isAtLiveEdge(el)) {
+    // Nothing to write, but a glide in flight is still going somewhere, and a
+    // releasing round must stop it chasing whatever arrives next.
+    if (freeze) freezeLandingGlide(el);
+    return;
+  }
   glideToLiveEdge(el, 'landing', freeze);
 }
 
@@ -1794,15 +1878,15 @@ function honourLanding(el: HTMLElement): void {
   const landing = _pendingLanding;
   if (!landing) return;
   if (!landing.on) {
-    const turn = landing.resolveTurn(el);
-    if (!turn) return;
+    const found = landing.resolveTurn(el);
+    if (!found) return;
     // A landing that never holds is done the moment its turn is there: aim
-    // once, frozen, and let go. It takes no row snapshot, because it has no
-    // use for one, so `on` is only ever populated for a real hold.
+    // once, frozen, and let go. It has no use for the baseline, so `on` is only
+    // ever populated for a real hold.
     if (!landing.holds) { _pendingLanding = null; landAtLiveEdge(el, true); return; }
-    landing.on = { turn, drawnAtStart: drawnRows(turn) };
+    landing.on = found;
   }
-  const { turn, drawnAtStart } = landing.on;
+  const { turn, drawnAtSubmit } = landing.on;
   // A turn that has LEFT the layout can draw nothing, so there is nothing left
   // to wait for. Without this the hold would sit out its whole backstop on a
   // node nobody can see.
@@ -1810,7 +1894,7 @@ function honourLanding(el: HTMLElement): void {
   // DECIDED before it aims, so the ending round can aim differently. Its glide
   // freezes, resting the reader where the agent's first row put them rather
   // than chasing the next one into the same tween.
-  const ending = turnIsQueued(turn) || drawnRows(turn) !== drawnAtStart;
+  const ending = turnIsQueued(turn) || drawnRows(turn) !== drawnAtSubmit;
   landAtLiveEdge(el, ending);
   if (ending) _pendingLanding = null;
 }
@@ -1821,9 +1905,24 @@ function honourLanding(el: HTMLElement): void {
  *  because a submit arms nothing and arming drops a pending landing
  *  (`armFollowOn`). Nothing at all for a reader who asked for neither.
  *
- *  Stands down while a navigation tween owns the scroll, the landing glide
- *  included. A tween re-reads its own target every frame, so a write beside it
- *  would fight the easing rather than help it.
+ *  Stands down while a tween owns the scroll. A tween re-reads its own target
+ *  every frame, so a write beside it would fight the easing rather than help it.
+ *
+ *  ONE TWEEN IS THE EXCEPTION, and it is the whole of what tells the two states
+ *  in the first paragraph apart at this point:
+ *
+ *  - A RIDE's glide may swallow the round. The reader ARMED the follow, so being
+ *    carried through everything the glide tracks is exactly their standing ask.
+ *  - A LANDING's glide may NOT. The reader armed nothing, and the round it would
+ *    swallow is the one carrying the agent's first row, which is what ENDS the
+ *    hold. Swallowed, the release waited for the tween, and the reply drew
+ *    itself into the reader's lap meanwhile. Most replies are fast enough to
+ *    land wholly inside one glide, so this was most replies.
+ *
+ *  Narrow by construction rather than by care: a pending landing and an armed
+ *  follow are mutually exclusive (`armFollowOn`), so no RIDE glide can ever be
+ *  in flight on the branch below. Every other tween still stands the round down,
+ *  a deep link's and a chevron's included.
  *
  *  TWO ARMS, and which one answers depends only on where the reader is. A reader
  *  who has SCROLLED AWAY is carried only while the agent is live
@@ -1836,8 +1935,12 @@ function honourLanding(el: HTMLElement): void {
  *  reader was, which is `honourWake`. A wake has just declared the thread live,
  *  so the arm above answers for a rider too. */
 function honourGrowth(el: HTMLElement, keepEdge?: () => boolean): void {
+  if (_pendingLanding) {
+    if (_scrollAnimRaf !== null && !landingGlideInFlight()) return;
+    honourLanding(el);
+    return;
+  }
   if (_scrollAnimRaf !== null) return;
-  if (_pendingLanding) { honourLanding(el); return; }
   if (followIsCarrying()) {
     markHeldScroll(el, liveEdgeTop(el));
     return;

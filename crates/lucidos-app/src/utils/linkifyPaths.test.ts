@@ -6,8 +6,12 @@ describe('extractNavTargetFromHref', () => {
     // Bare panel names — what the system prompt teaches the LLM to write
     ['notifications', 'notifications'],
     ['apps', 'apps'],
+    // The panel's own name AND the alias it retired. The agent reaches for the
+    // name it was told to SAY, so both have to land.
+    ['plugins', 'plugins'],
     ['app-store', 'app-store'],
     ['triggers', 'triggers'],
+    ['thread-queue', 'thread-queue'],
     ['changes', 'changes'],
     ['files', 'files'],
     ['settings', 'settings'],

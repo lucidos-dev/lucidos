@@ -53,8 +53,9 @@ had ever printed about fourfold (ADR 0110).
 ### Modality split
 How one call's tokens divide across text, audio and image. Carried by
 `ModalityUsage` on the `usage` block's optional `modality` key, and only a
-*voice session*'s talker reports one: the realtime API bills audio at eight
-times the text input rate, so its four flat counts cannot be priced.
+*voice session*'s REALTIME talker reports one: that API bills audio at eight
+times the text input rate, so its four flat counts cannot be priced. A Live
+talker reports no tokens at all, because it bills by the second (ADR 0181).
 
 Every field is a PART of a flat count, named after the count it belongs to.
 Three sums hold: input text + audio + image is `input_tokens`, cache-read text
@@ -192,8 +193,72 @@ Why the packaged macOS client's `main` window reaches the screen only once there
 
 Two frontend call sites, not one, because neither covers both launches: the packaged cold launch paints the *boot splash* from the pre-gateway document and returns before `<App/>` mounts, so `applyTheme` never runs there, while in the workspace document `loadPreferences` skips `applyTheme` when the stored theme is unchanged. The one-shot lives in `utils/tauri.ts` so both share it. What the window layer is tinted before any of this is the color the frontend last asked for, persisted by `set_titlebar_color` to `<app-data>/config/titlebar-color` and validated on read, so a light-theme user is not launched into the dark-theme `TITLE_BAR_DEFAULT_COLOR`. Distinct from the *boot splash*, which is what the window shows once it is up.
 
+### On screen (a window)
+Whether the packaged macOS client believes one of its windows is on the screen.
+A fact the client OWNS (`crates/lucidos-app/src/window_screen.rs`), rather than
+one it asks AppKit for. Every show records the label. Every hide clears it.
+
+Three inputs decide it, and `[NSWindow isVisible]` is deliberately not one:
+
+- **Our own intent**, which covers every hide the client performs itself.
+- **The app-hide flag**, because Cmd-H orders every window out behind our back.
+  Tracked from `NSApplicationDidHide` and its unhide twin.
+- **AppKit's miniaturized flag**, the one axis the user drives alone.
+
+The *crash watchdog* reads it to tell a page that died from one parked on
+purpose. Reloading a parked page throws away the state ADR 0141 keeps.
+`isVisible` is excluded for a reason. A report showed it answering NO for a
+window the user was clicking. A watchdog asking the same question stands down
+exactly when it is needed.
+
+**Not the question `native-window-active` asks.** That one asks whether the user
+is LOOKING at the window. A visible but unfocused one is deliberately not
+active, and gets an OS banner rather than an in-app toast.
+
 ### Traffic-light placement
-Where the packaged macOS client puts the three window buttons, and how the header row knows to stay clear of them. Under `titleBarStyle: "Overlay"` the webview owns the full window height and the buttons float above it in an AppKit layer, so our HTML never reflows around them and both numbers are ours to choose (`crates/lucidos-app/src/traffic_lights.rs`). **Vertically** the cluster's centre sits on the centre of the one bar the user sees (`--titlebar-inset` plus `--app-header-height`), so the lights obey the same centring rule as every other control in the row (`--header-band-lift`) instead of being the one that sits higher. The bar height can only come from the page, because `--desktop-bar-height` is `3rem` and the root font size is the user's UI-scale preference, so the frontend measures the rendered header and pushes it through the `set_traffic_light_offset` command on every apply that can move it (`store/actions/trafficLights.ts`), and the last value is remembered in `<app-data>/config/titlebar-bar-height` for the next cold launch. **Horizontally** `--titlebar-lights-reserve` is arithmetic on `--titlebar-lights-x`, the x the shell stamps pre-paint from the constant it actually placed with, plus the cluster's measured 60px and a gap held EQUAL to that x, so the 20px of slack in the 80px the row keeps clear is split evenly and the drawn cluster sits centred in it with 11px of air on each side. Moving the lights within the reserve therefore moves nothing of ours: the reserve is the same 80px whichever way the slack is split, and the five things laid out against it (the three controls that can lead the header row, the centred Threads title's clamp, and the thread drawer's floor) never notice. Tauri 2.11.4 exposes no runtime setter (the dispatcher method exists a layer down but nothing public wraps it) and the `main` window is config-declared, so the placement drives AppKit directly through `Window::ns_window()`; AppKit reverts it on **every** window resize, fullscreen enter/exit included, which is why it is re-applied on `Resized`. Distinct from the reclaimed title-bar band itself (`.titlebar-strip`), which is the blue the CSS paints behind them.
+Where the packaged macOS client puts the three window buttons, and how the
+header row stays clear of them. Under `titleBarStyle: "Overlay"` the webview
+owns the full window height. The buttons float above it in an AppKit layer, so
+our HTML never reflows around them. Both numbers are therefore ours to choose
+(`crates/lucidos-app/src/traffic_lights.rs`).
+
+**Vertically** the cluster's centre sits on the centre of the one bar the user
+sees, which is `--titlebar-inset` plus `--app-header-height`. So the lights obey
+the same centring rule as every other control in the row (`--header-band-lift`),
+instead of being the one that sits higher.
+
+**The bar height can only come from the page.** `--desktop-bar-height` is `3rem`
+and the root font size is the user's UI-scale preference. A surface DECLARES its
+band with `data-titlebar-band`, and the frontend measures that element and pushes
+the height through `set_traffic_light_offset` (`store/actions/trafficLights.ts`).
+Two surfaces declare one: the app shell's `.app-header`, and the picker's own
+invisible strip. The picker mounts no shell and runs at the browser default
+scale, so it would otherwise inherit a bar it does not have.
+
+**A height belongs to the window that reported it**, keyed by label, since two
+windows can show surfaces with different bars. The last value any page pushed is
+also remembered in `<app-data>/config/titlebar-bar-height`. That copy is a SEED
+only. It covers the frames between a window appearing and its own page
+measuring.
+
+**Horizontally** `--titlebar-lights-reserve` is arithmetic on
+`--titlebar-lights-x`, the x the shell stamps pre-paint from the constant it
+placed with. Add the cluster's measured 60px, and a gap held EQUAL to that x. The
+row keeps 80px clear, so the 20px of slack is split evenly. The drawn cluster
+then sits centred in it, with 11px of air on each side.
+
+Moving the lights within the reserve therefore moves nothing of ours. The reserve
+is the same 80px whichever way the slack is split. Five things are laid out
+against it and none notices: the three controls that can lead the header row, the
+centred Threads title's clamp, and the thread drawer's floor.
+
+Tauri 2.11.4 exposes no runtime setter, and the `main` window is
+config-declared. The dispatcher method exists a layer down, but nothing public
+wraps it. So the placement drives AppKit directly through `Window::ns_window()`.
+AppKit reverts it on **every** window resize, fullscreen enter and exit included,
+which is why it is re-applied on `Resized`. Distinct from the reclaimed
+title-bar band itself (`.titlebar-strip`), which is the blue the CSS paints
+behind them.
 
 ### Login-shell hydration
 What the packaged macOS **service** role does to its own environment before it starts anything, in `crates/lucidos-app/src/shell_env.rs`. A launchd or LaunchServices launch never ran `~/.zprofile` or `~/.zshrc`, so a user's exported provider keys are absent and `PATH` is the bare `/usr/bin:/bin:/usr/sbin:/sbin`. The service therefore runs the user's login shell once (`$SHELL -ilc`, falling back to `/bin/zsh`), reads its environment back null-delimited behind a marker, and applies an **allowlist** of it to its own process, which the *Workspace gateway*, every engine and every *agent session* below it then inherit. Deliberately the *service* role and not the **client**: in a packaged build the engine is not a descendant of the GUI client, so hydrating the client would reach nothing that reads these variables. Four properties define it: an allowlist (credentials, the paths credentials live at, and `PATH`) rather than a wholesale copy, so a shell profile can never repoint a packaged install's model, topology or storage; a variable already set in the process always wins, `PATH` excepted, which is merged shell-first over the inherited one because launchd always sets one; a hard timeout after which the launch continues un-hydrated, with the shell's whole process group killed so a descendant holding the output pipe cannot outlast it; and names-only logging, never a value. A run started from a terminal is detected by `SHLVL` and skipped entirely, so dev is unaffected. Distinct from and composed with the engine's static PATH floor (`crates/lucidos-engine/src/core/user_path.rs`), which prepends the well-known install dirs with no subprocess at all: hydration picks up a version manager's shims, the floor covers what hydration missed or never ran for. The allowlist itself is documented in the `lucidos-env-vars` skill.
@@ -554,7 +619,7 @@ Where a live *voice session* is, as the client models it: `idle` | `connecting` 
 
 **A call draws one surface, and it is not a caption.** The *call toggle* turns red while one is up, and everything said lands in the transcript as thread events. The one thing the phase paints is the *live utterance* row below. It is otherwise announced rather than drawn: the toggle carries the call's one `role="status"` region, empty at `idle`, so each state a call arrives at is spoken. Ringing off is the button's own announcement, since emptying a live region says nothing. The transcript deliberately is not a live region either, because announcing every delta of a reply being spoken aloud would talk over it.
 
-The client keeps ONE caption, `CallState.heard`, and it captions nothing in flight (ADR 0174). `talker_transcript` is still read for what it implies and its text dropped. A reply the speaker is mid-way through is state that can only go stale. `user_turn_ended` is different: the provider has ENDED that turn, so the sentence is final, and the *live utterance* row draws it the moment the speaking bars stop. An EMPTY transcript is the engine's own word for "that was a noise", and it withdraws the row on the spot. `voice/call.rs` refuses to hold a wordless one, which is what makes that reading safe.
+The client keeps THREE captions, and the field a word lands in says what it is worth. `CallState.heard` is the caller's finished sentence, set by `user_turn_ended`: the provider has ENDED that turn, so the sentence is final and a row may be claimed by it. `hearing` is their partial, built from `user_transcript` deltas and replaced outright by `heard`. `said` is the reply being spoken, built from `talker_transcript`, and `replyCount` beside it is which reply that is rather than a caption. An EMPTY `user_turn_ended` transcript is the engine's own word for "that was a noise", and it withdraws the row on the spot. `voice/call.rs` refuses to hold a wordless one, which is what makes that reading safe.
 
 One thing does outlive a call, the reason it could not run. `store/voice.ts` toasts that note when the phase reaches `idle`, rather than leaving it on a surface that has gone.
 See also: *live utterance*, *voice session* and *call toggle* (`system-knowhow/glossary.md`), `docs/plans/2026-08-29-a-microphone-reaches-the-call.md`.
@@ -562,7 +627,9 @@ See also: *live utterance*, *voice session* and *call toggle* (`system-knowhow/g
 ### Live utterance
 The caller's utterance before the engine's own row for it exists, and the row the transcript draws for it meanwhile. `CallState.utterance` (`voice/callState.ts`) carries it through four values. `none` is nothing heard and `live` is the speech gate open. `landing` is the gate shut with the provider still silent, and `transcribed` is the provider reporting the words.
 
-**The row carries those words, from the instant it reaches `transcribed`** (ADR 0174). Before that it holds a pulse, because none exist. The swap costs no round trip and no frame, which is the whole point: the engine's row can be tens of seconds later, and the stretch in between used to be blank.
+**The row carries words from the first one the provider hears.** A partial fills it while they speak (`LiveUtterance.partial`, from `user_transcript`), and the finished sentence replaces it at `transcribed` (`text`, ADR 0174). It holds a pulse only until the first partial, and for the whole utterance when the transcriber streams none. The swap costs no round trip and no frame, which is the whole point: the engine's row can be tens of seconds later, and the stretch in between used to be blank.
+
+**A partial captions and settles nothing.** It rides the synthetic row's `text` so every reader draws it as an ordinary bubble, and `_livePartial` is what marks it provisional: no response panel opens under it, and `claimUtteranceRows` skips it. Only `LiveUtterance.text` is words a persisted row may claim.
 
 **It exists because the words arrive late, not slowly.** `voice/call.rs::forward` HOLDS a transcript on `UserTurnEnded` and writes no row there. Which row it becomes depends on the *talker*: a `SpokenMessageReceived` when it answers alone, a `MessageReceived` when it delegates. Both wait on a talker tool round-trip, so the stretch from the first word to the bubble held no event and drew nothing at all.
 
@@ -572,10 +639,26 @@ They live in `ThreadState.liveUtterances`, a LIST of their own rather than `pend
 
 **Only two things withdraw a row, and neither is a clock.** An empty `user_turn_ended` transcript takes a wordless one, which is the noise case. The caller's real words landing as an event takes the matching one, which is the swap the reader sees. A row carrying words outlives the bound on the wait AND the hangup, because `call.rs` writes down whatever it holds for every end reason. `store/liveUtterance.ts` is the one seam between a call and a thread. It upserts one row per utterance count, so a revision rewrites in place rather than adding a bubble.
 
-**Both ends match by COUNT, and neither takes a row on sight.** The engine holds one utterance at a time, so a caller who barges in has a second row up before the first one's words arrive. `handleEvent` tallies landed words in `settledUtterances`. It clears a row only once that tally reaches the row's own count, so a late arrival cannot erase the sentence still being said. Words land in the order they were said, which is what makes a tally enough and an id unnecessary.
+**A landing row claims the live row carrying the SAME WORDS, never one matching a count.** `claimUtteranceRows` is the whole rule, and `unclaimedUtterances` holds the words no row has claimed yet. A row with no final words matches nothing, which is the barge-in guarantee by construction, and a partial is not words either.
 
-**A count is one PROVIDER turn, never one gate cycle**, and that is what keeps the two tallies comparable. The gate shuts on 320 ms of quiet and a provider endpoints on longer. So a breath mid-sentence would otherwise mint a second row against a turn reporting one set of words. `startUtterance` resumes a `landing` utterance and counts only a turn the provider has ENDED. The talker taking the floor is one of those, which is why it lands on `transcribed` rather than `landing`: it proves the provider read that turn.
-See also: *call phase*, *transcript marker*, ADR 0174, `docs/plans/2026-08-31-a-bubble-appears-as-the-caller-speaks.md`, `docs/plans/2026-09-05-a-turn-is-never-blank.md`.
+**No count works, because the two sides disagree about which row is next, in both directions.** `count` is the browser's gate cycling, and a persisted row is one thing the caller SAID. A pause inside one utterance gives two counts one row. And `call.rs` writes NO row for words spent answering a question card, leaving an orphan a later row would claim. Both are traced in `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`.
+
+**A persisted row is NOT one provider transcription item, and reading it as one is what drew seven bubbles for one sentence** (ADR 0185). A provider closes an item for its own reasons. `call.rs` accumulates across them and closes the row when the conversation MOVES: the talker says words, the doer is asked, or the call ends.
+
+**Trimmed on both sides, because exactly one leg normalizes.** The frame's transcript reaches `SpokenMessageReceived` verbatim and reaches `MessageReceived` through `doer.rs::wake`, which trims. `voice::call` pins the verbatim leg, so a second normalization cannot arrive unnoticed.
+
+**The words wait because the two arrive on two transports.** `call.rs` emits the persisted row BEFORE it sends `user_turn_ended`, over SSE against the call socket, so either can win. Words landing with no row to claim stay in `unclaimedUtterances`, and `store/liveUtterance.ts` claims again the moment a row gets its own.
+See also: *call phase*, *live reply*, *transcript marker*, ADR 0174, `docs/plans/2026-08-31-a-bubble-appears-as-the-caller-speaks.md`, `docs/plans/2026-09-05-a-turn-is-never-blank.md`.
+
+### Live reply
+The talker's own half of a *live utterance*: the reply the transcript draws while it is being spoken, before `SpokenReplyGenerated` exists. `CallState.said` accumulates the `talker_transcript` deltas the client already receives and used to drop, and `ThreadState.liveReply` is the row.
+
+A SLOT where the caller's is a list, and the asymmetry is the engine's: `call.rs` holds the floor to one reply at a time, so a second live reply is a state that cannot exist.
+
+The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past the fold beside the caller's rows and sorted with them by `created`. It wears the persisted type on purpose, so `initiatorFor` draws it as the Lucidos boundary and `exchangeHoldsNoTurn` already knows it holds none. `exchangeStatus` short-circuits it to `done`: the words moving in it are the activity, and a shimmer below would be a second one.
+
+**It outlives `said`.** The turn ending empties the caption and withdraws nothing, because the engine's row is on its way and the caller is still hearing the tail. The persisted `SpokenReplyGenerated` retires it, with `VoiceSessionEnded` as the backstop.
+See also: *live utterance*, *call phase*, ADR 0174.
 
 ### Capability parity manifest
 The single source of truth (`crates/lucidos-engine/src/capability_manifest/`) for which **agent surfaces** expose each capability — the LLM tools, the `lucidos` CLI, and the JS SDK (UI/HTTP are the substrate). Each *domain* declares its operations once plus domain-level `llm`/`cli`/`sdk` flags; from that one declaration the grouped LLM `ToolDefinition` is built in-crate, the CLI subcommand module is generated into `crates/lucidos-cli/src/generated/`, and the SDK capability table into `packages/lucidos-sdk/src/generated/`. Drift is a build failure: staleness tests (mirroring `navigate_targets_codegen`) fail `cargo test` when a generated file falls behind, the grouped handler's recognised-action set is checked against the manifest, and a Vitest test checks the SDK facade. Introduced to stop the agent-facing surfaces silently lagging UI/SDK/HTTP — see `docs/adr/0018-capability-parity-manifest.md`. Models *declared parity* (per-capability target surfaces), deliberately not blanket N×N parity.
@@ -677,6 +760,8 @@ See also: *handshake script approval*, *credential scope*, ADR 0157's amendment.
 A credential's `base_urls` treated as a binding rather than a label. The value is presented only to a request one of those URLs covers. `core::credentials::credential_scope_covers` asks the question and `credential_base_url_matches` judges each member: same scheme, host and effective port, plus a path prefix on a segment boundary. `core::git_auth` has always re-checked the same predicate on every git credential callback. ADR 0144 extended it to the proxy pipeline, at every place a credential itself travels to the entry's `base_url`: the static layers, `hmac_signed`, and a WASM signer's `credential_handles`.
 
 **It is a SET, and every member is exact** (ADR 0161). One key often covers several hostnames of one provider. A single value could not express Binance's `api.` and `fapi.` hosts at all, and refused the second. There is no wildcard, no suffix rule and no registrable-domain rule: the user names each host, and a second member widens the credential by that host alone. An empty set is legal and means the credential goes nowhere. `core::credentials::normalized_base_urls` is the one speller, refusing a member that is not a URL with a host at the write rather than at the gate.
+
+**Widening one is always the user's act, and three surfaces now reach it.** Settings edits the list directly, `lucidos credentials set-base-urls` replaces it from a script, and `request_credential` PROPOSES one: naming a host an existing credential misses reopens that row in the modal, seeded with the union and saying which hosts are new. The engine writes nothing there, so the Save is still the user's. Without that third surface, the Lucidos Agent's only move was a second service name holding the same secret. ADR 0161 rejected exactly that outcome.
 
 **The `CRED_*` injection into a handshake script is not one of them.** ADR 0144 listed it, and its 0157 amendment removed it. The script presents that credential to its provider's own token endpoint, not to `base_url`, so judging it against `base_url` refused every ordinary OAuth handshake. What binds there is the *handshake injected-secret set* instead.
 
@@ -865,6 +950,8 @@ What those branches reached for survives as ONE test in the right place. `landAt
 **It is a HOLD, not a one-shot, for the four that ask the agent for something.** That is the second thing the acted-on turn decides. Each growth round re-aims at the live edge, and each writes nothing when there is nowhere to go. It lets go on the first CHANGE to the rows the turn had at submit time, which is the agent starting. A change and not a growth: `getCollapsedVisibleEvents` drops earlier prose when a new text block arrives, so the count can fall. Rows means `.response-content > *`, never `.response-body`'s own children: those are the section wrappers, and a resuming agent appends inside the one already there.
 
 The hold's LAST glide freezes its target, resting the reader where the agent's first row put them. Every earlier round tracks the live edge, which is what catches the opening instalments. Without the freeze a second row arriving inside that tween carries them on to it, reported as scrolling past the first step.
+
+The releasing round REACHES a glide already running, and the growth branch stands down for every tween but this one. A fast reply lands wholly inside one glide, so a swallowed round left the release waiting for the tween's end. A turn the submit CREATED counts from zero, for the same reason. It can render with the agent's opening already in it, and reading its rows then swallows them.
 
 A QUEUED follow-up also lets go at once, after its one aim. Holding for a turn that never draws would chase the reader through the reply above it. It is recognised POSITIVELY, by the remove button its queued status carries. Inferring it from a missing `.response-panel` reads true for an unanswered card divider too, which renders none and is about to draw. `LANDING_HOLD_MS` is the backstop for a turn that draws no row: a dead request, a collapsed turn, a coding-agent turn running tool calls with the step log off.
 
@@ -1386,6 +1473,19 @@ The tri-state result of resolving a worktree directory's 8-hex thread-id prefix 
 ### e2e lock
 The single-writer lock on the shared e2e-test workspace (`<e2e-workspace>/.lucidos/e2e.lock`, `scripts/lib/e2e_lock.sh`), acquired by every e2e entry point before it starts the workspace or spawns a browser. **Machine-wide, not per workspace**: it is one file on one path, so a run in `dev` and a run in `myws` contend for the same lock. Four states (no lock, live-PID lock, stale lock without orphans, stale lock with orphans), the last two being the orphan-safe reclaim; the details and their incidents live in `docs/e2e-test-decisions.md`. A hold is announced by two domain events, `E2ELockAcquired` and `E2ELockReleased`, so a refused run can subscribe with `lucidos await-event` and end its turn instead of sleeping in a loop. **Both endings emit**: a normal release, and a reclaim, which announces the *dead* owner's hold ending because that owner's EXIT trap never ran. The announcement is best effort and bounded, and it is emitted into the emitting subprocess's own workspace, which is why a cross-workspace waiter is delivered nothing and recovers on its `--timeout-secs` deadline instead (ADR 0057). Agent-facing rules: `.claude/skills/e2e-lock-wait/SKILL.md`.
 
+### Pre-flight engine reclaim
+The nightly step that stops every `lucidos-engine` which should not be running, ahead of the pipeline's memory gate. Entry point `scripts/preflight-reclaim-engines.sh`, logic in `scripts/lib/preflight_reclaim.sh`, offline-tested by `preflight_reclaim_test.sh`. Three rules are load-bearing, and each replaces a way the pasted bash snippet it grew out of was a silent no-op.
+
+**It stops a workspace only through `scripts/stop.sh`, never with a raw signal.** The engine ignores SIGTERM on purpose. A bare SIGUSR1 leaves the gateway supervisor free to respawn the engine in the same second with a fresh pid. Only the path that asks the gateway to drop the workspace first makes a stop stick. It has to be the gateway that OWNS it, so `stop.sh` reads `LUCIDOS_GATEWAY_PORT` off the target engine: the dev gateway on 5251 and the packaged one on 5252 hold different registries (ADR 0179).
+
+**It reads the path out of the engine's own environment.** `LUCIDOS_WORKSPACE_ID` and `LUCIDOS_WORKSPACE` come from `ps -E`, and no path is built from an assumed layout. A non-dev workspace lives under `~/.lucidos/gateway/workspaces/<slug>`, so a guessed `~/workspaces/<slug>` makes `stop.sh` exit 1 on "Workspace not found", which reads like a clean no-op.
+
+**It watches the host afterwards**, exiting non-zero on any reclaimable engine still up or back again. A reclaim that cannot show what it freed must not look like success, which is why the before-list and the available-memory delta are printed too. The watch polls every 2s and needs 39s of continuous absence. That comes from `DEAD_MISS_THRESHOLD`, `SUPERVISE_INTERVAL` and `RESPAWN_BACKOFF`, plus the client's 15s boot watchdog and its one retry. It was a flat 10s sleep, shorter than the respawn it exists to catch.
+
+A workspace that returns inside that window is a failure, and the warning quotes the gateway log line naming which path returned it: `respawning '<ws>'` (the stop never reached the owning gateway) or `lazy-starting '<ws>'` (a client window navigated back). `LUCIDOS_RECLAIM_SETTLE_S` is retired in favour of `LUCIDOS_RECLAIM_QUIET_S` and `LUCIDOS_RECLAIM_DEADLINE_S`.
+
+The **keep list** (`LUCIDOS_RECLAIM_KEEP`, default `dev personal`) is matched exactly, so `devbox` is not caught by `dev`. An engine whose workspace id cannot be read is left alone, and never counted as a survivor. Available memory is read through `scripts/lib/host_memory_guard.sh`'s own function, so this step and the in-run floor share one formula. Distinct from the *host-pid kill guard*, which is about never signalling a protected pid: this step signals nothing.
+
 ### Network bind config
 The durable, user-configurable control over what address the *workspace gateway* and each *engine* listen on, with a loopback-first security default. Lives machine-globally in `~/.lucidos/network.toml`: `[gateway] bind = "loopback" | "all" | "<IP>"` (the gateway's own bind, machine-wide, since it binds before any workspace is chosen) and `[engine] inherit = true | false` (true: every engine binds the gateway's bind; false: each engine reads its own per-workspace **`network_bind`** preference, so `dev` can be on the tailnet while `myws` stays loopback). Resolved at process start by `crates/lucidos-{engine,gateway}/src/net_config.rs`: two **deliberately duplicated** modules, since the gateway has no dependency on the engine (ADR 0014 §1). Precedence (highest first): the engine's `LUCIDOS_BIND_LOOPBACK` floor (a packaged behind-gateway engine never faces the network) → the `LUCIDOS_BIND_ADDR` / `LUCIDOS_GATEWAY_BIND_ADDR` env (a literal IP, e.g. a Tailscale `100.x`) → the `LUCIDOS_BIND_ALL` / `LUCIDOS_GATEWAY_BIND_ALL` env → the file / per-workspace pref → loopback. A malformed value fails safe to loopback, **never** to all-interfaces. Edited from the **workspace picker** (the gateway bind + inherit toggle, via `/~/api/v1/control/network-config`) and per-workspace **Settings → Access → Network access** (the engine bind, via `/api/v1/network-config`). A change takes effect only after a gateway / engine **restart**: a live socket cannot be re-bound. Env vars override the file so launch scripts / e2e are unaffected.
 
@@ -1419,6 +1519,17 @@ A root thread plus every transitive descendant reachable through `parentThreadId
 
 ### Family extension
 The ancestor + descendant threads of a paginated set that get loaded eagerly so the drawer can render them under their parent, even when their own `last_activity` falls below the loaded window. Backend helper `EventStore::fetch_family_extension` (recursive CTE over `thread_summaries.parent_thread_id`); HTTP layer returns them in a separate `family_threads` field on `GET /threads` and `GET /threads/older`. The frontend upserts them into `threadMap` like any other thread but tracks their ids in `familyExtensionIds` (in `store/actions/thread-loading.ts`) so they're **excluded from the `loadOlderThreads` pagination cursor** — without that exclusion, a single old child would advance the cursor past every intervening thread. An id is removed from the set when natural pagination later returns it as a base thread.
+
+### Awaited thread
+The focused thread this client is **waiting for**, held in `awaitedThreadId` (`crates/lucidos-app/src/store/store.ts`). It is not in `threadMap` yet, and its absence is expected rather than stale.
+
+That distinction is the whole point. `ThreadView` clears a `focusedThreadId` it cannot find in the map, as stale-pointer cleanup during render, and an unfocused thread pane **is** the compose view. So a focus placed on a thread whose row has not landed is silently undone, and the user reads it as "the button did nothing".
+
+Two producers claim the await, always before they focus. `focusThreadOrBootstrapResult` claims it on its miss path, so a notification tap moves the pane at once while the metadata fetch runs. `focusSpawnedThread` claims it for a thread the engine has just spawned and named in its response: a plugin setup thread, an upstream-patch thread, the Store card's Setup button.
+
+That second case has two ways to be absent, and neither is an error. The row reaches this client over SSE, which can land after the response. And a spawn the *Thread Queue* has only queued owns no `thread_summaries` row at all, which is also why a bootstrap fetch is wrong there: it would 404.
+
+While the await stands, ThreadView shows its delay-gated skeleton, and the transcript appears the moment the row arrives. Two releases, because a leaked await would exempt a genuinely stale pointer for the rest of the session. `ThreadView` drops it on arrival, being the exemption's only reader, and `setFocusedThread` drops it when the focus moves anywhere else. The bootstrap additionally restores the previous focus when its fetch says the thread does not exist (`releaseAwait`). Pinned by `components/chat/__tests__/awaited-focus-survives-cleanup.test.ts` and `store/actions/threads-ensure-status.test.ts`.
 
 ### Focused pane
 Desktop-only signal (`focusedPane`, `FocusedPane = 'drawer' | 'thread' | 'content'` in `crates/lucidos-app/src/store/store.ts`) tracking which of the three desktop panes the user is working in. All three are user-facing terms defined in `system-knowhow/glossary.md`: `drawer` → *thread drawer* (`.thread-drawer`), `thread` → *thread pane* (`.pane-thread`), `content` → *content pane* (`.pane-content`) — so a UI string may name any of them directly. The *Conversation* / *Canvas* pair sits one level up and names the two **sides**, not panes; use it only when the subject is a whole side (see *Pane group*). Set on pointer-down inside a pane (`focusPane`) and by the thread-pane / content-pane keyboard toggles (`toggleThreadPane` / `toggleContentPane` via `focusPaneAndControl`, which also moves real DOM focus via `focusPaneMainControl`). The drawer splits pointer vs keyboard the same way: the drawer **icon** (`toggleThreads`) is a pure show/hide that never *sets* `focusedPane` — it only drops a hidden-but-focused drawer's focus back to the thread pane so the focus wash never strands on an invisible region — while the `toggleThreadDrawer` **shortcut** (⌘⇧1, `focusOrToggleThreadDrawer`) IS focus-aware: a three-stage open+focus / focus / close that moves real DOM focus into the drawer (re-expanding the Conversation side first if it was collapsed) so the drawer's existing ↑/↓/Enter list-nav is reachable from the keyboard. **Navigation also activates the matching pane group**, signal-only (no DOM focus moved — the first Tab pulls focus in via `handlePaneTab`): `revealContentPane` sets `content` for any content navigation (menu switch, settings subview, app / file / URL / trigger / change — Search Everywhere included), and `focusThread` re-activates `thread` when arriving from the Content group (`focusedPane === 'content'`, so drawer browsing is left undisturbed). Without this the view lands but Tab stays stuck on the previously-focused pane. See *Pane group*. **Desktop-only** — mobile has no focused pane: panes there are *navigated, not focused* (via the header / swipe, tracked by `mobileView`, the *visible pane*), and the pane keyboard shortcuts don't exist on mobile. Pane-scoped keyboard actions target the focused pane: resize (`stepThreadPaneWidth` / `stepThreadDrawerWidth` in `store/actions/pane.ts`) and history navigation. The Back / Forward shortcuts (`historyBack` / `historyForward`, ⌘⌥↓ / ⌘⌥↑) route through `store/actions/focused-pane-history.ts` to the focused pane's OWN history stack: the content pane walks the panel nav stack (`navigation.ts`, `navBack` / `navForward`), while the thread and drawer panes share the thread nav stack (`thread-navigation.ts`, `threadNavBack` / `threadNavForward`). Each pane header's dedicated Back / Forward buttons drive their own stack directly regardless of focus; only the keyboard shortcut is focus-routed. Canonical term — don't say "panel" or "view"; *view* is already taken by `MobileView` (the mobile swipe position).
@@ -2209,13 +2320,19 @@ How a reaped child process ended, as a typed enum (`crates/lucidos-engine/src/co
 The interpreter engine-spawned shell commands run under (`core::shell::command_shell`): a resolved `bash` invoked with `-o pipefail`, falling back to `/bin/sh` with a logged warning where no bash exists. `pipefail` is load-bearing rather than cosmetic — a POSIX shell reports the exit status of the *last* stage of a pipeline, so `cargo clippy … | tee build.log` returned `tee`'s `0` and a build that exited `101` reached the agent as a clean success (the 2026-07-26 nightly hit this four times in one pipeline, and every step had to cross-check a sidecar `.ec` file to catch it). What `pipefail` guarantees precisely: the pipeline's status is that of the *rightmost failing* stage, and `0` only when every stage succeeded — so a failing stage can never be masked by a later succeeding one, though with several fallible stages the reported code doesn't identify which failed first. Applied at all three shell call sites: `run_bash`, the *background task* registry, and trigger/scheduled scripts. Accepted consequence: a producer SIGPIPE'd by an early-closing consumer (`yes | head -1`) now reports failure instead of `0` — as exit code `141`, since the shell exits normally carrying `128 + signum` when a *pipeline stage* (rather than the shell itself) is signalled, which *TaskOutcome* renders as `exit code 141 (probable SIGPIPE)` rather than a bare number.
 
 ### Talker
-The rented speech-to-speech model that holds a *voice session*: it hears, it speaks, and it decides whether an utterance needs the *doer*. It is opened with **exactly three tools** and none of them acts (ADR 0170): `delegate` (see *delegation*), `answer`, and `hang_up`. `answer` settles what is waiting on the caller, by handing back a choice id the engine issued. `hang_up` ends the call and never the work. `SessionOpening` (`voice/provider.rs`) still has no tool field, so nothing above the seam can add a fourth. A talker that gets something wrong says a wrong sentence; only the doer beside it can send an email.
+The rented speech-to-speech model that holds a *voice session*: it hears, it speaks, and it decides whether an utterance needs the *doer*. `SessionOpening` (`voice/provider.rs`) has no tool field, so nothing above the seam can hand it one. A talker that gets something wrong says a wrong sentence; only the doer beside it can send an email.
+
+**Two implementations answer that seam, and `model_voice_talker` picks which.** A `gpt-realtime-*` id opens `voice/realtime.rs`, and `gpt-live-1` opens `voice/live.rs`. Nothing above `voice/provider.rs` learns which answered, and a source scan in `voice::tests` keeps it that way.
+
+A **Realtime** talker is opened with **exactly three tools** and none of them acts (ADR 0170): `delegate` (see *delegation*), `answer`, and `hang_up`. `answer` settles what is waiting on the caller, by handing back a choice id the engine issued. `hang_up` ends the call and never the work.
+
+A **Live** talker holds **none** (ADR 0181). Its API declares no tools under client delegation, so `delegate` arrives as a delegation frame instead, and the other two have no expression. The caller settles a card by tapping it and rings off on the button. Two more things follow from that protocol: it reports no tokens, because it bills by the second, and it has no turn boundaries, which `voice/live.rs` synthesizes below the seam.
 
 What it can answer with no wait is whatever was loaded at session open, the *resident block*. It can look nothing up mid-sentence, so for anything else it delegates, stalls truthfully while the doer works, then says what it was handed MEANS. It may not state a fact it did not receive.
 
 That block is a snapshot and nothing corrects it, which is why the tool's description biases hard toward calling. Under-calling is the expensive mistake: it answers confidently from what was true when the call opened. Over-calling costs one turn nobody hears.
 
-**A second model runs inside its socket**, the transcriber, turning the caller's audio into text. It is the only other model in the voice loop: nothing translates, and nothing summarises, because the doer's answer reaches the talker as written and the language is a rule in its instructions. `model_voice_transcriber` names it, and `voice_talker_voice` names the voice the talker speaks in. Both are read in `voice::build`, which records why neither takes a `ContextPurpose`.
+**A second model runs inside a Realtime socket**, the transcriber, turning the caller's audio into text. It is the only other model in the voice loop: nothing translates, and nothing summarises, because the doer's answer reaches the talker as written and the language is a rule in its instructions. `model_voice_transcriber` names it, and `voice_talker_voice` names the voice the talker speaks in. Both are read in `voice::build`, which records why neither takes a `ContextPurpose`. A **Live** talker transcribes the caller itself and reads no such setting. So on a Live call the transcriber row does nothing, and the spoken voice still applies.
 
 Internally it is a *guest* participant (`AgentParticipant::Guest`). So `history.rs` prints its turns under their own speaker label, and the doer never reads one as its own. **The user never meets that split**: the talker speaks as Lucidos, in the first person, and the transcript renders a spoken turn as Lucidos. `SpokenReplyGenerated` is what it leaves behind.
 
@@ -2468,8 +2585,19 @@ What Close to Menu Bar does to the packaged macOS client (`close_all_to_tray`; A
 
 A parked window is still part of the arrangement. Nothing is destroyed, so no `Destroyed` re-capture runs and the *window session* still names every parked workspace. The reverse is a **reopen**: the tray's "Open Lucidos", or a Dock click. `desktop::reopen_plan` then shows every hidden window and builds any recorded workspace this process no longer holds.
 
+### Client log
+`<app-data>/logs/client.log`, where the packaged macOS **client** writes its own diagnostics (`client_log::install`, ADR 0186). LaunchServices gives a launched app a write-only sink for fd 1 and fd 2, and nothing written there reaches the unified log. So until this existed, every `eprintln!` in the client role was discarded. The redirect is a `dup2` over both descriptors, taken as the first statement of `run()`. That is also what captures a CHILD's output: the *relaunch watcher* is a detached `/bin/sh`, and this is how `open`'s own refusal is recorded. Capped, with one kept generation rotated to `client.log.1` at a start that finds it oversized.
+
+Distinct from the two agent logs beside it, `engine-service.err.log` and `client-login.err.log`, which their plists write because launchd owns those jobs. Development writes none of the three.
+
 ### Relaunch watcher
-The detached `/bin/sh` the packaged macOS client spawns when it is about to relaunch itself (`desktop::schedule_relaunch_after_exit`): it waits for the client's pid to disappear and then hands the `.app` to LaunchServices with `open -a`. It exists so the relaunched client comes back **frontmost**. A fork/exec'd relaunch (tauri's `process::restart`, our `restart_process`) never asks the system to activate the new instance, so that instance can only land in front by inheriting the front slot from its dying parent, and it loses that race whenever it registers with the window server a moment too late (the 0.20 → 0.20.1 update on 2026-08-03 lost it by ~280ms and the slot went to the next app). Launching only *after* the exit removes the race, and is also what keeps the relaunch to one instance: `open` against a live app activates it rather than launching another, and `open -n` would overlap two clients. Two rules travel with it. The launch is **conditional on the client actually being gone**, checked again after the wait loop, since launching at the loop's ceiling would spend the relaunch activating a process that had not finished exiting. And the ceiling bounds the **watcher's** life, not the relaunch, so it is minutes rather than seconds. Both relaunch paths use it (the *update phase* `relaunching`, and the "Restart App" action), each falling back to a direct respawn when there is no enclosing `.app` (dev) or the watcher cannot be spawned.
+The detached `/bin/sh` the packaged macOS client spawns when it is about to relaunch itself (`desktop::schedule_relaunch_after_exit`). It waits for the client's pid to disappear, then hands the `.app` to LaunchServices with `open -a`. It exists so the relaunched client comes back **frontmost**.
+
+A fork/exec'd relaunch (tauri's `process::restart`, our `restart_process`) never asks the system to activate the new instance. Such an instance lands in front only by inheriting the front slot from its dying parent. It loses that race whenever it registers with the window server a moment too late. The 0.20 to 0.20.1 update on 2026-08-03 lost it by ~280ms, and the slot went to the next app. Launching only *after* the exit removes the race. It is also what keeps the relaunch to one instance: `open` against a live app activates it, and `open -n` would overlap two clients.
+
+Three rules travel with it. The launch is **conditional on the client actually being gone**, checked again after the wait loop. Launching at that ceiling would spend the relaunch activating a process that had not finished exiting. The ceiling bounds the **watcher's** life, not the relaunch, so it is minutes rather than seconds.
+
+And the ask **repeats until the client is confirmed back**, up to ten times, because LaunchServices can refuse and can answer without launching anything. That confirmation is a `pgrep -f` anchored at BOTH ends, since the service runs the same executable and is always up. Every refusal reaches the *client log*. Both relaunch paths use it: the *update phase* `relaunching`, and the "Restart App" action. Each falls back to a direct respawn when there is no enclosing `.app` (dev), or when the watcher cannot be spawned.
 
 ### Workspace payload
 The half of a chat turn's prompt that is sized by what the USER put in their workspace rather than by what the engine wrote: the `[CURRENT FILES]` listing, the Available Apps list, the Know-how routing list, and the open app's know-how listing inside `[ACTIVE APP UI]` (a pointer, never a body: ADR 0111). Built by `engine::chat::process::workspace_payload` and gated by that module's `busy_workspace_payload_stays_under_budget`: the counterpart to the engine-authored `always_loaded_context_stays_under_budget` in `system_prompt.rs`, which deliberately excludes everything here so neither total moves when the other changes. Two rules define it. It is **shaped, never trimmed at the source**: filtering and truncation happen where the prompt block is built, so the stored file, the API response and the UI carry the user's full text. And it **never narrows what the agent can reach**: the file listing is an inventory or nothing, never a sample; it excludes a vendored tree, and `list_files`, `glob_files` and `grep_files` still walk everything. Distinct from the *always-loaded set* and the *engine system prompt*, the two unconditional layers of a coding-agent session: this is the chat agent's per-workspace layer.

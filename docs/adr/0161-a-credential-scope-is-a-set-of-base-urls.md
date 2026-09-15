@@ -163,3 +163,76 @@ the shell history sees what the credential now covers.
 - **Drop the singular `base_url` from the request bodies.** Rejected. It would
   break a script or app a user already wrote, for a field the engine can accept
   in one place at no ongoing cost.
+
+## Amendment: the agent gets the third surface
+
+- **Date**: 2026-09-15
+
+Decision 6 named two editing surfaces, Settings and the CLI, and called them
+"both the user's". That was the right principle and the wrong count. **The
+Lucidos Agent is who the user is talking to when a scope turns out to be too
+narrow**, and it had neither: `request_credential` took ONE `base_url`, and a
+service name that already existed short-circuited to "already configured. You
+can proceed with API requests." whatever the stored scope covered.
+
+So the agent could not say the two-host shape up front, and could not widen a
+row afterwards. The one move left was a second service name. Registering a
+private repo as a plugin marketplace duly asked for the same GitHub token twice,
+once for `api.github.com` and once for `github.com`. That is the alternative
+this ADR rejected as "what a user does today to get around this", reached
+through the tool rather than around it.
+
+Three changes, and none of them touch decisions 1 to 4:
+
+1. **The tool argument is `base_urls`, an array.** Decision 5 said the field is
+   `base_urls` in every layer; the tool schema was the layer still saying
+   `base_url`. The singular is still read and unioned in, on decision 7's terms.
+2. **"Already configured" is scope-aware.** A requested host outside the stored
+   scope returns a credential request carrying `existing_credential_id`, the
+   UNION as `base_urls`, and `adding_base_urls` naming what is new. The row is
+   reopened in the modal with its secret pre-loaded, so the user presses Save.
+3. **The engine still writes nothing.** It proposes; the save is the ordinary
+   `PUT /api/v1/credentials` from the user's own browser. Decision 6 holds, with
+   a third way to reach the same user act.
+
+**A name-keyed lookup needs a kind check.** Only `oauth_client` may shadow a
+name, so every other type is found by name alone: a model guessing `api_key`
+over a stored `bearer` must not miss the row and collect the secret again. But
+the name it finds may belong to something else entirely. A mailbox password
+reported as a configured API key is one widening away from being sent to an HTTP
+host.
+
+So the handler asks whether the stored kind ANSWERS the request. Only `api_key`
+and `bearer` are interchangeable: both hold a bare token under `CRED_<NAME>`,
+and which one the user picked is a header detail the row carries. Every other
+type answers only itself, because it is a shape the agent cannot use as asked. A
+`password` splits into two env vars, a `basic` holds `username:password`, and a
+`secret` is sent nowhere.
+
+`email_password` and `unknown` answer nothing at all. None of these is "already
+configured", and the refusal names both types so the agent can use the stored
+one or pick another name.
+
+**A repair carries no scope at all.** The repair request is built on the
+registration request, so the rename reached it too. The modal then saved a
+registry host, or the `https://{provider}.com` guess, over whatever the user had
+scoped. A repair has nothing authoritative to say about a scope: the row exists,
+and its own is the answer. The cost is that repairing an unscoped row now asks
+for the host rather than seeding a guess.
+
+**Why this is not decision 4 reopened.** That one refuses to widen a scope from
+`apis.json`, because `apis.json` is the file the gate defends against and the
+widening would be silent. Here nothing is inferred and nothing is silent: an
+agent names a host, the form shows it, and a human presses Save. The consent is
+the same consent a brand-new credential needs, minus the retyping.
+
+**A widening is cheaper for a caller than a new credential**, because it costs
+no secret. So the form is what carries the consent. It names the added hosts
+apart from the seeded rows, so a Save cannot grant a host the user did not read.
+That is why `adding_base_urls` sits beside the union rather than being derived
+from it.
+
+`system-knowhow/plugins.md` was the other half. It said a credential for the
+REST API and a credential for the clone are two rows, written when a scope held
+one value. This ADR never reached it. It now states the set rule. See
+`docs/plans/2026-09-15-one-credential-covers-every-host-a-provider-uses.md`.

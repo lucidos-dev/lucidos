@@ -1,7 +1,7 @@
 // API response types that match the Rust backend
 
 import type { ActorMode } from '../store/thread-events';
-import type { AuthType, CredentialInfo } from '../store/types';
+import type { CredentialInfo, CredentialRequest } from '../store/types';
 import type { CodingAgent } from '../generated/thread-event-wire';
 
 /** Coding-agent backend discriminator, generated from the Rust `CodingAgent`
@@ -221,9 +221,11 @@ export interface CronPreview {
 export interface ApiResult {
   success: boolean;
   error?: string;
-  /** `base_url` is absent for a `secret`, which declares no scope and is sent
-   *  to no host. Every other type names the API it belongs to. */
-  credential_request?: { service: string; prompt: string; base_url?: string; auth_type: AuthType };
+  /** The whole request, not a narrower copy of it. This value is handed
+   *  straight to `openCredentialRequest`, so a copy listing four of its fields
+   *  only lies about the rest: the OAuth repair's `existing_credential_id` and
+   *  `missing` already travelled here undeclared. */
+  credential_request?: CredentialRequest;
   auth_url?: string;
   cron_preview?: CronPreview;
   /** Non-fatal notes about a write that succeeded. Today: an event type in a

@@ -221,7 +221,7 @@ impl LucidosEngine {
                     // is how `update_password` finds the row.
                     name,
                     &format!("Enter the app password for {}", email_address),
-                    &format!("smtp://{}", smtp_host),
+                    &[format!("smtp://{}", smtp_host)],
                     "email_password",
                 ))
             }

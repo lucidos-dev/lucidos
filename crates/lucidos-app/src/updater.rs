@@ -905,36 +905,10 @@ mod tests {
 
     // ── The post-install bundle check ────────────────────────────────────────
 
-    /// A throwaway directory that removes itself, so the bundle cases below can
-    /// be built on disk without depending on this machine's real install. Rolled
-    /// by hand because the crate has no dev-dependency on `tempfile` and one
-    /// helper is cheaper than pulling the tree in for it.
+    /// The bundle cases below are built on disk, so they need somewhere
+    /// throwaway that is not this machine's real install.
     #[cfg(target_os = "macos")]
-    struct TempDir(std::path::PathBuf);
-
-    #[cfg(target_os = "macos")]
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("the clock is after the epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("lucidos-updater-{tag}-{unique}"));
-            std::fs::create_dir_all(&path).expect("create the temp dir");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TempDir;
 
     /// Lay down `<root>/Lucidos.app/Contents/MacOS/lucidos-app` with `mode`, and
     /// return the bundle root.

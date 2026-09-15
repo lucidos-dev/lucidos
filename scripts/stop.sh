@@ -47,24 +47,58 @@ stop_workspace() {
     local frontend_pid_file="$ws/.lucidos/frontend.pid"
     local build_watch_pid_file="$ws/.lucidos/build-watch.pid"
 
-    # The gateway is now ONE shared, machine-global process fronting EVERY
-    # workspace (ADR 0014) — do NOT kill it here, or we'd take down every other
-    # workspace's proxy. Instead ask it (best-effort, over https then http — the
-    # dev gateway serves https when certs exist) to stop just THIS workspace's
-    # engine and drop its stack, so the gateway's supervisor won't respawn it.
-    # The registry entry survives, so the workspace stays listed in the picker as
-    # stopped. The engine.pid SIGUSR1 below is the fallback when the gateway is
-    # unreachable. To stop the gateway itself: kill $(cat "$(gateway_pidfile)").
-    local gw_pid gw_port slug
-    gw_pid="$(cat "$(gateway_pidfile)" 2>/dev/null || true)"
-    gw_port="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
+    # A gateway is a shared, machine-global process fronting many workspaces
+    # (ADR 0014), so do NOT kill it here: that would take down every other
+    # workspace's proxy. Instead ask it to stop just THIS workspace's engine and
+    # drop its stack, so the gateway's supervisor won't respawn it. The registry
+    # entry survives, so the workspace stays listed in the picker as stopped. The
+    # engine.pid SIGUSR1 below is the fallback when the gateway is unreachable.
+    # To stop the gateway itself: kill $(cat "$(gateway_pidfile)").
+    #
+    # WHICH gateway comes out of the engine we are about to stop, never from a
+    # constant: the dev gateway on 5251 and the packaged Lucidos.app one on 5252
+    # own different workspaces. A packaged workspace's stop used to go to 5251,
+    # a process that has never heard of it, leaving only the SIGUSR1 below to
+    # run and the packaged supervisor free to respawn what it had stopped.
+    local gw_pid gw_port gw_source slug status
     slug="$(workspace_slug)"
-    if [ -n "$gw_pid" ] && kill -0 "$gw_pid" 2>/dev/null; then
-        if gateway_curl -sk -X POST "https://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1 \
-           || gateway_curl -s -X POST "http://localhost:$gw_port/~/api/v1/control/workspaces/$slug/stop" >/dev/null 2>&1; then
-            echo "Asked shared gateway to stop workspace '$slug' (gateway left running for peers)"
-            stopped="1"
+    gw_port="$(engine_gateway_port "$engine_pid_file")"
+    if [ -n "$gw_port" ]; then
+        gw_source="the engine"
+    else
+        # No port came back: no live engine, or a platform whose `ps` will not
+        # print another process's environment. Fall back to the dev gateway, and
+        # only bother when it is up. Its answer is now discriminating: a
+        # workspace it does not own is a 404 rather than a 202.
+        gw_source="the dev default, no port read from the engine"
+        gw_port="${LUCIDOS_DEV_GATEWAY_PORT:-5251}"
+        gw_pid="$(cat "$(gateway_pidfile)" 2>/dev/null || true)"
+        if [ -z "$gw_pid" ] || ! kill -0 "$gw_pid" 2>/dev/null; then
+            gw_port=""
         fi
+    fi
+    if [ -n "$gw_port" ]; then
+        status="$(gateway_stop_status "$gw_port" "$slug")"
+        case "$status" in
+            2*)
+                echo "Asked gateway :$gw_port to stop workspace '$slug' (port from $gw_source; gateway left running for peers)"
+                stopped="1"
+                ;;
+            404)
+                # Not fatal. A workspace launched with no gateway is legitimately
+                # unknown to every one of them, and the SIGUSR1 below is its real
+                # stop. Said out loud, because the other way to get here is a
+                # stop aimed at the wrong gateway.
+                echo "Gateway :$gw_port (port from $gw_source) does not know workspace '$slug'."
+                echo "  Nothing there to drop, so the engine signal below is the whole stop."
+                ;;
+            000)
+                echo "No gateway answered on :$gw_port (port from $gw_source); using the engine signal alone."
+                ;;
+            *)
+                echo "Gateway :$gw_port answered $status to the stop for '$slug'; using the engine signal alone." >&2
+                ;;
+        esac
     fi
 
     # Stop engine via SIGUSR1, not SIGTERM — the engine ignores SIGTERM to

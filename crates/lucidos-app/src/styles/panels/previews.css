@@ -163,7 +163,12 @@
 .file-preview-content {
     flex: 1;
     overflow: auto;
-    padding: 0.75rem;
+    /* Named so the pinned gutter can paint over it while the code pans; see
+       `.line-numbered-pan .line-number::before` in panels/content.css. The
+       padding is written THROUGH the var so there is one source for the
+       value. */
+    --code-gutter-inset: 0.75rem;
+    padding: var(--code-gutter-inset);
 }
 
 /* Warns that the open handshake script will not run (ADR 0144). Tinted with
@@ -201,12 +206,13 @@
     cursor: zoom-in;
 }
 
+/* Every child of this `<pre>` is a `.code-line`, which carries its own
+   white-space (panels/content.css § the two line-wrapping modes). So this rule
+   is type and metrics only; a white-space value here would reach no text. */
 .file-preview-code {
     font-family: var(--font-ui);
     font-size: var(--font-size-sm);
     line-height: 1.5;
-    white-space: pre-wrap;
-    word-wrap: break-word;
 }
 
 /* --- Inline file editor (data-file preview) --- */
@@ -873,10 +879,14 @@
     word-break: break-word;
 }
 
-/* Direct children only: relaxed to a descendant selector this scores (0,2,1)
-   against `.route-app-name`'s (0,2,0) and wins, so the app name in a
-   `.route-value-group` would silently lose its `--text-primary`. */
-.message-route-panel .route-row > span {
+/* Direct children only, so a nested span keeps its own colour and takes this
+   one by inheritance. Relaxed to a descendant selector, the rule outscores
+   `.pill`, and the trimmed pill loses its accent.
+
+   `:not(.error-text)` is that same fight one level up. This selector scores
+   (0,2,1) against `.error-text`'s (0,2,0), which is why the Repository row's
+   "(load failed)" rendered secondary rather than red. */
+.message-route-panel .route-row > span:not(.error-text) {
     color: var(--text-secondary);
 }
 
@@ -886,7 +896,9 @@
 }
 
 /* A value made of more than one element (app icon + name, user-agent + thread
-   link) keeps them on one baseline inside the row's single value cell. */
+   link) keeps them on one line inside the row's single value cell. The baseline
+   is what lines two pieces of TEXT up; the app's icon opts out of it, for the
+   reason its own rule below gives. */
 .message-route-panel .route-value-group {
     display: flex;
     align-items: baseline;
@@ -899,23 +911,44 @@
     word-break: break-word;
 }
 
+/* The app's icon stays on the name's line. A flex line breaks on an item's FULL
+   width, never on the width it could shrink to. So any name too long to sit
+   beside the icon went below it and stranded it. Held on one line, the name
+   shrinks and wraps its own text instead, which is what the `min-width: 0`
+   above is for.
+
+   `:has()` scopes this to the App row. The API-client row's thread link is a
+   button, and it does want a line of its own once the user-agent fills the
+   row. */
+.message-route-panel .route-value-group:has(> .route-app-icon) {
+    flex-wrap: nowrap;
+}
+
 /* Holds EITHER the app's own manifest icon (user-authored, almost always an
    emoji, which takes its size from the row's font) OR our `<AppsIcon/>` fallback
-   when the app declares none. The svg rule sizes only the latter. */
+   when the app declares none. The svg rule sizes only the latter.
+
+   `align-self` opts the slot out of the group's baseline alignment, which an
+   svg cannot answer. It has no baseline, so the browser synthesizes one at its
+   bottom edge. That parked the mark's bottom on the text baseline and left its
+   top above the cap, riding visibly high beside the name. Centring is a no-op
+   for an emoji, whose own box already matches the name's.
+
+   The name carries no colour or weight of its own, so it inherits the same
+   secondary as every other value in the panel. */
 .message-route-panel .route-app-icon {
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
+    align-self: center;
 }
 
+/* The step below the row's `--font-size-md` text, as `.explainer-btn` uses for
+   a glyph inline with the same text. At `--icon-size-md` the mark overflowed
+   the name's line box and made the App row taller than every other row. */
 .message-route-panel .route-app-icon svg {
-    width: var(--icon-size-md);
-    height: var(--icon-size-md);
-}
-
-.message-route-panel .route-app-name {
-    color: var(--text-primary);
-    font-weight: 500;
+    width: var(--icon-size-sm);
+    height: var(--icon-size-sm);
 }
 
 .message-route-panel .muted {

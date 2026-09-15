@@ -19,32 +19,162 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::{
     activation, desktop, notifications, traffic_lights, window_persist, window_restore,
-    window_target,
+    window_screen, window_target,
 };
+
+/// One step of a placement: where the window goes, or how big it is.
+///
+/// A named pair rather than two straight-line calls, so the ORDER is a value a
+/// test can read. Nothing else in the crate can observe it, and getting it
+/// wrong halves the page in silence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Placement {
+    MoveTo { x: f64, y: f64 },
+    ResizeTo { width: f64, height: f64 },
+}
+
+impl Placement {
+    /// The verb the log line uses when this step fails.
+    fn verb(&self) -> &'static str {
+        match self {
+            Placement::MoveTo { .. } => "move",
+            Placement::ResizeTo { .. } => "resize",
+        }
+    }
+}
+
+/// The steps that put a window at `frame`, in the order they must go out.
+///
+/// The MOVE goes first. A move can change the window's scale factor, and a
+/// resize already queued behind it is then read at the wrong one. tao mints its
+/// `Resized` in physical pixels, times the factor at that moment, and the
+/// runtime divides by the factor at DRAIN time. Size then move across a scale
+/// boundary and the app window's child webview comes out at half the window
+/// (ADR 0178).
+///
+/// Moving first cannot straddle. A resize that itself crosses displays is safe:
+/// tao reads the live factor when `windowDidResize:` fires, so the mint and the
+/// read agree.
+fn placement_steps(frame: window_restore::Rect) -> [Placement; 2] {
+    [
+        Placement::MoveTo {
+            x: frame.x as f64,
+            y: frame.y as f64,
+        },
+        Placement::ResizeTo {
+            width: frame.width as f64,
+            height: frame.height as f64,
+        },
+    ]
+}
 
 /// Put a window at `frame`, in the logical points the record stores.
 ///
-/// Both restore paths go through here: `main` before the deferred show, and
-/// each extra window while it is still hidden. Best-effort and logged, since a
-/// window at the wrong size beats no window.
+/// The one routine that puts a window anywhere. `main` comes through it before
+/// the deferred show, and so does the clamp's own correction. An extra window
+/// no longer does: it is BORN at its frame instead (see [`build_geometry`]).
+/// Best-effort and logged, since a window at the wrong size beats no window.
+///
 /// Takes a `tauri::Window`, per ADR 0140: sizing and placing are window
-/// operations. Both callers already hold one, the restore path from a lookup
-/// and the builder path off the window it just built.
+/// operations, and every caller already holds one.
 ///
 /// Logical, so tao applies the numbers as they are. It divides a PHYSICAL one
-/// by the scale factor of the display the window is on. That is not the
-/// display the frame was captured on (ADR 0173). The two calls can also
-/// straddle a display change, and only logical values survive that.
+/// by the scale factor of the display the window is on, which is not the
+/// display the frame was captured on (ADR 0173).
 pub(crate) fn place_window(window: &tauri::Window, frame: window_restore::Rect, what: &str) {
-    if let Err(e) = window.set_size(tauri::LogicalSize::new(
-        frame.width as f64,
-        frame.height as f64,
-    )) {
-        eprintln!("[Tauri] Failed to size {what}: {e}");
+    for step in placement_steps(frame) {
+        let applied = match step {
+            Placement::MoveTo { x, y } => window.set_position(tauri::LogicalPosition::new(x, y)),
+            Placement::ResizeTo { width, height } => {
+                window.set_size(tauri::LogicalSize::new(width, height))
+            }
+        };
+        if let Err(e) = applied {
+            eprintln!("[Tauri] Failed to {} {what}: {e}", step.verb());
+        }
     }
-    if let Err(e) = window.set_position(tauri::LogicalPosition::new(frame.x as f64, frame.y as f64))
-    {
-        eprintln!("[Tauri] Failed to place {what}: {e}");
+}
+
+/// Re-assert that an app window's own webview fills its window.
+///
+/// An app window is exactly one webview under its own label, and that webview
+/// covers the whole window. Nothing insets it. The runtime is what keeps it
+/// there, from a resize event whose payload it converts with the scale factor
+/// of the moment. A scale change between the two halves of that conversion
+/// leaves the page in a corner at a fraction of its size (ADR 0178).
+///
+/// The NET, not the fix. [`build_geometry`] and [`placement_steps`] are what
+/// stop the client causing that change; this makes any it does not cause
+/// self-heal on the next frame.
+///
+/// By webview, not webview window, per ADR 0140. This resizes a page inside a
+/// window, and the window may well be hosting a URL preview. That preview keeps
+/// its own bounds: it is built without `auto_resize`, so the runtime's resize
+/// handler never touches it.
+pub(crate) fn refit_webview(app: &tauri::AppHandle, label: &str) {
+    let Some(webview) = app.get_webview(label) else {
+        return;
+    };
+    let window = webview.window();
+    let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) else {
+        eprintln!("[Tauri] Could not read {label} to refit its webview");
+        return;
+    };
+    // Points, through the window's OWN factor, which is what tao multiplied by
+    // (ADR 0173). An unreadable one skips rather than guesses: a wrong size
+    // here is the very fault this exists to undo.
+    if !scale.is_finite() || scale <= 0.0 {
+        eprintln!("[Tauri] {label} reports a scale factor of {scale}: skipping the refit");
+        return;
+    }
+    let bounds = tauri::Rect {
+        position: tauri::LogicalPosition::new(0.0, 0.0).into(),
+        size: tauri::LogicalSize::new(size.width as f64 / scale, size.height as f64 / scale).into(),
+    };
+    if let Err(e) = webview.set_bounds(bounds) {
+        eprintln!("[Tauri] Failed to refit the webview of {label}: {e}");
+    }
+}
+
+/// The size a window nothing is remembered about is built at, in logical
+/// points. The numbers `tauri.conf.json` declares for `main`, kept in step by
+/// `the_default_size_is_the_declared_one`.
+const DEFAULT_WIDTH_POINTS: f64 = 1024.0;
+const DEFAULT_HEIGHT_POINTS: f64 = 768.0;
+
+/// The geometry an extra window is BUILT with, in logical points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BuildGeometry {
+    width: f64,
+    height: f64,
+    /// `None` leaves the placing to macOS, which centres on the primary.
+    position: Option<(f64, f64)>,
+}
+
+/// Where an extra window is born, given the frame its workspace remembers.
+///
+/// A remembered frame goes to the BUILDER, not to `place_window` afterwards.
+/// tao creates the NSWindow at that content rect, so the window opens on the
+/// display the frame names. It carries that display's scale factor from its
+/// first frame, and wry computes the child webview's bounds from the same
+/// factor. Born on the primary and moved after, it changed scale with a resize
+/// still queued, and the page came out halved (ADR 0178).
+///
+/// No frame is File > New Window, or a workspace nothing is remembered about.
+/// That takes the declared default size and no position, which leaves macOS to
+/// centre it.
+fn build_geometry(frame: Option<window_restore::Rect>) -> BuildGeometry {
+    match frame {
+        Some(frame) => BuildGeometry {
+            width: frame.width as f64,
+            height: frame.height as f64,
+            position: Some((frame.x as f64, frame.y as f64)),
+        },
+        None => BuildGeometry {
+            width: DEFAULT_WIDTH_POINTS,
+            height: DEFAULT_HEIGHT_POINTS,
+            position: None,
+        },
     }
 }
 
@@ -147,10 +277,11 @@ pub(crate) fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// pre-paint tint and traffic-light placement.
 ///
 /// `frame` is the geometry the window's WORKSPACE was last left at, in logical
-/// points. Such a window is built hidden, placed, and shown once it is right, so
-/// it never appears at the default size and jumps. `None` takes the declared
-/// default, centred: File > New Window, and a workspace nothing is remembered
-/// about.
+/// points. Such a window is BUILT at that frame and hidden, then shown, so it
+/// never appears at the default size and jumps. It is also born on the display
+/// the frame names, which is what keeps its page from rendering at half size
+/// (ADR 0178). `None` takes the declared default, centred: File > New Window,
+/// and a workspace nothing is remembered about.
 ///
 /// The show is `set_visible(true)`, which is `makeKeyAndOrderFront` on macOS. So
 /// a window opened by a click still arrives key, and needs no focus call of its
@@ -172,9 +303,10 @@ fn open_app_window(
     // HTML5 `dragover` or `drop` then reaches the page, so every file drop is
     // silently dead. Nothing listens for a Tauri drag-drop event, so turning it
     // off gives up nothing.
+    let geometry = build_geometry(frame);
     let builder = WebviewWindowBuilder::new(app, &label, url)
         .title("Lucidos")
-        .inner_size(1024.0, 768.0)
+        .inner_size(geometry.width, geometry.height)
         .disable_drag_drop_handler();
     // The declared minimums too, which `main` takes from the config and a
     // builder-made window otherwise has none of. See `declared_min_size`: a
@@ -187,26 +319,29 @@ fn open_app_window(
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
-    // A restored window is built HIDDEN and shown at the end. It then appears
-    // at its own frame rather than at the default and jumping.
+    // A restored window is built HIDDEN and shown at the end, at its own frame
+    // rather than at the default and jumping.
     //
-    // `place_window` does the placing, not the builder's own `inner_size` and
-    // `position`. One routine places every window the client owns, so `main`
-    // and a `window-<n>` cannot drift apart.
-    let builder = if frame.is_some() {
-        builder.visible(false)
-    } else {
-        builder
+    // The BUILDER places it, not `place_window` afterwards. The two cannot
+    // drift. Both speak logical points, and tao routes each through the same
+    // `window_position` flip. `titleBarStyle: "Overlay"` makes the content rect
+    // the frame, so `inner_size` and `set_size` mean one thing.
+    //
+    // Hidden and placed are ONE decision, `geometry.position`, and the show
+    // below reads the same one. Split across two tests, a window could be
+    // hidden by the builder and never reach the branch that shows it.
+    let builder = match geometry.position {
+        Some((x, y)) => builder.position(x, y).visible(false),
+        None => builder,
     };
+    let placed = geometry.position.is_some();
     let window = builder.build().map_err(|e| format!("{e}"))?;
-    if let Some(frame) = frame {
-        place_window(
-            &window.as_ref().window(),
-            frame,
-            &format!("the restored window {label}"),
-        );
+    if placed {
         // Same sanity pass `main` gets: a frame saved against a display that is
-        // no longer attached must not put a window somewhere unreachable.
+        // no longer attached must not put a window somewhere unreachable. It
+        // judges real geometry here, because the builder applied the frame when
+        // it created the NSWindow. tao defers a SETTER to the main queue, so a
+        // clamp straight after one reads the geometry the window still has.
         window_restore::clamp_restored_geometry(app, &label);
     }
     // Tint the bar now, so it is not black for the moment before this window's
@@ -220,10 +355,19 @@ fn open_app_window(
     traffic_lights::place_all(app);
     // Last, so a restored window's first frame is already the right size, in
     // the right place, and tinted.
-    if frame.is_some() {
-        if let Err(e) = window.show() {
-            eprintln!("[Tauri] Failed to show the restored window {label}: {e}");
+    // An unplaced window is BORN visible. A placed one was built hidden, so it
+    // is on screen only if the show below works.
+    let mut on_screen = !placed;
+    if placed {
+        match window.show() {
+            Ok(()) => on_screen = true,
+            Err(e) => eprintln!("[Tauri] Failed to show the restored window {label}: {e}"),
         }
+    }
+    // Recording a failed show as on screen would leave the watchdog reloading an
+    // invisible page for the life of the process.
+    if on_screen {
+        window_screen::note_shown(&label);
     }
     // Either way this window is now on screen, which is what the session gate
     // waits for. See `window_persist::note_presented`.
@@ -421,8 +565,9 @@ pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::
 /// By window, not webview window, per ADR 0140. No filter is needed: a preview
 /// child is a webview and never a window, so this map holds app windows only.
 pub(crate) fn hide_all_windows(app: &tauri::AppHandle) {
-    for window in app.windows().values() {
+    for (label, window) in app.windows() {
         let _ = window.hide();
+        window_screen::note_hidden(&label);
     }
 }
 
@@ -452,6 +597,7 @@ pub(crate) fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window)
     let _ = window.show();
     let _ = window.set_focus();
     activation::activate_app_frontmost();
+    window_screen::note_shown(window.label());
     // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit explicitly
     // so the reshow is deterministic regardless of event timing.
     emit_window_active(&app, window.label(), true);
@@ -562,6 +708,7 @@ pub(crate) fn close_all_to_tray(app: &tauri::AppHandle) {
     for (label, window) in app.windows() {
         if is_app_window(&label) {
             let _ = window.hide();
+            window_screen::note_hidden(&label);
             emit_window_active(app, &label, false);
         }
     }
@@ -643,8 +790,9 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
         // one and then fail to find it, leaving it parked.
         if let Some(window) = app.get_window(label) {
             let _ = window.unminimize();
-            if let Err(e) = window.show() {
-                eprintln!("[Tauri] Failed to show the parked window {label}: {e}");
+            match window.show() {
+                Ok(()) => window_screen::note_shown(label),
+                Err(e) => eprintln!("[Tauri] Failed to show the parked window {label}: {e}"),
             }
         }
     }
@@ -677,6 +825,7 @@ fn front_window(app: &tauri::AppHandle, label: &str) {
         let _ = window.show();
         let _ = window.set_focus();
         activation::activate_app_frontmost();
+        window_screen::note_shown(label);
         emit_window_active(app, label, true);
         // A login-started client shows nothing until the user asks, and this is
         // where they ask. From here its window set is worth recording.
@@ -774,6 +923,93 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame the reported window came up wrong at, remembered on the 2.0
+    /// Retina panel while the 1.0 ultrawide was primary.
+    fn reported_frame() -> window_restore::Rect {
+        window_restore::Rect {
+            x: 1763,
+            y: 1473,
+            width: 1829,
+            height: 1084,
+        }
+    }
+
+    // ── Where a window is born ───────────────────────────────────────────────
+
+    // The fix. A remembered frame reaches the BUILDER, so the window opens on
+    // the display that frame names. Built at the default and moved after, it
+    // changed scale factor with a resize still queued. The runtime then sized
+    // the page at half the window.
+    #[test]
+    fn a_remembered_frame_is_where_the_window_is_born() {
+        assert_eq!(
+            build_geometry(Some(reported_frame())),
+            BuildGeometry {
+                width: 1829.0,
+                height: 1084.0,
+                position: Some((1763.0, 1473.0)),
+            }
+        );
+    }
+
+    // File > New Window, and a workspace nothing is remembered about. No
+    // position, so macOS centres it on the primary.
+    #[test]
+    fn no_frame_takes_the_declared_default_and_no_position() {
+        assert_eq!(
+            build_geometry(None),
+            BuildGeometry {
+                width: 1024.0,
+                height: 768.0,
+                position: None,
+            }
+        );
+    }
+
+    // The default is declared once, in the config the clamp also reads. Drift
+    // between the two would build a window the clamp then judges as corrupt.
+    #[test]
+    fn the_default_size_is_the_declared_one() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let main = config["app"]["windows"]
+            .as_array()
+            .and_then(|windows| windows.first())
+            .expect("a main window");
+        assert_eq!(main["width"].as_f64(), Some(DEFAULT_WIDTH_POINTS));
+        assert_eq!(main["height"].as_f64(), Some(DEFAULT_HEIGHT_POINTS));
+    }
+
+    // ── The order a placement goes out in ────────────────────────────────────
+
+    // The other half of the fix, and the half no other test can see. tao mints
+    // its resize event in physical pixels, and the runtime divides at drain
+    // time. A move queued between the two is read at the wrong factor, and
+    // moving first leaves nothing to straddle.
+    #[test]
+    fn a_placement_moves_before_it_resizes() {
+        assert_eq!(
+            placement_steps(reported_frame()),
+            [
+                Placement::MoveTo {
+                    x: 1763.0,
+                    y: 1473.0
+                },
+                Placement::ResizeTo {
+                    width: 1829.0,
+                    height: 1084.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_step_says_which_one_it_was() {
+        let [moved, resized] = placement_steps(reported_frame());
+        assert_eq!(moved.verb(), "move");
+        assert_eq!(resized.verb(), "resize");
+    }
 
     #[test]
     fn is_app_window_distinguishes_app_windows_from_panel_previews() {

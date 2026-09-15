@@ -564,6 +564,20 @@ export function CodeIcon() {
   );
 }
 
+/** Soft wrap: three lines of text, the second one turning back on itself. The
+ *  return arrow is what says "wrap" rather than "a list", so it keeps its own
+ *  head even at the smallest icon size. */
+export function WrapTextIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <path d="M3 12h13a3.5 3.5 0 0 1 0 7h-3" />
+      <polyline points="15 16 12 19 15 22" />
+      <line x1="3" y1="19" x2="8" y2="19" />
+    </svg>
+  );
+}
+
 export function CodexIcon() {
   return (
     <svg class="codex-icon" viewBox="0 0 24 24" fill="none" stroke="var(--accent-light)" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">

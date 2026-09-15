@@ -91,7 +91,7 @@ const credentialRequestForm = {
   type: 'credential' as const,
   request: {
     service: 'helius',
-    base_url: 'https://api.helius.xyz',
+    base_urls: ['https://api.helius.xyz'],
     auth_type: 'api_key' as const,
     prompt: 'Paste your Helius API key.\n1. Go to https://dev.helius.xyz/dashboard\n2. Copy API Key',
   } as CredentialRequest,

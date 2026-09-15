@@ -910,3 +910,63 @@ describe('route rows contribute exactly two grid cells', () => {
     );
   });
 });
+
+/** The two cells of the `.route-row` whose label reads `label`. */
+function routeRowCells(node: ComponentChildren, label: string): ComponentChildren[] | null {
+  for (const child of renderedChildren(node)) {
+    if (typeof child !== 'object') continue;
+    const v = child as VNode<{ class?: string; children?: ComponentChildren }>;
+    const cells = renderedChildren(v.props?.children);
+    const heading = cells[0] as VNode<{ children?: ComponentChildren }> | undefined;
+    if (v.props?.class === 'route-row' && renderedChildren(heading?.props?.children)[0] === label) {
+      return cells;
+    }
+    const found = routeRowCells(v.props?.children, label);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** The App row's name span, the second child of its `.route-value-group`. */
+function appNameSpan(node: ComponentChildren): VNode<{ class?: string }> {
+  const cells = routeRowCells(node, 'App');
+  expect(cells, 'no App row rendered').not.toBeNull();
+  const group = cells![1] as VNode<{ children?: ComponentChildren }>;
+  return renderedChildren(group.props?.children)[1] as VNode<{ class?: string }>;
+}
+
+/** The App row is a value like any other. Its name takes the panel's secondary
+ *  text by inheritance rather than a class of its own. It used to carry
+ *  `--text-primary` at weight 500, which read as the one emphasized value in a
+ *  panel of plain ones. A class here is how that comes back. */
+describe('the App row names its app in ordinary value text', () => {
+  const meta = {
+    codingAgentKind: 'app',
+    codingAgentFolder: 'data/apps/habit-tracker',
+  } as unknown as ThreadMeta;
+  const session: StoredEvent = { type: 'SessionStarted', session_id: '', branch: 'agent/turn-1' };
+  const exchange: Exchange = {
+    userEvent: { type: 'MessageReceived', text: 'go' },
+    userSeq: 1,
+    steps: [{ seq: 2, event: session }],
+  };
+  const events = new Map<number, StoredEvent>([[1, exchange.userEvent], [2, session]]);
+  const render = (): ComponentChildren => renderExecutorSection(exchange, events, meta);
+
+  afterEach(() => {
+    appsList.value = { status: 'not-loaded' };
+  });
+
+  it('gives the name no class of its own', () => {
+    appsList.value = {
+      status: 'loaded',
+      data: [{ id: 'habit-tracker', name: 'Habit Tracker', description: '', icon: '\u{1F9ED}' }],
+    };
+    expect(appNameSpan(render()).props.class).toBeUndefined();
+  });
+
+  it('marks the name as an error when the app list failed to load', () => {
+    appsList.value = { status: 'failed', error: 'boom' };
+    expect(appNameSpan(render()).props.class).toBe('error-text');
+  });
+});

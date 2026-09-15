@@ -750,6 +750,12 @@
 
 .line-numbered {
     padding: 0;
+    /* What the pinned gutter paints over the code panning behind it, so it has
+       to be the surface this view is sitting ON. The default is the content
+       pane's; the preview modal overrides it in components.css, being a
+       --bg-secondary panel. Opaque either way: a translucent value would let
+       the code through. */
+    --code-surface: var(--bg-primary);
 }
 
 .code-line {
@@ -796,6 +802,81 @@
     color: var(--accent);
 }
 
+/* --- What a line too wide for the box does (LineNumberedCode's `wideLines`) --- */
+
+/* Soft wrap, what a file preview opens on. A clipped tail is unreachable, and
+   a reader following a citation into a wide line needs the part it was about.
+   The gutter stays honest for free: it is a SIBLING flex item, so a
+   continuation indents under the content column and takes no number, and
+   `.line-selected` sits on the row, which grows to the wrapped block's height.
+
+   `anywhere` rather than `break-word` because only `anywhere` lowers the flex
+   item's min-content size, which is what its automatic minimum is measured
+   against. With `break-word` one long unbreakable token would still push the
+   row wider than the view. `min-width: 0` says the same thing outright, so a
+   later reader does not have to re-derive it. */
+.line-numbered-wrap .line-content {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+
+/* Pan: the code slides horizontally inside its own scroll container, under a
+   gutter pinned to the left edge the way a code host does it.
+
+   The `<pre>` is sized to its widest row so every row is that wide, which is
+   what keeps a selected row's tint painted all the way across the scroll
+   width. The `100%` floor covers the other direction, a file narrower than the
+   view. Both rows and gutter then need an OPAQUE background, since a sticky
+   cell paints over whatever passes beneath it.
+
+   The third mode, `caller`, carries NO class and so reaches none of this. That
+   is what keeps the opaque surface below off a side-by-side diff column, whose
+   rows carry their own green and red tints on a single class this would
+   outrank. */
+.line-numbered-pan {
+    width: max-content;
+    min-width: 100%;
+}
+
+.line-numbered-pan .code-line {
+    background: var(--code-surface);
+}
+
+/* The opaque twin of `.line-selected`'s translucent tint: the same 15% accent,
+   mixed over the surface instead of over nothing. */
+.line-numbered-pan .line-selected {
+    background: color-mix(in srgb, var(--accent) 15%, var(--code-surface));
+}
+
+/* `inherit` rather than a colour of its own, so the gutter wears whichever of
+   the two backgrounds above its row is wearing and the highlight stays
+   unbroken across it. */
+.line-numbered-pan .line-number {
+    position: sticky;
+    left: 0;
+    background: inherit;
+}
+
+/* A scroll container's own inline padding is INSIDE its scrollport, so panned
+   code slides through it and appears in the strip left of the pinned gutter.
+   This paints that strip with the row's background, so the gutter reads as an
+   edge rather than as a column with code sliding past it.
+
+   `--code-gutter-inset` is the container's own inline padding, declared beside
+   that padding so the two cannot drift (`.file-preview-content` in
+   panels/previews.css, `.repo-file-content` below). A container that declares
+   none falls back to painting nothing, which is the old behaviour. */
+.line-numbered-pan .line-number::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    width: var(--code-gutter-inset, 0px);
+    background: inherit;
+}
+
 /* --- Repo file content --- */
 
 /* Whole-file / file-preview content inset. Matches the rendered diff
@@ -805,7 +886,11 @@
 .repo-file-content {
     overflow: auto;
     height: 100%;
-    padding: 1rem 1.25rem;
+    /* Named so the pinned gutter can paint over it while the code pans; see
+       `.line-numbered-pan .line-number::before`. The padding is written THROUGH
+       the var so there is one source for the value. */
+    --code-gutter-inset: 1.25rem;
+    padding: 1rem var(--code-gutter-inset);
     box-sizing: border-box;
 }
 

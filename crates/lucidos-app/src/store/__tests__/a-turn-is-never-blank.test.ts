@@ -204,7 +204,7 @@ describe('the call ending sweeps whatever the engine wrote no row for', () => {
       type: 'SpokenMessageReceived', session_id: 'sess-1', text: WORDS,
     } as StoredEvent, '2026-09-05T20:58:30Z', 'e-9');
     expect(thread.liveUtterances).toEqual([]);
-    expect(thread.settledUtterances).toBe(1);
+    expect(thread.unclaimedUtterances ?? []).toEqual([]);
   });
 });
 
@@ -226,7 +226,36 @@ describe('loading the history leaves a live bubble alone', () => {
     ]);
 
     expect(thread.liveUtterances?.[0].text).toBe(WORDS);
-    expect(thread.settledUtterances).toBe(0);
+    expect(thread.unclaimedUtterances ?? []).toEqual([]);
+  });
+
+  /** The talker's live row is client state too, and a past call's session end
+   *  would sweep it exactly as it sweeps the caller's. */
+  it('keeps a reply a past call\'s session end would have swept', () => {
+    const { thread } = onACall();
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-09-05T20:58:00Z', text: 'On it' };
+
+    _applyEventRowsForTest(threadMap.value, thread, [
+      { sequence: 100, event_type: 'VoiceSessionEnded', payload: { session_id: 'old', reason: 'hangup', duration_secs: 20 }, created: '2026-09-01T10:00:20Z', event_id: 'h-1' },
+    ]);
+
+    expect(thread.liveReply?.text).toBe('On it');
+  });
+
+  /** A catch-up fetch is how a thread recovers from an SSE gap, so it can carry
+   *  the CURRENT call's own rows. The later SSE copy is deduped by seq, so a
+   *  replay that claimed nothing would leave the bubble beside its twin. */
+  it('claims a standing row when the current call\'s words arrive in a replay', () => {
+    const { thread, live } = onACall();
+    live({});
+    live({ utterance: 'transcribed', heard: WORDS });
+    expect(thread.liveUtterances?.[0].text).toBe(WORDS);
+
+    _applyEventRowsForTest(threadMap.value, thread, [
+      { sequence: 200, event_type: 'SpokenMessageReceived', payload: { session_id: 'sess-1', text: WORDS }, created: '2026-09-05T20:58:31Z', event_id: 'h-9' },
+    ]);
+
+    expect(thread.liveUtterances).toEqual([]);
   });
 });
 
@@ -275,7 +304,7 @@ describe('a caller who carries on speaking', () => {
 
     live({});
     expect(thread.liveUtterances?.map(r => r.text)).toEqual([undefined]);
-    expect(thread.settledUtterances).toBe(0);
+    expect(thread.unclaimedUtterances ?? []).toEqual([]);
   });
 
   /** A `userSeq` is an identity: `exchangeKey` falls back to it, the collapse

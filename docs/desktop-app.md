@@ -643,6 +643,14 @@ is also what keeps it to one instance (`open` against a live app activates it
 rather than launching another; `open -n` would overlap two clients). The
 **"Restart App"** action takes the same path.
 
+**The watcher asks until the client is actually back**, up to ten times. It
+confirms with a `pgrep -f` on the executable rather than trusting `open`'s exit
+status: on 2026-09-15 a user's client never returned from an update, and left no
+trace of why. That probe is anchored at **both** ends, because the service runs
+the same executable and is always up. Retrying cannot produce a second client,
+since `open -a` without `-n` activates a running app. Every refusal and the
+final give-up go to the client log (ADR 0186).
+
 **The install narrates itself, phase by phase.** All of that takes long enough —
 a ~100 MB download, a signature check, a bundle swap, a service restart — that a
 silent `await` reads as a frozen app, which is exactly how it behaved while the

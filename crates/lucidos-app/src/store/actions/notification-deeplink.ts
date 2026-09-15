@@ -1,5 +1,6 @@
 import type { Tap, NavigateUi } from '@lucidos/sdk';
 import type { Notification } from '../types';
+import { hasDangerousScheme } from '../../utils/dangerousUrlScheme';
 
 export type DeepLinkAction =
   /** Forward `to` straight to handleNavigationRequest (the same router the
@@ -98,39 +99,6 @@ export function hasDeepLinkParams(target: DeepLinkTarget): boolean {
   return !!target.notification;
 }
 
-/** Schemes a `navigate` tap may never carry.
- *
- *  `to.url` is reachable by an ATTACKER, which nothing else in this file is:
- *  `parseDeepLinkFromUrl` reads `tap=` straight off the page's own hash or
- *  query, so a crafted link to the user's workspace origin picks the value.
- *  `handleNavigationRequest`'s `url` branch then hands it to `openUrl`
- *  untouched, and from there to `window.open` or the OS opener.
- *
- *  A DENY-list, not an allow-list. `utils/openExternalUrl.ts` documents
- *  `mailto:`, `tel:`, `file:` and `data:` as legitimate targets that must reach
- *  their own handlers, so narrowing to http(s) would break them. */
-const DANGEROUS_URL_SCHEME_RE = /^(javascript|vbscript):/i;
-
-/** Whether `url` reaches the sink as one of the schemes above.
- *
- *  Test what the SINK sees, not what the caller passed. `openUrl` runs the
- *  value through `new URL(...).href` first, and that parser strips every
- *  leading C0 CONTROL as well as whitespace, then drops tab and newline
- *  anywhere. So `javascript:alert(1)` reaches `window.open` as a bare
- *  `javascript:` URL.
- *
- *  JavaScript's `\s` is the wrong set for that: it covers U+0020 and the
- *  usual line breaks, but NOT U+0000 to U+0008 or U+000E to U+001F. Matching
- *  the parser means stripping all of U+0000 to U+0020, which is why the class
- *  below is a range rather than `\s`. `\s` stays beside it for the few
- *  characters above U+0020 it adds, which only widens the guard.
- *
- *  The test is anchored, so stripping cannot manufacture a match from a URL
- *  that merely contains the word. */
-function hasDangerousScheme(url: string): boolean {
-  return DANGEROUS_URL_SCHEME_RE.test(url.replace(/[\u0000-\u0020\s]/g, ''));
-}
-
 /** Validate an unknown value against the `Tap` discriminated union. Returns
  *  the value when the `kind` is recognized; `null` otherwise. The SW message
  *  channel carries the structured object natively (no JSON round-trip), but
@@ -150,8 +118,11 @@ function validateTap(raw: unknown): Tap | null {
       if (!to || typeof to !== 'object') return null;
       const nav = to as Record<string, unknown>;
       if (typeof nav.target !== 'string') return null;
-      // See `DANGEROUS_URL_SCHEME_RE`. Rejecting the whole tap (rather than just
-      // the url) is what the caller already expects from a malformed one:
+      // `to.url` is the one attacker-reachable value in this file:
+      // `parseDeepLinkFromUrl` reads `tap=` off the page's own hash. The sinks
+      // screen it too (`hasDangerousScheme` in `utils/dangerousUrlScheme.ts`),
+      // so this is a first line rather than the only one. Rejecting the whole
+      // tap is what the caller already expects from a malformed one:
       // `resolveDeepLink` demotes `null` to the openable modal default, so the
       // notification still opens and only the scripted navigation is refused.
       if (typeof nav.url === 'string' && hasDangerousScheme(nav.url)) return null;

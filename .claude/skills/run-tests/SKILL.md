@@ -87,12 +87,12 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`10 ignored` in the lib run and `0 ignored` in the doctest run**,
+Expect **`11 ignored` in the lib run and `0 ignored` in the doctest run**,
 and nothing else. Any other ignored test is a real skip and must be
 fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
-no `#[ignore]` at all.) The ten are three different things: **six
-codegen writers**, **three diagnostic printers**, and **one
-live-provider check**.
+no `#[ignore]` at all.) The eleven are three different things: **six
+codegen writers**, **three diagnostic printers**, and **two
+live-provider checks**.
 
 ### The six codegen writers
 
@@ -146,28 +146,33 @@ in a frozen contract fixture and failing the suite on every deliberate
 schema change; that is a policy call for the maintainer, not something
 to decide from inside a test run.
 
-### The one live-provider check
+### The two live-provider checks
 
-`voice::realtime::tests::a_real_session_accepts_the_opening_payload`
-arrived with the voice talker/doer refactor
-(`docs/plans/2026-08-29-a-voice-session-opens-behind-one-seam.md`). It
-opens a real session on the OpenAI realtime API. It needs a credential
-and a network. With no `OPENAI_API_KEY` it self-skips, printing a line
-rather than failing. It is the only test that can tell us the live
-provider still accepts the opening payload.
+Both are named `a_real_session_accepts_the_opening_payload`, one per voice
+seam. `voice::realtime::tests` arrived with the voice talker/doer refactor
+(`docs/plans/2026-08-29-a-voice-session-opens-behind-one-seam.md`) and
+opens a real session on the OpenAI realtime API. `voice::live::tests`
+arrived with the live-model transcriber picker
+(`docs/plans/2026-09-01-voice-transcriber-picker-gains-the-live-model.md`)
+and opens a real session on the live model. Each needs a credential and a
+network. With no `OPENAI_API_KEY` each self-skips, printing a line rather
+than failing. They are the only tests that can tell us the live provider
+still accepts each seam's opening payload.
 
-It satisfies clause (a): the non-ignored sibling tests in the same file
-pin its payload construction and event mapping. Nothing is lost by
-keeping it out of the ordinary suite. Run it deliberately when you touch
-the realtime seam:
+Both satisfy clause (a): the non-ignored sibling tests in the same file
+pin each one's payload construction and event mapping. Nothing is lost by
+keeping them out of the ordinary suite. Run one deliberately when you
+touch its seam:
 
 ```sh
 cargo test -p lucidos-engine --lib voice::realtime -- --ignored --nocapture
+cargo test -p lucidos-engine --lib voice::live -- --ignored --nocapture
 ```
 
 | `#[ignore]` live check | Non-ignored siblings over the same data |
 |---|---|
-| `a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
+| `voice::realtime::…::a_real_session_accepts_the_opening_payload` | `the_instructions_reach_the_opening_payload`, `the_talker_is_opened_with_one_tool_and_it_delegates`, `end_of_turn_is_decided_semantically`, and the rest of `voice/realtime_tests.rs` |
+| `voice::live::…::a_real_session_accepts_the_opening_payload` | `the_opening_frame_names_the_model_and_starts_a_session`, `the_session_delegates_to_us_and_never_to_a_rented_backend`, `the_opening_frame_declares_no_tools`, and the rest of `voice/live_tests.rs` |
 
 **No doctests.** The crate has none, so the doc run reports `0 passed; 0
 failed; 0 ignored`. It once carried a single ```` ```ignore ```` fenced

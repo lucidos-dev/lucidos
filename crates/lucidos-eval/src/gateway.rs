@@ -98,7 +98,7 @@ impl Gateway {
 
     /// Stop the gateway's own engine for `slug`, keeping the registry entry.
     ///
-    /// 202 when it stopped one, and a 400 for a slug the gateway does not know.
+    /// 202 when it stopped one, and a 404 for a slug the gateway does not know.
     /// Both are fine here, so only a transport failure is reported.
     async fn stop_call(&self, slug: &str) -> Fallible<()> {
         self.request(

@@ -216,7 +216,93 @@ async fn apply_unplanned_change_is_blocked() {
     .fetch_one(&pool)
     .await
     .expect("count query failed");
-    assert!(n >= 1, "expected a ChangeApplyFailed event, found {n}");
+    assert_eq!(n, 1, "a refused apply announces itself once, found {n}");
+
+    // Cleanup
+    let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM changes WHERE id = $1")
+        .bind(change_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await;
+    pool.close().await;
+}
+
+/// One refused apply draws ONE "Change failed" card, on the Apply Now route.
+///
+/// Apply Now with no live session applies the thread's pending changes through
+/// `apply_change`, which announces its own refusal. It then emitted a second
+/// `ChangeApplyFailed` of its own, so the thread showed the same failure twice.
+/// The plan floor is the refusal used here because it needs no git state.
+#[tokio::test]
+async fn apply_now_announces_a_refused_apply_once() {
+    let client = user_client().await;
+    let ws = workspace_path();
+    let repo_root = ws.to_str().unwrap();
+
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+
+    let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
+    let branch = format!("e2e-test/apply-now-once-{}", suffix);
+    let thread_id = Uuid::new_v4();
+    let change_id = Uuid::new_v4();
+
+    seed_cc_thread_summary(&pool, thread_id, "idle").await;
+
+    let seed_url = format!("{}/api/v1/internal/seed-change-for-test", base_url());
+    let seed = client
+        .post(&seed_url)
+        .json(&json!({
+            "change_id": change_id.to_string(),
+            "thread_id": thread_id.to_string(),
+            "branch_name": branch,
+            "repo_root": repo_root,
+            "description": "E2E apply-now single announcement",
+            "files": ["e2e-apply-now-once.txt"],
+            "requires_restart": false,
+            "hardened": true,
+            "planned": false,
+        }))
+        .send()
+        .await
+        .expect("seed request failed");
+    assert!(seed.status().is_success(), "seed failed: {}", seed.status());
+
+    // No live session for this thread, so this takes the fast path: apply the
+    // pending change directly. It awaits the apply, so both emits of the bug
+    // had landed by the time the response came back.
+    let url = format!(
+        "{}/api/v1/claude-code/apply-now?thread_id={}",
+        base_url(),
+        thread_id
+    );
+    let resp = client.post(&url).send().await.expect("apply-now failed");
+    assert!(
+        resp.status().is_success(),
+        "apply-now returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1::text AND event_type = 'ChangeApplyFailed'",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count query failed");
+    assert_eq!(
+        n, 1,
+        "Apply Now must announce a refused apply once, found {n} ChangeApplyFailed events"
+    );
 
     // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")

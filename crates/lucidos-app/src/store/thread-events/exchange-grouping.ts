@@ -19,49 +19,116 @@ import type { ThreadAggregate, ThreadState } from './thread-meta';
  *  frame. A synthetic seq never enters the cache. The fast path appends to the
  *  cached fold; the fallback folds an augmented COPY of the events map. */
 export function computeExchanges(thread: ThreadState): Exchange[] {
-  return withLiveUtterance(thread, foldedExchanges(thread));
+  return withLiveCallRows(thread, foldedExchanges(thread));
 }
 
 /**
- * Draw the caller's utterances under everything, from the first word to the
- * moment the engine's own row for each of them lands.
+ * Draw the call under everything, both sides of it, as it happens.
  *
  * Appended HERE, past every path through the fold, and that is the whole of its
  * safety. The fold never sees them. So one cannot be re-anchored, cannot become
  * a wall a re-anchor stops at, and cannot take a step off a running turn.
  *
- * A row carries `text` from the instant the provider ends the turn. The words
- * replace the pulse in the same frame the speaking stops, and the engine's own
- * row lands later and retires this one (ADR 0174).
+ * A caller's row carries `partial` while they speak and `text` from the instant
+ * the provider ends the turn. The talker's row carries what it has said so far.
+ * Each is retired by the engine's own row for it (ADR 0174).
+ *
+ * **Ordered by `created` across both.** One clock stamps them, and a caller
+ * cutting in mid-reply must read BELOW the reply they cut into. Sorting is what
+ * keeps an answer from sitting above the question.
  *
  * They take the very top of the synthetic seq range, above every pending typed
- * message, which is right: the caller is speaking now, and those were sent
+ * message, which is right: the call is happening now, and those were sent
  * before. `syntheticSeqBase` is what keeps the two blocks from overlapping.
  */
-function withLiveUtterance(thread: ThreadState, exchanges: Exchange[]): Exchange[] {
-  const live = thread.liveUtterances;
-  if (!live || live.length === 0) return exchanges;
-  const rows = live.map((row, i) => {
-    const userEvent = {
-      type: 'MessageReceived' as const,
-      text: row.text ?? '',
-      _eventId: row.eventId,
-      _displayCreated: row.created,
-      _liveUtterance: true as const,
-      channel: thread.meta.channel,
-    } as StoredEvent;
-    return {
-      userEvent,
-      userSeq: Number.MAX_SAFE_INTEGER - (live.length - 1 - i),
-      steps: [],
-    };
-  });
+function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[] {
+  const live = liveCallEvents(thread);
+  if (live.length === 0) return exchanges;
+  const rows = live.map((userEvent, i) => ({
+    userEvent,
+    userSeq: Number.MAX_SAFE_INTEGER - (live.length - 1 - i),
+    steps: [],
+  }));
   return [...exchanges, ...rows];
 }
 
-/** True for the synthetic row above, and for nothing the engine ever wrote. */
-export function isLiveUtteranceRow(event: { _liveUtterance?: true }): boolean {
+/** The call's live rows as synthetic events, oldest first.
+ *
+ *  Each wears the type its persisted counterpart wears, so every reader
+ *  downstream already knows how to draw it and what it means. */
+function liveCallEvents(thread: ThreadState): StoredEvent[] {
+  const rows: { created: string; event: StoredEvent }[] = [];
+  for (const row of thread.liveUtterances ?? []) {
+    // The partial rides `text`, so every reader that draws a user bubble draws
+    // one here too. `_livePartial` is what stops them reading it as finished:
+    // the provider has not ended the turn, so nothing is in flight behind it.
+    const provisional = row.text === undefined && row.partial !== undefined;
+    rows.push({
+      created: row.created,
+      event: {
+        type: 'MessageReceived' as const,
+        text: row.text ?? row.partial ?? '',
+        _eventId: row.eventId,
+        _displayCreated: row.created,
+        _liveUtterance: true as const,
+        ...(provisional ? { _livePartial: true as const } : {}),
+        channel: thread.meta.channel,
+      } as StoredEvent,
+    });
+  }
+  const reply = thread.liveReply;
+  if (reply) {
+    rows.push({
+      created: reply.created,
+      event: {
+        type: 'SpokenReplyGenerated' as const,
+        text: reply.text,
+        interrupted: false,
+        // No frame carries the session id, so the client never learns one.
+        // Empty rather than invented, and nothing reads it off this type.
+        session_id: '',
+        _eventId: reply.eventId,
+        _displayCreated: reply.created,
+        _liveReply: true as const,
+      } as StoredEvent,
+    });
+  }
+  // Stable within one timestamp, which keeps a caller's own two rows in the
+  // order they were drawn when a reply lands in the same millisecond.
+  return rows
+    .map((row, i) => ({ ...row, i }))
+    .sort((a, b) => (a.created === b.created ? a.i - b.i : a.created < b.created ? -1 : 1))
+    .map(row => row.event);
+}
+
+/** How many live rows the call is drawing, both sides counted. */
+function liveCallRowCount(thread: ThreadState): number {
+  return (thread.liveUtterances?.length ?? 0) + (thread.liveReply ? 1 : 0);
+}
+
+/** The marks a synthetic live row wears. A persisted event carries none. */
+type LiveRowMarks = { _liveUtterance?: true; _liveReply?: true; _livePartial?: true };
+
+/** True for the caller's synthetic row, and for nothing the engine ever wrote. */
+export function isLiveUtteranceRow(event: LiveRowMarks): boolean {
   return event._liveUtterance === true;
+}
+
+/** True for the talker's synthetic row, same promise. */
+export function isLiveReplyRow(event: LiveRowMarks): boolean {
+  return event._liveReply === true;
+}
+
+/** True while the caller's row shows a PARTIAL rather than their finished
+ *  words. They are still speaking, so nothing is in flight behind it. */
+export function isLivePartialRow(event: LiveRowMarks): boolean {
+  return event._livePartial === true;
+}
+
+/** True for either side's live row. What they share is that no event carries
+ *  them, so nothing downstream may treat one as a persisted boundary. */
+export function isLiveCallRow(event: LiveRowMarks): boolean {
+  return isLiveUtteranceRow(event) || isLiveReplyRow(event);
 }
 
 /** Where the PENDING typed messages' synthetic seqs start.
@@ -73,7 +140,7 @@ export function isLiveUtteranceRow(event: { _liveUtterance?: true }): boolean {
  *  with two utterances still un-landed. The caller's rows take the top, so the
  *  typed ones start below them. */
 function syntheticSeqBase(thread: ThreadState): number {
-  return Number.MAX_SAFE_INTEGER - (thread.liveUtterances?.length ?? 0);
+  return Number.MAX_SAFE_INTEGER - liveCallRowCount(thread);
 }
 
 function foldedExchanges(thread: ThreadState): Exchange[] {
@@ -433,6 +500,82 @@ function requestEventIdOf(event: { type: string }): string | undefined {
 export function isCallerUtterance(event: { type: string; voice_session_id?: string }): boolean {
   if (event.type === 'SpokenMessageReceived') return true;
   return event.type === 'MessageReceived' && !!event.voice_session_id;
+}
+
+/**
+ * How many unclaimed utterances are worth keeping.
+ *
+ * A row the engine wrote but the client never drew leaves its words here for
+ * good. One that has not found a live row within this many later ones never
+ * will. Holding it only widens the window where a caller repeating a sentence
+ * has the wrong bubble retired.
+ */
+const UNCLAIMED_UTTERANCE_MEMORY = 8;
+
+/** The words a live row or a persisted event carries, for the match below. */
+function claimKey(text: string | undefined): string | undefined {
+  const trimmed = text?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
+ * Retire the live rows whose words the engine has now written down.
+ *
+ * **A row is claimed by the WORDS it carries, matched against the words the
+ * engine wrote.** Never by a count, of either shape. The plan
+ * `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md` traces
+ * the two orderings a count gets wrong, and both are reachable today.
+ *
+ * One turn of the browser's gate is not one transcription item, so the engine
+ * can write TWO rows against one live row. And it writes NO row for words the
+ * caller spent answering a question card. Words pair each row with its own
+ * sentence, so neither case can mispair.
+ *
+ * A row with no final words matches nothing, which is the barge-in guarantee
+ * by construction. A partial is not words either.
+ *
+ * **Trimmed on both sides, because one leg of the chain trims**, which is
+ * `doer.rs::wake`. Called from two places, because a row and the words that
+ * claim it arrive on two transports and `call.rs` emits the row FIRST.
+ */
+export function claimUtteranceRows(thread: ThreadState): void {
+  const owed = thread.unclaimedUtterances;
+  if (!owed || owed.length === 0) return;
+  // Runs with NO rows too, so the trim reaches a call whose bubbles the client
+  // never drew. Returning early there would grow the list for the whole call.
+  const rows = thread.liveUtterances ?? [];
+  const kept = [...rows];
+  const unmatched: string[] = [];
+  for (const words of owed) {
+    const at = kept.findIndex(row => claimKey(row.text) === words);
+    if (at === -1) unmatched.push(words);
+    else kept.splice(at, 1);
+  }
+  thread.unclaimedUtterances = unmatched.slice(-UNCLAIMED_UTTERANCE_MEMORY);
+  if (kept.length !== rows.length) thread.liveUtterances = kept;
+}
+
+/** Add what the engine just wrote to the unclaimed words, then claim. */
+export function recordCallerUtterance(thread: ThreadState, text: string): void {
+  const words = claimKey(text);
+  // A wordless row claims nothing and can be owed nothing: `call.rs` refuses
+  // to hold a transcript with no words, so one here writes no live row either.
+  if (!words) return;
+  thread.unclaimedUtterances = [...(thread.unclaimedUtterances ?? []), words];
+  claimUtteranceRows(thread);
+}
+
+/** Claim a standing row with these words, and remember nothing if none match.
+ *
+ *  For a HISTORY replay, where the words may belong to a call that ended long
+ *  ago. Remembering one would let an old sentence retire a bubble somebody is
+ *  speaking now, which is why the replay restores the unclaimed list. */
+export function offerCallerUtterance(thread: ThreadState, text: string): void {
+  const words = claimKey(text);
+  const rows = thread.liveUtterances;
+  if (!words || !rows || rows.length === 0) return;
+  const at = rows.findIndex(row => claimKey(row.text) === words);
+  if (at !== -1) thread.liveUtterances = rows.filter((_, i) => i !== at);
 }
 
 /** True when this exchange draws a stretch of a call and holds no turn.
@@ -1583,33 +1726,31 @@ export function handleEvent(
     // across the talker's decision, so `user_turn_ended` can precede this row
     // by a second or more. Dropping it there would reopen the silence.
     //
-    // Matched by COUNT rather than taken on sight. The engine holds one
-    // utterance at a time. So a caller who barges in can have a SECOND row up
-    // before the first one's words arrive. Clearing whatever is there would
-    // erase the row for the sentence they are still saying.
-    //
-    // Words land in the order they were said, so the tally is enough and no
-    // id is needed. An utterance the gate never heard still counts, which
-    // only ever makes the next clear more eager.
+    // Taken by the WORDS a row carries, never by its count. See
+    // `claimUtteranceRows`, which is the whole of the rule.
     if (isCallerUtterance(event)) {
-      const settled = (thread.settledUtterances ?? 0) + 1;
-      thread.settledUtterances = settled;
-      const rows = thread.liveUtterances;
-      if (rows && rows.length > 0) {
-        thread.liveUtterances = rows.filter(r => r.count > settled);
-      }
+      recordCallerUtterance(thread, (event as { text?: string }).text ?? '');
     }
-    // The call is over, so nobody is owed a caller bubble any more. This is
-    // the backstop for the one utterance the engine writes no row for: words
-    // the caller spent ANSWERING a question card, which `call.rs` drops
-    // because the answer's own row already carries them. Left standing, such
-    // a row shimmers on an idle thread for the life of the page.
+    // The talker's row is a slot, so its own row landing settles it outright.
+    //
+    // Words cannot pair these two: the client concatenates the reply's deltas
+    // and `done_transcript` joins the response's content parts with a space,
+    // so the same reply reaches the two sides differently. The residue is
+    // narrow and bounded by the sweep below, and the plan's non-goals name it.
+    if (event.type === 'SpokenReplyGenerated') thread.liveReply = undefined;
+    // The call is over, so nobody is owed a live row any more. This is the
+    // backstop for the one utterance the engine writes no row for: words the
+    // caller spent ANSWERING a question card, which `call.rs` drops because
+    // the answer's own row already carries them. Left standing, such a row
+    // shimmers on an idle thread for the life of the page.
     //
     // Safe because `call.rs` flushes whatever it still holds BEFORE it emits
     // this, on one bus and in order. So every row the engine did write has
-    // already been retired above.
-    if (event.type === 'VoiceSessionEnded' && thread.liveUtterances?.length) {
-      thread.liveUtterances = [];
+    // already been claimed above.
+    if (event.type === 'VoiceSessionEnded') {
+      if (thread.liveUtterances?.length) thread.liveUtterances = [];
+      thread.liveReply = undefined;
+      thread.unclaimedUtterances = [];
     }
     // A real MessageReceived from the backend removes the matching optimistic
     // pending message by event_id.

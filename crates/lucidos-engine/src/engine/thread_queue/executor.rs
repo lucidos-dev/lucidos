@@ -503,8 +503,7 @@ impl LucidosEngine {
                     Ok(res) => {
                         if res.proposed_change {
                             if res.auto_apply {
-                                self.auto_apply_proposed_change(res.request_id, thread_id, None)
-                                    .await;
+                                self.auto_apply_proposed_change(res.request_id, None).await;
                             }
                             self.broadcast_changes_updated().await;
                         }

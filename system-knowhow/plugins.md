@@ -236,8 +236,8 @@ unaffected. libgit2 asks for a credential only when the remote demands one.
 
 **A token comes from Settings, Credentials, and nowhere else.** No environment
 variable holds one. Before the clone starts, the engine looks up the credential
-whose **Base URL** scopes the clone URL, and hands that one credential to the
-clone.
+one of whose **Base URLs** scopes the clone URL, and hands that one credential
+to the clone.
 
 For each round libgit2 says which credential kinds the remote accepts, and the
 helper offers only those, in this order:
@@ -270,13 +270,19 @@ Settings, Credentials, **Add**. Three fields decide the clone:
 | Field | Value |
 |---|---|
 | Service Name | Any label you like. Nothing matches on it. |
-| Base URL | `https://github.com` for github.com. For a GitHub Enterprise install, its own host, `https://github.example.io`. |
+| Base URLs | `https://github.com` for github.com. For a GitHub Enterprise install, its own host, `https://github.example.io`. |
 | Auth Type | **Bearer Token**, with a token that can read the repo. |
 
-**Base URL is the whole scoping rule.** It must be the host you clone from, so
+**Base URLs are the whole scoping rule.** One must be the host you clone from, so
 `https://github.com`, **not** `https://api.github.com`. Those are different
-hosts, and a credential registered for the API host never matches a clone. A
-credential for the REST API and a credential for the clone are two rows.
+hosts, and a credential scoped only to the API host never matches a clone.
+
+**One credential names them both.** Base URLs is a set, one row per hostname, so
+the same token serves the REST API and the clone from a single credential.
+Nothing is inferred from a hostname's spelling, so name each host in full. What
+you do not have to do is store the token twice. Press **Add another host** in the
+credential form. Or ask Lucidos for the credential again, naming the second host,
+and it reopens the same row for you to save.
 
 A Base URL may also carry a path, `https://github.com/example-org`, which scopes
 it to that owner. When several credentials match one URL the longest Base URL

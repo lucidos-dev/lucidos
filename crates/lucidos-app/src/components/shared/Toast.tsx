@@ -264,6 +264,17 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
 function renderToast(t: ToastItem, entryDurationMs: number) {
   const autoTarget = toastAutofocusTarget(t);
   const { heading, sections } = parseToastMessage(t.message);
+  // A linkified URL in the message is its own destination, so a tap on it must
+  // not also fire the toast's action. The anchor cannot swallow the click
+  // itself: `onGlobalClick` is what opens it, and that listener sits on the
+  // document (see `linkifyText`). So the ancestor stands down instead.
+  const bodyAction = t.onClick;
+  const onBodyClick = bodyAction
+    ? (e: MouseEvent) => {
+        if ((e.target as HTMLElement | null)?.closest('a[href]')) return;
+        bodyAction();
+      }
+    : undefined;
   return (
     <div key={t.id} class={`toast toast-${t.type}`} style={{ animationDuration: `${entryDurationMs}ms` }} data-toast-id={t.id}>
       {/* The icon is the body's SIBLING, positioned over the gutter the body
@@ -275,7 +286,7 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
       }
       <div
         class={`toast-body${t.onClick ? ' toast-clickable' : ''}`}
-        onClick={t.onClick}
+        onClick={onBodyClick}
       >
         {/* `tabIndex={-1}` on both scroll boxes, so Chrome leaves them out of
             the Tab order. It promotes an overflowing scroller with no focusable

@@ -5,8 +5,9 @@ import { repoFileUrl } from '../../api/client';
 
 // `RepoFileContent` is a hookless dispatcher, so it can be called as a plain
 // function and its returned vnode inspected (same approach as
-// StoreTabSkeleton.test.tsx). Only the media branch carries an `ext` prop, so
-// that is what tells the two leaves apart without depending on function names.
+// StoreTabSkeleton.test.tsx). The media leaf takes a `kind` prop and the text
+// leaf a `body` one, so the props tell them apart without depending on function
+// names.
 function dispatch(props: { repoId: string; path: string; changeId?: string; gitRef: string | null }) {
   const node = RepoFileContent(props) as VNode<Record<string, unknown>>;
   return node.props;
@@ -23,7 +24,8 @@ describe('RepoFileContent takes its git ref from the caller', () => {
   it('forwards a null ref (the clone HEAD) to the text leaf', () => {
     const props = dispatch({ repoId: REPO, path: 'src/main.rs', gitRef: null });
     expect(props.gitRef).toBeNull();
-    expect(props.ext).toBeUndefined(); // text branch
+    expect(props.body).toBe('source'); // text branch
+    expect(props.kind).toBeUndefined();
   });
 
   it('forwards a branch ref to the text leaf', () => {
@@ -33,7 +35,7 @@ describe('RepoFileContent takes its git ref from the caller', () => {
 
   it('forwards the ref to the media leaf too', () => {
     const props = dispatch({ repoId: REPO, path: 'docs/diagram.png', gitRef: null });
-    expect(props.ext).toBe('png'); // media branch
+    expect(props.kind).toBe('image'); // media branch
     expect(props.gitRef).toBeNull();
   });
 

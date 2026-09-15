@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, filePreviewWrap, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
+import { wrapToggleAvailable } from '../../store/previewWrap';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
 import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch, popOutApp } from '../../store/actions/apps';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
-import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon } from '../shared/icons';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon, WrapTextIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
@@ -251,6 +252,21 @@ export function ContentHeaderActions({ layout }: Props) {
           label: isSource ? 'Show rendered' : 'Show source',
           icon: () => (isSource ? <EyeIcon /> : <CodeIcon />),
           onClick: () => { filePreviewSource.value = !isSource; },
+        });
+      }
+      // Only over the line-numbered source view, the one body wrapping acts on
+      // (`wrapToggleAvailable`). The control STAYS while wrapping is on, and
+      // reads as pressed: it is how the reader turns it back off, and the
+      // pinned-gutter pan is the other half of the same choice.
+      if (wrapToggleAvailable.value) {
+        const wrapOn = filePreviewWrap.value;
+        addAction({
+          key: 'wrap-toggle',
+          label: wrapOn ? 'Stop wrapping long lines' : 'Wrap long lines',
+          icon: () => <WrapTextIcon />,
+          onClick: () => { filePreviewWrap.value = !wrapOn; },
+          active: wrapOn,
+          extraClass: 'file-preview-wrap-toggle',
         });
       }
       if (editable) {

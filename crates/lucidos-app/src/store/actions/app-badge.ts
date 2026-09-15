@@ -70,7 +70,7 @@ function badgesEveryWorkspace(): boolean {
  *  Our own row is dropped rather than read back. For a second or two after an
  *  optimistic mark-read it still reports the pre-read count. Using it would let
  *  the icon disagree with the bell about the workspace on screen. */
-export const otherWorkspacesUnread = computed(() =>
+const otherWorkspacesUnread = computed(() =>
   peerWorkspaces.value
     .filter((w) => w.id !== WORKSPACE_ID)
     .reduce((sum, w) => sum + (w.unread_count ?? 0), 0),

@@ -637,6 +637,10 @@ async fn restart(
 /// Stop a workspace's engine but keep its registry entry (it stays listed in the
 /// picker as stopped). The dev `stop.sh` calls this so the shared gateway forgets
 /// the stack and its supervisor stops respawning the engine.
+///
+/// 202 for a workspace this gateway knows, running or not. 404 for one it does
+/// not, which is how `stop.sh` tells the owning gateway from a peer on another
+/// port. See [`GatewayState::stop_workspace`].
 async fn stop(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
@@ -645,8 +649,7 @@ async fn stop(
     reject_invalid_id(&id)?;
     state
         .stop_workspace(&id, requesting_device(device.as_deref()))
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .await?;
     Ok(StatusCode::ACCEPTED)
 }
 

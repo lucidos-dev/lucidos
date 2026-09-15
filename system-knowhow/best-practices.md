@@ -155,6 +155,8 @@ Setup is **partly interactive** — you can set the variables, but the user must
 
 **Want a credential's secret under a specific env var name?** A credential can be given a custom env var name, so its secret injects as e.g. `GITHUB_TOKEN` **in addition to** the default `CRED_<NAME>` (an extra alias — the `CRED_` form still works) — useful when a CLI/SDK expects an exact variable name. Set it two ways: in the credential editor (Settings → credential editor), or up front when the agent requests the credential — `request_credential` takes an optional `env_var_name` arg that pre-fills the modal's "Env var name" field (the user can still edit or clear it before saving). The name must match `[A-Z_][A-Z0-9_]*` and can't be an engine-owned name (`CRED_*`, `OAUTH_*`, `PG*`, `PATH`, `LUCIDOS_*`). Single-value auth types only — it's ignored for `password` credentials (which split into `_USERNAME`/`_PASSWORD`).
 
+**A credential names every host it may be sent to.** Its Base URLs field is a set, one row per hostname, and the secret is refused at any host outside it. So a provider whose API, clone and download traffic live on different hostnames takes **one** credential naming all of them, never one row per host. Nothing is inferred from a hostname's spelling: name each in full. `request_credential` takes the whole set in `base_urls`. Ask again for a host an existing credential does not cover and it reopens that credential, so the user never types the same secret twice.
+
 > Note: the legacy `data/.env` file mechanism was retired in favour of this store. Any existing `data/.env` is migrated into the environment-variables store on the next engine startup and the file is removed.
 
 ## Key Rules

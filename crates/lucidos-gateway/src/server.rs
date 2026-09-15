@@ -2029,11 +2029,23 @@ impl GatewayState {
     /// Stop, and is `None` for every other caller. Same contract as
     /// [`Self::restart_workspace`]: a named device makes the engine's in-flight
     /// threads settle as a deliberate pause rather than a crash.
+    ///
+    /// A slug this gateway does not know is a 404, not a silent success.
+    /// Several gateways run on one machine, each owning its own workspaces, so
+    /// the answer is how a caller learns it reached the wrong one. The registry
+    /// is resynced from disk first, exactly as [`Self::restart_workspace`] does
+    /// it: the dev launcher seeds that file directly, so the refusal must be
+    /// about the file rather than about stale memory. Stopping a KNOWN workspace
+    /// that is not running stays a 202, which keeps the call idempotent.
     pub async fn stop_workspace(
         &self,
         id: &str,
         requested_by: Option<&str>,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), ApiError> {
+        self.sync_registry_from_disk();
+        if !self.inner.registry.lock().unwrap().contains(id) {
+            return Err(ApiError::not_found(format!("workspace '{id}' not found")));
+        }
         let removed = self.inner.stacks.lock().await.remove(id);
         if let Some(stack) = removed {
             let mut s = stack.lock().await;
@@ -5809,6 +5821,58 @@ mod tests {
         let status = one_status(&state).await;
         assert_eq!(status.health, Health::Unhealthy);
         assert_eq!(status.last_error.as_deref(), Some("not started"));
+    }
+
+    /// POST the stop endpoint for `id`, answering with its status alone.
+    async fn stop_call(state: &GatewayState, id: &str) -> StatusCode {
+        use tower::ServiceExt as _;
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri(format!("/workspaces/{id}/stop"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        crate::control::router()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// The reported defect. Both gateways on the machine answered 202 to a stop
+    /// for a slug that cannot exist. So `stop.sh` posting to the wrong port
+    /// looked exactly like posting to the right one, and only its SIGUSR1
+    /// fallback ran. The status is the whole signal a shell caller gets.
+    #[tokio::test]
+    async fn a_stop_for_a_slug_this_gateway_does_not_know_is_a_404() {
+        let (state, _root) = adopting_state();
+        for id in ["no-such-workspace", "packaged", "myws"] {
+            assert_eq!(
+                stop_call(&state, id).await,
+                StatusCode::NOT_FOUND,
+                "'{id}' is not in this gateway's registry"
+            );
+        }
+    }
+
+    /// The other half. A workspace this gateway owns is still a 202, running or
+    /// not, so the call stays idempotent. No caller has to know the difference.
+    #[tokio::test]
+    async fn a_stop_for_a_registered_workspace_is_still_accepted() {
+        let (state, root) = adopting_state();
+        let arm = a_directory(root.path(), "eval-lean-1");
+        adopted(&state, json!({ "dir": arm })).await;
+
+        assert_eq!(
+            stop_call(&state, "eval-lean-1").await,
+            StatusCode::ACCEPTED,
+            "registered but not running: nothing to stop is not an error"
+        );
+        assert_eq!(
+            stop_call(&state, "eval-lean-1").await,
+            StatusCode::ACCEPTED,
+            "and stopping it twice is not one either"
+        );
     }
 
     /// A Stop must stick. The engine answers for the whole of its graceful

@@ -349,13 +349,33 @@ export type ThreadState = {
    *  same thing, and requiring it would have every hand-built fixture declare
    *  "nobody is speaking". */
   liveUtterances?: LiveUtterance[];
-  /** How many of this call's utterances have reached the transcript as real
-   *  words.
+  /** The WORDS of rows the engine has written that no live row has claimed
+   *  yet, oldest first and trimmed.
    *
-   *  It is what stops a late one erasing a newer row. Compared against each
-   *  row's `count` in `handleEvent`, and reset when a call draws its first
-   *  row. Optional for the same reason as the field above. */
-  settledUtterances?: number;
+   *  Words rather than a count, and that is the whole of the rule. A count
+   *  pairs a landing row with whichever live row is next in line, and the two
+   *  sides disagree about what next is. The browser's gate and the provider's
+   *  turn detection cut the same audio differently. `call.rs` also writes no
+   *  row at all for words spent answering a question card. One mispairing then
+   *  stands for the rest of the call.
+   *
+   *  `claimUtteranceRows` is the rule, and
+   *  `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`
+   *  traces the orderings it closes.
+   *
+   *  Reset when a call draws its first row. Optional for the same reason as
+   *  the field above. */
+  unclaimedUtterances?: string[];
+  /** The reply being spoken, drawn from the first word to the engine's own row
+   *  for it.
+   *
+   *  A SLOT where the caller's is a list, and the asymmetry is the engine's:
+   *  `call.rs` holds the floor to one reply at a time, so a second live reply
+   *  is a state that cannot exist. A list would model it anyway.
+   *
+   *  Retired by the persisted `SpokenReplyGenerated`, with `VoiceSessionEnded`
+   *  as the backstop. Optional for the same reason as the fields above. */
+  liveReply?: LiveReply;
 };
 
 /** A caller's utterance the transcript is drawing before the engine's own row
@@ -368,12 +388,34 @@ export type LiveUtterance = {
   count: number;
   /** When the row was drawn, for the timestamp its bubble header shows. */
   created: string;
-  /** What the caller said, once the provider has ended the turn.
+  /** What the caller said, once the provider has ENDED the turn.
    *
-   *  Absent while they are still speaking, and the row then draws a pulse.
-   *  Present from the instant the speaking stops, which is the whole point:
-   *  the swap from bars to words costs no frame and no round trip. */
+   *  The final words, and the only thing a landing row may claim. Absent until
+   *  the speaking stops, which is the whole point: the swap from bars to words
+   *  costs no frame and no round trip. */
   text?: string;
+  /** What the provider has heard SO FAR, while they are still speaking.
+   *
+   *  Drawn in the bubble when `text` is absent, so the row reads as words
+   *  rather than as bars from the first one. Revised in place as the provider
+   *  corrects itself, and dropped the moment `text` arrives.
+   *
+   *  Claims nothing, ever. A partial is the sentence being said now, and a row
+   *  the engine writes is for one already finished. Letting it count is how a
+   *  bubble disappears mid-sentence. */
+  partial?: string;
+};
+
+/** The reply the transcript is drawing while the talker says it.
+ *
+ *  No count: one reply at a time, so there is nothing to tell apart. */
+export type LiveReply = {
+  eventId: string;
+  /** When the row was drawn, for the timestamp its header shows, and for the
+   *  order it reads in against the caller's own rows. */
+  created: string;
+  /** What has been said so far, built from the deltas as they arrive. */
+  text: string;
 };
 
 /** Build a fresh `ThreadState` for optimistic / SSE-bootstrapped threads.

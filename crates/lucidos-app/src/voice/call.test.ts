@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SPEECH_GATE_DEFAULTS } from './speechGate';
-import { type CallRunner, createCallRunner } from './call';
+import { PREROLL_FRAMES_MAX, type CallRunner, createCallRunner } from './call';
 import { LANDING_BOUND_MS, WORDS_BOUND_MS, type CallState } from './callState';
 import { CAPTURE_FRAME_SAMPLES, floatToPcm16 } from './pcm';
 import type { AudioDevice, CallPorts, SocketHandlers } from './ports';
@@ -678,5 +678,107 @@ describe('the frames a call sends', () => {
     h.speak();
     h.runner.press(THREAD);
     expect(new Set(h.socket().controls())).toEqual(new Set(['barge_in', 'hang_up']));
+  });
+});
+
+/**
+ * The caller starts talking before the socket is up.
+ *
+ * The microphone opens ahead of the dial, and the engine sends
+ * `session_started` only once the PROVIDER session is up. Every frame captured
+ * in that window used to be dropped, so their opening words were never
+ * transcribed and no bubble was drawn for them.
+ */
+describe('audio captured before the handshake', () => {
+  /** Pressed, microphone open, socket dialled, handshake not yet answered. */
+  async function connecting(): Promise<Harness> {
+    const h = harness();
+    h.runner.press(THREAD);
+    await Promise.resolve();
+    await Promise.resolve();
+    return h;
+  }
+
+  it('raises the bubble without waiting for the session', async () => {
+    const h = await connecting();
+    h.speak();
+    expect(h.last().phase).toBe('connecting');
+    expect(h.last().utterance).toBe('live');
+  });
+
+  it('is held rather than sent, then flushed when the session opens', async () => {
+    const h = await connecting();
+    h.speak();
+    expect(h.socket().audio).toHaveLength(0);
+
+    h.socket().handlers.onOpen();
+    h.socket().say(STARTED);
+    expect(h.socket().audio).toHaveLength(SPEECH_GATE_DEFAULTS.framesToOpen);
+  });
+
+  /** Reordering would put the end of a sentence before its start. */
+  it('goes up in the order it was spoken, ahead of what follows', async () => {
+    const h = await connecting();
+    const loud = SPEECH_GATE_DEFAULTS.threshold * 2;
+    h.capture(loud, 1);
+    h.capture(loud / 2, 1);
+    h.socket().handlers.onOpen();
+    h.socket().say(STARTED);
+    h.capture(loud / 4, 1);
+
+    const sent = h.socket().audio.map(pcm => new DataView(pcm).getInt16(0, true));
+    expect(sent).toEqual([...sent].sort((a, b) => b - a));
+    expect(sent).toHaveLength(3);
+  });
+
+  /** A dial that never lands must not grow for the life of the page. */
+  it('drops the oldest frames past its bound', async () => {
+    const h = await connecting();
+    h.capture(SPEECH_GATE_DEFAULTS.threshold / 2, PREROLL_FRAMES_MAX + 40);
+    h.socket().handlers.onOpen();
+    h.socket().say(STARTED);
+    expect(h.socket().audio.length).toBe(PREROLL_FRAMES_MAX);
+    expect(h.socket().audio.length).toBeGreaterThan(0);
+  });
+
+  /** Both bounds wait on the PROVIDER, and a connecting call has none. Running
+   *  the clock there withdraws the bubble of somebody who spoke into a slow
+   *  connect, before their held audio has even been sent. */
+  it('runs no withdrawal clock while the call is still connecting', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = await connecting();
+      h.speak();
+      h.hush();
+      expect(h.last().utterance).toBe('landing');
+
+      vi.advanceTimersByTime(LANDING_BOUND_MS * 3);
+      expect(h.last().utterance).toBe('landing');
+
+      // The clock arms once there is a provider to wait on.
+      h.socket().handlers.onOpen();
+      h.socket().say(STARTED);
+      vi.advanceTimersByTime(LANDING_BOUND_MS);
+      expect(h.last().utterance).toBe('none');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is dropped outright when the call is torn down', async () => {
+    const h = await connecting();
+    h.capture(SPEECH_GATE_DEFAULTS.threshold / 2, 5);
+    h.socket().handlers.onClose();
+    await h.settleProbe();
+
+    const second = await (async () => {
+      h.runner.press(THREAD);
+      await Promise.resolve();
+      await Promise.resolve();
+      return h.socket();
+    })();
+    second.handlers.onOpen();
+    second.say(STARTED);
+    expect(second.audio).toHaveLength(0);
   });
 });

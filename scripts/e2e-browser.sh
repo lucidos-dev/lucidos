@@ -25,6 +25,7 @@
 # Environment:
 #   LUCIDOS_E2E_WEBKIT_CHUNK    specs per fresh-browser chunk (default 3)
 #   LUCIDOS_E2E_WEBKIT_CHUNKS   run only nav chunks <first>-<last> (or <first>-)
+#   LUCIDOS_E2E_WEBKIT_PHASE    run one phase only: nav, cc, or both (default both)
 #
 # mobile-webkit grows the macOS VM compressor by roughly 15 GB. That is squeezed
 # idle memory host-wide rather than anything the run holds, so it is a cost to
@@ -150,6 +151,7 @@ finish() {
     report_host_load_saturation "$rc"
     report_memory_stop
     report_webkit_chunk_range
+    report_webkit_phase_selection
     report_webkit_excluded "$SKIP_WEBKIT"
     rm -f "$PW_TALLY_LOG"
     exit "$rc"
@@ -289,6 +291,45 @@ report_webkit_chunk_range() {
     echo "[e2e] Coverage is incomplete. The chunks outside that range have no verdict."
 }
 
+# Resolve LUCIDOS_E2E_WEBKIT_PHASE into `both`, `cc` or `nav`. Anything else, an
+# empty value included, yields `both`, because a knob nobody can parse must never
+# be read as a request to run less. A garbage value SAYS SO on stderr rather than
+# quietly widening back, the same rule webkit_chunk_range carries: running
+# everything is the safe direction for a typo, and doing it silently is how a
+# typo goes unnoticed for a month.
+#
+# Values are kebab-case lowercase, like every other public knob here, and the
+# match is exact. Guessing at `NAV` would make the one unusable value that reads
+# like a request behave differently from every other one.
+#
+# Pure: no host reads, no globals. $1 is the raw value.
+webkit_phase_selection() {
+    case "$1" in
+        '' | both) echo both ;;
+        cc | nav) echo "$1" ;;
+        *)
+            echo "e2e-browser.sh: LUCIDOS_E2E_WEBKIT_PHASE='$1' is not nav, cc or both, running both phases" >&2
+            echo both
+            ;;
+    esac
+}
+
+# Set by _run_browser_project_body when a phase selection actually narrowed the
+# project, and read once by finish(). A phase-narrowed run must never read as a
+# complete project, exactly as a ranged one must not.
+WEBKIT_PHASE_APPLIED=""
+
+report_webkit_phase_selection() {
+    [ -n "$WEBKIT_PHASE_APPLIED" ] || return 0
+    local skipped="the CC-subprocess phase"
+    if [ "$WEBKIT_PHASE_APPLIED" = "cc" ]; then
+        skipped="the navigation phase"
+    fi
+    echo ""
+    echo "[e2e] mobile-webkit ran ONE PHASE ONLY: LUCIDOS_E2E_WEBKIT_PHASE=$WEBKIT_PHASE_APPLIED."
+    echo "[e2e] Coverage is incomplete. $skipped has no verdict."
+}
+
 merge_rc() {
     local current="$1" incoming="$2"
     if [ "$incoming" -eq 0 ]; then
@@ -320,11 +361,12 @@ merge_rc() {
 # always report, and a shortfall lands in nav instead. That is the half where a
 # partial chunk range is cheap to carry over and already has discharge tooling.
 #
-# Expect that shortfall on a warm host, by design rather than by accident. Nav's
-# 12.64 GB of compressor growth eats into the host's free headroom, and a warm
-# host starts with less of it, so the free-headroom floor in host_memory_guard.sh
-# stops the run sooner. A cold start clears it. A warm one loses the tail of nav,
-# which is exactly the half chosen to carry the loss.
+# A shortfall, if one comes, lands in nav by design rather than by accident. It
+# is no longer EXPECTED on a warm host. The free-headroom floor in
+# host_memory_guard.sh used to stop a warm host on the available reading alone,
+# and a warm host reads low because of the idle compressed-page pool rather than
+# because it is short of memory. That floor is corroborated now, so a warm start
+# runs to the end unless the kernel or swap says otherwise.
 #
 # WHAT THE SPLIT BUYS mostly survives the reversal, and the part that does not is
 # priced. Keeping the two sets in separate invocations is what shrinks the
@@ -372,6 +414,12 @@ merge_rc() {
 # night that lost the tail of nav discharges exactly that tail the next day. The
 # CC phase is four chunks and always runs whole, so a range never costs the ten
 # specs the phase order exists to protect.
+#
+# IT DOES COST THE CC PHASE'S OWN TIME AND MEMORY, and three separate
+# measurements put that at 93 to 97 percent of the excursion. So the cheapest
+# possible discharge, two nav specs, used to pay for all ten CC specs.
+# LUCIDOS_E2E_WEBKIT_PHASE=nav drops that half, and the two knobs compose: the
+# phase selector picks which halves run, the range narrows nav inside it.
 #
 # A ranged run must never read as a complete project: every skipped chunk says so
 # on its own line, and report_webkit_chunk_range restates the range at the end.
@@ -485,6 +533,14 @@ _run_browser_project_body() {
     # filters), running the entire suite instead of the requested subset. Targeted
     # runs fall through to the single-pass call below.
     if [ "$project" = "mobile-webkit" ] && [ -z "$TEST_FILE" ] && [ "${#PW_ARGS[@]}" -eq 0 ]; then
+        # WHICH PHASES THIS RUN IS FOR. `both` is the whole project, and the two
+        # narrowings exist for one job each: `nav` discharges a nav tail without
+        # paying for the CC phase, which three separate measurements put at 93 to
+        # 97 percent of the memory excursion, and `cc` covers the reverse.
+        # Resolved before the partition, because the announcement below needs the
+        # counts of the phase it is NOT running.
+        local phase_sel
+        phase_sel="$(webkit_phase_selection "${LUCIDOS_E2E_WEBKIT_PHASE:-}")"
         for f in e2e/*.spec.ts; do
             [ -e "$f" ] || continue
             base="$(basename "$f")"
@@ -504,31 +560,54 @@ _run_browser_project_body() {
             # CC-subprocess specs first (the cheap half), then nav specs. Each
             # phase is sharded into fresh-process chunks so WebKit memory cannot
             # accumulate across the whole suite into the cold-start-stall zone.
+            #
+            # A SKIPPED PHASE ANNOUNCES ITSELF, with the count it did not run.
+            # A phase that said nothing would leave a green-looking log for half
+            # a project, which is the one thing a narrowing must never do.
             local cc_rc=0 nav_rc=0
-            echo "── mobile-webkit phase 1/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
-            run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
-            # The CC/nav boundary, which the chunk loop deliberately leaves to
-            # its caller. Phase 2 is what follows, so there is real work to stop.
-            if [ -z "$MEMORY_STOPPED" ] \
-                && ! check_host_memory_at_boundary "$project phase 1/2 (CC)"; then
-                MEMORY_STOPPED="$project"
-                cc_rc="$(merge_rc "$cc_rc" "$HOST_MEMORY_STOP_EXIT")"
+            if [ "$phase_sel" = "nav" ]; then
+                WEBKIT_PHASE_APPLIED=nav
+                echo "── mobile-webkit phase 1/2 SKIPPED: ${#cc_specs[@]} CC-subprocess specs, LUCIDOS_E2E_WEBKIT_PHASE=nav ──"
+            else
+                echo "── mobile-webkit phase 1/2: ${#cc_specs[@]} CC-subprocess specs (sharded) ──"
+                run_specs_chunked "$project" "CC" "${cc_specs[@]}" || cc_rc=$?
             fi
-            if [ -n "$MEMORY_STOPPED" ]; then
-                # Phase 2 is the heavier half, and it is last ON PURPOSE: this is
-                # where we chose a shortfall to land. Nav carries over as a
-                # partial chunk range, so what is lost here is the recoverable
-                # half rather than ten specs that have gone unverified for weeks.
-                echo "── mobile-webkit phase 2/2 SKIPPED: stopped on host memory ──"
-                return "$cc_rc"
+            if [ "$phase_sel" = "cc" ]; then
+                WEBKIT_PHASE_APPLIED=cc
+                echo "── mobile-webkit phase 2/2 SKIPPED: ${#nav_specs[@]} navigation specs, LUCIDOS_E2E_WEBKIT_PHASE=cc ──"
+            else
+                # The CC/nav boundary, which the chunk loop deliberately leaves
+                # to its caller. It is checked only when BOTH phases are in this
+                # run: a stop needs work left to stop, and with the CC phase
+                # skipped there is no CC-to-nav boundary to stand at.
+                if [ "$phase_sel" = "both" ] && [ -z "$MEMORY_STOPPED" ] \
+                    && ! check_host_memory_at_boundary "$project phase 1/2 (CC)"; then
+                    MEMORY_STOPPED="$project"
+                    cc_rc="$(merge_rc "$cc_rc" "$HOST_MEMORY_STOP_EXIT")"
+                fi
+                if [ -n "$MEMORY_STOPPED" ]; then
+                    # Phase 2 is the heavier half, and it is last ON PURPOSE:
+                    # this is where we chose a shortfall to land. Nav carries
+                    # over as a partial chunk range, so what is lost here is the
+                    # recoverable half rather than ten specs that have gone
+                    # unverified for weeks.
+                    echo "── mobile-webkit phase 2/2 SKIPPED: stopped on host memory ──"
+                    return "$cc_rc"
+                fi
+                echo "── mobile-webkit phase 2/2: ${#nav_specs[@]} navigation specs (sharded) ──"
+                run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
             fi
-            echo "── mobile-webkit phase 2/2: ${#nav_specs[@]} navigation specs (sharded) ──"
-            run_specs_chunked "$project" "nav" "${nav_specs[@]}" || nav_rc=$?
             # A nav-phase stop must not overwrite a failing CC phase (see
             # merge_rc), which plain last-wins aggregation would do.
             rc="$(merge_rc "$rc" "$cc_rc")"
             rc="$(merge_rc "$rc" "$nav_rc")"
             return "$rc"
+        fi
+        # The set did not split, so there are no phases to choose between and
+        # the single pass below runs everything. Say so: a selection that
+        # silently ran the whole project is the same lie as a silent skip.
+        if [ "$phase_sel" != "both" ]; then
+            echo "e2e-browser.sh: the mobile-webkit set did not split (${#cc_specs[@]} CC, ${#nav_specs[@]} nav), so LUCIDOS_E2E_WEBKIT_PHASE=$phase_sel ran everything" >&2
         fi
     fi
     # Own output dir per project (see set_output_dir) — otherwise the NEXT

@@ -19,7 +19,7 @@
 import { test, expect, type Page } from './fixtures';
 import {
   apiRequest, assertHealthy, clickVisibleElement, ensureOnThreadPane, gotoWithRetry,
-  openFilesPanel, waitForVisibleElement, waitForVisibleInput,
+  openFilesPanel, waitForVisibleInput,
 } from './helpers';
 
 /** The screen this project is emulating, as the popup measures it.
@@ -97,7 +97,16 @@ async function openImageOfWidth(page: Page, width: number): Promise<void> {
   expect(status, 'the fixture upload').toBe(200);
 
   await openFilesPanel(page);
-  await waitForVisibleElement(page, '.file-item', 15_000);
+  // Wait for THIS file's row, not just any row. The PUT above lands the file
+  // through the API, and the Files panel appends its row asynchronously. WebKit
+  // renders that row a beat after Chromium. Waiting for any .file-item, then
+  // taking one non-polling snapshot, could click before the new row exists.
+  await page.waitForFunction((n) =>
+    Array.from(document.querySelectorAll('.file-item')).some((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(n);
+    }),
+  name, { timeout: 15_000 });
   expect(await clickVisibleElement(page, '.file-item', name)).toBe(true);
 
   const preview = page.locator('.preview-image:visible').first();

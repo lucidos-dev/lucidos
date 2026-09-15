@@ -254,16 +254,32 @@
     margin-top: 0.5rem;
 }
 
+/* The one raised box every note in this form sits in. Tone and spacing are
+   what the three below vary; the box itself is shared, so re-padding it is one
+   edit rather than three. */
+.credential-scope-notice,
+.credential-repair-notice,
+.credential-console-help {
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    font-size: var(--font-size-sm);
+}
+
+/* Which hosts a scope widening adds. Neutral-toned, unlike the repair notice
+   below: nothing is broken here, and the user is confirming a grant rather
+   than fixing a registration. */
+.credential-scope-notice {
+    margin: 0 0 0.5rem 0;
+    color: var(--text-primary);
+}
+
 /* Why the form reopened on a repair: which required fields the saved OAuth
    Client was missing. Warning-toned because the registration is broken until
    it is filled in, but not an error: the fix is right here. */
 .credential-repair-notice {
     margin: 0 0 0.75rem 0;
-    padding: 0.625rem 0.875rem;
-    background: var(--bg-tertiary);
-    border-radius: 0.25rem;
     color: var(--accent-yellow);
-    font-size: var(--font-size-sm);
 }
 
 /* Where to get the Client ID: the provider's own app console, which is the one
@@ -274,11 +290,7 @@
     flex-direction: column;
     gap: 0.5rem;
     margin-bottom: 0.75rem;
-    padding: 0.625rem 0.875rem;
-    background: var(--bg-tertiary);
-    border-radius: 0.25rem;
     color: var(--text-secondary);
-    font-size: var(--font-size-sm);
 }
 
 .credential-console-help p {

@@ -92,8 +92,11 @@ test.describe('Repo File Explorer', () => {
       });
     }, undefined, { timeout: 15_000 });
 
-    // Click a file item
-    await clickVisibleElement(page, '.file-item');
+    // Click a file row with an actionable Playwright click. It waits for the row
+    // to be attached and stable first. A raw synthetic click can land on a row
+    // still being detached as the source switch re-renders the tree. Then the
+    // preview never opens.
+    await page.locator('.file-item').first().click();
 
     // File preview should appear with code content
     await page.waitForFunction(() => {

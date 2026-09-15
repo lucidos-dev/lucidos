@@ -37,6 +37,7 @@ import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { isInteractiveTarget } from '../../utils/dom';
 import { dismissBootSplash } from '../../utils/bootSplash';
 import { isTauri } from '../../utils/platform';
+import { pushTrafficLightOffset } from '../../store/actions/trafficLights';
 import { applyAppBadge } from '../../store/actions/app-badge';
 import { WORKSPACE_ID } from '../../utils/basePath';
 import {
@@ -846,6 +847,17 @@ export function WorkspacePicker() {
   const pickerRef = useMemo(() => ({ current: pickerEl }), [pickerEl]);
   useWindowDragRegion(pickerRef, { canStart: pickerCanDragStart });
 
+  // Packaged macOS: tell the shell where THIS surface's title-bar band ends, so
+  // it centres the traffic lights on a bar the picker actually has. Nothing else
+  // pushes here: `pushTrafficLightOffset` otherwise rides `applyUiScale`, which
+  // only the app shell's preferences load reaches. Once, because the band is a
+  // fixed rem height and the picker never changes its root font size. So a
+  // failed push is not retried here, unlike in the app shell: the shell keeps
+  // its seed, and the lights are a few points off until the next launch.
+  useEffect(() => {
+    if (pickerEl) pushTrafficLightOffset();
+  }, [pickerEl]);
+
   // Smart-root auto-open in progress: render nothing so the inline boot splash
   // (index.html, kept up by the effect above) stays the only thing on screen —
   // the picker grid never flashes before the redirect to the last-active
@@ -854,6 +866,10 @@ export function WorkspacePicker() {
 
   return (
     <div class="ws-picker" ref={setPickerEl}>
+      {/* The band the macOS traffic lights centre on. Invisible and untouchable:
+          the picker draws no bar, but the window still wears the OS buttons, and
+          they have to sit on something this surface states for itself. */}
+      <div class="ws-picker-titlebar-band" data-titlebar-band aria-hidden="true" />
       <div class="ws-picker-shell">
         <header class="ws-picker-header">
           <button

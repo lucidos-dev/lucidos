@@ -9,6 +9,10 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 mod activation;
 mod app_window;
+/// Where the packaged client's own stdout and stderr go. LaunchServices gives a
+/// launched app a sink that discards both, so without this the client's
+/// diagnostics do not exist.
+mod client_log;
 mod config_scalar;
 mod crash_watchdog;
 mod desktop;
@@ -22,10 +26,19 @@ mod panel_preview;
 /// never touched, which is a macOS packaging fact.
 #[cfg(target_os = "macos")]
 mod shell_env;
+#[cfg(test)]
+mod test_support;
 mod traffic_lights;
 mod updater;
 mod window_persist;
+/// The window-lifecycle probe, behind its own feature so no shipped build
+/// carries it. Public because its one caller is an `examples/` binary.
+#[cfg(all(target_os = "macos", feature = "window-probe"))]
+pub mod window_probe;
 mod window_restore;
+/// Whether the client believes a window is on screen, which is a different
+/// question from whether the user is looking at it.
+mod window_screen;
 mod window_session;
 mod window_target;
 
@@ -762,7 +775,10 @@ fn show_startup_window(app: &tauri::AppHandle) -> bool {
         Some(win) => match win.show() {
             // Only a window that actually reached the screen latches the gate,
             // the same rule `front_window` follows.
-            Ok(()) => window_persist::note_presented(),
+            Ok(()) => {
+                window_screen::note_shown(app_window::MAIN_WINDOW_LABEL);
+                window_persist::note_presented();
+            }
             Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
         },
         None => eprintln!("[Tauri] No main window to show at startup"),
@@ -838,6 +854,9 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, before anything can have something to say. A packaged client's
+    // streams are discarded until this points them somewhere.
+    client_log::install();
     // Created here so both ends are in scope: `nudge_dock_badge` holds the
     // sender as managed state, and `desktop::launch` takes the receiver.
     let (dock_badge_nudge_tx, dock_badge_nudge_rx) = std::sync::mpsc::channel::<()>();
@@ -855,7 +874,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(panel_preview::PanelPreviewSlots::default())
         .manage(panel_preview::PanelContentChannel::default())
-        .manage(crash_watchdog::LastHeartbeat::default())
+        .manage(crash_watchdog::Heartbeats::default())
         .manage(window_persist::GeometrySaver::default())
         .manage(device_id_store::DeviceIdStore::default())
         .manage(updater::AppUpdateRun::default())
@@ -934,6 +953,10 @@ pub fn run() {
                         // the last visible window.
                         api.prevent_close();
                         let _ = window.hide();
+                        // Off screen by our own hand. The watchdog reads this
+                        // rather than `[NSWindow isVisible]`, so a parked page
+                        // is left alone instead of reloaded.
+                        window_screen::note_hidden(window.label());
                         // The WKWebView cannot report an `orderOut:`, and
                         // `Focused(false)` may not fire on one. This is the
                         // load-bearing signal that the page is inactive. It is
@@ -950,6 +973,7 @@ pub fn run() {
                 // builds. `main` never reaches here: its close is prevented.
                 tauri::WindowEvent::Destroyed if app_window::is_app_window(window.label()) => {
                     traffic_lights::unwatch(window.label());
+                    window_screen::forget(window.label());
                     // The SLOT is what this clears. The child webview itself
                     // dies with its host, which is now this window, and tauri
                     // drops it from the manager in `on_window_close`. Left
@@ -971,6 +995,20 @@ pub fn run() {
                     if app_window::is_app_window(window.label()) =>
                 {
                     app_window::emit_window_active(app, window.label(), *focused);
+                }
+                // The window moved to a display with a different scale factor,
+                // so put its page back over the whole window. The runtime sizes
+                // that page from a resize event, converted with the factor of
+                // the moment. A change between the two halves of that
+                // conversion leaves the page in a corner (ADR 0178).
+                //
+                // The net rather than the fix. `app_window::build_geometry` and
+                // `placement_steps` are what stop the client causing such a
+                // change while a resize is queued.
+                tauri::WindowEvent::ScaleFactorChanged { .. }
+                    if app_window::is_app_window(window.label()) =>
+                {
+                    app_window::refit_webview(app, window.label());
                 }
                 // Arm the debounced background flush. The plugin keeps its own
                 // in-memory cache from these same events, and the disk write is
@@ -1106,6 +1144,10 @@ pub fn run() {
                 eprintln!("[Tauri] Started at login: coming up menu-bar-only, no window");
                 activation::set_menu_bar_only(app.handle(), true);
             }
+
+            // Cmd-H is the one hide the client does not perform itself, so it
+            // is observed. See `window_screen`.
+            window_screen::watch_app_hide();
 
             crash_watchdog::spawn(app.handle().clone());
 

@@ -86,6 +86,53 @@
     color: var(--text-muted);
 }
 
+/* The caller's words while the provider is still transcribing them. Inline, so
+   the caret sits at the end of the last word rather than under the line. */
+.live-partial {
+    display: inline;
+    overflow-wrap: break-word;
+}
+
+/* Still being said, so the words are still arriving.
+ *
+ * One caret, drawn identically on both sides of a call: the caller's partial
+ * and the talker's reply in flight. Inline, hugging the last word, so a row it
+ * leaves loses no height and nothing around it moves.
+ *
+ * `currentColor`, so it takes whichever surface it sits on and stays legible
+ * in either theme. */
+.live-caret {
+    display: inline-block;
+    width: 0.125rem;
+    height: 0.875em;
+    margin-left: 0.1875rem;
+    border-radius: 0.0625rem;
+    background: currentColor;
+    vertical-align: text-bottom;
+    animation: live-caret-blink 1s steps(2, jump-none) infinite;
+}
+
+/* Indefinite, so it carries a literal duration and no `--duration-*` token: it
+   is an activity indicator rather than a transition, and does not ride the
+   animation-speed scale. See .claude/rules/frontend-css.md. */
+@keyframes live-caret-blink {
+    0%, 49% {
+        opacity: 0.85;
+    }
+
+    50%, 100% {
+        opacity: 0.2;
+    }
+}
+
+/* Still says the same thing, and says it without moving. */
+@media (prefers-reduced-motion: reduce) {
+    .live-caret {
+        animation: none;
+        opacity: 0.6;
+    }
+}
+
 /* The pulse a caller's bubble holds while they are still speaking.
  *
  * Sized to one short line of text, so the bubble it sits in is the size the

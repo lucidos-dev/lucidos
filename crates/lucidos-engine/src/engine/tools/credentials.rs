@@ -1,4 +1,5 @@
 use super::super::LucidosEngine;
+use crate::core::credentials::{credential_scope_covers, normalized_base_urls, Credential};
 use crate::core::oauth;
 use crate::core::oauth_registry;
 use crate::core::AuthType;
@@ -20,13 +21,13 @@ pub(crate) fn credential_request_envelope(payload: serde_json::Value) -> String 
 pub(crate) fn credential_request_payload(
     service: &str,
     prompt: &str,
-    base_url: &str,
+    base_urls: &[String],
     auth_type: &str,
 ) -> String {
     credential_request_with_defaults(
         service,
         prompt,
-        base_url,
+        base_urls,
         auth_type,
         serde_json::Map::new(),
         None,
@@ -41,12 +42,13 @@ pub(crate) fn credential_request_payload(
 /// `env_var_name` omits the field, so the modal starts empty (default
 /// `CRED_<NAME>` injection).
 ///
-/// A blank `base_url` drops that key too. A `secret` declares no scope, and the
+/// `base_urls` is the *credential scope* the modal seeds, one row per host
+/// (ADR 0161). An empty set drops the key: a `secret` declares no scope, and the
 /// modal hides the field for it, so a seeded row would be an edit nobody sees.
 pub(crate) fn credential_request_with_defaults(
     service: &str,
     prompt: &str,
-    base_url: &str,
+    base_urls: &[String],
     auth_type: &str,
     defaults: serde_json::Map<String, serde_json::Value>,
     env_var_name: Option<&str>,
@@ -56,8 +58,8 @@ pub(crate) fn credential_request_with_defaults(
         "prompt": prompt,
         "auth_type": auth_type,
     });
-    if !base_url.trim().is_empty() {
-        payload["base_url"] = serde_json::Value::String(base_url.to_string());
+    if !base_urls.is_empty() {
+        payload["base_urls"] = serde_json::Value::from(base_urls);
     }
     if !defaults.is_empty() {
         payload["defaults"] = serde_json::Value::Object(defaults);
@@ -66,6 +68,48 @@ pub(crate) fn credential_request_with_defaults(
         payload["env_var_name"] = serde_json::Value::String(name.to_string());
     }
     credential_request_envelope(payload)
+}
+
+/// The hosts one argument names, whichever shape it arrives in.
+///
+/// One reader serves both spellings, so it takes both. `base_urls` is an array
+/// and the back-compat `base_url` is a string, and reading a string is what the
+/// singular one needs.
+///
+/// Reading a bare string under the PLURAL key falls out of that, and is welcome:
+/// a JSON Schema `type` is advisory to a model, and one handed an array argument
+/// sometimes writes a scalar.
+///
+/// Not a *temporary measure*, despite reading like model tolerance. The `String`
+/// arm is load-bearing for the singular `base_url`, which ADR 0161 decision 7
+/// keeps permanently. So there is no separate site to remove, and a registry row
+/// would name a deletion nobody could perform.
+fn scope_strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(one) => vec![one.clone()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The *credential scope* a `request_credential` call declares, normalized, or
+/// the refusal the caller should return verbatim.
+///
+/// `base_urls` is the argument. The singular `base_url` is still read and
+/// unioned in, on ADR 0161 decision 7's terms: that spelling stayed legal on the
+/// request bodies, so a model still reaching for it is answered rather than
+/// refused.
+///
+/// Both go through [`normalized_base_urls`], the one speller. A member naming no
+/// host is refused here, rather than stored as a scope the gate can only reject.
+fn requested_scope(args: &serde_json::Value) -> Result<Vec<String>, String> {
+    let mut raw = scope_strings(&args["base_urls"]);
+    raw.extend(scope_strings(&args["base_url"]));
+    normalized_base_urls(raw)
 }
 
 /// The refusal a `request_credential` call earns, or `None` when it carries
@@ -77,23 +121,168 @@ pub(crate) fn credential_request_with_defaults(
 fn missing_field_refusal(
     service_name: &str,
     prompt: &str,
-    base_url: &str,
+    base_urls: &[String],
     auth_type: &str,
 ) -> Option<&'static str> {
-    // Blank means blank on both sides: the payload drops a whitespace-only
-    // base_url, so accepting one here would open a modal with no scope and
-    // tell the agent nothing.
+    // The set is already normalized, so a whitespace-only host has been dropped
+    // and reads as no host at all. Accepting one would open a modal with no
+    // scope and tell the agent nothing.
     let needs_base_url = AuthType::parse(auth_type) != AuthType::Secret;
-    if service_name.is_empty()
-        || prompt.is_empty()
-        || (needs_base_url && base_url.trim().is_empty())
-    {
+    if service_name.is_empty() || prompt.is_empty() || (needs_base_url && base_urls.is_empty()) {
         return Some(
-            "Error: service_name and prompt are required, and so is base_url for every \
+            "Error: service_name and prompt are required, and so is base_urls for every \
              auth_type but 'secret'",
         );
     }
     None
+}
+
+/// The credential a `request_credential` call is about, if one is stored.
+///
+/// **An `oauth_client` is looked up by name AND type**, because it is the one
+/// type allowed to share a name with another credential. A bare-name check
+/// would call a Google API key "already configured" to an agent asking for the
+/// Google app registration, and never open the modal.
+///
+/// **Every other type is looked up by NAME ALONE.** The partial unique index
+/// keeps a name globally unique across all of them. So the name is the whole
+/// handle, and the requested type is a guess the caller should not have to get
+/// right. Missing the row over that guess is expensive: the handler opens a
+/// CREATE modal, the user types the same secret again, and the save replaces
+/// the working row, type and scope included.
+async fn existing_credential(
+    pool: &sqlx::PgPool,
+    service_name: &str,
+    auth_type: &str,
+) -> Result<Option<Credential>, sqlx::Error> {
+    if AuthType::parse(auth_type) == AuthType::OauthClient {
+        CredentialStore::get_typed(pool, service_name, AuthType::OauthClient).await
+    } else {
+        CredentialStore::get(pool, service_name).await
+    }
+}
+
+/// Whether a stored credential is an answer to a request for `requested`.
+///
+/// The name-keyed lookup finds whatever row holds the name. This is what stops
+/// the handler treating an unrelated one as the credential being asked for.
+/// Wrong, the tool reports a mailbox password as a configured API key, and a
+/// widening then puts that password in reach of an HTTP host.
+///
+/// **Only `api_key` and `bearer` are interchangeable.** Both hold a bare token
+/// reaching a script as `CRED_<NAME>`, and which one the user picked is a
+/// header detail the row itself carries. Every other type is a shape the agent
+/// cannot use as asked, so it answers only itself: a `password` splits into two
+/// env vars, a `basic` holds `username:password`, and a `secret` is sent
+/// nowhere. `only_a_row_of_the_same_shape_answers_a_request` walks the grid.
+///
+/// `email_password` and `unknown` answer nothing. Neither is
+/// [`AuthType::agent_requestable`]: `configure_email` owns the first, and the
+/// second is a row a newer engine wrote.
+fn answers_request(stored: AuthType, requested: AuthType) -> bool {
+    let token = |t| matches!(t, AuthType::ApiKey | AuthType::Bearer);
+    match stored {
+        AuthType::EmailPassword | AuthType::Unknown => false,
+        AuthType::ApiKey | AuthType::Bearer => token(requested),
+        // `oauth_client` included: the lookup finds one only for a request that
+        // named that type, so it can only ever have matched itself.
+        other => other == requested,
+    }
+}
+
+/// The answer when the name is held by a credential of another shape.
+///
+/// It states the fact and leaves the move to the agent, which is the only
+/// honest thing it can do: the stored row may well serve, under its own type
+/// and its own env vars. The two answers it replaces were both worse. Told
+/// "already configured", the agent reads a signing secret as an API key. Shown
+/// an unexplained create modal, the user overwrites the row the name belongs to.
+///
+/// Written "a credential of type X" rather than "a X credential", so no
+/// indefinite article has to agree with a wire spelling. Four of the eight start
+/// with a vowel.
+fn name_taken_by(existing: &Credential, requested: AuthType) -> String {
+    format!(
+        "'{}' already names a credential of type {}, not the {requested} that \
+         was asked for. Use the stored one if it serves, or ask for this one \
+         under another service name.",
+        existing.service_name, existing.auth_type
+    )
+}
+
+/// The requested hosts a stored credential does not already reach.
+///
+/// Empty means it reaches everything that was asked for, so there is nothing to
+/// propose.
+///
+/// Judged by [`credential_scope_covers`], the same predicate the proxy and every
+/// git credential callback ask. So a host this calls missing is exactly a host
+/// the gate would refuse.
+///
+/// **A `secret` is never widened.** Its EMPTY scope is the answer rather than a
+/// gap, because the value is signed with and never sent.
+/// `CredentialStore::infer_scope_if_empty` skips one for the same reason:
+/// giving it a host grants exactly the reach the type exists to refuse.
+fn hosts_outside_scope(existing: &Credential, requested: &[String]) -> Vec<String> {
+    if existing.auth_type == AuthType::Secret {
+        return Vec::new();
+    }
+    requested
+        .iter()
+        .filter(|url| !credential_scope_covers(&existing.base_urls, url))
+        .cloned()
+        .collect()
+}
+
+/// The answer for a credential that already reaches everything asked for.
+///
+/// Pinned by a test and deliberately unchanged. The agent has read this exact
+/// sentence since the tool existed, and rewording a success is churn it has to
+/// relearn for nothing.
+fn already_configured(service_name: &str) -> String {
+    format!(
+        "Credentials for '{service_name}' are already configured. \
+         You can proceed with API requests."
+    )
+}
+
+/// Reopen the credential the agent asked about, seeded to reach `adding` too.
+///
+/// The engine proposes and writes nothing. `existing_credential_id` routes the
+/// modal's save to an update of this one row, so the user presses Save and the
+/// secret is never retyped. ADR 0161 decision 6 keeps the write the user's, and
+/// the alternative in practice is a second row holding the same token.
+///
+/// The seeded scope is the UNION, stored first. A replacement would let one
+/// widening quietly drop a host the user had, and the form is authoritative on
+/// save. The user still sees every row and can remove one before saving.
+///
+/// **The prompt leads with the grant, not with the reassurance.** A widening
+/// costs the user no secret, so reading the form IS the whole of the consent. A
+/// prompt opening on "this only widens where it may be sent" invites a Save
+/// nobody read, and the hosts are what they must read.
+///
+/// Nothing else is seeded. The modal resolves this row before it renders, so
+/// its own stored auth type, header and env var name already win over anything
+/// carried here.
+fn widen_scope_request(existing: &Credential, adding: &[String]) -> String {
+    let mut base_urls = existing.base_urls.clone();
+    base_urls.extend(adding.iter().cloned());
+    credential_request_envelope(serde_json::json!({
+        "service": existing.service_name,
+        "prompt": format!(
+            "This lets the '{}' secret be sent to {}. It is stored already and \
+             does not change, so Save is all this needs.",
+            existing.service_name,
+            adding.join(", "),
+        ),
+        "auth_type": existing.auth_type.to_string(),
+        "base_urls": base_urls,
+        "existing_credential_id": existing.id,
+        // Named apart from the union so the modal can say what is NEW. Read off
+        // the seeded rows it could not, since those hold the stored hosts too.
+        "adding_base_urls": adding,
+    }))
 }
 
 /// The service name a `request_credential` call actually writes under.
@@ -259,11 +448,35 @@ impl LucidosEngine {
             "request_credential" => {
                 let service_name = args["service_name"].as_str().unwrap_or("");
                 let prompt = args["prompt"].as_str().unwrap_or("");
-                let base_url = args["base_url"].as_str().unwrap_or("");
                 let auth_type = args["auth_type"].as_str().unwrap_or("api_key");
+                // Refused here, so every type reaching the rest of this arm is
+                // one the modal can actually collect. A spelling the enum does
+                // not know used to reach the form itself, where the Auth Type
+                // dropdown has no such option to select.
+                let requested = AuthType::parse(auth_type);
+                if !requested.agent_requestable() {
+                    return Ok(format!(
+                        "Error: '{auth_type}' is not an auth_type this can collect. Use one of: {}",
+                        AuthType::agent_requestable_values().join(", ")
+                    ));
+                }
+                // A `secret` declares no scope whatever the model passed, since
+                // it is signed with rather than sent. Clearing it here rather
+                // than refusing it keeps every downstream claim true, including
+                // the payload builder's "an empty set drops the key". A
+                // malformed member is not reported either: the field is not
+                // this type's to fill.
+                let base_urls = if requested == AuthType::Secret {
+                    Vec::new()
+                } else {
+                    match requested_scope(args) {
+                        Ok(urls) => urls,
+                        Err(reason) => return Ok(format!("Error: {reason}")),
+                    }
+                };
 
                 if let Some(refusal) =
-                    missing_field_refusal(service_name, prompt, base_url, auth_type)
+                    missing_field_refusal(service_name, prompt, &base_urls, auth_type)
                 {
                     return Ok(refusal.to_string());
                 }
@@ -286,27 +499,28 @@ impl LucidosEngine {
                     }
                 }
 
-                // Check if credential already exists. Typed, because an
-                // `oauth_client` row is the one type allowed to share a name
-                // with another credential: a bare-name check would report a
-                // Google API key as "already configured" when the agent is
-                // asking for the Google app registration, and never open the
-                // modal.
+                // Check if credential already exists.
+                //
                 // A lookup that FAILED is not "no credential is stored". Read as
                 // one, a DB blip re-opens the modal for a credential the user
                 // already entered, and they type it in again.
-                match CredentialStore::get_typed(
-                    &self.pool,
-                    service_name,
-                    AuthType::parse(auth_type),
-                )
-                .await
-                {
-                    Ok(Some(_)) => {
-                        return Ok(format!(
-                            "Credentials for '{}' are already configured. You can proceed with API requests.",
-                            service_name
-                        ))
+                match existing_credential(&self.pool, service_name, auth_type).await {
+                    Ok(Some(existing)) => {
+                        // The name may be held by a credential of another kind,
+                        // which answers nothing this asked for.
+                        if !answers_request(existing.auth_type, requested) {
+                            return Ok(name_taken_by(&existing, requested));
+                        }
+                        // A row exists, but "already configured" is only true for
+                        // the hosts its scope covers. Said of a host outside it,
+                        // the answer is false and leaves the agent nowhere: the
+                        // way around it is a second service name holding the same
+                        // secret, which is exactly what ADR 0161 rejected.
+                        let adding = hosts_outside_scope(&existing, &base_urls);
+                        if adding.is_empty() {
+                            return Ok(already_configured(service_name));
+                        }
+                        return Ok(widen_scope_request(&existing, &adding));
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -329,7 +543,7 @@ impl LucidosEngine {
                 Ok(credential_request_with_defaults(
                     service_name,
                     prompt,
-                    base_url,
+                    &base_urls,
                     auth_type,
                     defaults,
                     env_var_name,
@@ -452,61 +666,142 @@ mod tests {
         serde_json::from_str(json_part).expect("payload must be valid JSON")
     }
 
+    fn scope(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|u| u.to_string()).collect()
+    }
+
     #[test]
     fn payload_is_valid_json_with_multiline_prompt() {
         let prompt = "1. Open dashboard\n2. Create API key\n3. Paste it below";
-        let result =
-            credential_request_payload("binance", prompt, "https://api.binance.com", "api_key");
+        let result = credential_request_payload(
+            "binance",
+            prompt,
+            &scope(&["https://api.binance.com"]),
+            "api_key",
+        );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], "binance");
         assert_eq!(parsed["prompt"], prompt);
-        assert_eq!(parsed["base_url"], "https://api.binance.com");
+        assert_eq!(
+            parsed["base_urls"],
+            serde_json::json!(["https://api.binance.com"])
+        );
         assert_eq!(parsed["auth_type"], "api_key");
+    }
+
+    /// The shape the singular `base_url` could not express: one key, several
+    /// hostnames of one provider, on ONE credential (ADR 0161).
+    #[test]
+    fn a_request_may_name_every_host_the_provider_uses() {
+        let result = credential_request_payload(
+            "binance",
+            "prompt",
+            &scope(&["https://api.binance.com", "https://fapi.binance.com"]),
+            "api_key",
+        );
+        assert_eq!(
+            parse_payload(&result)["base_urls"],
+            serde_json::json!(["https://api.binance.com", "https://fapi.binance.com"]),
+            "every member reaches the modal, in order, so it seeds one row each"
+        );
     }
 
     /// A `secret` reaches scripts as `CRED_<NAME>` and no host, so the modal
     /// hides its scope field. A seeded row there would be an edit nobody sees.
     #[test]
-    fn a_secret_request_carries_no_base_url() {
+    fn a_secret_request_carries_no_base_urls() {
         let result = credential_request_payload(
             "deploys-github",
             "Paste the secret GitHub signs its webhooks with.",
-            "",
+            &[],
             "secret",
         );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["auth_type"], "secret");
         assert!(
-            parsed.get("base_url").is_none(),
-            "a blank base_url must be omitted, not sent as an empty string: {parsed}"
+            parsed.get("base_urls").is_none(),
+            "an empty scope must be omitted, not sent as an empty array: {parsed}"
         );
     }
 
     /// The one type that needs no base URL, and the five that do.
     #[test]
-    fn base_url_is_required_for_every_type_but_secret() {
-        assert!(missing_field_refusal("svc", "prompt", "", "secret").is_none());
+    fn base_urls_are_required_for_every_type_but_secret() {
+        assert!(missing_field_refusal("svc", "prompt", &[], "secret").is_none());
         for auth_type in ["api_key", "bearer", "basic", "password", "oauth_client"] {
             assert!(
-                missing_field_refusal("svc", "prompt", "", auth_type).is_some(),
+                missing_field_refusal("svc", "prompt", &[], auth_type).is_some(),
                 "{auth_type} is presented to a host, so it must name one"
             );
         }
-        // Whitespace is blank, matching what the payload builder drops.
-        assert!(missing_field_refusal("svc", "prompt", "   ", "api_key").is_some());
         // The other two fields are required whatever the type is.
-        assert!(missing_field_refusal("", "prompt", "", "secret").is_some());
-        assert!(missing_field_refusal("svc", "", "", "secret").is_some());
+        assert!(missing_field_refusal("", "prompt", &[], "secret").is_some());
+        assert!(missing_field_refusal("svc", "", &[], "secret").is_some());
+        assert!(missing_field_refusal(
+            "svc",
+            "prompt",
+            &scope(&["https://api.example.com"]),
+            "api_key"
+        )
+        .is_none());
+    }
+
+    /// Either spelling and either shape reaches the same normalized set. The
+    /// singular stayed legal on the request bodies (ADR 0161 decision 7), so a
+    /// model still reaching for it is answered rather than refused.
+    #[test]
+    fn a_request_reads_both_spellings_of_the_scope() {
+        let read = |args: serde_json::Value| requested_scope(&args).expect("a valid scope");
+        assert_eq!(
+            read(serde_json::json!({ "base_urls": ["https://a.test", "https://b.test"] })),
+            scope(&["https://a.test", "https://b.test"])
+        );
+        assert_eq!(
+            read(serde_json::json!({ "base_url": "https://a.test" })),
+            scope(&["https://a.test"]),
+            "the singular still lands, as a one-member set"
+        );
+        assert_eq!(
+            read(serde_json::json!({ "base_urls": "https://a.test" })),
+            scope(&["https://a.test"]),
+            "a bare string in the array-typed argument is read, not dropped"
+        );
+        assert_eq!(
+            read(serde_json::json!({
+                "base_urls": ["https://a.test"],
+                "base_url": "https://a.test",
+            })),
+            scope(&["https://a.test"]),
+            "both spellings union, and the duplicate collapses"
+        );
         assert!(
-            missing_field_refusal("svc", "prompt", "https://api.example.com", "api_key").is_none()
+            read(serde_json::json!({ "base_urls": ["  "] })).is_empty(),
+            "a blank member is dropped, so it reads as no host at all"
+        );
+    }
+
+    /// Refused at the tool, rather than stored as a scope the gate can only
+    /// reject. Stored, it would surface as a 502 far from the call behind it.
+    #[test]
+    fn a_member_naming_no_host_is_refused_with_a_reason() {
+        let refusal = requested_scope(&serde_json::json!({ "base_urls": ["api.example.com"] }))
+            .expect_err("a scheme-less member names no host");
+        assert!(refusal.contains("api.example.com"), "{refusal}");
+        assert!(
+            refusal.contains("https://"),
+            "it shows the shape: {refusal}"
         );
     }
 
     #[test]
     fn payload_escapes_quotes_and_backslashes_in_prompt() {
         let prompt = r#"Use the "API Key" field, escape backslashes like \n correctly"#;
-        let result =
-            credential_request_payload("svc", prompt, "https://api.example.com", "api_key");
+        let result = credential_request_payload(
+            "svc",
+            prompt,
+            &scope(&["https://api.example.com"]),
+            "api_key",
+        );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["prompt"], prompt);
     }
@@ -516,25 +811,298 @@ mod tests {
         let result = credential_request_payload(
             r#"weird"service"#,
             "prompt",
-            r#"https://example.com/path with "quotes""#,
+            &scope(&[r#"https://example.com/path with "quotes""#]),
             "api_key",
         );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], r#"weird"service"#);
         assert_eq!(
-            parsed["base_url"],
-            r#"https://example.com/path with "quotes""#
+            parsed["base_urls"],
+            serde_json::json!([r#"https://example.com/path with "quotes""#])
         );
     }
 
     #[test]
     fn basic_payload_has_no_defaults_block() {
-        let result =
-            credential_request_payload("svc", "prompt", "https://api.example.com", "api_key");
+        let result = credential_request_payload(
+            "svc",
+            "prompt",
+            &scope(&["https://api.example.com"]),
+            "api_key",
+        );
         let parsed = parse_payload(&result);
         assert!(
             parsed.get("defaults").is_none(),
             "non-oauth payloads must not carry a defaults block: {parsed}"
+        );
+    }
+
+    // ─── Asking again for a host the credential does not reach ─────────────
+    //
+    // The reported case: a token saved for a provider's REST host, then wanted
+    // for its git host. "Already configured" is false there, and the way around
+    // it was a second service name holding the same secret. ADR 0161 named that
+    // outcome as the thing a set exists to stop.
+
+    fn stored(base_urls: &[&str]) -> Credential {
+        Credential {
+            id: uuid::Uuid::nil(),
+            service_name: "github".to_string(),
+            base_urls: scope(base_urls),
+            auth_type: AuthType::Bearer,
+            auth_value: "ghp_secret".to_string(),
+            auth_header: "Authorization".to_string(),
+            env_var_name: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_host_the_scope_already_covers_is_not_missing() {
+        let existing = stored(&["https://api.github.com", "https://github.com"]);
+        assert!(hosts_outside_scope(&existing, &scope(&["https://github.com"])).is_empty());
+        assert!(
+            hosts_outside_scope(&existing, &scope(&["https://github.com/example-org"])).is_empty(),
+            "a path under a scoped host is covered, exactly as the gate reads it"
+        );
+        assert!(
+            hosts_outside_scope(&existing, &[]).is_empty(),
+            "a request naming no host can never want one"
+        );
+    }
+
+    #[test]
+    fn a_host_outside_the_scope_is_reported_once_and_exactly() {
+        assert_eq!(
+            hosts_outside_scope(
+                &stored(&["https://api.github.com"]),
+                &scope(&["https://api.github.com", "https://github.com"]),
+            ),
+            scope(&["https://github.com"]),
+            "only the uncovered host is new; the covered one is not re-proposed"
+        );
+    }
+
+    /// A stored `secret` is never widened. Its empty scope is the answer, so
+    /// every host reads as missing and a naive comparison proposes all of them.
+    /// Saving that turns a value the engine only signs with into one it sends.
+    #[test]
+    fn a_stored_secret_is_never_proposed_for_widening() {
+        let mut existing = stored(&[]);
+        existing.auth_type = AuthType::Secret;
+        assert!(hosts_outside_scope(&existing, &scope(&["https://api.github.com"])).is_empty());
+    }
+
+    /// The name-keyed lookup finds whatever row holds the name, so the handler
+    /// has to ask whether that row is an answer at all.
+    #[test]
+    fn only_a_row_of_the_same_shape_answers_a_request() {
+        use AuthType::*;
+
+        // A bare token under `CRED_<NAME>`, either way. Which one the user
+        // picked is a header detail, and the reported bug is a model guessing
+        // the other one.
+        for stored in [ApiKey, Bearer] {
+            for requested in [ApiKey, Bearer] {
+                assert!(answers_request(stored, requested));
+            }
+        }
+
+        // Every other type answers only itself. A `password` splits into two
+        // env vars and a `basic` holds `username:password`, so neither is a
+        // token an agent told "already configured" could use.
+        for stored in [Basic, Password, Secret, OauthClient] {
+            assert!(answers_request(stored, stored));
+            for requested in [ApiKey, Bearer, Basic, Password, Secret] {
+                assert_eq!(
+                    answers_request(stored, requested),
+                    stored == requested,
+                    "a stored {stored} against a request for {requested}"
+                );
+            }
+        }
+
+        // Never this tool's to touch, whatever was asked for.
+        for stored in [EmailPassword, Unknown] {
+            for requested in [ApiKey, Bearer, Basic, Password, Secret] {
+                assert!(
+                    !answers_request(stored, requested),
+                    "a stored {stored} must not answer a request for {requested}"
+                );
+            }
+        }
+
+        // The whole grid, so neither axis can grow a variant nobody judged.
+        // `requested` can only be a requestable type: the handler refuses the
+        // other two before the lookup runs.
+        for stored in AuthType::ALL {
+            for requested in AuthType::ALL.iter().filter(|t| t.agent_requestable()) {
+                let expected = match stored {
+                    EmailPassword | Unknown => false,
+                    ApiKey | Bearer => matches!(requested, ApiKey | Bearer),
+                    other => other == requested,
+                };
+                assert_eq!(
+                    answers_request(*stored, *requested),
+                    expected,
+                    "a stored {stored} against a request for {requested}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_held_by_another_shape_says_so_and_says_what_to_do() {
+        let mut existing = stored(&[]);
+        existing.service_name = "stripe".to_string();
+        existing.auth_type = AuthType::Secret;
+        let message = name_taken_by(&existing, AuthType::ApiKey);
+        assert!(message.contains("'stripe'"), "{message}");
+        assert!(
+            message.contains("type secret"),
+            "it names what is stored: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "and what was asked for: {message}"
+        );
+        assert!(
+            message.contains("another service name"),
+            "and the way forward: {message}"
+        );
+        // Never "a email_password". Four of the eight wire spellings start with
+        // a vowel, so the sentence is shaped to need no indefinite article at
+        // all. Both slots are swept: either could grow one.
+        for stored in AuthType::ALL {
+            for requested in AuthType::ALL {
+                existing.auth_type = *stored;
+                let message = name_taken_by(&existing, *requested);
+                for spelling in [stored, requested] {
+                    assert!(
+                        !message.contains(&format!("a {spelling} ")),
+                        "an article would have to agree with {spelling}: {message}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_widening_seeds_the_union_and_targets_the_stored_row() {
+        let existing = stored(&["https://api.github.com"]);
+        let parsed = parse_payload(&widen_scope_request(
+            &existing,
+            &scope(&["https://github.com"]),
+        ));
+        assert_eq!(
+            parsed["base_urls"],
+            serde_json::json!(["https://api.github.com", "https://github.com"]),
+            "the stored host survives: the form is authoritative on save"
+        );
+        assert_eq!(
+            parsed["adding_base_urls"],
+            serde_json::json!(["https://github.com"]),
+            "named apart, so the modal can say what is NEW"
+        );
+        assert_eq!(
+            parsed["existing_credential_id"],
+            serde_json::json!(uuid::Uuid::nil()),
+            "the save updates this row rather than creating a second one"
+        );
+        assert_eq!(parsed["service"], "github");
+        assert_eq!(
+            parsed["auth_type"], "bearer",
+            "the stored type, not a guess"
+        );
+    }
+
+    /// The prompt leads with the grant. A widening costs the user no secret, so
+    /// reading the form is the whole of the consent. An opening line about how
+    /// little is changing invites a Save nobody read.
+    #[test]
+    fn the_widening_prompt_names_the_hosts_before_it_reassures() {
+        let parsed = parse_payload(&widen_scope_request(
+            &stored(&["https://api.github.com"]),
+            &scope(&["https://github.com", "https://codeload.github.com"]),
+        ));
+        let prompt = parsed["prompt"].as_str().expect("a prompt");
+        let grant = prompt.find("https://github.com").expect("names the host");
+        assert!(
+            prompt.contains("https://codeload.github.com"),
+            "every added host, not just the first: {prompt}"
+        );
+        assert!(
+            grant < prompt.find("does not change").expect("still reassures"),
+            "the grant comes first: {prompt}"
+        );
+    }
+
+    /// The modal resolves the row before it renders, so its stored auth type,
+    /// header and env var name already win. A copy here is a field nobody reads,
+    /// and a later reordering of that precedence would make it load-bearing
+    /// without anyone deciding so.
+    #[test]
+    fn a_widening_seeds_nothing_the_stored_row_already_answers() {
+        let mut existing = stored(&["https://api.github.com"]);
+        existing.env_var_name = Some("GITHUB_TOKEN".to_string());
+        existing.auth_header = "X-Api-Key".to_string();
+        let parsed = parse_payload(&widen_scope_request(
+            &existing,
+            &scope(&["https://github.com"]),
+        ));
+        for field in ["env_var_name", "auth_header", "defaults"] {
+            assert!(
+                parsed.get(field).is_none(),
+                "{field} comes off the resolved row, never the request: {parsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_already_configured_answer_is_unchanged() {
+        assert_eq!(
+            already_configured("github"),
+            "Credentials for 'github' are already configured. You can proceed with API requests."
+        );
+    }
+
+    /// The load-bearing one: the engine PROPOSES a widening and writes nothing.
+    /// ADR 0161 decision 6 keeps a scope change the user's act, and the modal's
+    /// Save is what performs it.
+    ///
+    /// Scoped to the whole module rather than to the `request_credential` arm,
+    /// because a helper it calls is where a write would actually land. The
+    /// widening builder and the scope comparison both live outside the arm, and
+    /// an arm-only slice reads them as somebody else's code.
+    ///
+    /// Comments are stripped first. A doc comment naming a mutator, to say the
+    /// module does NOT call it, is prose. Read as a call, the explanation
+    /// becomes the failure.
+    #[test]
+    fn this_module_writes_no_credential() {
+        let production: String = include_str!("credentials.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the module has a body before its tests")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect();
+        for mutator in [
+            "upsert",
+            "update",
+            "delete",
+            "set_base_urls",
+            "infer_scope_if_empty",
+        ] {
+            assert!(
+                !production.contains(&format!("CredentialStore::{mutator}")),
+                "this module must not write a credential, but it calls {mutator}"
+            );
+        }
+        assert!(
+            !production.contains("sqlx::query"),
+            "nor reach past the store to write one by hand"
         );
     }
 
@@ -555,7 +1123,7 @@ mod tests {
         let result = credential_request_with_defaults(
             "oauth:ghealth",
             "Enter your OAuth client credentials.",
-            "https://healthcare.googleapis.com",
+            &scope(&["https://healthcare.googleapis.com"]),
             "oauth_client",
             defaults,
             None,
@@ -578,7 +1146,7 @@ mod tests {
         let result = credential_request_with_defaults(
             "svc",
             "prompt",
-            "https://api.example.com",
+            &scope(&["https://api.example.com"]),
             "oauth_client",
             serde_json::Map::new(),
             None,
@@ -595,7 +1163,7 @@ mod tests {
         let result = credential_request_with_defaults(
             "apple",
             "Enter your app-specific password.",
-            "https://api.apple.com",
+            &scope(&["https://api.apple.com"]),
             "password",
             serde_json::Map::new(),
             Some("APPLE_PASSWORD"),
@@ -643,7 +1211,7 @@ mod tests {
         let result = credential_request_with_defaults(
             &requested_service_name("Dropbox", "oauth_client"),
             "Paste your Dropbox App key into Client ID.",
-            "https://api.dropboxapi.com",
+            &scope(&["https://api.dropboxapi.com"]),
             "oauth_client",
             serde_json::Map::new(),
             None,
@@ -659,7 +1227,7 @@ mod tests {
             let result = credential_request_with_defaults(
                 "svc",
                 "prompt",
-                "https://api.example.com",
+                &scope(&["https://api.example.com"]),
                 "api_key",
                 serde_json::Map::new(),
                 name,

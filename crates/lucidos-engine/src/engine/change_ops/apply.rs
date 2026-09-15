@@ -210,6 +210,20 @@ impl LucidosEngine {
     /// (or re-snapshotting the served `dist/`) — deliberately does NOT live here:
     /// it hangs off `emit_change_applied`, the one emit every merge path performs
     /// exactly once. See `change_ops_emitters::post_apply_dev_refresh`.
+    ///
+    /// # This call announces its own failure
+    ///
+    /// Every `Err` returned for a change that EXISTS has already been emitted as
+    /// a `ChangeApplyFailed` on its thread. A caller must not emit a second one:
+    /// the frontend draws one card per event, so a caller that re-announces puts
+    /// the same failure on screen twice. Log it and let the event stand, as the
+    /// Apply-All driver and the standing-apply resolver do.
+    ///
+    /// Two errors are raised before a change row is in hand: the row is missing,
+    /// or its lookup failed. Neither names a thread, so neither announces. A
+    /// caller holding a thread id may announce those itself.
+    ///
+    /// Pinned by `apply_change_callers_do_not_re_announce_the_failure`.
     pub async fn apply_change(
         self: &Arc<Self>,
         change_id: Uuid,
@@ -269,8 +283,21 @@ impl LucidosEngine {
                 ..ApplyResult::default()
             });
         }
+        // Announced like every other refusal below, so `apply_change`'s contract
+        // holds for the whole function: a caller never has to guess whether this
+        // one reached the thread. It also gives the Apply spinner the terminal
+        // event it waits on. And it advances an Apply All batch past a member
+        // somebody discarded mid-run, which the driver waits on this event for.
         if change.status != "pending" {
-            return Err(format!("Change is already {}", change.status).into());
+            let msg = format!("Change is already {}", change.status);
+            self.emit_apply_failed(
+                change.thread_id.unwrap_or(change_id),
+                change_id,
+                &msg,
+                actor.clone(),
+            )
+            .await;
+            return Err(msg.into());
         }
 
         // Idempotency fast-path: when the branch ref is gone, check if it was

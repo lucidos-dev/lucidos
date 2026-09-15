@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use super::live::LiveProvider;
 use super::provider::VoiceProvider;
 use super::realtime::RealtimeProvider;
 use crate::core::{
@@ -70,6 +71,15 @@ pub async fn talker_voice(pool: &PgPool) -> String {
     or_catalog_default(pool, PREF_VOICE_TALKER_VOICE).await
 }
 
+/// Which protocol a model id speaks. The one place that decides.
+///
+/// A prefix rather than a list, because the family grows without us and an
+/// unlisted `gpt-live-*` id belongs to the Live API by construction. Everything
+/// else is Realtime, which is what an unknown id was before Live existed.
+fn speaks_live(model: &str) -> bool {
+    model.trim().starts_with("gpt-live")
+}
+
 /// The talker to open this call on.
 ///
 /// `Err` carries an engine-side sentence for the log, never one for a client:
@@ -106,6 +116,11 @@ pub async fn provider_for(engine: &LucidosEngine) -> Result<Arc<dyn VoiceProvide
     };
 
     log!("[Voice] Calling {} with the key from {}", model, source);
+    // The two protocols share a key and nothing else, so the id decides here
+    // and nowhere above. Both answer the same seam, so no caller learns which.
+    if speaks_live(&model) {
+        return Ok(Arc::new(LiveProvider::new(api_key, model)));
+    }
     Ok(Arc::new(RealtimeProvider::new(api_key, model)))
 }
 
@@ -188,6 +203,46 @@ mod tests {
         assert_eq!(talker_voice(&pool).await, "cedar");
 
         teardown_test_db(&db).await;
+    }
+
+    /// Every id the talker picker offers, and the protocol it speaks. A
+    /// Realtime id sent to the Live socket opens nothing, and the other way
+    /// round is the same failure.
+    #[test]
+    fn each_talker_model_routes_to_the_protocol_it_speaks() {
+        for realtime in [
+            "gpt-realtime-2.1",
+            "gpt-realtime-2.1-mini",
+            "gpt-realtime-2",
+            "gpt-realtime-1.5",
+            "gpt-realtime-mini",
+            "gpt-realtime",
+        ] {
+            assert!(!speaks_live(realtime), "{} was routed to Live", realtime);
+        }
+        for live in ["gpt-live-1", "gpt-live-1-mini", "gpt-live-2"] {
+            assert!(speaks_live(live), "{} was routed to Realtime", live);
+        }
+    }
+
+    /// An id nobody has heard of keeps the behaviour it had before Live
+    /// existed. A model the agent pinned must still reach a socket.
+    #[test]
+    fn an_unknown_model_still_speaks_realtime() {
+        for unknown in ["", "  ", "some-new-model", "whisper-1"] {
+            assert!(!speaks_live(unknown), "{:?} was routed to Live", unknown);
+        }
+    }
+
+    /// The catalog default is the id the picker leads with, so a fresh
+    /// workspace dials a Realtime model rather than a per-minute one.
+    #[test]
+    fn a_fresh_workspace_dials_realtime_and_never_live() {
+        let default = preference_catalog::lookup(PREF_MODEL_VOICE_TALKER)
+            .expect("catalog")
+            .default;
+        assert_eq!(default, "gpt-realtime-2.1");
+        assert!(!speaks_live(default));
     }
 
     /// Both keys are catalog rows, so both have a default to fall back on. An

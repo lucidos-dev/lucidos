@@ -7,6 +7,9 @@ Supersedes the one-tool clause of ADR 0164, which itself superseded ADR 0149's
 tool-less clause. The rest of both stands, including the guarantee this one
 keeps.
 
+Narrowed by ADR 0181 to a Realtime talker. A Live one declares no tools at all,
+and the guarantee below is what says that is still inside the line.
+
 ## Context
 
 ADR 0164 gave the talker one tool, `delegate`, and said so twice: "The list is

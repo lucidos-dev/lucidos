@@ -6,12 +6,25 @@
  *  `fapi.binance.com`. The form therefore edits a LIST, and these helpers own
  *  every way that list changes. */
 
-/** The rows the form starts with.
+/** The rows the form opens on, given what the engine asked for and what the
+ *  targeted row holds. The one entry point: picking a narrower one is how a
+ *  request's own hosts get dropped.
  *
- *  Always at least one, so a fresh credential shows a field to type into
+ *  A request's set WINS, because the engine already unioned it with the stored
+ *  one. A scope widening arrives holding stored plus requested, so preferring
+ *  the row here would drop the very host the form is open to add.
+ *
+ *  An OAuth repair carries no set, and its stored one is all there is. A plain
+ *  create carries neither.
+ *
+ *  Always at least one row, so a fresh credential shows a field to type into
  *  rather than a lone Add button. */
-export function seedScopeRows(stored: string[] | undefined): string[] {
-  const rows = (stored ?? []).filter((u) => u.trim() !== '');
+export function initialScopeRows(
+  requested: string[] | undefined,
+  stored: string[] | undefined,
+): string[] {
+  const declared = requested?.length ? requested : stored;
+  const rows = (declared ?? []).filter((u) => u.trim() !== '');
   return rows.length > 0 ? rows : [''];
 }
 

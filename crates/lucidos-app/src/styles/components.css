@@ -475,6 +475,14 @@
     min-height: 0;
 }
 
+/* The source view's pinned gutter paints the surface it sits on, and in here
+   that is the modal panel rather than the content pane. Declared on the same
+   element `.line-numbered` sets its default on (panels/content.css), one step
+   more specific, so the override cannot be lost to source order. */
+.file-preview-modal .line-numbered {
+    --code-surface: var(--bg-secondary);
+}
+
 /* Toast notifications — positioned below header. The container spans the full
    width and holds one .toast-column per VISIBLE pane, each centered over its own
    pane (desktop block below). Mobile shows one pane at a time, so it gets a

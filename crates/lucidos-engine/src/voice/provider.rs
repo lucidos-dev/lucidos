@@ -76,6 +76,16 @@ pub enum VoiceEvent {
     /// Talker audio to play. Forwarded to the socket and never written down
     /// (parent plan, decision 12).
     Audio(Vec<u8>),
+    /// A piece of what the caller is saying, while they are still saying it.
+    ///
+    /// A PARTIAL, and the only event here that is not a fact yet: the ones
+    /// after it revise it and [`Self::UserTurnEnded`] replaces it. Nothing in
+    /// the engine writes one down. It exists so the transcript can draw the
+    /// caller's words as they speak rather than after they stop.
+    ///
+    /// A transcriber that streams none is ordinary, not a failure. The bubble
+    /// then pulses until the turn ends, exactly as it did before.
+    UserTranscript { text: String },
     /// The provider decided the caller stopped talking. Semantic or
     /// audio-native, never a silence timer we wrote (parent plan, decision 11).
     UserTurnEnded { transcript: String },
@@ -135,6 +145,37 @@ pub trait VoiceProvider: Send + Sync {
     async fn open(&self, opening: SessionOpening) -> Result<Box<dyn VoiceSession>, BoxError>;
 }
 
+/// How long a closing session may take to hand back what it holds.
+///
+/// A backstop, not the usual path: a reader exits on its own when the socket
+/// goes, dropping the sender and ending the drain. This bounds a server that
+/// takes the close frame and then stays quiet.
+const CLOSING_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Take everything a closing session's reader has left, bounded.
+///
+/// Shared by both providers, because both hold their reader behind one channel
+/// and both owe the caller's last words at close. See [`VoiceSession::close`].
+pub async fn drain_held(rx: &mut tokio::sync::mpsc::Receiver<VoiceEvent>) -> Vec<VoiceEvent> {
+    let mut held = Vec::new();
+    let deadline = tokio::time::Instant::now() + CLOSING_DRAIN;
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        held.push(event);
+    }
+    held
+}
+
+/// Wait until `deadline`, or forever when there is none.
+///
+/// Nothing is owed whenever there is no deadline, and a branch that resolved at
+/// once would spin whichever loop selected on it.
+pub async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// One live conversation.
 #[async_trait]
 pub trait VoiceSession: Send {
@@ -179,7 +220,27 @@ pub trait VoiceSession: Send {
     /// Stop the talker mid-utterance, because the caller spoke over it.
     async fn cancel(&mut self) -> Result<(), BoxError>;
 
-    /// Close the session down. Cleanup only: usage was already reported per
-    /// reply on [`VoiceEvent::TalkerTurnEnded`], so nothing is owed here.
-    async fn close(&mut self);
+    /// The caller's words were taken above the seam, so stop holding them.
+    ///
+    /// A protocol with no turn-end frame accumulates the caller until something
+    /// asks for them. When the ENGINE takes those words instead, because
+    /// nothing answered the caller and the doer was woken, the provider is
+    /// still holding its own copy. Its next boundary would hand the same
+    /// sentence over again, and one breath would draw two rows.
+    ///
+    /// Nothing to do for a protocol that states its own turn ends, which is
+    /// why the default does nothing.
+    async fn caller_words_were_taken(&mut self) {}
+
+    /// Close the session down, and hand back whatever it was still holding.
+    ///
+    /// **A provider can be holding the caller's last words when the line
+    /// closes.** A protocol with no turn-end frame accumulates them and gives
+    /// them up only as the socket goes. That is after the call loop has stopped
+    /// reading [`Self::next`], so those words reached no row at all. Closing
+    /// returns them rather than dropping them.
+    ///
+    /// Usage is NOT owed here. It was reported per reply on
+    /// [`VoiceEvent::TalkerTurnEnded`].
+    async fn close(&mut self) -> Vec<VoiceEvent>;
 }

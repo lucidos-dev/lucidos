@@ -20,10 +20,12 @@ import {
   activeExchangeIndex,
   computeExchanges,
   handleEvent,
+  isLiveReplyRow,
   isLiveUtteranceRow,
   makeOptimisticThreadState,
   queuedFollowupRun,
   queuedMessagesFromExchanges,
+  type LiveReply,
   type LiveUtterance,
   type StoredEvent,
   type ThreadState,
@@ -169,65 +171,175 @@ describe('the row holds no turn', () => {
   });
 });
 
+/** A row is claimed on the WORDS it carries, never on its count. The count is
+ *  the browser's tally of utterances and a persisted row is the provider's,
+ *  and one transcription item can hold two of the browser's. */
 describe('the words replace the row', () => {
-  function threadWithARow(): Map<string, ThreadState> {
+  /** A row at `count` carrying the caller's finished words. */
+  const worded = (count: number, text: string): LiveUtterance => ({
+    eventId: liveUtteranceId(THREAD, count),
+    count,
+    created: `2026-08-31T07:16:0${count}Z`,
+    text,
+  });
+
+  function threadWithARow(rows: LiveUtterance[] = [worded(1, 'and the tests')]): Map<string, ThreadState> {
     const thread = withADoerWorking();
-    thread.liveUtterances = [SPEAKING];
+    thread.liveUtterances = rows;
     return new Map([[THREAD, thread]]);
   }
 
+  const spoken = (map: Map<string, ThreadState>, seq: number, text: string): void => {
+    handleEvent(map, THREAD, seq, { type: 'SpokenMessageReceived', session_id: 'sess-1', text } as StoredEvent, `2026-08-31T07:16:0${seq}Z`, `e-${seq}`);
+  };
+
+  const delegated = (map: Map<string, ThreadState>, seq: number, text: string): void => {
+    handleEvent(map, THREAD, seq, {
+      type: 'MessageReceived',
+      text,
+      mode: 'human',
+      channel: 'chat',
+      voice_session_id: 'sess-1',
+    } as StoredEvent, `2026-08-31T07:16:0${seq}Z`, `e-${seq}`);
+  };
+
   it('goes when the talker answered the caller alone', () => {
     const map = threadWithARow();
-    handleEvent(map, THREAD, 9, { type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'and the tests' } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+    spoken(map, 9, 'and the tests');
     expect(map.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   it('goes when the talker delegated it instead', () => {
     const map = threadWithARow();
-    handleEvent(map, THREAD, 9, {
-      type: 'MessageReceived',
-      text: 'and the tests',
-      mode: 'human',
-      channel: 'chat',
-      voice_session_id: 'sess-1',
-    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+    delegated(map, 9, 'and the tests');
     expect(map.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
   /** The engine holds one utterance at a time, so a caller who barges in has a
-   *  second row up before the first one's words arrive. Those words are the
-   *  FIRST sentence's, and they say nothing about the one still being said. */
-  it('leaves a newer row alone when an older utterance lands late', () => {
-    const thread = withADoerWorking();
-    const second: LiveUtterance = {
+   *  second row up before the first one's words arrive. That row carries no
+   *  words yet, and the landing ones are the FIRST sentence's. */
+  it('leaves a wordless newer row alone when an older utterance lands', () => {
+    const speaking: LiveUtterance = {
       eventId: liveUtteranceId(THREAD, 2),
       count: 2,
       created: '2026-08-31T07:16:02Z',
     };
-    thread.liveUtterances = [second];
-    const map = new Map([[THREAD, thread]]);
-    const spoken = (seq: number, text: string): void => {
-      handleEvent(map, THREAD, seq, { type: 'SpokenMessageReceived', session_id: 'sess-1', text } as StoredEvent, `2026-08-31T07:16:0${seq}Z`, `e-${seq}`);
-    };
+    const map = threadWithARow([worded(1, 'what is going on today'), speaking]);
 
-    spoken(9, 'what is going on today');
-    expect(map.get(THREAD)?.liveUtterances).toEqual([second]);
+    spoken(map, 9, 'what is going on today');
+    expect(map.get(THREAD)?.liveUtterances).toEqual([speaking]);
+  });
 
-    spoken(10, 'and the tests');
+  /**
+   * The defect this whole ledger replaced, replayed from the real call.
+   *
+   * The browser's gate closed on a pause and counted two utterances. The
+   * provider folded both into ONE transcription item, so the engine wrote a
+   * single row. Matched by count, that row cleared only the counts at or below
+   * one. The worded row at count 2 then stood for the rest of the call,
+   * painting the same sentence a second time.
+   */
+  it('goes when the caller counted two utterances and the engine wrote one row', () => {
+    const merged = 'Hello Hmm The transcript isn\'t really working.';
+    const map = threadWithARow([worded(2, merged)]);
+
+    delegated(map, 9, merged);
+
     expect(map.get(THREAD)?.liveUtterances).toEqual([]);
+  });
+
+  /**
+   * The engine can write TWO rows against ONE live row.
+   *
+   * `onSpeech` reaches the reducer on a gate EDGE, so a caller who does not
+   * pause for 320 ms holds one row across two provider turns. `call.rs` flushes
+   * the first utterance when the second arrives, so two rows land. A count
+   * claims the row on the FIRST and is left owed one. Every later bubble is
+   * then retired the instant it gains words, which is the blank ADR 0174
+   * removes.
+   */
+  it('is claimed by its OWN words when the engine wrote two rows for it', () => {
+    const first = 'what is going on today';
+    const second = 'and the tests too';
+    // The row holds the SECOND transcript: the first landed while the gate was
+    // still open, and a live utterance takes no caption.
+    const map = threadWithARow([worded(1, second)]);
+
+    spoken(map, 9, first);
+    expect(map.get(THREAD)?.liveUtterances?.[0].text).toBe(second);
+
+    spoken(map, 10, second);
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
+  });
+
+  /**
+   * The engine can write NO row at all.
+   *
+   * Words the caller spent answering a question card ARE the answer's row, so
+   * `call.rs` drops them (`Resolution::SettledWithTheirWords`). The live row
+   * for them is an orphan, and a count would hand it to the next utterance's
+   * row. The `VoiceSessionEnded` sweep is what retires it.
+   */
+  it('leaves an orphan alone and claims the row that was written', () => {
+    const answered = worded(1, 'the second one');
+    const asked = worded(2, 'and run the tests');
+    const map = threadWithARow([answered, asked]);
+
+    spoken(map, 9, 'and run the tests');
+    expect(map.get(THREAD)?.liveUtterances).toEqual([answered]);
+
+    handleEvent(map, THREAD, 10, {
+      type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 30,
+    } as StoredEvent, '2026-08-31T07:16:10Z', 'e-10');
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
+  });
+
+  /** `doer.rs::wake` trims before it writes, so a delegated row's text is the
+   *  trimmed transcript while the client holds the frame's own. Both sides are
+   *  trimmed for the match, which is the one normalization. */
+  it('claims a delegated row whose text the engine trimmed', () => {
+    const map = threadWithARow([worded(1, ' and the tests ')]);
+    delegated(map, 9, 'and the tests');
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
+  });
+
+  /** `call.rs` emits the persisted row BEFORE it sends `user_turn_ended`, and
+   *  the two travel on different transports. Driven through the real bridge,
+   *  because the claim runs through `writeRow` rather than being called. */
+  it('claims when the engine\'s row arrives before the words', () => {
+    installLiveUtteranceRow();
+    const thread = withADoerWorking();
+    threadMap.value = new Map([[THREAD, thread]]);
+    const speaking = { ...CALL_IDLE, phase: 'listening' as const, threadId: THREAD, utteranceCount: 1 };
+
+    voiceCall.value = { ...speaking, utterance: 'live' };
+    expect(thread.liveUtterances).toHaveLength(1);
+
+    // SSE wins the race: the row lands while the bubble is still a pulse.
+    handleEvent(threadMap.value, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'and the tests',
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+    expect(thread.liveUtterances).toHaveLength(1);
+    expect(thread.unclaimedUtterances).toEqual(['and the tests']);
+
+    voiceCall.value = { ...speaking, utterance: 'transcribed', heard: 'and the tests' };
+    expect(thread.liveUtterances).toEqual([]);
+    expect(thread.unclaimedUtterances).toEqual([]);
+    voiceCall.value = CALL_IDLE;
   });
 
   /** A message somebody typed mid-call says nothing about what is being said
    *  out loud. The composer stays live during a call (ADR 0148). */
   it('stays for a typed message landing while the caller talks', () => {
-    const map = threadWithARow();
+    const row = worded(1, 'and the tests');
+    const map = threadWithARow([row]);
     handleEvent(map, THREAD, 9, {
       type: 'MessageReceived',
       text: 'typed while talking',
       mode: 'human',
       channel: 'chat',
     } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
-    expect(map.get(THREAD)?.liveUtterances).toEqual([SPEAKING]);
+    expect(map.get(THREAD)?.liveUtterances).toEqual([row]);
   });
 });
 
@@ -235,15 +347,17 @@ describe('the bridge between a call and a thread', () => {
   function harness() {
     const call = signal<CallState>(CALL_IDLE);
     const drawn: { threadId: string; row: LiveUtterance }[] = [];
+    const replies: { threadId: string; row: LiveReply }[] = [];
     const erased: string[] = [];
     let tick = 0;
     const bridge = createLiveUtteranceBridge({
       call,
       draw: (threadId, row) => drawn.push({ threadId, row }),
       erase: (threadId) => erased.push(threadId),
+      drawReply: (threadId, row) => replies.push({ threadId, row }),
       now: () => `2026-08-31T07:16:0${tick++}Z`,
     });
-    return { call, drawn, erased, bridge };
+    return { call, drawn, replies, erased, bridge };
   }
 
   const speaking = (count: number): CallState => ({
@@ -315,13 +429,14 @@ describe('the live wiring', () => {
     expect(threadMap.value.get(THREAD)?.liveUtterances).toEqual([]);
   });
 
-  /** A second call counts from one again, so the tally of landed words starts
-   *  over with it. Left standing, it would clear the new call's first row on
-   *  the first thing anybody said. */
-  it('starts the tally over for a fresh call', () => {
+  /** A second call counts its utterances from one again, so the ledger starts
+   *  over with them. A debt left over from the last call would claim the new
+   *  one's first row the instant it got any words. */
+  it('starts the ledger over for a fresh call', () => {
     installLiveUtteranceRow();
     const thread = withADoerWorking();
-    thread.settledUtterances = 3;
+    thread.unclaimedUtterances = ['last call'];
+    thread.liveReply = { eventId: 'stale', created: '2026-08-31T07:00:00Z', text: 'last call' };
     threadMap.value = new Map([[THREAD, thread]]);
     voiceCall.value = {
       ...CALL_IDLE,
@@ -330,8 +445,204 @@ describe('the live wiring', () => {
       utterance: 'live',
       utteranceCount: 1,
     };
-    expect(thread.settledUtterances).toBe(0);
+    expect(thread.unclaimedUtterances).toEqual([]);
+    expect(thread.liveReply).toBeUndefined();
     expect(thread.liveUtterances?.[0].count).toBe(1);
     voiceCall.value = CALL_IDLE;
+  });
+
+  /** A claimed row stays gone. The bridge still holds the words it drew, so a
+   *  provider revising its own transcript rewrites a row the engine has
+   *  already written down. Putting it back paints the sentence twice. */
+  it('does not put a claimed row back when the provider revises it', () => {
+    installLiveUtteranceRow();
+    const thread = withADoerWorking();
+    threadMap.value = new Map([[THREAD, thread]]);
+    const speaking = { ...CALL_IDLE, phase: 'listening' as const, threadId: THREAD, utteranceCount: 1 };
+
+    voiceCall.value = { ...speaking, utterance: 'live' };
+    voiceCall.value = { ...speaking, utterance: 'transcribed', heard: 'fix the blank thread' };
+    expect(thread.liveUtterances).toHaveLength(1);
+
+    handleEvent(threadMap.value, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'fix the blank thread',
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+    expect(thread.liveUtterances).toEqual([]);
+
+    voiceCall.value = { ...speaking, utterance: 'transcribed', heard: 'fix the blank thread view' };
+    expect(thread.liveUtterances).toEqual([]);
+    voiceCall.value = CALL_IDLE;
+  });
+});
+
+/**
+ * The talker's own row, drawn while it speaks.
+ *
+ * The client is sent every word of a reply as it is said, and dropped them all:
+ * the transcript held nothing from the first word until the engine's row for
+ * the whole reply landed. On one 136-second call that row arrived at hangup,
+ * so the transcript said nothing for the length of the call.
+ */
+describe('the talker is drawn while it speaks', () => {
+  const speaking = (said: string, count = 1): CallState => ({
+    ...CALL_IDLE,
+    phase: 'speaking',
+    threadId: THREAD,
+    said,
+    replyCount: count,
+  });
+
+  function bridged() {
+    const call = signal<CallState>(CALL_IDLE);
+    const replies: { threadId: string; row: LiveReply }[] = [];
+    let tick = 0;
+    const bridge = createLiveUtteranceBridge({
+      call,
+      draw: () => {},
+      erase: () => {},
+      drawReply: (threadId, row) => replies.push({ threadId, row }),
+      now: () => `2026-08-31T07:16:0${tick++}Z`,
+    });
+    return { call, replies, bridge };
+  }
+
+  it('rewrites one row as the words arrive', () => {
+    const h = bridged();
+    h.call.value = speaking('Hey');
+    h.call.value = speaking('Hey! How can');
+    expect(h.replies.map(r => r.row.text)).toEqual(['Hey', 'Hey! How can']);
+    // One row, so the reply grows in place rather than stacking.
+    expect(new Set(h.replies.map(r => r.row.eventId)).size).toBe(1);
+  });
+
+  /** A reply already on screen must not have its timestamp jump as it grows,
+   *  and a NEW reply must not inherit the last one's moment. */
+  it('keeps the moment a reply went up, and stamps the next one afresh', () => {
+    const h = bridged();
+    h.call.value = speaking('Hey');
+    h.call.value = speaking('Hey there');
+    const first = h.replies[0].row.created;
+    expect(h.replies[1].row.created).toBe(first);
+
+    h.call.value = speaking('On it', 2);
+    expect(h.replies[2].row.created).not.toBe(first);
+  });
+
+  /** The engine's row arrives on SSE while the caller is still hearing the
+   *  tail of the reply. Withdrawing on the turn's end would blank it. */
+  it('stands until the engine writes the reply down', () => {
+    const thread = withADoerWorking();
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'On it' };
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'SpokenReplyGenerated', session_id: 'sess-1', text: 'On it', interrupted: false,
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveReply).toBeUndefined();
+  });
+
+  /** The backstop, for a reply the engine writes no row for. */
+  it('goes when the call rings off', () => {
+    const thread = withADoerWorking();
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'Bye' };
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12,
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveReply).toBeUndefined();
+  });
+
+  it('draws as the Lucidos side, holding no turn of its own', () => {
+    const thread = withADoerWorking();
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'On it' };
+    const rows = computeExchanges(thread);
+    const row = rows[rows.length - 1];
+
+    expect(isLiveReplyRow(row.userEvent)).toBe(true);
+    expect(row.userEvent.type).toBe('SpokenReplyGenerated');
+    expect(row.steps).toEqual([]);
+  });
+
+  /** The call ends while the talker is mid-reply. What it had said is the
+   *  caller's account of what they heard, and `call.rs` writes that down for
+   *  every end reason. So the sweep is what finally retires the row. */
+  it('keeps a reply in flight until the call itself ends', () => {
+    installLiveUtteranceRow();
+    const thread = withADoerWorking();
+    threadMap.value = new Map([[THREAD, thread]]);
+
+    voiceCall.value = { ...CALL_IDLE, phase: 'speaking', threadId: THREAD, said: 'On i', replyCount: 1 };
+    expect(thread.liveReply?.text).toBe('On i');
+
+    // The caller rings off mid-word. The row stands: the engine still owes one.
+    voiceCall.value = CALL_IDLE;
+    expect(thread.liveReply?.text).toBe('On i');
+
+    handleEvent(threadMap.value, THREAD, 9, {
+      type: 'VoiceSessionEnded', session_id: 'sess-1', reason: 'hangup', duration_secs: 12,
+    } as StoredEvent, '2026-08-31T07:16:09Z', 'e-9');
+    expect(thread.liveReply).toBeUndefined();
+  });
+
+  /** One clock stamps both sides, so a caller cutting in reads BELOW the reply
+   *  they cut into. Sorted rather than blocked: the caller's rows used to take
+   *  the whole synthetic range on their own. */
+  it('reads in the order the two sides spoke', () => {
+    const thread = withADoerWorking();
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'On it' };
+    thread.liveUtterances = [
+      { eventId: liveUtteranceId(THREAD, 1), count: 1, created: '2026-08-31T07:16:01Z', text: 'first' },
+      { eventId: liveUtteranceId(THREAD, 2), count: 2, created: '2026-08-31T07:16:03Z' },
+    ];
+
+    const tail = computeExchanges(thread).slice(-3);
+    expect(tail.map(e => e.userEvent._eventId)).toEqual([
+      liveUtteranceId(THREAD, 1),
+      'live-reply:t:1',
+      liveUtteranceId(THREAD, 2),
+    ]);
+    // A `userSeq` is an identity, so the merged block must not reuse one.
+    expect(new Set(tail.map(e => e.userSeq)).size).toBe(3);
+  });
+});
+
+/**
+ * The caller's own words as the provider hears them.
+ *
+ * A partial captions the bubble and settles nothing. `heard` is what a
+ * persisted row claims, so a sentence still being said can never be retired by
+ * one written for the sentence before it.
+ */
+describe('a partial captions the bubble and claims nothing', () => {
+  const partialRow: LiveUtterance = {
+    eventId: liveUtteranceId(THREAD, 1),
+    count: 1,
+    created: '2026-08-31T07:16:01Z',
+    partial: 'the transcript is',
+  };
+
+  it('draws the words instead of the pulse', () => {
+    const thread = withADoerWorking();
+    thread.liveUtterances = [partialRow];
+    const rows = computeExchanges(thread);
+    const row = rows[rows.length - 1];
+
+    expect(isLiveUtteranceRow(row.userEvent)).toBe(true);
+    expect((row.userEvent as { text: string }).text).toBe('the transcript is');
+  });
+
+  it('survives a persisted row landing for an earlier sentence', () => {
+    const thread = withADoerWorking();
+    thread.liveUtterances = [partialRow];
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: 'something else',
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveUtterances).toEqual([partialRow]);
   });
 });

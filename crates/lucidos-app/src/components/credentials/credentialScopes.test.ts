@@ -1,30 +1,54 @@
 import { describe, it, expect } from 'vitest';
 import {
   addScopeRow,
+  initialScopeRows,
   removeScopeRow,
-  seedScopeRows,
   setScopeRow,
   submittedScopes,
 } from './credentialScopes';
 
-describe('seedScopeRows', () => {
+describe('initialScopeRows', () => {
   it('shows every stored base URL', () => {
-    expect(seedScopeRows(['https://api.binance.com', 'https://fapi.binance.com'])).toEqual([
-      'https://api.binance.com',
-      'https://fapi.binance.com',
-    ]);
+    expect(
+      initialScopeRows(undefined, ['https://api.binance.com', 'https://fapi.binance.com']),
+    ).toEqual(['https://api.binance.com', 'https://fapi.binance.com']);
   });
 
   it('always leaves one field to type into', () => {
-    expect(seedScopeRows(undefined)).toEqual(['']);
-    expect(seedScopeRows([])).toEqual(['']);
-    expect(seedScopeRows(['  '])).toEqual(['']);
+    expect(initialScopeRows(undefined, undefined)).toEqual(['']);
+    expect(initialScopeRows([], [])).toEqual(['']);
+    expect(initialScopeRows(undefined, ['  '])).toEqual(['']);
   });
+
+  /* The reported case: a token saved for a provider's API host, then wanted for
+     its git host. The engine reopens that row seeded with BOTH, so preferring
+     the stored set here would drop the host the form is open to add, and the
+     user would be back to a second credential holding the same secret. */
+  it("takes the request's set over the stored one, because the engine unioned it", () => {
+    expect(
+      initialScopeRows(
+        ['https://api.github.com', 'https://github.com'],
+        ['https://api.github.com'],
+      ),
+    ).toEqual(['https://api.github.com', 'https://github.com']);
+  });
+
+  /* An OAuth repair carries no set. It must read exactly as it did before a
+     widening could reach this function. */
+  it('falls back to the stored set when the request names none', () => {
+    expect(initialScopeRows(undefined, ['https://api.dropboxapi.com'])).toEqual([
+      'https://api.dropboxapi.com',
+    ]);
+    expect(initialScopeRows([], ['https://api.dropboxapi.com'])).toEqual([
+      'https://api.dropboxapi.com',
+    ]);
+  });
+
 });
 
 describe('editing the rows', () => {
   it('adds, edits and removes without disturbing the others', () => {
-    let rows = seedScopeRows(['https://api.binance.com']);
+    let rows = initialScopeRows(undefined, ['https://api.binance.com']);
     rows = addScopeRow(rows);
     rows = setScopeRow(rows, 1, 'https://fapi.binance.com');
     expect(rows).toEqual(['https://api.binance.com', 'https://fapi.binance.com']);

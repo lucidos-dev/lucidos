@@ -77,15 +77,18 @@ export async function submitRequestedCredential(
   authType: AuthType,
   authValue: string,
   envVarName?: string,
+  authHeader?: string,
 ): Promise<boolean> {
   const saved = request.existing_credential_id
     ? await submitCredentialEdit(request.existing_credential_id, {
         base_urls: baseUrls,
         auth_type: authType,
-        // An `oauth_client` is not sent through the proxy auth pipeline, so it
-        // has no meaningful auth header. The field is required by the update
-        // shape, so it carries the same default the create path stores.
-        auth_header: 'Authorization',
+        // The STORED header, which the form passes in. Never hardcode the
+        // default here. A scope widening reaches this line for an ordinary API
+        // credential, and would reset an `X-Api-Key` one to `Authorization`,
+        // breaking every call through it. An `oauth_client` never travels the
+        // proxy auth pipeline, has no meaningful header, and takes the fallback.
+        auth_header: authHeader?.trim() || 'Authorization',
         auth_value: authValue,
         env_var_name: envVarName,
       })

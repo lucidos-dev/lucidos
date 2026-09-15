@@ -127,15 +127,22 @@ const DATA_NAV_TARGET_ATTR = /\sdata-nav-target\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_TRIGGER_ID_ATTR = /\sdata-trigger-id\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
 /** UI panels reachable from a markdown link like `[Notifications](notifications)`.
- *  Mirrors the side-drawer menu items, the same names the `navigate_ui` LLM
- *  tool accepts and `handleNavigationRequest` routes. Most route via
- *  `switchMenuItem`; `app-store` is an alias landing on the Plugins panel.
- *  Kept in sync by hand: short and stable. */
-const NAV_TARGETS: ReadonlySet<string> = new Set([
+ *  Every `MenuItem` plus the two bare `navigate_ui` targets that land somewhere
+ *  other than a menu row: `app-store` is the retired alias for Plugins, and
+ *  `thread-queue` opens a Settings subview.
+ *
+ *  Held apart from `MenuItem` on purpose. This set answers "is this href a
+ *  panel", so it stays a plain string set that `utils/` owns without importing
+ *  the store. Hand-written, so `nav-targets-cover-every-panel.test.ts` is what
+ *  keeps it honest: a menu item or a bare generated target missing here is a
+ *  link the agent writes and the reader cannot open. */
+export const NAV_TARGETS: ReadonlySet<string> = new Set([
   'notifications',
   'apps',
+  'plugins',
   'app-store',
   'triggers',
+  'thread-queue',
   'changes',
   'files',
   'settings',

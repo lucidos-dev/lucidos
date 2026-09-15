@@ -224,7 +224,7 @@ describe('viewChangeDiff', () => {
 
     await viewChangeDiff(mockChange);
 
-    expect(repoPending.value?.description).toBe('Fix the widget — widget');
+    expect(repoPending.value?.description).toBe('Fix the widget (widget)');
   });
 
   it('renders a single-file unregistered change inline (no file-preview overlay)', async () => {

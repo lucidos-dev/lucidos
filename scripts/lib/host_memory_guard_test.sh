@@ -11,6 +11,12 @@
 # the CI host's mood. The cases that exercise PARSING instead of policy shadow
 # `vm_stat` and `sysctl` as functions, so the awk is fed known text. Exit codes are
 # captured directly (cmd; rc=$?), never through a masking pipe.
+#
+# TWO TESTS RUN A SCRIPT THAT IS NOT IN THIS REPO. The pre-flight gate is a
+# knowhow script in the ops workspace, and the running guard must agree with it.
+# Those two shadow `vm_stat`, `sysctl` and `ps` on PATH instead of as functions,
+# because the gate runs as its own process. They read the real host no more than
+# the rest do, and they SKIP loudly when the gate is not on this machine.
 
 set -u
 
@@ -61,10 +67,57 @@ export HOST_PRESSURE_LEVEL_OVERRIDE=1
 export HOST_MEMORY_SAMPLES_FILE="$SANDBOX/host-memory-samples"
 export HOST_MEMORY_SAMPLER_PIDFILE="$SANDBOX/host-memory-sampler.pid"
 
+# A critical reading is now re-sampled before it is believed, up to 8 times 5 s
+# apart. Shadow the confirm's wait seam for the WHOLE file and record what it was
+# asked to wait, so the suite stays instant and the spacing is still assertable.
+# The seam has exactly one caller, so nothing else changes behaviour.
+CONFIRM_WAITS="$SANDBOX/confirm-waits"
+: > "$CONFIRM_WAITS"
+# shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+_host_mem_confirm_wait() { printf '%s\n' "$1" >> "$CONFIRM_WAITS"; }
+
+# How many times the confirm waited, and at what interval. Both are read after a
+# boundary call, and a stop that waited nothing is as much a finding as one that
+# waited the whole window.
+confirm_wait_count() { wc -l < "$CONFIRM_WAITS" | tr -d ' '; }
+confirm_wait_intervals() { sort -u "$CONFIRM_WAITS" | tr '\n' ' ' | sed 's/ $//'; }
+
+# Feed a SEQUENCE of pressure levels, one per read, with the last one repeating.
+# The boundary's own read takes the first and the confirm loop takes the rest, so
+# a test can replay a host whose level oscillates. `x` means the oid could not be
+# read. Call it INSIDE a subshell: it shadows the reader, and a shadow that
+# leaked would silently blind every test after it.
+#
+# The index lives in a FILE because every read happens inside a command
+# substitution, where an incremented shell variable would not survive.
+PRESSURE_SEQ_FILE="$SANDBOX/pressure-seq"
+PRESSURE_SEQ_IDX="$SANDBOX/pressure-seq-idx"
+use_pressure_sequence() {
+    printf '%s\n' "$*" > "$PRESSURE_SEQ_FILE"
+    printf '0\n' > "$PRESSURE_SEQ_IDX"
+    # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+    _host_mem_read_pressure_level() {
+        local i seq
+        i="$(cat "$PRESSURE_SEQ_IDX" 2>/dev/null || echo 0)"
+        printf '%s\n' "$((i + 1))" > "$PRESSURE_SEQ_IDX"
+        seq="$(cat "$PRESSURE_SEQ_FILE")"
+        awk -v s="$seq" -v i="$i" 'BEGIN {
+            n = split(s, a, " ")
+            v = (i + 1 <= n) ? a[i + 1] : a[n]
+            if (v != "x") printf "%s", v
+        }'
+    }
+}
+
 PASS=0
 FAIL=0
+# A skip is never a pass. Only the two pre-flight gate tests can skip, and only
+# when that script is not on this machine, so the count keeps a partial run from
+# reading as full coverage.
+SKIPPED=0
 fail() { echo "  FAIL: $*"; FAIL=$((FAIL + 1)); }
 pass() { echo "  ok:   $*"; PASS=$((PASS + 1)); }
+skip() { echo "  SKIP: $*"; SKIPPED=$((SKIPPED + 1)); }
 
 assert_eq() {
     local expected="$1" actual="$2" msg="$3"
@@ -108,6 +161,8 @@ reset_state() {
     # test's boundary reading, which is exactly the cross-test leak reset_state
     # exists to prevent.
     rm -f "$HOST_MEMORY_SAMPLES_FILE" "$HOST_MEMORY_SAMPLER_PIDFILE" 2>/dev/null || true
+    # Same reason: a previous test's confirm waits would be counted as this one's.
+    : > "$CONFIRM_WAITS"
 }
 
 # ── Test 1: the regression. A busy host that used to be stopped now runs on ──
@@ -185,26 +240,92 @@ test_swap_wins_when_all_are_over() {
     assert_eq "1" "$rc" "all over returns non-zero"
     assert_says "$OUT/both.out" "STOP: 9.00 GB of swap is in use" "swap is reported as the cause"
     assert_silent_about "$OUT/both.out" "backstop" "the backstop message is not also printed"
-    assert_silent_about "$OUT/both.out" "REAL SCARCITY" "the scarcity message is not also printed"
+    assert_silent_about "$OUT/both.out" "CORROBORATED SCARCITY" "the scarcity message is not also printed"
 }
 
-# ── Test 3: the free-headroom floor ─────────────────────────────────────────
-test_available_floor_stops_a_low_host() {
-    echo "test: available memory under the floor stops the run"
+# ── Test 3: the corroborated free-headroom floor ────────────────────────────
+# A low available reading is necessary and never sufficient. The floor stops only
+# when it is sustained AND a signal that measures the host rather than the
+# compressed-page pool agrees. The two corroborators get one test each.
+test_warn_pressure_corroborates_the_floor_and_stops() {
+    echo "test: available under the floor with the kernel at warn stops the run"
     local rc
     reset_state
-    # Compressor and swap both fine, so only the floor can be what stopped it.
-    HOST_COMPRESSOR_GB_OVERRIDE=8.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
+    # Compressor and swap both fine, so only the corroborated floor can be what
+    # stopped it, and warn pressure is the only thing corroborating.
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=8.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 15/32" >"$OUT/scarce.out" 2>&1
     rc=$?
-    assert_eq "1" "$rc" "available under the floor returns non-zero"
+    assert_eq "1" "$rc" "available under the floor with warn pressure returns non-zero"
     assert_says "$OUT/scarce.out" "STOP: available memory 3.00 GB is under the 9.60 GB floor" "the stop names the floor it broke"
-    assert_says "$OUT/scarce.out" "REAL SCARCITY" "the stop names itself as scarcity"
+    assert_says "$OUT/scarce.out" "corroborated by the kernel at warn pressure" "the stop names its corroborator"
+    assert_says "$OUT/scarce.out" "CORROBORATED SCARCITY" "the stop names itself as corroborated scarcity"
+    assert_silent_about "$OUT/scarce.out" "REAL SCARCITY" "the retired wording is gone"
     case "$MEMORY_STOP_DETAIL" in
-        *"nav chunk 15/32"*"available memory was 3.00 GB"*) pass "the detail records the boundary and reading" ;;
-        *) fail "detail did not record the boundary and reading: '$MEMORY_STOP_DETAIL'" ;;
+        *"nav chunk 15/32"*"available memory was 3.00 GB"*"corroborated by the kernel at warn"*)
+            pass "the detail records the boundary, the reading and the corroborator" ;;
+        *) fail "detail did not record the boundary, reading and corroborator: '$MEMORY_STOP_DETAIL'" ;;
     esac
+}
+
+test_swap_in_use_corroborates_the_floor_and_stops() {
+    echo "test: available under the floor with any swap in use stops the run"
+    local rc
+    reset_state
+    # 0.25 GB of swap is well under the 1 GB ceiling that stops on its own, so the
+    # swap stop cannot be what fired. It corroborates from the first byte.
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=8.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
+        HOST_SWAP_USED_GB_OVERRIDE=0.25 HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 16/32" >"$OUT/swapcorr.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "available under the floor with swap in use returns non-zero"
+    assert_says "$OUT/swapcorr.out" "corroborated by 0.25 GB of swap in use" "the stop names swap as its corroborator"
+    assert_says "$OUT/swapcorr.out" "CORROBORATED SCARCITY" "the stop names itself as corroborated scarcity"
+    assert_silent_about "$OUT/swapcorr.out" "MEASURED DISTRESS" "the swap stop itself did not fire"
+}
+
+# The regression this whole change removes. Deep scarcity on the available
+# instrument alone, with the kernel calm and no swap, is exactly what an idle
+# host reads. It must be recorded and never acted on, however far under it is.
+test_an_uncorroborated_reading_never_stops_however_deep() {
+    echo "test: 3.00 GB available with pressure normal and swap 0 runs on"
+    local rc
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=8.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
+        HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 17/32" >"$OUT/uncorr.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "an uncorroborated sub-floor reading does not stop the run"
+    assert_silent_about "$OUT/uncorr.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/uncorr.out" "note: available dipped to 3.00 GB, under the 9.60 GB floor" "the reading is still recorded"
+    assert_says "$OUT/uncorr.out" "Recorded, not a stop: it is uncorroborated." "the note says which half declined"
+    assert_says "$OUT/uncorr.out" "Pressure normal at the boundary" "the note names the signal that declined"
+    assert_says "$OUT/uncorr.out" "swap 0.00 GB" "the note names the other signal that declined"
+    assert_silent_about "$OUT/uncorr.out" "it is not sustained" "the sustain half is not blamed, because it held"
+}
+
+# The fail-open contract, applied to the corroboration. An unreadable pressure
+# oid corroborates nothing, and a guard that cannot measure the host must never
+# be able to end a run.
+test_unreadable_pressure_corroborates_nothing() {
+    echo "test: available under the floor with pressure unreadable runs on"
+    local rc
+    reset_state
+    # A subshell, so dropping the file-wide pressure pin cannot leak forward. Swap
+    # is injected, so the stubbed sysctl reaches nothing but the pressure oid.
+    (
+        unset HOST_PRESSURE_LEVEL_OVERRIDE
+        # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+        sysctl() { return 1; }
+        HOST_COMPRESSOR_GB_OVERRIDE=8.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
+            HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            check_host_memory_at_boundary "nav chunk 18/32"
+    ) >"$OUT/nocorr.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "an unreadable corroborator does not stop the run"
+    assert_silent_about "$OUT/nocorr.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/nocorr.out" "Pressure unreadable at the boundary" "the note names the corroboration it could not read"
 }
 
 test_available_at_the_floor_does_not_stop() {
@@ -225,9 +346,10 @@ test_the_floor_scales_with_ram() {
     # floor of a 16 GB one. So the same reading is danger on one machine and fine on
     # the other, which a single fixed number could never express. Compressor 5.00 GB
     # stays under both hosts' caps (16.8 and 5.6), so only the floor is in play.
+    # Warn pressure corroborates on both, so the RAM share is the only difference.
     local rc
     reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 9/32" >"$OUT/floorbig.out" 2>&1
     rc=$?
@@ -235,7 +357,7 @@ test_the_floor_scales_with_ram() {
     assert_says "$OUT/floorbig.out" "under the 9.60 GB floor" "the floor is a share of 48 GB RAM"
 
     reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=5.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=16 \
         check_host_memory_at_boundary "nav chunk 9/32" >"$OUT/floorsmall.out" 2>&1
     rc=$?
@@ -266,7 +388,7 @@ test_the_floor_uses_the_minimum_when_ram_is_unreadable() {
     got="$(_host_mem_available_floor_gb)"
     assert_eq "8" "$got" "no RAM reading falls back to the 8 GB minimum"
 
-    HOST_COMPRESSOR_GB_OVERRIDE=9.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=9.00 HOST_AVAIL_GB_OVERRIDE=3.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 \
         check_host_memory_at_boundary "nav chunk 10/32" >"$OUT/floornoram.out" 2>&1
     rc=$?
@@ -279,39 +401,107 @@ test_scarcity_wins_over_the_compressor_backstop() {
     echo "test: with available low and compressor high, the message names scarcity"
     local rc
     reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=30.00 HOST_AVAIL_GB_OVERRIDE=2.00 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=30.00 HOST_AVAIL_GB_OVERRIDE=2.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 28/34" >"$OUT/scarcewins.out" 2>&1
     rc=$?
     assert_eq "1" "$rc" "both over returns non-zero"
-    assert_says "$OUT/scarcewins.out" "REAL SCARCITY" "scarcity is reported as the cause"
+    assert_says "$OUT/scarcewins.out" "CORROBORATED SCARCITY" "scarcity is reported as the cause"
     assert_silent_about "$OUT/scarcewins.out" "RUNAWAY BACKSTOP" "the runaway message is not also printed"
     assert_silent_about "$OUT/scarcewins.out" "SURVIVABILITY" "the cap message is not also printed"
 }
 
 # The 2026-07-26 wedge reading. That night the compressor hit 17.41 GB with swap
-# still clear. This asserts that when available is also scarce at that reading, the
-# guard stops on the floor and names scarcity, ahead of the compressor cap and the
-# runaway backstop.
-test_the_2026_07_26_wedge_stops_on_the_floor() {
-    echo "test: compressor 17.41 GB, swap 0, available scarce stops on the floor"
+# still clear, and the kernel went critical. This replays the same compressor
+# reading with the kernel one level lower, at warn, so the critical stop cannot
+# fire and the corroborated floor is what has to catch it. It asserts the floor
+# is ahead of both compressor ceilings in the order.
+test_the_2026_07_26_wedge_stops_on_the_corroborated_floor() {
+    echo "test: compressor 17.41 GB, swap 0, available scarce under warn stops on the floor"
     local rc
     reset_state
-    HOST_COMPRESSOR_GB_OVERRIDE=17.41 HOST_AVAIL_GB_OVERRIDE=5.00 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=17.41 HOST_AVAIL_GB_OVERRIDE=5.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 30/34" >"$OUT/wedge.out" 2>&1
     rc=$?
-    assert_eq "1" "$rc" "the wedge reading stops when available is scarce"
+    assert_eq "1" "$rc" "the wedge reading stops when available is scarce and corroborated"
     assert_says "$OUT/wedge.out" "STOP: available memory 5.00 GB is under the 9.60 GB floor" "the floor is what stopped it"
-    assert_says "$OUT/wedge.out" "REAL SCARCITY" "scarcity is named as the cause"
+    assert_says "$OUT/wedge.out" "CORROBORATED SCARCITY" "scarcity is named as the cause"
     assert_silent_about "$OUT/wedge.out" "SURVIVABILITY" "the cap message did not also fire (scarcity is first)"
     assert_silent_about "$OUT/wedge.out" "RUNAWAY BACKSTOP" "the runaway message did not also fire"
 }
 
-# The in-run floor and the pre-flight gate must never disagree. The gate refuses to
-# START a run under 8 GB available (AVAILABLE_MIN_GB), so the in-run floor must
-# never drop below 8, or the running guard would continue on a host the gate would
-# have refused. max(8, 20% of RAM) guarantees it on every host size.
+# ── the in-run floor and the pre-flight gate judge available the same way ────
+# Where the gate lives. It is a knowhow script in the ops workspace rather than a
+# repo file, so the two agreement tests below locate it and say so loudly when it
+# is not on this machine. They never silently pass on a host that has no gate.
+PREFLIGHT_GATE="${PREFLIGHT_GATE:-$HOME/workspaces/dev/data/knowhow/lucidos-ops/scripts/preflight-memory-gate.sh}"
+
+# The gate reads the host through vm_stat, sysctl and ps, and it now also SLEEPS
+# between its confirm re-samples. Shadow all four on PATH so one known reading
+# can be replayed through it, the same way every test above replays one through
+# the running guard. awk and sed stay real.
+#
+# $1 available GB (split evenly over the four buckets the gate sums), $2 the
+# pressure level OR a space-separated SEQUENCE of them, one per read with the
+# last repeating, $3 swap MB, $4 compressor GB, $5 physical GB.
+#
+# The sequence is what makes an oscillating host replayable: the gate's own read
+# takes the first level and its confirm loop takes the rest. The index lives in a
+# file because each read is a separate process.
+GATE_PRESSURE_IDX="$SANDBOX/gate-pressure-idx"
+GATE_SLEEPS="$SANDBOX/gate-sleeps"
+install_gate_host_stubs() {
+    local dir="$SANDBOX/gate-bin" pages_per_gb=65536
+    mkdir -p "$dir"
+    printf '0\n' > "$GATE_PRESSURE_IDX"
+    : > "$GATE_SLEEPS"
+    cat > "$dir/vm_stat" <<EOF
+#!/bin/bash
+echo "Mach Virtual Memory Statistics: (page size of 16384 bytes)"
+awk -v a="$1" -v c="$4" -v p="$pages_per_gb" 'BEGIN {
+    printf "Pages free:                          %d.\n", a * p / 4
+    printf "Pages speculative:                   %d.\n", a * p / 4
+    printf "Pages purgeable:                     %d.\n", a * p / 4
+    printf "File-backed pages:                   %d.\n", a * p / 4
+    printf "Pages occupied by compressor:        %d.\n", c * p
+    printf "Anonymous pages:                     %d.\n", p
+}'
+EOF
+    cat > "$dir/sysctl" <<EOF
+#!/bin/bash
+case "\$*" in
+    *kern.memorystatus_vm_pressure_level*)
+        i="\$(cat "$GATE_PRESSURE_IDX" 2>/dev/null || echo 0)"
+        echo "\$((i + 1))" > "$GATE_PRESSURE_IDX"
+        awk -v s="$2" -v i="\$i" 'BEGIN {
+            n = split(s, a, " ")
+            print (i + 1 <= n) ? a[i + 1] : a[n]
+        }'
+        ;;
+    *vm.swapusage*) echo "total = 0.00M  used = $3M  free = 0.00M  (encrypted)" ;;
+    *hw.memsize*) awk -v g="$5" 'BEGIN { printf "%.0f\n", g * 1073741824 }' ;;
+    *) exit 1 ;;
+esac
+EOF
+    # The gate's confirm window is 40 seconds of real sleeping. Record what it
+    # was asked to wait instead, so the suite stays instant and "did it wait at
+    # all?" is still assertable: an arm that must be immediate must not sleep.
+    cat > "$dir/sleep" <<EOF
+#!/bin/bash
+printf '%s\n' "\$1" >> "$GATE_SLEEPS"
+exit 0
+EOF
+    printf '#!/bin/bash\nexit 0\n' > "$dir/ps"
+    chmod +x "$dir/vm_stat" "$dir/sysctl" "$dir/ps" "$dir/sleep"
+    printf '%s' "$dir"
+}
+
+gate_sleep_count() { wc -l < "$GATE_SLEEPS" | tr -d ' '; }
+
+# The 8 GB minimum is the number both guards share, so it is pinned on both sides
+# rather than only on ours. The gate's own thresholds are read out of its source,
+# because a comment claiming they match is not a test.
 test_the_floor_is_never_below_the_preflight_gate() {
     echo "test: the in-run floor is never below the pre-flight gate's 8 GB threshold"
     local got size
@@ -325,6 +515,252 @@ test_the_floor_is_never_below_the_preflight_gate() {
             fail "floor on a ${size} GB host is $got GB, below the gate's 8 GB"
         fi
     done
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half is unverified here"
+        return
+    fi
+    if grep -qE '^AVAILABLE_MIN_GB=\$\{AVAILABLE_MIN_GB:-8\}' "$PREFLIGHT_GATE"; then
+        pass "the gate's AVAILABLE_MIN_GB default is the same 8 GB"
+    else
+        fail "the gate's AVAILABLE_MIN_GB default is no longer 8 GB"
+    fi
+    if grep -q 'corroborat' "$PREFLIGHT_GATE"; then
+        pass "the gate's available line is corroborated, like the in-run floor"
+    else
+        fail "the gate's available line lost its corroboration"
+    fi
+    if grep -qE '^COMPRESSOR_MAX_GB=' "$PREFLIGHT_GATE"; then
+        fail "the gate's unconditional COMPRESSOR_MAX_GB is back; it was retired for a runaway backstop"
+    else
+        pass "the gate has no unconditional compressor ceiling"
+    fi
+
+    # The critical-pressure rule is the third instrument the two share, and every
+    # number in it is pinned on both sides. A comment claiming they match is not
+    # a test, so each default is read out of the gate's own source.
+    if grep -qE '^PRESSURE_MAX=' "$PREFLIGHT_GATE"; then
+        fail "the gate's unconditional PRESSURE_MAX is back; it made warn a refusal, which the guard has never done"
+    else
+        pass "the gate has no unconditional pressure ceiling"
+    fi
+    assert_eq "2" "$HOST_MEMORY_COLLAPSE_ABS_GB" "the guard's collapse minimum is 2 GB"
+    assert_eq "5" "$HOST_MEMORY_COLLAPSE_PCT" "the guard's collapse share is 5% of RAM"
+    assert_eq "8" "$HOST_MEMORY_CRITICAL_CONFIRM_SAMPLES" "the guard confirms over 8 samples"
+    assert_eq "5" "$HOST_MEMORY_CRITICAL_CONFIRM_SECS" "the guard spaces them 5 s apart"
+    for pin in 'COLLAPSE_MIN_GB=\$\{COLLAPSE_MIN_GB:-2\}' \
+        'COLLAPSE_PCT=\$\{COLLAPSE_PCT:-5\}' \
+        'CRITICAL_CONFIRM_SAMPLES=\$\{CRITICAL_CONFIRM_SAMPLES:-8\}' \
+        'CRITICAL_CONFIRM_SECS=\$\{CRITICAL_CONFIRM_SECS:-5\}'; do
+        if grep -qE "^$pin" "$PREFLIGHT_GATE"; then
+            pass "the gate carries the guard's own default: ${pin%%=*}"
+        else
+            fail "the gate's ${pin%%=*} no longer matches the guard's value"
+        fi
+    done
+}
+
+# THE 2026-09-12 OSCILLATION TRACE, replayed through both instruments. Ten
+# samples of an idle host 18 seconds apart, nothing of ours running: the level
+# goes 2 2 4 4 2 4 4 2 4 4 while available stays flat at 11 GB, the compressor
+# does not move by a page, swap is exactly zero and load is falling. Six of ten
+# read critical. This is the reading that refused 22 gate checks and three
+# nightlies, and neither instrument may act on it.
+test_the_oscillating_idle_host_stops_neither_guard() {
+    echo "test: the idle-host pressure oscillation (2/4 flapping, available flat at 11 GB) is GO for both"
+    local rc bin
+    reset_state
+    # The trace as the sampler would have recorded it: level, compressor,
+    # available, swap. Every available reading is above the 9.60 GB floor, so the
+    # floor is not what is under test here; the pressure column is.
+    printf '%s\n' \
+        '2 17.28 11.08 0.00' '2 17.28 11.03 0.00' '4 17.28 10.84 0.00' \
+        '4 17.28 11.05 0.00' '2 17.28 11.09 0.00' '4 17.28 11.07 0.00' \
+        '4 17.28 11.09 0.00' '2 17.28 11.10 0.00' '4 17.28 11.00 0.00' \
+        '4 17.28 11.01 0.00' > "$HOST_MEMORY_SAMPLES_FILE"
+    (
+        # The boundary lands on a critical reading, and the flapping continues
+        # into the confirm exactly as the trace does.
+        use_pressure_sequence 4 4 2 4 4 2
+        HOST_COMPRESSOR_GB_OVERRIDE=17.28 HOST_AVAIL_GB_OVERRIDE=11.01 \
+            HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            check_host_memory_at_boundary "nav chunk 33/34"
+    ) >"$OUT/osc.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the running guard does not stop on the oscillating idle host"
+    assert_silent_about "$OUT/osc.out" "STOP:" "the running guard announced no stop"
+    assert_says "$OUT/osc.out" "did not hold it" "the running guard names the reading as transient"
+    assert_says "$OUT/osc.out" "worst of 10 samples" "it judged the whole trace"
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half of the agreement is unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 11.01 "4 4 2 4 4 2" 0.00 17.28 48)"
+    PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/osc-gate.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the pre-flight gate says GO on the same oscillation"
+    assert_says "$OUT/osc-gate.out" "VERDICT: GO" "the gate's verdict is GO"
+    assert_silent_about "$OUT/osc-gate.out" "NO-GO" "the gate refused nothing"
+    assert_says "$OUT/osc-gate.out" "CRITICAL did not hold" "the gate names the reading as transient"
+}
+
+# The other end of the same instrument, and the reading that must never stop
+# being a stop. Critical with the headroom gone is the 2026-07-26 freeze, and
+# neither instrument may wait 40 seconds before getting out of the way.
+test_the_freeze_reading_stops_both_guards() {
+    echo "test: the freeze reading (critical, 0.30 GB available) stops the guard and refuses the gate, at once"
+    local rc bin
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=17.41 \
+        HOST_AVAIL_GB_OVERRIDE=0.30 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 33/34" >"$OUT/freezeboth.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the running guard stops on the freeze signature"
+    assert_says "$OUT/freezeboth.out" "FREEZE SIGNATURE" "the running guard names the arm"
+    assert_eq "0" "$(confirm_wait_count)" "the running guard did not wait"
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half of the agreement is unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 0.30 4 0.00 17.41 48)"
+    PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/freeze-gate.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the pre-flight gate refuses the freeze reading"
+    assert_says "$OUT/freeze-gate.out" "VERDICT: NO-GO" "the gate's verdict is NO-GO"
+    assert_says "$OUT/freeze-gate.out" "freeze signature" "the gate names what it saw"
+    assert_eq "0" "$(gate_sleep_count)" "the gate did not wait either"
+}
+
+# And the middle case, which is the new rule working. Nothing corroborates, so
+# both instruments spend the whole window, and both then act.
+test_sustained_critical_stops_both_guards() {
+    echo "test: critical that holds through the whole window stops the guard and refuses the gate"
+    local rc bin
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=17.28 \
+        HOST_AVAIL_GB_OVERRIDE=11.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 33/34" >"$OUT/heldboth.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the running guard stops once critical has held"
+    assert_says "$OUT/heldboth.out" "and it HELD" "the running guard says the level persisted"
+    assert_eq "8" "$(confirm_wait_count)" "the running guard spent the whole window"
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half of the agreement is unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 11.00 4 0.00 17.28 48)"
+    PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/held-gate.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the pre-flight gate refuses a sustained critical"
+    assert_says "$OUT/held-gate.out" "VERDICT: NO-GO" "the gate's verdict is NO-GO"
+    assert_says "$OUT/held-gate.out" "held through all 8 re-samples over 40s" "the gate quotes the window it spent"
+    assert_eq "8" "$(gate_sleep_count)" "the gate spent the whole window too"
+}
+
+# THE INVARIANT THAT KEEPS THIS BUG FROM COMING BACK IN A THIRD FORM. A reading a
+# completely idle host produces must never be able to stop anything, and the two
+# guards must agree about it. This is the 09:00 probe of 2026-09-09: nothing was
+# running, and the old floor and the old gate would both have refused the host.
+test_an_idle_host_reading_stops_neither_guard() {
+    echo "test: the idle-host reading (available 8.79, pressure normal, swap 0, compressor 14.30) is GO for both"
+    local rc bin
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=14.30 \
+        HOST_AVAIL_GB_OVERRIDE=8.79 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 21/34" >"$OUT/idle.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the running guard does not stop on an idle host's reading"
+    assert_silent_about "$OUT/idle.out" "STOP:" "the running guard announced no stop"
+    assert_says "$OUT/idle.out" "it is uncorroborated" "the running guard records the reading and says why it declined"
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half of the agreement is unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 8.79 1 0.00 14.30 48)"
+    PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/idle-gate.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the pre-flight gate says GO on the same idle-host reading"
+    assert_says "$OUT/idle-gate.out" "VERDICT: GO" "the gate's verdict is GO"
+    assert_silent_about "$OUT/idle-gate.out" "NO-GO" "the gate refused nothing"
+}
+
+# The other half of the agreement: the two must also both stop on a host that is
+# genuinely in trouble. Available under the floor with swap in use corroborates
+# on both sides, so neither can drift into ignoring a real one.
+test_a_corroborated_low_host_stops_both_guards() {
+    echo "test: available 3.00 GB with swap in use is a stop for the guard and a NO-GO for the gate"
+    local rc bin
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=10.00 \
+        HOST_AVAIL_GB_OVERRIDE=3.00 HOST_SWAP_USED_GB_OVERRIDE=0.25 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 22/34" >"$OUT/lowboth.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the running guard stops on corroborated scarcity"
+    assert_says "$OUT/lowboth.out" "CORROBORATED SCARCITY" "the running guard names the stop"
+
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its half of the agreement is unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 3.00 1 256.00 10.00 48)"
+    PATH="$bin:$PATH" bash "$PREFLIGHT_GATE" >"$OUT/low-gate.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the pre-flight gate refuses the same host"
+    assert_says "$OUT/low-gate.out" "VERDICT: NO-GO" "the gate's verdict is NO-GO"
+    assert_says "$OUT/low-gate.out" "corroborated" "the gate names the corroboration it found"
+}
+
+# The gate's half of the knob invariant the guard pins just below. Its two
+# confirm knobs are the only ones that fail DANGEROUSLY: a non-numeric count
+# makes its `-lt` test error, so the loop never runs and one reading becomes a
+# NO-GO, and a zero interval takes every sample in the same instant. Both are
+# the false stop this whole rule exists to remove, so both must fall back.
+test_a_garbage_confirm_knob_does_not_refuse_the_gate() {
+    echo "test: an unusable confirm knob falls back rather than refusing a healthy host"
+    local rc bin
+    reset_state
+    if [ ! -f "$PREFLIGHT_GATE" ]; then
+        skip "the pre-flight gate is not on this machine ($PREFLIGHT_GATE), so its knobs are unverified here"
+        return
+    fi
+    bin="$(install_gate_host_stubs 11.01 "4 2" 0.00 17.28 48)"
+    PATH="$bin:$PATH" CRITICAL_CONFIRM_SAMPLES=banana bash "$PREFLIGHT_GATE" >"$OUT/badknob.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a non-numeric sample count does not refuse the host"
+    assert_says "$OUT/badknob.out" "is not a count of 2 or more, using 8" "the gate names the value it rejected"
+    assert_says "$OUT/badknob.out" "VERDICT: GO" "the gate still judged the host on its readings"
+
+    bin="$(install_gate_host_stubs 11.01 "4 2" 0.00 17.28 48)"
+    PATH="$bin:$PATH" CRITICAL_CONFIRM_SECS=0 bash "$PREFLIGHT_GATE" >"$OUT/badsecs.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a zero interval does not refuse the host"
+    assert_says "$OUT/badsecs.out" "is not a wait of a second or more, using 5" "the gate names the interval it rejected"
+
+    # `1e3` is the one the guard's own shape test exists for: awk reads it as
+    # 1000, and `sleep 1e3` then errors and waits for nothing. The two
+    # instruments reject it identically.
+    assert_eq "5" "$(LUCIDOS_E2E_CRITICAL_SECS=1e3 _host_mem_critical_confirm_secs)" "the guard rejects an exponent"
+    bin="$(install_gate_host_stubs 11.01 "4 2" 0.00 17.28 48)"
+    PATH="$bin:$PATH" CRITICAL_CONFIRM_SECS=1e3 bash "$PREFLIGHT_GATE" >"$OUT/expsecs.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the gate rejects an exponent too, rather than waiting for nothing"
+    assert_says "$OUT/expsecs.out" "CRITICAL_CONFIRM_SECS='1e3'" "the gate names the exponent it rejected"
+
+    # The retired knob is named rather than silently obeyed, the same treatment
+    # the guard gives LUCIDOS_E2E_COMPRESSOR_CAP_GB.
+    bin="$(install_gate_host_stubs 11.01 "4 2" 0.00 17.28 48)"
+    PATH="$bin:$PATH" PRESSURE_MAX=1 bash "$PREFLIGHT_GATE" >"$OUT/staleknob.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "a stale PRESSURE_MAX no longer refuses a host at warn"
+    assert_says "$OUT/staleknob.out" "PRESSURE_MAX is set and is no longer read" "the retired knob is named"
 }
 
 # ── Test 4: the runaway backstop, the only compressor ceiling left ───────────
@@ -367,12 +803,14 @@ test_the_runaway_backstop_scales_with_ram() {
     assert_silent_about "$OUT/runaway.out" "SURVIVABILITY" "no survivability cap wording survives"
 }
 
-# ── Test 5: the kernel's own verdict is the danger stop ──────────────────────
+# ── Test 5: the kernel's own verdict is the danger stop, ONCE IT HOLDS ───────
 # CRITICAL is the freeze signature: the one recorded freeze on this host read
 # compressor 17.41 GB, free 0.04 GB, pressure critical. Compressor size did not
-# distinguish it from a healthy night; pressure did.
+# distinguish it from a healthy night; pressure did. What pressure alone does NOT
+# distinguish is an idle host: it read critical in six of ten samples at 15:52 to
+# 15:55 on 2026-09-12 with available flat at 11 GB. So it is re-sampled first.
 test_critical_pressure_stops_an_otherwise_healthy_looking_host() {
-    echo "test: kernel pressure critical stops, even with every other reading fine"
+    echo "test: kernel pressure critical that HOLDS stops, even with every other reading fine"
     local rc
     reset_state
     HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=6.00 \
@@ -380,11 +818,141 @@ test_critical_pressure_stops_an_otherwise_healthy_looking_host() {
         HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 9/34" >"$OUT/crit.out" 2>&1
     rc=$?
-    assert_eq "1" "$rc" "critical pressure stops the run"
+    assert_eq "1" "$rc" "sustained critical pressure stops the run"
     assert_says "$OUT/crit.out" "CRITICAL memory pressure" "the stop names the pressure level"
     assert_says "$OUT/crit.out" "KERNEL'S OWN VERDICT" "the stop says why pressure is the instrument"
     assert_says "$OUT/crit.out" "pressure critical," "the boundary line states the level"
     assert_silent_about "$OUT/crit.out" "RUNAWAY" "the compressor did not also fire"
+    # It was not believed on the first reading. Nothing corroborated it here, so
+    # the whole window had to be spent before the stop was allowed.
+    assert_says "$OUT/crit.out" "8 of 8 samples over" "the stop quotes the confirm window it spent"
+    assert_eq "8" "$(confirm_wait_count)" "the confirm took all eight samples"
+    assert_eq "5" "$(confirm_wait_intervals)" "the samples were five seconds apart"
+}
+
+# THE REGRESSION THIS CHANGE EXISTS TO REMOVE. One critical reading at the
+# boundary, on a host whose every other instrument says it is fine, used to end
+# the run at once. On the measured host that reading arrives six times in ten
+# samples with nothing running.
+test_a_single_critical_reading_at_the_boundary_does_not_stop() {
+    echo "test: a critical boundary reading that does not hold is recorded, not acted on"
+    local rc
+    reset_state
+    (
+        # Critical at the boundary, then the level drops back on the very first
+        # confirm sample. That is the oscillation, replayed.
+        use_pressure_sequence 4 2 4 2
+        HOST_COMPRESSOR_GB_OVERRIDE=17.28 HOST_AVAIL_GB_OVERRIDE=11.01 \
+            HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            check_host_memory_at_boundary "nav chunk 9/34"
+    ) >"$OUT/crittick.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "one critical reading does not stop the run"
+    assert_silent_about "$OUT/crittick.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/crittick.out" "did not hold it" "the note says the level did not hold"
+    assert_says "$OUT/crittick.out" "Sample 1 of 8" "the note says which sample ended the confirm"
+    assert_says "$OUT/crittick.out" "read warn" "the note names the level that ended it"
+    assert_says "$OUT/crittick.out" "transient edge notification" "the note names what the reading is"
+    assert_says "$OUT/crittick.out" "or available at or under 2.40 GB, or swap in use" "the note states what a stop would have needed"
+    assert_eq "1" "$(confirm_wait_count)" "the confirm exited on the first non-critical sample"
+}
+
+# The freeze arm. Critical WITH the headroom gone is unconditional: it must not
+# spend 40 seconds confirming a host that is already wedging.
+test_critical_with_the_headroom_gone_stops_without_waiting() {
+    echo "test: critical with available under the collapse level stops at once"
+    local rc
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=17.41 \
+        HOST_AVAIL_GB_OVERRIDE=1.50 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 9/34" >"$OUT/collapse.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the collapse arm stops the run"
+    assert_says "$OUT/collapse.out" "FREEZE SIGNATURE" "the stop names itself"
+    assert_says "$OUT/collapse.out" "at or under the 2.40 GB collapse level" "the stop quotes the level it broke"
+    assert_eq "0" "$(confirm_wait_count)" "it waited for nothing"
+}
+
+# The swap arm. Swap is accumulated state, so it corroborates from the first byte
+# and needs no window either.
+test_critical_with_swap_in_use_stops_without_waiting() {
+    echo "test: critical with any swap in use stops at once"
+    local rc
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=9.00 \
+        HOST_AVAIL_GB_OVERRIDE=30.00 HOST_SWAP_USED_GB_OVERRIDE=0.25 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 9/34" >"$OUT/critswap.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the swap-corroborated arm stops the run"
+    assert_says "$OUT/critswap.out" "CORROBORATED CRITICAL PRESSURE" "the stop names itself"
+    assert_says "$OUT/critswap.out" "0.25 GB of" "the stop quotes the swap reading"
+    assert_eq "0" "$(confirm_wait_count)" "it waited for nothing"
+    # 0.25 GB is under the 1 GB swap ceiling, so the swap stop of its own could
+    # not have fired here. Only the conjunction did.
+    assert_silent_about "$OUT/critswap.out" "MEASURED DISTRESS" "the swap stop of its own did not fire"
+}
+
+# Fail open, mid-confirm. An oid that stops answering is not evidence the host is
+# in trouble, so the confirm ends and the run continues.
+test_an_unreadable_level_mid_confirm_does_not_stop() {
+    echo "test: an unreadable level during the confirm ends it without a stop"
+    local rc
+    reset_state
+    (
+        use_pressure_sequence 4 4 4 x
+        HOST_COMPRESSOR_GB_OVERRIDE=6.00 HOST_AVAIL_GB_OVERRIDE=30.00 \
+            HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
+            check_host_memory_at_boundary "nav chunk 9/34"
+    ) >"$OUT/critblind.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "an unreadable level mid-confirm does not stop the run"
+    assert_silent_about "$OUT/critblind.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/critblind.out" "read unreadable" "the note names the reading that ended the confirm"
+    assert_says "$OUT/critblind.out" "Sample 3 of 8" "it ended on the sample that could not be read"
+}
+
+# The window's own knobs. A garbage value must fall back, and so must a value
+# that would disarm the rule: one sample is not a window, and a zero interval
+# takes every reading of the same latched level in the same instant.
+test_the_confirm_window_knobs_fall_back_rather_than_disarming() {
+    echo "test: the confirm knobs reject a value that would disarm the sustain rule"
+    assert_eq "8" "$(_host_mem_critical_confirm_samples)" "the default is eight samples"
+    assert_eq "5" "$(_host_mem_critical_confirm_secs)" "the default is five seconds apart"
+    assert_eq "4" "$(LUCIDOS_E2E_CRITICAL_SAMPLES=4 _host_mem_critical_confirm_samples)" "an explicit count is honoured"
+    assert_eq "8" "$(LUCIDOS_E2E_CRITICAL_SAMPLES=1 _host_mem_critical_confirm_samples)" "one sample is not a window, so it falls back"
+    assert_eq "8" "$(LUCIDOS_E2E_CRITICAL_SAMPLES=banana _host_mem_critical_confirm_samples)" "a non-numeric count falls back"
+    assert_eq "8" "$(LUCIDOS_E2E_CRITICAL_SAMPLES=08 _host_mem_critical_confirm_samples)" "a leading zero is read as decimal, not octal"
+    assert_eq "5" "$(LUCIDOS_E2E_CRITICAL_SECS=0 _host_mem_critical_confirm_secs)" "a zero interval falls back"
+    assert_eq "5" "$(LUCIDOS_E2E_CRITICAL_SECS=banana _host_mem_critical_confirm_secs)" "a non-numeric interval falls back"
+    assert_eq "10" "$(LUCIDOS_E2E_CRITICAL_SECS=10 _host_mem_critical_confirm_secs)" "an explicit interval is honoured"
+}
+
+# The collapse level scales with the host the way the floor does, and sits well
+# under the lowest reading an idle host has produced (8.79 GB).
+test_the_collapse_level_scales_with_ram() {
+    echo "test: the collapse level is max(2 GB, 5% of RAM) and never reaches an idle host"
+    local got size
+    assert_eq "2.40" "$(HOST_PHYSMEM_GB_OVERRIDE=48 _host_mem_collapse_level_gb)" "2.40 GB on a 48 GB host"
+    assert_eq "2.00" "$(HOST_PHYSMEM_GB_OVERRIDE=16 _host_mem_collapse_level_gb)" "the 2 GB minimum holds on a 16 GB host"
+    assert_eq "4.80" "$(HOST_PHYSMEM_GB_OVERRIDE=96 _host_mem_collapse_level_gb)" "4.80 GB on a 96 GB host"
+    # Shadow sysctl in a subshell so hw.memsize is unreadable. A level in bytes
+    # needs no RAM total, so the absolute still applies rather than lapsing.
+    # shellcheck disable=SC2329 # a seam: invoked by the sourced guard, not from this file
+    assert_eq "2" "$(sysctl() { return 1; }; _host_mem_collapse_level_gb)" "unreadable RAM leaves the absolute standing"
+    assert_eq "2.40" "$(HOST_PHYSMEM_GB_OVERRIDE=48 LUCIDOS_E2E_COLLAPSE_PCT=banana _host_mem_collapse_level_gb)" "a garbage share falls back"
+    # The collapse level must stay under the available floor on every host size,
+    # or critical pressure would stop before the corroborated floor ever could.
+    for size in 1 8 16 48 96; do
+        got="$(HOST_PHYSMEM_GB_OVERRIDE="$size" _host_mem_collapse_level_gb)"
+        if awk -v c="$got" -v f="$(HOST_PHYSMEM_GB_OVERRIDE="$size" _host_mem_available_floor_gb)" \
+            'BEGIN { exit (c + 0 < f + 0) ? 0 : 1 }'; then
+            pass "collapse on a ${size} GB host is $got GB, under that host's floor"
+        else
+            fail "collapse on a ${size} GB host is $got GB, at or above its floor"
+        fi
+    done
 }
 
 # WARN is reported and never acted on: 92 occurrences across 5749 host samples
@@ -464,10 +1032,30 @@ test_last_nights_boundary_now_runs_on() {
     assert_silent_about "$OUT/lastnight.out" "STOP" "no stop was announced"
 }
 
+# The false stop this change removes, replayed exactly. Available 9.05 GB against
+# the 9.60 GB floor, kernel pressure normal, swap 0.00. Nothing else about the
+# host was wrong, and the 55 specs it cut were later discharged clean on the same
+# commit with 12.86 GB as their lowest boundary reading.
+test_the_available_floor_false_stop_now_runs_on() {
+    echo "test: available 9.05 GB with pressure normal and swap 0 runs on"
+    local rc
+    reset_state
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=16.90 \
+        HOST_AVAIL_GB_OVERRIDE=9.05 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 16/34" >"$OUT/falsestop.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "the boundary that stopped four nightlies no longer stops"
+    assert_silent_about "$OUT/falsestop.out" "STOP" "no stop was announced"
+    assert_says "$OUT/falsestop.out" "it is uncorroborated" "the reading is still recorded, with the reason it was not acted on"
+}
+
 # The freeze itself, for contrast, on the same instrument. Compressor 17.41 GB is
 # 0.30 GB from the healthy reading above; pressure and available are what differ.
+# It must stop INSTANTLY: a host already wedging must not be made to wait out a
+# 40-second sustain window before the run gets out of its way.
 test_the_recorded_freeze_reading_stops() {
-    echo "test: the recorded freeze reading (critical, 0.04 GB free) stops"
+    echo "test: the recorded freeze reading (critical, 0.04 GB free) stops at once"
     local rc
     reset_state
     HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=17.41 \
@@ -477,14 +1065,25 @@ test_the_recorded_freeze_reading_stops() {
     rc=$?
     assert_eq "1" "$rc" "the freeze reading stops"
     assert_says "$OUT/freeze.out" "CRITICAL memory pressure" "pressure is what caught it, ahead of the floor"
+    assert_says "$OUT/freeze.out" "FREEZE SIGNATURE" "it is the collapse arm that caught it"
+    assert_eq "0" "$(confirm_wait_count)" "the freeze signature never waits out a window"
 }
 
 # ── Test 7: the boundary judges the whole chunk, not the instant ─────────────
 # A boundary sample bounds the reading at the boundary and says nothing about the
 # chunk that just ran. The sampler's window is folded over it, worst per
-# dimension, so an excursion that came and went is still seen.
-test_a_critical_excursion_inside_the_chunk_is_seen_at_the_boundary() {
-    echo "test: a critical sample mid-chunk stops even when the boundary reads healthy"
+# dimension, so an excursion that came and went is still seen and still reported.
+#
+# WHAT CHANGED, AND WHY THIS ASSERTION IS INVERTED. This case used to require a
+# STOP: two critical samples inside the chunk ended the run even though the
+# boundary read normal. The 2026-09-12 trace retired that rule. An idle host
+# produced critical in six of ten samples with available flat at 11 GB, so two
+# criticals in a window is what a healthy machine looks like here. A critical
+# that has cleared by the boundary now leaves nothing live to re-sample, so it is
+# reported and never acted on. The collapse and swap arms still read the folded
+# window, and the two tests after this one pin them.
+test_a_cleared_critical_excursion_is_reported_and_not_acted_on() {
+    echo "test: a critical excursion that cleared by the boundary is recorded, not a stop"
     local rc
     reset_state
     printf '1 6.00 30.00 0.00\n4 9.00 11.00 0.00\n4 9.10 11.20 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
@@ -493,9 +1092,32 @@ test_a_critical_excursion_inside_the_chunk_is_seen_at_the_boundary() {
         HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 7/34" >"$OUT/peak.out" 2>&1
     rc=$?
-    assert_eq "1" "$rc" "the mid-chunk critical excursion stops the run"
+    assert_eq "0" "$rc" "the cleared excursion does not stop the run"
     assert_says "$OUT/peak.out" "worst of 3 samples" "the line says it judged the window"
-    assert_says "$OUT/peak.out" "CRITICAL memory pressure" "the excursion is what stopped it"
+    assert_says "$OUT/peak.out" "pressure critical," "the excursion still reaches the boundary line"
+    assert_says "$OUT/peak.out" "CRITICAL in 2 of 3 samples during the chunk" "the note counts the excursion"
+    assert_says "$OUT/peak.out" "read normal at the boundary itself" "the note states the boundary reading"
+    assert_says "$OUT/peak.out" "had cleared by the boundary" "the note says why it was not acted on"
+    assert_silent_about "$OUT/peak.out" "STOP:" "no stop was announced"
+    assert_eq "0" "$(confirm_wait_count)" "a cleared excursion is not worth confirming"
+}
+
+# The collapse arm still reads the FOLDED window, because a freeze counts
+# whenever inside the chunk it happened. Here the boundary itself reads healthy
+# on both dimensions and only the window carries the freeze.
+test_a_collapse_inside_the_chunk_stops_though_the_boundary_recovered() {
+    echo "test: critical with the headroom gone mid-chunk stops, though the boundary recovered"
+    local rc
+    reset_state
+    printf '1 6.00 30.00 0.00\n4 9.00 0.80 0.00\n1 6.10 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=30.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 7/34" >"$OUT/peakcollapse.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the folded freeze signature stops the run"
+    assert_says "$OUT/peakcollapse.out" "FREEZE SIGNATURE" "the stop names itself"
+    assert_eq "0" "$(confirm_wait_count)" "the collapse arm never waits"
 }
 
 test_the_window_folds_worst_per_dimension() {
@@ -504,11 +1126,55 @@ test_the_window_folds_worst_per_dimension() {
     reset_state
     printf '1 6.00 30.00 0.00\n2 9.50 11.00 0.25\n1 7.00 22.00 0.10\n' > "$HOST_MEMORY_SAMPLES_FILE"
     got="$(_host_mem_window_worst)"
-    assert_eq "2 9.50 11.00 0.25 0 3" "$got" "worst is max level, max compressor, min available, max swap"
+    assert_eq "2 9.50 11.00 0.25 0 1 0 3" "$got" "worst is max level, max compressor, min available, max swap"
     # Reading TRUNCATES, so the next boundary judges its own chunk rather than
     # inheriting this one's peak forever.
     got="$(_host_mem_window_worst)"
     assert_eq "" "$got" "a second read sees an empty window"
+}
+
+# The under-floor count is the floor's sustain evidence, and it is the one number
+# in the fold that does not move with window length. Without a usable floor there
+# is nothing to be under, so the count is zero rather than a guess.
+test_the_window_counts_under_floor_samples() {
+    echo "test: the fold counts how many samples read under the floor it was given"
+    local got
+    reset_state
+    printf '1 6.00 30.00 0.00\n1 6.50 9.45 0.00\n1 6.20 9.10 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst 9.60)"
+    assert_eq "1 6.50 9.10 0.00 0 0 2 3" "$got" "two of three samples are under the 9.60 floor"
+
+    reset_state
+    printf '1 6.00 30.00 0.00\n1 6.50 9.60 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst 9.60)"
+    assert_eq "1 6.50 9.60 0.00 0 0 0 2" "$got" "a sample exactly at the floor is not under it"
+
+    reset_state
+    printf '1 6.00 3.00 0.00\n1 6.50 2.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst banana)"
+    assert_eq "1 6.50 2.00 0.00 0 0 0 2" "$got" "an unusable floor counts nothing rather than everything"
+}
+
+# The corroboration's own sustain evidence, and the counterpart of the critical
+# count. A critical sample is warn-or-worse too, so it counts on both; a garbage
+# level counts on neither, because a reading nobody can interpret is not evidence.
+test_the_window_counts_warn_or_worse_samples() {
+    echo "test: the fold counts how many samples read warn or worse"
+    local got
+    reset_state
+    printf '1 6.00 30.00 0.00\n2 6.50 29.00 0.00\n1 6.20 28.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst)"
+    assert_eq "2 6.50 28.00 0.00 0 1 0 3" "$got" "one of three samples read warn"
+
+    reset_state
+    printf '4 6.00 30.00 0.00\n2 6.50 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst)"
+    assert_eq "4 6.50 29.00 0.00 1 2 0 2" "$got" "a critical sample counts as warn or worse as well"
+
+    reset_state
+    printf '7 6.00 30.00 0.00\n- 6.50 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    got="$(_host_mem_window_worst)"
+    assert_eq "7 6.50 29.00 0.00 0 0 0 2" "$got" "a garbage level and an unreadable one corroborate nothing"
 }
 
 # A torn final record leaves $3 empty, which is not the "-" sentinel, and awk
@@ -520,7 +1186,7 @@ test_a_short_record_is_discarded_rather_than_read_as_zero() {
     reset_state
     printf '1 6.00 30.00 0.00\n\n' > "$HOST_MEMORY_SAMPLES_FILE"
     got="$(_host_mem_window_worst)"
-    assert_eq "1 6.00 30.00 0.00 0 1" "$got" "the blank line is dropped, not folded in as zeros"
+    assert_eq "1 6.00 30.00 0.00 0 0 0 1" "$got" "the blank line is dropped, not folded in as zeros"
 
     reset_state
     printf '1 6.00 30.00 0.00\n1 6.10\n' > "$HOST_MEMORY_SAMPLES_FILE"
@@ -548,11 +1214,15 @@ test_one_critical_tick_mid_chunk_does_not_stop() {
     rc=$?
     assert_eq "0" "$rc" "one critical tick does not stop the run"
     assert_says "$OUT/onetick.out" "pressure critical," "the peak is still reported on the line"
+    assert_says "$OUT/onetick.out" "CRITICAL in 1 of 3 samples during the chunk" "the note counts the tick it saw"
     assert_silent_about "$OUT/onetick.out" "STOP:" "no stop was announced"
 }
 
-test_critical_still_standing_at_the_boundary_stops_on_its_own() {
-    echo "test: critical at the boundary itself stops, with no window at all"
+# Critical standing at the boundary is the ONLY reading worth re-sampling, and
+# re-sampling is what it gets. It no longer stops on its own: the sustain window
+# is what turns a reading into evidence.
+test_critical_still_standing_at_the_boundary_is_confirmed_before_it_stops() {
+    echo "test: critical at the boundary is re-sampled, then stops, with no window at all"
     local rc
     reset_state
     HOST_PRESSURE_LEVEL_OVERRIDE=4 HOST_COMPRESSOR_GB_OVERRIDE=6.00 \
@@ -560,8 +1230,126 @@ test_critical_still_standing_at_the_boundary_stops_on_its_own() {
         HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 6/34" >"$OUT/critnow.out" 2>&1
     rc=$?
-    assert_eq "1" "$rc" "critical at the boundary stops without needing a window"
+    assert_eq "1" "$rc" "critical that holds stops without needing a sampler window"
     assert_says "$OUT/critnow.out" "CRITICAL memory pressure" "the stop names the pressure level"
+    assert_says "$OUT/critnow.out" "and it HELD" "the stop says the level persisted"
+    assert_eq "8" "$(confirm_wait_count)" "the whole confirm window was spent before stopping"
+}
+
+# ── The floor needs the same sustain the pressure stop needs (ADR 0176) ──────
+# Available folds with MIN, so the window value is the deepest 5-second trough of
+# 50 to 120 samples. It falls further the longer the chunk ran. A fresh browser
+# per chunk makes exactly such troughs, which is how a healthy host was stopped.
+# The nightly stop read 9.45 GB against a 9.60 GB floor, 1.5% under. The boundary
+# itself read 13.48 GB, and pressure was normal all night.
+test_one_available_dip_mid_chunk_does_not_stop() {
+    echo "test: a single sample under the floor mid-chunk is reported, not acted on"
+    local rc
+    reset_state
+    printf '1 6.00 30.00 0.00\n1 6.50 9.45 0.00\n1 6.20 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=13.48 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 4/34" >"$OUT/onedip.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "one 5-second dip under the floor does not stop the run"
+    assert_silent_about "$OUT/onedip.out" "STOP:" "no stop was announced"
+    assert_silent_about "$OUT/onedip.out" "CORROBORATED SCARCITY" "no scarcity was claimed"
+}
+
+# The sustain rule is not weakened by the corroboration, and that is the whole
+# point of keeping the two separate. Warn pressure corroborates here, so the
+# only thing standing between this reading and a stop is ADR 0176's sustain rule.
+test_one_available_dip_under_warn_pressure_still_does_not_stop() {
+    echo "test: one dip under the floor with the kernel at warn is still not a stop"
+    local rc
+    reset_state
+    printf '2 6.00 30.00 0.00\n2 6.50 9.45 0.00\n2 6.20 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=13.48 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 5/34" >"$OUT/warndip.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "corroboration does not excuse a single 5-second trough"
+    assert_silent_about "$OUT/warndip.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/warndip.out" "note: available dipped to 9.45 GB" "the dip is recorded with its measurement line"
+    assert_says "$OUT/warndip.out" "it is not sustained" "the sustain half is named as the one that declined"
+    assert_silent_about "$OUT/warndip.out" "it is uncorroborated" "the corroboration note is not printed, because it was corroborated"
+}
+
+test_the_boundary_reading_alone_satisfies_the_sustain_arm() {
+    echo "test: available under the floor at the boundary is sustained, with the window healthy"
+    local rc
+    reset_state
+    # Every sample is well clear of the floor, so only the boundary's own reading
+    # can be what satisfied sustain. That is the first arm, and it needs no window.
+    # Warn pressure at the boundary supplies the corroboration.
+    printf '1 6.00 30.00 0.00\n1 6.10 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=6.20 \
+        HOST_AVAIL_GB_OVERRIDE=9.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 11/34" >"$OUT/floornow.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "the boundary reading satisfies sustain and the run stops"
+    assert_says "$OUT/floornow.out" "STOP: available memory 9.00 GB is under the 9.60 GB floor" "the stop names the floor it broke"
+    assert_says "$OUT/floornow.out" "CORROBORATED SCARCITY" "the stop names itself as corroborated scarcity"
+}
+
+test_two_under_floor_samples_stop_even_after_the_boundary_recovered() {
+    echo "test: two samples under the floor stop the run, though the boundary recovered"
+    local rc
+    reset_state
+    # Sustained scarcity that ended just before the boundary, corroborated by two
+    # warn samples in the same window. Both second arms, and the boundary itself
+    # reads healthy on both dimensions, so only the window can be what caught it.
+    printf '2 6.00 9.40 0.00\n2 6.10 9.20 0.00\n1 6.20 30.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=20.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 12/34" >"$OUT/twounder.out" 2>&1
+    rc=$?
+    assert_eq "1" "$rc" "two under-floor samples with two warn samples stop the run"
+    assert_says "$OUT/twounder.out" "STOP: available memory 9.20 GB is under the 9.60 GB floor" "the stop quotes the window minimum"
+    assert_says "$OUT/twounder.out" "the kernel at warn or worse in 2 of 3 samples" "the window arm of the corroboration is named"
+    assert_says "$OUT/twounder.out" "CORROBORATED SCARCITY" "the stop names itself as corroborated scarcity"
+}
+
+# One warn sample is not corroboration, the same way one critical tick is not a
+# stop and one dip is not sustain. Both halves are missing here, so both notes
+# print and the reader sees which one declined.
+test_a_single_warn_sample_does_not_corroborate() {
+    echo "test: sustained sub-floor headroom with one warn sample runs on, and says why"
+    local rc
+    reset_state
+    printf '2 6.00 9.40 0.00\n1 6.10 9.20 0.00\n1 6.20 30.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=20.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 13/34" >"$OUT/onewarn.out" 2>&1
+    rc=$?
+    assert_eq "0" "$rc" "one warn sample does not corroborate the floor"
+    assert_silent_about "$OUT/onewarn.out" "STOP:" "no stop was announced"
+    assert_says "$OUT/onewarn.out" "warn or worse in 1 of 3 samples" "the note counts the warn samples it saw"
+}
+
+# Only the stop DECISION changed. The deepest excursion still reaches the log, so
+# a survived dip can be read at 06:30 rather than being silently swallowed.
+test_a_survived_dip_still_prints_the_window_minimum() {
+    echo "test: a dip the run survived is still visible on the boundary line"
+    reset_state
+    printf '1 6.00 30.00 0.00\n1 6.50 9.45 0.00\n1 6.20 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
+    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.30 \
+        HOST_AVAIL_GB_OVERRIDE=13.48 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
+        HOST_PHYSMEM_GB_OVERRIDE=48 \
+        check_host_memory_at_boundary "nav chunk 4/34" >"$OUT/dipline.out" 2>&1
+    assert_says "$OUT/dipline.out" "available 9.45 GB" "the boundary line carries the window minimum"
+    assert_says "$OUT/dipline.out" "worst of 3 samples" "the scope wording still names the window"
+    assert_says "$OUT/dipline.out" "note: available dipped to 9.45 GB, under the 9.60 GB floor, in 1 of 3 samples" "the note counts the dips it saw"
+    assert_says "$OUT/dipline.out" "read 13.48 GB at the boundary" "the note states the boundary reading that let the run continue"
+    # Both halves were missing here, so both reason lines print. A reader at 06:30
+    # has to be able to tell which one declined, and this dip failed on both.
+    assert_says "$OUT/dipline.out" "it is not sustained" "the sustain half is named"
+    assert_says "$OUT/dipline.out" "it is uncorroborated" "the corroboration half is named too"
 }
 
 # A zero reading is a READING, not an absence. Swap is 0.00 on every sample this
@@ -573,7 +1361,7 @@ test_a_zero_reading_in_the_window_is_a_value_not_an_absence() {
     reset_state
     printf '1 0.00 30.00 0.00\n1 0.00 29.00 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
     got="$(_host_mem_window_worst)"
-    assert_eq "1 0.00 29.00 0.00 0 2" "$got" "zero compressor and zero swap survive the fold"
+    assert_eq "1 0.00 29.00 0.00 0 0 0 2" "$got" "zero compressor and zero swap survive the fold"
 }
 
 test_an_unreadable_dimension_in_the_window_never_erases_the_direct_read() {
@@ -581,9 +1369,9 @@ test_an_unreadable_dimension_in_the_window_never_erases_the_direct_read() {
     local rc
     reset_state
     # Every sample failed to read available memory. The direct read did not, and
-    # it is under the floor, so the floor must still fire.
+    # it is under the floor, so the floor must still fire once corroborated.
     printf '1 6.00 - 0.00\n1 6.10 - 0.00\n' > "$HOST_MEMORY_SAMPLES_FILE"
-    HOST_PRESSURE_LEVEL_OVERRIDE=1 HOST_COMPRESSOR_GB_OVERRIDE=6.10 \
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=6.10 \
         HOST_AVAIL_GB_OVERRIDE=4.00 HOST_SWAP_USED_GB_OVERRIDE=0.00 \
         HOST_PHYSMEM_GB_OVERRIDE=48 \
         check_host_memory_at_boundary "nav chunk 8/34" >"$OUT/partial.out" 2>&1
@@ -765,8 +1553,9 @@ test_garbage_free_floor_knobs_fall_back() {
     echo "test: unusable free-floor knobs fall back, and 9 GB still stops on 48 GB"
     local rc
     reset_state
-    # Garbage knobs must resolve to the 9.6 GB default floor, so 9 GB available stops.
-    HOST_COMPRESSOR_GB_OVERRIDE=6.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
+    # Garbage knobs must resolve to the 9.6 GB default floor, so 9 GB available
+    # stops once warn pressure corroborates it.
+    HOST_PRESSURE_LEVEL_OVERRIDE=2 HOST_COMPRESSOR_GB_OVERRIDE=6.00 HOST_AVAIL_GB_OVERRIDE=9.00 \
         HOST_SWAP_USED_GB_OVERRIDE=0.00 HOST_PHYSMEM_GB_OVERRIDE=48 \
         LUCIDOS_E2E_FREE_FLOOR_MIN_GB=lots LUCIDOS_E2E_FREE_FLOOR_PCT=-9 \
         check_host_memory_at_boundary "nav chunk 1/32" >"$OUT/floorjunk.out" 2>&1
@@ -913,8 +1702,10 @@ test_start_records_the_baseline_and_states_the_thresholds() {
     assert_eq "4.39" "$HOST_MEMORY_BASELINE_GB" "the baseline was recorded"
     assert_says "$OUT/start.out" "browser phase start: pressure normal, compressor 4.39 GB, available 30.00 GB, swap 0.00 GB" "the start line states all four readings"
     assert_says "$OUT/start.out" \
-        "stops at: kernel pressure critical (the freeze signature), swap over 1 GB (distress), available under 9.60 GB (scarcity), or compressor over 24.00 GB (runaway backstop)." \
+        "stops at: kernel pressure critical (the freeze signature), swap over 1 GB (distress), available under 9.60 GB WITH a corroborating signal (corroborated scarcity), or compressor over 24.00 GB (runaway backstop)." \
         "the four thresholds are stated up front, and labelled"
+    assert_says "$OUT/start.out" "The corroborating signals are the kernel at warn or worse, or any swap in use." "the start line names what corroborates the floor"
+    assert_says "$OUT/start.out" "Available under the floor on its own is recorded and never stops the run." "the start line says a bare available reading is not a stop"
     assert_says "$OUT/start.out" "no survivability cap" "the start line says the compressor cap is gone"
 }
 
@@ -930,7 +1721,7 @@ test_the_swap_stop_calls_itself_measured_distress() {
     assert_says "$OUT/distress.out" "the host is in" "it says the host is in trouble"
     assert_silent_about "$OUT/distress.out" "BACKSTOP" "it does not also claim to be the backstop"
     assert_silent_about "$OUT/distress.out" "SURVIVABILITY" "it does not also claim to be the cap"
-    assert_silent_about "$OUT/distress.out" "REAL SCARCITY" "it does not also claim scarcity"
+    assert_silent_about "$OUT/distress.out" "CORROBORATED SCARCITY" "it does not also claim scarcity"
     case "$MEMORY_STOP_DETAIL" in
         *"measured distress"*) pass "the final-verdict detail carries the classification" ;;
         *) fail "detail did not classify the stop: '$MEMORY_STOP_DETAIL'" ;;
@@ -1266,27 +2057,52 @@ test_tonights_reading_runs_on
 test_swap_over_the_limit_stops
 test_swap_at_the_limit_does_not_stop
 test_swap_wins_when_all_are_over
-test_available_floor_stops_a_low_host
+test_warn_pressure_corroborates_the_floor_and_stops
+test_swap_in_use_corroborates_the_floor_and_stops
+test_an_uncorroborated_reading_never_stops_however_deep
+test_unreadable_pressure_corroborates_nothing
 test_available_at_the_floor_does_not_stop
 test_the_floor_scales_with_ram
 test_the_floor_value_resolves_per_host
 test_the_floor_uses_the_minimum_when_ram_is_unreadable
 test_scarcity_wins_over_the_compressor_backstop
-test_the_2026_07_26_wedge_stops_on_the_floor
+test_the_2026_07_26_wedge_stops_on_the_corroborated_floor
 test_the_floor_is_never_below_the_preflight_gate
+test_an_idle_host_reading_stops_neither_guard
+test_a_corroborated_low_host_stops_both_guards
+test_the_oscillating_idle_host_stops_neither_guard
+test_the_freeze_reading_stops_both_guards
+test_sustained_critical_stops_both_guards
+test_a_garbage_confirm_knob_does_not_refuse_the_gate
 test_the_runaway_backstop_scales_with_ram
 test_critical_pressure_stops_an_otherwise_healthy_looking_host
+test_a_single_critical_reading_at_the_boundary_does_not_stop
+test_critical_with_the_headroom_gone_stops_without_waiting
+test_critical_with_swap_in_use_stops_without_waiting
+test_an_unreadable_level_mid_confirm_does_not_stop
+test_the_confirm_window_knobs_fall_back_rather_than_disarming
+test_the_collapse_level_scales_with_ram
 test_warn_pressure_is_reported_but_never_stops
 test_unreadable_pressure_never_stops
 test_a_non_level_pressure_value_is_discarded
 test_last_nights_boundary_now_runs_on
+test_the_available_floor_false_stop_now_runs_on
 test_the_recorded_freeze_reading_stops
-test_a_critical_excursion_inside_the_chunk_is_seen_at_the_boundary
+test_a_cleared_critical_excursion_is_reported_and_not_acted_on
+test_a_collapse_inside_the_chunk_stops_though_the_boundary_recovered
 test_the_window_folds_worst_per_dimension
+test_the_window_counts_under_floor_samples
+test_the_window_counts_warn_or_worse_samples
 test_a_zero_reading_in_the_window_is_a_value_not_an_absence
 test_a_short_record_is_discarded_rather_than_read_as_zero
 test_one_critical_tick_mid_chunk_does_not_stop
-test_critical_still_standing_at_the_boundary_stops_on_its_own
+test_critical_still_standing_at_the_boundary_is_confirmed_before_it_stops
+test_one_available_dip_mid_chunk_does_not_stop
+test_one_available_dip_under_warn_pressure_still_does_not_stop
+test_the_boundary_reading_alone_satisfies_the_sustain_arm
+test_two_under_floor_samples_stop_even_after_the_boundary_recovered
+test_a_single_warn_sample_does_not_corroborate
+test_a_survived_dip_still_prints_the_window_minimum
 test_an_unreadable_dimension_in_the_window_never_erases_the_direct_read
 test_no_samples_falls_back_to_a_single_reading
 test_the_sampler_starts_writes_and_is_reaped
@@ -1320,5 +2136,10 @@ test_attribution_does_not_change_the_stop_decision
 test_attribution_classifies_by_run_membership_not_name
 
 echo ""
-echo "Passed: $PASS  Failed: $FAIL"
+echo "Passed: $PASS  Failed: $FAIL  Skipped: $SKIPPED"
+# A skip is never a pass. It is counted and named so a run that could not reach
+# the pre-flight gate says so, rather than reading as full coverage.
+if [ "$SKIPPED" -gt 0 ]; then
+    echo "NOTE: $SKIPPED assertion group(s) skipped. The gate half of the agreement was not verified on this host."
+fi
 [ "$FAIL" -eq 0 ]

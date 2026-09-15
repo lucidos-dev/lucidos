@@ -35,10 +35,10 @@ export function resetTrafficLightPush(): void {
 /** The height of the bar the lights have to centre on, in CSS px, or `null`
  *  when there is nothing mounted to measure.
  *
- *  ONE read, of the rendered header's bottom edge, rather than a sum of two
+ *  ONE read, of the rendered band's bottom edge, rather than a sum of two
  *  tokens or a `3rem` restated in TypeScript: under the overlay build the
  *  viewport's top edge IS the window's top edge, so the distance down to the
- *  bottom of `.app-header` is exactly `--titlebar-inset + --app-header-height`,
+ *  bottom of the band is exactly `--titlebar-inset + --app-header-height`,
  *  whatever those resolve to. `.titlebar-strip` is a static flow sibling above
  *  the header on desktop, and on a narrow (mobile-layout) window the header is
  *  fixed at `top: 0` and covers the strip, so the same read is right in both
@@ -65,8 +65,18 @@ export function resetTrafficLightPush(): void {
  *  moves by tens of pixels, so nothing it needs to catch is inside the slack. */
 const ROUNDING_SLACK_PX = 1;
 
+/** How a surface DECLARES the band the lights centre on.
+ *
+ *  Declared, never a class name this module knows. The app shell puts it on
+ *  `.app-header`; the picker, which mounts no shell, renders its own strip.
+ *  Keyed on `.app-header` instead, the picker measured nothing and pushed
+ *  nothing. Its window then wore whichever bar some other page had persisted,
+ *  which is not even the same size: that page runs at the user's UI scale, and
+ *  the picker runs at the browser default. */
+export const TITLEBAR_BAND_SELECTOR = '[data-titlebar-band]';
+
 export function measureHeaderBarHeight(): number | null {
-  const header = document.querySelector('.app-header') as HTMLElement | null;
+  const header = document.querySelector(TITLEBAR_BAND_SELECTOR) as HTMLElement | null;
   if (!header) return null;
   const bottom = header.getBoundingClientRect().bottom;
   if (!Number.isFinite(bottom) || bottom <= 0) return null;
