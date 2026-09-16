@@ -8,6 +8,8 @@ import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToI
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
 import { handleNotificationSSE } from './notifications';
+import { dropDeletedThreads } from './threads-delete';
+import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
 import {
   handleNotificationToastRequested,
@@ -880,6 +882,28 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'NotificationsAllRead':
       handleNotificationSSE();
       break;
+
+    case 'ThreadsDeleted': {
+      // The owner deleted a thread and its family, here or on another device.
+      // The rows are gone on the engine, so this is not a hint: every client
+      // holding them is now wrong about what exists.
+      const ids = Array.isArray(data.thread_ids) ? (data.thread_ids as string[]) : [];
+      dropDeletedThreads(ids);
+      // Idempotent on the device that made the delete, which already dropped
+      // them, and it is what corrects every other one.
+      //
+      // The refresh is what picks up a SURVIVING ancestor's repaired descendant
+      // counts. The engine recomputes them after the commit, and no per-thread
+      // event carries the new value. Without a re-read the parent keeps a stale
+      // blocking count and hides its own Archive.
+      void refreshThreadList();
+      // The family's notifications went with it, so the bell is stale too, and
+      // so is any queue entry bound to a member. Neither moves on an event of
+      // its own here: the rows went with the family.
+      handleNotificationSSE();
+      void loadThreadQueue();
+      break;
+    }
 
     case 'PresenceCheck':
       // Engine asked every connected page for live presence so it can

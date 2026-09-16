@@ -211,6 +211,135 @@ fn resolve_pg_tool_path_fails_fast_when_bundled_binary_missing() {
     );
 }
 
+/// The walk must not follow a symlink out of the workspace. Following one
+/// puts the target's bytes in the archive we upload to the user's cloud
+/// provider, and `.backupignore` cannot refuse it: that file matches the path
+/// inside the workspace, which is where the LINK lives.
+#[cfg(unix)]
+#[test]
+fn walkdir_does_not_follow_symlinks_out_of_the_workspace() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("id_rsa"), b"PRIVATE KEY").unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("real.txt"), b"mine").unwrap();
+    std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked-dir")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("id_rsa"),
+        workspace.path().join("linked-file"),
+    )
+    .unwrap();
+
+    let found = walkdir(workspace.path()).expect("walk succeeds");
+
+    assert!(
+        found.contains(&workspace.path().join("real.txt")),
+        "the workspace's own file is still collected: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|p| p.ends_with("id_rsa")),
+        "a symlinked directory must not be descended into: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|p| p.ends_with("linked-file")),
+        "a symlinked file must not be collected: {found:?}"
+    );
+}
+
+/// A relocated `data/` is a supported layout, granted by both coding-agent
+/// back ends. Skipping it would omit every artifact, app, knowhow file and
+/// trigger from the archive. The size estimate would agree, so nothing
+/// detects it until a restore comes back empty.
+#[cfg(unix)]
+#[test]
+fn walkdir_follows_a_relocated_data_dir() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::create_dir(elsewhere.path().join("artifacts")).unwrap();
+    std::fs::write(elsewhere.path().join("artifacts/report.md"), b"# hi").unwrap();
+
+    let workspace = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path(),
+        workspace.path().join(crate::core::DATA_DIR),
+    )
+    .unwrap();
+
+    let found = walkdir(workspace.path()).expect("walk succeeds");
+
+    // Entered through the LINK path, so the relative path the tar header and
+    // `is_excluded_workspace_path` see is still workspace-relative.
+    let expected = workspace
+        .path()
+        .join(crate::core::DATA_DIR)
+        .join("artifacts/report.md");
+    assert!(
+        found.contains(&expected),
+        "a relocated data/ must still be backed up, at its workspace-relative path: {found:?}"
+    );
+}
+
+/// A `data` link resolving onto a parent of the workspace would pull
+/// `.lucidos/` and every sibling worktree into the archive. The coding-agent
+/// grants refuse that shape, and so does the backup.
+#[cfg(unix)]
+#[test]
+fn walkdir_refuses_a_data_symlink_that_contains_the_workspace() {
+    let outer = tempfile::tempdir().unwrap();
+    let workspace = outer.path().join("ws");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(outer.path().join("sibling-secret.txt"), b"not mine").unwrap();
+    std::os::unix::fs::symlink(outer.path(), workspace.join(crate::core::DATA_DIR)).unwrap();
+
+    let err = walkdir(&workspace).expect_err("a data link onto a parent must fail the backup");
+    assert!(
+        err.to_string().contains("contains the workspace"),
+        "the error says why: {err}"
+    );
+}
+
+/// A relocated `data/` whose target is gone must FAIL the backup, not shrink
+/// it. An unmounted external disk is the ordinary way to get here. Skipping
+/// would upload an archive holding no user data at all. The size estimate
+/// walks this same function, so the preflight would agree and the run would
+/// report success.
+#[cfg(unix)]
+#[test]
+fn walkdir_fails_when_a_relocated_data_dir_does_not_resolve() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("root.txt"), b"still here").unwrap();
+    std::os::unix::fs::symlink(
+        workspace.path().join("no-such-volume"),
+        workspace.path().join(crate::core::DATA_DIR),
+    )
+    .unwrap();
+
+    let err = walkdir(workspace.path()).expect_err("an unresolvable data link must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does not resolve"),
+        "the error says why: {msg}"
+    );
+    assert!(
+        msg.contains(crate::core::DATA_DIR),
+        "the error names the path: {msg}"
+    );
+}
+
+/// A symlink loop must not recurse until the stack is exhausted. That aborts
+/// the process, so no `BackupFailed` event is ever emitted and the user is
+/// told nothing.
+#[cfg(unix)]
+#[test]
+fn walkdir_terminates_on_a_symlink_loop() {
+    let workspace = tempfile::tempdir().unwrap();
+    let nested = workspace.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::os::unix::fs::symlink(workspace.path(), nested.join("loop")).unwrap();
+
+    let found = walkdir(workspace.path()).expect("walk succeeds");
+    assert!(found.is_empty(), "no regular files were created: {found:?}");
+}
+
 /// `is_cross_version_set` strips SET statements for parameters that exist in
 /// newer PG versions but not older ones (e.g. `transaction_timeout` from PG 17).
 /// Normal SET statements (e.g. `SET statement_timeout`) must pass through.

@@ -425,6 +425,7 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
 - `crates/lucidos-app/src/**/*.rs` → also `cargo test --locked -p lucidos-app --lib` (`make test` runs the ENGINE crate alone, so the client's own unit tests run nowhere else; seconds, no Postgres)
 - `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
+- `install.sh`, `uninstall.sh`, `scripts/lib/{service,stage_runtime,headless_tarball,install_common}.sh` → also `bash scripts/lib/install_test.sh` (20 s, offline)
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
 - `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
@@ -433,6 +434,15 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `system-knowhow/**` → `./scripts/test-engine.sh -- -- always_loaded_context_stays_under_budget system_knowhow_descriptions_stay_routing_sized` (subsumed by `make test` when the diff also touches Rust)
 - Docs-only → skip, EXCEPT the `system-knowhow/**` row above
 - Mixed → run both **in parallel**
+
+**The piped installer needs a row: `make lint` cannot see its one hard
+constraint.** macOS `/bin/sh` IS bash 3.2, so `install.sh`'s re-exec guard
+deliberately does not fire there. Everything a `curl … | sh` reaches must stay
+inside the bash-3.2 posix subset. ShellCheck reads those files as bash, their
+shebang rather than their runtime, so it passes the process substitution that
+broke the one-liner. `install_test.sh` holds the line instead: it scans for
+constructs bash 3.2 cannot run, then parses each file under bash-as-sh. Nothing
+else in the local gate runs it.
 
 **The Locale dropdown is gated by an ENGINE test, so a `.tsx`-only edit needs
 its row.** `voice/language.rs` maps that dropdown's names to the ISO-639-1 codes
@@ -513,6 +523,14 @@ code, and it is what keeps the join cheap: every `TaskOutput` call replays the
 task's ENTIRE accumulated output rather than only what is new, so joining an
 un-redirected `make test` pours the whole engine suite into context again on
 every wait.
+
+**A jsdom test that times out at exactly the vitest default is contention, not
+a finding.** The engine suite saturates every core for minutes, and a Vitest
+case awaiting async work starves under it. The tell is a round 5000ms against
+a file the diff never touched. Re-run those files alone before believing them,
+exactly as the Codex note above says for `runtime::codex::driver_tests`. Two
+settings and trigger cases failed that way on 2026-09-15 and passed instantly
+on their own.
 
 **Never pipe the test command through `| tail` / `| head` / `| grep` to trim output.** Under zsh / bash a pipeline reports the *last* command's exit code, not cargo's — so `cargo test ... | tail` exits 0 even when a Rust test failed, and Phase 4.5 reports a false PASSED on a red run (this has actually shipped a failing nightly). Run each suite un-piped (the `run_in_background` + `TaskOutput` pattern above already preserves the real exit), or if you must trim, redirect to a log and capture `$?` first: `make test > /tmp/t.log 2>&1; echo "EXIT: $?"` then read the log. A "tests pass" claim needs the real exit code AND the `test result: ok.` / `0 failed` line — see `/clean-build`'s "Reading exit codes honestly" section for the full mechanism.
 

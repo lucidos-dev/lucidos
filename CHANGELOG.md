@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.38.0 — 2026-09-16
+
+### Added
+
+- **Delete a thread and its family.** Delete sits in the thread overflow menu, in the Archive section too, and removes the thread's events, the memory it taught, its notifications, changes and queue entries in one transaction. Only the owner device can do it, and the confirmation names exactly what goes, including any branch work under the thread.
+- **Every Lucidos install on the machine is listed on System Overview**, with the port each one holds. When another install already holds this port, the client says so once and names it, and the uninstaller names the install it cannot remove.
+- **The talker can explain how a call works.** Ask and it says that you can keep talking while something runs, that each request is a fresh ask, that it cannot see progress, that the answer lands in the conversation too, and that ringing off ends the call rather than the work. It offers this when it clears something up, never as a preamble.
+
+### Changed
+
+- The app icon carries Apple's own macOS shape, so it draws with rounded corners on macOS 15 and older as well as on Tahoe.
+- How to Update on a phone answers on a toast pointing at the desktop, and the update offer and the System attention badge stay quiet there.
+
+### Fixed
+
+- `curl -fsSL https://lucidos.dev/install.sh | sh` runs on macOS again. Both the installer and the uninstaller parse under macOS `/bin/sh`.
+- A backup follows a `data` symlink that relocates the tree to another disk, and skips every other symlink so nothing outside the workspace reaches the archive. A relocated `data` that cannot be resolved fails the backup instead of writing a near-empty one.
+- Six more security and data-integrity defects from the nightly sweep, each with a regression test.
+- A Microsoft or GitHub connection no longer reports `offline_access` as refused when it holds a refresh token.
+- One thing the talker says is one row in the transcript, and it reads inside the block it was said in. A reply is one growing bubble, and a finished sentence stops shimmering.
+- A pause during a call no longer takes the words the next question needs, so a request made just after a pause is acted on.
+- A window no attached display can hold is corrected to fit, on restore and on every other path to the screen. A window you can see is judged, not moved.
+- The What's New release row keeps its date on one line.
 ## v0.37.0 — 2026-09-15
 
 ### Added

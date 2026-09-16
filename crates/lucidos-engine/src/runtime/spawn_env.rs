@@ -214,6 +214,24 @@ pub(crate) fn isolate_in_process_group(cmd: &mut tokio::process::Command) {
 #[cfg(not(unix))]
 pub(crate) fn isolate_in_process_group(_cmd: &mut tokio::process::Command) {}
 
+/// The `kill(2)` first argument for a child's process group, or `None` when
+/// there is no group safe to name.
+///
+/// `kill(0, sig)` signals the CALLER's own process group. A pid of 0 would
+/// therefore turn a child teardown into killing this engine and every
+/// workspace process it spawned. A caller reaches 0 through `child.id()`
+/// returning `None`, where there is no group to signal anyway. Refusing here
+/// covers every call site (CLAUDE.md "Never kill broadly", ADR 0025).
+#[cfg(unix)]
+fn process_group_target(pid: u32) -> Option<i32> {
+    match i32::try_from(pid) {
+        Ok(0) => None,
+        Ok(p) => Some(-p),
+        // A pid past `i32::MAX` cannot be negated into a group id.
+        Err(_) => None,
+    }
+}
+
 /// Signal the agent child's process *group* (negative pid) so the agent AND
 /// every descendant it spawned (`Bash` tools, `cargo`/`rustc`, …) are torn
 /// down together on a deliberate cancel/shutdown. The child is its own group
@@ -223,13 +241,19 @@ pub(crate) fn isolate_in_process_group(_cmd: &mut tokio::process::Command) {}
 /// pid (and thus the group id) can be recycled, and signalling a recycled
 /// group would hit unrelated processes. Best-effort — `ESRCH` (group already
 /// gone, or the child was never made a group leader) is ignored.
+///
+/// A pid [`process_group_target`] refuses is logged and signals nothing.
 #[cfg(unix)]
 pub(super) fn signal_child_process_group(pid: u32, signal: i32) {
+    let Some(target) = process_group_target(pid) else {
+        crate::log!("[SpawnEnv] Refusing to signal process group for pid {pid}");
+        return;
+    };
     // SAFETY: `kill(2)` with a negative pid targets the process group and a
     // plain integer signal number; the call has no pointer arguments and is
     // well-defined. The return value is intentionally ignored (best-effort).
     unsafe {
-        libc::kill(-(pid as i32), signal);
+        libc::kill(target, signal);
     }
 }
 
@@ -358,6 +382,27 @@ pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pid of 0 must never reach `kill`. `kill(0, sig)` signals the caller's
+    /// OWN process group, so one `unwrap_or(0)` upstream turns a child
+    /// teardown into killing this engine and every process it spawned. The
+    /// predicate is tested rather than the call, because proving the unfixed
+    /// behaviour would take the test runner down with it.
+    #[cfg(unix)]
+    #[test]
+    fn process_group_target_refuses_pid_zero() {
+        assert_eq!(process_group_target(0), None, "pid 0 is our own group");
+        assert_eq!(
+            process_group_target(u32::MAX),
+            None,
+            "a pid past i32::MAX cannot be negated into a group id"
+        );
+        assert_eq!(
+            process_group_target(4321),
+            Some(-4321),
+            "a real child pid still targets its own group"
+        );
+    }
 
     // ── The trigger claim stops at a handoff (ADR 0137) ────────────────────
     // A coding-agent spawn runs INSIDE the fire's `ACTIVE_TRIGGER_ID` scope.

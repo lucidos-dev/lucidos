@@ -844,6 +844,27 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
   }
 }
 
+/** Forget every per-thread compose map this module owns, for a thread that will
+ *  never be fetched again.
+ *
+ *  The maps are module-private, so a teardown elsewhere cannot reach them and a
+ *  ninth map would have to be remembered in two places. One export instead.
+ *
+ *  `dropUndeliveredComposeDraft` is the load-bearing one. Leave the id in that
+ *  set and the next resume re-sends a draft for a thread that is gone. That
+ *  pins the unreachable-drafts toast until a flush collects it.
+ *
+ *  Two callers: discarding a draft, and deleting the thread (ADR 0192).
+ */
+export function forgetComposeState(threadId: string): void {
+  cancelPendingPush(threadId);
+  clearDraft(threadId);
+  clearComposeSelection(threadId);
+  lastSyncedImageHashes.delete(threadId);
+  lastSyncedComposeMode.delete(threadId);
+  composePutSettledAt.delete(threadId);
+}
+
 function cancelPendingPush(threadId: string): void {
   const t = pendingTimers.get(threadId);
   if (t) {
@@ -1133,15 +1154,12 @@ export async function sendSeededPrompt(text: string, what: string): Promise<bool
  *  The draft entry is dropped; if DELETE fails we restore it to the
  *  pre-discard text so the user doesn't lose what they typed. */
 export async function discardCompose(threadId: string): Promise<void> {
-  cancelPendingPush(threadId);
   if (focusedThreadId.value === threadId) setFocusedThread(null);
   const restoreDraft = snapshotDraft(threadId);
   mutateThreadMeta(threadId, { state: 'discarded' });
-  clearDraft(threadId);
-  // Drop the per-draft dropdown overrides too. A discarded draft is gone, and a
-  // stray entry would seed a future draft that happens to reuse the id.
-  clearComposeSelection(threadId);
-  lastSyncedImageHashes.delete(threadId);
+  // Drops the draft, the per-draft dropdown overrides and every sync marker.
+  // A stray override would seed a future draft that happens to reuse the id.
+  forgetComposeState(threadId);
   // Pairs with the push in ensureFocusedComposeThread. Back and Forward must
   // not restore a discarded thread whose events would 404.
   removeThreadNavEntries(threadId);

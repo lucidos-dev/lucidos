@@ -39,8 +39,8 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::engine::worktree_cleanup::{
     available_disk_bytes, deterministic_worktree_for, directory_size_bytes, inventory_worktrees,
     is_worktree_dirty, prune_build_artifacts, remove_stranded_worktree,
-    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, FREE_DISK_HARD_BYTES,
-    FREE_DISK_SOFT_BYTES,
+    remove_worktree_and_optionally_delete_branch, worktree_git_admin_missing, BranchDisposal,
+    FREE_DISK_HARD_BYTES, FREE_DISK_SOFT_BYTES,
 };
 
 /// GET /api/v1/disk-usage/worktrees — inventory of all known per-thread worktrees.
@@ -106,14 +106,18 @@ pub(super) async fn cleanup_worktree(
                     })?;
                 (freed, false)
             } else {
-                let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
-                    .await
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to remove worktree".to_string(),
-                        )
-                    })?;
+                let outcome = remove_worktree_and_optionally_delete_branch(
+                    &worktree,
+                    None,
+                    BranchDisposal::WhenMerged,
+                )
+                .await
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to remove worktree".to_string(),
+                    )
+                })?;
                 (outcome.freed_bytes, outcome.branch_deleted)
             }
         }

@@ -135,23 +135,23 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 
 ### The restore clamp judges the geometry a window had before the placement
 - **Where:** `crates/lucidos-app/src/window_restore.rs`,
-  `clamp_restored_geometry`; its callers in `lib.rs` (`setup`, after the
-  window-state plugin's restore) and `app_window.rs` (`reopen_client`, after
-  `size_main_window_for_its_workspace`).
-- **Gap:** on those two paths the clamp reads `outer_position` and `inner_size`
+  `clamp_restored_geometry`; its caller in `app_window.rs` (`reopen_client`,
+  after `size_main_window_for_its_workspace`).
+- **Gap:** on that path the clamp reads `outer_position` and `inner_size`
   before the placement it is meant to judge has reached the window. A rect that
   needs correcting is passed as healthy. To see it, leave `main` at a saved
-  position on a display, unplug that display, and relaunch: the clamp runs
-  against the geometry `main` still had.
+  position on a display, unplug that display, and reopen from the tray: the
+  clamp runs against the geometry `main` still had.
 - **Why:** tao defers both setters to the main dispatch queue
   (`set_content_size_async`, `set_frame_top_left_point_async`), and that queue is
   not drained until the run loop turns. Every caller reads back in the same
-  turn. `setup` runs before `app.run()`, so it cannot have turned at all.
-- **Status:** Open, and NARROWER since ADR 0178. `open_app_window` hands the
-  remembered frame to the builder now, and the builder applies it when it
-  creates the NSWindow. So the clamp reads real geometry on the new-window path.
-  Closing the rest means deferring the clamp by a turn, which is its own change:
-  the clamp must still run before the window is shown.
+  turn.
+- **Status:** Open, and NARROWER twice. ADR 0178 hands the remembered frame to
+  the builder, which applies it as it creates the NSWindow. The clamp therefore
+  reads real geometry on the new-window path. The `setup` half is **closed**:
+  the clamp moved into `show_startup_window`, which both racers reach after the
+  run loop has drained those setters and before the window is shown (ADR 0193).
+  The reopen still reads early, and its residue is one launch at the wrong size.
 
 ## Notifications & push
 

@@ -929,6 +929,39 @@ pub fn is_blocking(
     false
 }
 
+/// May the owner delete this thread? The UI-side half of the delete cascade's
+/// server gate, so the action is hidden rather than offered and then refused.
+///
+/// It asks `is_blocking` of the thread ITSELF, passing `ArchiveState::Inbox`
+/// whatever the thread's real section is. That one argument is the whole
+/// difference from Archive. Delete is offered in the Archive section too:
+/// gating it on inbox would leave archived garbage undeletable, which is the
+/// case the feature exists for. Passing the real state would silently admit an
+/// archived coding-agent thread still holding a pending change, which the
+/// server refuses.
+///
+/// `descendants_block` is `blocking_descendant_count > 0`, the same projection
+/// fact Archive reads.
+///
+/// **Server mirror**: the authority is `api::threads::family::classify_family`
+/// with `FamilyVerb::Delete`, which re-asks this over the locked family. This
+/// one decides what to draw; that one decides what happens.
+pub fn thread_is_deletable(
+    thread_type: ThreadType,
+    status: ThreadStatus,
+    has_pending_changes: bool,
+    is_external_repo: bool,
+    descendants_block: bool,
+) -> bool {
+    !is_blocking(
+        thread_type,
+        status,
+        ArchiveState::Inbox,
+        has_pending_changes,
+        is_external_repo,
+    ) && !descendants_block
+}
+
 /// A thread "needs attention" iff its state requires a user action to
 /// progress. Same shape as `is_blocking` but DROPS the `Running` clause:
 /// a running descendant is delegated work, not pending attention.

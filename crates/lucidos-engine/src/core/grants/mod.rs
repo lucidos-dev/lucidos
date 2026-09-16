@@ -18,8 +18,23 @@
 pub mod migration;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Serializes the read-modify-write in [`append`] and every [`write_raw`].
+///
+/// Several gates grant in parallel: chat's command guard, the Claude Code and
+/// MCP lanes, and the Settings editor. Without this, two appends both read the
+/// pre-state and the second rename publishes a file missing the first grant.
+/// `core::handshake_approvals` guards its own record the same way.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`WRITE_LOCK`], recovering a poisoned one. A panic under the lock
+/// leaves the file consistent, because every write lands through a rename.
+fn write_guard() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Engine-owned runtime directory at the workspace root, holding the grant
 /// files alongside the pidfile, the ports file and the worktrees. Gitignored,
@@ -147,6 +162,9 @@ pub fn parse_patterns(contents: &str) -> Vec<String> {
 /// Append `pattern` unless it is already granted. Creates the file with its
 /// header when absent.
 pub fn append(dir: &Path, file: GrantFile, pattern: &str) -> Result<(), BoxError> {
+    // Held across the read AND the write: two concurrent grants would
+    // otherwise both read the pre-state and the loser's pattern would vanish.
+    let _guard = write_guard();
     let path = file.path_in(dir);
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -162,7 +180,7 @@ pub fn append(dir: &Path, file: GrantFile, pattern: &str) -> Result<(), BoxError
     }
     next.push_str(pattern);
     next.push('\n');
-    write_raw(dir, file, &next)
+    write_locked(dir, file, &next)
 }
 
 /// The whole file, for the settings editor. A missing file reads as its header,
@@ -181,12 +199,31 @@ pub fn read_raw(dir: &Path, file: GrantFile) -> Result<String, BoxError> {
 /// gated call with no restart. Claude Code is the one exception: a running
 /// subprocess keeps the `--allowedTools` flag it was spawned with.
 pub fn write_raw(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxError> {
+    let _guard = write_guard();
+    write_locked(dir, file, contents)
+}
+
+/// The write itself. Callers already holding [`WRITE_LOCK`] use this, because
+/// [`std::sync::Mutex`] is not reentrant and [`append`] holds the lock across
+/// its read.
+fn write_locked(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxError> {
     std::fs::create_dir_all(dir)?;
     let path = file.path_in(dir);
-    let tmp = path.with_extension("tmp");
+    let tmp = scratch_path(&path);
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+/// The sibling file a write is staged in before its rename.
+///
+/// The name carries the pid. A second PROCESS on this workspace then cannot
+/// interleave into one shared scratch file, whose rename would publish a torn
+/// allowlist as the authoritative one. [`WRITE_LOCK`] covers the threads
+/// inside this process. Separated from the write so the name is testable: the
+/// file is renamed away, so nothing observes it afterwards.
+fn scratch_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("tmp{}", std::process::id()))
 }
 
 #[cfg(test)]

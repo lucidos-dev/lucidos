@@ -197,6 +197,42 @@ describe('a spoken reply is not the written answer', () => {
     const whole = SpokenReply({ event: spokenRow({ interrupted: false }) });
     expect(vnodeText(whole)).not.toContain('cut off');
   });
+
+  /** A RUN of spoken rows says "this was said aloud" once. Eleven of them
+   *  down one reply carried eleven call marks, which is the marker repeating
+   *  itself rather than telling the reader anything. */
+  it('marks the first of a run and no other', () => {
+    const reply = (text: string) => ({
+      seq: 1,
+      event: { type: 'SpokenReplyGenerated', session_id: 'sess-1', text, interrupted: false },
+    });
+    const events = exchangeResponseEvents(
+      exchangeWith({ type: 'MessageReceived', text: 'hi', mode: 'human' }, [
+        reply('Let me check.'),
+        reply('One moment.'),
+        { seq: 2, event: { type: 'ToolCalled', name: 'read_file', args: {}, description: 'Reading…' } },
+        reply('Here it is.'),
+      ] as Exchange['steps']),
+    );
+    const spoken = events.filter(e => e.type === 'spoken_reply');
+    expect(spoken.map(e => e.follows === true)).toEqual([false, true, false]);
+
+    // The slot is kept either way, so the bubbles keep one left edge.
+    const led = SpokenReply({ event: spokenRow() });
+    const inRun = SpokenReply({ event: { ...spokenRow(), follows: true } });
+    expect(hasHiddenName(led, 'Said aloud')).toBe(true);
+    expect(hasHiddenName(inRun, 'Said aloud')).toBe(false);
+    expect(findByRole(inRun, 'spoken-reply')).not.toBeNull();
+  });
+
+  /** The talker's LIVE row wears the same type, and the caret is what says it
+   *  is still arriving. It survives the row becoming a step. */
+  it('carries the caret while the words are still coming', () => {
+    const saying = SpokenReply({ event: { ...spokenRow(), live: true } });
+    expect(hasHiddenName(saying, 'Saying aloud')).toBe(true);
+    const said = SpokenReply({ event: spokenRow() });
+    expect(hasHiddenName(said, 'Said aloud')).toBe(true);
+  });
 });
 
 /** One act, one shape. Which model fielded an utterance is a fact about

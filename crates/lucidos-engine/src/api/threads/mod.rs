@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 mod actions;
 mod archive;
+mod delete;
 mod events_snapshot;
+mod family;
 mod follow_up;
 mod list;
 mod search;
@@ -124,6 +126,12 @@ pub(super) fn router() -> Router<super::AppState> {
         .route("/threads/unsave", post(unsave_thread))
         .route("/threads/rename", post(rename_thread))
         .route("/threads/archive", post(archive_thread))
+        // The owner's delete, and the read that tells the confirmation what is
+        // true of this family. Both are refused to anything but a registered
+        // device (ADR 0192), which is stricter than the thread-reach ladder
+        // every other mutating thread route uses.
+        .route("/threads/delete-preflight", get(delete::delete_preflight))
+        .route("/threads/delete", post(delete::delete_thread_family))
         .route("/threads/suggest-title", post(suggest_title))
         .route("/threads/older", get(get_older_threads))
         .route("/threads/filter-facets", get(get_filter_facets))

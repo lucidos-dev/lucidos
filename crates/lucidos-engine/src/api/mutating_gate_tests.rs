@@ -121,6 +121,10 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/event-waits/:wait_id/cancel",
     "/threads/:thread_id/event-waits/cancel",
     "/threads/archive",
+    // Gated twice over. This layer refuses a caller with no credential at all.
+    // The handler then insists the one it did present is a registered device
+    // (ADR 0192).
+    "/threads/delete",
     "/threads/rename",
     "/threads/save",
     "/threads/suggest-title",

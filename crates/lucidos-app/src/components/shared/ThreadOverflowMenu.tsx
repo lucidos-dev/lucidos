@@ -1,9 +1,11 @@
 import { OverflowMenu, type OverflowMenuOpener } from './OverflowMenu';
-import { CopyIcon, DownloadIcon, ArchiveIcon, PinIcon } from './icons';
+import { CopyIcon, DownloadIcon, ArchiveIcon, PinIcon, TrashIcon } from './icons';
 import { copyThreadRef, copyThreadTitle } from '../../utils/threadRef';
 import { exportThread } from '../../utils/exportThread';
 import { resolveThreadActions } from '../../store/actions/threadActions';
 import { handleSaveThread, handleUnsaveThread } from '../../store/actions/threads';
+import { handleDeleteThread } from '../../store/actions/threads-delete';
+import { threadIsDeletable } from '../../generated/thread-lifecycle';
 import { threadMap, effectiveThreadStatus } from '../../store/store';
 import { threadInfoRows } from '../drawer/threadRowInfo';
 
@@ -13,9 +15,17 @@ import { threadInfoRows } from '../drawer/threadRowInfo';
  *  Built on the shared <OverflowMenu> shell (trigger + anchored menu/Info
  *  popovers + keyboard roving + the full dismiss/Escape/inert contract).
  *
- *  **Archive sits second-last, right above Info.** It is the one mutating action
- *  here, so it stays off the top of the menu, where a stray tap (or the
- *  keyboard-open's focus landing on the first item) would reach it.
+ *  **Archive and Delete sit last, right above Info.** They are the mutating
+ *  actions here, so they stay off the top of the menu. A stray tap lands there,
+ *  and so does the keyboard-open's focus. Delete sits below Archive, being the
+ *  harsher of the two: it removes the thread, its sub-threads and what Lucidos
+ *  learned from them, with no undo (ADR 0192). It confirms, and the
+ *  confirmation names what this family holds.
+ *
+ *  **Delete is offered in the Archive section too.** `threadIsDeletable` asks
+ *  `is_blocking` of the thread as if it were in the inbox, which is the one way
+ *  it differs from Archive. Gating it on inbox would leave archived garbage
+ *  undeletable, which is the case the feature exists for.
  *
  *  **Pin/Unpin shows only on a keyboard-open.** Every inline pin button sitting
  *  next to a ⋯ trigger is mouse-only (`tabindex=-1`), so the menu is the
@@ -56,6 +66,17 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
         const saved = liveThread?.meta.saved ?? false;
         const showPin = !!liveThread && openedViaKeyboard;
         const archiveAction = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
+        // Read from the same projection facts the server gate re-asks over the
+        // locked family, so the item is hidden rather than offered and refused.
+        const deletable = !!liveThread
+          && liveThread.meta.state !== 'composing'
+          && threadIsDeletable(
+            liveThread.meta.channel === 'claude_code' ? 'claude_code' : 'chat',
+            effectiveThreadStatus(liveThread),
+            liveThread.meta.codingAgentProposed ?? false,
+            liveThread.meta.codingAgentKind === 'external' || liveThread.meta.codingAgentIsExternalRepo,
+            liveThread.meta.blockingDescendantCount > 0,
+          );
         return (
           <>
             {showPin && (
@@ -80,14 +101,19 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
               <DownloadIcon />
               Download thread
             </button>
+            {(archiveAction || deletable) && <div class="thread-overflow-divider" role="separator" />}
             {archiveAction && (
-              <>
-                <div class="thread-overflow-divider" role="separator" />
-                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void archiveAction.invoke(); })}>
-                  <ArchiveIcon />
-                  Archive
-                </button>
-              </>
+              <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void archiveAction.invoke(); })}>
+                <ArchiveIcon />
+                Archive
+              </button>
+            )}
+            {deletable && (
+              <button type="button" class="thread-overflow-item thread-overflow-item-danger" role="menuitem"
+                onClick={run(() => { void handleDeleteThread(threadId); })}>
+                <TrashIcon />
+                Delete thread
+              </button>
             )}
           </>
         );

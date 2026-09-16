@@ -1,0 +1,31 @@
+[package]
+name = "lucidos-installs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Everything the tree knows about where a Lucidos install puts itself, in one
+# place: the macOS app bundle, an install.sh headless install, and a source
+# checkout's dev gateway.
+#
+# It exists because a machine can carry more than one of those at once, and
+# until this crate nothing enumerated them. An install.sh install laid down
+# before a DMG keeps port 5252, the DMG's gateway then cannot bind, and the new
+# client drives the old engine with nothing saying so. See
+# docs/plans/2026-09-15-coexisting-installs-are-visible-and-honest.md.
+#
+# Two crates need the answer. `lucidos-gateway` serves it on the control plane,
+# and `lucidos-app` needs it before any gateway exists (at client startup, and
+# at uninstall). ADR 0014 section 1 requires the gateway to have NO dependency
+# on `lucidos-engine`, and offers the shared surface as "extracted to a tiny
+# shared util or duplicated". This is the first option, for the same reason
+# `lucidos-tailscale` is: two copies of a layout map drift, and a drifted copy
+# reports an install that is not there.
+#
+# `serde` is the only dependency, and the crate must stay that cheap. It is here
+# because the record shape IS the wire shape: the gateway serves it and the
+# frontend renders it, so a hand-written serializer would be a second definition
+# of the thing this crate exists to keep single.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

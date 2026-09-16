@@ -86,7 +86,7 @@ The configurable caps governing the *Thread Queue*. The fields:
 Concurrency caps of 0 mean "hold": admission pauses and the queue accumulates until the cap is raised. `max_event_trigger_depth` must be at least 1. Edited in the Thread Queue panel (`PUT /api/v1/thread-queue/policy`). Stored event-sourced, so the latest `CapacityPolicyChanged` event IS the policy. User-initiated work is prioritized but still subject to the ceiling (ADR 0008).
 
 ### Cascading archive
-Archiving a parent *thread* also archives every *sub-thread* under it, in one atomic operation. Disabled when any descendant is a *blocking descendant*.
+Archiving a parent *thread* also archives every *sub-thread* under it, in one atomic operation. Disabled when any descendant is a *blocking descendant*. **An archived thread stays fully searchable**, and what Lucidos learned from it stays in memory: Archive moves a thread to the Archive section of the *thread drawer* and changes nothing else. *Delete (a thread)* is the action that removes it.
 
 ### Chat thread
 A *thread* whose `source = 'chat'` — the user typed the opening message in the Lucidos chat UI. Answered by the *Lucidos Agent*. Contrast with *trigger thread* and *coding-agent thread*.
@@ -244,6 +244,16 @@ deliberately absent from the *OAuth provider registry* and is never guessed from
 its spelling: the Connect form asks which known provider it runs on, then fills
 that provider's endpoints in while keeping the name you gave it.
 See also: *connected account*, *OAuth provider registry*.
+
+### Delete (a thread)
+Permanently removing a *thread*, its *sub-threads*, everything said in them, and what Lucidos learned from them. *Archive* only moves a thread to the Archive section, where it stays fully searchable. Delete cannot be undone, and a backup taken earlier still holds it. Code already applied from a *coding-agent thread* stays; unapplied branch work does not, and the thread's *worktree* and branch go with it.
+
+Offered in the Lucidos UI to the workspace owner only, in the thread's own ⋯ menu. **Never to the *Lucidos Agent* or a *coding-agent thread***. There is no tool, CLI verb or SDK method for it. The route refuses any caller that is not a signed-in device, including one carrying the owner's *standing instruction*.
+
+It cascades over the family like *cascading archive*. The refusal is the same: no member may be running, waiting on an answer, or holding a pending *change*. One confirmation names how many threads go, then they are gone.
+
+Distinct from discarding a draft, which throws away a thread that was never sent.
+See also: `docs/adr/0192-thread-delete-is-the-one-sanctioned-removal.md`.
 
 ### Domain event
 An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI — anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable except per-token streaming ones — see *scheduler blocklist* (dev).

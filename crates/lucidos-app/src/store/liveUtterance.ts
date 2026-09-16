@@ -35,8 +35,12 @@ export interface LiveUtteranceDeps {
   draw(threadId: string, row: LiveUtterance, fresh: boolean): void;
   /** Take the row with this count off the thread. */
   erase(threadId: string, count: number): void;
-  /** Put the talker's row on the thread, or rewrite the one standing. */
-  drawReply(threadId: string, row: LiveReply): void;
+  /** Put the talker's row on the thread, or rewrite the one standing.
+   *
+   *  `fresh` says the row BEGINS a reply, exactly as it does for the caller's
+   *  side. Returns false for a REWRITE with no row standing, which means the
+   *  engine's own row claimed it while this bridge still held the words. */
+  drawReply(threadId: string, row: LiveReply, fresh: boolean): boolean;
   /** When the row was drawn, as the bubble header will show it. */
   now(): string;
 }
@@ -59,8 +63,33 @@ export function createLiveUtteranceBridge(deps: LiveUtteranceDeps): LiveUtteranc
    */
   let drawn: { threadId: string; count: number; text?: string; partial?: string } | null = null;
 
-  /** The reply row's identity, so a rewrite keeps the moment it went up. */
-  let reply: { threadId: string; count: number; created: string } | null = null;
+  /**
+   * The reply row's identity and everything drawn in it so far.
+   *
+   * `count` is the FIRST of the counts this row covers. So the row's id and
+   * the moment it went up survive every pause inside one reply.
+   *
+   * `before` is the stretches already finished in this row, and `said` is the
+   * one being spoken. The bubble reads the two joined. Keeping them apart is
+   * what lets a stretch be REVISED while it is still open.
+   *
+   * **The row's unit is the engine's, not a provider turn's.** A reply is
+   * everything the talker said between two moves of the conversation (ADR
+   * 0188), and `call.rs` writes exactly one row for it. `CallState.said`
+   * empties at every 700 ms hole in the words, and a row per hole is four
+   * bubbles where the engine writes one. So the row is assembled here, where
+   * the row lives, rather than in the reducer, which is a state machine over
+   * frames. The plan is `docs/plans/2026-09-16-a-pause-spends-nothing.md`.
+   */
+  let reply: {
+    threadId: string;
+    count: number;
+    created: string;
+    /** The stretch `said` belongs to, so a NEW one is told from a revision. */
+    stretch: number;
+    before: string;
+    said: string;
+  } | null = null;
 
   /** Draw or rewrite the row for the call's current utterance. */
   const paint = (threadId: string, call: CallState): void => {
@@ -95,17 +124,39 @@ export function createLiveUtteranceBridge(deps: LiveUtteranceDeps): LiveUtteranc
    * Called on every delta, and deliberately NOT memoized against the store. A
    * persisted row for the PREVIOUS reply can clear the slot mid-reply, and the
    * next delta is what puts this one back.
+   *
+   * A new `replyCount` under a standing row is a PAUSE rather than a new
+   * reply, so the stretch joins what is already there. The count is the first
+   * of the run, so the row's id and its moment do not move under the reader.
    */
   const paintReply = (threadId: string, call: CallState): void => {
-    const standing = reply && reply.threadId === threadId && reply.count === call.replyCount
-      ? reply
-      : { threadId, count: call.replyCount, created: deps.now() };
-    reply = standing;
-    deps.drawReply(threadId, {
-      eventId: liveReplyId(threadId, call.replyCount),
-      created: standing.created,
-      text: call.said,
-    });
+    const standing = reply && reply.threadId === threadId ? reply : null;
+    const row = standing ?? {
+      threadId,
+      count: call.replyCount,
+      created: deps.now(),
+      stretch: call.replyCount,
+      before: '',
+      said: '',
+    };
+    // A different stretch under the same row is a PAUSE, so the one that just
+    // finished is now part of what the row already reads. The deltas carry
+    // their own spacing, which is why `call.rs` builds its row from them too.
+    const before = row.stretch === call.replyCount ? row.before : row.before + row.said;
+    const text = before + call.said;
+    reply = { ...row, stretch: call.replyCount, before, said: call.said };
+    const held = deps.drawReply(threadId, {
+      eventId: liveReplyId(threadId, row.count),
+      created: row.created,
+      text,
+    }, standing === null);
+    if (held) return;
+    // The engine's own row claimed the slot while this bridge still held the
+    // words. Everything it covers is written down, so this delta opens a NEW
+    // row rather than redrawing what has already landed. `writeRow` reads a
+    // claim on the caller's side in exactly this way.
+    reply = null;
+    paintReply(threadId, call);
   };
 
   const dispose = effect(() => {
@@ -123,8 +174,9 @@ export function createLiveUtteranceBridge(deps: LiveUtteranceDeps): LiveUtteranc
       reply = null;
       return;
     }
-    // The reply's row outlives `said`, so an empty one withdraws nothing. Only
-    // `SpokenReplyGenerated` and the session's end retire it.
+    // The reply's row outlives `said`, so an empty one withdraws nothing, and
+    // a pause emptying it never shortens the bubble. Only
+    // `SpokenReplyGenerated` and the session's end retire the row.
     if (call.said !== '') paintReply(threadId, call);
   });
 
@@ -193,16 +245,25 @@ function writeRow(
   bumpThreadEvents(threadId);
 }
 
-/** Put the talker's row on the thread, or rewrite the one standing. */
-function writeReply(threadId: string, row: LiveReply): void {
+/** Put the talker's row on the thread, or rewrite the one standing.
+ *
+ *  False when a REWRITE found no row to rewrite, which is the same claim
+ *  `writeRow` reads on the caller's side: the engine wrote those words down
+ *  while the bridge still held them. Redrawing would paint the reply twice.
+ *
+ *  A thread that has gone from the map answers true. Nothing claimed the row;
+ *  there is simply nowhere to draw it, and the bridge keeps what it holds. */
+function writeReply(threadId: string, row: LiveReply, fresh: boolean): boolean {
   const map = threadMap.peek();
   const thread = map.get(threadId);
-  if (!thread) return;
+  if (!thread) return true;
   const standing = thread.liveReply;
-  if (standing && standing.eventId === row.eventId && standing.text === row.text) return;
+  if (!fresh && !standing) return false;
+  if (standing && standing.eventId === row.eventId && standing.text === row.text) return true;
   thread.liveReply = row;
   threadMap.value = new Map(map);
   bumpThreadEvents(threadId);
+  return true;
 }
 
 /** Would redrawing change anything the reader can see? `created` is excluded:

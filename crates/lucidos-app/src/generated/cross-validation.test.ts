@@ -8,7 +8,7 @@
 // from the Rust implementation.
 
 import { describe, it, expect } from 'vitest';
-import { availableThreadActions, displaySection, THREAD_STATUSES } from './thread-lifecycle';
+import { availableThreadActions, displaySection, threadIsDeletable, THREAD_STATUSES } from './thread-lifecycle';
 import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
@@ -24,12 +24,18 @@ interface DisplaySectionCase {
   expected: string;
 }
 
-type TestCase = AvailableThreadActionsCase | DisplaySectionCase;
+interface ThreadIsDeletableCase {
+  fn: 'threadIsDeletable';
+  args: [string, string, boolean, boolean, boolean];
+  expected: boolean;
+}
+
+type TestCase = AvailableThreadActionsCase | DisplaySectionCase | ThreadIsDeletableCase;
 
 // Meta-test: every generated function with logic (not just data lookups) must have
 // cross-validation cases in the fixture. If you add a new function to generate_typescript()
 // that has branching logic, add it to this set AND to generate_cross_validation_fixture().
-const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection']);
+const FUNCTIONS_REQUIRING_CROSS_VALIDATION = new Set(['availableThreadActions', 'displaySection', 'threadIsDeletable']);
 
 describe('Cross-validation: generated TS matches Rust', () => {
   const cases = fixture.cases as TestCase[];
@@ -90,6 +96,33 @@ describe('Cross-validation: generated TS matches Rust', () => {
           attention,
         );
         expect(result).toBe(tc.expected as DisplaySection);
+      });
+    }
+  });
+
+  describe('threadIsDeletable', () => {
+    const deletableCases = cases.filter((c): c is ThreadIsDeletableCase => c.fn === 'threadIsDeletable');
+
+    it(`has exhaustive coverage (${deletableCases.length} cases)`, () => {
+      // 2 threadTypes × N statuses × 2 pending × 2 externalRepo ×
+      // 2 descendantsBlock. No section dimension: delete is offered in the
+      // Archive section too, which is the predicate's whole point.
+      expect(deletableCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 3);
+    });
+
+    for (const tc of deletableCases) {
+      const [threadType, status, pending, externalRepo, descendantsBlock] = tc.args;
+      const label = `(${threadType}, ${status}, pending=${pending}, external=${externalRepo}, blocked=${descendantsBlock})`;
+
+      it(`${label} → ${tc.expected}`, () => {
+        const result = threadIsDeletable(
+          threadType as ThreadType,
+          status as ThreadStatus,
+          pending,
+          externalRepo,
+          descendantsBlock,
+        );
+        expect(result).toBe(tc.expected);
       });
     }
   });

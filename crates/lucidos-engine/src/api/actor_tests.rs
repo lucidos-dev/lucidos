@@ -1258,3 +1258,194 @@ async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
     }
     crate::test_support::teardown_test_db(&db_name).await;
 }
+
+// ── require_owner_device ───────────────────────────────────────────────
+//
+// The gate in front of the one irreversible, owner-only action. Every case
+// below presents a credential the engine accepts everywhere else, and only the
+// registered device gets through (ADR 0192).
+
+/// The one `Ok`. `require_user_actor` has already proved the id names a row, so
+/// the `Device` arm IS the evidence.
+#[tokio::test]
+async fn the_owners_registered_device_may_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "owner-phone", Some("Mozilla/5.0"), None)
+        .await
+        .unwrap();
+
+    let h = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+    let actor = require_owner_device(&h, &pool)
+        .await
+        .expect("the owner's own device is exactly who this is for");
+    assert!(matches!(actor, MessageOrigin::Device { .. }));
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The case the whole gate exists for. A Lucidos-spawned subprocess holds a
+/// verified thread-bound origin token, which the thread-reach ladder would weigh
+/// against a standing instruction. Here it is simply refused.
+#[tokio::test]
+async fn a_verified_agent_origin_token_may_not_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    init_agent_origin_secret("owner-device-gate-secret".into());
+    let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None)
+        .expect("the secret is installed, so a token mints");
+
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
+    // It really is a verified subprocess, not a token the engine ignored.
+    assert!(matches!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess { .. }
+    ));
+
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("no agent may press this button");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+    assert!(
+        refusal.message.contains("No agent may press"),
+        "the refusal must tell the agent the answer is no for every agent: {}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("Archive"),
+        "and point at the action it CAN reach: {}",
+        refusal.message
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A subprocess that also presents a device header is still a subprocess:
+/// `build_message_origin` puts the origin token first. So the obvious way round
+/// the gate does not work.
+#[tokio::test]
+async fn an_agent_token_beside_a_real_device_header_is_still_refused() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "owner-laptop", Some("Mozilla/5.0"), None)
+        .await
+        .unwrap();
+    init_agent_origin_secret("owner-device-gate-secret".into());
+    let token = mint_agent_origin_token(Some(Uuid::new_v4()), 0, None).unwrap();
+
+    let h = headers_with(&[
+        (HEADER_DEVICE_ID, "owner-laptop"),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
+    ]);
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("borrowing the owner's device id does not make an agent a person");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The engine's own machinery, which the build-watch and the release scripts
+/// hold. It is a real credential and it is not a person.
+#[tokio::test]
+async fn the_machine_local_token_may_not_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("the engine's own machinery is not the owner");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An unattributed API caller, which is what an external client that forgot its
+/// credential looks like. 401 rather than 403: it may retry with one.
+#[tokio::test]
+async fn an_unattributed_caller_may_not_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = headers_with(&[("user-agent", "curl/8")]);
+
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("a bare curl is nobody");
+    assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A device id that names no row is a header somebody typed. Attribution
+/// accepts it and this gate must not, or the evidence would be one header.
+#[tokio::test]
+async fn an_unregistered_device_may_not_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = headers_with(&[(HEADER_DEVICE_ID, "never-registered")]);
+
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("an id naming no device is not the owner");
+    assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The `device_is_evidence` fail-open is right where it was made, on the user's
+/// own send path. Here it is not: a pool timeout would promote an invented id
+/// to a `Device` actor and take the thread family with it.
+///
+/// Driven by closing the pool, which is the shape a saturated or dropped pool
+/// produces: the probe errors rather than answering false.
+#[tokio::test]
+async fn a_database_blip_cannot_promote_an_invented_device() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = headers_with(&[(HEADER_DEVICE_ID, "invented")]);
+
+    // Attribution still stamps it, and `require_user_actor` still admits it,
+    // which is exactly the pair this gate must not inherit.
+    pool.close().await;
+    assert!(matches!(
+        require_user_actor(&h, &pool, None).await,
+        Ok(MessageOrigin::Device { .. })
+    ));
+
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("an unconfirmable device must not delete a thread");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An app iframe runs on the engine's own origin and reaches the shell's
+/// `localStorage`, so its `fetch` carries the owner's real device id. The same
+/// per-route refusal the secret-reveal pair applies (ADR 0117, ADR 0144).
+#[tokio::test]
+async fn an_app_document_may_not_delete() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(&pool, &bus, "owner-tablet", Some("Mozilla/5.0"), None)
+        .await
+        .unwrap();
+
+    let h = headers_with(&[
+        (HEADER_DEVICE_ID, "owner-tablet"),
+        ("sec-fetch-site", "same-origin"),
+        ("referer", "https://localhost:5173/app/habit-tracker/"),
+    ]);
+    let refusal = require_owner_device(&h, &pool)
+        .await
+        .expect_err("an app must not press the owner's button with the owner's id");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
+
+    // The same device from the shell itself is fine, so the refusal is about the
+    // document rather than about browsers.
+    let shell = headers_with(&[
+        (HEADER_DEVICE_ID, "owner-tablet"),
+        ("sec-fetch-site", "same-origin"),
+        ("referer", "https://localhost:5173/"),
+    ]);
+    assert!(require_owner_device(&shell, &pool).await.is_ok());
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}

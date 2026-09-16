@@ -165,3 +165,52 @@ async fn search_threads_by_text_matches_via_entities() {
 
     teardown_test_db(&db).await;
 }
+
+// ── Archive stayed searchable ─────────────────────────────────────────
+//
+// Decision 1 of `docs/plans/2026-09-15-deleting-a-thread.md`: archive is "put
+// down for now" and delete is "gone", and only delete changed. An archive
+// filter appearing in either search arm would quietly turn the softer action
+// into the harsher one.
+
+/// The tester's report that started the delete work said archived threads felt
+/// retrievable. They ARE, and that is the decision: this pins it, so the
+/// obvious follow-up ("while we are here, hide archived from search") cannot
+/// land by accident.
+#[tokio::test]
+async fn an_archived_thread_is_still_returned_by_text_search() {
+    let (pool, db) = setup_test_db().await;
+    ensure_memory_entries_table(&pool).await;
+    let store = EventStore::new(pool.clone());
+
+    let archived = Uuid::new_v4();
+    insert_thread(&pool, archived, "Heat pump experiments").await;
+    insert_message(&pool, archived, "MessageReceived", "the defrost cycle").await;
+    sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+        .bind(archived)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let hits = store.search_threads_by_text("defrost", 10).await.unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.info.thread_id == archived.to_string()),
+        "an archived thread must rank like a live one; only delete removes it"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// The memory arm needs an embedder, so it is asserted at the source. Both
+/// queries read `thread_summaries`, so either could grow the filter, and only
+/// one of the two is reachable from a test without a model.
+#[test]
+fn neither_search_arm_filters_on_archive_state() {
+    const SRC: &str = include_str!("../threads/search.rs");
+    assert!(
+        !SRC.contains("archive_state"),
+        "a search arm grew an archive filter. Archive is 'put down for now' and \
+         stays fully searchable; delete is the action that removes a thread."
+    );
+}

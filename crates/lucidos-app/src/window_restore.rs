@@ -11,10 +11,12 @@
 //!
 //! So between the restore and the show, the geometry is checked once against the
 //! CURRENT display layout and the minimums declared in `tauri.conf.json`. A
-//! healthy rect is left exactly as it is; a degenerate one falls back to the
-//! declared default size; a position with no grabbable title bar left on any
-//! monitor is nudged back on screen, or re-centred on the primary when the
-//! window is essentially gone (the display it was on was unplugged).
+//! healthy rect is left exactly as it is. A degenerate one falls back to the
+//! declared default size. A frame no attached SCREEN can hold is capped to the
+//! work area it lands on. A position with no grabbable title bar left on any
+//! monitor is nudged back on screen. A window that is essentially gone is
+//! re-centred on the primary, which covers the display it was on being
+//! unplugged.
 //!
 //! # Units
 //!
@@ -32,7 +34,7 @@
 //!
 //! So every physical number converts the moment it is read, through the scale
 //! factor of the thing that reported it: [`Rect::from_physical`] for a window,
-//! [`work_area_points`] for a monitor. Corrections go back out through
+//! [`panel_points`] for a monitor. Corrections go back out through
 //! `app_window::place_window`, which applies logical values and moves a window
 //! before it resizes it (ADR 0178).
 
@@ -117,12 +119,27 @@ impl Rect {
     }
 }
 
+/// One attached monitor, in logical points.
+///
+/// Two rects, because the clamp asks a display two different questions and the
+/// answers differ by the Dock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Panel {
+    /// The usable frame, menu bar and Dock excluded. Where a window is PLACED,
+    /// since neither of those is somewhere a title bar can be grabbed.
+    pub work_area: Rect,
+    /// The whole screen. What bounds a RESIZE, which the Dock does not: the
+    /// user can drag a window's bottom edge under it, and turning Dock
+    /// auto-hide off shrinks the work area under a window already that tall.
+    /// Judging a SIZE against the work area would read both as corruption.
+    pub frame: Rect,
+}
+
 /// The display layout the clamp judges a rect against, in logical points.
 #[derive(Debug, Clone)]
 pub(crate) struct Displays {
-    /// Work area (the usable frame, menu bar and Dock excluded) of every
-    /// currently-attached monitor.
-    pub work_areas: Vec<Rect>,
+    /// Every currently-attached monitor.
+    pub panels: Vec<Panel>,
     /// Work area of the primary monitor: where a window with nowhere left to be
     /// gets re-centred.
     pub primary: Rect,
@@ -183,10 +200,43 @@ fn handle_is_reachable(rect: &Rect, displays: &Displays, policy: &Policy) -> boo
     // A window narrower than the requirement can never satisfy it, so what it
     // owes is its own full width.
     let needed_width = policy.grab_width.min(handle.width);
-    displays.work_areas.iter().any(|work_area| {
-        handle.overlap_width(work_area) >= needed_width
-            && handle.overlap_height(work_area) >= handle.height
+    displays.panels.iter().any(|panel| {
+        handle.overlap_width(&panel.work_area) >= needed_width
+            && handle.overlap_height(&panel.work_area) >= handle.height
     })
+}
+
+/// Can any attached SCREEN hold a window of `rect`'s size?
+///
+/// Size only. Where the window sits is the position pass's question, and a
+/// window hanging off an edge is a place the user put it.
+///
+/// The screen rather than the work area, because the screen is what bounds a
+/// drag. See [`Panel::frame`].
+fn a_screen_can_hold(rect: &Rect, displays: &Displays) -> bool {
+    displays
+        .panels
+        .iter()
+        .any(|panel| panel.frame.width >= rect.width && panel.frame.height >= rect.height)
+}
+
+/// The monitor a rect belongs to, for a correction that has to pick one.
+///
+/// The one it overlaps most, while that overlap is at least a drag handle's
+/// worth. Deriving the threshold from the handle rather than picking a
+/// percentage keeps one notion of "enough window to work with". It is also what
+/// separates a window hanging off an edge from the two cases with no place left:
+/// a corner sliver, and a display that was unplugged.
+///
+/// Answers the WORK AREA, because every caller is putting a window somewhere it
+/// has to live. `None` is those two cases, and both start over on the primary.
+fn home_work_area(rect: &Rect, displays: &Displays, policy: &Policy) -> Option<Rect> {
+    displays
+        .panels
+        .iter()
+        .map(|panel| panel.work_area)
+        .max_by_key(|work_area| rect.overlap_area(work_area))
+        .filter(|work_area| rect.overlap_area(work_area) >= policy.grab_width * policy.grab_height)
 }
 
 /// Slide one axis of the rect so a `len`-long span sits inside the
@@ -218,26 +268,38 @@ pub(crate) fn sanitize(restored: Rect, displays: &Displays, policy: &Policy) -> 
         fixed.height = policy.default_height;
     }
 
-    // 2. Position, judged against the size decided above: a corner position that
+    // 2. Size ceiling. A window bigger than EVERY attached SCREEN is not a shape
+    //    the user can have dragged, since macOS bounds a resize to the screen.
+    //    A physical-pixel record produces it whenever it is restored against a
+    //    scale factor the capture did not use (ADR 0173). The part of the app
+    //    past the edge cannot be reached at all.
+    //
+    //    The screen, deliberately, not the work area: the Dock does not bound a
+    //    resize. See [`Panel::frame`]. The CAP is the work area, because that is
+    //    where a corrected window has to be able to live.
+    //
+    //    A frame that still fits SOME attached display is left alone. So a
+    //    window sized for a monitor that is away today comes back whole when it
+    //    returns. ADR 0193 weighs that against the stricter rule.
+    //
+    //    Capped AND placed together, against the one display. A shrink alone
+    //    leaves the window hanging off the same edge. Its grab band is still
+    //    reachable there, so the position pass below would pass it through. The
+    //    floor is re-applied so step 1 cannot bounce the result back to the
+    //    default on a re-run, which is what keeps this idempotent.
+    if !a_screen_can_hold(&fixed, displays) {
+        let home = home_work_area(&fixed, displays, policy).unwrap_or(displays.primary);
+        fixed.width = fixed.width.min(home.width).max(policy.min_width);
+        fixed.height = fixed.height.min(home.height).max(policy.min_height);
+        fixed.x = nudge_axis(fixed.x, fixed.width, home.x, home.width);
+        fixed.y = nudge_axis(fixed.y, fixed.height, home.y, home.height);
+    }
+
+    // 3. Position, judged against the size decided above: a corner position that
     //    was fine for a 1x1 window puts a full-size one almost entirely off the
     //    screen, and that is exactly the shipped bug.
     if !handle_is_reachable(&fixed, displays, policy) {
-        let best = displays
-            .work_areas
-            .iter()
-            .copied()
-            .max_by_key(|work_area| fixed.overlap_area(work_area))
-            // Is there still a monitor this window belongs to? It counts as
-            // belonging while at least a drag handle's worth of it is on screen.
-            // Deriving the threshold from the handle rather than picking a
-            // percentage keeps one notion of "enough window to work with", and
-            // it is what separates a window hanging off an edge (a place the
-            // user put it) from the two cases that have no place left: a corner
-            // sliver, and a display that was unplugged.
-            .filter(|work_area| {
-                fixed.overlap_area(work_area) >= policy.grab_width * policy.grab_height
-            });
-        match best {
+        match home_work_area(&fixed, displays, policy) {
             // Partly off screen: keep the user's neighbourhood, nudge it back.
             Some(work_area) => {
                 fixed.x = nudge_axis(fixed.x, fixed.width, work_area.x, work_area.width);
@@ -293,17 +355,22 @@ pub(crate) fn declared_min_size(app: &tauri::AppHandle) -> Option<(f64, f64)> {
 }
 
 /// Read a window's restored geometry, sanity-check it, and correct it in place
-/// if it is unusable. Called for `main` from `setup`, which is after the
-/// window-state plugin's `on_window_ready` restore and before anything shows the
-/// window (it is declared `visible: false` and shown by `show_startup_window`).
-/// Also called for each window a session restore places, while it is hidden.
+/// if it is unusable.
+///
+/// Every caller runs just before a window reaches the screen, which is the rule
+/// (ADR 0193). Four of them: `show_startup_window`, `reopen_client`,
+/// `open_app_window`, and `front_window` for one brought forward that is not up
+/// yet. NOT `setup`, where tao's deferred setters have not landed and the read
+/// is of the geometry the window was born at.
+///
+/// A window already ON screen is not a caller, and `front_window` gates on that
+/// for the reason its own comment gives.
 ///
 /// Every failure here is a no-op with a log line: a client that cannot read its
 /// own monitors must still come up.
 ///
 /// By window, not webview window, per ADR 0140. Every read and every correction
-/// here is a window operation. Both callers run before their window is on
-/// screen, so no preview can be attached yet.
+/// here is a window operation.
 pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
     let Some(window) = app.get_window(label) else {
         return;
@@ -374,8 +441,8 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
         return;
     };
     let displays = Displays {
-        work_areas: monitors.iter().map(work_area_points).collect(),
-        primary: work_area_points(&primary),
+        panels: monitors.iter().map(panel_points).collect(),
+        primary: panel_points(&primary).work_area,
     };
 
     let Some(fixed) = sanitize(restored, &displays, &policy) else {
@@ -401,17 +468,20 @@ pub(crate) fn clamp_restored_geometry(app: &tauri::AppHandle, label: &str) {
     crate::app_window::place_window(&window, fixed, &format!("`{label}` back on screen"));
 }
 
-/// A monitor's usable frame as a [`Rect`]. Deliberately the work area rather
-/// than the full resolution: the menu bar and the Dock are not places a title
-/// bar can be grabbed.
+/// A monitor as the clamp sees it: its usable frame and its whole screen. Both
+/// are needed, for the reason [`Panel`] gives.
 ///
 /// Converted through THIS monitor's own scale factor, which is the one tao
-/// multiplied its work area by. A neighbour's factor would put the display
+/// multiplied its rects by. A neighbour's factor would put the display
 /// somewhere it is not. The clamp would then judge every window against a
 /// desktop that does not exist.
-fn work_area_points(monitor: &tauri::Monitor) -> Rect {
+fn panel_points(monitor: &tauri::Monitor) -> Panel {
+    let scale = monitor.scale_factor();
     let area = monitor.work_area();
-    Rect::from_physical(area.position, area.size, monitor.scale_factor())
+    Panel {
+        work_area: Rect::from_physical(area.position, area.size, scale),
+        frame: Rect::from_physical(*monitor.position(), *monitor.size(), scale),
+    }
 }
 
 #[cfg(test)]
@@ -455,31 +525,58 @@ mod tests {
         assert!(policy_config(&[], "main").is_none());
     }
 
+    /// A panel whose whole screen is usable below the menu bar: the Dock is
+    /// hidden, or on an edge this fixture does not model.
+    fn panel_under_a_menu_bar(x: i64, y: i64, width: i64, height: i64, menu_bar: i64) -> Panel {
+        Panel {
+            work_area: Rect {
+                x,
+                y: y + menu_bar,
+                width,
+                height: height - menu_bar,
+            },
+            frame: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+        }
+    }
+
     /// The internal Retina panel alone: 1728x1117 points behind 3456x2234
     /// pixels, with a 37-point menu bar. The display the shipped clamp bug was
     /// reported on.
     fn one_panel() -> Displays {
-        let work_area = Rect {
-            x: 0,
-            y: 37,
-            width: 1728,
-            height: 1080,
-        };
+        let panel = panel_under_a_menu_bar(0, 0, 1728, 1117, 37);
         Displays {
-            work_areas: vec![work_area],
-            primary: work_area,
+            panels: vec![panel],
+            primary: panel.work_area,
         }
+    }
+
+    /// The panel above with the Dock showing along its bottom edge. It takes 80
+    /// points out of the work area and none out of the screen.
+    fn one_panel_with_a_dock() -> Displays {
+        let mut displays = one_panel();
+        displays.panels[0].work_area.height -= 80;
+        displays.primary = displays.panels[0].work_area;
+        displays
     }
 
     /// The panel above plus an external display to its right, for the
     /// unplug case.
     fn two_panels() -> Displays {
         let mut displays = one_panel();
-        displays.work_areas.push(Rect {
+        let external = Rect {
             x: 1728,
             y: 0,
             width: 2560,
             height: 1440,
+        };
+        displays.panels.push(Panel {
+            work_area: external,
+            frame: external,
         });
         displays
     }
@@ -504,7 +601,16 @@ mod tests {
             height: 1117,
         };
         Displays {
-            work_areas: vec![ultrawide, panel],
+            panels: vec![
+                Panel {
+                    work_area: ultrawide,
+                    frame: ultrawide,
+                },
+                Panel {
+                    work_area: panel,
+                    frame: panel,
+                },
+            ],
             primary: ultrawide,
         }
     }
@@ -589,7 +695,7 @@ mod tests {
                 height: 1117,
             }
         );
-        assert_eq!(panel, mixed_dpi_desk().work_areas[1]);
+        assert_eq!(panel, mixed_dpi_desk().panels[1].work_area);
     }
 
     // Last net only: both callers refuse to convert without a scale they read.
@@ -723,8 +829,42 @@ mod tests {
         assert_eq!((fixed.x, fixed.y), (200, 37));
     }
 
+    // The tester-reported shape. The plugin records a 1024x768 window on a 2x
+    // panel as 2048x1536 PHYSICAL. Restored against a 1x reading, that means
+    // 2048x1536 points. Everything past the panel edge is then off screen, and
+    // the grab band is reachable, so the position pass alone passed it through.
     #[test]
-    fn a_window_larger_than_the_work_area_aligns_with_its_leading_edge() {
+    fn a_doubled_frame_is_capped_to_the_panel_it_lands_on() {
+        let doubled = Rect {
+            x: 600,
+            y: 400,
+            width: 2048,
+            height: 1536,
+        };
+        let fixed = sanitize(doubled, &one_panel(), &policy()).expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (1728, 1080));
+        assert_eq!((fixed.x, fixed.y), (0, 37));
+    }
+
+    // The lenient half of the rule: capping is for a frame NO attached display
+    // can hold. This one fits the external, so the size is the user's and it
+    // survives a launch taken while the window sits on the smaller panel.
+    #[test]
+    fn a_frame_another_attached_display_can_hold_keeps_its_size() {
+        let wide = Rect {
+            x: 1850,
+            y: 60,
+            width: 2000,
+            height: 1200,
+        };
+        assert_eq!(sanitize(wide, &two_panels(), &policy()), None);
+        // Unplug that display and there is nowhere left to put it whole.
+        let fixed = sanitize(wide, &one_panel(), &policy()).expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (1728, 1080));
+    }
+
+    #[test]
+    fn a_window_larger_than_the_screen_is_capped_to_its_work_area() {
         let oversized = Rect {
             x: -450,
             y: -100,
@@ -733,14 +873,68 @@ mod tests {
         };
         let fixed = sanitize(oversized, &one_panel(), &policy()).expect("must be corrected");
         assert_eq!((fixed.x, fixed.y), (0, 37));
-        // Oversized is not degenerate, so the size the user had is kept.
-        assert_eq!((fixed.width, fixed.height), (2000, 1200));
+        // It used to keep the size and align its leading edge. That left the
+        // right of the app off screen with no way to reach it.
+        assert_eq!((fixed.width, fixed.height), (1728, 1080));
+    }
+
+    /// The ceiling is measured against the SCREEN, not the work area, and this
+    /// is why. A user can drag a window's bottom edge under the Dock. Turning
+    /// Dock auto-hide off shrinks the work area under a window already that
+    /// tall. Judging the size against the work area would read both as
+    /// corruption, and quietly shrink a window the user sized on purpose.
+    #[test]
+    fn a_window_reaching_under_the_dock_keeps_its_size() {
+        let displays = one_panel_with_a_dock();
+        // Taller than the 1000-point work area, inside the 1117-point screen.
+        let over_the_dock = Rect {
+            x: 0,
+            y: 37,
+            width: 1728,
+            height: 1080,
+        };
+        assert_eq!(sanitize(over_the_dock, &displays, &policy()), None);
+    }
+
+    /// The floor wins over the ceiling. A screen under the declared minimum
+    /// cannot be served at all. Capping to it would return a window the config
+    /// calls unusable, and step 1 would bounce that back to the default on the
+    /// next run. The two would then take turns forever.
+    #[test]
+    fn a_cap_never_goes_under_the_declared_minimum() {
+        let tiny = Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 250,
+        };
+        let displays = Displays {
+            panels: vec![Panel {
+                work_area: tiny,
+                frame: tiny,
+            }],
+            primary: tiny,
+        };
+        let fixed = sanitize(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 2000,
+                height: 1200,
+            },
+            &displays,
+            &policy(),
+        )
+        .expect("must be corrected");
+        assert_eq!((fixed.width, fixed.height), (480, 400));
+        assert_eq!(sanitize(fixed, &displays, &policy()), None);
     }
 
     /// The reason `clamp_restored_geometry` returns early on a fullscreen
     /// window. A macOS fullscreen frame is the whole SCREEN, menu-bar strip
     /// included, so it is outside the work area at the top and the grab band
-    /// reads as unreachable. Nothing is wrong with it; the clamp simply has no
+    /// reads as unreachable. The ceiling leaves it alone, since the screen holds
+    /// it by definition. Nothing is wrong with it; the clamp simply has no
     /// business judging it.
     #[test]
     fn a_fullscreen_frame_reads_as_unreachable_which_is_why_it_is_skipped() {
@@ -790,6 +984,20 @@ mod tests {
                 y: -100,
                 width: 2000,
                 height: 1200,
+            },
+            // Bigger than the one attached panel, which the ceiling caps.
+            Rect {
+                x: 600,
+                y: 400,
+                width: 2048,
+                height: 1536,
+            },
+            // Oversize in one axis only, and off the top in the other.
+            Rect {
+                x: 100,
+                y: 0,
+                width: 3000,
+                height: 700,
             },
         ];
         for rect in broken {

@@ -261,6 +261,23 @@ The FreeText fast-path is additionally gated to **human-authored** follow-ups (`
 | `TriggerStarted` | A scheduled or event-driven trigger run started. Carries `trigger_id`, optional `trigger_name`, optional `prompt`, optional `invocation: TriggerInvocation` (`Schedule` or `Event { event_type, event_id?, thread_id? }`, where `thread_id` is set only for thread-scoped source events and is exposed to script triggers as `TRIGGER_EVENT_THREAD_ID`), optional `origin`, `go_to_review: bool`, optional `model` and `reasoning_effort`. Aliases on the wire: `task_id`, `task_name` (legacy from when triggers were called "scheduled tasks"). `model` / `reasoning_effort` record what the fire actually ran on (the trigger's own pin, else the account chat default). This is a trigger thread's *starter* event and it has no `MessageReceived`, so those two fields are where the per-thread model memory reads from: a follow-up on a trigger thread reuses the fire's model instead of snapping back to the account default. Absent on runs recorded before the fields existed. | lifecycle | yes | yes |
 | `TriggerCompleted` | A trigger run finished. Carries `trigger_id`, optional `trigger_name`, optional `result_summary`. Same aliases. The engine guarantees `result_summary` is a non-empty, single trimmed line for every run it emits — when a script exits 0 with no stdout it falls back to the script's last non-empty line, else `"<name> completed (exit <code>, no output)"`; an intent run with no final text falls back to `"<name> completed (no output)"`. So a blank summary never surfaces and idle-detector triggers don't read as a no-op fire flood to the learning/audit sweeps. | lifecycle | yes | yes |
 
+### Deleting a thread is a `SystemEvent`, not one of these
+
+A thread's own events cannot record its deletion, because the delete removes
+them. So `ThreadsDeleted` is a **`SystemEvent`** on aggregate `ops` with
+`aggregate_id` `global`. It is persisted and subscribable like any other, and
+`condition: { thread_id: ... }` does NOT reach it: the row belongs to no thread.
+Subscribe on the type and read `thread_ids` from the payload instead.
+
+| Event | When it fires | Volume | Persisted | Triggerable |
+|---|---|---|---|---|
+| `ThreadsDeleted` | The owner deleted a thread and every sub-thread under it, from the Lucidos UI. Carries `thread_ids` (the whole family, target first), `event_count`, `memory_count`, `worktrees_removed`, optional `actor`. **No title, no message text, no summary**: it is the only record left, and it must not re-file what the delete removed. | lifecycle (rare) | yes | yes |
+
+Deleting is not archiving. *Archive* moves a thread to the Archive section and
+changes nothing about retrievability. Delete removes the rows, and what Lucidos
+learned from them, with no undo. It is offered to the workspace owner in the UI
+and to nobody else, so no tool, CLI verb or SDK method can reach it.
+
 ## Changes (per-thread coding-agent change proposals)
 
 The change family is per-thread — `change_id` is the primary identifier. `ChangeProposed` is emitted **once per coding-agent turn**, at end-of-turn, gated by `may_touch_change_state_at_idle` (only on `TerminalKind::Generated`; aborts/cancels/failures don't propose). That's the "coding agent is done with real finished work" contract: Apply/proposal state waits for idle. The Diff button is separate git truth and can become available earlier when the worktree post-commit hook refreshes `coding_agent_has_diff`.
@@ -474,7 +491,7 @@ which is what lets the boot sweep find one whose engine died mid-call.
 |---|---|---|---|---|
 | `VoiceSessionStarted` | A voice session opened on this thread. Carries `session_id: Uuid`, and the `actor` (from `EventMeta`) is the device that opened the socket. Exactly one session may be live per thread, so a second upgrade is refused and writes no second row. Placing a call bumps the thread's recency and nothing else. It does NOT promote a draft: connecting is not a conversation, so the first spoken word does that instead (ADR 0167). | lifecycle (rare per thread) | yes | yes |
 | `VoiceSessionEnded` | The session closed. Carries the same `session_id`, `duration_secs: u64`, and `reason`: `hangup` (the caller rang off), `agent_hangup` (the caller said they were done and Lucidos rang off for them, which ends the call and never the work), `disconnected` (the socket died with no goodbye), `provider_failed` (the talker could not go on), `engine_shutdown` (the engine went away under the call, or the boot sweep settled a start its process never got to end). A sweep-settled row carries `duration_secs: 0`, because the engine holding the clock is gone. | lifecycle (rare per thread) | yes | yes |
-| `SpokenReplyGenerated` | The talker finished saying something out loud, and this is what it said. Carries `session_id: Uuid`, `text: String`, and `interrupted: bool` (the caller spoke over it, so only that much was heard). One per talker turn, whether the talker composed the words itself or was reading the agent's answer aloud: both are what the caller heard. A reply cut off before a word was said writes nothing. The `actor` names the talker as a guest agent, so the agent reading the thread sees it under its own speaker label rather than as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status and a talker turn landing mid-turn must not settle it. Like the spoken message beside it, it MAKES THE THREAD REAL (ADR 0167). That matters because the talker usually greets first. | a few per call | yes | yes |
+| `SpokenReplyGenerated` | The talker finished saying something out loud, and this is what it said. Carries `session_id: Uuid`, `text: String`, and `interrupted: bool` (the caller spoke over it, so only that much was heard). One per stretch of speech, whether the talker composed the words itself or was reading the agent's answer aloud: both are what the caller heard. A stretch is everything it said between two moves of the conversation, so it can span several provider turns (ADR 0188). A reply cut off before a word was said writes nothing. The `actor` names the talker as a guest agent, so the agent reading the thread sees it under its own speaker label rather than as its own prior turn (ADR 0150). It is `Metadata`, because the agent's turn owns the thread's status and a talker turn landing mid-turn must not settle it. Like the spoken message beside it, it MAKES THE THREAD REAL (ADR 0167). That matters because the talker usually greets first. | a few per call | yes | yes |
 | `SpokenMessageReceived` | The caller said something and the talker answered it alone, from what it already knew. Carries `session_id: Uuid` and `text: String`, and the `actor` is the caller's device rather than the talker. It started no agent turn, which is exactly why it is not a `MessageReceived`: that variant is a Start event, and using it here would leave the thread claiming a turn that never runs. `Metadata`, and it moves no section. It MAKES THE THREAD REAL, as the spoken reply beside it does (ADR 0167): a draft the call was placed from becomes an ordinary thread, its stored draft is cleared, and every device is told. The caller's FIRST spoken words also become the thread's `first_message`, which is what titles a call nobody delegated from. | a few per call | yes | yes |
 | `WorkDelegated` | The talker asked for the agent, with its `delegate` tool. Carries `session_id: Uuid` and `reason: String`, the talker's own few words on what the caller wants. Never empty: a call with no reason gets a stand-in rather than being dropped. The `actor` names the talker as a guest agent, as on a spoken reply. It sits BESIDE the `MessageReceived` that started the turn, never in place of it, so it is `Metadata` and moves no section. | a few per call | yes | yes |
 
@@ -502,8 +519,10 @@ the thread's transcript: the caller's words, the agent's answer where there was
 one, and the `SpokenReplyGenerated` rows for what was actually said out loud.
 
 **The caller's words are always written before the reply to them.** Both rows
-of a talker-only exchange leave one handler, so the order they are emitted in
-is the order a reader meets them.
+go down when the conversation MOVES on: the caller speaking again, a new thing
+handed to the talker to say, or the call ending. A pause in the talker's words
+is none of those and writes nothing. It says nothing about whether the talker
+is about to ask for the agent (ADR 0191).
 
 That `MessageReceived` carries `voice_session_id`, naming the session it was
 spoken on. It is the only thing that tells the message apart from a typed one,

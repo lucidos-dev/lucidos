@@ -604,8 +604,12 @@ impl WorktreeCleanup {
             return None;
         }
 
-        let outcome =
-            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        let outcome = remove_worktree_and_optionally_delete_branch(
+            worktree,
+            Some(pre_size),
+            BranchDisposal::WhenMerged,
+        )
+        .await?;
         log!(
             "[WorktreeCleanup] tier-0 freed {} bytes for thread {} (branch_deleted={})",
             outcome.freed_bytes,
@@ -660,8 +664,12 @@ impl WorktreeCleanup {
             }
         }
 
-        let outcome =
-            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        let outcome = remove_worktree_and_optionally_delete_branch(
+            worktree,
+            Some(pre_size),
+            BranchDisposal::WhenMerged,
+        )
+        .await?;
         log!(
             "[WorktreeCleanup] orphan-path freed {} bytes at {} (branch_deleted={})",
             outcome.freed_bytes,
@@ -762,8 +770,12 @@ impl WorktreeCleanup {
             return None;
         }
 
-        let outcome =
-            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        let outcome = remove_worktree_and_optionally_delete_branch(
+            worktree,
+            Some(pre_size),
+            BranchDisposal::WhenMerged,
+        )
+        .await?;
         log!(
             "[WorktreeCleanup] temp worktree freed {} bytes at {} (branch_deleted={})",
             outcome.freed_bytes,
@@ -833,8 +845,12 @@ impl WorktreeCleanup {
             return None;
         }
 
-        let outcome =
-            remove_worktree_and_optionally_delete_branch(worktree, Some(pre_size)).await?;
+        let outcome = remove_worktree_and_optionally_delete_branch(
+            worktree,
+            Some(pre_size),
+            BranchDisposal::WhenMerged,
+        )
+        .await?;
 
         log!(
             "[WorktreeCleanup] tier-2 freed {} bytes for thread {} (branch_deleted={})",

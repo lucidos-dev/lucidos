@@ -253,6 +253,62 @@ export async function reloadGateway(): Promise<void> {
   await controlJson<void>('/gateway/reload', { method: 'POST' });
 }
 
+// ── Coexisting installs ─────────────────────────────────────────────────────
+
+/** Which vehicle laid an install down. Mirrors `lucidos_installs::InstallKind`,
+ *  whose serde rename is kebab-case. */
+export type InstallKind = 'desktop-app' | 'headless-installer' | 'source-checkout';
+
+/** A registered job that can start an install with nobody clicking anything. */
+export interface InstallLaunchAgent {
+  label: string;
+  path: string;
+  manager: 'launchd' | 'systemd';
+}
+
+/** One Lucidos install the gateway found on this machine.
+ *
+ *  `null` means the filesystem said nothing, never a default. An unreadable
+ *  version renders as "unknown", because the whole value of this surface is
+ *  that the user can trust every number on it. */
+export interface InstallRecord {
+  kind: InstallKind;
+  name: string;
+  root: string | null;
+  version: string | null;
+  data_dir: string | null;
+  port: number | null;
+  agents: InstallLaunchAgent[];
+  /** The gateway answering this request belongs to this install. */
+  running_here: boolean;
+  /** Exactly what removes it, ready to copy. */
+  removal: string;
+}
+
+/** Two or more installs configured for one port. Only one can bind it. */
+export interface InstallPortConflict {
+  port: number;
+  /** The contending installs, by `InstallRecord.name`. */
+  installs: string[];
+}
+
+export interface InstallInventory {
+  installs: InstallRecord[];
+  conflicts: InstallPortConflict[];
+}
+
+/** Every Lucidos install on the machine this workspace runs on.
+ *
+ *  Its own route rather than a field on `gateway/status`, which the picker
+ *  polls every two seconds: the scan walks directories and reads a plist.
+ *
+ *  A gateway too old to carry the route throws, which System > Overview shows
+ *  as a failed load rather than as an empty machine. That distinction matters
+ *  here most of all: an ancient gateway is the condition this explains. */
+export async function fetchInstallInventory(): Promise<InstallInventory> {
+  return controlJson<InstallInventory>('/installs');
+}
+
 // ── Network access (machine-global gateway bind) ────────────────────────────
 
 /** The machine-global network bind config from `~/.lucidos/network.toml`.

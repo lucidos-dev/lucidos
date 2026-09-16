@@ -22,6 +22,9 @@ path = "src/main.rs"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
+# Enumerating the machine's Lucidos installs, shared with `lucidos-app` so the
+# control plane and the client cannot describe one machine two ways.
+lucidos-installs = { path = "../lucidos-installs" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }

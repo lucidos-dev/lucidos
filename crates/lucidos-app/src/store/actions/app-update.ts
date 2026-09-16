@@ -1,9 +1,10 @@
-import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, releaseCheck, settingsScrollTarget } from '../store';
+import { showToast, removeToast, latestTauriAppVersion, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, releaseCheck, settingsScrollTarget } from '../store';
+import { isNewerVersion } from '../../utils/version';
 // The READ lives a layer up, where a surface can ask "is there an update?"
 // without importing this module's toasts, IPC and menu navigation.
 import { packagedUpdateVersion } from '../packagedUpdate';
 import { openWhatsNew, openSettingsSubview } from './menu';
-import { isTauri } from '../../utils/platform';
+import { isTauri, thisDeviceIsMobile } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
 import { requestUpdateCheck } from '../../api/client/control';
 import {
@@ -27,6 +28,18 @@ const UPDATE_TOAST_KEY = 'app-update-available';
 /** Why a check could not run, when the INSTALL is the reason rather than the
  *  session. A source checkout is the everyday case, and it never polls. */
 const NO_CHECK_HERE = 'this install has no update check';
+
+/** The whole answer a phone gets about taking an update.
+ *
+ *  It says WHERE and stops, because the how varies by install shape and none of
+ *  them is a thing this device can do. A bundle installs in the desktop client,
+ *  a headless install re-runs `install.sh`, and a source checkout rebuilds. So a
+ *  sentence naming the app would misdirect the last two outright.
+ *
+ *  Keyed, because the button that raises it stays live: unkeyed, a second tap
+ *  stacked a second copy of one sentence. */
+const UPDATE_ON_DESKTOP = 'Update Lucidos on the machine that runs this workspace, not from this device.';
+const UPDATE_ON_DESKTOP_KEY = 'app-update-on-desktop';
 
 let installing = false;
 /** Unsubscribe for the progress event, or `null` when not subscribed. */
@@ -67,7 +80,11 @@ export type UpdateCheckVerdict =
    *  user-facing. */
   | { kind: 'failed'; reason: string }
   /** An install is already under way, so its own narration is the answer. */
-  | { kind: 'installing' };
+  | { kind: 'installing' }
+  /** A second install is serving this workspace, and it is older than the app
+   *  asking. Nothing about the CLIENT's version answers that, so neither
+   *  "up to date" nor a client-side offer would be true. */
+  | { kind: 'shadowed'; engine: string; client: string };
 
 /** Surface the "Lucidos <v> available" offer.
  *
@@ -83,6 +100,11 @@ export type UpdateCheckVerdict =
  *  Extracted so the cancel path can put the offer straight back: abandoning a
  *  download abandons the attempt, not the update. */
 function offerAppUpdate(version: string): void {
+  // Never on a phone. The offer can only be taken on the machine running the
+  // workspace, so raising it here interrupts a reader to report somebody else's
+  // click. The release check still runs and What's New still marks the release
+  // `Available`, which is where a reader who cares goes looking.
+  if (thisDeviceIsMobile()) return;
   const route = updateRoute(true);
   const action = {
     label: route === 'install' ? 'Update & restart' : 'How to update',
@@ -277,7 +299,7 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
 
 /** What a surface can offer about a release newer than the one running.
  *
- *  Three answers, and deliberately never "nothing" (ADR 0142). A surface may
+ *  Four answers, and deliberately never "nothing" (ADR 0142). A surface may
  *  not say a newer release exists and then leave the reader no way to get it.
  *  That is what What's New did for every release the updater had not offered.
  *
@@ -285,8 +307,11 @@ export function checkForUpdatesNow(): Promise<UpdateCheckVerdict> {
  *  - `check`: no offer yet, and this session has a check it can run.
  *  - `guide`: the answer is on Settings, System, Overview. It carries the
  *    installer command for a headless install, and the rebuild for a source
- *    checkout. */
-export type UpdateRoute = 'install' | 'check' | 'guide';
+ *    checkout.
+ *  - `desktop`: the answer is one sentence, said here on a toast. A phone is
+ *    never the machine an install lands on, and that page's controls are all
+ *    things it cannot do. */
+export type UpdateRoute = 'install' | 'check' | 'guide' | 'desktop';
 
 /** Could this session install an offer, if one existed?
  *
@@ -323,17 +348,28 @@ export function canCheckForUpdatesHere(): boolean {
  *  `offered` says whether there is an offer to act on. It defaults to the
  *  updater's own answer, and a caller holding an offer already passes `true`.
  *  That matters on the client-check path, where the offer is in hand before the
- *  signals it would be re-derived from have settled. */
+ *  signals it would be re-derived from have settled.
+ *
+ *  **A mobile client gets one answer, whatever the state.** It is decided first
+ *  because none of the branches below can reach a different one: Lucidos ships
+ *  no mobile client, so `isTauri()` is false and `install` is already out. What
+ *  it takes away is `check`, whose only outcomes on a phone are "up to date"
+ *  and this same sentence. And `guide`, which spends a page load to say it. */
 export function updateRoute(offered: boolean = packagedUpdateVersion() !== null): UpdateRoute {
+  if (thisDeviceIsMobile()) return 'desktop';
   if (offered) return sessionCanInstall() ? 'install' : 'guide';
   return canCheckForUpdatesHere() ? 'check' : 'guide';
 }
 
-/** The label an update BUTTON wears, in all four of its states.
+/** The label an update BUTTON wears, in every one of its states.
  *
  *  Every word here, so Settings and What's New cannot drift apart. Handing each
  *  surface its own idle string is what let them ship as "Check for Updates" and
  *  "Check for updates" at once.
+ *
+ *  `guide` and `desktop` share their words, because the reader's question is
+ *  the same one and so is the answer's subject. What differs is where the
+ *  answer is written: a page for one, a toast for the other.
  *
  *  Paired with `disabled`, the in-flight word is also the whole of the feedback
  *  a fast check needs. A spinner would be a second gate on top of this one. */
@@ -344,6 +380,12 @@ export function updateControlLabel(route: UpdateRoute, checking: boolean): strin
 }
 
 /** Do what a route says. The click behind every label above.
+ *
+ *  `desktop` answers on a toast and navigates nowhere. Every control the page
+ *  below would offer a phone is one it cannot work: an installer command, a
+ *  rebuild, an in-app install. So the page costs a load and leaves the reader
+ *  to find the one line that applies. See {@link UPDATE_ON_DESKTOP} for why
+ *  that line names no mechanism.
  *
  *  `guide` lands on System > Overview and scrolls to Maintenance, which is
  *  where the installer command, the update button and the rebuild control all
@@ -357,6 +399,10 @@ export async function followUpdateRoute(route: UpdateRoute): Promise<void> {
   }
   if (route === 'check') {
     reportUpdateCheck(await checkForUpdatesNow());
+    return;
+  }
+  if (route === 'desktop') {
+    showToast(UPDATE_ON_DESKTOP, 'info', { key: UPDATE_ON_DESKTOP_KEY });
     return;
   }
   settingsScrollTarget.value = 'system:maintenance';
@@ -373,12 +419,48 @@ export function reportUpdateCheck(verdict: UpdateCheckVerdict): void {
   if (verdict.kind === 'up-to-date') showToast('Lucidos is up to date', 'success');
   else if (verdict.kind === 'failed') {
     showToast(`Couldn't check for updates: ${verdict.reason}`, 'error');
+  } else if (verdict.kind === 'shadowed') {
+    // Not a failure, and emphatically not "up to date". An older Lucidos is
+    // serving this workspace, so the check has no answer. Name the two
+    // versions that disagree, and point at the page holding the account.
+    //
+    // It states the FACT and stops. A second install is the usual cause but
+    // not the only one: the gateway re-adopts an engine that outlived it, so a
+    // survivor of a failed restart reads identically from here. Installs, on
+    // that page, is what can tell the two apart.
+    showToast(
+      `This workspace is served by Lucidos ${verdict.engine}, but this app is ` +
+        `${verdict.client}. See System > Overview.`,
+      'error',
+    );
   }
+}
+
+/** Is an OLDER Lucidos serving this workspace than the app asking?
+ *
+ *  Two coexisting installs can both be current while the wrong one holds the
+ *  port. The engine's `/health` carries its `release`, and it has for a long
+ *  time, so this works against a gateway ten releases behind. That is the whole
+ *  point: such a gateway is precisely the one that cannot answer for itself.
+ *
+ *  Packaged clients only. A browser session has no release of its own to
+ *  compare, just a build id, so it can conclude nothing here. */
+export function shadowedEngine(): { engine: string; client: string } | null {
+  const client = typeof window !== 'undefined' ? window.__LUCIDOS_APP_VERSION__ : undefined;
+  const engine = lucidosRelease.value;
+  if (!client || !engine) return null;
+  return isNewerVersion(client, engine) ? { engine, client } : null;
 }
 
 async function runUserCheck(): Promise<UpdateCheckVerdict> {
   if (appUpdateProgress.value) return { kind: 'installing' };
   if (releaseCheck.value) return refreshReleaseCheck(true);
+  // Before the client fallback, never after. That fallback asks the Tauri
+  // updater, which compares the CLIENT's version and nothing else. With an old
+  // install holding the port, it answered "Lucidos is up to date" over an
+  // ancient engine. That is the worst part of this whole story.
+  const shadow = shadowedEngine();
+  if (shadow) return { kind: 'shadowed', ...shadow };
   if (isTauri()) return checkAppUpdateViaClient();
   // No gateway answer and no client updater: a browser or PWA session on a
   // direct engine port. It cannot learn about a release at all, so "up to date"

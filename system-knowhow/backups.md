@@ -33,6 +33,12 @@ Excluded:
   protected by a workspace backup.)
 - Anything matched by the workspace's optional **`data/.backupignore`**
   (gitignore-style, workspace-relative paths).
+- **Symlinks**, with one exception. A link is not followed, so what it points at
+  is not archived. The exception is a top-level **`data`** symlink relocating
+  the whole tree to another disk, which IS followed and backed up. `.backupignore`
+  matches the path inside the workspace, which is where the link lives, so it
+  cannot refuse a link's target. Following every link would put files from
+  anywhere on the machine into the archive you upload to your provider.
 
 ## The schedule (in the user's timezone)
 

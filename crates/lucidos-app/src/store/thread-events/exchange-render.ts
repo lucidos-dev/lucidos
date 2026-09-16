@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { AWAIT_EVENT_TOOL } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
-import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
+import { UNANCHORABLE_ASYNC_EVENTS, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, isWaitingTypedMessage, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -875,10 +875,18 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
         // It is a marker rather than a step, and renders ungated.
         const e = event as { text: string; interrupted?: boolean };
         if (!hasVisibleText(e.text)) break;
+        // A RUN of these is one stretch of speech, so the call mark is drawn
+        // once, on the first. Eight of them down one reply is the marker
+        // saying the same thing eight times.
+        const after = events[events.length - 1];
         events.push({
           type: 'spoken_reply',
           text: e.text,
           interrupted: e.interrupted === true,
+          // The live row wears the same type, so it takes this arm too. One
+          // shape for a reply being said and for the same reply written down.
+          ...(isLiveReplyRow(event) ? { live: true as const } : {}),
+          ...(after?.type === 'spoken_reply' ? { follows: true as const } : {}),
         });
         break;
       }
@@ -1784,10 +1792,18 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // row for it exists. It carries no steps and can carry none. So no terminal
   // verdict below is about it, and every one of them would be a guess.
   //
-  // Always pending, which is the honest reading either way: the caller is
-  // still speaking, or their words are held while the talker decides. The
-  // reader is waiting in both, and the shimmer says so (ADR 0174).
-  if (isLiveUtteranceRow(exchange.userEvent)) return 'pending';
+  // The PULSE and a PARTIAL are pending: the caller is mid-sentence, and the
+  // shimmer says the reader is waiting on the rest of it (ADR 0174).
+  //
+  // FINAL words are not. The engine holds them until the conversation moves,
+  // which is a whole reply long. "Requesting" over a sentence nothing is
+  // running for is a chip that stands there saying nothing true. The row IS
+  // the activity, exactly as the talker's own live row is. Whatever the words
+  // do start arrives as its own exchange within a second, carrying its real
+  // status. See `docs/plans/2026-09-16-a-pause-spends-nothing.md`.
+  if (isLiveUtteranceRow(exchange.userEvent)) {
+    return isSettledLiveUtterance(exchange.userEvent) ? 'done' : 'pending';
+  }
   // The talker's own live row. Nothing is in flight BEHIND it: the row is the
   // activity, and the words moving in it are what says so. A pending verdict
   // here would put a second waiting mark under a reply already being read.

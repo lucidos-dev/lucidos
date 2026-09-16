@@ -188,6 +188,9 @@ do_list() {
 $(service_list_instance_names "$LUCIDOS_PREFIX")
 EOF
     [ "$any" = "1" ] || info "(none)"
+    # A listing that names only this vehicle is what lets somebody conclude
+    # Lucidos is not installed while an app bundle serves port 5252.
+    report_desktop_app
 }
 
 # ── remove one instance ──────────────────────────────────────────────────────
@@ -377,6 +380,9 @@ run_uninstall() {
     resolve_targets
     if [ "${#TARGETS[@]}" -eq 0 ]; then
         info "No Lucidos instances are installed under $LUCIDOS_PREFIX (nothing to remove)."
+        # The case where the report matters most: nothing of OURS is here, and
+        # a bundle may still be answering. Silence reads as "Lucidos is gone".
+        report_desktop_app
         return 0
     fi
 
@@ -402,6 +408,38 @@ run_uninstall() {
     print_summary
 }
 
+# The macOS .app, if this machine also has one. It is a DIFFERENT install with
+# its own gateway, its own data and its own launch agents, and nothing here can
+# remove it. An uninstaller that finishes silently over a second engine is how
+# a tester came to reinstall the newest DMG three times while an old install.sh
+# gateway kept answering. Report it; never touch it.
+report_desktop_app() {
+    local line
+    local -a found=()
+    # An ARRAY, never word-splitting: one of these paths is
+    # "Library/Application Support/...", which a split would report as two
+    # directories that do not exist. Unlike install.sh's sibling check, the
+    # report below prints the paths, so the contents are genuinely needed here.
+    #
+    # A HERE-DOC feeds the loop, the same idiom service_desktop_app_present
+    # itself uses. macOS /bin/sh IS bash 3.2, so the re-exec guard at the top of
+    # this file deliberately does not fire, and bash 3.2 as sh rejects both
+    # `mapfile` and the `< <(…)` this used to be. A pipe is no answer either: it
+    # would run the loop in a subshell and throw the array away. Command
+    # substitution drops trailing newlines, so an absent bundle arrives as one
+    # blank line, which the -n guard is there to absorb.
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then found+=("$line"); fi
+    done <<EOF
+$(service_desktop_app_present "$HOME")
+EOF
+    [ "${#found[@]}" -gt 0 ] || return 0
+    printf '\n'
+    service_desktop_app_report "${found[@]}" | while IFS= read -r line; do
+        warn "$line"
+    done
+}
+
 print_summary() {
     # KEPT_DATA is non-empty under --purge only when the purge was REFUSED for a
     # still-running instance, so report it either way. Claiming "purged" over
@@ -418,6 +456,7 @@ print_summary() {
         done
         [ -n "$LUCIDOS_ALL" ] && info "  $LUCIDOS_PREFIX/runtime  (shared runtime)"
     fi
+    report_desktop_app
     printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
     if [ -n "$LUCIDOS_PURGE" ] && [ -z "$KEPT_DATA" ]; then
         printf '%s  Lucidos uninstalled + purged ✓%s\n' "$C_BOLD" "$C_RESET"

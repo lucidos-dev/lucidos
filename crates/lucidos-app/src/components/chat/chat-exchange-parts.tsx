@@ -996,18 +996,23 @@ export function SpokenChip() {
 export function SpokenReply(
   { event, live }: { event: Extract<ResponseEvent, { type: 'spoken_reply' }>; live?: boolean },
 ) {
+  const saying = live ?? event.live === true;
   return (
-    <div class="spoken-reply" data-role="spoken-reply" data-live={live ? 'true' : undefined}>
-      <span class="spoken-reply-who">
-        <CallIcon />
-        <span class="visually-hidden">{live ? 'Saying aloud' : 'Said aloud'}</span>
+    <div class="spoken-reply" data-role="spoken-reply" data-live={saying ? 'true' : undefined}>
+      {/* The mark is drawn once per RUN, and the slot is kept either way so
+          the bubbles below it stay on the same left edge. */}
+      <span class="spoken-reply-who" aria-hidden={event.follows ? 'true' : undefined}>
+        {!event.follows && <CallIcon />}
+        {!event.follows && (
+          <span class="visually-hidden">{saying ? 'Saying aloud' : 'Said aloud'}</span>
+        )}
       </span>
       <span class="spoken-reply-text">
         {event.text}
         {/* Still being said, so the words are still arriving. The caret marks
             where the next one lands, which is what tells a reply in progress
             from one that stopped there. */}
-        {live && <span class="live-caret" aria-hidden="true" />}
+        {saying && <span class="live-caret" aria-hidden="true" />}
         {/* The caller talked over it, so the text stops where they cut in. */}
         {event.interrupted && <span class="spoken-reply-cut">{'cut off'}</span>}
       </span>

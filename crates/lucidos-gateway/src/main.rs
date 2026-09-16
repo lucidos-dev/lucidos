@@ -42,6 +42,7 @@ mod control;
 mod error;
 mod file_backup;
 mod hook_socket;
+mod installs;
 mod net_config;
 mod next_boot;
 mod pairing_qr;

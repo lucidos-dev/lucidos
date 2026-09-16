@@ -135,16 +135,30 @@ describe('the caller\'s words, before the engine has written them down', () => {
     expect(initiator.variant).toBe('user');
   });
 
-  /** The waiting is real: the engine is holding the words. So the turn reads
-   *  as pending, which is the Requesting shimmer, rather than as a finished
-   *  turn with no answer. */
-  it('reads as a turn still being requested', () => {
+  /** Nothing is in flight behind a sentence the caller has finished. The
+   *  engine holds it until the conversation moves, which is a whole reply
+   *  long. A Requesting shimmer over it says something untrue for all of that.
+   *  Whatever the words do start arrives as its own exchange. */
+  it('reads as settled once the caller has finished saying it', () => {
     expect(exchangeStatus(spoken, '', true, false, false, /* threadIdle */ true, false))
+      .toBe('done');
+  });
+
+  /** The pulse is the other half, and it still shimmers: they are mid-word,
+   *  so the reader really is waiting on the rest of the sentence. */
+  it('still reads as pending while the caller is speaking', () => {
+    expect(exchangeStatus(theRow, '', true, false, false, /* threadIdle */ true, false))
       .toBe('pending');
   });
 
-  it('reads the same way while the caller is still speaking', () => {
-    expect(exchangeStatus(theRow, '', true, false, false, /* threadIdle */ true, false))
+  /** A partial is words the provider may still revise, so it is the pulse's
+   *  half rather than the finished sentence's. */
+  it('still reads as pending on a partial', () => {
+    const partial: Exchange = {
+      ...theRow,
+      userEvent: { ...theRow.userEvent, text: 'fix the blank', _livePartial: true } as StoredEvent,
+    };
+    expect(exchangeStatus(partial, '', true, false, false, /* threadIdle */ true, false))
       .toBe('pending');
   });
 

@@ -10,7 +10,14 @@
  * The version below is a fixed synthetic value, deliberately not a real
  * release, so it can never collide with the `RELEASE` file being shipped.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+// Mocked whole, rather than partially: the real module reads `navigator` at
+// load time and this suite runs without jsdom. Nothing else in the badge's
+// import graph reaches it.
+const platform = vi.hoisted(() => ({ thisDeviceIsMobile: vi.fn(() => false) }));
+vi.mock('../utils/platform', () => platform);
+
 import { systemAttentionBadge, systemAttentionBadgeLabel } from './systemAttentionBadge';
 import { releaseNoticeDismissed } from './releaseNotices';
 import { latestTauriAppVersion, releaseCheck, releaseNoticeView } from './store';
@@ -43,6 +50,7 @@ beforeEach(() => {
   latestTauriAppVersion.value = null;
   releaseNoticeView.value = { status: 'not-loaded' };
   releaseNoticeDismissed.value = false;
+  platform.thisDeviceIsMobile.mockReturnValue(false);
 });
 
 describe('systemAttentionBadgeLabel', () => {
@@ -87,6 +95,22 @@ describe('systemAttentionBadge', () => {
     expect(systemAttentionBadge()).toBe(null);
     releaseNoticeView.value = { status: 'failed', error: 'engine unreachable' };
     expect(systemAttentionBadge()).toBe(null);
+  });
+
+  // The badge clears on the INSTALL, and a phone can never run one, so a mark
+  // raised there would never go out.
+  it('does not raise the update half on a phone', () => {
+    platform.thisDeviceIsMobile.mockReturnValue(true);
+    offer('9.9.9');
+    expect(systemAttentionBadge()).toBe(null);
+  });
+
+  // A notice is answerable from anywhere, so only the update half stands down.
+  it('still raises an owed notice on a phone', () => {
+    platform.thisDeviceIsMobile.mockReturnValue(true);
+    offer('9.9.9');
+    owe([notice('a', false)]);
+    expect(systemAttentionBadge()).toBe('1 thing to do');
   });
 
   // Escape on the modal answers nothing, so the badge must survive it. The one

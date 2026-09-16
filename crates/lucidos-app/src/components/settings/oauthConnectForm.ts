@@ -42,6 +42,15 @@ export function reconnectScopes(account: OAuthAccountInfo): string {
   return account.desired_scopes?.trim() || account.scopes;
 }
 
+/** Scopes a provider may leave out of the echoed `scopes` after granting them,
+ *  so their absence from it proves nothing.
+ *
+ *  The OIDC and meta scopes, which name no resource. Microsoft omits all four
+ *  when the token is issued for a RESOURCE such as `outlook.office.com`: that
+ *  response lists the resource's own scopes and nothing else. GitHub knows
+ *  none of them, and every Connect asks for three (`SIGN_IN_SCOPES`). */
+const META_SCOPES = new Set(['offline_access', 'openid', 'profile', 'email']);
+
 /** The scopes an account was asked for but did not get.
  *
  *  A real and previously invisible state: a provider may refuse part of a
@@ -50,13 +59,29 @@ export function reconnectScopes(account: OAuthAccountInfo): string {
  *  say otherwise, and only for its own provider, by re-deriving the shortfall
  *  from what an upload needs.
  *
+ *  **A resource scope is an exact token set difference.** **A meta scope is
+ *  answered by evidence, never by the echo.** Only `offline_access` has
+ *  evidence to read, and `has_refresh_token` is it. The other three stay quiet:
+ *  a missing email proves nothing when the provider exposes no userinfo
+ *  endpoint, and warning would send the user to a console for nothing.
+ *
+ *  Same rule as `missing_requested_scopes` in the engine's `core/oauth.rs`, so
+ *  the account row and the agent cannot disagree about a shortfall.
+ *
  *  Empty whenever nothing was recorded, so an account from before the desired
  *  set existed reports no shortfall rather than a false one. */
 export function missingScopes(account: OAuthAccountInfo): string[] {
   const desired = account.desired_scopes?.trim();
   if (!desired) return [];
   const granted = new Set(account.scopes.split(/\s+/).filter(Boolean));
-  return desired.split(/\s+/).filter((s) => s && !granted.has(s));
+  return desired.split(/\s+/).filter((s) => {
+    if (!s) return false;
+    // `=== false` on purpose: an engine older than the field sends nothing,
+    // and an unknown is not a refusal.
+    if (s === 'offline_access') return account.has_refresh_token === false;
+    if (META_SCOPES.has(s)) return false;
+    return !granted.has(s);
+  });
 }
 
 /** What to put in the Connect field for `provider`.

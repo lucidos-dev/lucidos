@@ -19,7 +19,22 @@
  */
 import { packagedUpdateVersion } from './packagedUpdate';
 import { owedReleaseNoticeCount } from './releaseNotices';
+import { thisDeviceIsMobile } from '../utils/platform';
 import type { SettingsNavKey } from './store';
+
+/**
+ * The update this device could actually take, or `null`.
+ *
+ * The badge clears on the install, never on being seen, so a device that cannot
+ * install is a device the mark would never leave. Lucidos ships no mobile
+ * client, so a phone is exactly that device. Its answer is a sentence rather
+ * than work, and `updateRoute`'s `desktop` says it on demand.
+ *
+ * The notice half is untouched: a notice is answerable from anywhere.
+ */
+function resolvableUpdateVersion(): string | null {
+  return thisDeviceIsMobile() ? null : packagedUpdateVersion();
+}
 
 /**
  * What the badge says, or `null` when there is nothing to say.
@@ -54,7 +69,7 @@ export function systemAttentionBadgeLabel(update: string | null, owed: number): 
  * a dead engine, from flashing a dot that clears itself.
  */
 export function systemAttentionBadge(): string | null {
-  return systemAttentionBadgeLabel(packagedUpdateVersion(), owedReleaseNoticeCount());
+  return systemAttentionBadgeLabel(resolvableUpdateVersion(), owedReleaseNoticeCount());
 }
 
 /**
@@ -68,7 +83,7 @@ export function systemAttentionBadge(): string | null {
  * end up with four spellings of one sentence.
  */
 export function updateBadge(): string | null {
-  return systemAttentionBadgeLabel(packagedUpdateVersion(), 0);
+  return systemAttentionBadgeLabel(resolvableUpdateVersion(), 0);
 }
 
 /** The owed-notice half. See {@link updateBadge}. */

@@ -47,10 +47,15 @@
     font-size: var(--font-size-sm);
 }
 
+/* The call mark, drawn once per RUN of spoken rows. The slot keeps its width
+   when the mark is not drawn, so every bubble of a run sits on one left edge:
+   the mark says "this was said aloud" for the run, and a shifting edge would
+   read as a different kind of row. */
 .spoken-reply-who {
     display: inline-flex;
     align-items: center;
     flex-shrink: 0;
+    width: 0.75rem;
     color: var(--text-muted);
 }
 

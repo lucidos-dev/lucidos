@@ -25,11 +25,13 @@ import {
   canInstallUpdateHere,
   followUpdateRoute,
   sessionCanInstall,
+  shadowedEngine,
   updateControlLabel,
   type UpdateRoute,
 } from '../../store/actions/app-update';
 import { updateGuidance } from './updateGuidance';
 import { packagedUpdateVersion } from '../../store/packagedUpdate';
+import { thisDeviceIsMobile } from '../../utils/platform';
 import { setReleaseCheckConfig } from '../../api/client/control';
 import { appUpdateNarration } from '../../store/progressDialogCopy';
 import { cancelAppUpdate } from '../../utils/tauri';
@@ -43,6 +45,7 @@ import { formatShortTime } from '../../utils/formatTime';
 import { connectionNotice } from '../../utils/connectionNotice';
 import { errorDetail } from '../../utils/errorDetail';
 import { BackupSection } from './BackupSection';
+import { InstallsSection } from './InstallsSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
@@ -118,6 +121,11 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
 
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
+  // An older Lucidos is serving this workspace than the app showing this page.
+  // Two installs contend for the port, and the wrong one won. Derived from the
+  // engine's own `/health`, so it holds against a gateway too old to say
+  // anything for itself. That gateway is exactly the one this happens with.
+  const shadowed = shadowedEngine();
   const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
   // Shared with the Lucidos menu's identity row, which names the same thing.
   const clientVersion = clientVersionLabel();
@@ -127,6 +135,12 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
   const offeredVersion = packagedUpdateVersion();
   const canInstallHere = canInstallUpdateHere();
   const canCheckHere = canCheckForUpdatesHere();
+  // A phone can neither install nor usefully check (ADR 0190), so it gets no
+  // button. The subtraction lands HERE, never on `canCheckHere`, which stays a
+  // capability. `updateGuidance` reads that to reason about the INSTALL. A
+  // phone answering "cannot check" makes it claim a desktop app on a machine
+  // that may have none.
+  const offersUpdateControl = (canInstallHere || canCheckHere) && !thisDeviceIsMobile();
   const pageRoute: UpdateRoute = canInstallHere ? 'install' : 'check';
   const tauriHasUpdate = !!offeredVersion;
   const check = releaseCheck.value;
@@ -274,7 +288,21 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
               * code has changed since the {release} release
             </div>
           )}
+          {/* The row above can show a current Client beside an ancient
+              Lucidos, and until this said so, nothing explained it.
+              It states the fact and names where the cause is, rather than
+              asserting one. A second install is the usual reason, and not the
+              only one: the gateway re-adopts an engine that outlived it, so a
+              survivor of a failed restart reads identically here. */}
+          {shadowed && (
+            <div class="system-notice">
+              This workspace is served by Lucidos {shadowed.engine}, but this app is{' '}
+              {shadowed.client}. Installs, below, lists what is on this machine.
+            </div>
+          )}
         </div>
+
+        <InstallsSection />
 
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:maintenance">Maintenance</div>
@@ -383,7 +411,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
               ? (updateNarration.cancellable
                   ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
                   : <button class="action-btn" disabled>Updating…</button>)
-              : (canInstallHere || canCheckHere) && (
+              : offersUpdateControl && (
                 <button
                   class="action-btn"
                   onClick={() => { void followUpdateRoute(pageRoute); }}

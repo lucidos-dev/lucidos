@@ -26,6 +26,11 @@ fn talker_said(text: &str) -> serde_json::Value {
     serde_json::json!({ "type": "session.output_transcript.delta", "delta": text })
 }
 
+fn talker_streamed(pcm: &[u8]) -> serde_json::Value {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(pcm);
+    serde_json::json!({ "type": "session.output_audio.delta", "delta": encoded })
+}
+
 // The opening frame.
 
 /// The model rides the payload rather than the URL, which is the first thing
@@ -210,11 +215,7 @@ fn a_long_answer_of_multibyte_text_never_splits_a_character() {
 #[test]
 fn talker_audio_is_decoded_and_forwarded() {
     let mut turn = TurnState::default();
-    let encoded = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
-    let events = frame(
-        serde_json::json!({ "type": "session.output_audio.delta", "delta": encoded }),
-        &mut turn,
-    );
+    let events = frame(talker_streamed(&[1, 2, 3]), &mut turn);
     assert_eq!(events, vec![VoiceEvent::Audio(vec![1, 2, 3])]);
 }
 
@@ -231,10 +232,10 @@ fn talker_words_are_forwarded_as_they_arrive() {
     );
 }
 
-/// The turn ends when the talker's own output goes quiet, and it carries
+/// The turn ends when the talker's own WORDS go quiet, and it carries
 /// everything that turn said.
 #[test]
-fn a_quiet_output_stream_ends_the_talkers_turn() {
+fn a_talker_that_stops_saying_words_ends_its_turn() {
     let mut turn = TurnState::default();
     frame(talker_said("on it, "), &mut turn);
     frame(talker_said("one moment"), &mut turn);
@@ -246,6 +247,38 @@ fn a_quiet_output_stream_ends_the_talkers_turn() {
             usage: ApiUsage::default(),
         }]
     );
+}
+
+/// **The merged-reply regression.** This provider streams audio between turns,
+/// so a clock reading the output STREAM never runs out. One call's two answers
+/// then arrived as a single row at the hangup.
+///
+/// Audio after the words must leave the bound exactly where the words set it.
+#[test]
+fn the_talkers_audio_never_pushes_its_own_turn_end_back() {
+    let mut turn = TurnState::default();
+    frame(talker_said("on it"), &mut turn);
+    let armed = turn.last_words.expect("the words armed the bound");
+
+    for _ in 0..20 {
+        frame(talker_streamed(&[0, 0, 0, 0]), &mut turn);
+    }
+
+    assert_eq!(turn.last_words, Some(armed), "audio moved the bound");
+}
+
+/// A blank delta says nothing, so it arms nothing. Both providers forward one
+/// exactly as it arrives, and a stream of them would hold the bound off for a
+/// whole call.
+#[test]
+fn a_blank_talker_delta_arms_no_turn_end() {
+    let mut turn = TurnState::default();
+    for _ in 0..20 {
+        frame(talker_said(""), &mut turn);
+    }
+
+    assert!(turn.last_words.is_none(), "a blank delta armed the bound");
+    assert!(talker_went_quiet(&mut turn).is_empty());
 }
 
 /// One end per turn. A second idle with nothing said would write a reply the
@@ -315,7 +348,7 @@ fn an_empty_caller_delta_reaches_nobody() {
 #[test]
 fn a_hole_in_the_talkers_audio_never_cuts_the_callers_sentence() {
     let mut turn = TurnState::default();
-    let audio = serde_json::json!({ "type": "session.output_audio.delta", "delta": "" });
+    let audio = talker_streamed(&[]);
 
     frame(caller_said("Why "), &mut turn);
     for _ in 0..7 {
@@ -405,23 +438,17 @@ fn a_caller_who_speaks_into_the_hole_gets_one_boundary_for_it() {
     assert_eq!(resumed.len(), 2, "{:?}", resumed);
 }
 
-/// A talker that streams audio and never a word ends no caller turn either.
-/// Its turn still ends, so the call can tell that nothing was said.
+/// A talker that streams audio and never a word ends no caller turn, and has
+/// no turn of its own to end.
+///
+/// The honest reading: with no words there is no reply to write down, and
+/// `call.rs` took no floor for one either.
 #[test]
-fn a_wordless_talker_turn_ends_with_an_empty_transcript() {
+fn a_talker_that_only_streams_audio_has_no_turn_to_end() {
     let mut turn = TurnState::default();
-    let encoded = base64::engine::general_purpose::STANDARD.encode([9u8]);
-    frame(
-        serde_json::json!({ "type": "session.output_audio.delta", "delta": encoded }),
-        &mut turn,
-    );
-    assert_eq!(
-        talker_went_quiet(&mut turn),
-        vec![VoiceEvent::TalkerTurnEnded {
-            transcript: String::new(),
-            usage: ApiUsage::default(),
-        }]
-    );
+    frame(talker_streamed(&[9]), &mut turn);
+
+    assert!(talker_went_quiet(&mut turn).is_empty());
 }
 
 /// The talker answering IS its judgment that the caller stopped. No timer

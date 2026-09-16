@@ -145,10 +145,17 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "standing_applies",
-        owners: &["engine/standing_apply.rs"],
+        owners: &["api/threads/delete.rs", "engine/standing_apply.rs"],
         announcement: Announcement::Announced {
             events: &["StandingApplyArmed", "StandingApplyDropped"],
-            exempt: &[],
+            exempt: &[ExemptWriter {
+                function: "delete_family_rows",
+                why: "The thread-delete cascade, which ThreadsDeleted covers as \
+                      the parent event. A StandingApplyDropped names a thread \
+                      the reader can no longer open, and its `reason` field \
+                      exists to tell the owner why their arm did not fire; \
+                      here they deleted the thread themselves.",
+            }],
         },
     },
     TableRule {
@@ -162,7 +169,7 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "changes",
-        owners: &["core/changes_projection.rs"],
+        owners: &["api/threads/delete.rs", "core/changes_projection.rs"],
         announcement: Announcement::Projection {
             of: "the change-lifecycle thread events, written through by \
                  event_bus_projection_thread in the same transaction as the \
@@ -224,17 +231,25 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "events",
-        owners: &["core/image_migration.rs", "engine/event_bus/mod.rs"],
+        owners: &[
+            "api/threads/delete.rs",
+            "core/image_migration.rs",
+            "engine/event_bus/mod.rs",
+        ],
         announcement: Announcement::Silent {
             reason: "The event log itself. EventBus::persist is the append path \
                      and is private; announcing an append would be circular. \
                      image_migration rewrites historical payloads in place, \
-                     which is a data migration rather than a state change.",
+                     which is a data migration rather than a state change. \
+                     api/threads/delete.rs is the one REMOVAL, and it is the \
+                     exception ADR 0192 sanctions: the owner deleting their own \
+                     thread. It announces ThreadsDeleted, which lands on the \
+                     ops aggregate so no later delete can reach it.",
         },
     },
     TableRule {
         table: "hardened_branches",
-        owners: &["engine/git_ops/harden_marker.rs"],
+        owners: &["api/threads/delete.rs", "engine/git_ops/harden_marker.rs"],
         announcement: Announcement::Silent {
             reason: "The per-branch hardening marker Apply reads to decide \
                      whether to run /harden synchronously. Build-gate \
@@ -274,12 +289,19 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "memory_entries",
-        owners: &["engine/memory/rebuild.rs", "memory/pgvector.rs"],
+        owners: &[
+            "api/threads/delete.rs",
+            "engine/memory/rebuild.rs",
+            "memory/pgvector.rs",
+        ],
         announcement: Announcement::Silent {
             reason: "The derived vector index. Entries are rebuilt from the \
                      events and artifacts that were themselves announced; \
                      MemoryRebuildProgress covers the only user-visible \
-                     operation on it.",
+                     operation on it. A thread delete removes the rows sourced \
+                     to that thread's events, first and in the same \
+                     transaction, because the events are the only way to find \
+                     them; ThreadsDeleted carries the count.",
         },
     },
     TableRule {
@@ -293,6 +315,7 @@ pub const TABLES: &[TableRule] = &[
     TableRule {
         table: "notifications",
         owners: &[
+            "api/threads/delete.rs",
             "engine/event_bus_projection_system.rs",
             "scheduler/notifications.rs",
         ],
@@ -318,6 +341,15 @@ pub const TABLES: &[TableRule] = &[
                 ExemptWriter {
                     function: "insert",
                     why: "Thin wrapper over insert_with_timestamp, same caller.",
+                },
+                ExemptWriter {
+                    function: "delete_family_rows",
+                    why: "The thread-delete cascade, which ThreadsDeleted covers \
+                          as the parent event. NotificationRead is the wrong \
+                          shape twice over: nobody read these, and the ones the \
+                          user HAD read are removed too. The unread count moves \
+                          on the client's own refresh, driven by the \
+                          ThreadsDeleted arm in thread-sync.ts.",
                 },
             ],
         },
@@ -361,7 +393,7 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "planned_branches",
-        owners: &["engine/git_ops/plan_marker.rs"],
+        owners: &["api/threads/delete.rs", "engine/git_ops/plan_marker.rs"],
         announcement: Announcement::Silent {
             reason: "The per-branch plan marker the edit gate and Apply read. \
                      Build-gate bookkeeping, same shape as hardened_branches.",
@@ -433,7 +465,10 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "thread_queue",
-        owners: &["engine/event_bus_projection_system.rs"],
+        owners: &[
+            "api/threads/delete.rs",
+            "engine/event_bus_projection_system.rs",
+        ],
         announcement: Announcement::Projection {
             of: "the ThreadQueued / ThreadQueueAdmitted / ThreadQueueDropped / \
                  ThreadQueueCompleted stream the queue emits as it decides",
@@ -442,6 +477,7 @@ pub const TABLES: &[TableRule] = &[
     TableRule {
         table: "thread_summaries",
         owners: &[
+            "api/threads/delete.rs",
             "api/threads_compose.rs",
             "core/image_migration.rs",
             "core/store/threads/backfill.rs",

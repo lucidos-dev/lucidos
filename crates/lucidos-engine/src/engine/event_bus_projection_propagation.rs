@@ -444,6 +444,23 @@ impl EventBus {
         .bind(&crate::core::store::active_thread_statuses()[..])
         .execute(pool)
         .await?;
+        // Reset a row that is nobody's parent any more. The UPDATE above only
+        // touches rows still named by some child, so a thread whose children
+        // were all PRUNED keeps its stale count. That was unreachable until
+        // threads could be deleted, and it is what a thread delete produces:
+        // a stale count of 1 leaves the surviving parent's own Archive and
+        // Delete hidden for good. Mirrors the second statement in
+        // `rebuild_blocking_descendant_count`.
+        sqlx::query(
+            "UPDATE thread_summaries p \
+             SET active_children_count = 0 \
+             WHERE p.active_children_count <> 0 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM thread_summaries c WHERE c.parent_thread_id = p.thread_id \
+               )",
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 

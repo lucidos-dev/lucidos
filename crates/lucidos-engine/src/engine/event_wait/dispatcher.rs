@@ -767,6 +767,28 @@ impl LucidosEngine {
             .await
     }
 
+    /// Forget every live wait on a thread WITHOUT recording a cancel. Returns
+    /// how many were dropped.
+    ///
+    /// Exactly one caller, and it needs the silence. A thread *delete* removed
+    /// the thread's rows. An `EventWaitCanceled` on that id would re-insert an
+    /// `events` row and raise a `thread_summaries` row through the projection's
+    /// upsert (ADR 0192). There is nothing left to record on.
+    ///
+    /// Every other way a subscription ends takes
+    /// [`Self::cancel_event_waits_for_thread`] and records why. Reach for this
+    /// one only where the thread itself is gone, or the reason a wait ended
+    /// stops being findable.
+    pub async fn drop_waits_for_thread(&self, thread_id: Uuid) -> usize {
+        let mut dropped = 0usize;
+        for live in self.live_waits.for_thread(thread_id).await {
+            if self.live_waits.take(live.wait_id).await.is_some() {
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
     /// Cancel every live wait on a thread that WATCHES `event_type`, leaving the
     /// rest alone. Returns how many were canceled.
     ///

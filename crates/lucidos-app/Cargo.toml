@@ -26,6 +26,11 @@ required-features = ["window-probe"]
 # Tailnet state (CLI-free) + Tailscale CLI resolution for Mobile Access.
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-local-token = { path = "../lucidos-local-token" }
+# Enumerating the machine's Lucidos installs, shared with `lucidos-gateway`. The
+# client needs it before any gateway answers: at startup, where it is the only
+# thing that can tell a trapped user why their engine is ten releases old, and
+# at uninstall, where it names what this uninstaller cannot remove.
+lucidos-installs = { path = "../lucidos-installs" }
 # image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
 # (install_tray in lib.rs). Not in tauri's default feature set.
 #

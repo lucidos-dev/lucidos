@@ -4226,6 +4226,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "libc",
+ "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
  "objc2",
@@ -4400,6 +4401,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "lucidos-file-backup-exclusion",
+ "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
  "qrcode",
@@ -4413,6 +4415,13 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tower-http",
+]
+
+[[package]]
+name = "lucidos-installs"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

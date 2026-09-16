@@ -807,3 +807,88 @@ async fn ample_disk_keeps_non_archived_worktree_artifacts() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+// ── BranchDisposal ────────────────────────────────────────────────────
+//
+// The reclamation rule and its one sanctioned inversion (ADR 0035 amendment).
+// A worktree built by `add_worktree_for_thread` has a commit of its own, so
+// both cases below start from a branch the worker would keep.
+
+/// The worker's rule, and the one the other four callers pass. A unique commit
+/// is the user's work, so the tree goes and the branch stays.
+#[tokio::test]
+async fn when_merged_keeps_a_branch_that_holds_commits() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::WhenMerged)
+            .await
+            .expect("the repo root resolves");
+
+    assert!(!worktree.exists(), "the tree is always reclaimed");
+    assert!(
+        !outcome.branch_deleted,
+        "reclamation must not take work nothing merged"
+    );
+    assert!(
+        branch_exists(&root, &branch).await,
+        "and the branch must still be there to find it by"
+    );
+}
+
+/// The thread delete. The owner asked for the thread and its work to be gone.
+/// Once the events are removed nothing can resolve this branch back to a
+/// thread, so leaving it is leaving litter nobody can read.
+#[tokio::test]
+async fn always_deletes_the_branch_even_holding_commits() {
+    use crate::engine::worktree_cleanup::{
+        remove_worktree_and_optionally_delete_branch, BranchDisposal,
+    };
+
+    let (_tmp, root) = fresh_workspace().await;
+    let thread_id = Uuid::new_v4();
+    let worktree = add_worktree_for_thread(&root, thread_id, false).await;
+    let branch = format!("test/{}", &thread_id.simple().to_string()[..8]);
+    assert!(branch_exists(&root, &branch).await, "precondition");
+
+    let outcome =
+        remove_worktree_and_optionally_delete_branch(&worktree, None, BranchDisposal::Always)
+            .await
+            .expect("the repo root resolves");
+
+    assert!(!worktree.exists(), "the worktree directory is gone");
+    assert!(outcome.branch_deleted, "and so is the branch");
+    assert!(
+        !branch_exists(&root, &branch).await,
+        "confirmed against git rather than against our own bookkeeping"
+    );
+    assert_eq!(
+        outcome.branch.as_deref(),
+        Some(branch.as_str()),
+        "the outcome names the branch, so the caller can sweep the rows keyed on it"
+    );
+    assert_eq!(
+        outcome.repo_root.canonicalize().ok(),
+        root.canonicalize().ok(),
+        "and the repo it belonged to, the other half of that key"
+    );
+}
+
+/// Does `branch` exist in `repo_root`? Asks git, so the assertions above cannot
+/// pass by reading our own return value twice.
+async fn branch_exists(repo_root: &std::path::Path, branch: &str) -> bool {
+    git_cmd(
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        repo_root,
+    )
+    .await
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}

@@ -770,16 +770,21 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
 
     // Before the show, so an adrift `main` does not flash the picker on its way
     // to the workspace it is owed, and so it is already the right size when it
-    // lands. Place then clamp, the pair `setup` uses. The clamp rides the frame
-    // here, unlike in `setup`: with no frame to place, `main` keeps the geometry
-    // launch already sanitised.
+    // lands.
     if let Some(planned) = &plan.navigate_main {
         desktop::navigate_main_window(app, &planned.url);
         if let Some(frame) = planned.frame {
             window_persist::size_main_window_for_its_workspace(app, frame);
-            window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL);
         }
     }
+    // Whatever put the geometry there, sanitise it before the show. It no
+    // longer rides the planned frame: a launch that came up menu-bar-only never
+    // reached `show_startup_window`, so this reopen is the first time anything
+    // judges what the plugin restored. A healthy rect makes it a no-op.
+    //
+    // The placement above is deferred, so this still reads what the window had
+    // before it. `docs/known-gaps.md` carries that half.
+    window_restore::clamp_restored_geometry(app, MAIN_WINDOW_LABEL);
     // No `native-window-active` here: these land on screen unfocused, and a
     // page that believes it is active suppresses the OS banner for a toast
     // nobody is looking at. `front_window` emits for the one that does
@@ -818,6 +823,20 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
 /// the reshow is deterministic regardless of event timing.
 fn front_window(app: &tauri::AppHandle, label: &str) {
     activation::set_menu_bar_only(app, false);
+    // Sanitise a window that is about to REACH the screen, and this is the path
+    // that needs it most. A login start comes up menu-bar-only, so it never
+    // reaches `show_startup_window` and its `main` carries whatever the
+    // window-state plugin restored, unjudged. A banner tap is then the first
+    // thing to put that window up. A healthy rect makes this a no-op (ADR 0193).
+    //
+    // Gated on the window being off screen, which is the whole difference
+    // between judging a restore and moving a window under the user. Fronting
+    // also focuses one that is already up, from the switcher. A window parked
+    // with a sliver of title bar is the user's to leave there, and ADR 0173
+    // refused to widen the clamp for that.
+    if !window_screen::shown_by_client(label) {
+        window_restore::clamp_restored_geometry(app, label);
+    }
     // By window, not webview window, per ADR 0140. Fronting is a pure window
     // operation, and the lookup must survive a URL preview open in the target.
     if let Some(window) = app.get_window(label) {

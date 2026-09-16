@@ -10,15 +10,29 @@
 }
 
 /* A release you can act on carries its control BESIDE the toggle. It cannot go
-   inside: the toggle is itself a button, and a nested one is invalid markup. */
+   inside: the toggle is itself a button, and a nested one is invalid markup.
+
+   The control wraps to a line of its own where the two cannot share one, which
+   is every phone. The header refuses to squeeze (see its min-width), so the
+   wrap is what happens INSTEAD of a squashed row, and every release reads the
+   same on its first line: chevron, version, date, chip. */
 .whats-new-release-row {
     display: flex;
     align-items: center;
-    gap: var(--space-sm);
+    flex-wrap: wrap;
+    column-gap: var(--space-sm);
+    /* The header's padding and the action's own margin already space a wrapped
+       line, so a row gap on top of them would double it. */
+    row-gap: 0;
 }
 
 .whats-new-release-action {
     flex: 0 0 auto;
+    /* The trailing edge on a wrapped line. A no-op inline, where the header's
+       flex-grow has taken the free space an auto margin would otherwise eat. */
+    margin-left: auto;
+    /* Clear of the next release's border, once it sits below the header. */
+    margin-block: var(--space-xs);
 }
 
 /* The whole header is the toggle, so it spans the row and keeps the version and
@@ -31,11 +45,22 @@
     /* Both, because this class has two parents. `width` serves the SKELETON
        row, whose header is a plain block child of `.whats-new-release`.
        `flex` serves the loaded row, where the header shares
-       `.whats-new-release-row` with the action button, and `min-width` lets a
-       long date shrink there instead of pushing that button off the row. */
+       `.whats-new-release-row` with the action button.
+
+       `min-width` is what sends the action to its own line rather than
+       squeezing this one. It was `0`, which let the header shrink to nothing:
+       the date broke across two lines mid-value and the row grew a step taller
+       than every other. Nothing here shrinks usefully, so refusing is the
+       honest answer and the wrap absorbs it.
+
+       `auto` and not `min-content`. The two agree at every width where the
+       header fits, and past that they differ badly: a flex item's automatic
+       minimum is the SMALLER of its content and its own `width`, so `auto`
+       gives way where `min-content` overflows the panel. A 200% ui-scale on a
+       phone reaches that. Never back to `0`. */
     width: 100%;
     flex: 1;
-    min-width: 0;
+    min-width: auto;
     padding: 0.5rem 0;
     background: none;
     border: none;
@@ -68,9 +93,13 @@
     color: var(--text-primary);
 }
 
+/* A date is one value, so it breaks at neither of its own hyphens. Left free it
+   wrapped to `2026-` over `09-15` the moment the row ran out of room, which read
+   as two dates. */
 .whats-new-date {
     font-size: var(--font-size-sm);
     color: var(--text-muted);
+    white-space: nowrap;
 }
 
 /* The chip naming what a row IS: the release you are running, or the one being

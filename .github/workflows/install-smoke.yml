@@ -15,6 +15,14 @@
 # across two triggers because the two artifacts become testable at different
 # times in Phase A:
 #
+#   * SH COMPAT (job: sh-compat) is the cheapest rung in the file, seconds on a
+#     macOS runner, and it auto-runs on `push` to rc/**. It pipes THIS tree's
+#     install.sh and uninstall.sh into /bin/sh, which on macOS IS bash 3.2, and
+#     asserts exit 0. Every other job either installs from a tree under a REAL
+#     bash or tests an origin, so none of them can see that the tree's own front
+#     door stopped parsing as sh. One did, over a `done < <(…)`, and killed the
+#     advertised one-liner for every Mac user at parse time.
+#
 #   * SOURCE INSTALL (job: smoke) — needs only the RC branch tree, so it auto-runs
 #     on `push` to rc/**. Checkout-based (fetch_repo reuses the checked-out tree,
 #     no clone) clean-machine install on macOS + Ubuntu. Gates BEFORE any tag.
@@ -473,6 +481,90 @@ jobs:
   # first-run path that throws all leave a live process. It is the only reason a
   # human still mounted every release DMG by hand, and rungs 4-6 are what let
   # that manual gate go.
+  sh-compat:
+    name: sh-compat (macOS /bin/sh is bash 3.2)
+    # The cheapest job in the file, and the only one that puts the front doors
+    # through the shell a Mac actually hands them.
+    #
+    # install.sh re-execs itself under bash when /bin/sh is not bash, which is
+    # why Linux cannot see this class at all: there /bin/sh is dash,
+    # BASH_VERSION is empty, and the guard fires. On macOS /bin/sh IS bash 3.2,
+    # so the guard deliberately does NOT fire and the file has to survive bash
+    # 3.2 in posix mode. It stopped doing so once, over a process substitution,
+    # and the advertised one-liner died at parse time with exit 2 on every Mac.
+    # The offline half of the same gate is scripts/lib/install_test.sh, which
+    # scans for the constructs bash 3.2 cannot run; this job is the end-to-end
+    # proof against a real 3.2.
+    #
+    # Guards are the smoke job's, verbatim (see there for the repo guard and the
+    # release-event reasoning). It claims the WEEKLY cron rather than the daily
+    # one because the drift it would catch is a runner image changing /bin/sh,
+    # which is a toolchain question and not an origin one.
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name != 'release'
+          || github.event.release.prerelease == false)
+      && (github.event_name != 'schedule'
+          || github.event.schedule == '0 4 * * 1')
+      && inputs.dmg_tag == ''
+    # macos-latest alone, deliberately. /bin/sh is bash 3.2 on every macOS image
+    # regardless of architecture, and a parse has no architecture to disagree
+    # about, so an Intel leg here would buy a second identical verdict. That is
+    # the opposite of front-door-macos, which needs both because install.sh
+    # resolves a DIFFERENT tarball per triple.
+    runs-on: macos-latest
+    timeout-minutes: 5
+    # It reads the tree and talks to nothing.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Fail loudly if a future image ships a non-bash /bin/sh. The job would
+      # then be exercising a shell no macOS user has, and its green tick would
+      # mean nothing while reading exactly like coverage.
+      - name: Confirm /bin/sh is still bash
+        run: |
+          set -euo pipefail
+          ver="$(/bin/sh -c 'echo "${BASH_VERSION:-}"')"
+          echo "/bin/sh reports BASH_VERSION=${ver:-<empty>}"
+          if [ -z "$ver" ]; then
+            echo "::error::/bin/sh on this runner is not bash, so this job no longer reproduces macOS" >&2
+            exit 1
+          fi
+
+      # The advertised shape, both front doors. `cat |` rather than a path is
+      # the point and not a useless use of cat: piped, $0 is not a readable
+      # file, so the installer cannot re-exec its way out of a parse error, and
+      # this is what a stranger's terminal does.
+      - name: Pipe both front doors into /bin/sh
+        run: |
+          set -euo pipefail
+          for f in install.sh uninstall.sh; do
+            echo "--- cat $f | /bin/sh -s -- --help"
+            cat "$f" | /bin/sh -s -- --help > /dev/null
+          done
+          echo "both front doors exited 0 under /bin/sh"
+
+      # --help returns before the helper libs are sourced, so the run above
+      # never reaches them. Parse them directly. The list is read out of
+      # install.sh so a new lib is covered the day it is added, which is the
+      # same derivation scripts/lib/install_test.sh makes, and the parse fails
+      # closed if that read comes back empty.
+      - name: Parse the libs a piped install sources
+        run: |
+          set -euo pipefail
+          libs="$(sed -n 's/^LUCIDOS_LIBS="\(.*\)"$/\1/p' install.sh)"
+          if [ -z "$libs" ]; then
+            echo "::error::could not read LUCIDOS_LIBS out of install.sh" >&2
+            exit 1
+          fi
+          for lib in $libs service.sh; do
+            echo "--- /bin/sh -n scripts/lib/$lib"
+            /bin/sh -n "scripts/lib/$lib"
+          done
+
   dmg-verify:
     name: dmg-verify (macOS, clean)
     # Public mirror only (see the smoke job's repo guard) — never bill the private

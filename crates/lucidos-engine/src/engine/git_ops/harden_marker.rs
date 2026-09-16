@@ -13,17 +13,6 @@ pub(crate) enum HardenMarkerState {
     Missing,
 }
 
-/// Canonical absolute repo_root used as the DB key. Resolves symlinks so the
-/// hook (which uses `git rev-parse --git-common-dir`) and the engine produce
-/// the same row.
-fn canonical_repo_root(repo_root: &Path) -> String {
-    repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf())
-        .to_string_lossy()
-        .to_string()
-}
-
 pub(crate) async fn harden_marker_state(
     pool: &sqlx::PgPool,
     repo_root: &Path,

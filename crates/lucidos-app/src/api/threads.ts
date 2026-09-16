@@ -198,6 +198,50 @@ export async function archiveThread(threadId: string): Promise<{ archived: strin
     return res.json();
 }
 
+/** One family member the delete cascade refuses to run over. */
+export interface DeleteBlockingMember {
+  thread_id: string;
+  title: string | null;
+  /** `running` | `waiting_for_user_answer` | `pending_change` | `agent_session_live`. */
+  reason: string;
+}
+
+/** Everything the delete confirmation may say, from one locked read on the
+ *  engine. Each flag gates exactly one line of the dialog, so a warning that
+ *  does not apply is never shown. */
+export interface DeletePreflight {
+  thread_count: number;
+  sub_thread_titles: string[];
+  memory_count: number;
+  has_unapplied_branch_work: boolean;
+  has_applied_changes: boolean;
+  backups_present: boolean;
+  blocked_by: DeleteBlockingMember[];
+}
+
+/** What the delete would take, asked before the dialog opens.
+ *
+ *  Owner-gated like the delete itself: it carries sub-thread titles, so an
+ *  agent that cannot delete must not read the family through it either. */
+export async function deletePreflight(threadId: string): Promise<DeletePreflight> {
+    return json<DeletePreflight>(
+        `${API}/threads/delete-preflight?thread_id=${encodeURIComponent(threadId)}`,
+    );
+}
+
+/** Delete a thread and every sub-thread under it. There is no undo.
+ *
+ *  Returns the ids that went, so the caller can drop them from the thread map
+ *  without waiting for the `ThreadsDeleted` frame to come back round. A 409
+ *  surfaces as `ApiError` carrying the same `{reason, blocking}` body archive
+ *  answers with. */
+export async function deleteThreadFamily(
+    threadId: string,
+): Promise<{ deleted: string[]; event_count: number; memory_count: number }> {
+    const res = await postThreadAction('delete', { thread_id: threadId });
+    return res.json();
+}
+
 export async function renameThread(threadId: string, title: string): Promise<void> {
     await postThreadAction('rename', { thread_id: threadId, title });
 }

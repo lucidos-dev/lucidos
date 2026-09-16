@@ -1,19 +1,25 @@
-// ── Archive cascade tests ─────────────────────────────────────────────────
+// ── Family cascade tests ──────────────────────────────────────────────────
 //
 // Two layers:
 //
-// 1. `classify_archive_decision` is a pure function operating on a
-//    `Vec<FamilyRow>` — every rejection path is testable without touching
-//    Postgres. We hand-build family snapshots and assert the StatusCode +
-//    JSON shape.
+// 1. `classify_family` is a pure function over a `Vec<FamilyRow>`, so every
+//    rejection path is testable without touching Postgres. We hand-build
+//    family snapshots and assert the StatusCode plus the JSON shape.
 //
-// 2. `load_family_for_archive` walks a real recursive CTE under `FOR UPDATE`.
-//    We exercise it end-to-end via `EventBus` (which feeds the projection
-//    that populates `thread_summaries`), then drive `classify_archive_decision`
-//    against the loaded snapshot. This validates that the SQL + the parser
-//    correctly round-trip every column the decision consults.
+// 2. `load_family` walks a real recursive CTE under `FOR UPDATE`. We exercise
+//    it end to end through `EventBus`, which feeds the projection that
+//    populates `thread_summaries`, then drive `classify_family` against the
+//    loaded snapshot. That is what proves the SQL and the row parser round-trip
+//    every column the decision consults.
+//
+// Most cases pass `FamilyVerb::Archive`, because archive is the verb whose
+// behaviour was already pinned here. The delete-specific arms live at the
+// bottom, beside the one case where the two verbs answer differently.
 
-use super::{classify_archive_decision, load_family_for_archive, ArchiveDecision, FamilyRow};
+use super::{
+    classify_family, coding_agent_members, every_member, external_repo_pending, load_family,
+    not_yet_archived, FamilyDecision, FamilyRow, FamilyVerb,
+};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -378,11 +384,33 @@ async fn archive_via_event(bus: &EventBus, thread_id: Uuid) {
     .unwrap();
 }
 
-async fn load_family(pool: &PgPool, thread_uuid: Uuid) -> Vec<FamilyRow> {
+async fn locked_family(pool: &PgPool, thread_uuid: Uuid) -> Vec<FamilyRow> {
     let mut tx = pool.begin().await.unwrap();
-    let family = load_family_for_archive(&mut tx, thread_uuid).await.unwrap();
+    let family = load_family(&mut tx, thread_uuid).await.unwrap();
     tx.commit().await.unwrap();
     family
+}
+
+/// Archive's two subsets, or a panic saying `why` the family should have been
+/// admitted. `Proceed` is fieldless, so each verb derives what it needs.
+fn expect_proceed(family: &[FamilyRow], target: Uuid, why: &str) -> (Vec<Uuid>, Vec<Uuid>) {
+    match classify_family(family, target, FamilyVerb::Archive) {
+        FamilyDecision::Proceed => (not_yet_archived(family), external_repo_pending(family)),
+        FamilyDecision::Reject { status, body } => panic!("{why}; got {status} {body}"),
+    }
+}
+
+/// The refusal a verb answers with, or a panic saying `why` one was owed.
+fn expect_reject(
+    family: &[FamilyRow],
+    target: Uuid,
+    verb: FamilyVerb,
+    why: &str,
+) -> (StatusCode, serde_json::Value) {
+    match classify_family(family, target, verb) {
+        FamilyDecision::Reject { status, body } => (status, body),
+        FamilyDecision::Proceed => panic!("{why}"),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -393,15 +421,13 @@ async fn archive_with_no_descendants_archives_parent() {
     let (bus, _rx) = EventBus::new(pool.clone());
 
     let parent_id = spawn_idle_parent(&bus).await;
-    let family = load_family(&pool, parent_id).await;
+    let family = locked_family(&pool, parent_id).await;
 
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed for an idle childless parent");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed for an idle childless parent",
+    );
     assert_eq!(to_archive, vec![parent_id]);
     assert!(external_repo_pending.is_empty());
 
@@ -432,11 +458,12 @@ async fn archive_cascade_carries_an_idle_chat_child() {
         "a finished chat child keeps the inbox state it ran with",
     );
 
-    let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Proceed { to_archive, .. } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("an idle chat child must not block its parent's archive");
-    };
+    let family = locked_family(&pool, parent_id).await;
+    let (to_archive, _) = expect_proceed(
+        &family,
+        parent_id,
+        "an idle chat child must not block its parent's archive",
+    );
     assert!(
         to_archive.contains(&child_id),
         "the cascade must carry the child, or it is stranded in the inbox",
@@ -456,16 +483,14 @@ async fn archive_with_idle_descendants_archives_all() {
     let child_b = spawn_child(&bus, &pool, parent_id, true).await;
     let grandchild = spawn_child(&bus, &pool, child_a, true).await;
 
-    let family = load_family(&pool, parent_id).await;
+    let family = locked_family(&pool, parent_id).await;
     assert_eq!(family.len(), 4, "parent + 2 children + 1 grandchild");
 
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed when every descendant is idle");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed when every descendant is idle",
+    );
     assert_eq!(
         to_archive.len(),
         4,
@@ -489,11 +514,13 @@ async fn archive_rejects_when_descendant_running() {
     let parent_id = spawn_idle_parent(&bus).await;
     let running_child = spawn_child(&bus, &pool, parent_id, false).await; // status='running'
 
-    let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Reject when a descendant is running");
-    };
+    let family = locked_family(&pool, parent_id).await;
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "expected Reject when a descendant is running",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "descendants_blocking");
     let blocking = body["blocking"].as_array().unwrap();
@@ -513,11 +540,13 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let parent_id = spawn_idle_parent(&bus).await;
     let cc_child = spawn_cc_child(&bus, &pool, parent_id, true).await;
 
-    let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Reject when a CC descendant has pending changes");
-    };
+    let family = locked_family(&pool, parent_id).await;
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "expected Reject when a CC descendant has pending changes",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "descendants_blocking");
     let blocking = body["blocking"].as_array().unwrap();
@@ -536,10 +565,12 @@ async fn archive_rejects_when_parent_running() {
     // doesn't care how the rows arrived.
     let parent_id = Uuid::new_v4();
     let family = vec![running_chat(parent_id)];
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Reject when parent is running");
-    };
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "expected Reject when parent is running",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "parent_not_archivable");
     assert_eq!(body["parent_status"], "running");
@@ -559,13 +590,11 @@ async fn archive_already_archived_parent_is_idempotent() {
     // Idempotent archive lets the click converge to 'archived'.
     let parent_id = Uuid::new_v4();
     let family = vec![archived(parent_id)];
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed (idempotent) when the parent is already archived");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed (idempotent) when the parent is already archived",
+    );
     assert!(
         to_archive.is_empty(),
         "an already-archived parent has nothing to re-emit: {:?}",
@@ -585,13 +614,11 @@ async fn archive_already_archived_parent_archives_resurfaced_descendant() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let family = vec![archived(parent_id), idle_cc(child_id)];
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed with the resurfaced descendant");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed with the resurfaced descendant",
+    );
     assert_eq!(to_archive, vec![child_id]);
     assert!(external_repo_pending.is_empty());
 }
@@ -610,10 +637,12 @@ async fn archive_rejects_parent_cc_with_pending_changes() {
     // state.
     let parent_id = Uuid::new_v4();
     let family = vec![cc_with_pending(parent_id)];
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Reject when parent CC has its own pending changes");
-    };
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "expected Reject when parent CC has its own pending changes",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "parent_has_pending_changes");
 }
@@ -629,13 +658,11 @@ async fn archive_allows_parent_external_repo_cc_with_pending_changes() {
     let mut row = cc_with_pending(parent_id);
     row.coding_agent_is_external_repo = true;
     let family = vec![row];
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed when parent CC is external-repo with pending changes");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed when parent CC is external-repo with pending changes",
+    );
     assert_eq!(to_archive, vec![parent_id]);
     assert_eq!(external_repo_pending, vec![parent_id]);
 }
@@ -654,13 +681,11 @@ async fn archive_allows_parent_waiting_for_user_answer() {
         false,
         false,
     )];
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed when parent CC is WaitingForUserAnswer");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed when parent CC is WaitingForUserAnswer",
+    );
     assert_eq!(to_archive, vec![parent_id]);
     assert!(external_repo_pending.is_empty());
 }
@@ -675,16 +700,14 @@ async fn archive_skips_already_archived_descendants() {
     let archived_child = spawn_child(&bus, &pool, parent_id, true).await;
     archive_via_event(&bus, archived_child).await;
 
-    let family = load_family(&pool, parent_id).await;
+    let family = locked_family(&pool, parent_id).await;
     assert_eq!(family.len(), 3);
 
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("expected Proceed when only an already-archived descendant exists");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "expected Proceed when only an already-archived descendant exists",
+    );
     assert!(external_repo_pending.is_empty());
     assert_eq!(
         to_archive.len(),
@@ -708,10 +731,12 @@ async fn archive_target_not_found_returns_404() {
     // The CTE returns an empty Vec when the target doesn't exist.
     let missing = Uuid::new_v4();
     let family: Vec<FamilyRow> = vec![];
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, missing)
-    else {
-        panic!("expected Reject for missing target");
-    };
+    let (status, body) = expect_reject(
+        &family,
+        missing,
+        FamilyVerb::Archive,
+        "expected Reject for missing target",
+    );
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["reason"], "thread_not_found");
 }
@@ -724,13 +749,7 @@ async fn idle_descendants_alongside_archived_and_self() {
     let child = Uuid::new_v4();
     let gc = Uuid::new_v4();
     let family = vec![idle_chat(target), idle_chat(child), archived(gc)];
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, target)
-    else {
-        panic!("expected Proceed");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(&family, target, "expected Proceed");
     assert!(external_repo_pending.is_empty());
     assert_eq!(to_archive.len(), 2);
     assert!(to_archive.contains(&target));
@@ -854,17 +873,13 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     // status=idle + section=inbox passes `is_blocking`, so the orphaned
     // question rides through — which is exactly why we need the
     // defensive helper in the per-thread loop.
-    let family = load_family(&pool, parent_id).await;
+    let family = locked_family(&pool, parent_id).await;
     assert_eq!(family.len(), 2, "parent + orphaned-question child");
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!(
-            "cascade must admit the orphaned-question child, otherwise the helper would never run"
-        );
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        parent_id,
+        "cascade must admit the orphaned-question child, otherwise the helper would never run",
+    );
     assert!(external_repo_pending.is_empty());
     assert_eq!(to_archive.len(), 2);
     assert!(to_archive.contains(&parent_id));
@@ -934,11 +949,13 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
     .await
     .unwrap();
 
-    let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("cascade must reject when a fresh CC child is actively running");
-    };
+    let family = locked_family(&pool, parent_id).await;
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "cascade must reject when a fresh CC child is actively running",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "descendants_blocking");
     let blocking = body["blocking"].as_array().unwrap();
@@ -962,10 +979,12 @@ async fn archive_rejects_legacy_running_archived_descendant() {
         idle_chat(parent_id),
         row(legacy_child, true, "running", "archived", false, false),
     ];
-    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
-    else {
-        panic!("cascade must reject a legacy Running+Archived descendant");
-    };
+    let (status, body) = expect_reject(
+        &family,
+        parent_id,
+        FamilyVerb::Archive,
+        "cascade must reject a legacy Running+Archived descendant",
+    );
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["reason"], "descendants_blocking");
     let blocking = body["blocking"].as_array().unwrap();
@@ -987,13 +1006,132 @@ async fn external_repo_cc_with_pending_changes_does_not_block() {
     ext_row.status = "waiting".into();
     let family = vec![idle_chat(target), ext_row];
 
-    let ArchiveDecision::Proceed {
-        to_archive,
-        external_repo_pending,
-    } = classify_archive_decision(&family, target)
-    else {
-        panic!("expected Proceed — external-repo CC with pending changes is exempt");
-    };
+    let (to_archive, external_repo_pending) = expect_proceed(
+        &family,
+        target,
+        "expected Proceed: external-repo CC with pending changes is exempt",
+    );
     assert_eq!(to_archive.len(), 2);
     assert_eq!(external_repo_pending, vec![ext_cc]);
+}
+
+// ── The delete verb ───────────────────────────────────────────────────
+//
+// Delete asks this same classifier, so everything above binds it too. What
+// follows is the one state the two verbs answer differently, plus the parity
+// assertion that keeps them from drifting anywhere else.
+
+/// The single divergence. Archive admits a parked parent and cancel-stamps its
+/// question card in its own cascade step. Delete cannot: there is nothing to
+/// stamp when the card is about to go. The subprocess parked on that question
+/// would be left with nobody to answer it.
+#[test]
+fn delete_refuses_a_parent_waiting_on_an_answer_where_archive_admits_it() {
+    let target = Uuid::new_v4();
+    let mut parked = idle_chat(target);
+    parked.status = "waiting_for_user_answer".into();
+    let family = vec![parked];
+
+    let (status, body) = expect_reject(
+        &family,
+        target,
+        FamilyVerb::Delete,
+        "delete must refuse a parent parked on a question",
+    );
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["reason"], "parent_not_deletable");
+    assert_eq!(body["parent_status"], "waiting_for_user_answer");
+
+    let (to_archive, _) = expect_proceed(
+        &family,
+        target,
+        "archive must still admit a parent parked on a question",
+    );
+    assert_eq!(to_archive, vec![target]);
+}
+
+/// Everything except that one state must answer identically, or the lift into
+/// one classifier bought nothing. Each family below is refused, and the two
+/// verbs must agree on the refusal slug as well as on the fact of it.
+#[test]
+fn archive_and_delete_refuse_the_same_family() {
+    let target = Uuid::new_v4();
+    let running_child = Uuid::new_v4();
+    let pending_child = Uuid::new_v4();
+
+    let mut running_parent = idle_chat(target);
+    running_parent.status = "running".into();
+
+    let families: Vec<(&str, Vec<FamilyRow>)> = vec![
+        (
+            "a running descendant",
+            vec![idle_chat(target), running_chat(running_child)],
+        ),
+        (
+            "a descendant holding a pending change",
+            vec![idle_chat(target), cc_with_pending(pending_child)],
+        ),
+        (
+            "the parent holding a pending change",
+            vec![cc_with_pending(target)],
+        ),
+    ];
+
+    for (what, family) in families {
+        let (archive_status, archive_body) =
+            expect_reject(&family, target, FamilyVerb::Archive, what);
+        let (delete_status, delete_body) = expect_reject(&family, target, FamilyVerb::Delete, what);
+        assert_eq!(
+            archive_status, delete_status,
+            "the two verbs disagreed on the status for {what}"
+        );
+        assert_eq!(
+            archive_body["reason"], delete_body["reason"],
+            "the two verbs disagreed on the reason for {what}"
+        );
+    }
+
+    // And the running-parent case, where the slug is deliberately per-verb.
+    let running_family = vec![running_parent];
+    let (_, archive_body) = expect_reject(
+        &running_family,
+        target,
+        FamilyVerb::Archive,
+        "a running parent",
+    );
+    let (_, delete_body) = expect_reject(
+        &running_family,
+        target,
+        FamilyVerb::Delete,
+        "a running parent",
+    );
+    assert_eq!(archive_body["reason"], "parent_not_archivable");
+    assert_eq!(delete_body["reason"], "parent_not_deletable");
+}
+
+/// Delete sweeps the WHOLE family, including members archive would skip.
+/// `not_yet_archived` is archive's subset and would silently strand an
+/// already-archived sub-thread's rows behind.
+#[test]
+fn delete_takes_every_member_including_the_already_archived() {
+    let target = Uuid::new_v4();
+    let archived_child = Uuid::new_v4();
+    let cc_child = Uuid::new_v4();
+    let family = vec![
+        idle_chat(target),
+        archived(archived_child),
+        idle_cc(cc_child),
+    ];
+
+    assert_eq!(
+        every_member(&family),
+        vec![target, archived_child, cc_child],
+        "delete must take the archived member too"
+    );
+    assert_eq!(
+        not_yet_archived(&family),
+        vec![target, cc_child],
+        "archive still skips it, which is why the two subsets are separate"
+    );
+    assert_eq!(coding_agent_members(&family), vec![cc_child]);
 }

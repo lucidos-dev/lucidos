@@ -1639,14 +1639,97 @@ fn tar_and_compress(
     Ok(())
 }
 
-/// Recursively walk a directory, returning all file paths.
-fn walkdir(dir: &Path) -> Result<Vec<PathBuf>, BoxError> {
+/// Recursively walk the workspace, returning all regular file paths.
+///
+/// One symlink is followed: a top-level `data` relocating the tree to another
+/// disk. That layout is supported, and both coding-agent back ends grant it
+/// through [`grants_more_than_the_data_tree`]. A backup skipping it would omit
+/// every artifact, app, knowhow file and trigger the user has.
+///
+/// Every other symlink is skipped. Following one pulls its target into the
+/// archive we upload to the user's cloud provider. `.backupignore` cannot
+/// refuse that, because it matches the path INSIDE the workspace.
+///
+/// Skipping also makes a symlink loop unreachable. A `data` link onto a parent
+/// of the workspace is refused, and no other link is entered, so the walk only
+/// descends real directories.
+fn walkdir(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
     let mut results = Vec::new();
-    walkdir_inner(dir, &mut results)?;
+    let mut skipped = 0usize;
+    walkdir_inner(root, root, &mut results, &mut skipped)?;
+    if skipped > 0 {
+        // One line per walk, not one per link. The walk runs before
+        // `is_excluded_workspace_path`, so it meets every symlink under
+        // `.lucidos/` too, and a dev workspace has hundreds of those.
+        crate::log!(
+            "[Backup] Skipped {} symlink(s); only a relocated {}/ is followed",
+            skipped,
+            crate::core::DATA_DIR
+        );
+    }
     Ok(results)
 }
 
-fn walkdir_inner(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), BoxError> {
+/// What the walk does with a symlink it met.
+enum SymlinkAction {
+    /// The one relocation a backup follows. Recursion enters the LINK path
+    /// rather than its target, so every child stays under the workspace and
+    /// `is_excluded_workspace_path` keeps working on the relative path.
+    Follow,
+    Skip,
+}
+
+/// Decide a symlink's fate, or FAIL the backup.
+///
+/// A top-level `data` link that does not resolve is an error, never a skip.
+/// Skipping it archives a workspace holding no artifacts, apps, knowhow or
+/// triggers. `workspace_backup_size` walks this same function, so the
+/// preflight agrees and the run reports success. The user finds out at
+/// restore. An unmounted external disk is the ordinary way to get here.
+fn classify_symlink(path: &Path, root: &Path) -> Result<SymlinkAction, BoxError> {
+    if path != root.join(crate::core::DATA_DIR) {
+        return Ok(SymlinkAction::Skip);
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|e| {
+        format!(
+            "{} is a symlink that does not resolve ({e}). Refusing to write a \
+             backup with no data tree in it.",
+            path.display()
+        )
+    })?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "{} resolves to {}, which is not a directory. Refusing to write a \
+             backup with no data tree in it.",
+            path.display(),
+            resolved.display()
+        )
+        .into());
+    }
+    // A link resolving onto a parent of the workspace would pull `.lucidos/`
+    // and every sibling worktree into the archive. The coding-agent grants
+    // refuse the same shape.
+    if crate::runtime::codex::grants_more_than_the_data_tree(&resolved, root) {
+        return Err(format!(
+            "{} resolves to {}, which contains the workspace. Refusing to back \
+             up the workspace's own runtime state and sibling worktrees.",
+            path.display(),
+            resolved.display()
+        )
+        .into());
+    }
+    Ok(SymlinkAction::Follow)
+}
+
+fn walkdir_inner(
+    dir: &Path,
+    root: &Path,
+    results: &mut Vec<PathBuf>,
+    skipped: &mut usize,
+) -> Result<(), BoxError> {
+    // Only the walk ROOT reaches this as a non-directory; recursion already
+    // checked the entry type. A root reached through a symlink is the caller's
+    // own choice and stays allowed.
     if !dir.is_dir() {
         return Ok(());
     }
@@ -1659,9 +1742,28 @@ fn walkdir_inner(dir: &Path, results: &mut Vec<PathBuf>) -> Result<(), BoxError>
             continue;
         };
         let path = entry.path();
-        if path.is_dir() {
-            walkdir_inner(&path, results)?;
-        } else {
+        // `file_type` reads the entry itself, so a symlink reports as one
+        // rather than as whatever it points at.
+        let Some(file_type) = skip_if_vanished(&path, entry.file_type())? else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            match classify_symlink(&path, root)? {
+                SymlinkAction::Follow => walkdir_inner(&path, root, results, skipped)?,
+                SymlinkAction::Skip => {
+                    *skipped += 1;
+                    // Name the ones at the workspace root. A relocation lives
+                    // there, so a link this walk declines to follow is worth
+                    // reading by name. Deeper ones are `.lucidos/` noise and
+                    // stay in the count.
+                    if dir == root {
+                        crate::log!("[Backup] Not following symlink {}", path.display());
+                    }
+                }
+            }
+        } else if file_type.is_dir() {
+            walkdir_inner(&path, root, results, skipped)?;
+        } else if file_type.is_file() {
             results.push(path);
         }
     }

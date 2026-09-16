@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.37.0"
+LUCIDOS_DEFAULT_VERSION="0.38.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -539,6 +539,7 @@ finish_install() {
     manager="$(service_detect_manager)"
     decision="$(service_compose_decision "$LUCIDOS_NO_SERVICE" "$manager")"
     resolve_instance
+    report_coexisting_app
 
     if [ "$decision" = "service" ]; then
         register_service "$runtime_dir" "$manager"
@@ -550,6 +551,35 @@ finish_install() {
             info "Re-run on a machine with launchd (macOS) or systemd --user (Linux) to install the always-on service."
         fi
         launch_runtime "$runtime_dir"
+    fi
+}
+
+# report_coexisting_app: say so when the macOS .app is installed too.
+#
+# The two coexist fine on two ports, and this is an info line rather than a
+# warning for exactly that reason. What it prevents is the silent version of
+# the same machine: the app expects port 5252 and cannot step off it, so an
+# instance that took 5252 first leaves the app driving THIS gateway with
+# nothing in either product saying so. Settings, System, Overview lists both.
+report_coexisting_app() {
+    # PRESENCE only, never the paths: the report below names none of them, so
+    # the whole question is whether the helper printed anything at all. It used
+    # to read the lines into an array over a process substitution, which broke
+    # the advertised one-liner on every Mac. macOS /bin/sh IS bash 3.2, so the
+    # re-exec guard at the top of this file deliberately does not fire, and
+    # bash 3.2 as sh rejects `< <(…)` while PARSING. The script died having run
+    # nothing at all. Everything a piped install reaches must stay inside the
+    # bash-3.2 posix subset; install_test.sh scans for the constructs that
+    # leave it.
+    [ -n "$(service_desktop_app_present "$HOME")" ] || return 0
+    local app_port; app_port="$(service_desktop_app_port "$HOME")"
+    info "The macOS Lucidos app is installed on this machine as well."
+    if [ "$app_port" = "$LUCIDOS_PORT" ]; then
+        warn "This instance is on port $LUCIDOS_PORT, which is also the app's port. Only one can
+       answer it, and whichever starts first wins. Give this instance another
+       port with --port, or remove one of the two installs."
+    else
+        info "  It uses port $app_port; this instance uses $LUCIDOS_PORT, so the two coexist."
     fi
 }
 

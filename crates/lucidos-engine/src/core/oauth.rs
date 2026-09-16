@@ -71,8 +71,29 @@ pub struct OAuthAccountInfo {
     /// `None` for an account connected before the column existed. The caller
     /// falls back to something never narrower than the granted set.
     pub desired_scopes: Option<String>,
+    /// The account holds a refresh token, so renewal works and
+    /// `offline_access` was granted. Presence only: the value never leaves the
+    /// engine. Derived in the SELECT, not a column.
+    pub has_refresh_token: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Whether a row ends up holding a refresh token, as SQL.
+///
+/// An empty string is not a token. `refresh_token` takes an `Option<&str>`, so
+/// a provider answering `"refresh_token": ""` would otherwise read as proof
+/// that renewal works.
+const HAS_REFRESH_TOKEN_SQL: &str = "(COALESCE(refresh_token, '') <> '')";
+
+/// A stored OAuth account, as [`OAuthStore::connect`] left it.
+pub struct ConnectedAccount {
+    pub id: Uuid,
+    /// Read from the ROW, never from the token response. A re-authorization
+    /// returning no refresh token keeps the one the account already had, and
+    /// renewal still works (see `upsert_row`'s `COALESCE`). Both the tool
+    /// result and the Accounts card answer `offline_access` from this.
+    pub has_refresh_token: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -347,10 +368,10 @@ impl OAuthStore {
         token_expiry: Option<DateTime<Utc>>,
         scopes: &str,
         desired_scopes: &str,
-    ) -> Result<Uuid, sqlx::Error> {
+    ) -> Result<ConnectedAccount, sqlx::Error> {
         let result = if email.is_some() {
-            sqlx::query_scalar::<_, Uuid>(
-                r#"
+            sqlx::query_as::<_, (Uuid, bool)>(
+                &format!(r#"
                 INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes, desired_scopes)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (provider, email) DO UPDATE SET
@@ -361,8 +382,8 @@ impl OAuthStore {
                     scopes = EXCLUDED.scopes,
                     desired_scopes = EXCLUDED.desired_scopes,
                     updated_at = NOW()
-                RETURNING id
-                "#,
+                RETURNING id, {HAS_REFRESH_TOKEN_SQL}
+                "#),
             )
             .bind(provider)
             .bind(email)
@@ -375,8 +396,8 @@ impl OAuthStore {
             .fetch_one(pool)
             .await?
         } else {
-            sqlx::query_scalar::<_, Uuid>(
-                r#"
+            sqlx::query_as::<_, (Uuid, bool)>(
+                &format!(r#"
                 INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes, desired_scopes)
                 VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (provider) WHERE email IS NULL DO UPDATE SET
@@ -387,8 +408,8 @@ impl OAuthStore {
                     scopes = EXCLUDED.scopes,
                     desired_scopes = EXCLUDED.desired_scopes,
                     updated_at = NOW()
-                RETURNING id
-                "#,
+                RETURNING id, {HAS_REFRESH_TOKEN_SQL}
+                "#),
             )
             .bind(provider)
             .bind(display_name)
@@ -401,7 +422,10 @@ impl OAuthStore {
             .await?
         };
 
-        Ok(result)
+        Ok(ConnectedAccount {
+            id: result.0,
+            has_refresh_token: result.1,
+        })
     }
 
     /// Get an OAuth account by ID (includes tokens)
@@ -487,14 +511,15 @@ impl OAuthStore {
 
     /// List all OAuth accounts without tokens (safe for API)
     pub async fn list(pool: &PgPool) -> Result<Vec<OAuthAccountInfo>, sqlx::Error> {
-        sqlx::query_as::<_, OAuthAccountInfo>(
+        sqlx::query_as::<_, OAuthAccountInfo>(&format!(
             r#"
             SELECT id, provider, email, display_name, scopes, desired_scopes,
+                   {HAS_REFRESH_TOKEN_SQL} AS has_refresh_token,
                    created_at, updated_at
             FROM oauth_accounts
             ORDER BY provider ASC, created_at ASC
-            "#,
-        )
+            "#
+        ))
         .fetch_all(pool)
         .await
     }
@@ -544,8 +569,8 @@ impl OAuthStore {
         scopes: &str,
         desired_scopes: &str,
         actor: Option<MessageOrigin>,
-    ) -> Result<Uuid, sqlx::Error> {
-        let id = Self::upsert_row(
+    ) -> Result<ConnectedAccount, sqlx::Error> {
+        let stored = Self::upsert_row(
             pool,
             provider,
             email,
@@ -560,7 +585,7 @@ impl OAuthStore {
         event_bus
             .emit_or_log(
                 BusEvent::System(SystemEvent::OAuthAccountConnected {
-                    account_id: id.to_string(),
+                    account_id: stored.id.to_string(),
                     provider: provider.to_string(),
                     email: email.map(str::to_string),
                     actor,
@@ -568,7 +593,7 @@ impl OAuthStore {
                 "[OAuth] OAuthAccountConnected",
             )
             .await;
-        Ok(id)
+        Ok(stored)
     }
 
     /// Delete an OAuth account and announce it. The only way to disconnect one.
@@ -1295,26 +1320,57 @@ fn merge_scopes(existing: &str, requested: &str) -> String {
     all.join(" ")
 }
 
+/// Scopes a provider may leave out of the echoed `scope` after granting them,
+/// so their absence from it proves nothing.
+///
+/// These are the OIDC and meta scopes, which name no resource. Microsoft omits
+/// all four when the token is issued for a RESOURCE such as
+/// `outlook.office.com`: that response lists the resource's own scopes and
+/// nothing else. GitHub knows none of them, and a bare Connect asks for three.
+const META_SCOPES: [&str; 4] = ["offline_access", "openid", "profile", "email"];
+
+/// What a grant produced that its echoed scope list cannot say.
+///
+/// `offline_access` is the one that matters. It asks for a refresh token, and
+/// the token itself IS the answer. Diff the echo instead and a resource-scoped
+/// Microsoft grant reads as refusing it. That sends the user to the Entra
+/// portal to enable something already enabled.
+#[derive(Debug, Clone, Copy)]
+pub struct GrantEvidence {
+    /// The account holds a refresh token, so renewal works.
+    pub refresh_token: bool,
+}
+
 /// Which scopes an authorization asked for and did not get, in the order they
 /// were requested.
 ///
-/// **Exact token set difference**, never containment. This is the same rule as
-/// `missingScopes` in `components/settings/oauthConnectForm.ts`, so the agent
-/// and the Accounts panel cannot disagree about whether an account is short.
+/// **A resource scope is an exact token set difference**, never containment.
+/// Same rule as `missingScopes` in `components/settings/oauthConnectForm.ts`,
+/// so the agent and the Accounts panel cannot disagree about a shortfall.
 ///
-/// **Not the same question as [`crate::core::backup::missing_scopes`]**, which
-/// asks whether a backup provider can upload. Its `required_scopes` are
-/// substring MATCHERS, so it uses containment on purpose. Containment here
-/// would report a refused scope as granted whenever another granted scope
-/// contained its name.
+/// **A meta scope is answered by `evidence`, never by the echo.** A provider
+/// may grant one and leave it out of the echoed list, so a difference there
+/// means nothing. Only `offline_access` has evidence to read, so the other
+/// three stay quiet rather than sending the user to a provider console.
+///
+/// **Not the same question as [`crate::core::backup::missing_scopes`]**, whose
+/// `required_scopes` are substring MATCHERS and use containment on purpose.
 ///
 /// An empty requested set yields no shortfall: nothing was asked for, so
 /// nothing can be short.
-pub fn missing_requested_scopes(requested: &str, granted: &str) -> Vec<String> {
+pub fn missing_requested_scopes(
+    requested: &str,
+    granted: &str,
+    evidence: GrantEvidence,
+) -> Vec<String> {
     let held: std::collections::HashSet<&str> = granted.split_whitespace().collect();
     requested
         .split_whitespace()
-        .filter(|scope| !held.contains(scope))
+        .filter(|scope| match *scope {
+            "offline_access" => !evidence.refresh_token,
+            meta if META_SCOPES.contains(&meta) => false,
+            resource => !held.contains(resource),
+        })
         .map(str::to_string)
         .collect()
 }
@@ -1769,6 +1825,10 @@ pub struct OAuthFlowOutcome {
     /// [`Self::granted_scopes`] is the shortfall
     /// ([`missing_requested_scopes`]).
     pub requested_scopes: String,
+    /// The stored account holds a refresh token. This is what answers
+    /// `offline_access`, which a provider may grant without echoing. See
+    /// [`ConnectedAccount::has_refresh_token`].
+    pub has_refresh_token: bool,
 }
 
 /// Outcome of an OAuth token exchange, or the reason it failed.
@@ -1939,7 +1999,7 @@ pub async fn prepare_oauth_flow(
 
             // Both scope sets are stored. Their difference IS the shortfall a
             // later *Reconnect* re-requests.
-            OAuthStore::connect(
+            let stored = OAuthStore::connect(
                 &pool,
                 &event_bus,
                 &provider,
@@ -1969,6 +2029,11 @@ pub async fn prepare_oauth_flow(
                 // The set the authorization URL was built from. Anything
                 // derived later from the stored account could disagree.
                 requested_scopes: merged_scopes.clone(),
+                // From the row the upsert left, not from `token_resp`: a
+                // re-authorization returning no refresh token keeps the one
+                // the account already had, and the Accounts card reads that
+                // same row.
+                has_refresh_token: stored.has_refresh_token,
             })
         }
         .await;

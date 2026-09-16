@@ -184,6 +184,20 @@ fn clamp_result_summary(summary: &str) -> String {
     }
 }
 
+/// The body of a trigger-failure notification, bounded.
+///
+/// A script's error carries its whole stderr. An LLM trigger's carries
+/// whatever the provider echoed back, which for several providers is the
+/// entire response body. Neither is bounded upstream.
+///
+/// The message lands in the append-only `events` table and the
+/// `notifications` projection, so an oversized one is permanent. Web push
+/// shrinks its own body, which is why this shows up as table growth rather
+/// than as a visible failure.
+fn failure_notification_message(body: &str) -> String {
+    clamp_result_summary(body)
+}
+
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
 /// Failure notifications never deep-link to the trigger's owning app — see the
 /// "Deep-link discipline" guidance in `system-knowhow/triggers.md`.
@@ -193,6 +207,13 @@ async fn emit_failure_notification(
     title: String,
     message: String,
 ) {
+    // Bounded HERE rather than at each arm, so no failure path can forget it.
+    // Both arms build their message from an error whose length nothing
+    // upstream caps, and `config.name` is unbounded at every site that sets
+    // it. Both ride the same `NotificationCreated` into the append-only
+    // events table.
+    let title = failure_notification_message(&title);
+    let message = failure_notification_message(&message);
     let notification_id = uuid::Uuid::new_v4();
     if let Err(emit_err) = engine
         .event_bus
@@ -629,6 +650,62 @@ async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A failing trigger must not write an unbounded blob into the
+    /// append-only `events` table. A script's error carries its whole stderr,
+    /// and the success arm beside it has always clamped.
+    #[test]
+    fn a_failure_notification_message_is_clamped() {
+        let stderr = "x".repeat(2_000_000);
+        let body = format!("[trigger: daily-report] Python error:\n{stderr}");
+        let message = failure_notification_message(&body);
+
+        assert_eq!(
+            message.chars().count(),
+            RESULT_SUMMARY_MAX_CHARS,
+            "clamped to exactly the shared cap"
+        );
+        assert!(
+            message.starts_with("[trigger: daily-report]"),
+            "the trigger is still named: {message}"
+        );
+        assert!(message.ends_with("..."), "the cut is visible");
+    }
+
+    /// Clamping counts characters, not bytes, so a multi-byte error is never
+    /// cut mid-codepoint into a payload no reader can decode.
+    #[test]
+    fn a_clamped_failure_message_cuts_on_a_character_boundary() {
+        let body = "\u{1f600}".repeat(RESULT_SUMMARY_MAX_CHARS * 2);
+        let message = failure_notification_message(&body);
+
+        assert_eq!(message.chars().count(), RESULT_SUMMARY_MAX_CHARS);
+        let kept = message.trim_end_matches('.');
+        assert!(
+            kept.chars().all(|c| c == '\u{1f600}'),
+            "every kept character is a whole emoji, none half-written"
+        );
+        // A byte cut would have split a 4-byte emoji and produced a shorter
+        // char count than the cap, or panicked outright.
+        assert_eq!(kept.chars().count(), RESULT_SUMMARY_MAX_CHARS - 3);
+    }
+
+    /// Both failure arms are bounded, not just the script one. The LLM arm's
+    /// reason is a provider error, and several providers format the whole
+    /// response body into it.
+    #[test]
+    fn the_transient_llm_failure_message_is_clamped_too() {
+        let provider_body = "<html>".repeat(200_000);
+        let message = failure_notification_message(&format!(
+            "Transient error (will retry on next schedule): {provider_body}"
+        ));
+
+        assert_eq!(message.chars().count(), RESULT_SUMMARY_MAX_CHARS);
+        assert!(
+            message.starts_with("Transient error (will retry on next schedule):"),
+            "the retry notice survives the clamp"
+        );
+    }
 
     /// Every emit stamps this onto `EmittedEvent::depth`, so an answer of 0
     /// inside a trigger would restart the chain and let a chain across

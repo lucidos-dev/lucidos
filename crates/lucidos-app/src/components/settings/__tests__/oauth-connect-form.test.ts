@@ -35,6 +35,14 @@ const PROVIDERS: KnownOAuthProvider[] = [
   },
 ];
 
+/** What Microsoft echoes for a token issued to the `outlook.office.com`
+ *  RESOURCE: that resource's own scopes, and nothing else. */
+const OUTLOOK_GRANTED = [
+  'https://outlook.office.com/SMTP.Send',
+  'https://outlook.office.com/IMAP.AccessAsUser.All',
+  'https://outlook.office.com/Mail.Read',
+].join(' ');
+
 function account(over: Partial<OAuthAccountInfo> = {}): OAuthAccountInfo {
   return {
     id: 'a1',
@@ -168,5 +176,96 @@ describe('missingScopes', () => {
     // would prove otherwise did not exist when it was connected.
     expect(missingScopes(account({ desired_scopes: null }))).toEqual([]);
     expect(missingScopes(account({ desired_scopes: undefined }))).toEqual([]);
+  });
+
+  // The engine's `missing_requested_scopes` answers the same cases, so a change
+  // here needs the matching one in `core/oauth_tests.rs`.
+
+  it('reads a refresh token as offline_access granted', () => {
+    // The reported bug. Microsoft issues the token for a RESOURCE, so the echo
+    // lists that resource's scopes and nothing else. The shortfall then named
+    // offline_access on a grant that HAD produced a refresh token. That sent
+    // the user to the Entra portal twice for nothing.
+    expect(
+      missingScopes(
+        account({
+          provider: 'microsoft',
+          scopes: OUTLOOK_GRANTED,
+          desired_scopes: `${OUTLOOK_GRANTED} offline_access`,
+          has_refresh_token: true,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('reports offline_access when no refresh token arrived', () => {
+    // The case that actually breaks renewal. Same echo as above; only the
+    // evidence differs.
+    expect(
+      missingScopes(
+        account({
+          provider: 'microsoft',
+          scopes: OUTLOOK_GRANTED,
+          desired_scopes: `${OUTLOOK_GRANTED} offline_access`,
+          has_refresh_token: false,
+        }),
+      ),
+    ).toEqual(['offline_access']);
+  });
+
+  it('will not take an echoed offline_access for the token itself', () => {
+    expect(
+      missingScopes(
+        account({
+          scopes: 'read offline_access',
+          desired_scopes: 'read offline_access',
+          has_refresh_token: false,
+        }),
+      ),
+    ).toEqual(['offline_access']);
+  });
+
+  it('stays quiet on offline_access when the engine cannot say', () => {
+    // An engine older than the field sends nothing, which is the window
+    // between a new bundle and the engine restart. An unknown is not a
+    // refusal, and the wrong guess here is the one that costs a console trip.
+    expect(
+      missingScopes(
+        account({
+          scopes: OUTLOOK_GRANTED,
+          desired_scopes: `${OUTLOOK_GRANTED} offline_access`,
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('never reports the sign-in scopes from the echo', () => {
+    // Every Connect asks for openid email profile. GitHub has no such scopes
+    // and echoes none of them, so every GitHub account read as short of three.
+    expect(
+      missingScopes(
+        account({
+          provider: 'github',
+          scopes: 'repo',
+          desired_scopes: 'openid email profile repo',
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('still names a refused resource scope beside a quiet meta scope', () => {
+    expect(
+      missingScopes(
+        account({
+          provider: 'microsoft',
+          scopes: 'https://outlook.office.com/Mail.Read',
+          desired_scopes: `${OUTLOOK_GRANTED} offline_access openid`,
+          has_refresh_token: true,
+        }),
+      ),
+    ).toEqual([
+      'https://outlook.office.com/SMTP.Send',
+      'https://outlook.office.com/IMAP.AccessAsUser.All',
+    ]);
   });
 });

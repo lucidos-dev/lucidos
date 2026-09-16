@@ -53,26 +53,30 @@ pub(crate) fn plugin_tracks(label: &str) -> bool {
     label == crate::app_window::MAIN_WINDOW_LABEL
 }
 
-/// How long the window must sit still (no move/resize) before the debounced
-/// background flush writes `.window-state.json`. Short enough that a quick
-/// move-then-relaunch is remembered, long enough that a drag doesn't thrash the
-/// disk on every intermediate `Moved`/`Resized` event.
-const GEOMETRY_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
+/// How long the windows must sit still before the debounced background flush
+/// writes. Short enough that a quick move-then-relaunch is remembered, long
+/// enough that a drag doesn't thrash the disk on every intermediate
+/// `Moved`/`Resized` event.
+const WINDOW_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(600);
 
-/// How often the flush thread wakes to ask whether the window has gone quiet.
-const GEOMETRY_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+/// How often the flush thread wakes to ask whether the windows have gone quiet.
+const WINDOW_POLL: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Coordinates the debounced geometry flush. The window-state plugin writes to
-/// disk only on `RunEvent::Exit`, which the packaged client never reaches.
-/// Without this, a moved or resized window is remembered in memory alone. A
-/// background thread flushes once the window has been quiet for
-/// [`GEOMETRY_SAVE_DEBOUNCE`] (see [`should_persist_geometry`]).
-pub(crate) struct GeometrySaver {
+/// Coordinates the debounced flush of both window records. The window-state
+/// plugin writes to disk only on `RunEvent::Exit`, which the packaged client
+/// never reaches. Without this, a moved or resized window is remembered in
+/// memory alone. A background thread flushes once the windows have been quiet
+/// for [`WINDOW_SAVE_DEBOUNCE`] (see [`should_persist_windows`]).
+///
+/// Windows rather than geometry, because a navigation owes a write too: the
+/// session record holds a workspace per window as well as a frame. See
+/// [`note_windows_changed`].
+pub(crate) struct WindowSaver {
     dirty: AtomicBool,
     last_change: Mutex<Instant>,
 }
 
-impl Default for GeometrySaver {
+impl Default for WindowSaver {
     fn default() -> Self {
         Self {
             dirty: AtomicBool::new(false),
@@ -81,32 +85,76 @@ impl Default for GeometrySaver {
     }
 }
 
-/// Whether the debounced flush should run now: there is unsaved geometry and
-/// the window has been quiet at least [`GEOMETRY_SAVE_DEBOUNCE`].
-fn should_persist_geometry(dirty: bool, since_last_change: std::time::Duration) -> bool {
-    dirty && since_last_change >= GEOMETRY_SAVE_DEBOUNCE
+impl WindowSaver {
+    /// A write is owed, and the quiet period starts again.
+    fn note_changed(&self) {
+        *self.last_change.lock().unwrap() = Instant::now();
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Is a write owed, and have the windows been quiet long enough for it?
+    fn write_is_due(&self) -> bool {
+        should_persist_windows(
+            self.dirty.load(Ordering::Acquire),
+            self.last_change.lock().unwrap().elapsed(),
+        )
+    }
+
+    /// Claim the owed write. The flush is a one-shot, so a caller that claims
+    /// it owns it: nothing re-takes it until something notes a change.
+    fn take_write(&self) {
+        self.dirty.store(false, Ordering::Release);
+    }
+
+    /// Is a write still owed? Test seam for the sequence a cold boot takes.
+    #[cfg(test)]
+    fn owes_a_write(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
 }
 
-/// A window moved or resized, so the flush is owed. Called from the window
-/// event handler on every intermediate event, which is why the write itself is
-/// debounced rather than immediate.
-pub(crate) fn note_geometry_changed(app: &tauri::AppHandle) {
-    let saver = app.state::<GeometrySaver>();
-    *saver.last_change.lock().unwrap() = Instant::now();
-    saver.dirty.store(true, Ordering::Release);
+/// Whether the debounced flush should run now: a write is owed and the windows
+/// have been quiet at least [`WINDOW_SAVE_DEBOUNCE`].
+///
+/// A write is owed by a move, a resize OR a navigation, so this asks about the
+/// debt rather than about geometry. [`note_windows_changed`] is what records
+/// all three.
+fn should_persist_windows(dirty: bool, since_last_change: std::time::Duration) -> bool {
+    dirty && since_last_change >= WINDOW_SAVE_DEBOUNCE
 }
 
-/// Start the debounced geometry flush. Its own thread, for the life of the
+/// Something about the windows changed, so the flush is owed. Called from the
+/// window event handler on every intermediate move and resize, which is why the
+/// write itself is debounced rather than immediate.
+///
+/// Also called when a page starts loading on a URL past the splash, and that
+/// arm is what stops the session record losing a launch.
+/// [`persist_window_session`] refuses to write while every window is still on
+/// the boot splash, and the debounced write lands there on a cold boot: the
+/// engine is restarting, so the first navigation is many seconds out. The
+/// refusal used to be the end of it, because nothing re-armed the flush. Now
+/// the navigation itself does, at the one moment the gate can open.
+///
+/// That caller carries `window_target::window_is_navigated`, the same predicate
+/// the gate reads, so the two cannot drift. It rules out the bundled splash and
+/// not the gateway's, which is served at the workspace's own url.
+///
+/// So the name is windows rather than geometry, and so is the whole mechanism
+/// this arms. The record holds a workspace per window as well as a frame, and a
+/// navigation changes the first half.
+pub(crate) fn note_windows_changed(app: &tauri::AppHandle) {
+    app.state::<WindowSaver>().note_changed();
+}
+
+/// Start the debounced window flush. Its own thread, for the life of the
 /// process. The save is marshalled onto the main thread, for the reason
 /// [`persist_window_state_on_main`] gives.
-pub(crate) fn spawn_geometry_flush(app: tauri::AppHandle) {
+pub(crate) fn spawn_window_flush(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(GEOMETRY_POLL);
-        let saver = app.state::<GeometrySaver>();
-        let dirty = saver.dirty.load(Ordering::Acquire);
-        let since = saver.last_change.lock().unwrap().elapsed();
-        if should_persist_geometry(dirty, since) {
-            saver.dirty.store(false, Ordering::Release);
+        std::thread::sleep(WINDOW_POLL);
+        let saver = app.state::<WindowSaver>();
+        if saver.write_is_due() {
+            saver.take_write();
             persist_window_state_on_main(&app);
         }
     });
@@ -410,21 +458,51 @@ mod tests {
         assert!(gate.may_write(true));
     }
 
+    /// The sequence a cold boot takes, and the launch this used to lose.
+    ///
+    /// The startup placement arms the flush. The flush fires while every window
+    /// is still on the boot splash, so `persist_window_session` refuses. The
+    /// claim is unconditional, so the refusal ended it: nothing re-armed, and
+    /// the record kept whatever it held before.
+    ///
+    /// The engine is cold after an update, so the first navigation is the
+    /// slowest it ever is, and that is the launch where this bites. Arming on
+    /// the navigation is what closes it.
     #[test]
-    fn should_persist_geometry_waits_for_quiet_then_fires() {
-        // Nothing changed, so never flush, however long it has been.
-        assert!(!should_persist_geometry(false, Duration::from_secs(10)));
-        // Dirty, but the user is still moving or resizing, so wait.
-        assert!(!should_persist_geometry(true, Duration::from_millis(0)));
-        assert!(!should_persist_geometry(
+    fn a_write_refused_on_the_splash_is_armed_again_by_the_navigation() {
+        let saver = WindowSaver::default();
+        saver.note_changed();
+        assert!(saver.owes_a_write(), "the startup placement owes a write");
+
+        saver.take_write();
+        assert!(!saver.owes_a_write(), "the flush is a one-shot");
+
+        // The session write was refused behind it: every window is on the
+        // splash, so the gate is shut.
+        assert!(!window_session::any_window_is_navigated(&[]));
+
+        saver.note_changed();
+        assert!(
+            saver.owes_a_write(),
+            "the navigation owes the record a write the flush already spent"
+        );
+    }
+
+    #[test]
+    fn should_persist_windows_waits_for_quiet_then_fires() {
+        // Nothing owed, so never flush, however long it has been.
+        assert!(!should_persist_windows(false, Duration::from_secs(10)));
+        // Owed, but the user is still moving or resizing, so wait.
+        assert!(!should_persist_windows(true, Duration::from_millis(0)));
+        assert!(!should_persist_windows(
             true,
-            GEOMETRY_SAVE_DEBOUNCE - Duration::from_millis(1)
+            WINDOW_SAVE_DEBOUNCE - Duration::from_millis(1)
         ));
-        // Dirty and quiet for at least the debounce window, so flush.
-        assert!(should_persist_geometry(true, GEOMETRY_SAVE_DEBOUNCE));
-        assert!(should_persist_geometry(
+        // Owed and quiet for at least the debounce window, so flush.
+        assert!(should_persist_windows(true, WINDOW_SAVE_DEBOUNCE));
+        assert!(should_persist_windows(
             true,
-            GEOMETRY_SAVE_DEBOUNCE + Duration::from_millis(1)
+            WINDOW_SAVE_DEBOUNCE + Duration::from_millis(1)
         ));
     }
 

@@ -199,6 +199,14 @@
     margin-top: 0.5rem;
 }
 
+/* Which of the listed installs is answering this workspace. It rides beside the
+   install's own name, and is the one fact the Installs list exists to deliver,
+   so it takes the accent exactly as the update markers above do. */
+.install-live {
+    color: var(--accent);
+    font-weight: 600;
+}
+
 /* Buttons size to their own labels. Give the row a flex basis instead and it
    splits the pane between them, which hands a routine Refresh Client the same
    weight as a rebuild.

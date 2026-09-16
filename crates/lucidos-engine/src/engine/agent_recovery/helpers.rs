@@ -350,7 +350,9 @@ pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
         return;
     }
     match crate::engine::worktree_cleanup::remove_worktree_and_optionally_delete_branch(
-        wt_path, None,
+        wt_path,
+        None,
+        crate::engine::worktree_cleanup::BranchDisposal::WhenMerged,
     )
     .await
     {

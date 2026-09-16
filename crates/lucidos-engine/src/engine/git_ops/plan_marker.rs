@@ -14,6 +14,7 @@
 //! that a follow-up commit does not invalidate, so the stored `head_sha` is
 //! diagnostic only.
 
+use super::canonical_repo_root;
 use std::path::Path;
 
 /// How many files a `BoundedSecurityFix` may name. The lane's whole claim is
@@ -127,17 +128,6 @@ impl PlanMarkerState {
     pub(crate) fn satisfies_gate(&self) -> bool {
         matches!(self, PlanMarkerState::Present(k) if k.satisfies_gate())
     }
-}
-
-/// Canonical absolute repo_root used as the DB key. Resolves symlinks so the
-/// hook (which uses `git rev-parse --git-common-dir`) and the engine produce
-/// the same row — identical to `harden_marker::canonical_repo_root`.
-fn canonical_repo_root(repo_root: &Path) -> String {
-    repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf())
-        .to_string_lossy()
-        .to_string()
 }
 
 pub(crate) async fn plan_marker_state(

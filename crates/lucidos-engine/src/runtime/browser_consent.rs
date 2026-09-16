@@ -479,7 +479,92 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     log!("[BrowserConsent] No cookie consent dialog found after all attempts");
 }
 
-/// Find consent button position by executing in all frames (including cross-origin)
+/// Finds the accept button inside ONE frame, by matching the phrases below.
+///
+/// Module-level so `frame_consent_button_js_reports_no_page_text` can assert
+/// the debug payload carries no page text. That payload is logged, and a
+/// consent or callback page shows one-time codes in its visible body.
+const FRAME_CONSENT_BUTTON_JS: &str = r#"
+    (function() {
+        // Key phrases to look for (must contain one of these)
+        const acceptPhrases = [
+            'godta alle', 'aksepter alle', 'tillat alle',
+            'accept all', 'allow all', 'i agree',
+            'acceptera alla', 'accepter alle',
+            'alle akzeptieren', 'tout accepter',
+            'aceptar todo', 'alles accepteren', 'accetta tutto'
+        ];
+
+        // Reject if contains these
+        const rejectPhrases = [
+            'settings', 'preferences', 'manage', 'reject', 'decline',
+            'learn more', 'read more', 'how we use', 'privacy policy',
+            'innstillinger', 'avvis', 'les mer', 'velg'
+        ];
+
+        // Search all elements for accept text
+        const allElements = document.querySelectorAll('button, [role="button"], a, span, div, p');
+        let bestMatch = null;
+
+        for (const el of allElements) {
+            const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+
+            // Skip if empty or too long
+            if (!text || text.length > 50) continue;
+
+            // Skip reject patterns
+            if (rejectPhrases.some(p => text.includes(p))) continue;
+
+            // Check for accept phrase
+            const hasAccept = acceptPhrases.some(p => text.includes(p));
+            if (!hasAccept) continue;
+
+            const rect = el.getBoundingClientRect();
+
+            // Must be visible
+            if (rect.width < 20 || rect.height < 10) continue;
+            if (rect.top < 0 || rect.top > 1400 || rect.left < 0) continue;
+
+            // Prefer shorter text (more specific match)
+            if (!bestMatch || text.length < bestMatch.textLen) {
+                bestMatch = {
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    text: text.substring(0, 50),
+                    textLen: text.length
+                };
+            }
+        }
+
+        if (bestMatch) {
+            return JSON.stringify({
+                x: bestMatch.x + (window.screenX || 0),
+                y: bestMatch.y + (window.screenY || 0),
+                clientX: bestMatch.x,
+                clientY: bestMatch.y,
+                text: bestMatch.text
+            });
+        }
+
+        // Debug: what is in this frame. Both fields below go straight into
+        // an engine log line, which is persisted.
+        //
+        // origin + pathname, never location.href. A frame's query string
+        // and fragment can carry an OAuth `code`, `access_token` or
+        // `id_token`.
+        //
+        // The body TEXT is not reported, for the same reason. A consent,
+        // callback or 2FA page shows a one-time passcode or the account
+        // email in its visible body. The button count is the diagnostic.
+        const buttonCount = document.querySelectorAll('button').length;
+        return JSON.stringify({
+            debug: true,
+            buttonCount: buttonCount,
+            url: location.origin + location.pathname
+        });
+    })()
+"#;
+
 async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)> {
     // Get all frames
     let frame_tree = page.execute(GetFrameTreeParams::default()).await.ok()?;
@@ -523,85 +608,7 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
         }
     });
 
-    // JavaScript to find button by searching for "Godta alle" etc. text
-    // Searches ALL elements to find the accept button text
-    let find_button_js = r#"
-        (function() {
-            // Key phrases to look for (must contain one of these)
-            const acceptPhrases = [
-                'godta alle', 'aksepter alle', 'tillat alle',
-                'accept all', 'allow all', 'i agree',
-                'acceptera alla', 'accepter alle',
-                'alle akzeptieren', 'tout accepter',
-                'aceptar todo', 'alles accepteren', 'accetta tutto'
-            ];
-
-            // Reject if contains these
-            const rejectPhrases = [
-                'settings', 'preferences', 'manage', 'reject', 'decline',
-                'learn more', 'read more', 'how we use', 'privacy policy',
-                'innstillinger', 'avvis', 'les mer', 'velg'
-            ];
-
-            // Search all elements for accept text
-            const allElements = document.querySelectorAll('button, [role="button"], a, span, div, p');
-            let bestMatch = null;
-
-            for (const el of allElements) {
-                const text = (el.innerText || el.textContent || '').toLowerCase().trim();
-
-                // Skip if empty or too long
-                if (!text || text.length > 50) continue;
-
-                // Skip reject patterns
-                if (rejectPhrases.some(p => text.includes(p))) continue;
-
-                // Check for accept phrase
-                const hasAccept = acceptPhrases.some(p => text.includes(p));
-                if (!hasAccept) continue;
-
-                const rect = el.getBoundingClientRect();
-
-                // Must be visible
-                if (rect.width < 20 || rect.height < 10) continue;
-                if (rect.top < 0 || rect.top > 1400 || rect.left < 0) continue;
-
-                // Prefer shorter text (more specific match)
-                if (!bestMatch || text.length < bestMatch.textLen) {
-                    bestMatch = {
-                        x: rect.left + rect.width / 2,
-                        y: rect.top + rect.height / 2,
-                        text: text.substring(0, 50),
-                        textLen: text.length
-                    };
-                }
-            }
-
-            if (bestMatch) {
-                return JSON.stringify({
-                    x: bestMatch.x + (window.screenX || 0),
-                    y: bestMatch.y + (window.screenY || 0),
-                    clientX: bestMatch.x,
-                    clientY: bestMatch.y,
-                    text: bestMatch.text
-                });
-            }
-
-            // Debug: return info about what's in this frame.
-            // origin + pathname, never location.href: the query string and
-            // fragment of a frame the agent happens to be on can carry an
-            // OAuth `code` / `access_token` / `id_token`, and this value goes
-            // straight into an engine log line below.
-            const bodyText = (document.body?.innerText || '').substring(0, 200);
-            const buttonCount = document.querySelectorAll('button').length;
-            return JSON.stringify({
-                debug: true,
-                bodyPreview: bodyText.replace(/\n/g, ' ').substring(0, 100),
-                buttonCount: buttonCount,
-                url: location.origin + location.pathname
-            });
-        })()
-        "#;
+    let find_button_js = FRAME_CONSENT_BUTTON_JS;
 
     // Try each frame in priority order
     for &idx in &frame_indices {
@@ -647,17 +654,14 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                                             // Check if this is a debug response or actual button
                                             if coords.get("debug").is_some() {
                                                 // Debug info about frame content
-                                                let preview =
-                                                    coords["bodyPreview"].as_str().unwrap_or("");
                                                 let btn_count =
                                                     coords["buttonCount"].as_i64().unwrap_or(0);
                                                 let url = coords["url"].as_str().unwrap_or("");
                                                 log!(
-                                                    "[BrowserConsent] Frame {}: {} buttons, url={}, preview='{}'",
+                                                    "[BrowserConsent] Frame {}: {} buttons, url={}",
                                                     idx,
                                                     btn_count,
-                                                    url,
-                                                    preview
+                                                    url
                                                 );
                                             } else if let (Some(x), Some(y)) = (
                                                 coords["clientX"].as_f64(),
@@ -747,4 +751,54 @@ async fn click_at_coordinates(page: &Page, x: f64, y: f64) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame probe's debug payload is written to the engine log, so it
+    /// must carry no page TEXT. A consent, callback or 2FA page shows a
+    /// one-time passcode, a device code or the account email in its body.
+    /// The log is persisted, and nothing redacts it afterwards.
+    #[test]
+    fn frame_consent_button_js_reports_no_page_text() {
+        let debug_return = FRAME_CONSENT_BUTTON_JS
+            .split("debug: true")
+            .nth(1)
+            .expect("the probe still returns a debug payload");
+
+        assert!(
+            !debug_return.contains("bodyPreview"),
+            "the debug payload must not carry page text"
+        );
+        assert!(
+            !debug_return.contains("innerText"),
+            "the debug payload must not read the body's text"
+        );
+        assert!(
+            debug_return.contains("buttonCount"),
+            "the button count is the diagnostic and stays"
+        );
+    }
+
+    /// The reported url is origin + pathname. `location.href` would carry the
+    /// query and fragment, where an OAuth callback keeps `code`, `access_token`
+    /// and `id_token`.
+    #[test]
+    fn frame_consent_button_js_logs_no_url_query() {
+        let debug_return = FRAME_CONSENT_BUTTON_JS
+            .split("debug: true")
+            .nth(1)
+            .expect("the probe still returns a debug payload");
+
+        assert!(
+            debug_return.contains("location.origin + location.pathname"),
+            "the probe reports origin + pathname"
+        );
+        assert!(
+            !debug_return.contains("location.href"),
+            "location.href would carry an OAuth token into the log"
+        );
+    }
 }

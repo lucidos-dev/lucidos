@@ -50,8 +50,12 @@ below it:
   that stream between turns, so a resumption edge fires on every hole in the
   audio. Reading the caller's turn end off one cut a spoken sentence into seven
   rows.
-- The **talker's** turn ends when its own output stream goes quiet. That is a
-  fact about a stream we are receiving, not a judgment about anybody.
+- The **talker's** turn ends when its own WORDS go quiet, and never when its
+  output STREAM does (ADR 0187). This ADR said the stream, and that is what
+  shipped and failed: the provider streams audio between turns and blank
+  transcript deltas with it, so the bound never expired on a 32-second call.
+  Both replies then landed as one row at the hangup. Its WORDS are a fact about
+  a stream we are receiving, and still not a judgment about anybody.
 
 **A Live turn reports zero tokens.** What prices the call is
 `VoiceSessionEnded.duration_secs`, which every call already writes.
@@ -75,8 +79,8 @@ produces.
 
 **The silence-timer ban is about the caller, and it survives.** Its reason is
 that a timer cannot tell a pause from a full stop, so it must not decide when a
-person finished. Both flush points here are the model deciding. The talker's own
-output gap is a different measurement with a different subject.
+person finished. Both flush points here are the model deciding. A gap in the
+talker's own WORDS is a different measurement with a different subject.
 
 **ADR 0170's guarantee was never the count.** Its own words: the three tools are
 each on the harmless side of ADR 0149's line, and none reaches a capability the

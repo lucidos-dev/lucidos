@@ -44,6 +44,9 @@ pub fn router() -> Router<GatewayState> {
         // `/gateway/status`, which the picker hits every 2s and which must
         // never wait on an outbound request.
         .route("/gateway/check-updates", post(gateway_check_updates))
+        // Every Lucidos install on this machine. Kept off `/gateway/status`
+        // for the same reason as the line above: this one walks directories.
+        .route("/installs", get(list_installs))
         // Write the machine-global release-check preference. The matching READ
         // is the `release_check` field on `/gateway/status`, so there is one
         // place the frontend gets the whole answer.
@@ -464,6 +467,16 @@ async fn gateway_status(State(state): State<GatewayState>) -> Json<Value> {
         "packaged": state.packaged(),
         "release_check": state.release_check().snapshot(),
     }))
+}
+
+/// GET /~/api/v1/control/installs: every Lucidos install on this machine, and
+/// which of them are configured for one port.
+///
+/// The answer is what Settings, System, Overview renders. It is also the only
+/// way a headless install learns that a second one is shadowing it, having no
+/// client to raise a dialog.
+async fn list_installs(State(state): State<GatewayState>) -> Json<lucidos_installs::Inventory> {
+    Json(state.install_inventory())
 }
 
 /// Body for a release-check poll request. Absent means an ordinary refresh,
@@ -897,6 +910,9 @@ mod authz_tests {
         ("POST", "/~/api/v1/control/gateway/reload"),
         ("GET", "/~/api/v1/control/network-config"),
         ("PUT", "/~/api/v1/control/network-config"),
+        // A read, and still behind the credential: it enumerates this user's
+        // install paths, launch agents and data directories.
+        ("GET", "/~/api/v1/control/installs"),
     ];
 
     async fn control_call(
@@ -989,6 +1005,27 @@ mod authz_tests {
                 "token {token:?} must not authenticate"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_install_inventory_is_not_on_the_two_second_poll() {
+        // The picker refetches `gateway/status` every two seconds. This scan
+        // walks directories and reads a plist, so it lives on its own route and
+        // is fetched when somebody opens Settings.
+        let state = crate::server::GatewayState::for_tests();
+
+        let Json(status) = gateway_status(State(state.clone())).await;
+        assert!(
+            status.get("installs").is_none(),
+            "an install scan must never ride the picker's poll"
+        );
+
+        // Shape only. What this machine actually carries is not the subject:
+        // `lucidos-installs` owns the enumeration, against fixture trees.
+        let Json(inventory) = list_installs(State(state)).await;
+        let body = serde_json::to_value(&inventory).unwrap();
+        assert!(body["installs"].is_array());
+        assert!(body["conflicts"].is_array());
     }
 
     #[tokio::test]

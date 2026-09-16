@@ -354,7 +354,10 @@ describe('the bridge between a call and a thread', () => {
       call,
       draw: (threadId, row) => drawn.push({ threadId, row }),
       erase: (threadId) => erased.push(threadId),
-      drawReply: (threadId, row) => replies.push({ threadId, row }),
+      drawReply: (threadId, row) => {
+        replies.push({ threadId, row });
+        return true;
+      },
       now: () => `2026-08-31T07:16:0${tick++}Z`,
     });
     return { call, drawn, replies, erased, bridge };
@@ -492,15 +495,21 @@ describe('the talker is drawn while it speaks', () => {
     replyCount: count,
   });
 
-  function bridged() {
+  /** `claimed` makes the store answer as it does once the engine's own row has
+   *  landed: there is nothing standing for a rewrite to find. */
+  function bridged(claimed: () => boolean = () => false) {
     const call = signal<CallState>(CALL_IDLE);
-    const replies: { threadId: string; row: LiveReply }[] = [];
+    const replies: { threadId: string; row: LiveReply; fresh: boolean }[] = [];
     let tick = 0;
     const bridge = createLiveUtteranceBridge({
       call,
       draw: () => {},
       erase: () => {},
-      drawReply: (threadId, row) => replies.push({ threadId, row }),
+      drawReply: (threadId, row, fresh) => {
+        if (!fresh && claimed()) return false;
+        replies.push({ threadId, row, fresh });
+        return true;
+      },
       now: () => `2026-08-31T07:16:0${tick++}Z`,
     });
     return { call, replies, bridge };
@@ -515,17 +524,52 @@ describe('the talker is drawn while it speaks', () => {
     expect(new Set(h.replies.map(r => r.row.eventId)).size).toBe(1);
   });
 
+  /** **The restarting-bubble regression.** A Live talker paces its transcript
+   *  with its audio, so a reply has 700 ms holes inside it and `said` empties
+   *  at every one. A row per hole is four bubbles where `call.rs` writes one,
+   *  and the reader watches sentences disappear as they are spoken. */
+  it('joins the stretches of one reply into one growing bubble', () => {
+    const h = bridged();
+    h.call.value = speaking('One: only you from the UI.');
+    // The pause: `said` empties, and the bridge is not asked to draw.
+    h.call.value = { ...speaking(''), replyCount: 1 };
+    h.call.value = speaking(' Two: also a CLI verb.', 2);
+    h.call.value = speaking(' Two: also a CLI verb, which is riskier.', 2);
+
+    expect(h.replies[h.replies.length - 1].row.text).toBe(
+      'One: only you from the UI. Two: also a CLI verb, which is riskier.',
+    );
+    // And it is the same bubble throughout, so nothing on screen is replaced.
+    expect(new Set(h.replies.map(r => r.row.eventId)).size).toBe(1);
+  });
+
   /** A reply already on screen must not have its timestamp jump as it grows,
-   *  and a NEW reply must not inherit the last one's moment. */
-  it('keeps the moment a reply went up, and stamps the next one afresh', () => {
+   *  through a revision and through a pause alike. */
+  it('keeps the moment the bubble went up', () => {
     const h = bridged();
     h.call.value = speaking('Hey');
     h.call.value = speaking('Hey there');
     const first = h.replies[0].row.created;
     expect(h.replies[1].row.created).toBe(first);
 
-    h.call.value = speaking('On it', 2);
-    expect(h.replies[2].row.created).not.toBe(first);
+    h.call.value = speaking(' On it', 2);
+    expect(h.replies[2].row.created).toBe(first);
+  });
+
+  /** The engine wrote the reply down while the bridge still held the words.
+   *  Redrawing would paint the whole reply twice, once under the row that
+   *  landed. So the next delta opens a bubble carrying its own stretch only. */
+  it('opens a new bubble once the engine claims the one standing', () => {
+    let landed = false;
+    const h = bridged(() => landed);
+    h.call.value = speaking('One: only you from the UI.');
+    landed = true;
+    h.call.value = speaking(' Two: also a CLI verb.', 2);
+
+    const last = h.replies[h.replies.length - 1];
+    expect(last.row.text).toBe(' Two: also a CLI verb.');
+    expect(last.fresh).toBe(true);
+    expect(last.row.eventId).not.toBe(h.replies[0].row.eventId);
   });
 
   /** The engine's row arrives on SSE while the caller is still hearing the
@@ -555,15 +599,38 @@ describe('the talker is drawn while it speaks', () => {
     expect(map.get(THREAD)?.liveReply).toBeUndefined();
   });
 
-  it('draws as the Lucidos side, holding no turn of its own', () => {
+  /** **The wandering-header regression.** The row used to be appended as an
+   *  exchange of its own. So it drew a second Lucidos Agent header under the
+   *  first, and that header came and went as each persisted row landed.
+   *
+   *  It goes INSIDE the block its own persisted row will be filed into, which
+   *  is what makes the swap move nothing on screen. */
+  it('draws inside the running block, opening no boundary of its own', () => {
     const thread = withADoerWorking();
+    const before = computeExchanges(thread).length;
     thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'On it' };
-    const rows = computeExchanges(thread);
-    const row = rows[rows.length - 1];
 
-    expect(isLiveReplyRow(row.userEvent)).toBe(true);
-    expect(row.userEvent.type).toBe('SpokenReplyGenerated');
-    expect(row.steps).toEqual([]);
+    const rows = computeExchanges(thread);
+    expect(rows).toHaveLength(before);
+    const last = rows[rows.length - 1];
+    expect(isLiveReplyRow(last.userEvent)).toBe(false);
+
+    const step = last.steps[last.steps.length - 1];
+    expect(isLiveReplyRow(step.event)).toBe(true);
+    expect(step.event.type).toBe('SpokenReplyGenerated');
+  });
+
+  /** The talker spoke before anybody else did, so there is no block to go in.
+   *  It opens one, exactly as a persisted greeting does. */
+  it('opens a boundary when nothing can hold it', () => {
+    const thread = makeOptimisticThreadState({
+      id: THREAD, title: 'A call', channel: 'chat', initiator: 'user', eventsLoaded: true,
+    });
+    thread.liveReply = { eventId: 'live-reply:t:1', created: '2026-08-31T07:16:02Z', text: 'Hi!' };
+
+    const rows = computeExchanges(thread);
+    expect(rows).toHaveLength(1);
+    expect(isLiveReplyRow(rows[0].userEvent)).toBe(true);
   });
 
   /** The call ends while the talker is mid-reply. What it had said is the
@@ -598,14 +665,16 @@ describe('the talker is drawn while it speaks', () => {
       { eventId: liveUtteranceId(THREAD, 2), count: 2, created: '2026-08-31T07:16:03Z' },
     ];
 
-    const tail = computeExchanges(thread).slice(-3);
+    const tail = computeExchanges(thread).slice(-2);
     expect(tail.map(e => e.userEvent._eventId)).toEqual([
       liveUtteranceId(THREAD, 1),
-      'live-reply:t:1',
       liveUtteranceId(THREAD, 2),
     ]);
+    // The reply reads between them, as a step of the bubble it answered.
+    expect(tail[0].steps.map(s => s.event._eventId)).toEqual(['live-reply:t:1']);
+    expect(tail[1].steps).toEqual([]);
     // A `userSeq` is an identity, so the merged block must not reuse one.
-    expect(new Set(tail.map(e => e.userSeq)).size).toBe(3);
+    expect(new Set(tail.map(e => e.userSeq)).size).toBe(2);
   });
 });
 
@@ -644,5 +713,72 @@ describe('a partial captions the bubble and claims nothing', () => {
     } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
 
     expect(map.get(THREAD)?.liveUtterances).toEqual([partialRow]);
+  });
+});
+
+/**
+ * **The orphan-bubble regression.** `call.rs` accumulates a caller stretch
+ * across provider items, so a row drawn part-way through holds a PREFIX of
+ * what finally lands. Matched on equality alone it is an orphan.
+ *
+ * What the reader saw was a bubble reading `bit` under a "Requesting" header,
+ * standing until the hangup swept it away.
+ */
+describe('a landing row retires the rows it grew out of', () => {
+  const stretch = 'Let\'s try this for a bit';
+
+  it('takes the earlier rows of its own stretch', () => {
+    const thread = withADoerWorking();
+    thread.liveUtterances = [
+      { eventId: liveUtteranceId(THREAD, 1), count: 1, created: '2026-08-31T07:16:01Z', text: 'Let\'s try this for a' },
+      { eventId: liveUtteranceId(THREAD, 2), count: 2, created: '2026-08-31T07:16:02Z', text: stretch },
+    ];
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: stretch,
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveUtterances).toEqual([]);
+    expect(map.get(THREAD)?.unclaimedUtterances).toEqual([]);
+  });
+
+  /** Prefix, never containment. Those words appear in the middle of the
+   *  landing row, and the caller is still saying that sentence. */
+  it('leaves a row whose words merely appear inside it', () => {
+    const inFlight: LiveUtterance = {
+      eventId: liveUtteranceId(THREAD, 1),
+      count: 1,
+      created: '2026-08-31T07:16:01Z',
+      text: 'try this',
+    };
+    const thread = withADoerWorking();
+    thread.liveUtterances = [inFlight];
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: stretch,
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveUtterances).toEqual([inFlight]);
+  });
+
+  /** A row with no words yet is not a prefix of anything. That is the
+   *  barge-in guarantee, restated against the new arm. */
+  it('leaves a row that has said nothing yet', () => {
+    const pulsing: LiveUtterance = {
+      eventId: liveUtteranceId(THREAD, 1),
+      count: 1,
+      created: '2026-08-31T07:16:01Z',
+    };
+    const thread = withADoerWorking();
+    thread.liveUtterances = [pulsing];
+    const map = new Map([[THREAD, thread]]);
+
+    handleEvent(map, THREAD, 9, {
+      type: 'SpokenMessageReceived', session_id: 'sess-1', text: stretch,
+    } as StoredEvent, '2026-08-31T07:16:04Z', 'e-9');
+
+    expect(map.get(THREAD)?.liveUtterances).toEqual([pulsing]);
   });
 });

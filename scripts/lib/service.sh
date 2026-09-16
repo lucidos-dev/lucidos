@@ -442,6 +442,65 @@ service_uninstall_purge_targets() {
     printf '%s\n' "${1%/}"
 }
 
+# ── the OTHER install vehicle (pure) ─────────────────────────────────────────
+#
+# A machine can carry the macOS .app as well as install.sh instances, and
+# neither uninstaller can remove the other. Saying nothing is what turned one
+# tester's afternoon into a day: they uninstalled the DMG, reinstalled the
+# newest one, and the old install.sh gateway kept answering on 5252.
+#
+# So this half REPORTS the bundle and never touches it. Its Rust twin is
+# `lucidos_installs::leftovers_report`, which the app's own uninstall prints for
+# the mirror case. The four literals below are the same constants that crate
+# declares, and `service_test.sh` greps them out of it to keep the two in step.
+
+# service_bundle_identifier: the .app's bundle id, which also names its support
+# data dir. Mirrors BUNDLE_IDENTIFIER in crates/lucidos-installs/src/lib.rs.
+service_bundle_identifier() { printf 'com.lucidos.app'; }
+
+# service_bundle_name: the .app's on-disk name.
+service_bundle_name() { printf 'Lucidos.app'; }
+
+# service_desktop_agent_labels: the two launchd jobs the .app installs, the
+# always-on service and the login agent that brings the client back.
+service_desktop_agent_labels() {
+    printf '%s\n' 'com.lucidos.engine' 'com.lucidos.client'
+}
+
+# service_desktop_default_port: the port the .app takes when nothing has
+# overridden it. The *stable gateway port*: paired devices and the Tauri
+# capability URL pattern key on it, so the app cannot step off it the way a
+# brand-new instance here can. Mirrors DEFAULT_GATEWAY_PORT in the Rust crate.
+service_desktop_default_port() { printf '5252'; }
+
+# service_desktop_app_paths <home> [system-applications-dir]: every path the
+# macOS .app owns, one per line, whether or not it exists. Both bundle
+# locations, both LaunchAgent plists, and the support-data dir. Pure; the caller
+# probes. The second argument mirrors `ScanRoots.application_dirs` on the Rust
+# side and exists for the same reason: a test cannot move /Applications.
+service_desktop_app_paths() {
+    local home="${1%/}" apps="${2:-/Applications}" label
+    printf '%s\n' "${apps%/}/$(service_bundle_name)"
+    printf '%s\n' "$home/Applications/$(service_bundle_name)"
+    while IFS= read -r label; do
+        printf '%s\n' "$home/Library/LaunchAgents/$label.plist"
+    done <<EOF
+$(service_desktop_agent_labels)
+EOF
+    printf '%s\n' "$home/Library/Application Support/$(service_bundle_identifier)"
+}
+
+# service_desktop_app_report <path>...: the lines an uninstaller prints for a
+# macOS .app it found and cannot remove. Nothing in, nothing out, so a caller
+# passing the filtered set gets silence when there is nothing to say.
+service_desktop_app_report() {
+    [ "$#" -gt 0 ] || return 0
+    printf '%s\n' 'The macOS Lucidos app is also installed, and this uninstaller cannot remove it:'
+    printf '  %s\n' "$@"
+    printf '%s\n' 'Remove it from the app itself: open Lucidos, then the Lucidos menu, then'
+    printf '%s\n' 'Uninstall Lucidos.'
+}
+
 # ════════════════════════════════════════════════════════════════════════════
 # EFFECTFUL wrappers — the launchctl/systemctl/curl/kill/pg_ctl side effects +
 # port probing + instance listing. The unit tests NEVER call anything below this
@@ -451,6 +510,38 @@ service_uninstall_purge_targets() {
 # service_detect_manager — probe the host → launchd | systemd-user | none (via
 # the pure service_decide_manager). systemd --user needs a reachable user
 # systemd/D-Bus session; `systemctl --user show-environment` is the cheap probe.
+# service_desktop_app_present <home> [system-applications-dir]: which of the
+# .app-owned paths actually exist, one per line. The single effectful half of
+# the bundle report, so the wording above stays offline-testable. Empty output
+# means no bundle install.
+service_desktop_app_present() {
+    local path
+    while IFS= read -r path; do
+        if [ -e "$path" ]; then printf '%s\n' "$path"; fi
+    done <<EOF
+$(service_desktop_app_paths "$1" "${2:-/Applications}")
+EOF
+    return 0
+}
+
+# service_desktop_app_port <home>: the port the macOS .app is configured for,
+# from its persisted config/engine-port, else the stable default. Mirrors
+# `resolve_engine_port` in crates/lucidos-app/src/desktop.rs, minus the env
+# override, which belongs to a running process rather than to an install.
+service_desktop_app_port() {
+    local home="${1%/}" cfg value
+    cfg="$home/Library/Application Support/$(service_bundle_identifier)/config/engine-port"
+    # The -f guard, not just `2>/dev/null` on `tr`: a missing input file is the
+    # SHELL's redirect error, which tr's own stderr redirect never sees.
+    value=""
+    if [ -f "$cfg" ]; then value="$(tr -d '[:space:]' < "$cfg" 2>/dev/null || true)"; fi
+    if service_is_port_number "$value"; then
+        printf '%s' "$value"
+    else
+        service_desktop_default_port
+    fi
+}
+
 service_detect_manager() {
     local os has_launchctl=0 has_systemd_user=0
     os="$(uname -s)"

@@ -374,7 +374,8 @@ async fn connect_announces_and_a_token_refresh_does_not() {
         None,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .id;
     assert_eq!(emitted(&pool, "OAuthAccountConnected").await, 1);
 
     // A re-authorization grants scopes, so it announces even though the row
@@ -525,6 +526,88 @@ async fn insert_upserts_same_provider_email_in_place() {
         "a None refresh token on re-connect must preserve the stored one"
     );
     assert!(acct.scopes.contains("drive"), "scopes should be broadened");
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The fact both surfaces answer `offline_access` from, read off the row the
+/// upsert left rather than off the token response.
+///
+/// A re-authorization often returns no refresh token: Google issues one on
+/// first consent only. The account keeps the stored one and renewal still
+/// works. Reading the response alone would report a shortfall that the
+/// Accounts card, reading the row, would not.
+#[tokio::test]
+async fn a_reconnect_that_returns_no_refresh_token_still_holds_one() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    async fn connect(
+        pool: &sqlx::PgPool,
+        bus: &crate::engine::event_bus::EventBus,
+        access_token: &str,
+        refresh_token: Option<&str>,
+    ) -> ConnectedAccount {
+        OAuthStore::connect(
+            pool,
+            bus,
+            "google",
+            Some("user@example.com"),
+            None,
+            access_token,
+            refresh_token,
+            None,
+            "openid email",
+            "openid email offline_access",
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    let first = connect(&pool, &bus, "access-1", Some("refresh-1")).await;
+    assert!(first.has_refresh_token, "the first consent issued one");
+
+    let second = connect(&pool, &bus, "access-2", None).await;
+    assert_eq!(first.id, second.id, "the same row was updated in place");
+    assert!(
+        second.has_refresh_token,
+        "the stored token survives a re-consent that returns none"
+    );
+
+    assert!(
+        OAuthStore::list(&pool).await.unwrap()[0].has_refresh_token,
+        "and the Accounts card reads the same row"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// A blank string is not a token. `refresh_token` takes an `Option<&str>`, so
+/// a provider answering with an empty one must not read as proof of renewal.
+#[tokio::test]
+async fn an_empty_refresh_token_is_no_refresh_token() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+
+    let stored = OAuthStore::connect(
+        &pool,
+        &bus,
+        "acme",
+        None,
+        None,
+        "access",
+        Some(""),
+        None,
+        "read",
+        "read offline_access",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(!stored.has_refresh_token);
+    assert!(!OAuthStore::list(&pool).await.unwrap()[0].has_refresh_token);
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -2270,9 +2353,24 @@ async fn a_legacy_account_with_no_desired_set_is_never_narrowed() {
 // same shortfall on the account row. These cases are the ones that would let
 // the two answers diverge.
 
+/// A grant that produced a refresh token.
+const WITH_REFRESH: GrantEvidence = GrantEvidence {
+    refresh_token: true,
+};
+/// A grant that did not, so renewal is what breaks.
+const NO_REFRESH: GrantEvidence = GrantEvidence {
+    refresh_token: false,
+};
+
+/// What Microsoft echoes for a token issued to the `outlook.office.com`
+/// RESOURCE: that resource's own scopes, and nothing else.
+const OUTLOOK_GRANTED: &str = "https://outlook.office.com/SMTP.Send \
+                               https://outlook.office.com/IMAP.AccessAsUser.All \
+                               https://outlook.office.com/Mail.Read";
+
 #[test]
 fn a_full_grant_is_short_of_nothing() {
-    assert!(missing_requested_scopes("read write", "read write").is_empty());
+    assert!(missing_requested_scopes("read write", "read write", NO_REFRESH).is_empty());
 }
 
 #[test]
@@ -2281,6 +2379,7 @@ fn a_partial_grant_names_every_refused_scope_in_request_order() {
         missing_requested_scopes(
             "files.content.write files.content.read files.metadata.read account_info.read",
             "account_info.read",
+            NO_REFRESH,
         ),
         vec![
             "files.content.write".to_string(),
@@ -2298,31 +2397,31 @@ fn a_provider_that_reports_no_scope_string_is_not_reported_short() {
     // make every such connection look broken.
     let requested = "read write";
     let granted = requested;
-    assert!(missing_requested_scopes(requested, granted).is_empty());
+    assert!(missing_requested_scopes(requested, granted, NO_REFRESH).is_empty());
 }
 
 #[test]
 fn an_unrecorded_request_reports_no_shortfall_rather_than_a_false_one() {
     // The engine's mirror of the account row's `desired_scopes` being NULL:
     // nothing was recorded as asked for, so nothing can be missing.
-    assert!(missing_requested_scopes("", "read write").is_empty());
-    assert!(missing_requested_scopes("", "").is_empty());
+    assert!(missing_requested_scopes("", "read write", NO_REFRESH).is_empty());
+    assert!(missing_requested_scopes("", "", NO_REFRESH).is_empty());
 }
 
 #[test]
 fn everything_is_missing_when_the_provider_granted_nothing() {
     assert_eq!(
-        missing_requested_scopes("read write", ""),
+        missing_requested_scopes("read write", "", NO_REFRESH),
         vec!["read".to_string(), "write".to_string()],
     );
 }
 
 #[test]
 fn the_granted_side_is_a_set_so_order_and_spacing_do_not_matter() {
-    assert!(missing_requested_scopes("read write", "write   read").is_empty());
-    assert!(missing_requested_scopes("read", "read read").is_empty());
+    assert!(missing_requested_scopes("read write", "write   read", NO_REFRESH).is_empty());
+    assert!(missing_requested_scopes("read", "read read", NO_REFRESH).is_empty());
     // Newlines and tabs split like spaces: a provider is free to send either.
-    assert!(missing_requested_scopes("read write", "read\twrite\n").is_empty());
+    assert!(missing_requested_scopes("read write", "read\twrite\n", NO_REFRESH).is_empty());
 }
 
 #[test]
@@ -2331,8 +2430,65 @@ fn containment_never_stands_in_for_a_granted_scope() {
     // requirements are substring MATCHERS, so `files.content` would "match"
     // here and hide a genuinely refused scope.
     assert_eq!(
-        missing_requested_scopes("files.content.write", "files.content"),
+        missing_requested_scopes("files.content.write", "files.content", NO_REFRESH),
         vec!["files.content.write".to_string()],
+    );
+}
+
+// ─── offline_access is proven by the refresh token, not by the echo ────────
+
+#[test]
+fn a_refresh_token_is_what_grants_offline_access() {
+    // The reported bug, in one line. The echo lists the resource's scopes and
+    // nothing else, so the difference named `offline_access` on every
+    // Microsoft connection that had in fact granted it.
+    let requested = format!("{OUTLOOK_GRANTED} offline_access");
+    assert!(missing_requested_scopes(&requested, OUTLOOK_GRANTED, WITH_REFRESH).is_empty());
+}
+
+#[test]
+fn no_refresh_token_is_what_refuses_offline_access() {
+    // The case that actually breaks renewal. Same echo as above: only the
+    // evidence differs.
+    let requested = format!("{OUTLOOK_GRANTED} offline_access");
+    assert_eq!(
+        missing_requested_scopes(&requested, OUTLOOK_GRANTED, NO_REFRESH),
+        vec!["offline_access".to_string()],
+    );
+}
+
+#[test]
+fn an_echoed_offline_access_does_not_stand_in_for_the_token() {
+    // The evidence answers this scope in BOTH directions. A provider that
+    // lists it and issues nothing has still left renewal broken.
+    assert_eq!(
+        missing_requested_scopes("read offline_access", "read offline_access", NO_REFRESH),
+        vec!["offline_access".to_string()],
+    );
+}
+
+#[test]
+fn the_sign_in_scopes_are_never_reported_from_the_echo() {
+    // Every Connect asks for `openid email profile` (the frontend's
+    // SIGN_IN_SCOPES). GitHub has no such scopes and echoes none of them,
+    // which reported every GitHub account as short of all three.
+    assert!(missing_requested_scopes("openid email profile repo", "repo", NO_REFRESH).is_empty());
+}
+
+#[test]
+fn a_refused_resource_scope_is_still_named_beside_a_quiet_meta_scope() {
+    // Staying quiet about the meta scopes must not cover for a real refusal.
+    let requested = format!("{OUTLOOK_GRANTED} offline_access openid");
+    assert_eq!(
+        missing_requested_scopes(
+            &requested,
+            "https://outlook.office.com/Mail.Read",
+            WITH_REFRESH,
+        ),
+        vec![
+            "https://outlook.office.com/SMTP.Send".to_string(),
+            "https://outlook.office.com/IMAP.AccessAsUser.All".to_string(),
+        ],
     );
 }
 

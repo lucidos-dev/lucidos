@@ -64,9 +64,9 @@ const SPARK_BEZIERS = [
 // favicon surfaces share ONE scale so the installed-app icon and the browser-tab
 // favicon read identically (they used to be 0.78 / 0.80 — close, but the maskable
 // install variant at 0.62 made the "app" look far rounder than the "web page"):
-//   • Full-bleed / lightly-masked surfaces — macOS squircle, iOS, apple-touch,
-//     PWA purpose:"any", the master SVG — the mark runs at ~74%, a touch more
-//     border padding than before, so it reads like a typical platform icon.
+//   • Full-bleed / lightly-masked surfaces (iOS, apple-touch, the master SVG,
+//     and the art square inside every macOS-shaped icon): the mark runs at
+//     ~74%, so it reads like a typical platform icon.
 //   • Favicon family — browsers don't mask; it shares the full-bleed 74% so the
 //     tab favicon matches the app icon exactly.
 //   • Maskable / adaptive surfaces — Android adaptive foreground, PWA
@@ -77,6 +77,20 @@ const SCALE_FULLBLEED = 0.74; // macOS / iOS / apple-touch / PWA "any" / master 
 const SCALE_MASKABLE = 0.72; // Android adaptive foreground / PWA "maskable"
 const SCALE_FAVICON = 0.74; // browser-tab favicon — matches SCALE_FULLBLEED
 const FAVICON_SVG_RADIUS = 0.22; // self-rounded rounded-rect bg for favicon.svg
+
+// ── Apple's macOS icon template ─────────────────────────────────────────────
+// macOS draws an app icon exactly as authored, so the artwork must carry the
+// rounded rect and its transparent margin itself. Apple's template centres an
+// 824x824 rounded rect on a 1024 canvas, corner radius 185.4.
+//
+// Tahoe composites a BUNDLED icon into this shape for you. It leaves a
+// custom-assigned one alone, and macOS 15 and older never composite at all.
+// A Chrome PWA shim takes the custom-icon path, which is how a full-bleed
+// square reaches the dock. Baking the shape removes every one of those ifs.
+// See docs/plans/2026-09-16-macos-icon-shape.md.
+const MACOS_MARGIN = 100 / 1024; // transparent margin per side, canvas fraction
+const MACOS_CORNER = 185.4 / 824; // corner radius, fraction of the art side
+
 // Native Android adaptive foreground densities (`cargo tauri icon` output dirs).
 const ANDROID_DENSITIES = [
   'mipmap-mdpi',
@@ -192,22 +206,23 @@ function chunk(type, data) {
   crc.writeUInt32BE(crc32(body), 0);
   return Buffer.concat([len, body, crc]);
 }
-// Encode an RGB (opaque) raster, full-bleed, as a PNG buffer.
-function encodePNG(size, rgb) {
+// Encode a square raster as a PNG buffer. `channels` is 3 for opaque RGB or
+// 4 for RGBA. The shaped icons need alpha for their transparent margin.
+function encodePNG(size, pixels, channels = 3) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // color type 2 = truecolor RGB
+  ihdr[9] = channels === 4 ? 6 : 2; // color type: 6 = RGBA, 2 = truecolor RGB
   ihdr[10] = 0; // deflate
   ihdr[11] = 0; // filter
   ihdr[12] = 0; // no interlace
   // filtered scanlines (filter byte 0 per row)
-  const stride = size * 3;
+  const stride = size * channels;
   const raw = Buffer.alloc((stride + 1) * size);
   for (let y = 0; y < size; y++) {
     raw[y * (stride + 1)] = 0;
-    rgb.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
+    pixels.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
   }
   const idat = deflateSync(raw, { level: 9 });
   const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -252,6 +267,45 @@ function pngIcon(size, scale) {
   return encodePNG(size, renderRGB(size, scale));
 }
 
+// Render a macOS-shaped icon → RGBA buffer. The full-bleed art is rendered at
+// the art size, so the gradient and the mark keep their full-bleed proportions,
+// then blitted into a transparent canvas under a rounded-rect alpha mask.
+function renderShapedRGBA(size, scale, ss = 4) {
+  const margin = Math.round(size * MACOS_MARGIN);
+  const art = size - 2 * margin;
+  const rgb = renderRGB(art, scale, ss);
+  const radius = art * MACOS_CORNER;
+  const rgba = Buffer.alloc(size * size * 4);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let covered = 0;
+      for (let sy = 0; sy < ss; sy++) {
+        for (let sx = 0; sx < ss; sx++) {
+          const px = x + (sx + 0.5) / ss;
+          const py = y + (sy + 0.5) / ss;
+          if (roundedRectSDF(px, py, margin, margin, art, art, radius) <= 0) covered++;
+        }
+      }
+      if (!covered) continue; // stays transparent black
+      // Clamp into the art square so a partly covered edge pixel takes the
+      // colour of the art it overlaps rather than an out-of-range read.
+      const ax = Math.min(art - 1, Math.max(0, x - margin));
+      const ay = Math.min(art - 1, Math.max(0, y - margin));
+      const src = (ay * art + ax) * 3;
+      const dst = (y * size + x) * 4;
+      rgba[dst] = rgb[src];
+      rgba[dst + 1] = rgb[src + 1];
+      rgba[dst + 2] = rgb[src + 2];
+      rgba[dst + 3] = Math.round((255 * covered) / (ss * ss));
+    }
+  }
+  return rgba;
+}
+
+function pngIconShaped(size, scale) {
+  return encodePNG(size, renderShapedRGBA(size, scale), 4);
+}
+
 // ── ICO (PNG-in-ICO, supported by all modern browsers + Windows 7+) ─────────
 function buildICO(entries) {
   // entries: [{ size, png }]
@@ -276,6 +330,39 @@ function buildICO(entries) {
     blobs.push(e.png);
   });
   return Buffer.concat([header, dir, ...blobs]);
+}
+
+// ── ICNS (PNG-in-ICNS) ──────────────────────────────────────────────────────
+// This script writes the icns, not `cargo tauri icon`. That command builds it
+// from the full-bleed app-icon.png, which would flatten the shape to a square.
+// Each member is a 4-char type, a big-endian length COUNTING the 8-byte header,
+// then the payload. Two type codes share a pixel size: a retina variant and a
+// larger @1x one. The legacy is32/il32 raw members are omitted; the shipped Mac
+// build is Apple Silicon only, so macOS 11 or newer, which reads the PNG types.
+const ICNS_MEMBERS = [
+  ['ic11', 32], // 16@2x
+  ['ic12', 64], // 32@2x
+  ['ic07', 128],
+  ['ic13', 256], // 128@2x
+  ['ic08', 256],
+  ['ic14', 512], // 256@2x
+  ['ic09', 512],
+  ['ic10', 1024], // 512@2x
+];
+function buildICNS(pngBySize) {
+  const members = ICNS_MEMBERS.map(([type, size]) => {
+    const png = pngBySize.get(size);
+    if (!png) throw new Error(`buildICNS: no ${size}px raster for member ${type}`);
+    const head = Buffer.alloc(8);
+    head.write(type, 0, 'ascii');
+    head.writeUInt32BE(8 + png.length, 4);
+    return Buffer.concat([head, png]);
+  });
+  const body = Buffer.concat(members);
+  const header = Buffer.alloc(8);
+  header.write('icns', 0, 'ascii');
+  header.writeUInt32BE(8 + body.length, 4);
+  return Buffer.concat([header, body]);
 }
 
 // ── SVG authoring ───────────────────────────────────────────────────────────
@@ -344,25 +431,38 @@ writeFileSync(resolve(PUBLIC, 'favicon.ico'), buildICO([
   { size: 48, png: fav48 },
 ]));
 
-// App-icon family. Full-bleed PNGs at SCALE_FULLBLEED for the lightly-masked /
-// unmasked surfaces (macOS, iOS, apple-touch, PWA "any"); the manifest pairs the
-// icon-NNN.png set with a matching icon-NNN-maskable.png at SCALE_MASKABLE for
-// purpose:"maskable" (Android home-screen install crops the corners hard).
+// App-icon family, in three regimes:
+//   • purpose:"any" is what a desktop PWA install bakes into its launcher, and
+//     nothing masks that copy, so it ships macOS-shaped.
+//   • apple-touch-icon stays full-bleed: iOS masks the home-screen icon itself,
+//     and a pre-rounded source shows dark fringes inside its corners.
+//   • purpose:"maskable" stays full-bleed at SCALE_MASKABLE, because Android's
+//     home-screen install crops the corners hard.
 writeFileSync(resolve(ICONS, 'apple-touch-icon.png'), pngIcon(180, SCALE_FULLBLEED));
-writeFileSync(resolve(ICONS, 'icon-192.png'), pngIcon(192, SCALE_FULLBLEED));
-writeFileSync(resolve(ICONS, 'icon-512.png'), pngIcon(512, SCALE_FULLBLEED));
+writeFileSync(resolve(ICONS, 'icon-192.png'), pngIconShaped(192, SCALE_FULLBLEED));
+writeFileSync(resolve(ICONS, 'icon-512.png'), pngIconShaped(512, SCALE_FULLBLEED));
 writeFileSync(resolve(ICONS, 'icon-192-maskable.png'), pngIcon(192, SCALE_MASKABLE));
 writeFileSync(resolve(ICONS, 'icon-512-maskable.png'), pngIcon(512, SCALE_MASKABLE));
-// app-icon.png — the 1024 full-bleed master and the canonical Tauri icon
-// source, written to the NATIVE icon dir (next to tauri.conf.json's icons/).
-// Regenerate the native desktop/mobile icon set (icon.icns, icon.ico, the
-// Windows Square tiles, StoreLogo, android/, ios/) from it with:
+// app-icon.png: the 1024 full-bleed master and the canonical Tauri icon source,
+// written to the NATIVE icon dir (next to tauri.conf.json's icons/).
+// Regenerate the rest of the native desktop/mobile set (icon.ico, the Windows
+// Square tiles, StoreLogo, android/, ios/) from it with:
 //   cargo tauri icon crates/lucidos-app/icons/app-icon.png --ios-color "#0a4ea8"
-// then re-run THIS script: `cargo tauri icon` regenerates the Android adaptive
-// foregrounds full-bleed at the source scale, so the maskable re-stamp below
-// must land after it (re-running rewrites app-icon.png byte-identically).
+// then re-run THIS script. `cargo tauri icon` rewrites icon.icns and the Android
+// adaptive foregrounds full-bleed at the source scale. So the icns write and the
+// maskable re-stamp below must both land after it. Re-running rewrites
+// app-icon.png byte-identically.
 mkdirSync(NATIVE_ICONS, { recursive: true });
 writeFileSync(resolve(NATIVE_ICONS, 'app-icon.png'), pngIcon(1024, SCALE_FULLBLEED));
+// icon.icns: macOS-shaped, so the dock icon carries Apple's rounded rect on
+// every macOS version, and through a PWA install's unmasked custom-icon path.
+const macShaped = new Map(
+  [...new Set(ICNS_MEMBERS.map(([, size]) => size))].map((size) => [
+    size,
+    pngIconShaped(size, SCALE_FULLBLEED),
+  ]),
+);
+writeFileSync(resolve(NATIVE_ICONS, 'icon.icns'), buildICNS(macShaped));
 // `cargo tauri icon` (v2) no longer emits these two sizes, but the repo still
 // tracks them — render them here so the native set never drifts to the old mark.
 writeFileSync(resolve(NATIVE_ICONS, '256x256.png'), pngIcon(256, SCALE_FULLBLEED));
@@ -386,5 +486,6 @@ console.log('  gradient :', GRAD_HIGHLIGHT, '→', GRAD_EDGE, '  theme-color:', 
 console.log('  scales   : fullbleed', SCALE_FULLBLEED, ' maskable', SCALE_MASKABLE, ' favicon', SCALE_FAVICON);
 console.log('  public/  : favicon.svg, favicon.ico, favicon.png, favicon-16/32/48.png');
 console.log('  icons/   : icon-source.svg, apple-touch-icon.png, icon-192/512(.maskable).png, app-icon.png');
+console.log('  macOS    : icon.icns + PWA "any" shaped at margin', MACOS_MARGIN.toFixed(5), ' corner', MACOS_CORNER.toFixed(4));
 console.log(`  android  : re-stamped ${androidStamped} adaptive foreground(s) at maskable scale`);
 console.log('  native   : run `cargo tauri icon crates/lucidos-app/icons/app-icon.png --ios-color "#0a4ea8"` then re-run this script');

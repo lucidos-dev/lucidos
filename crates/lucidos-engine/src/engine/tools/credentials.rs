@@ -412,8 +412,13 @@ fn connect_result_message(
     outcome: &oauth::OAuthFlowOutcome,
     row: Option<&oauth_registry::OAuthProviderRow>,
 ) -> String {
-    let missing =
-        oauth::missing_requested_scopes(&outcome.requested_scopes, &outcome.granted_scopes);
+    let missing = oauth::missing_requested_scopes(
+        &outcome.requested_scopes,
+        &outcome.granted_scopes,
+        oauth::GrantEvidence {
+            refresh_token: outcome.has_refresh_token,
+        },
+    );
     let mut message = connected_sentence(provider, outcome);
     if missing.is_empty() {
         // Nothing follows, so an unidentified account gets its closing
@@ -1259,8 +1264,23 @@ mod tests {
             display_name: display_name.map(str::to_string),
             granted_scopes: granted.to_string(),
             requested_scopes: requested.to_string(),
+            has_refresh_token: false,
         }
     }
+
+    /// The same, for a connection that came back with a refresh token.
+    fn outcome_with_refresh_token(granted: &str, requested: &str) -> oauth::OAuthFlowOutcome {
+        oauth::OAuthFlowOutcome {
+            has_refresh_token: true,
+            ..outcome(Some("user@example.com"), None, granted, requested)
+        }
+    }
+
+    /// What Microsoft echoes for a token issued to the `outlook.office.com`
+    /// RESOURCE: that resource's own scopes, and nothing else.
+    const OUTLOOK_GRANTED: &str = "https://outlook.office.com/SMTP.Send \
+                                   https://outlook.office.com/IMAP.AccessAsUser.All \
+                                   https://outlook.office.com/Mail.Read";
 
     /// A registry row with only the fields a shortfall message reads. Named for
     /// nothing shipped, so the source scan below stays meaningful.
@@ -1328,6 +1348,64 @@ mod tests {
         assert!(
             message.contains("refresh"),
             "the message must say why a refresh does not help: {message}"
+        );
+    }
+
+    #[test]
+    fn a_refresh_token_settles_offline_access_whatever_the_echo_listed() {
+        // The reported bug. Microsoft granted the refresh token and left
+        // `offline_access` out of the echo. The diff read that as a refusal
+        // and sent the user to the Entra portal, to enable something already
+        // enabled.
+        let requested = format!("{OUTLOOK_GRANTED} offline_access");
+        assert_eq!(
+            connect_result_message(
+                "microsoft",
+                &outcome_with_refresh_token(OUTLOOK_GRANTED, &requested),
+                Some(&row_with_console()),
+            ),
+            "Successfully connected microsoft account (user@example.com)."
+        );
+    }
+
+    #[test]
+    fn offline_access_with_no_refresh_token_is_still_reported() {
+        // The case that actually breaks renewal, and the only one worth a
+        // console trip. The echo says the same thing in both tests; the
+        // evidence is what differs.
+        let requested = format!("{OUTLOOK_GRANTED} offline_access");
+        let message = connect_result_message(
+            "microsoft",
+            &outcome(Some("user@example.com"), None, OUTLOOK_GRANTED, &requested),
+            Some(&row_with_console()),
+        );
+        assert!(
+            message.contains("offline_access"),
+            "a grant with no refresh token is short of it: {message}"
+        );
+        assert!(
+            message.contains("RECONNECT"),
+            "and a reconnect is the fix: {message}"
+        );
+    }
+
+    #[test]
+    fn the_sign_in_scopes_are_never_reported_from_the_echo() {
+        // Every Connect asks for `openid email profile` (the frontend's
+        // SIGN_IN_SCOPES). GitHub has no such scopes and echoes neither, which
+        // reported every GitHub account as short of all three.
+        assert_eq!(
+            connect_result_message(
+                "github",
+                &outcome(
+                    Some("user@example.com"),
+                    None,
+                    "repo",
+                    "openid email profile repo",
+                ),
+                None,
+            ),
+            "Successfully connected github account (user@example.com)."
         );
     }
 

@@ -124,3 +124,42 @@ Unchanged and still correct, because neither is reclamation:
   motivation and it did not survive contact with the numbers: the removal never
   ran on the clean path that produces most worktrees, and the worker reclaims the
   same bytes within the hour.
+
+## Amendment, 2026-09-16: a thread delete removes the worktree and the branch
+
+The rule above stands. This names a second removal outside the worker, and it is
+the same category as the Discard the Decision already sanctions: explicit user
+intent, not reclamation.
+
+**Deleting a thread must take its worktree, because nothing else can.** The
+worker resolves a directory back to a thread through `lookup_thread_by_short`,
+which queries `events` by `aggregate_id` prefix. A delete removes those rows, so
+the lookup answers `NotFound` and the directory falls to `try_orphan_path`. That
+path refuses any worktree whose branch has commits, which is most of them. Leave
+it to the worker and a deleted coding-agent thread leaks its whole tree, silently
+and for good.
+
+**The branch goes too, whatever it holds.** This is the one place the reclamation
+rule is inverted on purpose. `remove_worktree_and_optionally_delete_branch` keeps
+a branch with unique commits, because for the worker an unmerged commit is the
+user's work and the tree is only spent disk. For a delete it is the opposite: the
+user asked for the thread and everything in it to be gone, and the confirmation
+says unapplied branch work goes with it. The helper now takes a `BranchDisposal`,
+and delete is the only caller passing `Always`.
+
+**Nothing can race it.** The cascade refuses while any family member is Running,
+waiting on a user answer, or holding a pending change. It decides that under a
+`FOR UPDATE` lock over the whole family. So there is no live session to have the
+tree pulled from under it, which is the hazard the original decision is about.
+
+**Delete skips the dirtiness gate, deliberately.** Every worker caller asks
+`is_worktree_dirty` first, because it is reclaiming and an uncommitted edit is
+work. Delete is the second caller to skip it, after the disk-usage page's Tier 3,
+and for the same reason: the user confirmed a destructive action naming this
+thread.
+
+`the_completion_path_removes_only_the_two_worktrees_it_is_allowed_to` is
+unchanged and still binding. It reads `run_session/completion.rs`, and the delete
+lives in `api/threads/delete.rs`, so the session teardown still holds exactly two
+removals. See ADR 0192 and
+`docs/plans/2026-09-15-deleting-a-thread.md`.

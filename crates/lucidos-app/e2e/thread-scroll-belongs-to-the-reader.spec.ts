@@ -75,11 +75,28 @@ test.describe('Transcript scroll belongs to the reader (desktop)', () => {
     await waitForResponse(page);
     await expect.poll(() => tc.evaluate(el => el.scrollHeight - el.clientHeight)).toBeGreaterThan(100);
     await expect.poll(atBottom).toBe(false);
-    // Not merely short of the bottom: still up at the turn's own opening, a
-    // small fraction of the way down, rather than carried through the reply.
-    const opening = await tc.evaluate(el => el.scrollTop);
-    const reach = await tc.evaluate(el => el.scrollHeight - el.clientHeight);
-    expect(opening).toBeLessThan(reach / 4);
+    // Not merely short of the bottom: the reply is still below them. What they
+    // can see of it is the sliver the transcript reserves under its last turn.
+    // Measured against the answer's OWN box: the landing rests on the edge the
+    // agent's first rows left, and the answer is what arrived after.
+    //
+    // A fraction of the scroll range cannot say this. Its numerator is the
+    // turn's opening and its denominator is the reply's length, so a step row
+    // added to the turn moves them apart. One was: pinning the e2e query
+    // classifier to `all` added a memory row. A correct landing then read 68 of
+    // a 238 range, just over the quarter line.
+    const answer = await tc.evaluate((el) => {
+      const chunks = el.querySelectorAll('.chat-exchange .response-chunk');
+      if (!chunks.length) throw new Error('the reply drew no prose block');
+      const top = chunks[0].getBoundingClientRect().top;
+      const bottom = chunks[chunks.length - 1].getBoundingClientRect().bottom;
+      const pane = el.getBoundingClientRect();
+      return {
+        shown: Math.max(0, Math.min(bottom, pane.bottom) - Math.max(top, pane.top)),
+        height: bottom - top,
+      };
+    });
+    expect(answer.shown).toBeLessThan(answer.height / 4);
     await expect(page.locator('button.scroll-to-bottom.visible')).toHaveCount(1);
 
     // A send into that same thread DOES move them, once: the reader is above the

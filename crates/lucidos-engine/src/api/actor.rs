@@ -665,6 +665,93 @@ pub(crate) async fn require_user_actor(
     })
 }
 
+/// What a caller is told when its credential is real but is not a person's.
+///
+/// Written for the agent most likely to read it, the way
+/// `chat::HUMAN_MODE_UNATTRIBUTED` is. It names the act, says the answer is no
+/// for every agent rather than for this one, and points somewhere real.
+pub const NOT_THE_OWNERS_DEVICE: &str =
+    "Deleting a thread is the workspace owner's button, offered in the Lucidos UI and \
+     nowhere else. It removes the thread, every sub-thread under it, everything said in \
+     them and what Lucidos learned from them, and it cannot be undone. No agent may press \
+     it, on any authority, including a standing instruction from a turn the owner opened. \
+     If the owner asked you to delete something, tell them it is theirs to do and where the \
+     action is. Archive is the one an agent can reach.";
+
+/// [`require_user_actor`], narrowed to the workspace owner at one of their own
+/// registered devices.
+///
+/// The gate in front of an irreversible, owner-only action (ADR 0192). Only a
+/// resolved `Device` passes. Two other credentials reach here and are refused:
+///
+/// - The **thread-bound origin token**, which proves the opposite of a person:
+///   a Lucidos-spawned subprocess. It arrives as `Api { mode: Agent }`.
+/// - The **machine-local token**, the engine's own machinery, as
+///   `Api { mode: Engine }`. The build-watch and the release scripts hold it.
+///
+/// A cross-workspace `caller_workspace` is a body field this route never
+/// parses, so such a caller arrives as one of the two above or as nobody.
+///
+/// **A device header is attribution, not authentication**, and ADR 0192 records
+/// the residual that leaves. This gate closes the part it can: the fail-open
+/// probe, and an app document borrowing the shell's id.
+///
+/// 403 rather than 401: the caller identified itself perfectly well, and the
+/// answer is still no.
+pub(crate) async fn require_owner_device(
+    headers: &axum::http::HeaderMap,
+    pool: &PgPool,
+) -> Result<MessageOrigin, super::error::ApiError> {
+    // An app iframe loads on the engine's own origin and reads the shell's
+    // `localStorage`. Its `fetch` therefore carries the owner's real device id
+    // (ADR 0117, ADR 0144). Defense in depth rather than a boundary, and the
+    // same per-route refusal the secret-reveal pair applies for the same
+    // reason: an app an agent wrote must not press this.
+    if !super::secret_reveal::reveal_request_allowed(
+        headers,
+        super::secret_reveal::RefererRule::WhenPresent,
+    ) {
+        crate::log!("[Actor] Refusing an owner-only action from an app document");
+        return Err(super::error::ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            NOT_THE_OWNERS_DEVICE,
+        ));
+    }
+    // Deliberately NOT the `thread_reach` ladder. That gate admits a thread
+    // acting outside its own subtree on the owner's standing instruction. Any
+    // thread whose newest turn-start event has a `Device` actor carries one.
+    // So an agent working inside a turn the user opened would inherit this.
+    let actor = require_user_actor(headers, pool, None).await?;
+    let MessageOrigin::Device { device_id, .. } = &actor else {
+        crate::log!(
+            "[Actor] Refusing an owner-only action: the caller is {:?}, not a registered device",
+            actor
+        );
+        return Err(super::error::ApiError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            NOT_THE_OWNERS_DEVICE,
+        ));
+    };
+    // `device_is_evidence` answers "registered" when the lookup ERRORS, so a
+    // pool timeout turns an invented id into a `Device` actor. That trade is
+    // right where it was made, on the user's own send path, where refusing on a
+    // blip costs a retry. Here it costs the thread family, so the same probe is
+    // asked again and its failure is a refusal.
+    match crate::core::DeviceStore::is_registered(pool, device_id).await {
+        Ok(true) => Ok(actor),
+        Ok(false) | Err(_) => {
+            crate::log!(
+                "[Actor] Refusing an owner-only action: device '{}' could not be confirmed",
+                device_id
+            );
+            Err(super::error::ApiError::new(
+                axum::http::StatusCode::FORBIDDEN,
+                NOT_THE_OWNERS_DEVICE,
+            ))
+        }
+    }
+}
+
 /// [`require_user_actor`], shaped for a handler that returns a bare `Response`.
 ///
 /// The same refusal, rendered rather than propagated. A handler that has not

@@ -44,12 +44,25 @@ describe('the update-check button', () => {
     expect(page).not.toContain("'guide'");
   });
 
+  // A phone can neither install nor usefully check (ADR 0190), so the gate
+  // stands the button down.
+  it('offers a phone no update button', () => {
+    expect(page).toContain('(canInstallHere || canCheckHere) && !thisDeviceIsMobile()');
+  });
+
+  // The subtraction must not reach `canCheckHere` itself. That value feeds
+  // `updateGuidance`, whose rule is about the INSTALL. A phone answering
+  // "cannot check" makes it claim a desktop app on a machine with none.
+  it('leaves the capability itself alone', () => {
+    expect(page).toContain('const canCheckHere = canCheckForUpdatesHere();');
+  });
+
   // A live run renders on its own, ahead of the capability gate. That gate
   // reads signals a background poll also writes. Folding the two together
   // would let a mid-run refresh take Cancel away from a live download.
   it('keeps a live run outside the capability gate', () => {
     expect(page).toMatch(/\{updateNarration\s*\n\s*\?/);
-    expect(page).toMatch(/:\s*\(canInstallHere \|\| canCheckHere\) &&/);
+    expect(page).toMatch(/:\s*offersUpdateControl &&/);
   });
 
   it('refuses a second check while one is running', () => {

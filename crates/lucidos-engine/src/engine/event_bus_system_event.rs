@@ -150,6 +150,30 @@ pub enum SystemEvent {
     ProxyConfigRejected {
         rejected: Vec<crate::api::RejectedProvider>,
     },
+    /// The owner deleted a thread and its whole family. PERSISTED, and the only
+    /// trace left of them (ADR 0192).
+    ///
+    /// It sits on aggregate `ops` with `aggregate_id` `global` precisely so no
+    /// later delete can reach it: a thread sweep matches `aggregate = 'thread'`
+    /// and a `thread_id`, and this row carries neither.
+    ///
+    /// **The payload carries no content, and that is load-bearing.** Ids and
+    /// counts only. A title or a first message here would re-file the very text
+    /// the delete removed, under a row nothing can delete.
+    ThreadsDeleted {
+        /// Every member of the deleted family, target first.
+        thread_ids: Vec<Uuid>,
+        /// `events` rows removed.
+        event_count: i64,
+        /// `memory_entries` rows removed, found by joining their `source` event
+        /// id against those events before either went.
+        memory_count: i64,
+        /// Coding-agent worktrees removed after the commit. Best effort, so it
+        /// can be lower than the number of coding-agent members.
+        worktrees_removed: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     RecoveryProgress {
         completed: usize,
         total: usize,
@@ -1380,6 +1404,7 @@ impl SystemEvent {
         "BackupFailed",
         "BackupKeyRevealed",
         "ProxyConfigRejected",
+        "ThreadsDeleted",
     ];
 
     /// Whether this event writes a row to the `events` table.
@@ -1418,6 +1443,7 @@ impl SystemEvent {
             Self::BackupFailed { .. } => "BackupFailed",
             Self::BackupKeyRevealed { .. } => "BackupKeyRevealed",
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
+            Self::ThreadsDeleted { .. } => "ThreadsDeleted",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
@@ -1553,6 +1579,7 @@ impl SystemEvent {
         "BackupFailed",
         "BackupKeyRevealed",
         "ProxyConfigRejected",
+        "ThreadsDeleted",
         "RecoveryProgress",
         "Toast",
         "ArtifactImported",
@@ -1676,6 +1703,7 @@ impl SystemEvent {
             | Self::BackupFailed { .. }
             | Self::BackupKeyRevealed { .. }
             | Self::ProxyConfigRejected { .. }
+            | Self::ThreadsDeleted { .. }
             | Self::RecoveryProgress { .. }
             | Self::Toast { .. } => "ops",
             Self::ArtifactImported { .. }

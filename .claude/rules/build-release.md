@@ -76,7 +76,7 @@ artifact**, and that is the complete list of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
-| `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
+| `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, **route parity between the two front doors**, and that both front doors still parse under macOS `/bin/sh` |
 | `release-tarballs.yml` | `rc/**` push, `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
 **Nothing in there DEPLOYS, and that is a second rule, not a coincidence of the
@@ -764,6 +764,20 @@ Write one when the release leaves existing content or settings **stale rather th
 - **`--dev` / `--source` / `LUCIDOS_FROM_SOURCE=1`** — the legacy compile-from-source path, preserved verbatim (toolchain bootstrap, clone/update, `data/.env`, build + launch via `scripts/run.sh`). The only network/compile path; **always foreground** (never registers a service).
 - **`--from-tarball <path>`** — install a LOCAL tarball (offline; e.g. from `build-headless.sh`). Verifies the adjacent `<path>.sha256` if present (fail-closed), warns if absent, extracts, and registers the service too (unless `--no-service`).
 
+**These files must stay inside the bash-3.2 posix subset, and only a test
+enforces it.** The re-exec guard at the top of `install.sh` re-runs the script
+under bash when `/bin/sh` is not bash. On Debian that fires, and the re-fetched
+copy gets a real bash. On macOS `/bin/sh` IS bash 3.2, so the guard deliberately
+does not fire. Arrays and here-strings are fine there; process substitution and
+anything from bash 4 are not.
+
+`scripts/lib/install_test.sh` is the gate, over both front doors, `LUCIDOS_LIBS`
+and `service.sh`. It scans for the banned constructs and then parses each file
+under bash-as-sh, and it needs both nets. The bash 4 features parse cleanly on
+every bash and fail only at run time on 3.2. Process substitution needs the scan
+for the opposite reason: bash 5 in posix mode still accepts what 3.2 rejects.
+The `sh-compat` job in `install-smoke.yml` runs the real thing on a macOS runner.
+
 **Service = the GATEWAY only (ADR 0014).** The service supervises the gateway; the gateway provisions the embedded Postgres + spawns/supervises the engines itself — never a service per engine. The gateway ignores SIGTERM and stops gracefully on SIGUSR1 (`crates/lucidos-gateway/src/server.rs`), so the systemd unit sets `KillSignal=SIGUSR1` + `KillMode=process` (stop the gateway; leave engines + PG for a relaunch to re-adopt).
 
 **Slug-keyed multi-instance.** Several gateways coexist as named *instances* (`--name <slug>` / `LUCIDOS_INSTANCE`, default `default`). The **port is a mutable property**, not the identity, so a re-run with a new `--port` moves an instance. Each instance owns `<prefix>/<slug>/` (registry + embedded PG + `fastembed/` + `logs/` + a `port` marker) and a slug-suffixed service id; the **runtime is downloaded once and SHARED** at `<prefix>/runtime/current`. Slugs `gateway`/`runtime`/`current`/`logs` are reserved (so a `--name` can't alias the dev gateway's `~/.lucidos/gateway` or the shared runtime). This is how a terminal install coexists with a dev gateway (5251) and the packaged `.app` (5252). **Service ids + paths:** launchd `com.lucidos.gateway.<slug>` at `~/Library/LaunchAgents/` (logs `<prefix>/<slug>/logs/gateway.{out,err}.log`); systemd `lucidos-gateway-<slug>.service` at `${XDG_CONFIG_HOME:-~/.config}/systemd/user/` (logs `journalctl --user -u lucidos-gateway-<slug>`).
@@ -781,6 +795,26 @@ Write one when the release leaves existing content or settings **stale rather th
 **Remote access (`--bind`) + unit-value escaping.** Default posture stays loopback + plain http; the final banners print the remote options (SSH tunnel and `tailscale serve` keep a SECURE origin — which web push + PWA require — with zero config), and the https half is the TLS opt-in above (`append_tls_env` is ADDITIVE, so the flag-less env block stays byte-identical to `spawn_gateway`'s contract). `--bind all|loopback|<IP>` (`LUCIDOS_BIND`) writes the machine-global `~/.lucidos/network.toml` via `service_write_network_toml` (byte-mirror of the gateway's own writer, preserves `[engine] inherit`) — **never unit env**, which would permanently shadow the picker's Settings → Network access knob (env beats the file). Invalid `--bind` values are refused up front (the gateway would silently fall back to loopback). systemd unit values are escaped via `service_systemd_escape_env` (`%%`, `\"`, `\\` — an API key with `%` used to reach the gateway mangled); launchd's twin is `service_xml_escape`.
 
 **Uninstall.** `uninstall.sh` (and `install.sh --uninstall`, which delegates to it): `--name <slug>` removes one instance (a bare uninstall removes the sole instance, else lists), `--all` removes every instance, `--list` shows instances + ports. It stops + unregisters the service (both launchd + systemd artifacts that exist), gracefully stops that instance's engines + embedded Postgres, and **keeps all data unless `--purge`** (prints what it left). `--purge` deletes the instance data dir; `--all --purge` also deletes the shared runtime. The systemd unit FILE is removed **even when the user D-Bus session is unreachable** (bare ssh, no `XDG_RUNTIME_DIR`) so an "uninstalled" service can't resurrect at the next boot; in that case the possibly-running stack is left alone (a bus-less shell can't stop the gateway, and killing its engines would only make it respawn them).
+
+**Neither uninstaller can remove the other install vehicle, and both now say so
+(ADR 0189).** A machine can carry the `.app`, one or more `install.sh`
+instances, and a source checkout at once. `uninstall.sh` reports a bundle it
+found, with the menu item that removes it. The app's own uninstall dialog
+reports an `install.sh` instance and carries its `--uninstall --name <slug>`
+command. Both REPORT and neither touches the other's paths.
+
+The `.app`'s layout is therefore written down twice. `crates/lucidos-installs`
+is the source of truth, and `service_desktop_app_paths` in `service.sh` mirrors
+its four constants for the shell side. `service_test.sh` greps them out of the
+Rust and fails when the two drift, the `version_sources_test.sh` idiom. A rename
+of `com.lucidos.engine` that reaches only one language is what that guards.
+
+**`install.sh` also says when it lands on the app's own port.** The packaged
+gateway cannot step aside: the *stable gateway port* is an address paired
+devices hold. So an instance that takes 5252 first leaves the app unable to bind
+at its next launch. `report_coexisting_app` compares this instance's port
+against `service_desktop_app_port`, which reads the app's persisted
+`config/engine-port`. Two ports get one info line; one port gets a warning.
 
 **Discovery is the `<prefix>/<slug>/port` marker, and BOTH launch shapes write it.** `service_list_instance_names` lists exactly the `<prefix>/*/` dirs carrying one, so that file is the whole of "is this instance installed": no marker means invisible to `--list`, no target for `--all`, and `run_uninstall` returning before the purge, which leaves the data dir *and* the shared runtime on disk. Until 2026-07-30 only `register_service` wrote it, so a `--no-service` run or the no-manager degrade (a container) finished uninstallable. Both paths now go through `record_instance_port`, and the **orderings stay deliberately different**: `register_service` writes *after* its unit, so a failed registration leaves no marker, while `launch_runtime` writes *before* an `exec` that never returns. `service_test.sh` asserts the marker and `service_list_instance_names` discoverability on both foreground paths, and `install-smoke.yml`'s front-door rungs 5-8 assert the end-to-end consequence against the live origin.
 

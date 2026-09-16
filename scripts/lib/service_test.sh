@@ -889,6 +889,185 @@ else
 fi
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
+# ── PURE: the OTHER install vehicle, and the Rust it must agree with ─────────
+echo ""
+echo "test: the macOS .app report names every path the bundle owns"
+paths="$(service_desktop_app_paths /Users/me)"
+for want in \
+    "/Applications/Lucidos.app" \
+    "/Users/me/Applications/Lucidos.app" \
+    "/Users/me/Library/LaunchAgents/com.lucidos.engine.plist" \
+    "/Users/me/Library/LaunchAgents/com.lucidos.client.plist" \
+    "/Users/me/Library/Application Support/com.lucidos.app"; do
+    if has "$paths" "$want"; then pass "names $want"; else fail "missing $want: $paths"; fi
+done
+
+echo ""
+echo "test: the report says what it found and how to remove it, and says nothing about nothing"
+rep="$(service_desktop_app_report "/Applications/Lucidos.app")"
+if has "$rep" "cannot remove it" && has "$rep" "/Applications/Lucidos.app" \
+   && has "$rep" "Uninstall Lucidos"; then
+    pass "the report names the bundle and the menu item that removes it"
+else
+    fail "unexpected report: $rep"
+fi
+if [ -z "$(service_desktop_app_report)" ]; then
+    pass "no bundle, no report"
+else
+    fail "a report with no paths must be empty"
+fi
+
+# The same layout is now encoded in three languages. This is the guard that
+# stops a rename landing in one of them: the shell literals above are read out
+# of the Rust crate that declares them, so a drift fails here rather than at a
+# user whose uninstaller names an agent that no longer exists.
+echo ""
+echo "test: the shell's bundle paths match the constants lucidos-installs declares"
+RUST_INSTALLS="$PROJECT_DIR/crates/lucidos-installs/src/lib.rs"
+rust_const() {
+    sed -n "s/^pub const $1: &str = \"\(.*\)\";\$/\1/p" "$RUST_INSTALLS"
+}
+if [ ! -f "$RUST_INSTALLS" ]; then
+    fail "crates/lucidos-installs/src/lib.rs is gone; the shell report has no source of truth"
+else
+    for pair in \
+        "BUNDLE_IDENTIFIER:$(service_bundle_identifier)" \
+        "BUNDLE_NAME:$(service_bundle_name)"; do
+        name="${pair%%:*}"; shell_value="${pair#*:}"
+        rust_value="$(rust_const "$name")"
+        if [ -n "$rust_value" ] && [ "$rust_value" = "$shell_value" ]; then
+            pass "$name agrees ($shell_value)"
+        else
+            fail "$name: shell says '$shell_value', Rust says '${rust_value:-<not found>}'"
+        fi
+    done
+    labels="$(service_desktop_agent_labels | tr '\n' ' ')"
+    for name in SERVICE_AGENT_LABEL LOGIN_AGENT_LABEL; do
+        rust_value="$(rust_const "$name")"
+        if [ -n "$rust_value" ] && has "$labels" "$rust_value"; then
+            pass "$name agrees ($rust_value)"
+        else
+            fail "$name: Rust says '${rust_value:-<not found>}', shell lists '$labels'"
+        fi
+    done
+fi
+
+# ── INTEGRATION: an uninstall that leaves a bundle behind says so ────────────
+echo ""
+echo "test: uninstall.sh reports a macOS .app it cannot remove"
+FB="$(make_fakebin "" 1)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/default"; printf '5252\n' > "$PREFIX/default/port"
+mkdir -p "$FAKEHOME/Applications/Lucidos.app/Contents"
+mkdir -p "$FAKEHOME/Library/LaunchAgents"
+printf '<plist/>\n' > "$FAKEHOME/Library/LaunchAgents/com.lucidos.engine.plist"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name default 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && has "$out" "cannot remove it" \
+   && has "$out" "$FAKEHOME/Applications/Lucidos.app" \
+   && has "$out" "com.lucidos.engine.plist"; then
+    pass "the bundle and its launch agent are both named"
+else
+    fail "expected the bundle reported (rc=$rc): $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: uninstall.sh names only a bundle that is actually there"
+# The machine running this may legitimately have /Applications/Lucidos.app, so
+# the assertion is that the FAKE home's bundle is not invented. "Nothing at all
+# means nothing reported" is pinned in-process just below, where both search
+# roots can be empty.
+FB="$(make_fakebin "" 1)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/default"; printf '5252\n' > "$PREFIX/default/port"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name default 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && ! has "$out" "$FAKEHOME/Applications/Lucidos.app"; then
+    pass "a bundle that is not installed is not named"
+else
+    fail "expected no invented bundle (rc=$rc): $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: an empty machine produces no bundle report at all"
+EMPTY_HOME="$(mktemp -d)"; EMPTY_APPS="$(mktemp -d)"
+found="$(service_desktop_app_present "$EMPTY_HOME" "$EMPTY_APPS")"
+if [ -z "$found" ]; then
+    pass "nothing installed, nothing found"
+else
+    fail "expected no paths, got: $found"
+fi
+mkdir -p "$EMPTY_APPS/Lucidos.app"
+found="$(service_desktop_app_present "$EMPTY_HOME" "$EMPTY_APPS")"
+if [ "$found" = "$EMPTY_APPS/Lucidos.app" ]; then
+    pass "a bundle in the system applications dir is found, and nothing else is"
+else
+    fail "expected only the bundle, got: $found"
+fi
+rm -rf "$EMPTY_HOME" "$EMPTY_APPS"
+
+echo ""
+echo "test: the .app's configured port is read, not assumed"
+PORTHOME="$(mktemp -d)"
+if [ "$(service_desktop_app_port "$PORTHOME")" = "5252" ]; then
+    pass "no persisted port falls back to the stable default"
+else
+    fail "expected 5252, got $(service_desktop_app_port "$PORTHOME")"
+fi
+mkdir -p "$PORTHOME/Library/Application Support/com.lucidos.app/config"
+printf '59240\n' > "$PORTHOME/Library/Application Support/com.lucidos.app/config/engine-port"
+if [ "$(service_desktop_app_port "$PORTHOME")" = "59240" ]; then
+    pass "a persisted engine-port wins"
+else
+    fail "expected 59240, got $(service_desktop_app_port "$PORTHOME")"
+fi
+printf 'nonsense\n' > "$PORTHOME/Library/Application Support/com.lucidos.app/config/engine-port"
+if [ "$(service_desktop_app_port "$PORTHOME")" = "5252" ]; then
+    pass "an unreadable engine-port falls back rather than reporting nonsense"
+else
+    fail "expected the default for an unreadable port file"
+fi
+rm -rf "$PORTHOME"
+
+# ── INTEGRATION: install.sh says when it lands on the .app's own port ────────
+echo ""
+echo "test: install.sh warns when this instance takes the port the .app expects"
+# The bundle is pinned at a FREE port, so the case is reachable on a machine
+# that already runs the real app on 5252. install.sh's own fail-closed refusal
+# covers a port genuinely in use; this covers an app that is installed but not
+# running, where nothing used to say the two would collide at its next launch.
+FB="$(make_fakebin Darwin 0)"
+REL="$(new_release_dir)"; TARBALL="$REL/$STEM.tar.gz"
+PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"; DATA="$PREFIX/clash"
+mkdir -p "$FAKEHOME/Applications/Lucidos.app/Contents"
+mkdir -p "$FAKEHOME/Library/Application Support/com.lucidos.app/config"
+printf '59241\n' > "$FAKEHOME/Library/Application Support/com.lucidos.app/config/engine-port"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA="$DATA" LUCIDOS_HEALTH_TIMEOUT=1 \
+        bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name clash --port 59241 2>&1)"
+if has "$out" "which is also the app's port"; then
+    pass "warned about the shared port"
+else
+    fail "expected a shared-port warning: $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME" "$REL"
+
+echo ""
+echo "test: install.sh reports a coexisting .app on a different port as ordinary"
+FB="$(make_fakebin Darwin 0)"
+REL="$(new_release_dir)"; TARBALL="$REL/$STEM.tar.gz"
+PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"; DATA="$PREFIX/coex"
+mkdir -p "$FAKEHOME/Applications/Lucidos.app/Contents"
+mkdir -p "$FAKEHOME/Library/Application Support/com.lucidos.app/config"
+printf '59242\n' > "$FAKEHOME/Library/Application Support/com.lucidos.app/config/engine-port"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA="$DATA" LUCIDOS_HEALTH_TIMEOUT=1 \
+        bash "$INSTALL" --from-tarball "$TARBALL" --prefix "$PREFIX" --name coex --port 59243 2>&1)"
+if has "$out" "so the two coexist" && ! has "$out" "which is also the app's port"; then
+    pass "two ports, two installs, no warning"
+else
+    fail "expected a plain coexistence note: $out"
+fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME" "$REL"
+
 echo ""
 echo "service: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

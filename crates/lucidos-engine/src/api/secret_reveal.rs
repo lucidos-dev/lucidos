@@ -124,7 +124,7 @@ impl RevealTokens {
 /// The two steps of a reveal answer this differently, and the difference is
 /// load-bearing rather than an inconsistency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RefererRule {
+pub(crate) enum RefererRule {
     /// Refuse a browser that presents no `Referer`. Stricter than the gateway's
     /// control plane, which lets one through.
     ///
@@ -149,7 +149,7 @@ pub(super) enum RefererRule {
 /// Allowed under either rule, and bounded by the loopback bind: this is the CLI
 /// and the API e2e suite. A browser-shaped one whose `Referer` names an app
 /// document is refused under either.
-pub(super) fn reveal_request_allowed(headers: &HeaderMap, rule: RefererRule) -> bool {
+pub(crate) fn reveal_request_allowed(headers: &HeaderMap, rule: RefererRule) -> bool {
     let header = |name: &str| {
         headers
             .get(name)

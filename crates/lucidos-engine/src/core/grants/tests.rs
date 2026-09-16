@@ -2,6 +2,66 @@
 
 use super::*;
 
+/// Concurrent grants must all survive. `append` reads the file, checks the
+/// pattern, then writes it back. Two unsynchronized appends therefore both
+/// read the pre-state, and the winner's rename drops the loser's grant.
+/// Several gates grant in parallel: the command guard, the Claude Code and
+/// MCP lanes, and the Settings editor.
+#[test]
+fn concurrent_appends_keep_every_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = grants_dir(tmp.path());
+    let file = GrantFile::ALL[0];
+    // Create the file first, so every thread races the same read-modify-write
+    // rather than the one-off create.
+    append(&dir, file, "Bash(seed:*)").unwrap();
+
+    let expected: Vec<String> = (0..16).map(|i| format!("Bash(cmd{i}:*)")).collect();
+    std::thread::scope(|scope| {
+        for pattern in &expected {
+            let dir = dir.clone();
+            scope.spawn(move || append(&dir, file, pattern).unwrap());
+        }
+    });
+
+    let got = patterns(&dir, file);
+    for pattern in &expected {
+        assert!(got.contains(pattern), "{pattern} was lost: {got:?}");
+    }
+    assert_eq!(got.len(), expected.len() + 1, "no duplicates: {got:?}");
+}
+
+/// The temp file a write renames from must be unique per process. A shared
+/// name lets two engines on one workspace interleave their bytes. The rename
+/// then publishes the torn result as the authoritative allowlist.
+#[test]
+fn write_raw_uses_a_process_unique_temp_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = grants_dir(tmp.path());
+    let file = GrantFile::ALL[0];
+    let path = file.path_in(&dir);
+
+    let scratch = scratch_path(&path);
+    assert_ne!(
+        scratch,
+        path.with_extension("tmp"),
+        "a fixed `.tmp` name is shared by every process on this workspace"
+    );
+    assert!(
+        scratch
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == format!("tmp{}", std::process::id())),
+        "the scratch name carries this pid: {}",
+        scratch.display()
+    );
+
+    // The write still lands, and leaves no scratch file behind.
+    write_raw(&dir, file, "Bash\n").unwrap();
+    assert_eq!(patterns(&dir, file), vec!["Bash".to_string()]);
+    assert!(!scratch.exists(), "the temp file is renamed away");
+}
+
 /// The whole point of per-workspace grants, in one test: a yes said in one
 /// workspace binds there and nowhere else.
 #[test]

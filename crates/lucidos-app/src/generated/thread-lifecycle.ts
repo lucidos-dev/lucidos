@@ -200,6 +200,18 @@ export function availableThreadActions(
   actions.push(isSaved ? 'unsave' : 'save');
   return actions;
 }
+
+export function threadIsDeletable(
+  threadType: ThreadType,
+  status: ThreadStatus,
+  hasPendingChanges: boolean,
+  isExternalRepo: boolean,
+  descendantsBlock: boolean,
+): boolean {
+  if (status === 'running' || status === 'waiting_for_user_answer') return false;
+  if (hasPendingChanges && threadType === 'claude_code' && !isExternalRepo) return false;
+  return !descendantsBlock;
+}
 export const MESSAGE_COUNT_EVENTS: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',

@@ -209,13 +209,42 @@ pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
         .or_unknown(true)
 }
 
+/// What [`remove_worktree_and_optionally_delete_branch`] does with the branch
+/// the worktree was on.
+///
+/// The default is [`Self::WhenMerged`], and it is the rule for RECLAMATION: the
+/// worker is taking spent disk back, and a unique commit is the user's work.
+/// Keeping the branch costs a ref and keeps the work findable.
+///
+/// [`Self::Always`] inverts that, and exactly one caller may (ADR 0035
+/// amendment, ADR 0192).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchDisposal {
+    /// Delete the branch only when it holds no unique commits.
+    WhenMerged,
+    /// Delete the branch whatever it holds. Only a thread delete passes this.
+    /// The owner asked for the thread and its work to be gone, and the
+    /// confirmation said unapplied branch work goes with it. Once the thread's
+    /// events are removed, nothing can resolve this branch back to a thread.
+    Always,
+}
+
 /// Outcome of [`remove_worktree_and_optionally_delete_branch`].
 pub(crate) struct RemoveWorktreeOutcome {
     /// Bytes reclaimed from the on-disk worktree (best-effort directory size
     /// captured before removal).
     pub freed_bytes: u64,
-    /// True iff the worktree's branch was fully merged and deleted.
+    /// True iff the branch was deleted.
     pub branch_deleted: bool,
+    /// The branch the worktree was on, read before the removal. `None` for a
+    /// detached HEAD or a git call that could not answer.
+    ///
+    /// Carried so a caller can clean up rows keyed on the branch. The delete
+    /// path sweeps `hardened_branches` and `planned_branches` with it.
+    pub branch: Option<String>,
+    /// The repo the worktree belonged to, resolved before the removal. Pairs
+    /// with `branch` as the key of both marker tables.
+    pub repo_root: std::path::PathBuf,
 }
 
 /// Strip regenerable build artifacts (`target/`, `node_modules/`,
@@ -267,13 +296,13 @@ pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     }
 }
 
-/// Remove a worktree directory and (when its branch is fully merged into
-/// main) delete the branch.
+/// Remove a worktree directory, and delete its branch per `disposal`.
 ///
 /// It opens with `git worktree remove --force`, so a caller gates it on
-/// [`is_worktree_dirty`] first. Only the disk-usage endpoint's Tier 3 skips
-/// the gate, where the user confirmed a force. Add a caller and you add the
-/// gate with it. `rg is_worktree_dirty` lists the current set.
+/// [`is_worktree_dirty`] first. Two callers skip the gate, both because the
+/// user confirmed a destructive action naming this tree: the disk-usage
+/// endpoint's Tier 3, and a thread delete. Add a caller and you add the gate
+/// with it. `rg is_worktree_dirty` lists the current set.
 ///
 /// `pre_size` lets the Tier 2 worker pass the directory size it already
 /// surveyed at the top of `run_once`, avoiding a second walk of the same
@@ -286,6 +315,7 @@ pub(crate) fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
 pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     worktree: &Path,
     pre_size: Option<u64>,
+    disposal: BranchDisposal,
 ) -> Option<RemoveWorktreeOutcome> {
     // Capture the branch + repo root BEFORE we remove the worktree —
     // once the directory is gone we can't read either.
@@ -342,17 +372,22 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
         }
     }
 
-    // Branch deletion (Phase 10.3): only when fully merged. `has_branch_commits`
-    // returns true on error (conservative) so we keep branches when in doubt.
+    // Branch deletion (Phase 10.3). `WhenMerged` is the reclamation rule, and
+    // `has_branch_commits` returns true on error, so a branch is kept whenever
+    // git could not answer. `Always` is the owner's delete and takes the branch
+    // without asking, which is the one place that inversion is correct.
     let mut branch_deleted = false;
     if let Some(branch_name) = branch.as_deref() {
-        if !has_branch_commits(&repo_root, branch_name).await {
+        let keep_unmerged = disposal == BranchDisposal::WhenMerged
+            && has_branch_commits(&repo_root, branch_name).await;
+        if !keep_unmerged {
             match git_cmd(&["branch", "-D", branch_name], &repo_root).await {
                 Ok(o) if o.status.success() => {
                     branch_deleted = true;
                     log!(
-                        "[WorktreeCleanup] deleted fully-merged branch {}",
-                        branch_name
+                        "[WorktreeCleanup] deleted branch {} ({:?})",
+                        branch_name,
+                        disposal
                     );
                 }
                 Ok(o) => log!(
@@ -368,7 +403,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
             }
         } else {
             log!(
-                "[WorktreeCleanup] preserving branch {} — has unmerged commits",
+                "[WorktreeCleanup] preserving branch {}: it has unmerged commits",
                 branch_name
             );
         }
@@ -377,6 +412,8 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     Some(RemoveWorktreeOutcome {
         freed_bytes: total_size,
         branch_deleted,
+        branch,
+        repo_root,
     })
 }
 

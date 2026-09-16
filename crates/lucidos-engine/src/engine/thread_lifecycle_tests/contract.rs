@@ -122,6 +122,25 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
+    // threadIsDeletable: the full cross product of thread_types × statuses ×
+    // pending × external_repo × descendants_block. No section dimension, which
+    // is the predicate's whole point.
+    for (tt_str, tt) in &thread_types {
+        for (st_str, st) in &statuses {
+            for &pending in &bools {
+                for &external in &bools {
+                    for &blocked in &bools {
+                        let result = thread_is_deletable(*tt, *st, pending, external, blocked);
+                        cases.push(format!(
+                            r#"    {{ "fn": "threadIsDeletable", "args": [{:?}, {:?}, {}, {}, {}], "expected": {} }}"#,
+                            tt_str, st_str, pending, external, blocked, result
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     format!("{{\n  \"cases\": [\n{}\n  ]\n}}\n", cases.join(",\n"))
 }
 
@@ -259,6 +278,25 @@ fn generate_typescript() -> String {
     out.push_str("  }\n");
     out.push_str("  actions.push(isSaved ? 'unsave' : 'save');\n");
     out.push_str("  return actions;\n");
+    out.push_str("}\n");
+
+    // threadIsDeletable. Deliberately NOT an `Action`: Delete is not a close
+    // layer, it lives only in the overflow menu, and its availability ignores
+    // the section. See `thread_is_deletable` in thread_lifecycle.rs.
+    out.push_str("\nexport function threadIsDeletable(\n");
+    out.push_str("  threadType: ThreadType,\n");
+    out.push_str("  status: ThreadStatus,\n");
+    out.push_str("  hasPendingChanges: boolean,\n");
+    out.push_str("  isExternalRepo: boolean,\n");
+    out.push_str("  descendantsBlock: boolean,\n");
+    out.push_str("): boolean {\n");
+    out.push_str(
+        "  if (status === 'running' || status === 'waiting_for_user_answer') return false;\n",
+    );
+    out.push_str(
+        "  if (hasPendingChanges && threadType === 'claude_code' && !isExternalRepo) return false;\n",
+    );
+    out.push_str("  return !descendantsBlock;\n");
     out.push_str("}\n");
 
     // STATUS_TRANSITIONS / SECTION_TRANSITIONS removed in Phase 5: the

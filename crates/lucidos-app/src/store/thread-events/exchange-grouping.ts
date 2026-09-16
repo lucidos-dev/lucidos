@@ -44,12 +44,28 @@ export function computeExchanges(thread: ThreadState): Exchange[] {
 function withLiveCallRows(thread: ThreadState, exchanges: Exchange[]): Exchange[] {
   const live = liveCallEvents(thread);
   if (live.length === 0) return exchanges;
-  const rows = live.map((userEvent, i) => ({
-    userEvent,
-    userSeq: Number.MAX_SAFE_INTEGER - (live.length - 1 - i),
-    steps: [],
-  }));
-  return [...exchanges, ...rows];
+  const out = [...exchanges];
+  let seq = Number.MAX_SAFE_INTEGER - (live.length - 1);
+  for (const userEvent of live) {
+    // The talker's row goes INSIDE the block its persisted row will land in,
+    // which is the one `callRowTarget` picks. Two things follow, and both were
+    // reported. It draws no Lucidos Agent header of its own, so none appears
+    // between two speech bubbles. And the swap to the engine's row moves
+    // nothing, because both sit in the same place.
+    //
+    // A reply with nowhere to land still opens a boundary, which is the
+    // greeting: the talker spoke before anybody else did.
+    const at = isLiveReplyRow(userEvent) ? liveReplyTargetIndex(out) : -1;
+    if (at === -1) {
+      out.push({ userEvent, userSeq: seq, steps: [] });
+    } else {
+      // Cloned, never mutated: the fold's result is memoized, and pushing onto
+      // its array would make the live row permanent.
+      out[at] = { ...out[at], steps: [...out[at].steps, { seq, event: userEvent }] };
+    }
+    seq += 1;
+  }
+  return out;
 }
 
 /** The call's live rows as synthetic events, oldest first.
@@ -123,6 +139,15 @@ export function isLiveReplyRow(event: LiveRowMarks): boolean {
  *  words. They are still speaking, so nothing is in flight behind it. */
 export function isLivePartialRow(event: LiveRowMarks): boolean {
   return event._livePartial === true;
+}
+
+/** True for a live caller row carrying the provider's FINAL words.
+ *
+ *  Three shapes wear `_liveUtterance` and this is the last of them. The pulse
+ *  has no words at all, a partial has words the provider may still revise, and
+ *  this one has the sentence. Only here has the caller finished. */
+export function isSettledLiveUtterance(event: LiveRowMarks & { text?: string }): boolean {
+  return isLiveUtteranceRow(event) && !isLivePartialRow(event) && !!event.text;
 }
 
 /** True for either side's live row. What they share is that no event carries
@@ -534,6 +559,16 @@ function claimKey(text: string | undefined): string | undefined {
  * A row with no final words matches nothing, which is the barge-in guarantee
  * by construction. A partial is not words either.
  *
+ * **A landing row also retires every EARLIER row of its own stretch.**
+ * `call.rs` accumulates a caller stretch across provider items, appending as
+ * it goes. So a row drawn part-way through carries a strict PREFIX of the
+ * words that land. Matched on equality alone, those rows are orphans: the one
+ * reported read `bit` and sat under a "Requesting" header until the hangup
+ * swept it.
+ *
+ * Prefix, never containment. A short fragment appearing in the middle of an
+ * unrelated sentence must not retire the bubble somebody is speaking now.
+ *
  * **Trimmed on both sides, because one leg of the chain trims**, which is
  * `doer.rs::wake`. Called from two places, because a row and the words that
  * claim it arrive on two transports and `call.rs` emits the row FIRST.
@@ -544,15 +579,26 @@ export function claimUtteranceRows(thread: ThreadState): void {
   // Runs with NO rows too, so the trim reaches a call whose bubbles the client
   // never drew. Returning early there would grow the list for the whole call.
   const rows = thread.liveUtterances ?? [];
-  const kept = [...rows];
+  let kept = [...rows];
   const unmatched: string[] = [];
   for (const words of owed) {
     const at = kept.findIndex(row => claimKey(row.text) === words);
     if (at === -1) unmatched.push(words);
     else kept.splice(at, 1);
+    kept = kept.filter(row => !isEarlierInStretch(row.text, words));
   }
   thread.unclaimedUtterances = unmatched.slice(-UNCLAIMED_UTTERANCE_MEMORY);
   if (kept.length !== rows.length) thread.liveUtterances = kept;
+}
+
+/** Are these the words of a row the landing one grew out of?
+ *
+ *  A strict prefix, and a shorter one: equality is the claim above, and a row
+ *  the engine has not finished accumulating is never longer than the row it
+ *  ends up in. */
+function isEarlierInStretch(text: string | undefined, landed: string): boolean {
+  const words = claimKey(text);
+  return words !== undefined && words.length < landed.length && landed.startsWith(words);
 }
 
 /** Add what the engine just wrote to the unclaimed words, then claim. */
@@ -872,13 +918,23 @@ export function isWaitingTypedMessage(exchange: Exchange): boolean {
  *  own, the greeting arm in `foldEvent`, and a session mark is dropped.
  *  Deliberately NOT `current`, which is routinely the waiting message. */
 function callRowTarget(exchanges: Exchange[]): Exchange | null {
+  const at = liveReplyTargetIndex(exchanges);
+  return at === -1 ? null : exchanges[at];
+}
+
+/** Where a reply lands, as an index. `-1` means nowhere can hold it.
+ *
+ *  Shared with `withLiveCallRows`, so the LIVE row is drawn in the block the
+ *  persisted one will be filed into. Two rules would drift, and the drift a
+ *  reader sees is a bubble jumping between blocks as the row lands. */
+function liveReplyTargetIndex(exchanges: Exchange[]): number {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const exchange = exchanges[i];
     if (isWaitingTypedMessage(exchange)) continue;
     if (isUserStoppedWait(exchange.userEvent)) continue;
-    return exchange;
+    return i;
   }
-  return null;
+  return -1;
 }
 
 export function groupIntoExchanges(events: Map<number, StoredEvent>): Exchange[] {

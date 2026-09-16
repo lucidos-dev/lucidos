@@ -116,6 +116,9 @@ pub(super) fn choices_for(choices: &[DecisionChoice]) -> String {
 /// - It does nothing itself. Its tools ask, answer and hang up. Calling one is
 ///   the only way anything gets looked up or done (ADR 0149, and ADR 0170,
 ///   which supersedes its tool-less clause).
+/// - It may SAY how that works, still in the first person. A caller who is
+///   never told repeats a request three times waiting for something to happen.
+///   Five facts, and none of them names a second agent (ADR 0191).
 /// - It may stall truthfully, because work really is running on its behalf.
 /// - It may not state a fact it did not receive. A confident first-person
 ///   claim is a fabrication rather than a paraphrase.
@@ -139,6 +142,16 @@ done.
 Reach for them early. Ask for work the moment you hear something that block \
 does not answer, and for anything the user wants done. Speak in the same turn: \
 tell them you are on it, then stop and wait.
+
+Say how you work when it would help them, as your own way of working. Five \
+things are worth saying, and each one saves somebody asking twice. They can \
+keep talking while something runs. Nothing is queued, so every new thing they \
+want is one more you have to go and get. You cannot see how far along anything \
+is. What you find out lands in this conversation too, in full. Ringing off ends \
+the call and not the work.
+
+Offer that when it clears something up, never as a preamble. Nobody wants an \
+explanation of the plumbing before they can ask a question.
 
 When something is waiting on the user, they can settle it by saying so. Put it \
 to them out loud, and hand back the choice they pick.
@@ -500,6 +513,63 @@ mod tests {
                 phrase
             );
         }
+    }
+
+    /// A caller who is never told how this works asks for the same thing
+    /// three times, which is what one reported call was. The five facts are
+    /// the whole of what there is to say, and the talker says them as its own
+    /// way of working (ADR 0191).
+    #[test]
+    fn the_talker_may_say_how_it_works() {
+        assert!(TALKER_INSTRUCTIONS.contains("Say how you work"));
+        for fact in [
+            "keep talking while something runs",
+            "Nothing is queued",
+            "cannot see how far along",
+            "lands in this conversation too",
+            "ends the call and not the work",
+        ] {
+            assert!(
+                TALKER_INSTRUCTIONS.contains(fact),
+                "the talker cannot tell the caller: {:?}",
+                fact
+            );
+        }
+        // Offered, never recited. An assistant that explains its plumbing
+        // before the caller can ask is worse than one that never explains.
+        assert!(TALKER_INSTRUCTIONS.contains("never as a preamble"));
+    }
+
+    /// Saying how it works must not turn into saying WHO does the work. The
+    /// caller meets one entity (ADR 0149), and every word below would break
+    /// that by naming a second one.
+    #[test]
+    fn explaining_itself_still_names_no_second_agent() {
+        let whole = format!(
+            "{} {} {} {}",
+            instructions_for(SpokenLanguage::resolve("Norwegian").as_ref()),
+            DELEGATE_TOOL_DESCRIPTION,
+            ANSWER_TOOL_DESCRIPTION,
+            HANGUP_TOOL_DESCRIPTION
+        )
+        .to_lowercase();
+        for named in [
+            "another agent",
+            "another model",
+            "the doer",
+            "the agent",
+            "my colleague",
+            "hand it to",
+            "passes it to",
+            "somebody else",
+        ] {
+            assert!(
+                !whole.contains(named),
+                "the caller was told a second thing is involved: {:?}",
+                named
+            );
+        }
+        assert!(TALKER_INSTRUCTIONS.contains("Never mention that any other model or agent exists"));
     }
 
     /// The talker reads a name, the transcriber reads a code. A name nobody can

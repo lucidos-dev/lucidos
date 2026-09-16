@@ -20,6 +20,25 @@ pub(crate) use plan_marker::*;
 pub(crate) use restart_detection::*;
 pub(crate) use worktree::*;
 
+/// Canonical absolute repo root, as the DB key of a per-branch marker.
+///
+/// Resolves symlinks, so the git hook and the engine produce the same row. The
+/// hook derives its path from `git rev-parse --git-common-dir`, which can
+/// answer relatively or through a symlink. An unresolved path would key a
+/// second row nothing reads.
+///
+/// One definition for all three readers of those tables: the harden marker, the
+/// plan marker, and the sweep a thread delete runs over both. It lived twice,
+/// once per marker module, and a third copy in `api::threads::delete` would
+/// have keyed its DELETEs on a path the writers never wrote.
+pub(crate) fn canonical_repo_root(repo_root: &Path) -> String {
+    repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 /// How long a single git invocation may run before the engine gives up on it.
 /// Generous, because it is a ceiling on a saturated host, not a latency target:
 /// while the e2e suite runs, ordinary `rev-parse` calls have been observed

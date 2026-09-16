@@ -463,7 +463,7 @@ function orderedVisibleThreadIds(): string[] {
  *  the currently active drawer view (`orderedVisibleThreadIds`). Snapshotted
  *  BEFORE the optimistic flip so the position anchor survives the cascade
  *  dropping `aroundId` (and its descendants) out of the view. */
-function visibleCandidatesAround(aroundId: string): string[] {
+export function visibleCandidatesAround(aroundId: string): string[] {
   const ordered = orderedVisibleThreadIds();
   const idx = ordered.indexOf(aroundId);
   if (idx < 0) return [];
@@ -474,9 +474,13 @@ function visibleCandidatesAround(aroundId: string): string[] {
 }
 
 /** Walk parentThreadId from every thread in the map to collect the target +
- *  every transitive descendant. Mirrors the backend cascade scope so the
- *  optimistic flip drops the whole family out of review in one stroke. */
-function collectArchiveCascade(rootId: string): Set<string> {
+ *  every transitive descendant. Mirrors the backend cascade scope, which
+ *  archive and delete share, so an optimistic flip covers the whole family in
+ *  one stroke.
+ *
+ *  Exported for delete, which needs the same set for a harsher reason: archive
+ *  flips a column on each member and delete removes the rows. */
+export function collectThreadFamily(rootId: string): Set<string> {
   const childrenByParent = new Map<string, string[]>();
   for (const t of threadMap.value.values()) {
     const p = t.meta.parentThreadId;
@@ -596,7 +600,7 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
   // The archive cascades to the target + every transitive descendant; collect
   // the family up front so we can both check it for unsent drafts here and (just
   // below) flip the whole family out of review in one stroke.
-  const cascade = collectArchiveCascade(threadId);
+  const cascade = collectThreadFamily(threadId);
 
   // If any family member carries an unsent reply draft, ask whether to discard
   // it too. Archiving doesn't clear the draft server-side, so the focused OK

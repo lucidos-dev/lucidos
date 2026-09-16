@@ -261,8 +261,9 @@ redeemed. Nothing to configure; it is listed here because `state` is refused in
   `https://openidconnect.googleapis.com/v1/userinfo` if you request `openid`.
 - **Microsoft**: scopes look like `https://graph.microsoft.com/Mail.Read` or
   short names like `offline_access User.Read`. Include `offline_access` to get a
-  refresh token. See the Microsoft section below — its app registration needs
-  more care than the others.
+  refresh token. The token response will not echo it back, so the refresh token
+  is what proves it was granted (see "what the token response echoes" below).
+  Its app registration also needs more care than the others.
 - **GitHub**: scopes are short names (`repo read:user`). GitHub tokens don't
   expire and have no refresh token — that's expected.
 - **Spotify / Dropbox**: short scope names per their docs. Dropbox's account
@@ -347,6 +348,26 @@ Pick one of the two coherent setups and make both halves agree:
 Do **not** register the same callback in both buckets — Entra picks one
 arbitrarily when URIs differ only by bucket, which makes the failure
 intermittent.
+
+## Microsoft (Entra): what the token response echoes
+
+A token issued for a **resource** (`https://outlook.office.com/…`,
+`https://graph.microsoft.com/…`) comes back with a `scope` naming that
+resource's own scopes and nothing else. `offline_access`, `openid`, `profile`
+and `email` are never in that list, however the consent went.
+
+So **a scope absent from the echo is not a refused scope**. For
+`offline_access` the authoritative signal is the refresh token: one was issued
+and stored, so it was granted. Lucidos reads it that way on the account card
+and in the `connect_oauth_account` result alike. It warns only when the refresh
+token is genuinely absent, which is the case that breaks renewal.
+
+Do not send a user to the Entra portal over an unechoed `offline_access`. That
+is what the old echo-based check did, on connections that were working.
+
+A real refusal still surfaces. Ask for a **resource** scope the app
+registration has not been granted and it is missing from the echo, where
+nothing else vouches for it.
 
 ## Adding a new provider
 

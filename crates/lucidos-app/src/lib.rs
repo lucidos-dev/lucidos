@@ -17,6 +17,7 @@ mod config_scalar;
 mod crash_watchdog;
 mod desktop;
 mod device_id_store;
+mod install_preflight;
 mod mobile;
 mod notifications;
 mod pairing;
@@ -563,9 +564,14 @@ fn run_uninstall(app: tauri::AppHandle, delete_data: bool) {
                 return;
             }
         };
+        // Asked BEFORE the destructive steps, which trash the bundle this
+        // process runs from. It names every OTHER Lucidos install on the
+        // machine, because this uninstaller cannot remove one and used to say
+        // nothing about it.
+        let leftovers = desktop::leftover_installs(&app_data);
         match desktop::uninstall(&app_data, delete_data) {
             Ok(()) => {
-                let body = if delete_data {
+                let mut body = if delete_data {
                     "Lucidos has been uninstalled and all its data deleted. The app has been \
                      moved to the Trash."
                         .to_string()
@@ -576,6 +582,13 @@ fn run_uninstall(app: tauri::AppHandle, delete_data: bool) {
                         app_data.display()
                     )
                 };
+                if !leftovers.is_empty() {
+                    body.push_str(&format!(
+                        "\n\nAnother Lucidos install is still on this machine, and this \
+                         uninstaller cannot remove it:\n\n{}",
+                        leftovers.join("\n")
+                    ));
+                }
                 app.dialog()
                     .message(body)
                     .title("Uninstall Lucidos")
@@ -760,9 +773,44 @@ impl StartupShow {
 
 static STARTUP_SHOW: StartupShow = StartupShow::new();
 
+/// What the startup show does to `main`, in the order it must go out.
+///
+/// A named pair rather than two straight-line calls, for the reason
+/// `app_window::placement_steps` is one: the ORDER is the whole content, and
+/// two calls read the same either way. Clamp after the show and the correction
+/// is certain to land in front of the user. Drop the clamp and a frame no
+/// display can hold reaches the screen, which is the bug this exists to prevent
+/// (ADR 0193).
+///
+/// Issued in this order, which is not the same as APPLIED in it. tao defers a
+/// placement to the main dispatch queue, and runs an order-front inline. So a
+/// launch the clamp corrects can still paint one frame at the restored size.
+/// Issuing the correction first is what keeps that to one frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupStep {
+    Clamp,
+    Show,
+}
+
+/// Sanitise `main`'s restored geometry, then put it on screen.
+const STARTUP_SHOW_STEPS: [StartupStep; 2] = [StartupStep::Clamp, StartupStep::Show];
+
 /// Put the deferred startup window on screen, at most once. Returns whether this
 /// call was the one that did it, so the fallback timer can say that the frontend
 /// never signalled without the frontend's own path logging anything.
+///
+/// The work is marshalled onto the main thread, and that is load-bearing. The
+/// clamp has to read geometry tao applied through its own main-queue setters,
+/// which the run loop drains on its first turn. The fallback racer is also off
+/// the main thread; the frontend's is not, and needs the hop for the ordering
+/// rather than for the thread.
+///
+/// Both racers are strictly later than that first turn: the frontend cannot
+/// signal before its document has run, and the fallback is seconds away. So
+/// this is the first moment the clamp can see what the window will actually
+/// wear. `docs/known-gaps.md` carries the paths still reading early.
+///
+/// The claim stays synchronous, because the caller needs its answer now.
 ///
 /// By window, not webview window, per ADR 0140. Showing is a window operation.
 /// No preview can exist this early, so the flavour costs nothing here and is
@@ -771,19 +819,35 @@ fn show_startup_window(app: &tauri::AppHandle) -> bool {
     if !STARTUP_SHOW.claim(activation::is_menu_bar_only()) {
         return false;
     }
-    match app.get_window(app_window::MAIN_WINDOW_LABEL) {
-        Some(win) => match win.show() {
-            // Only a window that actually reached the screen latches the gate,
-            // the same rule `front_window` follows.
-            Ok(()) => {
-                window_screen::note_shown(app_window::MAIN_WINDOW_LABEL);
-                window_persist::note_presented();
-            }
-            Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
-        },
-        None => eprintln!("[Tauri] No main window to show at startup"),
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || startup_clamp_and_show(&handle)) {
+        eprintln!("[Tauri] Could not schedule the startup show: {e}");
     }
     true
+}
+
+/// The steps above, run on the main thread. One block, so nothing can land
+/// between the clamp and the show.
+fn startup_clamp_and_show(app: &tauri::AppHandle) {
+    for step in STARTUP_SHOW_STEPS {
+        match step {
+            StartupStep::Clamp => {
+                window_restore::clamp_restored_geometry(app, app_window::MAIN_WINDOW_LABEL);
+            }
+            StartupStep::Show => match app.get_window(app_window::MAIN_WINDOW_LABEL) {
+                Some(win) => match win.show() {
+                    // Only a window that actually reached the screen latches the
+                    // gate, the same rule `front_window` follows.
+                    Ok(()) => {
+                        window_screen::note_shown(app_window::MAIN_WINDOW_LABEL);
+                        window_persist::note_presented();
+                    }
+                    Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
+                },
+                None => eprintln!("[Tauri] No main window to show at startup"),
+            },
+        }
+    }
 }
 
 /// The frontend's "theme resolved, about to paint" signal (`windowReadyToShow`
@@ -875,7 +939,7 @@ pub fn run() {
         .manage(panel_preview::PanelPreviewSlots::default())
         .manage(panel_preview::PanelContentChannel::default())
         .manage(crash_watchdog::Heartbeats::default())
-        .manage(window_persist::GeometrySaver::default())
+        .manage(window_persist::WindowSaver::default())
         .manage(device_id_store::DeviceIdStore::default())
         .manage(updater::AppUpdateRun::default())
         .manage(mobile::MobileAccessRuns::default())
@@ -1030,7 +1094,7 @@ pub fn run() {
                     if matches!(event, tauri::WindowEvent::Resized(_)) {
                         traffic_lights::place(window);
                     }
-                    window_persist::note_geometry_changed(app);
+                    window_persist::note_windows_changed(app);
                 }
                 _ => {}
             }
@@ -1067,25 +1131,40 @@ pub fn run() {
                 // The outgoing page took its preview's positioning element with
                 // it, and ran no unmount to say so.
                 panel_preview::close_owned_by(webview.app_handle(), webview.window().label());
+                // This window is on a different URL now, and the window session
+                // is keyed by the workspace a URL names. This is also the one
+                // event that can open that record's write gate, so arming here
+                // is what stops a cold boot losing its arrangement. See
+                // `window_persist::note_windows_changed`.
+                //
+                // Gated on the same predicate the gate itself uses, so the two
+                // cannot disagree about which load is worth a write. What it
+                // rules out is the BUNDLED splash every window starts on
+                // (`tauri://localhost`), which names no workspace. It does NOT
+                // rule out the gateway's 503 splash: that is served at the
+                // workspace's own http url, so nothing here can tell it apart.
+                if window_target::window_is_navigated(payload.url().as_str()) {
+                    window_persist::note_windows_changed(webview.app_handle());
+                }
             }
         })
         .setup(move |app| {
             // What this launch owes the user: a window per workspace that had
-            // one, at the size that workspace was left. Resolved BEFORE the
-            // clamp and the show, because `main` takes the first entry and must
-            // be sized before it appears rather than resized after.
+            // one, at the size that workspace was left. The plugin has already
+            // written its own saved rect onto `main`, and this supersedes it
+            // whenever the record knows the workspace. `main` must be sized
+            // before it appears rather than resized after.
+            //
+            // The clamp that judges the result is NOT here. This runs before
+            // `app.run()`, so neither this placement nor the plugin's has
+            // reached the window: tao defers both setters to the main dispatch
+            // queue. A clamp here reads the geometry the window was BORN at. It
+            // passed a doubled rect as healthy, which is how one reached a
+            // tester's screen. `show_startup_window` owns it now.
             let plan = window_persist::resolve_window_session_plan();
             if let Some((_, Some(frame))) = plan.first() {
                 window_persist::size_main_window_for_its_workspace(app.handle(), *frame);
             }
-
-            // The plugin has already written the saved rect onto `main`, and
-            // nothing has shown the window yet. This is therefore the one moment
-            // a corrupt or now-impossible rect can be corrected off screen. A
-            // healthy rect makes it a no-op. It runs AFTER the line above, so it
-            // judges the rect the window will actually wear. See
-            // `window_restore`.
-            window_restore::clamp_restored_geometry(app.handle(), app_window::MAIN_WINDOW_LABEL);
 
             // Best-effort: a menu build failure must not block app startup.
             if let Err(e) = install_app_menu(app) {
@@ -1151,7 +1230,7 @@ pub fn run() {
 
             crash_watchdog::spawn(app.handle().clone());
 
-            window_persist::spawn_geometry_flush(app.handle().clone());
+            window_persist::spawn_window_flush(app.handle().clone());
 
             // Register the UserNotifications delegate and request notification
             // authorization. No-op in dev. See `notifications.rs`.
@@ -1483,6 +1562,16 @@ mod tests {
         // In dev the flag is inert. There is no tray there (`install_tray` is
         // skipped), so a hidden dev window would have nothing to reopen it.
         assert!(should_show_window_at_startup(&login, true));
+    }
+
+    /// The clamp goes first, and it is the step that exists at all. `setup` ran
+    /// it before tao's deferred setters had reached the window. So it judged the
+    /// geometry the window was born at, and passed a doubled rect as healthy.
+    /// Issuing it after the show instead would put the correction in front of
+    /// the user for certain, rather than at worst for one frame.
+    #[test]
+    fn the_startup_show_clamps_before_it_shows() {
+        assert_eq!(STARTUP_SHOW_STEPS, [StartupStep::Clamp, StartupStep::Show]);
     }
 
     #[test]

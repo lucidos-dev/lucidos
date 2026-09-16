@@ -10,6 +10,7 @@ import { appUpdateNarration, appUpdateDialogState } from '../progressDialogCopy'
 
 const mocks = vi.hoisted(() => ({
   isTauri: vi.fn(() => true),
+  thisDeviceIsMobile: vi.fn(() => false),
   checkAppUpdate: vi.fn(),
   installAppUpdateAndRestart: vi.fn(),
   cancelAppUpdate: vi.fn(),
@@ -52,6 +53,10 @@ const storeSignals = vi.hoisted(() => ({
   appUpdateProgress: { value: null as AppUpdateProgress | null },
   releaseCheck: { value: null as ReleaseCheck | null },
   settingsScrollTarget: { value: null as string | null },
+  // What the ENGINE serving this workspace reports, from its own `/health`.
+  // The shadowed check reads it, and it is the only signal available when a
+  // gateway is too old to carry `release_check` at all.
+  lucidosRelease: { value: null as string | null },
 }));
 
 /** What `check_app_update` resolves to. Notes default to absent, which is the
@@ -62,9 +67,12 @@ function offer(version: string, notes: string | null = null) {
 
 /** Every route. A case added to the union with no label fails here, rather than
  *  shipping a button with no words on it. */
-const ROUTES: UpdateRoute[] = ['install', 'check', 'guide'];
+const ROUTES: UpdateRoute[] = ['install', 'check', 'guide', 'desktop'];
 
-vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
+vi.mock('../../utils/platform', () => ({
+  isTauri: mocks.isTauri,
+  thisDeviceIsMobile: mocks.thisDeviceIsMobile,
+}));
 // The offer toast's secondary action navigates; the navigation itself belongs to
 // the menu action's own tests. Mocked rather than left real because pulling the
 // real module in would drag the whole store graph through this file's partial
@@ -91,6 +99,7 @@ vi.mock('../store', () => ({
   appUpdateProgress: storeSignals.appUpdateProgress,
   releaseCheck: storeSignals.releaseCheck,
   settingsScrollTarget: storeSignals.settingsScrollTarget,
+  lucidosRelease: storeSignals.lucidosRelease,
 }));
 
 const {
@@ -102,6 +111,7 @@ const {
   installAppUpdate,
   refreshReleaseCheck,
   reportUpdateCheck,
+  shadowedEngine,
   startAppUpdateProgress,
   stopAppUpdateProgress,
   updateControlLabel,
@@ -131,6 +141,7 @@ function lastToast(): { message: string; type: string; opts: Record<string, unkn
 
 beforeEach(() => {
   mocks.isTauri.mockReturnValue(true);
+  mocks.thisDeviceIsMobile.mockReturnValue(false);
   mocks.checkAppUpdate.mockReset();
   mocks.installAppUpdateAndRestart.mockReset();
   mocks.cancelAppUpdate.mockReset();
@@ -153,6 +164,8 @@ beforeEach(() => {
   storeSignals.appUpdateProgress.value = null;
   storeSignals.releaseCheck.value = null;
   storeSignals.settingsScrollTarget.value = null;
+  storeSignals.lucidosRelease.value = null;
+  delete (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__;
 });
 
 afterEach(() => {
@@ -724,6 +737,31 @@ describe('refreshReleaseCheck', () => {
     expect(storeSignals.appUpdateCheckError.value).toContain('connection refused');
   });
 
+  // The offer can only be taken on the machine running the workspace, so on a
+  // phone it interrupts a reader to report somebody else's click.
+  it('raises no offer on a phone', async () => {
+    mocks.isTauri.mockReturnValue(false);
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.9.1', install: 'desktop-app', notes: '- a thing' }),
+    );
+    expect(await refreshReleaseCheck()).toEqual({ kind: 'available', version: '9.9.1' });
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  // The suppression is at the toast, never at the poll. What's New reads these
+  // signals to mark the release `Available`, and a phone must still see that.
+  it('still records the gateway answer on a phone', async () => {
+    mocks.isTauri.mockReturnValue(false);
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    mocks.requestUpdateCheck.mockResolvedValue(
+      releaseCheckOf({ version: '9.9.2', install: 'desktop-app', notes: '- a thing' }),
+    );
+    await refreshReleaseCheck();
+    expect(storeSignals.releaseCheck.value?.latest?.version).toBe('9.9.2');
+    expect(storeSignals.latestTauriAppNotes.value).toBe('- a thing');
+  });
+
   // A run in flight owns the shared toast key, and its narration is a more
   // specific answer than a fresh offer would be.
   it('raises no offer over an install already running', async () => {
@@ -857,6 +895,58 @@ describe('checkForUpdatesNow', () => {
     expect(await checkForUpdatesNow()).toEqual({ kind: 'installing' });
     expect(mocks.requestUpdateCheck).not.toHaveBeenCalled();
   });
+
+  // The incident, exactly: a current DMG client, an ancient `install.sh`
+  // gateway holding port 5252, and a check that answered about the CLIENT.
+  it('never answers "up to date" while an older install serves this workspace', async () => {
+    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    storeSignals.lucidosRelease.value = '0.26.2';
+    storeSignals.releaseCheck.value = null; // a gateway too old to carry the field
+
+    const verdict = await checkForUpdatesNow();
+
+    expect(verdict).toEqual({ kind: 'shadowed', engine: '0.26.2', client: '0.36.0' });
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+  });
+
+  // The client updater still answers when the engine is not behind. Anything
+  // else would strand every ordinary install on a check it cannot run.
+  it('still asks the client updater when the engine is current', async () => {
+    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    storeSignals.lucidosRelease.value = '0.36.0';
+    storeSignals.releaseCheck.value = null;
+    mocks.checkAppUpdate.mockResolvedValue(null);
+
+    expect(await checkForUpdatesNow()).toEqual({ kind: 'up-to-date' });
+    expect(mocks.checkAppUpdate).toHaveBeenCalled();
+  });
+});
+
+describe('shadowedEngine', () => {
+  it('reports only an engine OLDER than the app asking', () => {
+    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+
+    storeSignals.lucidosRelease.value = '0.26.2';
+    expect(shadowedEngine()).toEqual({ engine: '0.26.2', client: '0.36.0' });
+
+    // A NEWER engine is the client being stale, which the client updater owns.
+    storeSignals.lucidosRelease.value = '0.40.0';
+    expect(shadowedEngine()).toBeNull();
+
+    storeSignals.lucidosRelease.value = '0.36.0';
+    expect(shadowedEngine()).toBeNull();
+  });
+
+  // A browser or PWA session has a build id rather than a release, so it has
+  // nothing to compare and must conclude nothing.
+  it('concludes nothing without both versions', () => {
+    storeSignals.lucidosRelease.value = '0.26.2';
+    expect(shadowedEngine()).toBeNull();
+
+    (globalThis as { __LUCIDOS_APP_VERSION__?: string }).__LUCIDOS_APP_VERSION__ = '0.36.0';
+    storeSignals.lucidosRelease.value = null;
+    expect(shadowedEngine()).toBeNull();
+  });
 });
 
 describe('reportUpdateCheck', () => {
@@ -871,6 +961,17 @@ describe('reportUpdateCheck', () => {
       message: "Couldn't check for updates: connection refused",
       type: 'error',
     });
+  });
+
+  // Neither a failure nor "up to date". It names the two versions that
+  // disagree, which is the sentence nothing in the product used to say.
+  it('names both versions when another install is answering', () => {
+    reportUpdateCheck({ kind: 'shadowed', engine: '0.26.2', client: '0.36.0' });
+    const toast = lastToast();
+    expect(toast.type).toBe('error');
+    expect(toast.message).toContain('0.26.2');
+    expect(toast.message).toContain('0.36.0');
+    expect(toast.message).not.toContain('up to date');
   });
 
   // The offer toast has already named the release, and the progress dialog is
@@ -895,6 +996,7 @@ describe('updateControlLabel', () => {
     expect(updateControlLabel('install', false)).toBe('Update & Restart');
     expect(updateControlLabel('check', false)).toBe('Check for Updates');
     expect(updateControlLabel('guide', false)).toBe('How to Update');
+    expect(updateControlLabel('desktop', false)).toBe('How to Update');
   });
 
   // The invariant, restated as the thing a caller can rely on: whatever the
@@ -965,12 +1067,27 @@ describe('updateRoute', () => {
     expect(updateRoute(true)).toBe('install');
   });
 
-  it('always answers, whatever the session is', () => {
-    for (const tauri of [true, false]) {
+  // A phone is never the machine an install lands on, so every state it can be
+  // in has the same answer. The loop is the whole rule.
+  it('gives a phone one answer, whatever the state', () => {
+    mocks.thisDeviceIsMobile.mockReturnValue(true);
+    for (const offered of [true, false]) {
       for (const check of [null, releaseCheckOf(null), releaseCheckOf(null, { supported: false })]) {
-        mocks.isTauri.mockReturnValue(tauri);
         storeSignals.releaseCheck.value = check;
-        expect(ROUTES).toContain(updateRoute());
+        expect(updateRoute(offered), `${offered}/${check?.supported}`).toBe('desktop');
+      }
+    }
+  });
+
+  it('always answers, whatever the session is', () => {
+    for (const mobile of [true, false]) {
+      for (const tauri of [true, false]) {
+        for (const check of [null, releaseCheckOf(null), releaseCheckOf(null, { supported: false })]) {
+          mocks.thisDeviceIsMobile.mockReturnValue(mobile);
+          mocks.isTauri.mockReturnValue(tauri);
+          storeSignals.releaseCheck.value = check;
+          expect(ROUTES).toContain(updateRoute());
+        }
       }
     }
   });
@@ -1023,6 +1140,41 @@ describe('followUpdateRoute', () => {
     expect(mocks.openSettingsSubview).toHaveBeenCalledWith('system-overview');
     expect(storeSignals.settingsScrollTarget.value).toBe('system:maintenance');
     expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  // Every control that page would offer a phone is one it cannot work. So the
+  // one line that applies is said here, rather than navigated to.
+  it('answers on a toast and navigates nowhere on the desktop route', async () => {
+    await followUpdateRoute('desktop');
+    expect(lastToast().message).toBe(
+      'Update Lucidos on the machine that runs this workspace, not from this device.',
+    );
+    expect(mocks.openSettingsSubview).not.toHaveBeenCalled();
+    expect(storeSignals.settingsScrollTarget.value).toBeNull();
+    expect(mocks.installAppUpdateAndRestart).not.toHaveBeenCalled();
+  });
+
+  // It says WHERE and no more, because the how differs per install shape and a
+  // phone can do none of them. A sentence naming the desktop app would be
+  // wrong for a headless install and for a source checkout.
+  it('names no mechanism, whatever this workspace installs as', async () => {
+    for (const install of ['desktop-app', 'installer-rerun', null] as const) {
+      mocks.showToast.mockClear();
+      storeSignals.releaseCheck.value = install
+        ? releaseCheckOf({ version: '9.50.0', install })
+        : releaseCheckOf(null, { supported: false });
+      await followUpdateRoute('desktop');
+      expect(lastToast().message, install ?? 'source checkout')
+        .not.toMatch(/\b(app|installer|install\.sh|rebuild|pull)\b/i);
+    }
+  });
+
+  // The button stays live, so an unkeyed toast stacked one card per tap.
+  it('replaces its own toast rather than stacking a second copy', async () => {
+    await followUpdateRoute('desktop');
+    await followUpdateRoute('desktop');
+    const keys = mocks.showToast.mock.calls.map((c) => (c[2] as { key?: string })?.key);
+    expect(keys).toEqual(['app-update-on-desktop', 'app-update-on-desktop']);
   });
 });
 

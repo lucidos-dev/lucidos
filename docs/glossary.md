@@ -193,6 +193,8 @@ Why the packaged macOS client's `main` window reaches the screen only once there
 
 Two frontend call sites, not one, because neither covers both launches: the packaged cold launch paints the *boot splash* from the pre-gateway document and returns before `<App/>` mounts, so `applyTheme` never runs there, while in the workspace document `loadPreferences` skips `applyTheme` when the stored theme is unchanged. The one-shot lives in `utils/tauri.ts` so both share it. What the window layer is tinted before any of this is the color the frontend last asked for, persisted by `set_titlebar_color` to `<app-data>/config/titlebar-color` and validated on read, so a light-theme user is not launched into the dark-theme `TITLE_BAR_DEFAULT_COLOR`. Distinct from the *boot splash*, which is what the window shows once it is up.
 
+The claiming racer does not show the window itself. It marshals a clamp-then-show pair onto the main thread (`STARTUP_SHOW_STEPS`). So `show_startup_window` returning `true` means the pair is scheduled, not that the window is up. The clamp rides here because this is the first moment after the run loop has drained tao's deferred setters. It is therefore the first moment anything can judge the geometry `main` will wear (ADR 0193).
+
 ### On screen (a window)
 Whether the packaged macOS client believes one of its windows is on the screen.
 A fact the client OWNS (`crates/lucidos-app/src/window_screen.rs`), rather than
@@ -269,6 +271,24 @@ The fixed TCP port the **packaged gateway** binds, default `5252`, so the mobile
 The gateway binds all interfaces (`Ipv6Addr::UNSPECIFIED`), so it is network-reachable once the port is stable. Everything behind it is not: the per-workspace engines bind **loopback only** (`LUCIDOS_BIND_LOOPBACK=1` is also set as the `behind_gateway` signal) and Postgres stays loopback-only too. The gateway is the sole network-facing surface.
 
 Dev binds the same way since ADR 0096. Its **one shared dev gateway** takes **`5251`** by default (override `LUCIDOS_DEV_GATEWAY_PORT`). That is one below the packaged `5252`, so a dev gateway and an installed `Lucidos.app` coexist out of the box. See *Workspace gateway* and ADR 0014's dev-topology table.
+
+**It never moves to dodge a squatter, and that is a decision rather than an omission** (ADR 0189). `resolve_engine_port` reads the persisted `<app-data>/config/engine-port` or the default, and probes nothing. Paired-device URLs and the Tauri capability URL pattern are addresses other things hold.
+
+`install.sh` DOES step around an occupied port for a brand-new instance: an instance's port is a mutable property of its slug, not a published address. So an `install.sh` install laid down first keeps 5252, and the packaged app collides with it. The product reports that collision instead of resolving it. See *install inventory* and *port contention*.
+
+### Install vehicle
+One of the three ways Lucidos gets onto a machine, each writing a distinct set of paths: the macOS **`.app`** from the DMG, an **`install.sh`** headless install (one or more slug-keyed instances sharing a runtime), and a **source checkout** run by `scripts/web-dev.sh`. A machine can carry all three at once, and each uninstaller reaches only its own. `crates/lucidos-installs` is the one place the layouts are written down. `scripts/lib/service.sh` mirrors the `.app`'s four paths for the shell uninstaller, and `service_test.sh` reads the Rust constants to keep the two in step.
+
+### Install inventory
+Every *install vehicle* this user can see, as `lucidos-installs::scan` reports it. Per install: kind, name, root, version, data dir, port, the launch agents that can start it, whether the asking process belongs to it, and the removal command. Read from paths and from an `Info.plist`, **never by running a discovered binary** (`no_execute_and_no_write` pins that by scanning the source). A field the filesystem cannot answer is `None` and renders as "unknown": a plausible default here would be the lie this surface exists to end. Served by `GET /~/api/v1/control/installs`, deliberately off `gateway/status` (the picker polls that every two seconds). Rendered by Settings, System, Overview; also read by the client's startup preflight and by both uninstallers' leftovers reports.
+
+### Port contention
+Two or more entries of the *install inventory* configured for the same gateway port. Only one can bind it, and the winner is whichever started first. So the client can end up driving an engine from an install nobody chose.
+
+**This is the whole discriminator between a deliberate multi-install and the trap** (ADR 0189). Coexistence on two ports is a supported setup, reported silently. Contention raises a warning on System, Overview, a native dialog at client startup (once per `PortConflict::fingerprint`), and a block in the gateway's boot log. No marker file, environment variable or setting expresses the difference, because the ports already do.
+
+### Shadowed engine
+A workspace served by an OLDER Lucidos than the client showing it, which is what *port contention* usually produces. Not always: the gateway re-adopts an engine that outlived it, so a survivor of a failed restart reads the same. The surfaces therefore state the two versions and point at *install inventory*, rather than asserting a cause. `shadowedEngine()` derives it from the engine's own `/health` `release` against `window.__LUCIDOS_APP_VERSION__`. So it holds against a gateway too old to say anything for itself, which is exactly the gateway this happens with. It is the fifth `UpdateCheckVerdict`, returned BEFORE the client-updater fallback: that fallback compares the client's version and nothing else, and answered "Lucidos is up to date" over an engine ten releases behind.
 
 ### Workspace gateway
 The standalone headless reverse-proxy + control plane — the **`lucidos-gateway`** binary (`crates/lucidos-gateway/`, ADR 0014), with **no dependency on `lucidos-engine`** so the only network-facing process links proxy + supervise + registry code, not the engine's heavy core. Runs as the *Always-on engine service* (launchd on the *stable gateway port*; also used in dev). Owns the workspace registry (`<app-data>/config/workspaces.json`: stable slug → {display name, dir, engine port, optional legacy `database_url`, **auto-start flag**}; **membership is durable** — a workspace stays registered, and thus listed in the picker, until explicitly deleted), provisions one database per workspace in a shared Postgres cluster (`lucidos_<slug>`) and supervises that workspace's engine (spawned by path via `LUCIDOS_ENGINE_BIN`). A legacy `database_url` is a migration source only: if the shared database is missing, the gateway/dev launcher dumps/restores the old per-workspace `lucidos` database, verifies the shared database, re-points the engine to it, and leaves the old cluster intact until the explicit decommission script removes it.
@@ -448,6 +468,15 @@ Three readers are served by the row. The engine-armed *event wait*, `bash_output
 The marker riding the *Lucidos mark*'s corner in the header. There are **two**, on opposite corners, and "brand badge" unqualified means the first. The **state badge** (`BrandBadge`, top-right) runs a one-slot `busy > ready > pending` ladder over engine lifecycle: see *background activity* and *pending engine version*. The **unread badge** (`UnreadBrandBadge`, bottom-right) is the cross-workspace unread count, and reads `crossWorkspaceUnreadTotal`, the same computed `syncWorkspaceAppBadge` writes onto the *app-icon badge*.
 
 Two corners rather than one ladder, because both are resident and each hides the other in one slot. Which corner is not arbitrary either. `LucidosMarkIcon` draws its sparkle top-right, so a badge there costs the brand its distinguishing element. The state badge pays that only while a build runs or an update waits. A count is resident, so it takes the corner the artwork can spare. Both are positioned off one inherited `--brand-badge-corner` on `.brand-mark-slot`, pinned by `styles/__tests__/header-mark-geometry.test.ts`.
+
+### Icon shape regime
+Which of three treatments a generated brand icon gets, decided by how hard its destination masks the art. `crates/lucidos-app/scripts/generate-brand-icons.mjs` is the single source of truth, and `src/brand-icons.test.ts` guards the result.
+
+**macOS-shaped** carries Apple's template itself: art at 824 of a 1024 canvas, corner radius 185.4, and a transparent margin. It covers `icon.icns` and the manifest `purpose: "any"` PNGs, because nothing masks those reliably. macOS 15 and older composite nothing, and a PWA install's custom-icon path is unmasked even on Tahoe.
+
+**Full-bleed** is opaque corner to corner, for a destination that masks its own: `apple-touch-icon.png` (iOS) and the `purpose: "maskable"` PNGs (Android). A pre-rounded source there shows dark fringes inside the mask. The favicon family is full-bleed too, at its own scale, because browsers do not mask a tab icon.
+
+Distinct from the *mark scale* (`SCALE_FULLBLEED` / `SCALE_MASKABLE`), which is how much room the mark leaves inside whatever art square it sits in. A regime picks the shape of the canvas; a scale picks the size of the mark within it. See `docs/plans/2026-09-16-macos-icon-shape.md`.
 
 ### Effective shutdown
 The answer to "is this *agent session* shutting down?", which is the OR of two
@@ -633,7 +662,9 @@ The caller's utterance before the engine's own row for it exists, and the row th
 
 **It exists because the words arrive late, not slowly.** `voice/call.rs::forward` HOLDS a transcript on `UserTurnEnded` and writes no row there. Which row it becomes depends on the *talker*: a `SpokenMessageReceived` when it answers alone, a `MessageReceived` when it delegates. Both wait on a talker tool round-trip, so the stretch from the first word to the bubble held no event and drew nothing at all.
 
-The row is a synthetic `MessageReceived` at a near-`MAX_SAFE_INTEGER` seq, marked `_liveUtterance`. It is appended at the single exit of `computeExchanges`, PAST every path through the fold, and that is the whole of its safety. The fold never sees it. So it cannot be re-anchored, cannot become a wall a re-anchor stops at, and cannot take a step off a running turn. `exchangeHoldsNoTurn` and `isUningestedMessage` then keep it out of the queue and the live-turn walk, so it takes neither the live stream nor the running badge. `exchangeStatus` short-circuits it to `pending`, so the wait wears the Requesting shimmer and never reads as a finished turn with no answer.
+The row is a synthetic `MessageReceived` at a near-`MAX_SAFE_INTEGER` seq, marked `_liveUtterance`. It is appended at the single exit of `computeExchanges`, PAST every path through the fold, and that is the whole of its safety. The fold never sees it. So it cannot be re-anchored, cannot become a wall a re-anchor stops at, and cannot take a step off a running turn. `exchangeHoldsNoTurn` and `isUningestedMessage` then keep it out of the queue and the live-turn walk, so it takes neither the live stream nor the running badge.
+
+**`exchangeStatus` short-circuits it, and which way splits on the words** (ADR 0191). The pulse and a partial read `pending`, so a caller mid-sentence wears the Requesting shimmer. FINAL words read `done`: the engine holds those until the conversation moves, a whole reply long, and a shimmer over a sentence nothing is running for says nothing true.
 
 They live in `ThreadState.liveUtterances`, a LIST of their own rather than `pendingUserMessages` entries. Every rule that array carries would need a carve-out, `effectiveThreadStatus`'s running flip most of all, and its safety timer drops a row on a clock. A list because the engine holds one utterance at a time. A caller who carries on speaking has a second row up before the first one's lands, and a slot would drop the first one's words.
 
@@ -641,9 +672,13 @@ They live in `ThreadState.liveUtterances`, a LIST of their own rather than `pend
 
 **A landing row claims the live row carrying the SAME WORDS, never one matching a count.** `claimUtteranceRows` is the whole rule, and `unclaimedUtterances` holds the words no row has claimed yet. A row with no final words matches nothing, which is the barge-in guarantee by construction, and a partial is not words either.
 
+**It also retires every EARLIER row of its own stretch** (ADR 0188). `call.rs` appends as it accumulates, so such a row carries a strict PREFIX of the words that land. Matched on equality alone it is an orphan: the reported one read `bit` and sat under a "Requesting" header until the hangup swept it. Prefix, never containment, or a short fragment would retire a bubble from a different sentence. The `user_turn_ended` frame carries the whole stretch for the same reason, so the bubble captions the sentence rather than its tail.
+
 **No count works, because the two sides disagree about which row is next, in both directions.** `count` is the browser's gate cycling, and a persisted row is one thing the caller SAID. A pause inside one utterance gives two counts one row. And `call.rs` writes NO row for words spent answering a question card, leaving an orphan a later row would claim. Both are traced in `docs/plans/2026-09-14-the-transcript-shows-a-call-as-it-happens.md`.
 
-**A persisted row is NOT one provider transcription item, and reading it as one is what drew seven bubbles for one sentence** (ADR 0185). A provider closes an item for its own reasons. `call.rs` accumulates across them and closes the row when the conversation MOVES: the talker says words, the doer is asked, or the call ends.
+**A persisted row is NOT one provider transcription item, and reading it as one is what drew seven bubbles for one sentence** (ADR 0185). A provider closes an item for its own reasons. `call.rs` accumulates across them and closes the row when the conversation MOVES: the caller's next finished words, a new thing handed to the talker to say, the doer being asked, or the call ending.
+
+**A PAUSE in the talker's words is not one of those moves, and reading it as one lost the doer's work** (ADR 0191). The pause used to write the row, which took the held words with it. The talker routinely asks a beat later, so the ask paired with nothing and the turn never ran.
 
 **Trimmed on both sides, because exactly one leg normalizes.** The frame's transcript reaches `SpokenMessageReceived` verbatim and reaches `MessageReceived` through `doer.rs::wake`, which trims. `voice::call` pins the verbatim leg, so a second normalization cannot arrive unnoticed.
 
@@ -651,13 +686,21 @@ They live in `ThreadState.liveUtterances`, a LIST of their own rather than `pend
 See also: *call phase*, *live reply*, *transcript marker*, ADR 0174, `docs/plans/2026-08-31-a-bubble-appears-as-the-caller-speaks.md`, `docs/plans/2026-09-05-a-turn-is-never-blank.md`.
 
 ### Live reply
-The talker's own half of a *live utterance*: the reply the transcript draws while it is being spoken, before `SpokenReplyGenerated` exists. `CallState.said` accumulates the `talker_transcript` deltas the client already receives and used to drop, and `ThreadState.liveReply` is the row.
+The talker's own half of a *live utterance*: the reply the transcript draws while it is being spoken, before `SpokenReplyGenerated` exists. `CallState.said` accumulates the `talker_transcript` deltas of ONE stretch, `store/liveUtterance.ts` joins the stretches into the row, and `ThreadState.liveReply` is the row.
 
 A SLOT where the caller's is a list, and the asymmetry is the engine's: `call.rs` holds the floor to one reply at a time, so a second live reply is a state that cannot exist.
 
 The row is a synthetic `SpokenReplyGenerated` marked `_liveReply`, appended past the fold beside the caller's rows and sorted with them by `created`. It wears the persisted type on purpose, so `initiatorFor` draws it as the Lucidos boundary and `exchangeHoldsNoTurn` already knows it holds none. `exchangeStatus` short-circuits it to `done`: the words moving in it are the activity, and a shimmer below would be a second one.
 
 **It outlives `said`.** The turn ending empties the caption and withdraws nothing, because the engine's row is on its way and the caller is still hearing the tail. The persisted `SpokenReplyGenerated` retires it, with `VoiceSessionEnded` as the backstop.
+
+**The ROW is one reply, and `replyCount` is one stretch of it** (ADR 0191). The count moves when a delta lands on an empty `said`, which a 700 ms hole in the talker's words is enough to cause. A new count under a standing row therefore JOINS it, keeping the row's id and the moment it went up. Drawing a row per count made four bubbles of one reply, and the reader watched sentences disappear as they were spoken.
+
+**The engine's own row retires the live one, read as a rewrite that finds no row standing.** `handleEvent` clears the slot when `SpokenReplyGenerated` lands. The bridge's next draw then learns the words are written down, and opens a fresh row for whatever follows. `writeRow` reads a claim on the caller's side in exactly that way.
+
+**A PERSISTED reply row is one thing the talker said, between two moves of the conversation** (ADR 0188). The moves are the caller's finished words, a new thing handed to the talker to say, and the call ending. A pause in its words is none of those: `TALKER_IDLE` holes of up to 3.6 s fall inside one reply, so a row per pause drew one sentence as eleven bubbles. `call.rs` builds the row from the raw deltas, which carry their own spacing, and the pause keeps its other five jobs under its own name.
+
+**The live row is drawn INSIDE the block its persisted row will land in**, as a step rather than a boundary. `withLiveCallRows` and `callRowTarget` share `liveReplyTargetIndex`, so the two cannot drift. Appended as its own exchange it drew a second Lucidos Agent header between the speech bubbles. That header then came and went as each persisted row landed.
 See also: *live utterance*, *call phase*, ADR 0174.
 
 ### Capability parity manifest
@@ -766,6 +809,27 @@ A credential's `base_urls` treated as a binding rather than a label. The value i
 **The `CRED_*` injection into a handshake script is not one of them.** ADR 0144 listed it, and its 0157 amendment removed it. The script presents that credential to its provider's own token endpoint, not to `base_url`, so judging it against `base_url` refused every ordinary OAuth handshake. What binds there is the *handshake injected-secret set* instead.
 
 It closes a theft that needed no script. `data/config/apis.json` is writable over the API. An entry naming a real credential, with an attacker `base_url`, used to make the engine attach that credential and forward it. A credential carrying no scope is refused everywhere rather than sent anywhere. The startup pass gives one to any row exactly one `apis.json` entry explains, once, announced as `CredentialScopeInferred`. It stays single-valued and never appends: `apis.json` is the file the gate defends against, so widening a working scope is the user's call, through Settings or `lucidos credentials set-base-urls`.
+
+### Meta scope
+
+An OIDC or meta scope in an OAuth request: `offline_access`, `openid`,
+`profile`, `email`. None of them names a resource, and a provider may grant one
+and leave it out of the `scope` its token response echoes. Microsoft omits all
+four when the token is issued for a resource such as `outlook.office.com`.
+
+So **a meta scope is answered by evidence, never by the echo**, wherever a
+requested set is diffed against a granted one. `offline_access` has evidence:
+the account holds a refresh token, or it does not. The other three have none
+worth reading, so they are never reported as refused. Two spellers carry the
+rule: `core::oauth::missing_requested_scopes`, taking a `GrantEvidence`, and
+`missingScopes` in `components/settings/oauthConnectForm.ts`, reading the
+account's `has_refresh_token`. The `connect_oauth_account` result and the
+Accounts card therefore cannot disagree.
+
+Diffing the echo instead reported `offline_access` as refused on every working
+Microsoft connection. It also called every GitHub account short of the three
+scopes a bare Connect asks for. See
+`docs/plans/2026-09-16-offline-access-is-proven-by-a-refresh-token.md`.
 
 ### Secret reveal token
 A one-shot, 30-second capability that spends for exactly one stored secret. Two secrets use it, and a token names which, so one can never open the other (`api::secret_reveal::RevealSubject`).
@@ -1728,9 +1792,11 @@ The archive the in-app auto-updater installs: `Lucidos.app.tar.gz` plus its deta
 The gateway's hourly poll of `https://lucidos.dev/api/update-check`, and the answer it announces on `GET /~/api/v1/control/gateway/status` as `release_check`. One per install rather than one per open window, because a refresh re-polls only when the gateway's answer is older than the interval. It is fail closed, running only when `LUCIDOS_PACKAGED=1` is set and the executable resolves outside a source checkout, so a dev tree never polls. The request carries platform, arch, version and the caller's IP; `enabled` in `~/.lucidos/updates.toml` defaults true and is its one preference gate (ADR 0139). Distinct from *gateway binary check*, which asks whether a newer gateway binary sits on disk. It never installs: the client does that, via `install_app_update_and_restart` on macOS or a re-run of `install.sh` elsewhere (ADR 0108).
 
 ### Update route
-What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Three values, and deliberately no fourth meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no offer yet, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
+What a session can do about a release newer than the one running, as the single derivation `updateRoute()` in `store/actions/app-update.ts`. Four values, and deliberately none meaning "nothing". `install` is a Tauri client fronting a bundle, which takes the update here. `check` is no offer yet, plus a check this session can run. `guide` sends the reader to Settings, System, Overview, which carries the installer command for a headless install and the rebuild for a source checkout. That page, never the `system` submenu above it: the route sets a Maintenance scroll anchor, and the submenu has nothing to scroll to.
 
-Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button, which is install-or-check because it is where `guide` lands. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
+`desktop` is a mobile client, decided FIRST because none of the other three can be reached from a phone. Lucidos ships no mobile client, so `install` is already out. A check there ends at "up to date" or at this same sentence, and `guide` spends a page load to say it. Following it shows a toast naming the machine that runs the workspace, and navigates nowhere. A phone also raises no offer toast, and no update half of the *System attention badge*. Both of those clear on an install it can never run (ADR 0190).
+
+Every surface that can name a newer release reads it: the offer toast, the *What's New* release list, and Overview's own button, which is install-or-check because it is where `guide` lands. The label comes from `updateControlLabel` and the click from `followUpdateRoute`, so a surface cannot invent either. `guide` and `desktop` share their words, because the reader's question is the same and only the answer's medium differs. It exists because the panel and the *release check* have independent sources. What's New routinely knows about a release no offer has named, and used to mark it `Newer` and offer nothing (ADR 0142).
 
 ### Release notice cursor
 The `release_notice_cursor` preference: the id of the last *release notice* this workspace answered. Everything after it in `release-notices.toml`, and at or before the running release, is still owed. One scalar is the whole of the ordering and the one-time-ness, because the authored file is an ordered append-only sequence.
@@ -2328,6 +2394,8 @@ A **Realtime** talker is opened with **exactly three tools** and none of them ac
 
 A **Live** talker holds **none** (ADR 0181). Its API declares no tools under client delegation, so `delegate` arrives as a delegation frame instead, and the other two have no expression. The caller settles a card by tapping it and rings off on the button. Two more things follow from that protocol: it reports no tokens, because it bills by the second, and it has no turn boundaries, which `voice/live.rs` synthesizes below the seam.
 
+**Both synthesized boundaries read WORDS, never an output stream** (ADR 0185, ADR 0187). The caller's turn ends when the talker says something, and the talker's when it stops. Audio and blank deltas decide neither, because this provider sends both between turns.
+
 What it can answer with no wait is whatever was loaded at session open, the *resident block*. It can look nothing up mid-sentence, so for anything else it delegates, stalls truthfully while the doer works, then says what it was handed MEANS. It may not state a fact it did not receive.
 
 That block is a snapshot and nothing corrects it, which is why the tool's description biases hard toward calling. Under-calling is the expensive mistake: it answers confidently from what was true when the call opened. Over-calling costs one turn nobody hears.
@@ -2396,6 +2464,15 @@ How far a verb may be aimed: the caller itself, plus every descendant, at any de
 Wider than the *child follow-up* edge, which stops at direct children, and deliberately so: archive cascades to the whole family, so its authorization reasons over the same tree it tears down. The unscoped `POST /api/v1/chat/cancel` (no `thread_id`) stops everything, so it aims at the workspace rather than at a thread. A thread-bound caller needs the standing instruction for it, rather than being narrowed to itself.
 
 Enforced on all fourteen routes carrying seven of clause 4's eight verbs, per verb rather than per route: Apply, Discard, answering a question card, restarting a turn (Continue), creating a top-thread, archiving and cancelling. Three of them arrive by more than one path, and gating the first path of each is how the ungated set grew. Three LLM tools press Apply in-process (`apply_change`, `apply_when_settled`, `apply_as_they_settle`). They carry no headers, so they name their own thread and ask the same rule through `refuse_thread_without_authority`. The eighth verb, resolving a permission card, is still ungated and recorded as such in the plan. See ADR 0083's amendment for the archive and cancel half, and ADR 0168 for the rest.
+
+**Deleting a thread is deliberately NOT one of these verbs.** It has no place on the ladder and no `ThreadReachVerb`, because the ladder's second question admits a thread carrying the *standing instruction*. It takes the *owner-device gate* instead, which refuses every agent outright (ADR 0192).
+
+### Owner-device gate
+`api::actor::require_owner_device`, the check in front of an action no agent may take on any authority. It resolves the caller with `require_user_actor` and then insists the answer is `MessageOrigin::Device`. It refuses four real credentials: a verified *thread-bound origin token*, the machine-local token, another workspace, and a device id naming no row. The 403 is written for the agent that will read it.
+
+**Strictly stronger than *thread reach* plus the *standing instruction*, and that is the point.** The ladder lets a thread act outside its own subtree while it carries the instruction. Any thread whose newest turn-start event has a `Device` actor carries one, so an agent inside a turn the user opened would inherit the act. Deleting a thread cannot be undone, so it takes the narrower question instead (ADR 0192).
+
+One user today, `POST /api/v1/threads/delete` and its preflight. A second one is a decision, not a convenience: every other clause-4 verb is recoverable, which is what makes the ladder right for them.
 
 ### Standing instruction
 The engine mechanism behind the term `system-knowhow/glossary.md` defines for the workspace LLM. Two shapes qualify and no third (ADR 0168 clause 5), and `api::standing_instruction::carries_standing_instruction` is the single definition every clause-4 verb asks.
@@ -2508,6 +2585,8 @@ An isolated git worktree under `<workspace>/.lucidos/worktrees/` where an *agent
 
 ### Worktree reclamation
 Freeing the disk a *worktree* occupies once it is spent. **Exactly one subsystem owns it: the background `worktree_cleanup` worker** (ADR 0035), which weighs retention on evidence it gathers while nothing is racing it: Tier 0 removes zero-information trees (clean, no pending change, no commits ahead) after a grace window, Tier 1 strips regenerable build artifacts at 24h idle, Tier 2 removes fully at 30d, and disk pressure escalates all three. Deliberately distinct from **failure-path cleanup**, which deletes only what a failed attempt itself created (`git_ops::cleanup_failed_spawn`, the Tier-3 merge temp tree behind `conflict_abort_deletes_temp_state`) and from an explicit user **Discard**, which deletes the tree and its branch together because the user asked for the work to go away. Those two are not reclamation and are not owned by the worker. The distinction is load-bearing rather than pedantic: a session **teardown** must never reclaim, because it frequently runs *because* something went wrong and can be unwinding while the safety net relaunches a session into the very tree it would delete. An unconditional `git worktree remove --force` on that path destroyed two live worktrees on 2026-08-03, once acting on a timed-out probe (see *GitAnswer*) and once losing that race; the call site was deleted rather than gated further. Enforced by `the_completion_path_removes_only_the_two_worktrees_it_is_allowed_to`.
+
+A thread **delete** is a third non-reclamation removal, and the one place the branch rule inverts. `BranchDisposal::Always` takes the branch even holding commits nothing merged. Once the thread's events are gone, `lookup_thread_by_short` cannot name the directory's thread. The worker's orphan path would then keep the tree for good (ADR 0035 amendment, ADR 0192).
 
 ### Worktree-pinned stack
 A long-lived dev stack (gateway + engine + served `dist/`) whose paths resolve inside a

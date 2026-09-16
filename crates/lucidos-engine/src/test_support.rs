@@ -408,6 +408,7 @@ pub async fn seed_oauth_account_with_desired(
         None,
     )
     .await
+    .map(|stored| stored.id)
 }
 
 /// Seed a global preference for a test that just needs one stored.

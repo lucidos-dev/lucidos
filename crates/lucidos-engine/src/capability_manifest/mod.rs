@@ -3200,6 +3200,33 @@ mod tests {
         assert!(domain_for_tool("run_coding_agent").is_none());
     }
 
+    /// The `threads` domain is READ-ONLY, and deleting is the reason to say so
+    /// out loud (ADR 0192). The assertion above pins the exact action list, so
+    /// it already fails if a `delete` lands; this one fails with the reason.
+    ///
+    /// Deleting a thread removes its rows, its sub-threads and what the
+    /// workspace learned from them, with no undo. It is offered to the owner in
+    /// the UI and nowhere else. So adding it to any generated surface is the
+    /// thing that must not happen quietly.
+    #[test]
+    fn the_threads_domain_exposes_no_delete() {
+        let threads = domains().iter().find(|d| d.name == "threads").unwrap();
+        for action in threads.actions() {
+            assert!(
+                !action.contains("delete") && !action.contains("remove"),
+                "the threads domain grew a destructive action '{action}'. Deleting \
+                 a thread is the owner's button in the UI and is reachable from no \
+                 generated surface (ADR 0192)."
+            );
+        }
+        for name in ["delete_thread", "delete_threads", "remove_thread"] {
+            assert!(
+                domain_for_tool(name).is_none(),
+                "'{name}' resolves to a domain, so some surface offers it"
+            );
+        }
+    }
+
     #[test]
     fn phase5f_env_vars_declared() {
         let ev = domains().iter().find(|d| d.name == "env_vars").unwrap();

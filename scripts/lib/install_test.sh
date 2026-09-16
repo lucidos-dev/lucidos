@@ -188,6 +188,124 @@ got="$(install_ca_bundle_candidates)"
 if echo "$got" | grep -qx '/etc/ssl/certs/ca-certificates.crt'; then pass "Debian/Ubuntu bundle listed"; else fail "Debian bundle missing: $got"; fi
 if echo "$got" | grep -qx '/etc/pki/tls/certs/ca-bundle.crt'; then pass "Fedora/RHEL bundle listed"; else fail "RHEL bundle missing: $got"; fi
 
+# ── PURE: the piped-install scope stays in the bash-3.2 posix subset ──────────
+# REGRESSION (production macOS, 2026-09-16): the advertised
+# `curl -fsSL https://lucidos.dev/install.sh | sh` died with
+# `line 570: syntax error near unexpected token '<'` and exit 2, over a
+# `done < <(service_desktop_app_present …)` in report_coexisting_app.
+#
+# Linux never saw it. There /bin/sh is dash, BASH_VERSION is empty, and
+# install.sh's re-exec guard re-fetches the script under bash. On macOS
+# /bin/sh IS bash 3.2, so the guard deliberately does not fire and these files
+# must survive bash 3.2 in posix mode. Nothing enforced that until this check.
+echo ""
+echo "test: install.sh, uninstall.sh and the piped-install libs stay bash-3.2 clean"
+
+# What a piped install actually runs: both front doors, install.sh's own
+# LUCIDOS_LIBS list read out of the file so a new lib is covered the day it is
+# added, and service.sh, which both front doors source lazily. The build and
+# release libs are out of scope on purpose: they only ever run under a real
+# bash, where their bash 4 features are correct.
+#
+# Two ways that derivation fails silently, so the floor checks both rather than
+# a file count: the sed matching nothing, and a named lib that is not on disk.
+# A count would also red on a legitimate consolidation of the lib list, and
+# blame the parse for it.
+POSIX_SCOPE=("$INSTALL" "$PROJECT_DIR/uninstall.sh")
+posix_libs="$(sed -n 's/^LUCIDOS_LIBS="\(.*\)"$/\1/p' "$INSTALL")"
+for lib in $posix_libs service.sh; do
+    POSIX_SCOPE+=("$SCRIPT_DIR/$lib")
+done
+posix_missing=""
+for f in "${POSIX_SCOPE[@]}"; do
+    [ -f "$f" ] || posix_missing="$posix_missing $f"
+done
+if [ -n "$posix_libs" ] && [ -z "$posix_missing" ]; then
+    pass "scope resolved to ${#POSIX_SCOPE[@]} files"
+else
+    fail "scope did not resolve (LUCIDOS_LIBS='$posix_libs', missing:${posix_missing:- none})"
+fi
+
+# Constructs bash 3.2 cannot run, as one ERE. This scan sits BESIDE the parse
+# check below because most of them are invisible to any `-n`: the bash 4
+# builtins and ${x^^} parse cleanly on every bash and fail only at RUN time on
+# 3.2, half way through an install. Process substitution needs the scan too,
+# since bash 5 in posix mode still ACCEPTS what bash 3.2 rejects, so a Linux
+# runner's parse check stays green over the very line that broke production.
+#
+# Here-strings (<<<) are deliberately absent, and so are arrays: bash has had
+# both since 3.2 or earlier, so they run fine. Probe a construct against a real
+# bash 3.2 before widening this, rather than banning it on a guess.
+BASH32_FORBIDDEN='[<>]\(|(mapfile|readarray)[[:space:]]|declare[[:space:]]+-[A-Za-z]*A|local[[:space:]]+-[A-Za-z]*n[[:space:]]|[$]\{[A-Za-z_][A-Za-z0-9_]*(\[[^]}]*\])?(\^\^?|,,?)\}'
+
+# posix_subset_hits <file>…: "<file>:<line>:<text>" per offending line. Empty
+# means clean, which is exactly why the fixture below exists: a regex that
+# quietly stops matching anything looks identical to a clean tree.
+#
+# Whole-line comments are dropped, because a comment naming a banned construct
+# is documentation rather than a use, and the fix in install.sh is exactly that.
+# -H forces the filename even for one file, so the filter has one shape.
+posix_subset_hits() {
+    grep -HnE "$BASH32_FORBIDDEN" "$@" | grep -vE ':[0-9]+:[[:space:]]*#' || true
+}
+
+hits="$(posix_subset_hits "${POSIX_SCOPE[@]}")"
+if [ -z "$hits" ]; then
+    pass "no construct bash 3.2 rejects, across ${#POSIX_SCOPE[@]} files"
+else
+    fail "macOS /bin/sh is bash 3.2 and cannot run these:
+$hits"
+fi
+
+# Positive proof the scan still bites. Every line of the fixture is bad and
+# exercises exactly one alternative, so the count must come back whole.
+BADDIR="$(mktemp -d)"
+cat > "$BADDIR/bad.sh" <<'SH'
+while read -r l; do :; done < <(echo hi)
+diff <(echo a) <(echo b)
+tee >(cat) </dev/null
+mapfile -t arr < /etc/hosts
+readarray -t arr < /etc/hosts
+declare -A map
+local -n ref=$1
+echo "${name^^}"
+echo "${name,,}"
+SH
+bad_total="$(grep -c . "$BADDIR/bad.sh")"
+bad_flagged="$(posix_subset_hits "$BADDIR/bad.sh" | grep -c . || true)"
+if [ "$bad_flagged" = "$bad_total" ]; then
+    pass "the scan flags all $bad_total known-bad constructs"
+else
+    fail "the scan flagged $bad_flagged of $bad_total known-bad lines:
+$(posix_subset_hits "$BADDIR/bad.sh")"
+fi
+rm -rf "$BADDIR"
+
+# Second net, for anything the list above has not learned yet: parse each file
+# under bash IN POSIX MODE, the way macOS runs it. /bin/sh there IS bash, which
+# is the exact condition the re-exec guard tests, so use it when that holds.
+# Elsewhere /bin/sh is dash, which would reject the arrays the guard re-execs to
+# GET, so stand in with a `sh`-named symlink to bash (bash picks posix mode off
+# argv[0]). That stand-in is weaker, and the scan above is why that is tolerable.
+SHDIR="$(mktemp -d)"
+posix_sh_bash="$(/bin/sh -c 'echo "${BASH_VERSION:-}"' 2>/dev/null)"
+if [ -n "$posix_sh_bash" ]; then
+    POSIX_SH=/bin/sh
+else
+    ln -s "${BASH:-$(command -v bash)}" "$SHDIR/sh"
+    POSIX_SH="$SHDIR/sh"
+    posix_sh_bash="$BASH_VERSION"
+fi
+echo "  (posix parse via $POSIX_SH, bash $posix_sh_bash)"
+for f in "${POSIX_SCOPE[@]}"; do
+    if err="$("$POSIX_SH" -n "$f" 2>&1)"; then
+        pass "$(basename "$f") parses as sh"
+    else
+        fail "$(basename "$f") does not parse as sh: $err"
+    fi
+done
+rm -rf "$SHDIR"
+
 # ── INTEGRATION: --help + flag parsing ───────────────────────────────────────
 echo ""
 echo "test: --help documents the modes, flags, and env contract"

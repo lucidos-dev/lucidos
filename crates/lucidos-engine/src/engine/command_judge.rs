@@ -82,6 +82,13 @@ impl JudgeVerdict {
 
 /// Build the per-command user message: the tool kind, the out-of-workspace risk
 /// signal, and the command text itself.
+///
+/// The command is redacted first. This text leaves the machine for whatever
+/// `model_command_judge` resolves to, which is often not the chat provider,
+/// and a `run_bash` body routinely carries a `postgresql://user:pass@host/db`.
+/// Every sibling lane redacts before it PERSISTS that same text. The path
+/// shipping it to a third party cannot be the one that skips it. A password is
+/// not a risk signal, so the verdict is unchanged.
 fn build_judge_user_prompt(input: &JudgeInput) -> String {
     let kind = match input.tool_name.as_str() {
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => "Python code",
@@ -97,7 +104,7 @@ fn build_judge_user_prompt(input: &JudgeInput) -> String {
         kind = kind,
         escapes = escapes,
         kind_lower = kind.to_ascii_lowercase(),
-        cmd = input.command,
+        cmd = crate::core::redact_postgres_secrets(&input.command),
     )
 }
 
@@ -290,6 +297,28 @@ mod tests {
             out_of_workspace: oow,
             fast_path_refused: false,
         }
+    }
+
+    /// The judge prompt leaves the machine, often for a provider other than
+    /// the chat one. A connection string in the command must be redacted
+    /// before it is sent. The rest of the command still reaches the judge,
+    /// because that is what it classifies.
+    #[test]
+    fn judge_prompt_redacts_postgres_secrets() {
+        let input = ji(
+            tn::RUN_BASH,
+            "psql postgresql://lucidos:hunter2@db.example.com:5432/app -c 'DROP TABLE events'",
+            false,
+        );
+        let prompt = build_judge_user_prompt(&input);
+        assert!(
+            !prompt.contains("hunter2"),
+            "the password must not reach the judge provider: {prompt}"
+        );
+        assert!(
+            prompt.contains("DROP TABLE events"),
+            "the classifiable command survives redaction: {prompt}"
+        );
     }
 
     /// A stubbed [`LlmProvider`] that echoes a fixed response — lets us exercise

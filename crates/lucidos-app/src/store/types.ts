@@ -365,6 +365,12 @@ export type ResponseEvent =
       type: 'spoken_reply';
       text: string;
       interrupted: boolean;
+      /** Still being said, so the words are still arriving. The talker's LIVE
+       *  row wears this; the engine's own row never does. */
+      live?: boolean;
+      /** Another spoken row came directly before this one, so the call mark is
+       *  drawn on that one alone. A run says "this was said aloud" once. */
+      follows?: boolean;
     }
   | {
       /** The model ended its turn cleanly but produced no text (a benign empty
@@ -633,6 +639,16 @@ export interface OAuthAccountInfo {
    *  the new bundle being served and the engine restart landing. Callers fall
    *  back to `scopes`, which is never narrower than today's behavior. */
   desired_scopes?: string | null;
+  /** The account holds a refresh token, so renewal works.
+   *
+   *  This is what answers `offline_access`: a provider may grant it and leave
+   *  it out of the echoed `scopes`, which is what every resource-scoped
+   *  Microsoft token does. Presence only; the token never leaves the engine.
+   *
+   *  Absent on an engine older than this field, which is the window between a
+   *  new bundle being served and the engine restart landing. Undefined is
+   *  UNKNOWN, and callers stay quiet on it rather than warning. */
+  has_refresh_token?: boolean;
   created_at: string;
   updated_at: string;
 }

@@ -963,6 +963,15 @@ impl GatewayState {
         &self.inner.release_check
     }
 
+    /// Every Lucidos install on this machine, scanned fresh.
+    ///
+    /// Deliberately NOT folded into `gateway_status`, which the picker polls
+    /// every two seconds. This walks directories and reads a plist, and its one
+    /// reader is a Settings page somebody opened.
+    pub fn install_inventory(&self) -> lucidos_installs::Inventory {
+        crate::installs::inventory(self.inner.exe_path.clone(), self.app_data())
+    }
+
     /// Re-exec this process onto the on-disk binary, keeping the PID so the
     /// supervisor keeps `wait`ing and the pidfile stays valid. The fresh
     /// `main()` re-adopts the running engines (see [`Self::boot_all`]). This is
@@ -2935,6 +2944,10 @@ pub async fn run() -> Result<(), BoxError> {
             }),
         };
     crate::log!("[Gateway] build id: {}", GATEWAY_BUILD_ID);
+    // What else is installed, and whether anything contends for a port. One
+    // pass at boot, so a support log carries the answer without anybody asking
+    // for it. The loud arm fires only on contention, never on coexistence.
+    crate::installs::log_boot_summary(&state.install_inventory());
 
     // Re-adopt running engines and spawn the auto-start workspaces (ADR 0014).
     // A first-run empty registry is a no-op: nothing is auto-created, so the

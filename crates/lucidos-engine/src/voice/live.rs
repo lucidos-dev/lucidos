@@ -58,11 +58,17 @@ const EVENT_QUEUE: usize = 64;
 /// socket that connects and then says nothing would hang the caller forever.
 const OPENING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the talker's own output may go quiet before its turn is over.
+/// How long the talker's own WORDS may go quiet before its turn is over.
+///
+/// **Words, never the output stream carrying them.** The stream runs when
+/// nothing is being said: audio arrives with silence in it, and a transcript
+/// delta arrives blank. Read off the stream, this bound never expired at all,
+/// so one call's two replies landed as a single row at hangup. See
+/// `docs/plans/2026-09-15-a-talker-turn-ends-when-its-words-do.md`.
 ///
 /// **This is not the forbidden silence timer.** That rule is about the CALLER:
 /// a timer cannot tell a person's pause from their full stop, so it must never
-/// decide one. This measures our own received stream instead, which is a
+/// decide one. This measures our own received words instead, which is a
 /// mechanical fact rather than a judgment about anybody.
 const TALKER_IDLE: Duration = Duration::from_millis(700);
 
@@ -150,7 +156,7 @@ impl VoiceProvider for LiveProvider {
                 ..TurnState::default()
             };
             loop {
-                let quiet_at = turn.last_output.map(|at| at + TALKER_IDLE);
+                let quiet_at = turn.last_words.map(|at| at + TALKER_IDLE);
                 let (events, over) = tokio::select! {
                     message = reader.next() => read_frame(message, &mut turn),
                     _ = wait_until(quiet_at) => (talker_went_quiet(&mut turn), false),
@@ -428,8 +434,17 @@ pub struct TurnState {
     caller_words: Arc<Mutex<String>>,
     /// What the talker has said in the turn it is speaking now.
     talker_words: String,
-    /// When the talker's output last carried something. `None` between turns.
-    last_output: Option<Instant>,
+    /// When the talker last said a WORD. `None` between turns.
+    ///
+    /// Armed by [`map_event`]'s transcript arm alone, and only for a delta that
+    /// carries words. Audio arms nothing: this provider streams it whether or
+    /// not anybody is speaking, so a clock reading it never runs out. Nor does
+    /// a blank transcript delta, for the same reason.
+    ///
+    /// So it is `Some` exactly while the talker owes the end of something it
+    /// said, which is what makes [`talker_went_quiet`] one-shot and never
+    /// empty.
+    last_words: Option<Instant>,
 }
 
 /// Map one Live frame onto zero or more [`VoiceEvent`].
@@ -441,23 +456,24 @@ pub fn map_event(value: &Value, turn: &mut TurnState, now: Instant) -> Vec<Voice
         return vec![];
     };
     match kind {
-        "session.output_audio.delta" => {
-            turn.last_output = Some(now);
-            match decoded_audio(value) {
-                Some(pcm) => vec![VoiceEvent::Audio(pcm)],
-                None => vec![],
-            }
-        }
+        // Forwarded and nothing else. Audio says nothing about whether the
+        // talker is speaking, because this provider streams it either way. See
+        // [`TurnState::last_words`].
+        "session.output_audio.delta" => match decoded_audio(value) {
+            Some(pcm) => vec![VoiceEvent::Audio(pcm)],
+            None => vec![],
+        },
         "session.output_transcript.delta" => {
-            turn.last_output = Some(now);
             let Some(text) = value.get("delta").and_then(Value::as_str) else {
                 return vec![];
             };
             // The talker composing words IS its judgment that the caller
-            // finished, which is ADR 0181's rule. A blank delta composes none.
+            // finished, which is ADR 0181's rule. A blank delta composes none,
+            // so it neither ends the caller's turn nor arms the talker's own.
             let mut events = if text.trim().is_empty() {
                 vec![]
             } else {
+                turn.last_words = Some(now);
                 caller_finished(turn)
             };
             turn.talker_words.push_str(text);
@@ -549,14 +565,19 @@ fn reason_for(spoken: &str) -> String {
     super::clip(spoken, super::READ_ALOUD_CHARS)
 }
 
-/// The talker's output stopped, so its turn is over.
+/// The talker stopped saying words, so its turn is over.
+///
+/// **A turn the talker never spoke in has no end.** The clock is armed by words
+/// alone, so this answers with nothing after audio that carried none. That is
+/// the honest reading: with no words there is no reply to write down, and
+/// `call.rs` hands no floor back for one either.
 ///
 /// Usage is all zeros, and that is what this provider reports. It bills by the
 /// second, not by the token. Its duration figures are cumulative snapshots, and
 /// summing them per turn would overstate every call. What prices a Live call is
 /// `VoiceSessionEnded.duration_secs`, which the call already writes.
 fn talker_went_quiet(turn: &mut TurnState) -> Vec<VoiceEvent> {
-    if turn.last_output.take().is_none() {
+    if turn.last_words.take().is_none() {
         return vec![];
     }
     vec![VoiceEvent::TalkerTurnEnded {

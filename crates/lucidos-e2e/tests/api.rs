@@ -146,6 +146,9 @@ mod command_safety_test;
 #[path = "api_support/cascade_archive_test.rs"]
 mod cascade_archive_test;
 
+#[path = "api_support/delete_thread_test.rs"]
+mod delete_thread_test;
+
 #[path = "api_support/notifications_presence_test.rs"]
 mod notifications_presence_test;
 

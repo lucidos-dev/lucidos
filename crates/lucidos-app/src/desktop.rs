@@ -992,6 +992,11 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             plan = launch_plan(Some(url), restore, &origin);
             navigate_main_window(&handle, &plan.main);
         }
+        // Is a second install in the way? Asked after the window is aimed, so
+        // the answer lands over a live app rather than delaying it, and only a
+        // PORT CONTENTION speaks. A source checkout on 5251 beside this bundle
+        // on 5252 is an ordinary setup and stays silent.
+        announce_install_conflict(&handle, &app_data, port);
         // The rest of the session. Building a window is a main-thread call, and
         // this runs on the launch thread.
         if !plan.extra.is_empty() {
@@ -1004,6 +1009,54 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
             }
         }
     });
+}
+
+/// What an uninstall from this app will leave on the machine.
+///
+/// The app's uninstall reaches its own bundle, its two launch agents and its
+/// support data. It cannot reach an `install.sh` install or a source checkout,
+/// and until this it did not mention them. A user who uninstalled, reinstalled
+/// the newest DMG, and watched nothing change was reading that silence.
+///
+/// Called BEFORE the destructive steps, since they trash the bundle this
+/// process is running from. Read-only.
+pub fn leftover_installs(app_data: &Path) -> Vec<String> {
+    let Some(roots) = lucidos_installs::ScanRoots::for_machine() else {
+        return Vec::new();
+    };
+    let running = lucidos_installs::RunningProcess {
+        exe: std::env::current_exe().ok(),
+        data_dir: Some(app_data.to_path_buf()),
+    };
+    let inventory = lucidos_installs::scan(&roots, &running);
+    // Exactly what this uninstaller removes: the bundle it is running from.
+    lucidos_installs::leftovers_report(&inventory, |i| i.running_here)
+}
+
+/// Warn, once per machine state, that another install holds this client's port.
+///
+/// A native dialog rather than a toast, deliberately. It has to reach a user
+/// whose gateway is ten releases old. Their frontend therefore carries none of
+/// this, and their client is the only current thing they have.
+///
+/// Every decision lives in `install_preflight`, which is pure and tested. This
+/// is the effectful half: it shows what that module hands back, and nothing.
+fn announce_install_conflict(app: &AppHandle, app_data: &Path, port: u16) {
+    let version = env!("LUCIDOS_APP_VERSION");
+    let Some(notice) = crate::install_preflight::take_notice(app_data, port, version) else {
+        return;
+    };
+    eprintln!(
+        "[desktop] install conflict on port {port}:\n{}",
+        notice.body
+    );
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    app.dialog()
+        .message(notice.body)
+        .title("Another Lucidos install is in the way")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::Ok)
+        .show(|_| {});
 }
 
 /// One additional window this launch opens.
@@ -1380,6 +1433,22 @@ pub fn run_service() -> i32 {
         Err(e) => return service_boot_failed(format!("cannot resolve resource dir: {e}")),
     };
     let port = resolve_engine_port(&app_data);
+
+    // Somebody already answers here, so the gateway below cannot bind and will
+    // die on every launchd respawn. That used to happen in silence: the wait
+    // sees the OTHER gateway's health, reports "healthy", and the loop repeats
+    // forever while the client talks to an install nobody chose. Say it.
+    //
+    // A log line, not a refusal. An orphan of our own reads identically from
+    // here, and it is perfectly serviceable. Failing the boot would put the
+    // splash in an error state while the app works. The client's own preflight
+    // is what tells the user, and it can tell the two cases apart.
+    if http_ok(port, "/~/api/v1/health") {
+        eprintln!(
+            "[service] port {port} is already served by a gateway this service did not spawn; \
+             the one below will fail to bind. See Settings, System, Overview for the installs."
+        );
+    }
 
     let mut svc = match spawn_gateway(&resources, &app_data, port) {
         Ok(svc) => svc,
